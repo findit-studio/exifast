@@ -205,7 +205,13 @@ impl CanonPrintConv {
 /// "EOS 5DS", "EOS 5DS R" ALL match (each contains the literal `EOS 5D`),
 /// which is what gates Canon Main tag `0x96` onto the `SerialInfo`
 /// SubDirectory rather than `InternalSerialNumber` (`Canon.pm:1834-1846`).
-pub(super) fn model_matches_eos_5d(model: &str) -> bool {
+///
+/// `pub(crate)` so the shared `Walker`'s Canon walk-time value rewrite
+/// (`crate::exif::mod`, #243 phase 2 step B3) selects the SAME `0x96`
+/// LIST arm — `SerialInfo` blob vs `InternalSerialNumber` strip — that
+/// `body::walk_canon_in_tiff` selects, keyed on the identical
+/// `$$self{Model}` predicate.
+pub(crate) fn model_matches_eos_5d(model: &str) -> bool {
   model.contains("EOS 5D")
 }
 

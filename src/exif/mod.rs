@@ -486,6 +486,61 @@ enum ResolvedConv {
   /// A GPS IFD leaf (`%GPS::Main` descriptor).
   #[cfg(feature = "gps")]
   Gps(&'static gps::GpsTag),
+  /// A Canon maker-note leaf (`%Canon::Main` descriptor). Carries the resolved
+  /// [`CanonTag`](makernotes::vendors::canon::tags::CanonTag) so the emit reapplies
+  /// its [`CanonPrintConv`](makernotes::vendors::canon::printconv::CanonPrintConv)
+  /// (the same render `parse_in_tiff` does at collection time, `canon/mod.rs`) and
+  /// reads its `Unknown=>1` flag. Step A of the Canon engine migration (#243 phase
+  /// 2): the shared `Walker` resolves Canon leaf names/convs here when
+  /// `active_table == Canon`, while production still routes Canon through
+  /// `parse_in_tiff` (so conformance is unchanged) — proven byte-identical by the
+  /// differential test in `mod.rs`.
+  Canon(&'static makernotes::vendors::canon::tags::CanonTag),
+}
+
+impl ResolvedConv {
+  /// The family-1 group OVERRIDE for a vendor maker-note leaf — `Some("Canon")`
+  /// for a [`ResolvedConv::Canon`] leaf, `None` for a core Exif/GPS leaf (which
+  /// keeps its kind-derived [`IfdName`] group). The bridge from the emit-time
+  /// `ResolvedConv` discriminant to [`vendor_group1_of`] (the table-keyed rule
+  /// the Walker applies during the walk).
+  #[inline]
+  fn vendor_group1(self) -> Option<&'static str> {
+    match self {
+      ResolvedConv::Exif(_) => vendor_group1_of(TableRef::Exif),
+      #[cfg(feature = "gps")]
+      ResolvedConv::Gps(_) => vendor_group1_of(TableRef::Gps),
+      ResolvedConv::Canon(_) => vendor_group1_of(TableRef::Canon),
+    }
+  }
+}
+
+/// The family-1 group a leaf walked under `table` emits in, OR `None` when the
+/// leaf keeps its kind-derived [`IfdName`] group (`IFD0`/`ExifIFD`/`GPS`/…).
+///
+/// ExifTool tags a maker-note leaf with the vendor's group1 (`Canon`/`Sony`/…),
+/// not the `IfdName` of the directory it physically lives in — `parse_in_tiff`
+/// pushes every Canon `VendorEmission` under `("MakerNotes","Canon")`
+/// (`ExifMeta::push_maker_note_tags`). A CORE IFD table
+/// ([`TableRef::is_core_ifd`]) returns `None`, so the emit keeps the existing
+/// kind-derived family-1 group BYTE-IDENTICALLY (the conformance suite proves
+/// this for Exif/GPS/Interop). Step A wires only `Canon`; the other vendor arms
+/// land with the Phase-2 per-vendor migrations.
+#[inline]
+const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
+  match table {
+    TableRef::Canon => Some("Canon"),
+    // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
+    // tables never reach the emit through this walker in Step A.
+    TableRef::Exif
+    | TableRef::Gps
+    | TableRef::Interop
+    | TableRef::Sony
+    | TableRef::Panasonic
+    | TableRef::Nikon
+    | TableRef::Apple
+    | TableRef::Samsung => None,
+  }
 }
 
 // ====================================================================// MakerNote capture — the deferred-vendor-parsing seam
@@ -511,7 +566,14 @@ enum MakerNoteValueConvDecode<'a> {
   None,
   /// Apple — `parse_with_print_conv(blob, order, ·)`.
   Apple { blob: &'a [u8], order: ByteOrder },
-  /// Canon — `parse_in_tiff(data, mn_offset, mn_len, order, ·, model, file_type)`.
+  /// Canon — re-drive the SHARED `Walker`'s Canon walk + emission capture
+  /// ([`canon_recompute_value_conv`]) with `print_conv = false` (#243 phase 2
+  /// step C). The Canon Main IFD walk is deterministic across the PrintConv flag
+  /// (it reads the same bytes through the same machinery; only the per-leaf
+  /// render differs), so the recomputed `-n` emissions are byte-identical to
+  /// the old eager `-n` cache — exactly the contract the other gated vendors
+  /// hold. Carries the parent-TIFF window + the `$$self{Model}` /
+  /// `$$self{FILE_TYPE}` the walk + capture read.
   Canon {
     data: &'a [u8],
     mn_offset: usize,
@@ -586,7 +648,7 @@ impl MakerNoteValueConvDecode<'_> {
   /// ValueConv too (same gate, PrintConv-independent).
   #[must_use]
   fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission> {
-    use makernotes::vendors::{apple, canon, dji, panasonic, sony};
+    use makernotes::vendors::{apple, dji, panasonic, sony};
     match self {
       MakerNoteValueConvDecode::None => std::vec::Vec::new(),
       MakerNoteValueConvDecode::Apple { blob, order } => {
@@ -599,18 +661,14 @@ impl MakerNoteValueConvDecode<'_> {
         order,
         model,
         file_type,
-      } => {
-        canon::parse_in_tiff(
-          data,
-          *mn_offset,
-          *mn_len,
-          *order,
-          false,
-          model.as_deref(),
-          file_type.as_deref(),
-        )
-        .1
-      }
+      } => canon_recompute_value_conv(
+        data,
+        *mn_offset,
+        *mn_len,
+        *order,
+        model.as_deref(),
+        file_type.as_deref(),
+      ),
       MakerNoteValueConvDecode::Sony {
         data,
         mn_offset,
@@ -1849,6 +1907,11 @@ fn parse_tiff_with_base_no_raf<'a>(
     // The walk starts on the Exif table; `walk_ifd_chain` re-affirms it and
     // `process_subdir` swaps it for a sub-IFD's table (GPS) and restores it.
     active_table: TableRef::Exif,
+    // The Canon DataMembers are meaningful only during a Canon sub-walk; the
+    // pre-scan sets them when `process_subdir(TableRef::Canon)` runs.
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
@@ -1978,6 +2041,10 @@ fn parse_bigtiff<'a>(
     // The BigTIFF walker keys its leaf lookup off `kind` directly
     // (`big_tag_known`), not `active_table`; this just satisfies the struct.
     active_table: TableRef::Exif,
+    // BigTIFF never dispatches the Canon sub-walk; these stay `None`.
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
   };
   w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
   debug_assert!(
@@ -2159,6 +2226,11 @@ fn parse_tiff_with_base_shared<'a>(
     warn_count: 0,
     // Starts on the Exif table; `walk_ifd_chain` re-affirms it.
     active_table: TableRef::Exif,
+    // The embedded PNG `eXIf` / CTMD path never dispatches the Canon sub-walk
+    // through `process_subdir(TableRef::Canon)`; these stay `None`.
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -2418,6 +2490,38 @@ struct Walker<'a, 'g> {
   /// duration of that recursion — so routing the lookups through it
   /// reproduces the prior `IfdKind`-keyed selection exactly.
   active_table: TableRef,
+  /// `$$self{FocalUnits}` Canon DataMember (`%Canon::CameraSettings` position
+  /// 25, `Canon.pm:2530-2537`) — captured by [`canon_prescan_datamembers`] from
+  /// the CameraSettings (0x01) entry BEFORE the Canon Main IFD's main walk, then
+  /// threaded into the `FocalLength` (0x02) sub-table's `ValueConv => '$val /
+  /// ($$self{FocalUnits} || 1)'` at emit time (#243 phase 2 step B2). `None`
+  /// outside a Canon sub-walk (every non-Canon directory and any Canon IFD with
+  /// no readable position-25 FocalUnits); reset to `None` by the pre-scan on
+  /// each `process_subdir(TableRef::Canon)` so a sibling/subsequent walk is
+  /// unaffected. WRITE-ONLY apart from the [`emit_canon_subtable`] FocalLength
+  /// read — it influences no other tag and is inert for the core Exif/GPS walk.
+  canon_focal_units: Option<u16>,
+  /// `$$self{LensType}` Canon DataMember (`%Canon::CameraSettings` position 22's
+  /// `RawConv => '$val ? $$self{LensType} = $val : undef'`, `Canon.pm:2503`) —
+  /// captured by [`canon_prescan_datamembers`] from the CameraSettings (0x01)
+  /// entry BEFORE the main walk, then threaded into the `FileInfo` (0x93)
+  /// sub-table's position-16 `MacroMagnification` `Condition` (`$$self{LensType}
+  /// == 124`, `Canon.pm:7002-7005`) at emit time (#243 phase 2 step B2). Same
+  /// lifecycle as [`canon_focal_units`](Self::canon_focal_units): `None` outside
+  /// a Canon sub-walk, reset by the pre-scan per Canon `process_subdir`.
+  canon_lens_type: Option<u16>,
+  /// The LAST readable `CanonFocalLength` (0x02) record's reserialized `$$valPt`
+  /// — captured by [`canon_prescan_datamembers`] (last-readable-wins, like the
+  /// two DataMembers above) so the `FocalLength` sub-table emit decodes EVERY
+  /// 0x02 entry from this ONE cached blob. This mirrors `parse_in_tiff`'s
+  /// pre-pass, which overwrites `focal_length_data` for each readable 0x02
+  /// (`canon/mod.rs:737`) and then renders every 0x02 SubDirectory from that
+  /// FINAL cached blob (`canon/mod.rs:883-889`) — so a Canon IFD with two
+  /// `CanonFocalLength` entries emits "last,last", NOT "first,last". Reset to
+  /// `None` by the pre-scan on each `process_subdir(TableRef::Canon)`; read ONLY
+  /// by [`emit_canon_subtable`]'s FocalLength arm. `None` when no readable 0x02
+  /// exists ⇒ that arm (and the oracle) emit nothing for FocalLength.
+  canon_focal_length_blob: Option<std::vec::Vec<u8>>,
 }
 
 impl Walker<'_, '_> {
@@ -3222,6 +3326,10 @@ impl Walker<'_, '_> {
           None
         }
       }
+      // `%Canon::Main` — Step A of the Canon engine migration (#243 phase 2). An
+      // unknown Canon tag yields `None` (the unknown-tag warning form), matching
+      // `parse_in_tiff`'s `tags::lookup(...).is_none()` skip.
+      TableRef::Canon => makernotes::vendors::canon::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -3415,15 +3523,29 @@ impl Walker<'_, '_> {
       // check). The validated end is reused for the IFD-overlap test below.
       let value_end = match off.checked_add(size) {
         Some(end) if end <= data.len() => end,
-        // No-RAF re-dispatch (the Canon CTMD `0x8769` ExifIFD hop): bundled
-        // takes the no-RAF `else` branch (`Exif.pm:6616-6670`) — `Bad offset
-        // for $dir $tagStr` (`Exif.pm:6660`) + `$bad = 1` (the value is
-        // dropped) + CONTINUE the loop. `$tagStr` is the name-if-known form
-        // (`Exif.pm:6634`), NOT the RAF path's `ID 0x…` text. NON-minor
-        // (`$inMakerNotes = 0` for `Exif::Main`). Takes precedence over the
-        // suspect test below (the read happens first, `Exif.pm:6660` before
-        // `:6672`).
-        _ if self.no_raf => {
+        // Two cases take the no-RAF `else` branch (`Exif.pm:6616-6670`) —
+        // `Bad offset for $dir $tagStr` (`Exif.pm:6660`) + `$bad = 1` (the
+        // value is dropped) + CONTINUE the loop. `$tagStr` is the name-if-known
+        // form (`Exif.pm:6634`), NOT the RAF path's `ID 0x…` text. Takes
+        // precedence over the suspect test below (the read happens first,
+        // `Exif.pm:6660` before `:6672`).
+        //   1. `self.no_raf` — the Canon CTMD `0x8769` ExifIFD hop (a buffer
+        //      with no backing RAF), where ExifTool likewise has no `$raf`.
+        //   2. `!active_table.is_core_ifd()` — a VENDOR maker-note walk
+        //      (`%Canon::Main` via `process_subdir(.., TableRef::Canon, ..)`,
+        //      #243 phase 2 step C). A maker-note directory IS `$inMakerNotes`,
+        //      so even on the RAF-backed production path (`no_raf == false`)
+        //      the abort below does NOT fire: `Exif.pm:6602` is
+        //      `return 0 unless $inMakerNotes …`, i.e. inMakerNotes CONTINUES
+        //      with `$bad = 1` rather than aborting. Routing this case to the
+        //      same `Bad offset` + `warn_counted` + `Skip` path matches the
+        //      retired `canon::body::classify_canon_entry`
+        //      (`CanonEntryClass::BadOffset` → "Bad offset" warning + CONTINUE)
+        //      so ONE malformed Canon entry no longer suppresses every later
+        //      valid Canon tag. Core walks (Exif/GPS/Interop) keep aborting
+        //      (`is_core_ifd()` is `true`, none are inMakerNotes) — see the RAF
+        //      arm's precedence note for why their exception never applies.
+        _ if self.no_raf || !self.active_table.is_core_ifd() => {
           let warning = match Self::lookup_name_in(self.active_table, tag_id) {
             Some(name) => std::format!("Bad offset for {dir} {name}"),
             None => std::format!("Bad offset for {dir} tag 0x{tag_id:04x}"),
@@ -3491,7 +3613,27 @@ impl Walker<'_, '_> {
     // Only IFD0 carries ExifIFD/GPS pointers; only ExifIFD carries Interop
     // + MakerNote (faithful: ExifTool resolves these by tag table + DirName,
     // Exif.pm:2006/2130/2496/2720).
-    if let Some(sub) = sub_dir_for(tag_id, kind) {
+    //
+    // These pointer IDs (0x8769/0x8825/0xa005/0x927c) are SubDirectory entries
+    // ONLY in the CORE `%Exif::Main` table. The shared `Walker` reaches this
+    // body with the same `kind` (`IfdKind::ExifIfd`) for a vendor maker-note
+    // walk (`%Canon::Main` is dispatched as `process_subdir(.., ExifIfd,
+    // TableRef::Canon, ..)`, #243 phase 2 step C), where those IDs are ordinary
+    // VENDOR leaves — e.g. `%Canon::Main` has no 0xa005, so `Canon.pm` (via
+    // `tags::lookup`) treats 0xa005 as an unknown Canon tag, NEVER as the
+    // Interop sub-IFD. Gating on `active_table.is_core_ifd()` keeps the core
+    // IFD-chain seam byte-identical (it is `true` for Exif/GPS/Interop) while
+    // routing a vendor table's pointer-ID-colliding tag PAST this block to the
+    // vendor leaf / sub-table emit (`ResolvedConv::Canon`) or the unknown-skip
+    // — exactly as the retired `canon::parse_in_tiff` did. Without the gate a
+    // crafted Canon 0xa005/0x8769/0x927c would recurse into a CORE sub-IFD that
+    // pushes `ResolvedConv::Exif` entries; those scalar entries then hit the
+    // `VendorEmissionSink` capture path, whose core `write_*` writers are not a
+    // Canon emission — a byte-identity break (and, before the sink was made
+    // non-panicking below, a malformed-input DoS).
+    if self.active_table.is_core_ifd()
+      && let Some(sub) = sub_dir_for(tag_id, kind)
+    {
       // `if (($$tagInfo{IsOffset} or $$tagInfo{SubIFD}) and not
       // $intFormat{$formatStr}) { Warn('Wrong format ...'); ... next unless
       // $verbose }` (Exif.pm:6747-6754). A SubIFD/offset pointer encoded with
@@ -3525,6 +3667,31 @@ impl Walker<'_, '_> {
       return Step::Keep;
     }
 
+    // ---- Canon LIST / Format-override specials (`0x28` / `0x96`) ---------
+    // `%Canon::Main` carries two leaf tags whose VALUE bytes are rewritten at
+    // walk time — `Format => 'undef'` (0x28 ImageUniqueID) and the model-
+    // conditional `0x96` LIST (`Canon.pm:1726-1735`/`:1834-1846`) — reproducing
+    // exactly what [`body::walk_canon_in_tiff`](makernotes::vendors::canon::walk_canon_in_tiff)
+    // (`body.rs:395-468`) does BEFORE `parse_in_tiff` emits them. The rewrite
+    // bypasses the `Format` override / large-array guards / numeric `read_value`
+    // path below (the `undef`/`string` view is the faithful one — Canon's table
+    // `Format`s override the on-disk numeric decode; a 0x28's Exif-table
+    // `format_override` is irrelevant here), so it is taken FIRST, only for those
+    // two tags and only under `%Canon::Main`. `read_len == size` is the on-disk
+    // `format.byte_size() * count` (the body walker's `total_size`), and
+    // `value_offset` is the same out-of-line / inline value pointer — so the
+    // window read here is byte-identical to the body walker's. A `None` means
+    // the entry is NOT one of these specials (or its 0x96 window is out of
+    // bounds, matching the body walker's `get(..).is_some()` rewrite gate) — fall
+    // through to the normal leaf decode.
+    if self.active_table == TableRef::Canon
+      && let Some(raw) = self.canon_special_leaf_value(tag_id, format, value_offset, read_len)
+    {
+      self.emit(kind, tag_id, raw);
+      // The special-case value was decoded + emitted (FoundTag) — [`Step::Keep`].
+      return Step::Keep;
+    }
+
     // ---- Tag-table READ-side `Format` override --------------------------
     // `my $readFormat = $$tagInfo{Format}; ... if ($readFormat) { $formatStr
     // = $readFormat; ... $format = $newNum; ... $count = int($size /
@@ -3546,8 +3713,8 @@ impl Walker<'_, '_> {
     // tags 0x001b/0x001c — `Writable => 'undef'` but NO `Format`, GPS.pm:296/
     // 304 — correctly NUL-trimmed, exactly as bundled does.
     // Resolved against the active table (`Exif.pm:6729-6744` reads the
-    // override off the directory's `$tagTablePtr`). `Interop`/vendor arms
-    // (unreachable in Phase 1) share the `%Exif::Main` override table.
+    // override off the directory's `$tagTablePtr`). `Interop` inherits the
+    // `%Exif::Main` override table; VENDOR tables (Canon) do NOT (see the `_` arm).
     let table_override = match self.active_table {
       TableRef::Gps => {
         #[cfg(feature = "gps")]
@@ -3563,7 +3730,18 @@ impl Walker<'_, '_> {
           None
         }
       }
-      _ => tables::format_override(tag_id),
+      TableRef::Exif | TableRef::Interop => tables::format_override(tag_id),
+      // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
+      // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
+      // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
+      // `%Canon::Main` carries no such directive. Without this, a crafted numeric
+      // Canon 0x9286 would be coerced to `undef`, BYPASS the excessive-count guard
+      // (which exempts `undef`), and be read into a large allocation before `emit`
+      // drops the unknown tag — a divergence from `parse_in_tiff` (which applies NO
+      // EXIF override) AND an OOM vector (#243 phase 2 R11). The Canon table's OWN
+      // format rewrites (0x28/0x96) run EARLIER via `canon_special_leaf_value`, so
+      // `None` here is complete for Canon.
+      _ => None,
     };
     let (format, count) = if let Some(over) = table_override {
       let new_elem = over.byte_size();
@@ -3695,6 +3873,120 @@ impl Walker<'_, '_> {
     Step::Keep
   }
 
+  /// The Canon `%Main` walk-time value rewrite for the two special leaves
+  /// `0x28` (`ImageUniqueID`, `Format => 'undef'`) and `0x96` (the model-
+  /// conditional `SerialInfo` / `InternalSerialNumber` LIST) — the
+  /// shared-`Walker` reproduction of
+  /// [`body::walk_canon_in_tiff`](makernotes::vendors::canon::walk_canon_in_tiff)'s
+  /// per-entry value rewrites (`body.rs:395-468`), #243 phase 2 step B3.
+  ///
+  /// Returns `Some(raw)` with the rewritten value for those two tags (the value
+  /// the [`emit`](Self::emit) → `ResolvedConv::Canon` arm then renders), or
+  /// `None` when the tag is NOT one of the two specials — in which case
+  /// [`walk_entry`](Self::walk_entry) falls through to the normal `Format`-
+  /// override / large-array / numeric `read_value` leaf path (the path Steps
+  /// A/B1/B2 use for every other Canon tag, unchanged).
+  ///
+  /// `value_offset` / `read_len` are the already-resolved (out-of-line OR
+  /// inline) value pointer and on-disk byte size (`read_len == count *
+  /// format.byte_size()`, the body walker's `total_size`), so the window read
+  /// here is byte-for-byte the body walker's `value_data_offset ..
+  /// value_data_offset + total_size`.
+  ///
+  /// ## `0x28` ImageUniqueID — `Format => 'undef'` (`Canon.pm:1726-1735`)
+  ///
+  /// ExifTool's `ProcessExif` overrides the entry's declared numeric format
+  /// with `undef` and reads the ORIGINAL on-disk `$size` bytes VERBATIM
+  /// (`int8u[16]` / `int16u[8]` / `undef[16]` / `float[4]` … all read the SAME
+  /// literal bytes — `body.rs:369-402`). Capture that raw-byte view as
+  /// [`RawValue::Bytes`], with `get(..).unwrap_or(&[])` so a truncated/oversized
+  /// shape yields an empty (`undef`) value — never an OOB read — and a count-0
+  /// entry yields empty bytes (oracle: `undef[0]` ⇒ `ImageUniqueID = ""`).
+  ///
+  /// ## `0x96` `SerialInfo` / `InternalSerialNumber` LIST (`Canon.pm:1834-1846`)
+  ///
+  /// Using the on-disk window (only when it is in bounds — matching the body
+  /// walker's `get(..).is_some()` rewrite gate; an out-of-bounds window returns
+  /// `None`, falling through to the normal numeric decode just as the body
+  /// walker leaves `raw` untouched):
+  /// - FIRST arm — `$$self{Model} =~ /EOS 5D/`
+  ///   ([`model_matches_eos_5d`](makernotes::vendors::canon::printconv::model_matches_eos_5d)):
+  ///   the `SerialInfo` SubDirectory blob, kept VERBATIM as [`RawValue::Bytes`]
+  ///   (NO NUL-trim, NO `0xff` strip — those are second-arm `string` semantics).
+  /// - SECOND arm — `string`-format `InternalSerialNumber` (`Canon.pm:1841-
+  ///   1845`, `$val=~s/\xff+$//`): NUL-trim at the first NUL (the `string`
+  ///   `ReadValue` decode), then strip one-or-more trailing `0xff` bytes, BOTH at
+  ///   the RAW-byte level (BEFORE the lossy UTF-8 decode could turn a trailing
+  ///   `0xff` into U+FFFD and defeat the strip), then surface as
+  ///   [`RawValue::Text`]. Only a `string`-format 0x96 is rewritten; any other
+  ///   on-disk format on a non-5D body returns `None` (normal decode), exactly
+  ///   like the body walker's `matches!(format, Format::Ascii)` guard.
+  ///
+  /// The 5D arm keys on [`captured_model`](Self::captured_model) (IFD0's
+  /// `$$self{Model}`, the SAME field the body walker's `model` parameter
+  /// carries), so the arm selection is identical.
+  #[cfg_attr(not(feature = "alloc"), allow(dead_code))]
+  fn canon_special_leaf_value(
+    &self,
+    tag_id: u16,
+    format: Format,
+    value_offset: usize,
+    read_len: usize,
+  ) -> Option<RawValue> {
+    let data = self.data;
+    if tag_id == 0x28 {
+      // `Format => 'undef'`: the ORIGINAL on-disk bytes, read verbatim.
+      // `value_offset + read_len` is the body walker's `value_data_offset +
+      // format.byte_size() * count`; `get(..).unwrap_or(&[])` keeps a
+      // truncated/oversized/count-0 shape an empty `undef`, never an OOB read.
+      let window = value_offset
+        .checked_add(read_len)
+        .and_then(|end| data.get(value_offset..end))
+        .unwrap_or(&[]);
+      return Some(RawValue::Bytes(window.to_vec()));
+    }
+    if tag_id == 0x96 {
+      use makernotes::vendors::canon::printconv;
+      // The on-disk window — only rewrite when it is in bounds (the body
+      // walker's `if let Some(window) = tiff_data.get(..)` gate); an out-of-bounds
+      // window leaves the value to the normal numeric decode (`None`).
+      let window = value_offset
+        .checked_add(read_len)
+        .and_then(|end| data.get(value_offset..end))?;
+      if self
+        .captured_model
+        .as_deref()
+        .is_some_and(printconv::model_matches_eos_5d)
+      {
+        // FIRST arm — `SerialInfo` SubDirectory blob: on-disk bytes verbatim.
+        return Some(RawValue::Bytes(window.to_vec()));
+      }
+      if matches!(format, Format::Ascii) {
+        // SECOND arm — `InternalSerialNumber` (`$val=~s/\xff+$//`). NUL-trim at
+        // the first NUL (`s/\0.*//s`), then strip trailing `0xff`, BOTH at the
+        // raw-byte level, then decode lossily for display while retaining the
+        // post-RawConv bytes (`RawValue::Text { raw }`).
+        let nul_trimmed = match window.iter().position(|&b| b == 0) {
+          Some(nul) => window.get(..nul).unwrap_or(window),
+          None => window,
+        };
+        let end = nul_trimmed
+          .iter()
+          .rposition(|&b| b != 0xff)
+          .map_or(0, |i| i + 1);
+        let stripped = nul_trimmed.get(..end).unwrap_or(nul_trimmed);
+        return Some(RawValue::Text {
+          text: std::string::String::from_utf8_lossy(stripped).into_owned(),
+          raw: stripped.into(),
+        });
+      }
+      // A non-5D body with a non-`string` 0x96 — the body walker leaves `raw`
+      // as the numeric decode; fall through to the normal leaf path.
+      return None;
+    }
+    None
+  }
+
   /// THE one sub-directory entry point — the faithful
   /// `ProcessExif`-on-a-`SubDirectory` path (`Exif.pm:6919-7102`), parameterized
   /// by the `SubDirectory` directive set the engine unification models
@@ -3809,15 +4101,279 @@ impl Walker<'_, '_> {
       let _ = makernotes::fixbase::fix_base(&input);
     }
 
+    // ---- Pre-walk hook 4: the Canon `%CameraSettings` DataMember pre-pass
+    // (#243 phase 2 step B2). ExifTool resolves a `ProcessBinaryData` table's
+    // `DATAMEMBER` positions BEFORE the main walk, and `Canon::CameraSettings`
+    // (`Canon.pm:2219` `DATAMEMBER => [ 22, 25 ]`) sets `$$self{FocalUnits}`
+    // (pos 25) and `$$self{LensType}` (pos 22) — cross-entry inputs the
+    // `FocalLength` (0x02) and `FileInfo` (0x93) sub-tables read. The Canon Main
+    // IFD walk reaches those entries in tag order INDEPENDENT of CameraSettings
+    // (0x01), so — exactly like `canon::parse_in_tiff`'s pre-pass
+    // (`canon/mod.rs:718-739`) — capture them up front, here, before
+    // `walk_one_ifd`, so the dependency holds regardless of IFD entry order.
+    // `process` is `ProcessProc::Canon` for this table (the test's sole caller);
+    // the pre-scan reads only the 0x01 entry and EMITS NOTHING. Re-scan per
+    // Canon directory (it resets both members first), so a sibling/subsequent
+    // walk is unaffected.
+    if table == TableRef::Canon {
+      self.canon_prescan_datamembers(ifd_start, resolved_order);
+    }
+
     // ---- The walk: SAME `walk_one_ifd` machinery IFD0/ExifIFD/GPS use, under
-    // the child table + resolved order, with both restored on return.
+    // the child table + resolved order, with all three restored on return.
+    //
+    // `$warnCount` is a `my` local PER `ProcessExif` call (`Exif.pm:6453`): a
+    // sub-directory's warning count is independent of its parent's, and the
+    // parent resumes its own loop with its own counter unchanged when the
+    // sub-call returns. The shared `Walker` holds `warn_count` as ONE field that
+    // [`walk_one_ifd_body`] re-zeroes per directory — so the child walk starts at
+    // 0 (faithful), but on return it has CLOBBERED the parent's accumulated count
+    // (the parent's `walk_entries` loop is suspended mid-iteration around this
+    // sub-directory dispatch). Without the restore, the parent's `> 10` abort
+    // (`Exif.pm:6455`) would test the CHILD's count: a maker-note / sub-IFD with
+    // many bad entries could abort the PARENT directory (dropping its later
+    // tags), or a clean child could reset a parent that was near the cap. Save
+    // the caller's count before descending and restore it after, so the field
+    // behaves like the per-call `my` local across the recursion boundary. (Core
+    // sub-IFD recursions — GPS/Interop/ExifIFD via `dispatch_subdir` — share this
+    // entry point, so they get the same per-directory scoping; byte-identical for
+    // every walk whose sub-directory does not pile up > 10 warnings before the
+    // parent's later entries, which the conformance suite confirms is all of them.)
     let saved_table = self.active_table;
     let saved_order = self.order;
+    let saved_warn_count = self.warn_count;
     self.active_table = table;
     self.order = resolved_order;
     let _ = self.walk_one_ifd(ifd_start, kind);
+    self.warn_count = saved_warn_count;
     self.order = saved_order;
     self.active_table = saved_table;
+  }
+
+  /// The Canon `%CameraSettings` DataMember pre-pass (#243 phase 2 step B2) —
+  /// the emit-path reproduction of `canon::parse_in_tiff`'s sub-pass
+  /// (`canon/mod.rs:717-739`). Walks the Canon Main IFD at `ifd_start` with the
+  /// SAME entry classification the main walk uses, and for EVERY readable tag
+  /// **0x01** (`CanonCameraSettings`) populates the two Canon DataMembers from
+  /// its decoded value — `$$self{FocalUnits}` via
+  /// [`read_focal_units`](makernotes::vendors::canon::read_focal_units)
+  /// (position 25) and `$$self{LensType}` via
+  /// [`camera_settings::parse_with_lens_id_capture`](makernotes::vendors::canon::camera_settings::parse_with_lens_id_capture)'s
+  /// lens capture (position 22, `Canon.pm:2503`).
+  ///
+  /// ## Byte-identity argument
+  ///
+  /// The DataMembers must equal what `canon::parse_in_tiff` computes — that
+  /// sub-pass loops over the `Read`-classified `CanonEntry`s
+  /// [`walk_canon_in_tiff`](makernotes::vendors::canon::walk_canon_in_tiff)
+  /// produced and, for each CameraSettings, OVERWRITES `focal_units`/`lens_type`
+  /// — i.e. the LAST readable 0x01 in IFD order wins (a malformed/suspicious
+  /// first 0x01 contributes no entry, so a valid later 0x01 still sets them).
+  /// This pre-scan therefore drives the SHARED [`classify_canon_directory`] +
+  /// [`classify_canon_entry`] predicates `walk_canon_in_tiff` (and, by the same
+  /// `Exif.pm` line refs, the shared Walker's own [`walk_entry`]) use — same
+  /// directory shape, same `> 10` warn-count abort, same index-0 bad-format
+  /// directory abort, same skip set (bad-format / oversized / bad-offset /
+  /// suspicious) — and decodes each surviving 0x01 with the identical ON-DISK
+  /// `read_value` (Canon's `%Main` has no `Format` override on 0x01, and the
+  /// `read_len = data.len() - value_offset` bound matches `walk_canon_in_tiff`).
+  /// So the members it captures equal the oracle's for every input.
+  ///
+  /// EMITS NOTHING — it only populates [`canon_focal_units`](Self::canon_focal_units)
+  /// and [`canon_lens_type`](Self::canon_lens_type), which it RESETS to `None`
+  /// first so a re-scan (a second Canon directory, or a Canon walk after some
+  /// other directory left them set) never carries a stale member.
+  #[cfg_attr(not(feature = "alloc"), allow(dead_code))]
+  fn canon_prescan_datamembers(&mut self, ifd_start: usize, order: ByteOrder) {
+    use makernotes::vendors::canon::body::{
+      CanonDirShape, CanonEntryClass, classify_canon_directory, classify_canon_entry,
+    };
+    use makernotes::vendors::canon::{camera_settings, read_focal_units};
+    // Reset first: the members are only meaningful for THIS Canon walk.
+    self.canon_focal_units = None;
+    self.canon_lens_type = None;
+    self.canon_focal_length_blob = None;
+    let data = self.data;
+    // Directory shape — the SHARED `ProcessExif` gate (`Exif.pm:6343-6400`) the
+    // emission walk uses. A degenerate/overrunning/`1`/`3`-byte-tail directory
+    // walks no entries (so both members stay `None`); only the `Walk` arm walks.
+    let CanonDirShape::Walk {
+      num_entries,
+      dir_end,
+    } = classify_canon_directory(data, ifd_start, data.len(), order)
+    else {
+      return;
+    };
+    let entries_start = ifd_start + 2;
+    // `$warnCount` — the SAME per-entry abort cap the emission walk honors
+    // (`Exif.pm:6455-6456`): once it exceeds ten, ExifTool `return 0`s, so a 0x01
+    // AFTER a >10-warning run is never reached. Counting matches the emission
+    // walk's `CanonEntryClass::bumps_warn_count`.
+    let mut warn_count: u32 = 0;
+    for index in 0..num_entries {
+      // `if ($warnCount > 10) { … return 0 }` — abort before reading any further
+      // entry (the same point `walk_canon_in_tiff` / `walk_entries` stop).
+      if warn_count > 10 {
+        break;
+      }
+      let Some(entry) = entries_start.checked_add(12usize.wrapping_mul(index)) else {
+        break;
+      };
+      // The `Walk` shape proved `dir_end <= data.len()`, so every `entry + 12` is
+      // in range. Read the tag id; classify EVERY entry (so warn_count + the
+      // index-0 abort track the emission walk) but only decode the 0x01 ones.
+      let Some(tag_id) = get_u16(data, entry, order) else {
+        continue;
+      };
+      let class = classify_canon_entry(data, entry, index, ifd_start, dir_end, data.len(), order);
+      if class.bumps_warn_count() {
+        warn_count = warn_count.saturating_add(1);
+      }
+      let value_offset = match class {
+        CanonEntryClass::Read { value_offset } => value_offset,
+        // `index == 0` bad/zero format ⇒ `return 0` (abort the whole directory,
+        // no entries) — matching `walk_canon_in_tiff`'s `break`.
+        CanonEntryClass::BadFormat { abort: true, .. }
+        | CanonEntryClass::SilentBadFormat { abort: true } => break,
+        // Every other bad class is a single-entry skip.
+        _ => continue,
+      };
+      // Only the 0x01 (CameraSettings DataMembers) and 0x02 (the FocalLength
+      // `$$valPt` cache) pre-pass entries are decoded here — every other tag is
+      // surfaced by the main walk, not the pre-scan. (Both are captured in the
+      // SAME pass, matching `parse_in_tiff`'s single sub-pass loop,
+      // `canon/mod.rs:719-739`.)
+      if tag_id != 0x01 && tag_id != 0x02 {
+        continue;
+      }
+      let Some(format_code) = get_u16(data, entry + 2, order) else {
+        continue;
+      };
+      let Some(count) = get_u32(data, entry + 4, order).map(|c| c as usize) else {
+        continue;
+      };
+      let format = Format::from_code(format_code);
+      // `if ($count > 100000 and $formatStr !~ /^(undef|string|binary)$/) { next }`
+      // (`Exif.pm:6760-6770`) — the SAME excessive-count guard the emission walk
+      // applies in `walk_entry`, PREDICATE-FOR-PREDICATE. The pre-scan is a SECOND
+      // decode of the 0x01/0x02 entries, so it MUST skip a `count > 100000`
+      // CameraSettings/FocalLength the emission walk skips (#243 phase 2 R9) — but
+      // ONLY when the guard does, i.e. NOT for `undef`/`string`. The guard reads
+      // the ON-DISK `format` (NOT the table format), so a crafted 0x01/0x02
+      // mis-written as `undef[100001]` is DECODED by the emission walk (the format
+      // exemption) and must be decoded here too — the pre-scan's blob must match
+      // what the emit walk reads (#243 phase 2 R10 — an unconditional skip dropped
+      // the FocalLength blob / DataMembers the emission walk still sets).
+      if !matches!(format, Format::Undef | Format::Ascii) && count > 100_000 {
+        continue;
+      }
+      // `read_len` = the on-disk byte size `$count * $formatSize[$format]`
+      // (`Exif.pm:6502` `my $size = $count * $formatSize[$format]`) — the SAME
+      // COUNT-based size the emission walk (`walk_entry`) passes to `read_value`,
+      // NOT an EOF-bound read. This is the critical consistency: the pre-scan is a
+      // SECOND decode of the 0x01/0x02 entries (the emission walk decodes them
+      // AGAIN), so it MUST use the emission walk's value-decode policy. A count-0
+      // 0x01/0x02 therefore decodes EMPTY here (`Exif.pm:6285-6288` `unless
+      // ($count) { $count = int($size / $len) }` with `$size == 0` ⇒ `undef`),
+      // setting NO DataMember — exactly as the emission walk emits no CameraSettings
+      // positions for it. An EOF-bound bound would instead re-derive a bogus count
+      // from the trailing buffer (`int($size / $len)` with `$size = EOF`) and set
+      // `focal_units` / `lens_type` from bytes the emission walk never reads — a
+      // divergence (#243 phase 2 R6). `read_value` clamps its window to
+      // `data.len()` internally, so the count-based size can never read OOB.
+      let read_len = count.saturating_mul(format.byte_size());
+      // Decode with the ON-DISK format (no Canon `Format` override on 0x01/0x02)
+      // — byte-identical to `walk_canon_in_tiff`'s `read_value` for this entry. A
+      // decode failure `continue`s (the oracle drops such an entry before its
+      // sub-pass, `body.rs:405-408` — so a later valid one can still win), NOT a
+      // `return` that would abandon a subsequent readable record.
+      let Some(raw) = read_value(data, value_offset, format, count, read_len, order) else {
+        continue;
+      };
+      if tag_id == 0x02 {
+        // `CanonFocalLength` (0x02): cache the reserialized `$$valPt`. LAST
+        // readable 0x02 WINS — `parse_in_tiff`'s sub-pass overwrites
+        // `focal_length_data` for EVERY readable 0x02 (`canon/mod.rs:735-738`,
+        // no break), and its main pass then renders EVERY 0x02 SubDirectory from
+        // that FINAL cached blob (`canon/mod.rs:883-889`). The emit reads
+        // `self.canon_focal_length_blob` for every 0x02, so two 0x02 entries
+        // emit "last,last" (the divergence this closes). The cached blob is the
+        // SAME `reserialize_int_array` view `emit_canon_subtable` builds from a
+        // walked entry's `RawValue`, since both decode the SAME bytes via the
+        // SAME `read_value`.
+        self.canon_focal_length_blob = Some(makernotes::vendors::canon::reserialize_int_array(
+          &raw, order,
+        ));
+        continue;
+      }
+      // `read_focal_units` reads position 25 (FocalUnits); the lens capture
+      // reads position 22's `RawConv` DataMember. Both operate on the SAME
+      // decoded value the production sub-pass uses (`canon/mod.rs:723-733`).
+      //
+      // LAST-WINS, NOT first-wins: `parse_in_tiff`'s sub-pass overwrites
+      // `focal_units`/`lens_type` for EACH CameraSettings it walks (it never
+      // breaks after the first), so the LAST readable 0x01 in IFD order
+      // determines both members. Do NOT `return` here — let a subsequent 0x01
+      // overwrite. (Lens capture writes `lens_type` only for a truthy position-22
+      // word — `Canon.pm:2503` `$val ? … : undef` — so a valid 0x01 with a 0
+      // lens word leaves the prior value; matching the oracle, whose RawConv is
+      // likewise a no-op for a 0 word.)
+      self.canon_focal_units = read_focal_units(&raw, order);
+      let blob = makernotes::vendors::canon::reserialize_int_array(&raw, order);
+      let mut lens_type: Option<u16> = self.canon_lens_type;
+      // PrintConv mode is irrelevant to the lens-id CAPTURE (the side channel is
+      // written from the raw word, not the rendered string); pass `false` since
+      // the returned position vector is discarded here.
+      let _ = camera_settings::parse_with_lens_id_capture(&blob, order, false, &mut lens_type);
+      self.canon_lens_type = lens_type;
+    }
+  }
+
+  /// CAPTURE the Canon Main IFD's walked leaves into a `Vec<VendorEmission>` —
+  /// the emit-time reproduction of `canon::parse_in_tiff`'s emission stream
+  /// (#243 phase 2 step C). The Canon walk
+  /// ([`process_subdir`](Self::process_subdir) under `TableRef::Canon`) appended
+  /// each Canon leaf to `self.entries` as a [`ResolvedConv::Canon`] entry; this
+  /// re-runs [`emit_entry`] over the contiguous run `self.entries[canon_start..]`
+  /// with a [`VendorEmissionSink`], threading the SAME render context the walk
+  /// resolved — `self.captured_model` (`$$self{Model}`), `self.file_type`
+  /// (`$$self{FILE_TYPE}`), and the pre-scanned `%CameraSettings` DataMembers
+  /// (`self.canon_focal_units` / `self.canon_lens_type`). The result is the
+  /// vendor-emission `Vec` every other vendor's body parser produces, so the
+  /// dispatch can store it in [`MakerNote::cached_emissions_print_conv`] (PrintConv)
+  /// or hand it back from the `-n` recompute (ValueConv), driven by `print_conv`.
+  ///
+  /// Borrows `self` immutably for the entry slice + context but builds an owned
+  /// `Vec` (the sink pushes into a fresh buffer), so it does NOT mutate the walk
+  /// state — the caller decides whether to TRUNCATE `self.entries` back to
+  /// `canon_start` afterward (the dispatch does, so the Canon leaves emit via the
+  /// cached emissions, NOT inline in `push_exif_tags`).
+  #[must_use]
+  fn capture_canon_emissions(
+    &self,
+    canon_start: usize,
+    print_conv: bool,
+  ) -> std::vec::Vec<makernotes::VendorEmission> {
+    let mut emissions = std::vec::Vec::new();
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in self.entries.get(canon_start..).unwrap_or(&[]) {
+      // Only `ResolvedConv::Canon` entries live in this run; `emit_entry` routes
+      // them through the Canon `PrintConv` / sub-table / special renderers, all
+      // of which write through `write_vendor_value` into the capture sink. The
+      // emit is infallible (`Infallible`).
+      let Ok(()) = emit_entry(
+        entry,
+        self.order,
+        print_conv,
+        self.captured_model.as_deref(),
+        self.file_type.as_deref(),
+        self.canon_focal_units,
+        self.canon_lens_type,
+        self.canon_focal_length_blob.as_deref(),
+        &mut sink,
+      );
+    }
+    emissions
   }
 
   /// Dispatch a SubDirectory pointer tag.
@@ -3966,26 +4522,55 @@ impl Walker<'_, '_> {
                 };
               }
               makernotes::Vendor::Canon => {
-                // Canon: parse using the parent TIFF context so
-                // out-of-line offsets resolve correctly. Thread the container
-                // `$$self{FILE_TYPE}` for the `Canon::ShotInfo` pos-22
-                // CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
-                let mn_offset = value_offset;
-                let mn_len = read_len;
-                let model = self.captured_model.as_deref();
-                let file_type = self.file_type.as_deref();
-                let (typed_pc, emi_pc) = makernotes::vendors::canon::parse_in_tiff(
-                  self.data, mn_offset, mn_len, self.order, true, model, file_type,
+                // Canon: walk the Canon Main IFD in a FRESH, ISOLATED `Walker`
+                // ([`canon_makernote_isolated`]) — NOT on `self` — then capture
+                // its emissions into the cached-emission buffer exactly like the
+                // other vendors (#243 phase 2 step C, structural isolation). The
+                // isolated walk builds its own `Walker` over `self.data` (base 0,
+                // the Canon Main IFD at the MakerNote value offset), runs the
+                // `%CameraSettings` DataMember pre-scan, walks the IFD under
+                // `TableRef::Canon`, and DISCARDS its `warnings` / `warn_count` /
+                // `active_ifd_offsets` / file-level RawConv-tap state — so a
+                // malformed Canon entry cannot leak a core `ExifTool:Warning`,
+                // abort the parent ExifIFD's warn-count, or suppress the walk via
+                // the parent's ancestor cycle guard. Canon inherits the parent
+                // order and (effectively) base — Canon's `%Main` has no
+                // `IsOffset`/`SubIFD` tag, so out-of-line value offsets resolve
+                // TIFF-relative against `self.data` regardless of base — exactly as
+                // the retired `canon::parse_in_tiff` did.
+                //
+                // `print_conv = true`: the eager single-mode decode yields the
+                // cached PrintConv (`-j`) emissions AND the typed `MakerNotesCanon`
+                // slot. The `-n` (ValueConv) emissions are recomputed on demand via
+                // `value_conv_decode` below, through the SAME isolated helper with
+                // `print_conv = false` — so both modes share one walk path.
+                let (emissions, typed) = canon_makernote_isolated(
+                  self.data,
+                  value_offset,
+                  read_len,
+                  self.order,
+                  self.captured_model.as_deref(),
+                  self.file_type.as_deref(),
+                  true,
                 );
-                meta.set_canon(typed_pc);
-                cached_pc = emi_pc;
+                cached_pc = emissions;
+                // `print_conv = true` always returns `Some(typed)`; the production
+                // dispatch needs the typed surface.
+                if let Some(typed) = typed {
+                  meta.set_canon(typed);
+                }
+                // The `-n` (ValueConv) emissions are recomputed ON DEMAND by
+                // re-driving the SAME isolated walk + capture with
+                // `print_conv = false` ([`canon_recompute_value_conv`] →
+                // [`canon_makernote_isolated`]) — the P0 single-mode-decode
+                // contract every gated vendor holds.
                 value_conv_decode = MakerNoteValueConvDecode::Canon {
                   data: self.data,
-                  mn_offset,
-                  mn_len,
+                  mn_offset: value_offset,
+                  mn_len: read_len,
                   order: self.order,
-                  model: model.map(smol_str::SmolStr::new),
-                  file_type: file_type.map(smol_str::SmolStr::new),
+                  model: self.captured_model.as_deref().map(smol_str::SmolStr::new),
+                  file_type: self.file_type.as_deref().map(smol_str::SmolStr::new),
                 };
               }
               // Sony: dispatcher gives us body_offset (12 for the
@@ -4271,24 +4856,41 @@ impl Walker<'_, '_> {
     // decoded value is the first element of an `RawValue::U64`. Read it via
     // `first_uint` and ignore non-integer shapes (a malformed encoding
     // matches bundled's silent `next` on the `Format::None` arm).
-    if tag_id == tables::TAG_SUBFILE_TYPE
-      && let Some(v) = first_uint(&raw)
-    {
-      // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
-      if v == (v & 0x02) {
-        self.page_count = self.page_count.saturating_add(1);
-        if v == 2 || self.page_count > 1 {
-          self.multi_page = true;
+    //
+    // TABLE-SCOPED to the CORE Exif/Interop directories (like the `DNGVersion`
+    // tap below): `SubfileType`/`OldSubfileType`'s RawConvs live in `%Exif::Main`
+    // (Exif.pm:452/469), which the walker applies to every IFD resolved against
+    // it (IFD0 / ExifIFD / SubIFD / trailing / Interop — `active_table ∈ {Exif,
+    // Interop}`). The GPS IFD (`%GPS::Main`) and a VENDOR maker-note directory
+    // (`%Canon::Main` via `process_subdir(.., TableRef::Canon, ..)`, #243 phase 2
+    // step C) have NO 0x00fe/0x00ff RawConv, so an unknown Canon/GPS tag whose ID
+    // collides with these must NOT bump `page_count`/`multi_page` — on a
+    // standalone TIFF that file-level state finalizes the synthesized
+    // `File:PageCount` (`ExifTool.pm:8756-8757`), so a vendor-table leak could
+    // emit a bogus PageCount or wrongly flip `multi_page`. `parse_in_tiff` (the
+    // Canon oracle) has no such file-level side effect. Byte-identical for a
+    // normal TIFF (where `active_table == table_for_ifd_kind(kind)` for every
+    // core IFD that carries these tags).
+    if matches!(self.active_table, TableRef::Exif | TableRef::Interop) {
+      if tag_id == tables::TAG_SUBFILE_TYPE
+        && let Some(v) = first_uint(&raw)
+      {
+        // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
+        if v == (v & 0x02) {
+          self.page_count = self.page_count.saturating_add(1);
+          if v == 2 || self.page_count > 1 {
+            self.multi_page = true;
+          }
         }
-      }
-    } else if tag_id == tables::TAG_OLD_SUBFILE_TYPE
-      && let Some(v) = first_uint(&raw)
-    {
-      // `$val == 1 or $val == 3` (per Exif.pm:470).
-      if v == 1 || v == 3 {
-        self.page_count = self.page_count.saturating_add(1);
-        if v == 3 || self.page_count > 1 {
-          self.multi_page = true;
+      } else if tag_id == tables::TAG_OLD_SUBFILE_TYPE
+        && let Some(v) = first_uint(&raw)
+      {
+        // `$val == 1 or $val == 3` (per Exif.pm:470).
+        if v == 1 || v == 3 {
+          self.page_count = self.page_count.saturating_add(1);
+          if v == 3 || self.page_count > 1 {
+            self.multi_page = true;
+          }
         }
       }
     }
@@ -4315,20 +4917,26 @@ impl Walker<'_, '_> {
     // truthy and the file stays a plain TIFF; the reverse leaves DNG). A sticky
     // `set-true-only` latch would wrongly keep the earlier truthy.
     //
-    // TABLE-SCOPED to `%Exif::Main`: DNGVersion's RawConv lives in `%Exif::Main`
-    // (Exif.pm:3353), which the walker applies in the IFD0 / ExifIFD / SubIFD /
-    // trailing-IFD / InteropIFD directories — every IFD walked against the Exif
-    // main [`tables`] table. The GPS IFD ([`IfdKind::Gps`]) is walked against
-    // `%GPS::Main` instead (the same `kind.is_gps()` split that routes the leaf
-    // lookup below to `gps::lookup`), and `%GPS::Main` has NO 0xc612 entry — so
-    // an unknown GPS-IFD tag with id 0xc612 must NOT touch the DataMember. Gate
-    // the assignment on the ACTIVE TABLE (not `kind`): `%GPS::Main` is selected
-    // by `active_table == Gps`, which holds for the GPS IFD AND for every IFD of
-    // a GPS-only chain (`parse_gps_block`, where the trailing dirs are `kind =
-    // Trailing` but still walk `%GPS::Main`). `kind.is_gps()` would wrongly fire
-    // the Exif `DNGVersion` tap in such a chain. Byte-identical for a normal
-    // TIFF, where `active_table == table_for_ifd_kind(kind)`.
-    if tag_id == tables::TAG_DNG_VERSION && self.active_table != TableRef::Gps {
+    // TABLE-SCOPED to the CORE Exif/Interop directories: DNGVersion's RawConv
+    // lives in `%Exif::Main` (Exif.pm:3353), which the walker applies in the
+    // IFD0 / ExifIFD / SubIFD / trailing-IFD / InteropIFD directories — every IFD
+    // walked against the Exif main [`tables`] table (`active_table ∈ {Exif,
+    // Interop}`). The GPS IFD ([`IfdKind::Gps`]) is walked against `%GPS::Main`
+    // instead (the same split that routes the leaf lookup below to `gps::lookup`)
+    // and a VENDOR maker-note directory against `%Canon::Main` (#243 phase 2 step
+    // C) — NEITHER has a 0xc612 entry, so an unknown GPS / Canon tag whose ID
+    // collides with DNGVersion must NOT touch the DataMember. `DoProcessTIFF`
+    // (`ExifTool.pm:8763`) reads `$$self{DNGVersion}` to finalize a standalone
+    // TIFF as `DNG`, so a vendor-table leak could wrongly re-type the file. Gate
+    // on the ACTIVE TABLE being a core one (`Exif | Interop`), NOT `!= Gps`
+    // (which would still fire under `%Canon::Main`) and NOT `kind` (`%GPS::Main`
+    // is selected by `active_table == Gps`, which holds for the GPS IFD AND for
+    // every IFD of a GPS-only chain — `parse_gps_block`, where the trailing dirs
+    // are `kind = Trailing` but still walk `%GPS::Main`). Byte-identical for a
+    // normal TIFF, where `active_table == table_for_ifd_kind(kind)`.
+    if tag_id == tables::TAG_DNG_VERSION
+      && matches!(self.active_table, TableRef::Exif | TableRef::Interop)
+    {
       self.dng_version = raw.is_perl_truthy();
     }
 
@@ -4337,15 +4945,27 @@ impl Walker<'_, '_> {
     // adding `$base + $$et{BASE}`. `$$et{BASE}` is 0 for the top-level Exif
     // walk, so `offsetBase = self.base`. The two `IsOffset => 1` tags the port
     // decodes are `StripOffsets` (0x0111) and `ThumbnailOffset` (0x0201), both
-    // in the non-GPS table (GPS has no `IsOffset` tags). When `base == 0`
-    // (standalone TIFF) this is a no-op, so the existing TIFF goldens are
-    // unaffected; for a JPEG `APP1` block `base` is the TIFF block's file
-    // offset, matching bundled's absolute `ThumbnailOffset`.
-    // `!kind.is_gps()` → `active_table != Gps`: GPS has no `IsOffset` tags, and
-    // the gate must follow the ACTIVE TABLE so a GPS-only chain's trailing dirs
-    // (`kind = Trailing`, `active_table = Gps`) do not apply the Exif
-    // `StripOffsets`/`ThumbnailOffset` base-add. Byte-identical for a normal TIFF.
-    let raw = if self.base != 0 && self.active_table != TableRef::Gps && is_offset_tag(tag_id) {
+    // `%Exif::Main` attributes (Exif.pm:608/1169). When `base == 0` (standalone
+    // TIFF) this is a no-op, so the existing TIFF goldens are unaffected; for a
+    // JPEG `APP1` block `base` is the TIFF block's file offset, matching
+    // bundled's absolute `ThumbnailOffset`.
+    //
+    // CORE-TABLE-SCOPED (`Exif | Interop`): `IsOffset` is a `%Exif::Main` tag
+    // attribute, so the base-add applies ONLY to a leaf resolved against the Exif
+    // table. GPS (`%GPS::Main`) has no `IsOffset` tags, and a VENDOR maker-note
+    // walk (`%Canon::Main`, #243 phase 2 step C) carries its OWN offset handling
+    // — a Canon leaf must not be rebased by the core walk's `$base`. The Canon
+    // production walk runs with `base != 0` (the JPEG `APP1` TIFF offset), so a
+    // `!= Gps` gate would WRONGLY add the base to any Canon tag whose ID collides
+    // with 0x0111/0x0201, mutating its emitted value (the oracle `parse_in_tiff`
+    // applies no such rebase). Gating on the core tables (NOT `!= Gps`, NOT
+    // `kind`) keeps this off both GPS-only chains (`kind = Trailing`,
+    // `active_table = Gps`) and vendor walks; byte-identical for a normal TIFF
+    // (where the IsOffset-bearing IFDs resolve against `Exif`/`Interop`).
+    let raw = if self.base != 0
+      && matches!(self.active_table, TableRef::Exif | TableRef::Interop)
+      && is_offset_tag(tag_id)
+    {
       add_offset_base(raw, self.base)
     } else {
       raw
@@ -4372,6 +4992,15 @@ impl Walker<'_, '_> {
           return;
         }
       }
+      // `%Canon::Main` — Step A of the Canon engine migration (#243 phase 2). The
+      // resolved [`CanonTag`] rides in `ResolvedConv::Canon` so the emit reapplies
+      // its `CanonPrintConv` exactly as `parse_in_tiff` does at collection time
+      // (`canon/mod.rs:1018`). An unknown Canon tag is skipped here, matching
+      // `parse_in_tiff`'s `tags::lookup(...).is_none()` `continue`.
+      TableRef::Canon => match makernotes::vendors::canon::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Canon(t)),
+        None => return,
+      },
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
@@ -4524,24 +5153,50 @@ impl ExifMeta<'_> {
     // entries, so the fallback is unreachable-by-construction (same as
     // `serialize_tags`).
     let entry_order = self.byte_order.unwrap_or(ByteOrder::Little);
+    // `self.entries` carries ONLY core Exif/GPS leaves — the Canon MakerNote
+    // leaves the shared `Walker` decoded are CAPTURED into the `MakerNote`'s
+    // cached emissions and TRUNCATED off `self.entries` at dispatch time (#243
+    // phase 2 step C), so no `ResolvedConv::Canon` entry reaches this loop. The
+    // core Exif/GPS arms ignore `model`/`file_type`/the Canon DataMembers, so
+    // pass the inert `None`s.
+    let model = None;
+    let file_type = None;
+    let (canon_focal_units, canon_lens_type) = (None, None);
+    let canon_focal_length_blob: Option<&[u8]> = None;
     for entry in &self.entries {
       // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
-      let Ok(()) = emit_entry(entry, entry_order, print_conv, &mut sink);
+      let Ok(()) = emit_entry(
+        entry,
+        entry_order,
+        print_conv,
+        model,
+        file_type,
+        canon_focal_units,
+        canon_lens_type,
+        canon_focal_length_blob,
+        &mut sink,
+      );
     }
   }
 
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
-  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags).
+  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Emitted
+  /// AFTER the EXIF/IFD leaves ([`push_exif_tags`]), faithful to ExifTool
+  /// emitting the MakerNote stream after the parent IFD.
   ///
-  /// Each [`VendorEmission`](makernotes::VendorEmission) becomes an
-  /// `EmittedTag` under `Group{family0:"MakerNotes", family1:<vendor group1>}`
-  /// (`Apple`/`Canon` — [`Vendor::group1`](makernotes::Vendor::group1)),
-  /// carrying the emission's own `Unknown => 1` flag. The flag is NOT filtered
-  /// here: the engine ([`run_emission`](crate::emit::run_emission)) drops the
-  /// Unknown ones once, reproducing the OLD per-vendor pre-filter generically
-  /// (the legacy `serialize_tags` path still filters on read for byte-identity
-  /// until the flip).
+  /// Each [`VendorEmission`](makernotes::VendorEmission) becomes an `EmittedTag`
+  /// under `Group{family0:"MakerNotes", family1:<vendor group1>}`
+  /// (`Apple`/`Canon`/`Sony`/`Panasonic`/… —
+  /// [`Vendor::group1`](makernotes::Vendor::group1)), carrying the emission's own
+  /// `Unknown => 1` flag. The flag is NOT filtered here: the engine
+  /// ([`run_emission`](crate::emit::run_emission)) drops the Unknown ones once.
+  /// `-j` reads the eagerly-cached PrintConv emissions (borrowed); `-n` decodes
+  /// the vendor body ONCE on demand (P0 — owned `Vec`). Canon's emissions are
+  /// CAPTURED at dispatch time the same way (PrintConv eager, ValueConv on
+  /// demand via [`MakerNoteValueConvDecode::Canon`]), so it flows through this
+  /// shared cached-emission push exactly like the other vendors (#243 phase 2
+  /// step C).
   fn push_maker_note_tags(
     &self,
     print_conv: bool,
@@ -4870,6 +5525,28 @@ trait ExifSink {
     name: &str,
     value: &[u8],
   ) -> Result<(), core::convert::Infallible>;
+  /// Write an ALREADY-RENDERED vendor maker-note value under a FULL group
+  /// (`family0`, `family1`) with its `Unknown=>1` flag.
+  ///
+  /// Unlike the scalar `write_*` writers (which fix `family0 = "EXIF"` and route
+  /// a scalar through the terminal number gate), a vendor leaf's value is built
+  /// directly by its vendor `PrintConv` as a complete [`TagValue`] (e.g.
+  /// [`CanonPrintConv::apply`](makernotes::vendors::canon::printconv::CanonPrintConv::apply)),
+  /// and lands under the vendor's own family-0 group (`MakerNotes`). The Canon
+  /// engine migration (#243 phase 2) callers are [`emit_canon_value`] (a leaf),
+  /// [`emit_canon_subtable`] (each WALKED binary sub-table position), and
+  /// [`emit_canon_special`] (the 0x28 / 0x96 LIST specials). The `unknown` flag
+  /// rides into the [`EmittedTag`](crate::emit::EmittedTag) so the shared engine
+  /// ([`run_emission`](crate::emit::run_emission)) drops it centrally — exactly
+  /// as a Canon `VendorEmission`'s flag flows today.
+  fn write_vendor_value(
+    &mut self,
+    family0: &str,
+    family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+  ) -> Result<(), core::convert::Infallible>;
 }
 
 /// Test-only sink: each writer delegates to the matching inherent
@@ -4934,6 +5611,21 @@ impl ExifSink for crate::tagmap::TagMap {
       name,
       crate::value::TagValue::Bytes(value.to_vec()),
     )
+  }
+  #[inline(always)]
+  fn write_vendor_value(
+    &mut self,
+    _family0: &str,
+    family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    _unknown: bool,
+  ) -> Result<(), core::convert::Infallible> {
+    // The `TagMap` keys on family-1 only (`-G1`), so this test sink stores the
+    // value under `family1:name` (the `Unknown=>1` suppression is the engine's
+    // job and is not modelled by this raw test sink — a caller that wants the
+    // gate tests it before writing).
+    crate::tagmap::TagMap::write_value(self, family1, name, value)
   }
 }
 
@@ -5039,10 +5731,143 @@ impl ExifSink for EmittedTagSink<'_> {
     self.push(group, name, crate::value::TagValue::Bytes(value.to_vec()));
     Ok(())
   }
+  #[inline(always)]
+  fn write_vendor_value(
+    &mut self,
+    family0: &str,
+    family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+  ) -> Result<(), core::convert::Infallible> {
+    // The vendor value is already a complete `TagValue` (built by the vendor
+    // `PrintConv`), so it bypasses `Self::push`'s `EXIF`/`unknown:false` shape:
+    // push the FULL group + flag, matching `push_maker_note_tags`'s
+    // `EmittedTag::new(Group::new("MakerNotes", group1), …, e.unknown())`.
+    self.tags.push(crate::emit::EmittedTag::new(
+      crate::value::Group::new(family0, family1),
+      smol_str::SmolStr::new(name),
+      value,
+      unknown,
+    ));
+    Ok(())
+  }
+}
+
+/// The CAPTURE sink: each [`write_vendor_value`](ExifSink::write_vendor_value)
+/// becomes one [`VendorEmission`](makernotes::VendorEmission), collected into a
+/// borrowed `Vec`. This is how the shared `Walker`'s Canon walk lands its
+/// emissions in the same `Vec<VendorEmission>` shape every other vendor's body
+/// parser produces (#243 phase 2 step C): [`Walker::capture_canon_emissions`]
+/// re-runs [`emit_entry`] over the walked `ResolvedConv::Canon` entries with
+/// this sink, so the result is byte-identical to the retired
+/// `canon::parse_in_tiff` emissions (the same `emit_canon_value` /
+/// `emit_canon_subtable` / `emit_canon_special` render the values), and the
+/// captured `Vec` populates [`MakerNote::cached_emissions_print_conv`] exactly
+/// like Apple/Sony/Panasonic/Nikon/DJI.
+///
+/// A Canon emission's value is ALWAYS built as a complete [`TagValue`] by its
+/// vendor `PrintConv` and written through `write_vendor_value`; the scalar
+/// `write_*` writers (`family0` fixed to `"EXIF"`) are the CORE Exif/GPS leaf
+/// path. The Canon walk now resolves only vendor leaves (`walk_entry` gates the
+/// core sub-IFD pointer dispatch on [`TableRef::is_core_ifd`], so no
+/// `ResolvedConv::Exif` entry is produced under `%Canon::Main`), so a scalar
+/// `write_*` is unreachable in practice — but these writers DROP the value
+/// (a safe no-op) rather than `unreachable!()`, so a stray core entry can never
+/// turn into a malformed-input panic (defense in depth).
+#[cfg(feature = "alloc")]
+struct VendorEmissionSink<'v> {
+  /// The destination [`VendorEmission`] buffer (borrowed) — pushed in walk
+  /// (emission) order.
+  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>,
+}
+
+#[cfg(feature = "alloc")]
+impl<'v> VendorEmissionSink<'v> {
+  /// Wrap a destination buffer.
+  #[inline(always)]
+  fn new(emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>) -> Self {
+    Self { emissions }
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl ExifSink for VendorEmissionSink<'_> {
+  // The scalar writers are the core Exif/GPS leaf path and are not reached by a
+  // Canon walk (every Canon emission goes through `write_vendor_value`). They
+  // DROP the value (`Ok(())`) instead of `unreachable!()` so a stray core entry
+  // can never DoS the capture — see the type doc.
+  fn write_str(
+    &mut self,
+    _group: &str,
+    _name: &str,
+    _value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    Ok(())
+  }
+  fn write_i64(
+    &mut self,
+    _group: &str,
+    _name: &str,
+    _value: i64,
+  ) -> Result<(), core::convert::Infallible> {
+    Ok(())
+  }
+  fn write_u64(
+    &mut self,
+    _group: &str,
+    _name: &str,
+    _value: u64,
+  ) -> Result<(), core::convert::Infallible> {
+    Ok(())
+  }
+  fn write_f64(
+    &mut self,
+    _group: &str,
+    _name: &str,
+    _value: f64,
+  ) -> Result<(), core::convert::Infallible> {
+    Ok(())
+  }
+  fn write_bytes(
+    &mut self,
+    _group: &str,
+    _name: &str,
+    _value: &[u8],
+  ) -> Result<(), core::convert::Infallible> {
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_vendor_value(
+    &mut self,
+    _family0: &str,
+    _family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+  ) -> Result<(), core::convert::Infallible> {
+    // The family-0/1 group is fixed (`("MakerNotes", "Canon")`) for every Canon
+    // emission and re-applied by [`ExifMeta::push_maker_note_tags`] from
+    // [`MakerNote::emission_group1`], so it is NOT stored on the
+    // `VendorEmission` (which carries only `name` / `value` / `unknown`, exactly
+    // as the vendor body parsers build it).
+    self.emissions.push(makernotes::VendorEmission::new(
+      smol_str::SmolStr::new(name),
+      value,
+      unknown,
+    ));
+    Ok(())
+  }
 }
 
 /// Emit one [`ExifEntry`] into the [`crate::tagmap::TagMap`] sink, applying
 /// the resolved conversion.
+// The emit seam threads the full render context (entry, order, PrintConv mode,
+// the MakerNote `model`/`file_type` context, the two Canon CameraSettings
+// DataMembers, and the sink). Bundling them into a context struct would obscure
+// the 1:1 mapping to `parse_in_tiff`'s collection-time render, not clarify it —
+// the sibling `emit_canon_subtable` carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "alloc")]
 fn emit_entry<S: ExifSink>(
   entry: &ExifEntry,
@@ -5051,10 +5876,45 @@ fn emit_entry<S: ExifSink>(
   // GPS `GpsConv::ExifText` arm (GPSProcessingMethod/GPSAreaInformation).
   order: ByteOrder,
   print_conv: bool,
+  // The parent body `$$self{Model}` (IFD0's Model) — threaded ONLY into a vendor
+  // leaf's conditional `PrintConv` (Canon `SerialNumber`, `Canon.pm:1282-1306`)
+  // and the Canon sub-table parsers; every Exif/GPS arm ignores it. The
+  // core-IFD callers ([`push_exif_tags`]) pass `None` (their `self.entries` carry
+  // no Canon leaf — those were captured + truncated at dispatch); the Canon
+  // CAPTURE caller ([`Walker::capture_canon_emissions`]) passes the walk-time
+  // value so the captured emissions match `parse_in_tiff`.
+  model: Option<&str>,
+  // The container `$$self{FILE_TYPE}` — threaded ONLY into the Canon `ShotInfo`
+  // sub-table (position 22's CRW-allows-0 RawConv, `Canon.pm:2977`/`:2990`); the
+  // core Exif/GPS arms and every other Canon arm ignore it. `None` for the
+  // core-IFD callers; the Canon capture caller passes the container type.
+  file_type: Option<&str>,
+  // The two Canon `%CameraSettings` DataMembers the pre-scan captured (#243
+  // phase 2 step B2): `$$self{FocalUnits}` (CameraSettings pos 25) threads into
+  // the `FocalLength` (0x02) sub-table's `ValueConv`, and `$$self{LensType}`
+  // (pos 22) into the `FileInfo` (0x93) position-16 `Condition`. Both are
+  // consumed ONLY by [`emit_canon_subtable`] for those two sub-tables; every
+  // core Exif/GPS arm, the Canon leaf arm, and the simple-sub-table arms ignore
+  // them. `None` for the core-IFD callers; the Canon capture caller threads the
+  // pre-scanned members so the FocalLength/FileInfo emissions match
+  // `parse_in_tiff`.
+  canon_focal_units: Option<u16>,
+  canon_lens_type: Option<u16>,
+  // The pre-scanned LAST readable `CanonFocalLength` (0x02) `$$valPt` (#243 phase
+  // 2 step C, R4) — threaded ONLY into [`emit_canon_subtable`]'s FocalLength arm,
+  // which decodes EVERY 0x02 entry from this ONE cached blob (last-wins, matching
+  // `parse_in_tiff`'s `focal_length_data`). `None` for the core-IFD callers (no
+  // Canon leaf) and for any Canon walk with no readable 0x02; every other arm
+  // ignores it.
+  canon_focal_length_blob: Option<&[u8]>,
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
-  let group = entry.group();
-  let group = group.as_str();
+  // The kind-derived family-1 group (`IFD0`/`ExifIFD`/`GPS`/…). For a core
+  // Exif/GPS leaf this IS the leaf's family-1 group (passed unchanged to the
+  // scalar emitters — byte-identical, the conformance suite proves it); a Canon
+  // vendor leaf OVERRIDES it to its vendor group via `vendor_group1()`.
+  let kind_group = entry.group();
+  let group = kind_group.as_str();
   let name = entry.name();
   let raw = entry.value.raw();
   // Emit the leaf through the bespoke `emit_exif_value` / `emit_gps_value`
@@ -5062,14 +5922,563 @@ fn emit_entry<S: ExifSink>(
   // Exif/GPS leaf convs operate on the RAW value's first scalar / exact rational
   // / byte shape, which the golden `convert::apply` runtime — written for the
   // already-rendered `TagValue` — cannot reproduce byte-identically for a
-  // multi-element value or preserve in TagValue shape; #243 Codex R1/R2. The
-  // Phase-2 vendor tables are golden `TagDef`s and DO emit through
-  // `convert::apply`, via a separate path.)
+  // multi-element value or preserve in TagValue shape; #243 Codex R1/R2.)
   match entry.conv {
     ResolvedConv::Exif(tag) => emit_exif_value(group, name, raw, tag.conv, order, print_conv, out),
     #[cfg(feature = "gps")]
     ResolvedConv::Gps(tag) => emit_gps_value(group, name, raw, tag.conv, order, print_conv, out),
+    // `%Canon::Main` vendor leaf (Step A, #243 phase 2) — render via the Canon
+    // `PrintConv` (`CanonPrintConv::apply`) and emit under the vendor group
+    // `("MakerNotes","Canon")`, mirroring `parse_in_tiff` + `push_maker_note_tags`.
+    // `vendor_group1()` is `Some("Canon")` here by construction; the unreachable
+    // `None` (a future vendor table not yet wired) falls back to `group` so a leaf
+    // is never silently mis-grouped.
+    ResolvedConv::Canon(canon_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      // The two Canon `%Main` LIST / Format-override specials (`0x28`
+      // ImageUniqueID, `0x96` SerialInfo/InternalSerialNumber LIST), #243
+      // phase 2 step B3. Their VALUE was already rewritten at walk time
+      // ([`Walker::canon_special_leaf_value`]) — here the EMIT reproduces
+      // `parse_in_tiff`'s matching emit branches (`canon/mod.rs:943-1010`):
+      // 0x28's 16-NUL-drop / hex `ValueConv`, and the 5D-body 0x96's
+      // `serial_info::parse`. (A non-5D 0x96 is the LIST's SECOND arm
+      // `InternalSerialNumber`, whose value is the already-stripped `Text`; it
+      // is NOT special-cased here — it falls through to the leaf renderer below,
+      // matching `parse_in_tiff`'s `else` leaf branch.)
+      if let Some(result) = emit_canon_special(group1, entry.tag_id, raw, print_conv, model, out) {
+        return result;
+      }
+      // A WALKED binary sub-table pointer is decoded HERE at emit time and each
+      // returned position emitted — reproducing `parse_in_tiff`'s SubDirectory
+      // arm (`canon/mod.rs:762-911`) through the shared Walker. The SIMPLE set
+      // (ShotInfo / AFInfo{,2,3} / SensorInfo / ColorBalance — NO DataMember,
+      // NO 2-pass) joined the emit path in step B1; the DataMember 2-pass set
+      // (CameraSettings 0x01 / FocalLength 0x02 / FileInfo 0x93) joins in step
+      // B2, threading the pre-scanned `$$self{FocalUnits}` / `$$self{LensType}`
+      // (see [`canon_prescan_datamembers`]).
+      match canon_tag.sub_table() {
+        Some(sub) if sub.is_walked() => emit_canon_subtable(
+          group1,
+          sub,
+          raw,
+          order,
+          print_conv,
+          model,
+          file_type,
+          canon_focal_units,
+          canon_lens_type,
+          canon_focal_length_blob,
+          out,
+        ),
+        // A STILL-DEFERRED SubDirectory (`is_walked() == false` — CameraInfo /
+        // CropInfo / ColorData / the #223 swept-from-`None` set, etc.) emits
+        // NOTHING: ExifTool descends into the child table and never emits the
+        // parent pointer as a value (`Exif.pm:7103-7104` `next` skips `FoundTag`
+        // for a no-value SubDirectory), and the port defers the child walk — so
+        // NEITHER the parent NOR the children are emitted. This reproduces
+        // `parse_in_tiff`'s `_ =>` SubDirectory arm (`canon/mod.rs`), which
+        // pushes no emission. Rendering it through `emit_canon_value` (the bug
+        // this guards) would leak a bogus `Canon:CanonCameraInfo` / `Canon:ColorData`
+        // / … parent that ExifTool never emits (#223).
+        Some(_) => Ok(()),
+        // A plain LEAF (`sub_table() == None`) — the Canon `PrintConv` renderer.
+        None => emit_canon_value(group1, name, raw, canon_tag, print_conv, model, out),
+      }
+    }
   }
+}
+
+/// Render ONE Canon maker-note leaf into the sink — the emit-time reproduction
+/// of `parse_in_tiff`'s leaf branch (`canon/mod.rs:1018-1027`).
+///
+/// Applies the resolved tag's [`CanonPrintConv`](makernotes::vendors::canon::printconv::CanonPrintConv)
+/// to `raw` EXACTLY as the collection-time path does
+/// (`def.conv().apply(&entry.value, print_conv, model)`), then writes the
+/// already-rendered [`TagValue`] under `("MakerNotes", group1)` carrying the
+/// tag's `Unknown=>1` flag. The flag is NOT filtered here — it rides into the
+/// [`EmittedTag`](crate::emit::EmittedTag) so the shared
+/// [`run_emission`](crate::emit::run_emission) engine drops it ONCE, identical to
+/// how a Canon `VendorEmission`'s `is_unknown()` flows through
+/// [`ExifMeta::push_maker_note_tags`].
+///
+/// `model` is the parent body `$$self{Model}`, consumed only by the conditional
+/// `SerialNumber` list (`Canon.pm:1282-1306`); every other Canon `PrintConv`
+/// ignores it.
+#[cfg(feature = "alloc")]
+fn emit_canon_value<S: ExifSink>(
+  group1: &str,
+  name: &str,
+  raw: &RawValue,
+  canon_tag: &makernotes::vendors::canon::tags::CanonTag,
+  print_conv: bool,
+  model: Option<&str>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  let value = canon_tag.conv().apply(raw, print_conv, model);
+  out.write_vendor_value("MakerNotes", group1, name, value, canon_tag.is_unknown())
+}
+
+/// Emit the two Canon `%Main` LIST / Format-override SPECIALS at emit time —
+/// the emit-path reproduction of `canon::parse_in_tiff`'s 0x28 / 0x96 branches
+/// (`canon/mod.rs:943-1010`) through the shared `Walker` (#243 phase 2 step B3).
+///
+/// Returns `Some(Ok(()))` when `tag_id` is one of the two specials this emit
+/// handles — `0x28` (`ImageUniqueID`) or a 5D-body `0x96` (the `SerialInfo`
+/// SubDirectory arm) — having written the resulting tag(s) (or NOTHING, for a
+/// dropped 0x28). Returns `None` when `tag_id` is NOT such a special — including
+/// a NON-5D `0x96`, which is the LIST's SECOND arm `InternalSerialNumber` and is
+/// rendered by the normal [`emit_canon_value`] leaf path (its value is the
+/// already-`0xff`-stripped `Text` the walk-time rewrite produced) — so the
+/// caller falls through to its leaf / sub-table dispatch.
+///
+/// `raw` is the entry's walk-time-rewritten value
+/// ([`Walker::canon_special_leaf_value`]): a [`RawValue::Bytes`] for both 0x28
+/// (the `Format => 'undef'` on-disk bytes) and the 5D 0x96 (the `SerialInfo`
+/// `$$valPt` blob, un-stripped). A defensive non-`Bytes` shape (the walker
+/// always rewrites these two to `Bytes`) is treated as empty bytes — emit
+/// nothing — mirroring `parse_in_tiff`'s same `_ => &[]` guards.
+///
+/// `0x28` `ImageUniqueID` (`Canon.pm:1726-1735`): `RawConv => '$val eq "\0" x 16
+/// ? undef : $val'` drops the value ONLY when it is EXACTLY sixteen NUL bytes
+/// (Perl string equality — a short all-zero value of any OTHER length survives);
+/// the survivor renders through `ValueConv => 'unpack("H*", $val)'`
+/// ([`hex_lower`](makernotes::vendors::canon::hex_lower)). No `PrintConv`, so
+/// `-j` and `-n` agree; `Writable`, non-`Unknown` ⇒ `unknown = false`.
+///
+/// 5D `0x96` `SerialInfo` (`Canon.pm:1834-1846`): ExifTool descends into
+/// `%Canon::SerialInfo` and emits ITS leaves (`InternalSerialNumber2` /
+/// `InternalSerialNumber`) but never the parent — decode the captured blob via
+/// [`serial_info::parse`](makernotes::vendors::canon::serial_info::parse). Each
+/// position is an explicit `BinaryData` entry ⇒ `unknown = false`.
+#[cfg(feature = "alloc")]
+fn emit_canon_special<S: ExifSink>(
+  group1: &str,
+  tag_id: u16,
+  raw: &RawValue,
+  print_conv: bool,
+  model: Option<&str>,
+  out: &mut S,
+) -> Option<Result<(), core::convert::Infallible>> {
+  use makernotes::vendors::canon::{hex_lower, printconv, serial_info};
+  if tag_id == 0x28 {
+    // The faithful `Format => 'undef'` bytes captured at walk time.
+    let val_bytes: &[u8] = match raw {
+      RawValue::Bytes(b) => b,
+      _ => &[],
+    };
+    // `$val eq "\0" x 16` — EXACTLY sixteen NUL bytes ⇒ RawConv undef (emit
+    // NOTHING). A different length, or any non-NUL byte, survives.
+    let is_undef = val_bytes.len() == 16 && val_bytes.iter().all(|&b| b == 0);
+    if is_undef {
+      return Some(Ok(()));
+    }
+    let hex = hex_lower(val_bytes);
+    return Some(out.write_vendor_value(
+      "MakerNotes",
+      group1,
+      "ImageUniqueID",
+      crate::value::TagValue::Str(smol_str::SmolStr::from(hex)),
+      false,
+    ));
+  }
+  // `0x96` FIRST arm — `SerialInfo` SubDirectory, only for an EOS-5D body. A
+  // non-5D 0x96 is the SECOND arm (`InternalSerialNumber`) and is NOT handled
+  // here (`None` ⇒ the caller's normal leaf renderer takes it).
+  if tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d) {
+    // The `$$valPt` SerialInfo blob the walker captured verbatim for the 5D arm.
+    let blob: &[u8] = match raw {
+      RawValue::Bytes(b) => b,
+      _ => &[],
+    };
+    for (name, value) in serial_info::parse(blob, print_conv) {
+      // Explicit BinaryData positions are never `Unknown`. The sink write is
+      // infallible (`Infallible`); propagating it would only ever be `Ok`.
+      if let err @ Err(_) = out.write_vendor_value("MakerNotes", group1, &name, value, false) {
+        return Some(err);
+      }
+    }
+    return Some(Ok(()));
+  }
+  None
+}
+
+/// Decode a WALKED Canon binary sub-table at emit time and write each of its
+/// positions into the sink — the emit-path reproduction of `parse_in_tiff`'s
+/// SubDirectory arm (`canon/mod.rs:762-911`). Step B1 of the Canon engine
+/// migration (#243 phase 2) routed the no-DataMember / no-2-pass tables
+/// (`ShotInfo` / `AFInfo` / `AFInfo2` / `AFInfo3` / `SensorInfo` /
+/// `ColorBalance`) here; step B2 adds the DataMember 2-pass tables
+/// (`CameraSettings` 0x01 / `FocalLength` 0x02 / `FileInfo` 0x93), so the shared
+/// `Walker` now decodes the FULL [`SubTable::is_walked`] set instead of through
+/// the legacy `canon::parse_in_tiff` dispatch.
+///
+/// `raw` is the entry's DECODED value (the int16s/int16u word array or raw
+/// bytes the Walker read for the SubDirectory pointer); it is reserialized to
+/// the `$$valPt` byte blob via [`reserialize_int_array`](makernotes::vendors::canon::reserialize_int_array)
+/// — the SAME helper, byte-for-byte, the collection-time dispatch uses — and
+/// handed to the matching sub-parser. `model` threads the parent `$$self{Model}`
+/// (ColorBalance position-29 name; AFInfo PrimaryAFPoint condition; ShotInfo
+/// position-22 350D branch; FileInfo position-1 conditional list +
+/// MacroMagnification exclusion; FocalLength FocalPlaneX/YSize `Condition`);
+/// `file_type` threads the container `$$self{FILE_TYPE}` into ShotInfo
+/// position-22's CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
+///
+/// `canon_focal_units` is the pre-scanned `$$self{FocalUnits}`
+/// (`%CameraSettings` pos 25) — the `FocalLength` (0x02) `ValueConv => '$val /
+/// ($$self{FocalUnits} || 1)'` divisor (`Canon.pm:2702`). `canon_lens_type` is
+/// the pre-scanned `$$self{LensType}` (`%CameraSettings` pos 22's `RawConv`
+/// DataMember, `Canon.pm:2503`) — the `FileInfo` (0x93) position-16
+/// `MacroMagnification` `Condition` (`$$self{LensType} == 124`,
+/// `Canon.pm:7002-7005`). Both come from [`canon_prescan_datamembers`], which
+/// resolved them from the CameraSettings entry BEFORE the main walk — exactly as
+/// `parse_in_tiff`'s pre-pass threads its own captured `focal_units` / `lens_type`
+/// (`canon/mod.rs:707-739`). They are read ONLY by the FocalLength / FileInfo
+/// arms; the CameraSettings arm itself recaptures its OWN lens-id (for emission)
+/// and reads its OWN position-25 FocalUnits internally, so it does not consume
+/// either parameter.
+///
+/// Every sub-table position is an explicit `BinaryData` entry — NEVER `Unknown`
+/// (the `Unknown` scalars are excluded INSIDE each sub-parser), so each emits
+/// with `unknown = false`, exactly as the legacy `VendorEmission::new(name,
+/// value, false)` pushes do.
+///
+/// The AFInfo2 (0x26) `Condition => '$$valPt !~ /^\0\0\0\0/'` skip
+/// (`Canon.pm:1713`) is preserved here via
+/// [`first4_all_zero`](makernotes::vendors::canon::first4_all_zero): an all-zero
+/// first four bytes means the SubDirectory is NOT entered and NOTHING is emitted
+/// — identical to `parse_in_tiff`. AFInfo3 (0x3c) has no such `Condition`, so it
+/// always decodes.
+// The emit seam threads the full render context (group, value, order, PrintConv
+// mode, the MakerNote `model`/`file_type` context, the two CameraSettings
+// DataMembers, and the sink). Bundling them into a context struct would obscure
+// the 1:1 mapping to `parse_in_tiff`'s sub-parser calls, not clarify it.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+fn emit_canon_subtable<S: ExifSink>(
+  group1: &str,
+  sub: makernotes::vendors::canon::tags::SubTable,
+  raw: &RawValue,
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+  file_type: Option<&str>,
+  canon_focal_units: Option<u16>,
+  canon_lens_type: Option<u16>,
+  // The pre-scanned LAST readable `CanonFocalLength` (0x02) `$$valPt` (the SAME
+  // cache `parse_in_tiff` builds in its pre-pass, `canon/mod.rs:737`). The
+  // FocalLength arm decodes THIS blob for EVERY 0x02, NOT the current entry's
+  // `raw` — so two 0x02 entries emit "last,last" (R4 finding 2). `None` when no
+  // readable 0x02 exists; the FocalLength arm then emits nothing (the oracle's
+  // `if let Some(ref bytes) = focal_length_data` is likewise a no-op).
+  canon_focal_length_blob: Option<&[u8]>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::canon::tags::SubTable;
+  use makernotes::vendors::canon::{
+    af_info, camera_settings, color_balance, file_info, first4_all_zero, focal_length,
+    reserialize_int_array, sensor_info, shot_info,
+  };
+
+  let blob = reserialize_int_array(raw, order);
+  // Each arm decodes the blob into `(name, value)` positions; the typed structs
+  // the standalone sub-parsers also return are not needed here (the migrated
+  // emit path only re-emits the tag stream — the typed accessors stay sourced by
+  // `parse_in_tiff` until the Step C production switch).
+  let positions: Vec<(smol_str::SmolStr, crate::value::TagValue)> = match sub {
+    // CameraSettings (0x01): emit its positions. It captures its OWN lens-id
+    // here (`&mut lens_id`, discarded — the emission needs only the rendered
+    // `LensType` position, and the cross-entry DataMember was already pre-scanned
+    // for FileInfo), and pre-reads its OWN position-25 FocalUnits internally for
+    // Max/MinFocalLength — so it consumes neither threaded DataMember.
+    SubTable::CameraSettings => {
+      let mut lens_id: Option<u16> = None;
+      camera_settings::parse_with_lens_id_capture(&blob, order, print_conv, &mut lens_id)
+    }
+    // FocalLength (0x02): the `$val / ($$self{FocalUnits} || 1)` divisor is the
+    // pre-scanned CameraSettings position-25 value (`Canon.pm:2702`). The blob
+    // decoded is NOT this entry's own `$$valPt` but the pre-scanned LAST readable
+    // 0x02 (`canon_focal_length_blob`) — `parse_in_tiff` caches `focal_length_data`
+    // in its pre-pass (last-wins, `canon/mod.rs:735-738`) and renders EVERY 0x02
+    // SubDirectory from that FINAL blob (`canon/mod.rs:883-889`), so a Canon IFD
+    // with two `CanonFocalLength` entries emits "last,last", not "first,last"
+    // (R4 finding 2). The pre-scan always captures a value for any 0x02 the walk
+    // also surfaced (same classification + `read_value`), so `None` here means no
+    // readable 0x02 existed at all — then, like the oracle's `if let Some(ref
+    // bytes) = focal_length_data`, emit nothing.
+    SubTable::FocalLength => match canon_focal_length_blob {
+      Some(bytes) => focal_length::parse(bytes, order, print_conv, canon_focal_units, model),
+      None => Vec::new(),
+    },
+    // FileInfo (0x93): position 16 (`MacroMagnification`) gates on the
+    // pre-scanned `$$self{LensType} == 124` (`Canon.pm:7002-7005`); `model` keys
+    // its position-1 conditional list. Drop the typed `decoded` return.
+    SubTable::FileInfo => {
+      file_info::parse_with_model(&blob, order, print_conv, canon_lens_type, model).0
+    }
+    SubTable::ShotInfo => shot_info::parse(&blob, order, print_conv, model, file_type).1,
+    SubTable::AfInfo => af_info::parse_af_info(&blob, order, print_conv, model).1,
+    // `Canon::Main` 0x26 `Condition => '$$valPt !~ /^\0\0\0\0/'` (`Canon.pm:1713`):
+    // skip the SubDirectory entirely when the first four bytes are all zero.
+    SubTable::AfInfo2 => {
+      if first4_all_zero(&blob) {
+        Vec::new()
+      } else {
+        af_info::parse_af_info2(&blob, order, print_conv, model).1
+      }
+    }
+    SubTable::AfInfo3 => af_info::parse_af_info3(&blob, order, print_conv, model).1,
+    SubTable::SensorInfo => sensor_info::parse(&blob, order, print_conv),
+    SubTable::ColorBalance => color_balance::parse(&blob, order, print_conv, model),
+    // `emit_entry` only routes the `is_walked()` set here; any other variant is
+    // a caller bug, not a malformed-input case — emit nothing.
+    _ => Vec::new(),
+  };
+
+  for (name, value) in positions {
+    out.write_vendor_value("MakerNotes", group1, &name, value, false)?;
+  }
+  Ok(())
+}
+
+/// Build the typed [`MakerNotesCanon`](makernotes::vendors::canon::MakerNotesCanon)
+/// from the Canon Main IFD leaves the shared `Walker` produced (#243 phase 2
+/// step C). `canon_entries` is the contiguous run of `ResolvedConv::Canon`
+/// entries `process_subdir(TableRef::Canon)` appended to `self.entries`, IN WALK
+/// ORDER. Maps each to its `(tag_id, &RawValue)` and hands them to
+/// [`canon::build_typed_from_entries`](makernotes::vendors::canon::build_typed_from_entries),
+/// which reproduces every `parse_in_tiff` typed-population site — so the typed
+/// accessors (`model_id` / `lens_type` / `shot_info` / `af_info` / `file_info` /
+/// …) are populated identically to the retired collection-time path.
+///
+/// `order` is the parent byte order; `model` the parent `$$self{Model}`;
+/// `file_type` the container `$$self{FILE_TYPE}`; `lens_type` the pre-scanned
+/// `%CameraSettings` pos-22 DataMember the FileInfo typed decode reads (the SAME
+/// value the emission capture reads, so the typed surface and the JSON stream
+/// agree). The `$$self{FocalUnits}` DataMember scales only emissions, never a
+/// typed field, so it is not threaded here.
+#[cfg(feature = "alloc")]
+fn populate_canon_typed(
+  canon_entries: &[ExifEntry],
+  order: ByteOrder,
+  model: Option<&str>,
+  file_type: Option<&str>,
+  lens_type: Option<u16>,
+) -> makernotes::vendors::canon::MakerNotesCanon {
+  let pairs: Vec<(u16, &RawValue)> = canon_entries
+    .iter()
+    .map(|e| (e.tag_id, e.value.raw()))
+    .collect();
+  makernotes::vendors::canon::build_typed_from_entries(&pairs, order, model, file_type, lens_type)
+}
+
+/// Re-drive the SHARED `Walker`'s Canon Main IFD walk + emission capture in `-n`
+/// (ValueConv) mode — the on-demand `-n` recompute for
+/// [`MakerNoteValueConvDecode::Canon`] (#243 phase 2 step C).
+///
+/// The walk-time PrintConv decode caches its emissions eagerly (it ALSO yields
+/// the typed `MakerNotesCanon` slot), but the `-n` emissions are needed only by
+/// the `-n` serialize path, so — exactly like the other gated vendors — this
+/// captures the decode INPUTS (the borrowed parent slice + `mn_offset` / order /
+/// model / file_type) and re-runs the walk only when
+/// [`MakerNote::emissions_value_conv`] is called. It builds a fresh single-use
+/// [`Walker`] over the parent TIFF block, walks the Canon Main IFD at `mn_offset`
+/// through [`process_subdir`](Walker::process_subdir) under `TableRef::Canon`
+/// (the SAME entry the dispatch used — so the `%CameraSettings` DataMember
+/// pre-scan runs identically and `self.canon_focal_units` /
+/// `self.canon_lens_type` are repopulated), then captures the walked leaves with
+/// `print_conv = false` via [`capture_canon_emissions`](Walker::capture_canon_emissions).
+///
+/// Byte-identical to the old eager `-n` cache: the Canon walk reads the same
+/// bytes through the same machinery regardless of the PrintConv flag (Canon's
+/// `%Main` has no `IsOffset`/`SubIFD` tag, so the walk never consults
+/// `Walker::base`, and a fresh `base: 0` Walker walks the same entries the
+/// dispatch's parent-context Walker did — the retired `canon::parse_in_tiff`
+/// likewise took no base).
+///
+/// `mn_len` is the MakerNote read length the dispatch captured (the 0x927c value
+/// window); the Canon walk reads its own IFD entry-count + per-entry extents from
+/// `data` at `mn_offset` (it does not slice to `mn_len`), so the parameter is
+/// carried for symmetry with the dispatch capture inputs and the bounds it
+/// documents, not consumed by the walk.
+#[cfg(feature = "alloc")]
+fn canon_recompute_value_conv(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  order: ByteOrder,
+  model: Option<&str>,
+  file_type: Option<&str>,
+) -> std::vec::Vec<makernotes::VendorEmission> {
+  // The `-n` recompute is the isolated walk with `print_conv = false` and the
+  // typed slot discarded (the `-n` path needs only the ValueConv emissions).
+  canon_makernote_isolated(data, mn_offset, mn_len, order, model, file_type, false).0
+}
+
+/// Walk the Canon Main IFD in a FRESH, ISOLATED [`Walker`] and capture its
+/// emissions — the single entry point BOTH the `-j` production dispatch and the
+/// `-n` recompute drive (#243 phase 2 step C, structural isolation).
+///
+/// ## Why a fresh Walker (the structural fix)
+///
+/// Canon's `%Main` is a vendor table whose walk must have NO effect on the
+/// parent TIFF walk's CORE state. The earlier production switch reused the parent
+/// `Walker` via `process_subdir`, which shared every mutable field — and each one
+/// is a core-state leak the retired `canon::parse_in_tiff` oracle (an isolated
+/// `walk_canon_in_tiff`) does not have:
+///
+/// * `warnings` / `warnings_ignorable` — a malformed Canon entry warns
+///   `"Bad offset for ExifIFD <tag>"` (the directory `kind` is `ExifIfd`); on the
+///   parent that core ExifIFD `$et->Warn` would surface as an `ExifTool:Warning`
+///   the oracle never emits.
+/// * `active_ifd_offsets` — the parent's ACTIVE recursion path holds the IFD0 /
+///   ExifIFD offsets; a Canon MakerNote whose value offset coincides with an
+///   ancestor (e.g. 8, the IFD0 offset) would hit the ancestor cycle guard in
+///   [`walk_one_ifd`](Walker::walk_one_ifd) and be SUPPRESSED — the oracle, with
+///   an empty path, always walks it.
+/// * `warn_count` / `page_count` / `multi_page` / `dng_version` — the per-call
+///   `$warnCount` abort cap and the file-level RawConv-tap DataMembers.
+///
+/// A fresh `Walker` over the SAME `data` (base 0, the Canon Main IFD at
+/// `mn_offset`) has its OWN of every field; they are populated by THIS walk and
+/// DISCARDED on return — none touches the parent. The within-walk Canon gates
+/// (the `sub_dir_for`/bad-offset/SubfileType/DNGVersion `active_table` guards in
+/// [`walk_entry`](Walker::walk_entry)) still apply, so the fresh walk is correct;
+/// because it is isolated, even their effects (an empty `warnings`, an
+/// untouched `dng_version`) never leave this function.
+///
+/// ## Byte-identity to `parse_in_tiff`
+///
+/// The Canon walk reads the same bytes through the same machinery regardless of
+/// container: Canon's `%Main` has no `IsOffset`/`SubIFD` tag, so the walk never
+/// consults [`Walker::base`] (a `base: 0` fresh walker walks the same entries the
+/// parent-context walk did — the retired `canon::parse_in_tiff` likewise took no
+/// base), and the directory `kind` is `ExifIfd` (so the IFD0-only Make/Model
+/// capture tap never fires). The `%CameraSettings` DataMember pre-scan runs
+/// inside `process_subdir` exactly as the oracle's pre-pass does, and
+/// [`capture_canon_emissions`](Walker::capture_canon_emissions) reproduces the
+/// oracle's leaf/sub-table/special render stream — for BOTH `print_conv` modes.
+///
+/// ## Return
+///
+/// The captured `Vec<VendorEmission>` for `print_conv` (PrintConv `-j` /
+/// ValueConv `-n`), plus — only when `print_conv == true` (the production `-j`
+/// dispatch, which also wants the typed surface) — the typed `MakerNotesCanon`
+/// built from the SAME walked entries via [`populate_canon_typed`] (it reads the
+/// post-walk `$$self{LensType}` the pre-scan captured). The `-n` recompute passes
+/// `false` and ignores the `None` typed slot.
+///
+/// `mn_len` is the MakerNote read length the dispatch captured (the 0x927c value
+/// window); the Canon walk reads its own IFD entry-count + per-entry extents from
+/// `data` at `mn_offset` (it does not slice to `mn_len`), so the parameter is
+/// carried for symmetry with the decode inputs, not consumed by the walk.
+#[cfg(feature = "alloc")]
+fn canon_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  order: ByteOrder,
+  model: Option<&str>,
+  file_type: Option<&str>,
+  print_conv: bool,
+) -> (
+  std::vec::Vec<makernotes::VendorEmission>,
+  Option<makernotes::vendors::canon::MakerNotesCanon>,
+) {
+  // The SAME entry-region guard `walk_canon_in_tiff` applies at its top
+  // (`body.rs:299` `if mn_offset + 2 > tiff_data.len() || mn_len < 2 { return }`):
+  // the IFD count word must be readable AND the captured `0x927c` value window
+  // must hold at least that count word (`mn_len >= 2`). A short/truncated Canon
+  // MakerNote (e.g. a 0x927c with count 0 or 1) is REJECTED here, exactly as the
+  // oracle rejects it — so the fresh Walker never re-reads inline padding / the
+  // following ExifIFD bytes as a Canon Main IFD and never emits bogus
+  // MakerNotesCanon data past the declared MakerNote extent. (Inside the walk,
+  // the directory extent + out-of-line value offsets bound against
+  // `data.len()`, NOT `mn_len`, identically to the oracle, whose `data_len` is
+  // likewise `tiff_data.len()`; `mn_len` only gates this `< 2` short-directory
+  // check — `body.rs:308`.) The walk produces NO emissions either way, but the
+  // typed surface is still installed to match the retired oracle: `parse_in_tiff`
+  // ALWAYS returns a `MakerNotesCanon` (an EMPTY `MakerNotesCanon::new()` for a
+  // short/rejected MakerNote — the walk yields no entries but the caller still
+  // installs the typed slot), so a detected-but-short Canon MakerNote must keep
+  // `canon() == Some(empty)`, NOT collapse to `None` — a typed-API divergence the
+  // byte-identical JSON gate cannot see (#243 phase 2 R8). Mirror the non-short
+  // policy below (`print_conv.then(...)`): an empty typed slot in `-j`, `None` in
+  // `-n` (the `-n` recompute discards the typed slot regardless).
+  if mn_len < 2 || mn_offset.checked_add(2).is_none_or(|end| end > data.len()) {
+    let typed = print_conv.then(makernotes::vendors::canon::MakerNotesCanon::new);
+    return (std::vec::Vec::new(), typed);
+  }
+  let mut w = Walker {
+    data,
+    order,
+    // Canon's `%Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
+    // `base` to a value (`is_offset_tag` matches only 0x0111/0x0201, absent from
+    // `%Canon::Main`) — `base: 0` is byte-identical to the parent-context walk.
+    base: 0,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Canon entry warns into THESE, which are
+    // dropped on return — never the parent's `ExifTool:Warning` stream (the
+    // oracle `parse_in_tiff` emits no such warning).
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    captured_make: None,
+    // `$$self{Model}` (the conditional `SerialNumber` PrintConv is `-j`-only, but
+    // the model also gates the 0x96 SerialInfo LIST + ShotInfo branches the `-n`
+    // walk traverses).
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
+    // so a Canon MakerNote whose value offset coincides with a PARENT IFD offset
+    // (e.g. 8) is still walked — the oracle, also pathless, always walks it. The
+    // parent's path-cycle guard cannot suppress this isolated walk.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // `$$self{FILE_TYPE}` — the `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv.
+    file_type: file_type.map(smol_str::SmolStr::new),
+    // The parent TIFF block IS the readable buffer (an effective RAF), like the
+    // dispatch walk — only the CTMD `0x8769` hop is no-RAF.
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Canon)` swaps it to
+    // `Canon` for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    // Repopulated by the Canon pre-scan inside `process_subdir`.
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Canon Main IFD walk — the SAME `process_subdir` entry the recompute used
+  // (`IfdKind::ExifIfd` directory kind, fixed parent order, no FixBase, the Canon
+  // ProcessProc that runs the DataMember pre-scan). It appends the Canon leaves
+  // to `w.entries` from index 0. Running it on a FRESH walker is what isolates
+  // every core side effect (warnings / active-path / warn_count / file-level
+  // taps) from the parent.
+  w.process_subdir(
+    mn_offset,
+    IfdKind::ExifIfd,
+    TableRef::Canon,
+    ByteOrderRule::Fixed(order),
+    FixBaseMode::No,
+    ProcessProc::Canon,
+  );
+  let emissions = w.capture_canon_emissions(0, print_conv);
+  // The typed surface is only needed by the `-j` production dispatch; the `-n`
+  // recompute discards it. Build it from the SAME walked entries (the pre-scanned
+  // `$$self{LensType}` the FileInfo typed decode reads is on `w` post-walk).
+  let typed = print_conv.then(|| {
+    populate_canon_typed(
+      &w.entries,
+      order,
+      w.captured_model.as_deref(),
+      w.file_type.as_deref(),
+      w.canon_lens_type,
+    )
+  });
+  (emissions, typed)
 }
 
 // ====================================================================// Exif value emission — applies a `Conv` to a `RawValue`
@@ -7775,6 +9184,11 @@ mod tests {
       no_raf: false,
       warn_count: 0,
       active_table: TableRef::Exif,
+      // The Canon DataMember pre-scan sets these when the white-box test drives
+      // `process_subdir(TableRef::Canon)`; a fresh walker starts with neither.
+      canon_focal_units: None,
+      canon_lens_type: None,
+      canon_focal_length_blob: None,
     }
   }
 
@@ -8280,6 +9694,2535 @@ mod tests {
       device_name_values(&meta),
       std::vec!["aux-early".to_string(), "aux-late".to_string()],
       "the position-1 block sorts before the EXIF block, the position-7 after"
+    );
+  }
+
+  // ====================================================================// Canon engine migration — Step A differential test (#243 phase 2)
+  //
+  // PROVES the shared `Walker`'s Canon LEAF path (`process_subdir` under
+  // `TableRef::Canon` → `emit_entry`'s `ResolvedConv::Canon` arm → `emit_canon_value`)
+  // is BYTE-IDENTICAL to the production `canon::parse_in_tiff` leaf rendering
+  // (`canon/mod.rs:1018`). The same crafted Canon MakerNote IFD bytes are run
+  // through BOTH paths; the emitted `(name, value, group, unknown)` tuples must
+  // match, in order. Production keeps `parse_in_tiff`, so this is the leaf-path
+  // proof WITHOUT switching production (conformance stays 416/0).
+  // ====================================================================
+
+  /// Push one little-endian 12-byte Canon IFD entry with an INLINE value
+  /// (`size <= 4`, stored at `entry+8`). Inline values resolve to the SAME
+  /// offset (`entry+8`) in both the shared walk (`walk_entry`) and the Canon
+  /// body walk (`classify_canon_entry`'s inline arm), so `read_value` reads the
+  /// identical bytes — the precondition for the leaf-path byte-identity this
+  /// test asserts. `value` is the up-to-4 value bytes (zero-padded to 4).
+  #[cfg(feature = "alloc")]
+  fn push_canon_entry(buf: &mut Vec<u8>, tag: u16, format: u16, count: u32, value: &[u8]) {
+    assert!(value.len() <= 4, "inline value must be <= 4 bytes");
+    buf.extend_from_slice(&tag.to_le_bytes());
+    buf.extend_from_slice(&format.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    let mut slot = [0u8; 4];
+    slot[..value.len()].copy_from_slice(value);
+    buf.extend_from_slice(&slot);
+  }
+
+  /// Build a crafted little-endian Canon MakerNote IFD holding ONLY plain leaf
+  /// tags (no sub-tables, no `0x28`/`0x96` special cases — those are Step B).
+  /// The chosen `%Canon::Main` leaves exercise: a `None` conv (string +
+  /// integer), the four hash/format PrintConvs (`DateStampMode`, `ColorSpace`,
+  /// `SerialNumberFormat`, `CanonModelID`), the model-conditional `SerialNumber`
+  /// list, and one `Unknown=>1` tag (`CanonFlashInfo`) to prove unknown-gating
+  /// flows identically.
+  #[cfg(feature = "alloc")]
+  fn crafted_canon_leaf_ifd() -> Vec<u8> {
+    // ASCII=2, int16u=3, int32u=4.
+    let entries: &[(u16, u16, u32, &[u8])] = &[
+      // 0x03 CanonFlashInfo — Unknown=>1, conv None (int16u=7). Suppressed.
+      (0x03, 3, 1, &[0x07, 0x00]),
+      // 0x07 CanonFirmwareVersion — ASCII, conv None. Inline "1.0\0".
+      (0x07, 2, 4, b"1.0\0"),
+      // 0x09 OwnerName — ASCII, conv None. Inline "Al\0\0".
+      (0x09, 2, 4, b"Al\0\0"),
+      // 0x0c SerialNumber — int32u, conditional SerialNumber conv (uses model).
+      (0x0c, 4, 1, &123_456u32.to_le_bytes()),
+      // 0x10 CanonModelID — int32u, ModelId hash lookup (0x412 = EOS M50).
+      (0x10, 4, 1, &0x0000_0412u32.to_le_bytes()),
+      // 0x15 SerialNumberFormat — int32u, hash PrintConv (0x90000000 ⇒ Format 1).
+      (0x15, 4, 1, &0x9000_0000u32.to_le_bytes()),
+      // 0x1c DateStampMode — int16u, hash PrintConv (2 ⇒ "Date & Time").
+      (0x1c, 3, 1, &[0x02, 0x00]),
+      // 0xb4 ColorSpace — int16u, hash PrintConv (1 ⇒ "sRGB").
+      (0xb4, 3, 1, &[0x01, 0x00]),
+    ];
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(tag, format, count, value) in entries {
+      push_canon_entry(&mut buf, tag, format, count, value);
+    }
+    // Next-IFD pointer word = 0 (no next IFD). A Canon MakerNote sub-IFD is
+    // walked with `kind = ExifIfd`, so `walk_one_ifd_body`'s `follows_chain` is
+    // false and this word is ignored — matching `walk_canon_in_tiff`, which also
+    // never follows the chain.
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf
+  }
+
+  /// Drive the shared `Walker` through `process_subdir` under `TableRef::Canon`
+  /// over `blob`, then render every collected entry through `emit_entry` (the
+  /// `ResolvedConv::Canon` arm → `emit_canon_value` for a leaf, or
+  /// `emit_canon_subtable` for a WALKED binary sub-table) into an
+  /// `EmittedTagSink`. Returns the emitted tags in walk order — the NEW path's
+  /// output. `model` threads the parent `$$self{Model}` and `file_type` the
+  /// container `$$self{FILE_TYPE}` exactly as production would.
+  ///
+  /// `process_subdir` runs the Canon DataMember pre-scan
+  /// ([`Walker::canon_prescan_datamembers`]) before the walk, so after it
+  /// returns `w.canon_focal_units` / `w.canon_lens_type` hold the captured
+  /// `$$self{FocalUnits}` / `$$self{LensType}` — threaded into the SAME
+  /// `emit_entry` the production re-emit uses, so the FocalLength/FileInfo
+  /// sub-tables decode against them (#243 phase 2 step B2).
+  #[cfg(feature = "alloc")]
+  fn drive_canon_subdir(
+    blob: &[u8],
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+    file_type: Option<&str>,
+  ) -> Vec<crate::emit::EmittedTag> {
+    let mut w = test_walker(blob);
+    w.order = order;
+    // The Canon `SerialNumber` PrintConv reads `$$self{Model}`; set it on the
+    // walker so the emit threads it (the differential oracle uses the SAME model).
+    w.captured_model = model.map(std::string::String::from);
+    // `kind = ExifIfd`: a non-Ifd0 kind, so the IFD0-only Make/Model capture tap
+    // never fires for the maker-note walk; the leaf group is overridden to
+    // `MakerNotes:Canon` regardless of kind. Fixed parent order, no FixBase,
+    // ProcessCanon (the hooks are inert for a plain in-bounds leaf IFD) — but the
+    // `TableRef::Canon` pre-scan hook DOES run, populating the DataMembers below.
+    w.process_subdir(
+      0,
+      IfdKind::ExifIfd,
+      TableRef::Canon,
+      ByteOrderRule::Fixed(order),
+      FixBaseMode::No,
+      ProcessProc::Canon,
+    );
+    // The DataMembers the pre-scan captured — thread them exactly as the Step C
+    // production switch will (the FocalLength/FileInfo emit reads them).
+    let canon_focal_units = w.canon_focal_units;
+    let canon_lens_type = w.canon_lens_type;
+    let canon_focal_length_blob = w.canon_focal_length_blob.clone();
+    let mut out: Vec<crate::emit::EmittedTag> = Vec::new();
+    let mut sink = EmittedTagSink::new(&mut out);
+    for entry in &w.entries {
+      let Ok(()) = emit_entry(
+        entry,
+        order,
+        print_conv,
+        model,
+        file_type,
+        canon_focal_units,
+        canon_lens_type,
+        canon_focal_length_blob.as_deref(),
+        &mut sink,
+      );
+    }
+    out
+  }
+
+  /// The leaf-path differential proof: for BOTH `-j` (PrintConv) and `-n`
+  /// (ValueConv), the shared `Walker` Canon leaf path emits the EXACT same
+  /// `(name, value, group="MakerNotes:Canon", unknown)` stream — in order — as
+  /// `canon::parse_in_tiff`. This is the byte-identity oracle for Step A.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_leaf_emit_matches_parse_in_tiff() {
+    let blob = crafted_canon_leaf_ifd();
+    let order = ByteOrder::Little;
+    // A model that exercises the `EOS-1D` SerialNumber branch (`%.6u`,
+    // `Canon.pm:1295`) — proving the model threads through `emit_canon_value`.
+    let model = Some("Canon EOS-1D Mark IV");
+
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_in_tiff` (renders leaves at collection). The
+      // blob IS the whole TIFF here (`mn_offset = 0`, inline values resolve within
+      // it); `file_type = None` (irrelevant to these leaves).
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+
+      // ---- New path: shared Walker → emit_canon_value.
+      let emitted = drive_canon_subdir(&blob, order, print_conv, model, None);
+
+      // Both streams are in IFD-tag order (ascending), so compare position-wise.
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: leaf COUNT must match \
+         (every plain leaf the oracle emits, the shared path emits)"
+      );
+      for (i, (got, want)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        let tag = got.tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: NAME mismatch"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): rendered VALUE mismatch \
+           (the new path must apply CanonPrintConv exactly as parse_in_tiff)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} leaf #{i} ({}): Unknown flag mismatch \
+           (it must ride the EmittedTag for the engine's central drop)",
+          want.name()
+        );
+        // The vendor group OVERRIDE — every Canon leaf is `MakerNotes:Canon`,
+        // NOT the kind-derived `ExifIFD` group.
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} leaf #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Canon",
+          "print_conv={print_conv} leaf #{i} ({}): family-1 must be Canon",
+          want.name()
+        );
+      }
+    }
+  }
+
+  /// The crafted blob carries the `Unknown=>1` `CanonFlashInfo` (0x03), and the
+  /// differential stream INCLUDES it with `unknown=true` on BOTH sides (the
+  /// shared engine's `run_emission` is what drops it later — neither leaf path
+  /// pre-filters). Asserting it is present-and-flagged proves the unknown flag
+  /// flows identically (not silently dropped early by the new path).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_leaf_unknown_flag_flows_like_parse_in_tiff() {
+    let blob = crafted_canon_leaf_ifd();
+    let order = ByteOrder::Little;
+    let emitted = drive_canon_subdir(&blob, order, true, None, None);
+    let flash = emitted
+      .iter()
+      .find(|t| t.tag().name() == "CanonFlashInfo")
+      .expect("CanonFlashInfo (0x03) must be emitted (pre-drop) by the new path");
+    assert!(
+      flash.unknown(),
+      "CanonFlashInfo carries Unknown=>1 — the flag must ride the EmittedTag \
+       so run_emission drops it centrally, NOT a per-path pre-filter"
+    );
+  }
+
+  /// The group OVERRIDE is scoped to the vendor table: `vendor_group1_of` is
+  /// `Some(\"Canon\")` for `Canon` and `None` for every core IFD table — so the
+  /// Exif/GPS/Interop leaf group derivation is UNCHANGED (the byte-identity the
+  /// conformance suite enforces).
+  #[test]
+  fn vendor_group1_override_is_canon_only() {
+    assert_eq!(vendor_group1_of(TableRef::Canon), Some("Canon"));
+    assert_eq!(vendor_group1_of(TableRef::Exif), None);
+    assert_eq!(vendor_group1_of(TableRef::Interop), None);
+    #[cfg(feature = "gps")]
+    assert_eq!(vendor_group1_of(TableRef::Gps), None);
+  }
+
+  // ====================================================================// Canon engine migration — Step B1 differential test (#243 phase 2)
+  //
+  // PROVES the shared `Walker`'s SIMPLE binary sub-table path (`process_subdir`
+  // under `TableRef::Canon` → `emit_entry`'s `ResolvedConv::Canon` SubDirectory
+  // arm → `emit_canon_subtable`) is BYTE-IDENTICAL to the production
+  // `canon::parse_in_tiff` SubDirectory dispatch (`canon/mod.rs:824-911`) for
+  // the no-DataMember / no-2-pass tables (ShotInfo / AFInfo / AFInfo2 / AFInfo3
+  // / SensorInfo / ColorBalance). The same crafted Canon Main IFD — carrying an
+  // OUT-OF-LINE ShotInfo (0x04) record AND an OUT-OF-LINE AFInfo (0x12) record
+  // PLUS plain inline leaves — is run through BOTH paths; the emitted
+  // `(name, value, group, unknown)` tuples must match, in order, for `-j` AND
+  // `-n`. Production keeps `parse_in_tiff`, so conformance stays 416/0.
+  // ====================================================================
+
+  /// Build a crafted little-endian Canon Main IFD mixing INLINE leaves and
+  /// OUT-OF-LINE binary sub-table records. `entries` is `(tag, format, count,
+  /// inline_value_or_empty, out_of_line_bytes_or_empty)`: an entry is inline
+  /// when `out_of_line` is empty (value zero-padded to 4 bytes at `entry+8`),
+  /// else out-of-line (the 4 bytes at `entry+8` are the blob-relative offset and
+  /// `out_of_line` holds the value bytes).
+  ///
+  /// Out-of-line value data is appended AFTER the next-IFD word, so every value
+  /// offset is `>= dir_end + 4` — past the directory extent
+  /// (`dir_end == 2 + 12*N`) — and so is NOT flagged `Suspicious` by either
+  /// walker (`off < dir_end` is false). The body walker (`walk_canon_in_tiff`,
+  /// `mn_offset = 0`) and the shared `Walker` (`process_subdir(0, …)`,
+  /// `base = 0`) both resolve offsets blob-relative, so they read the IDENTICAL
+  /// value bytes — the precondition for the sub-table byte-identity this test
+  /// asserts. Total out-of-line length stays even (int16 arrays), keeping
+  /// `data_len - dir_end` clear of the body walker's `1`/`3` `Illegal directory`
+  /// tail check.
+  #[cfg(feature = "alloc")]
+  fn crafted_canon_subtable_ifd(entries: &[(u16, u16, u32, &[u8], &[u8])]) -> Vec<u8> {
+    let n = entries.len();
+    // Header (2) + entries (12*N) + next-IFD word (4) = where value data starts.
+    let value_base = 2 + 12 * n + 4;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(n as u16).to_le_bytes());
+    let mut next_value_off = value_base;
+    // Collect the out-of-line payloads in entry order to append after the header.
+    let mut payloads: Vec<&[u8]> = Vec::new();
+    for &(tag, format, count, inline, out_of_line) in entries {
+      buf.extend_from_slice(&tag.to_le_bytes());
+      buf.extend_from_slice(&format.to_le_bytes());
+      buf.extend_from_slice(&count.to_le_bytes());
+      if out_of_line.is_empty() {
+        // Inline value (<= 4 bytes), zero-padded to the 4-byte slot.
+        assert!(inline.len() <= 4, "inline value must be <= 4 bytes");
+        let mut slot = [0u8; 4];
+        slot[..inline.len()].copy_from_slice(inline);
+        buf.extend_from_slice(&slot);
+      } else {
+        // Out-of-line: store the blob-relative offset; stage the payload.
+        buf.extend_from_slice(&(next_value_off as u32).to_le_bytes());
+        next_value_off += out_of_line.len();
+        payloads.push(out_of_line);
+      }
+    }
+    // Next-IFD pointer word = 0 (ExifIfd-kind walk never follows the chain).
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    for p in payloads {
+      buf.extend_from_slice(p);
+    }
+    buf
+  }
+
+  /// Encode an `i16` word array as little-endian bytes — a Canon binary
+  /// sub-table record (`int16s`, the on-disk `$$valPt`).
+  #[cfg(feature = "alloc")]
+  fn i16_words_le(words: &[i16]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(words.len() * 2);
+    for &w in words {
+      v.extend_from_slice(&w.to_le_bytes());
+    }
+    v
+  }
+
+  /// The sub-table differential proof: for BOTH `-j` (PrintConv) and `-n`
+  /// (ValueConv), the shared `Walker` SIMPLE sub-table path emits the EXACT same
+  /// `(name, value, group="MakerNotes:Canon", unknown)` stream — in order — as
+  /// `canon::parse_in_tiff`, for a crafted IFD holding a ShotInfo (0x04) record,
+  /// an AFInfo (0x12) record, and two plain leaves. This is the byte-identity
+  /// oracle for Step B1.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_subtable_emit_matches_parse_in_tiff() {
+    // EOS 300D fixture vectors (the real-input records the sub-parser unit tests
+    // use): a 33-word ShotInfo and a 24-word AFInfo, both `int16s`. The 300D
+    // model threads into ShotInfo position 22 (the non-350D branch) AND AFInfo
+    // (EOS → serial stops before PrimaryAFPoint) — so model-threading is
+    // meaningfully exercised, not inert.
+    let shot_info_words: [i16; 33] = [
+      66, 0, 160, -200, 244, -32768, 0, 0, 3, 0, 8, 8, 0, 0, 0, 0, 0, 0, 1, -1, 546, 244, -224, 38,
+      40, 0, 252, 0, -1, 0, 0, 0, 0,
+    ];
+    let af_info_words: [i16; 24] = [
+      7, 7, 3072, 2048, 3072, 2048, 151, 151, // scalars 0-7
+      1014, 608, 0, 0, 0, -608, -1014, // AFAreaXPositions[7]
+      0, 0, -506, 0, 506, 0, 0,  // AFAreaYPositions[7]
+      0,  // AFPointsInFocus[1]
+      -1, // trailing (EOS stops before consuming)
+    ];
+    let shot_info = i16_words_le(&shot_info_words);
+    let af_info = i16_words_le(&af_info_words);
+    // int16s=8, ASCII=2, int16u=3. Tag order ascending (the IFD walk order).
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x04 ShotInfo — SubDirectory, int16s[33], OUT-OF-LINE.
+      (0x04, 8, shot_info_words.len() as u32, &[], &shot_info),
+      // 0x07 CanonFirmwareVersion — ASCII, conv None. Inline "1.0\0".
+      (0x07, 2, 4, b"1.0\0", &[]),
+      // 0x12 AFInfo — SubDirectory, int16s[24], OUT-OF-LINE.
+      (0x12, 8, af_info_words.len() as u32, &[], &af_info),
+      // 0xb4 ColorSpace — int16u, hash PrintConv (1 ⇒ "sRGB"). Inline.
+      (0xb4, 3, 1, &[0x01, 0x00], &[]),
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("EOS Digital Rebel / 300D / Kiss Digital");
+    // `file_type = None` (these 300D records don't take the ShotInfo CRW
+    // clause); threaded identically on both sides so the comparison is fair.
+    let file_type = None;
+
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_in_tiff` (renders sub-tables at
+      // collection via the SubDirectory dispatch). The blob IS the whole TIFF
+      // (`mn_offset = 0`), so out-of-line offsets resolve within it.
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        file_type,
+      );
+
+      // ---- New path: shared Walker → emit_canon_subtable (+ emit_canon_value
+      // for the plain leaves).
+      let emitted = drive_canon_subdir(&blob, order, print_conv, model, file_type);
+
+      // Both streams are in IFD-tag order, each sub-table expanded in its
+      // BinaryData position order at the parent tag's slot — compare position-wise.
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: emission COUNT must match \
+         (every sub-table position + plain leaf the oracle emits, the shared \
+         path emits — and NONE extra)"
+      );
+      // The crafted blob MUST actually exercise the sub-tables (guard against a
+      // future refactor silently turning these into no-ops).
+      assert!(
+        oracle.iter().any(|e| e.name() == "AutoISO"),
+        "the ShotInfo (0x04) record must decode (AutoISO is position 1)"
+      );
+      assert!(
+        oracle.iter().any(|e| e.name() == "NumAFPoints"),
+        "the AFInfo (0x12) record must decode (NumAFPoints is position 0)"
+      );
+      for (i, (got, want)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        let tag = got.tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} position #{i}: NAME mismatch \
+           (sub-table position order must match parse_in_tiff)"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} position #{i} ({}): rendered VALUE mismatch \
+           (the new path must reserialize + run the sub-parser exactly as \
+           parse_in_tiff)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} position #{i} ({}): Unknown flag mismatch \
+           (sub-table positions are never Unknown — both must emit false)",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} position #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Canon",
+          "print_conv={print_conv} position #{i} ({}): family-1 must be Canon",
+          want.name()
+        );
+      }
+    }
+  }
+
+  /// The AFInfo2 (0x26) `Condition => '$$valPt !~ /^\0\0\0\0/'` skip
+  /// (`Canon.pm:1713`) is preserved on the emit path: an all-zero first four
+  /// bytes means the SubDirectory is NOT entered and the shared `Walker` emits
+  /// NOTHING for it — byte-identical to `parse_in_tiff` (which also emits
+  /// nothing). The differential count comparison covers the positive case; this
+  /// pins the skip explicitly on BOTH paths.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_af_info2_first4_zero_skip_matches_parse_in_tiff() {
+    // A 0x26 record whose first four bytes (NumAFPoints + ValidAFPoints) are all
+    // zero — the all-zero MOV-thumbnail record Canon.pm:1713 skips. Pad to a
+    // realistic length so only the `Condition`, not a short-blob accident,
+    // governs.
+    let af_info2_words = [0i16; 20];
+    let af_info2 = i16_words_le(&af_info2_words);
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x07 CanonFirmwareVersion — a plain leaf to anchor a non-empty stream.
+      (0x07, 2, 4, b"1.0\0", &[]),
+      // 0x26 AFInfo2 — SubDirectory, int16s[20], first 4 bytes all zero.
+      (0x26, 8, af_info2_words.len() as u32, &[], &af_info2),
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+
+    for print_conv in [true, false] {
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        None,
+        None,
+      );
+      let emitted = drive_canon_subdir(&blob, order, print_conv, None, None);
+      // The 0x26 all-zero record contributes NOTHING on either side: only the
+      // CanonFirmwareVersion leaf survives.
+      assert_eq!(
+        oracle.len(),
+        1,
+        "print_conv={print_conv}: the all-zero AFInfo2 must be skipped by \
+         parse_in_tiff (only the firmware leaf remains)"
+      );
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: the shared Walker must ALSO skip the all-zero \
+         AFInfo2 (the 0x26 first4-zero Condition holds on the emit path)"
+      );
+      assert!(
+        emitted.iter().all(|t| t.tag().name() != "NumAFPoints"),
+        "no AFInfo2 position may be emitted for the all-zero 0x26 record"
+      );
+    }
+  }
+
+  // ====================================================================// Canon engine migration — Step B2 differential test (#243 phase 2)
+  //
+  // PROVES the shared `Walker`'s DataMember 2-pass (CameraSettings 0x01 →
+  // `$$self{FocalUnits}`/`$$self{LensType}` → FocalLength 0x02 + FileInfo 0x93),
+  // routed through the pre-scan ([`Walker::canon_prescan_datamembers`]) + the
+  // emit dispatch (`emit_canon_subtable`), is BYTE-IDENTICAL to the production
+  // `canon::parse_in_tiff` pre-pass + SubDirectory dispatch (`canon/mod.rs:707-
+  // 911`). A crafted Canon Main IFD carries an OUT-OF-LINE CameraSettings (0x01)
+  // with a position-25 FocalUnits AND a position-22 LensType, an OUT-OF-LINE
+  // FocalLength (0x02) whose `FocalLength` output DEPENDS on FocalUnits, and an
+  // OUT-OF-LINE FileInfo (0x93) whose `MacroMagnification` output DEPENDS on
+  // LensType — so a broken DataMember thread would DIVERGE. Run through BOTH
+  // paths; the emitted `(name, value, group, unknown)` tuples must match, in
+  // order, for `-j` AND `-n`. Production keeps `parse_in_tiff`, so conformance
+  // stays 416/0.
+  // ====================================================================
+
+  /// Encode a `u16` word array as little-endian bytes — a FocalLength
+  /// (`int16u`) on-disk `$$valPt`.
+  #[cfg(feature = "alloc")]
+  fn u16_words_le(words: &[u16]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(words.len() * 2);
+    for &w in words {
+      v.extend_from_slice(&w.to_le_bytes());
+    }
+    v
+  }
+
+  /// The DataMember 2-pass differential proof: for BOTH `-j` and `-n`, the
+  /// shared `Walker`'s pre-scan + emit path threads `$$self{FocalUnits}` and
+  /// `$$self{LensType}` from CameraSettings into FocalLength and FileInfo
+  /// byte-identically to `canon::parse_in_tiff`.
+  ///
+  /// The crafted vectors make the dependency LOAD-BEARING:
+  /// - CameraSettings (0x01) word 22 (`LensType`) = 124 (MP-E 65mm) and word 25
+  ///   (`FocalUnits`) = 10 (also words 23/24 = 550/180 for MaxFocalLength /
+  ///   MinFocalLength = 55 mm / 18 mm).
+  /// - FocalLength (0x02) word 1 (`FocalLength` raw) = 550 ⇒ `550 / FocalUnits(10)`
+  ///   = "55 mm". A broken FocalUnits thread (defaulting to 1) would render
+  ///   "550 mm" — a DIVERGENCE.
+  /// - FileInfo (0x93) word 16 (`MacroMagnification`) = 75 ⇒ emitted ONLY because
+  ///   `$$self{LensType} == 124`; a broken LensType thread would SUPPRESS it (a
+  ///   count + content DIVERGENCE). The model `Canon EOS 20D` additionally
+  ///   exercises the FileInfo position-1 conditional `FileNumber` decode.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_datamember_two_pass_emit_matches_parse_in_tiff() {
+    use crate::value::TagValue;
+    // ---- CameraSettings (0x01), int16s. Word 0 is the blob byte-length (the
+    // `Canon::Validate` word); data words start at position 1. 26 words reach
+    // position 25 (FocalUnits).
+    let mut cs_words = [0i16; 26];
+    cs_words[0] = (cs_words.len() * 2) as i16; // 52-byte blob length word
+    cs_words[22] = 124; // LensType = MP-E 65mm (the MacroMagnification gate)
+    cs_words[23] = 550; // MaxFocalLength raw ⇒ 55 mm (÷ FocalUnits 10)
+    cs_words[24] = 180; // MinFocalLength raw ⇒ 18 mm
+    cs_words[25] = 10; // FocalUnits (the FocalLength divisor)
+    let camera_settings = i16_words_le(&cs_words);
+
+    // ---- FocalLength (0x02), int16u. [FocalType=2 ("Zoom"), FocalLength=550,
+    // FocalPlaneXSize=0, FocalPlaneYSize=0]. With FocalUnits=10 ⇒ "55 mm";
+    // positions 2/3 are 0 (< 40 RawConv threshold) so they never emit.
+    let fl_words: [u16; 4] = [2, 550, 0, 0];
+    let focal_length = u16_words_le(&fl_words);
+
+    // ---- FileInfo (0x93), int16s. Position 1 is an int32u (bytes 2-5); the
+    // 20D `FileNumber` vector 0x00451D87 ⇒ "118-1861". Word 16
+    // (`MacroMagnification`) = 75 ⇒ "1.0x" (only with LensType 124). 17 words
+    // (34 bytes) reach position 16.
+    let mut fi_words = [0i16; 17];
+    fi_words[16] = 75; // MacroMagnification raw 75 ⇒ exp(0) = 1.0 ⇒ "1.0x"
+    let mut file_info = i16_words_le(&fi_words);
+    // Overlay the position-1 int32u FileNumber (bytes 2..6, LE 0x00451D87).
+    file_info[2..6].copy_from_slice(&0x0045_1D87u32.to_le_bytes());
+
+    // int16s=8, int16u=3. Tag order ascending (the IFD walk order): 0x01, 0x02,
+    // 0x93 — CameraSettings precedes FocalLength/FileInfo, but the pre-scan
+    // resolves the DataMembers regardless of order.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x01, 8, cs_words.len() as u32, &[], &camera_settings),
+      (0x02, 3, fl_words.len() as u32, &[], &focal_length),
+      (0x93, 8, fi_words.len() as u32, &[], &file_info),
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    // `Canon EOS 20D`: NOT a MacroMagnification-excluded body (40D/450D/REBEL
+    // XSi/Kiss X2), so position 16 emits; AND it keys the FileInfo position-1
+    // `FileNumber` conditional — exercising the model thread on BOTH sub-tables.
+    let model = Some("Canon EOS 20D");
+    let file_type = None;
+
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_in_tiff` (pre-pass captures FocalUnits +
+      // LensType, then the SubDirectory dispatch threads them). The blob IS the
+      // whole TIFF (`mn_offset = 0`), so out-of-line offsets resolve within it.
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        file_type,
+      );
+
+      // ---- New path: shared Walker pre-scan + emit_canon_subtable.
+      let emitted = drive_canon_subdir(&blob, order, print_conv, model, file_type);
+
+      // The crafted blob MUST actually exercise the DataMember dependency —
+      // guard against a future refactor silently turning these into no-ops. The
+      // FocalUnits-scaled FocalLength is "55 mm" (`-j`) / `55.0` (`-n`); EITHER
+      // shape proves `550 ÷ FocalUnits(10)` ran (a broken thread would yield
+      // "550 mm" / `550.0`).
+      let want_focal = if print_conv {
+        TagValue::Str("55 mm".into())
+      } else {
+        TagValue::F64(55.0)
+      };
+      assert!(
+        oracle
+          .iter()
+          .any(|e| e.name() == "FocalLength" && e.value() == &want_focal),
+        "print_conv={print_conv}: FocalLength must decode to 55 mm (550 ÷ \
+         FocalUnits 10) — the FocalUnits DataMember thread; got {oracle:?}"
+      );
+      assert!(
+        oracle.iter().any(|e| e.name() == "MacroMagnification"),
+        "MacroMagnification (FileInfo pos 16) must emit — proving the LensType \
+         == 124 DataMember thread reached FileInfo; got {oracle:?}"
+      );
+      assert!(
+        oracle.iter().any(|e| e.name() == "FileNumber"),
+        "FileNumber (FileInfo pos 1, 20D) must emit — proving the model thread"
+      );
+
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: emission COUNT must match (every DataMember-\
+         threaded sub-table position the oracle emits, the shared path emits — \
+         and NONE extra)"
+      );
+      for (i, (got, want)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        let tag = got.tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} position #{i}: NAME mismatch \
+           (DataMember 2-pass position order must match parse_in_tiff)"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} position #{i} ({}): rendered VALUE mismatch \
+           (the new path must thread FocalUnits/LensType exactly as the \
+           parse_in_tiff pre-pass)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} position #{i} ({}): Unknown flag mismatch",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} position #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Canon",
+          "print_conv={print_conv} position #{i} ({}): family-1 must be Canon",
+          want.name()
+        );
+      }
+    }
+  }
+
+  /// The DataMember thread is LOAD-BEARING: feeding the FocalLength / FileInfo
+  /// sub-tables a `None`/`None` DataMember pair (the bug a broken pre-scan would
+  /// cause) DIVERGES from `parse_in_tiff` — FocalLength renders "550 mm" instead
+  /// of "55 mm", and MacroMagnification disappears. This pins that the
+  /// differential above would actually CATCH a regression (guards against the
+  /// test passing vacuously).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_datamember_thread_is_load_bearing() {
+    use crate::value::TagValue;
+    // FocalLength (0x02): FocalType=2, FocalLength raw 550.
+    let fl_words: [u16; 4] = [2, 550, 0, 0];
+    let focal_length = u16_words_le(&fl_words);
+    let raw_fl = RawValue::U64(fl_words.iter().map(|&w| u64::from(w)).collect());
+
+    // ---- Correct thread (FocalUnits = Some(10)) ⇒ "55 mm".
+    let mut out_correct: Vec<crate::emit::EmittedTag> = Vec::new();
+    {
+      let mut sink = EmittedTagSink::new(&mut out_correct);
+      let Ok(()) = emit_canon_subtable(
+        "Canon",
+        makernotes::vendors::canon::tags::SubTable::FocalLength,
+        &raw_fl,
+        ByteOrder::Little,
+        /* print_conv */ true,
+        Some("Canon EOS 20D"),
+        None,
+        /* canon_focal_units */ Some(10),
+        /* canon_lens_type */ Some(124),
+        /* canon_focal_length_blob */ Some(focal_length.as_slice()),
+        &mut sink,
+      );
+    }
+    assert!(
+      out_correct.iter().any(|t| t.tag().name() == "FocalLength"
+        && t.tag().value_ref() == &TagValue::Str("55 mm".into())),
+      "with FocalUnits=10 the shared emit must render 55 mm: {out_correct:?}"
+    );
+
+    // ---- Broken thread (FocalUnits = None ⇒ divisor 1) ⇒ "550 mm" — the
+    // DIVERGENCE the differential above would catch.
+    let mut out_broken: Vec<crate::emit::EmittedTag> = Vec::new();
+    {
+      let mut sink = EmittedTagSink::new(&mut out_broken);
+      let Ok(()) = emit_canon_subtable(
+        "Canon",
+        makernotes::vendors::canon::tags::SubTable::FocalLength,
+        &raw_fl,
+        ByteOrder::Little,
+        true,
+        Some("Canon EOS 20D"),
+        None,
+        /* canon_focal_units */ None,
+        None,
+        /* canon_focal_length_blob */ Some(focal_length.as_slice()),
+        &mut sink,
+      );
+    }
+    assert!(
+      out_broken.iter().any(|t| t.tag().name() == "FocalLength"
+        && t.tag().value_ref() == &TagValue::Str("550 mm".into())),
+      "with FocalUnits=None the divisor is 1 ⇒ 550 mm (the regression signature): \
+       {out_broken:?}"
+    );
+    // The FocalLength arm now decodes the pre-scanned `canon_focal_length_blob`
+    // (passed as `focal_length` above), NOT the `raw_fl` entry value — so neither
+    // varies the on-disk bytes; only the DataMember thread differs.
+    let _ = &raw_fl;
+  }
+
+  /// A count-0 `CanonCameraSettings` (0x01) followed by a `CanonFocalLength`
+  /// (0x02) — the #243 phase 2 R6 scenario. ExifTool `ProcessExif` reads
+  /// `$count * $formatSize` on-disk bytes (`Exif.pm:6502`); for count 0 that is
+  /// `$size == 0`, so `ReadValue` returns `undef` (`Exif.pm:6285-6288`) — the
+  /// CameraSettings SubDirectory is NEVER processed, so it emits NO positions AND
+  /// sets NO `$$self{FocalUnits}` DataMember. A following FocalLength therefore
+  /// scales by the DEFAULT divisor (1) ⇒ "550 mm", NOT by a bogus unit over-read
+  /// from the count-0 entry's trailing bytes.
+  ///
+  /// LOAD-BEARING on BOTH count-based fixes (a regression to the old EOF-bound
+  /// reads makes this FAIL):
+  /// - The oracle `walk_canon_in_tiff` (`body.rs`) — its former EOF-bound `avail`
+  ///   read expanded the count-0 entry from the trailing buffer and emitted
+  ///   CameraSettings positions the shared `Walker` never does (a COUNT mismatch).
+  /// - The pre-scan (`canon_prescan_datamembers`) — its former EOF-bound read
+  ///   captured `FocalUnits` = 10 from the decoy word at blob offset 60 (word 25
+  ///   of the count-0 entry's over-read from `entry+8` == offset 10), scaling
+  ///   FocalLength to "55 mm" — a VALUE mismatch vs the oracle's "550 mm".
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_count_zero_camera_settings_does_not_leak_like_parse_in_tiff() {
+    use crate::value::TagValue;
+    // FocalLength (0x02), int16u, padded to 16 words so the blob reaches offset
+    // 62. Word 0 = FocalType 2, word 1 = FocalLength raw 550. Word 15 = 10 lands
+    // at blob offset 60 = word 25 of the count-0 0x01 entry's (`entry+8` == offset
+    // 10) EOF-bound over-read — the bogus `FocalUnits` the OLD pre-scan would
+    // capture. The FocalLength sub-table reads only words 0..4, so the decoy never
+    // affects FocalLength's own decode (positions 2/3 = 0 ⇒ suppressed).
+    let mut fl_words = [0u16; 16];
+    fl_words[0] = 2;
+    fl_words[1] = 550;
+    fl_words[15] = 10;
+    let focal_length = u16_words_le(&fl_words);
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // count-0 CameraSettings FIRST (the pre-scan reads 0x01 before 0x02).
+      (0x01, 8, 0, &[], &[]),
+      (0x02, 3, fl_words.len() as u32, &[], &focal_length),
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    assert_eq!(
+      blob.len(),
+      62,
+      "blob layout: the decoy FocalUnits must land at offset 60"
+    );
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D");
+
+    for print_conv in [true, false] {
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let emitted = drive_canon_subdir(&blob, order, print_conv, model, None);
+
+      // FocalLength scaled by the DEFAULT divisor (1) ⇒ 550 — proving the count-0
+      // CameraSettings set no FocalUnits (a leak would yield "55 mm" / 55.0).
+      let want_focal = if print_conv {
+        TagValue::Str("550 mm".into())
+      } else {
+        TagValue::F64(550.0)
+      };
+      assert!(
+        oracle
+          .iter()
+          .any(|e| e.name() == "FocalLength" && e.value() == &want_focal),
+        "print_conv={print_conv}: FocalLength must be 550 mm (default divisor — the \
+         count-0 CameraSettings leaked no FocalUnits); got {oracle:?}"
+      );
+      // No CameraSettings position (e.g. MacroMode, position 1) leaked into the
+      // stream from the count-0 entry.
+      assert!(
+        !oracle.iter().any(|e| e.name() == "MacroMode"),
+        "print_conv={print_conv}: a count-0 CameraSettings must emit NO positions \
+         (e.g. MacroMode); got {oracle:?}"
+      );
+
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: shared Walker emission COUNT must match \
+         parse_in_tiff (count-0 CameraSettings contributes nothing on either side)"
+      );
+      for (i, (got, want)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        let tag = got.tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} #{i}: NAME"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} #{i} ({}): VALUE",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} #{i} ({}): Unknown",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Canon",
+          "print_conv={print_conv} #{i} ({}): family-1",
+          want.name()
+        );
+      }
+    }
+  }
+
+  /// A crafted Canon leaf with on-disk format `undef` + count 1 — the
+  /// `$formatStr = 'int8u' if $format == 7 and $count == 1` carve-out
+  /// (`Exif.pm:6644`) the shared `Walker` applies in `walk_entry`. The retired
+  /// oracle `walk_canon_in_tiff` now mirrors it (#243 phase 2 R6 audit of the
+  /// generic core read rules reachable under `TableRef::Canon`), so a single
+  /// `undef` byte decodes as an int8u in BOTH paths — here `DateStampMode` (0x1c)
+  /// byte 2 ⇒ the hash render "Date & Time", NOT a raw-byte blob. Real Canon
+  /// leaves are never `undef[1]`; this pins the crafted-edge consistency.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_undef_count1_leaf_coerces_int8u_like_parse_in_tiff() {
+    use crate::value::TagValue;
+    // 0x1c DateStampMode, on-disk format undef (7), count 1, inline byte 2.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[(0x1c, 7, 1, &[0x02], &[])];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D");
+
+    for print_conv in [true, false] {
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let emitted = drive_canon_subdir(&blob, order, print_conv, model, None);
+
+      // The int8u carve-out ⇒ DateStampMode hash key 2 ⇒ "Date & Time" (`-j`); a
+      // raw-`undef`-bytes decode would NOT key the int hash. The `-n` shape is
+      // pinned by the production-vs-oracle equality below (both coerce identically).
+      if print_conv {
+        assert!(
+          oracle.iter().any(
+            |e| e.name() == "DateStampMode" && e.value() == &TagValue::Str("Date & Time".into())
+          ),
+          "undef[1] DateStampMode must coerce to int8u 2 ⇒ Date & Time; got {oracle:?}"
+        );
+      }
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: shared Walker emission must match parse_in_tiff \
+         for an undef[1] leaf"
+      );
+      for (i, (got, w)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(got.tag().name(), w.name(), "#{i} name");
+        assert_eq!(
+          got.tag().value_ref(),
+          w.value(),
+          "#{i} ({}) value",
+          w.name()
+        );
+      }
+    }
+  }
+
+  /// R9 (excessive-count guard): a crafted IN-BOUNDS Canon leaf with `count >
+  /// 100000` is SKIPPED — matching ExifTool's `ProcessExif` excessive-count guard
+  /// (`Exif.pm:6760-6770`), which has NO `$inMakerNotes` exemption and so applies
+  /// to `%Canon::Main`. The shared `Walker` (production) applies it in `walk_entry`;
+  /// the oracle `walk_canon_in_tiff` + the DataMember pre-scan now mirror it. So a
+  /// `CanonModelID` (0x10) written with `count = 100001` emits NOTHING and
+  /// populates no typed `model_id` — and a NORMAL leaf after it (OwnerName) STILL
+  /// emits, proving the walk CONTINUES past the skip (the guard is `next`, not
+  /// abort). Before the alignment, `parse_in_tiff` DECODED the over-count leaf — a
+  /// public JSON + typed-API divergence (this test is LOAD-BEARING on both: the
+  /// emission count + the `model_id == None` assertions fail without the fix).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_excessive_count_leaf_skipped_like_parse_in_tiff() {
+    // 0x10 CanonModelID, on-disk int8u (1), count 100001 (> 100000), OUT-OF-LINE
+    // (100001 filler bytes — exactly in-bounds, so the entry classifies `Read` and
+    // REACHES the excessive-count guard, which skips it before the value is read).
+    // Then 0x09 OwnerName, ASCII, count 4, inline — a NORMAL leaf the walk must
+    // still reach AFTER the skip.
+    let over_count: u32 = 100_001;
+    let filler = std::vec![0u8; over_count as usize];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x10, 1, over_count, &[], &filler), // int8u, excessive count, out-of-line
+      (0x09, 2, 4, b"Al\0\0", &[]),        // OwnerName, normal inline leaf
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D");
+
+    for print_conv in [true, false] {
+      let (otyped, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let (emi, typed) =
+        canon_makernote_isolated(&blob, 0, blob.len(), order, model, None, print_conv);
+
+      // The excessive-count CanonModelID (0x10) is SKIPPED in BOTH paths.
+      assert!(
+        !oracle.iter().any(|e| e.name() == "CanonModelID"),
+        "print_conv={print_conv}: count>100000 CanonModelID must be SKIPPED \
+         (Exif.pm:6760 excessive-count guard); oracle={:?}",
+        oracle
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      // The NORMAL leaf after it still emits — the walk continued past the skip.
+      assert!(
+        emi.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: OwnerName (after the skipped leaf) MUST emit — \
+         the excessive-count guard is `next`, not abort"
+      );
+      // Emission byte-parity: production (shared Walker) == oracle.
+      assert_eq!(
+        emi.len(),
+        oracle.len(),
+        "print_conv={print_conv}: shared Walker emission must match parse_in_tiff \
+         (both skip the count>100000 leaf)"
+      );
+      for (i, (g, w)) in emi.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv} #{i}: name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv} #{i}: value");
+      }
+      // TYPED parity: the skipped 0x10 populates NO `model_id` in EITHER path.
+      assert_eq!(
+        otyped.model_id(),
+        None,
+        "print_conv={print_conv}: parse_in_tiff typed model_id must be None \
+         (the count>100000 CanonModelID was skipped, not decoded)"
+      );
+      if print_conv {
+        assert_eq!(
+          typed.expect("print_conv yields the typed slot").model_id(),
+          None,
+          "the shared-Walker typed model_id must ALSO be None (no silent divergence)"
+        );
+      }
+    }
+  }
+
+  /// R10: the excessive-count guard EXEMPTS `undef`/`string` formats (the
+  /// `$formatStr !~ /^(undef|string|binary)$/` predicate, `Exif.pm:6760`). A
+  /// crafted `CanonFocalLength` (0x02) mis-written as `undef[100001]` (the ON-DISK
+  /// format) is therefore DECODED — not skipped — by the emission walk AND the
+  /// pre-scan + oracle. Pins that the pre-scan's `count > 100000` skip matches the
+  /// guard PREDICATE: an UNCONDITIONAL skip (the R9 form) dropped the focal-length
+  /// blob the emit walk still reads, so FocalLength vanished. The undef value's
+  /// first words encode FocalLength raw 550 ⇒ "550 mm" (no FocalUnits 0x01 here, so
+  /// the divisor is 1).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_excessive_count_undef_focal_length_decoded_like_parse_in_tiff() {
+    use crate::value::TagValue;
+    let over_count: u32 = 100_001;
+    let mut value = std::vec![0u8; over_count as usize];
+    value[0..2].copy_from_slice(&2u16.to_le_bytes()); // FocalType
+    value[2..4].copy_from_slice(&550u16.to_le_bytes()); // FocalLength raw 550
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x02, 7, over_count, &[], &value), // undef, excessive count, out-of-line
+      (0x09, 2, 4, b"Al\0\0", &[]),       // OwnerName, normal leaf
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D");
+
+    for print_conv in [true, false] {
+      let (_otyped, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let (emi, _typed) =
+        canon_makernote_isolated(&blob, 0, blob.len(), order, model, None, print_conv);
+      // The undef 0x02 is DECODED (NOT skipped) — FocalLength emits from the blob.
+      let want = if print_conv {
+        TagValue::Str("550 mm".into())
+      } else {
+        TagValue::F64(550.0)
+      };
+      assert!(
+        oracle
+          .iter()
+          .any(|e| e.name() == "FocalLength" && e.value() == &want),
+        "print_conv={print_conv}: an undef[100001] 0x02 is EXEMPT from the \
+         excessive-count guard ⇒ FocalLength 550; oracle={:?}",
+        oracle
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      assert_eq!(
+        emi.len(),
+        oracle.len(),
+        "print_conv={print_conv}: production emission must match parse_in_tiff"
+      );
+      for (i, (g, w)) in emi.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv} #{i}: name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv} #{i}: value");
+      }
+    }
+  }
+
+  /// R10: a non-5D `0x96` with a NON-`Ascii` numeric format is NOT rewritten by
+  /// `canon_special_leaf_value` (the `SerialInfo` arm needs 5D; the
+  /// `InternalSerialNumber` strip arm needs `Ascii`), so it reaches the generic
+  /// excessive-count guard in production and is SKIPPED for `count > 100000`. Pins
+  /// that the oracle's 0x96 guard exemption matches: `tag_id != 0x96` (the R9 form)
+  /// was too broad — it would DECODE this leaf and emit `InternalSerialNumber`, a
+  /// public JSON divergence. With the EOS-5D-only exemption, BOTH skip.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_excessive_count_non5d_numeric_0x96_skipped_like_parse_in_tiff() {
+    let over_count: u32 = 100_001;
+    let filler = std::vec![0u8; over_count as usize];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x96, 6, over_count, &[], &filler), // int8s (numeric, non-Ascii), excessive
+      (0x09, 2, 4, b"Al\0\0", &[]),        // OwnerName, normal leaf
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D"); // NON-5D body
+
+    for print_conv in [true, false] {
+      let (_otyped, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let (emi, _typed) =
+        canon_makernote_isolated(&blob, 0, blob.len(), order, model, None, print_conv);
+      // The non-5D numeric 0x96 is SKIPPED in BOTH paths — no InternalSerialNumber.
+      assert!(
+        !oracle.iter().any(|e| e.name() == "InternalSerialNumber"),
+        "print_conv={print_conv}: a non-5D numeric 0x96 with count>100000 must be \
+         SKIPPED (not rewritten ⇒ the guard applies); oracle={:?}",
+        oracle
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      // The normal leaf after it still emits — the walk continued past the skip.
+      assert!(
+        emi.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: OwnerName (after the skipped 0x96) MUST emit"
+      );
+      assert_eq!(
+        emi.len(),
+        oracle.len(),
+        "print_conv={print_conv}: production emission must match parse_in_tiff \
+         (both skip the non-5D numeric 0x96)"
+      );
+      for (i, (g, w)) in emi.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv} #{i}: name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv} #{i}: value");
+      }
+    }
+  }
+
+  /// R11: format overrides are SCOPED by active table — a VENDOR (Canon) table
+  /// inherits NO `%Exif::Main` `Format` override. A crafted unknown Canon tag
+  /// 0x9286 (collides with EXIF `UserComment`, `Format => 'undef'`) with a NUMERIC
+  /// on-disk format + `count > 100000` keeps its numeric format, so the
+  /// excessive-count guard SKIPS it — rather than the EXIF `undef` override
+  /// exempting it from the guard and reading a large allocation before `emit`
+  /// drops the unknown tag (a `parse_in_tiff` divergence + OOM vector). The
+  /// EMISSION is unchanged either way (an unknown Canon tag is always dropped), so
+  /// this pins the no-panic + walk-continues + production==oracle consistency; the
+  /// fix's value is AVOIDING the over-count read.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_exif_override_id_not_applied_under_canon_table() {
+    let over_count: u32 = 100_001;
+    let filler = std::vec![0u8; over_count as usize];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x9286, 6, over_count, &[], &filler), // EXIF UserComment id, int8s, excessive
+      (0x09, 2, 4, b"Al\0\0", &[]),          // OwnerName, normal leaf
+    ];
+    let blob = crafted_canon_subtable_ifd(entries);
+    let order = ByteOrder::Little;
+    let model = Some("Canon EOS 20D");
+
+    for print_conv in [true, false] {
+      let (_otyped, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      let (emi, _typed) =
+        canon_makernote_isolated(&blob, 0, blob.len(), order, model, None, print_conv);
+      // The normal leaf after the over-count 0x9286 still emits — the walk
+      // continued, no panic, and the unknown 0x9286 contributes no emission.
+      assert!(
+        emi.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: OwnerName (after the over-count 0x9286) MUST emit"
+      );
+      assert_eq!(
+        emi.len(),
+        oracle.len(),
+        "print_conv={print_conv}: production == oracle (Canon applies NO EXIF \
+         format override, so the numeric over-count 0x9286 is guard-skipped, NOT \
+         undef-coerced and read)"
+      );
+      for (i, (g, w)) in emi.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv} #{i}: name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv} #{i}: value");
+      }
+    }
+  }
+
+  // ====================================================================
+  // Canon 0x28 / 0x96 SPECIALS differential proof (#243 phase 2 step B3)
+  //
+  // PROVES the shared `Walker`'s Canon LIST / Format-override special path
+  // (`process_subdir(TableRef::Canon)` → walk-time
+  // [`Walker::canon_special_leaf_value`] rewrite → `emit_entry`'s
+  // `ResolvedConv::Canon` arm → [`emit_canon_special`], or the leaf renderer
+  // for the non-5D 0x96 second arm) is BYTE-IDENTICAL to the production
+  // `canon::parse_in_tiff` 0x28 / 0x96 branches (`canon/mod.rs:943-1010`). Four
+  // crafted Canon Main IFDs — covering BOTH 0x28 shapes (a non-NUL 16-byte
+  // value ⇒ hex `ImageUniqueID`; exactly 16 NUL bytes ⇒ dropped) and BOTH 0x96
+  // arms (an EOS-5D body + a SerialInfo-shaped blob ⇒ `serial_info` positions;
+  // a NON-5D body + an Ascii value with trailing `0xff` ⇒ `InternalSerialNumber`
+  // with the `0xff` stripped) — are run through BOTH paths; the emitted
+  // `(name, value, group="MakerNotes:Canon", unknown)` tuples must match, in
+  // order, for `-j` AND `-n`. Production keeps `parse_in_tiff`, so conformance
+  // stays 416/0.
+  // ====================================================================
+
+  /// Assert the shared `Walker` 0x28/0x96 special path emits EXACTLY the same
+  /// `(name, value, group, unknown)` stream — in order — as `parse_in_tiff`,
+  /// for the crafted `blob` under `model`, for BOTH `-j` and `-n`. Returns the
+  /// `-j` (PrintConv) emission so the caller can pin the concrete value(s)
+  /// (guarding against a both-paths-identically-wrong drift).
+  #[cfg(feature = "alloc")]
+  fn assert_canon_special_matches(
+    blob: &[u8],
+    model: Option<&str>,
+  ) -> Vec<crate::emit::EmittedTag> {
+    let order = ByteOrder::Little;
+    let mut print_conv_emission: Vec<crate::emit::EmittedTag> = Vec::new();
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_in_tiff` (blob IS the whole TIFF,
+      // `mn_offset = 0`; `file_type = None` — these specials don't read it).
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        blob,
+        0,
+        blob.len(),
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      // ---- New path: shared Walker → walk-time rewrite + emit_canon_special.
+      let emitted = drive_canon_subdir(blob, order, print_conv, model, None);
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv} model={model:?}: emission COUNT must match \
+         (a dropped 0x28 emits NOTHING on both; a 5D 0x96 expands to its \
+         SerialInfo positions on both)"
+      );
+      for (i, (got, want)) in emitted.iter().zip(oracle.iter()).enumerate() {
+        let tag = got.tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} #{i}: NAME mismatch"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} #{i} ({}): VALUE mismatch (the rewrite + \
+           emit must reproduce parse_in_tiff byte-for-byte)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} #{i} ({}): Unknown flag mismatch",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Canon",
+          "print_conv={print_conv} #{i} ({}): family-1 must be Canon",
+          want.name()
+        );
+      }
+      if print_conv {
+        print_conv_emission = emitted;
+      }
+    }
+    print_conv_emission
+  }
+
+  /// The 0x28 / 0x96 special-case differential proof — all four cases.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_special_0x28_0x96_emit_matches_parse_in_tiff() {
+    use crate::value::TagValue;
+    // int8u=1, ASCII=2. Every value here is > 4 bytes, so it is out-of-line
+    // (`crafted_canon_subtable_ifd` stages it after the next-IFD word, past the
+    // directory extent — never `Suspicious`), resolving to the IDENTICAL window
+    // in both walkers (`mn_offset = 0` / `base = 0`).
+
+    // ---- Case 1: 0x28 with a NON-NUL 16-byte value ⇒ hex ImageUniqueID.
+    // `int8u[16]` "read as undef[16]"; bytes 0x00..0x0f hex to the 32-char
+    // lowercase string below.
+    let uid_bytes: [u8; 16] = [
+      0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+      0xff,
+    ];
+    let ifd1 = crafted_canon_subtable_ifd(&[(0x28, 1, 16, &[], &uid_bytes)]);
+    let em1 = assert_canon_special_matches(&ifd1, None);
+    assert_eq!(
+      em1.len(),
+      1,
+      "a non-NUL 0x28 emits exactly one ImageUniqueID"
+    );
+    assert_eq!(em1[0].tag().name(), "ImageUniqueID");
+    assert_eq!(
+      em1[0].tag().value_ref(),
+      &TagValue::Str("00112233445566778899aabbccddeeff".into()),
+      "0x28 ValueConv is unpack(\"H*\", $val) — lowercase, separator-free hex"
+    );
+
+    // ---- Case 2: 0x28 with EXACTLY 16 NUL bytes ⇒ RawConv undef ⇒ DROPPED.
+    let uid_zero = [0u8; 16];
+    let ifd2 = crafted_canon_subtable_ifd(&[(0x28, 1, 16, &[], &uid_zero)]);
+    let em2 = assert_canon_special_matches(&ifd2, None);
+    assert!(
+      em2.is_empty(),
+      "exactly sixteen NUL bytes ⇒ RawConv undef ⇒ NOTHING emitted: {em2:?}"
+    );
+
+    // ---- Case 3: 0x96 on an EOS-5D body + a SerialInfo-shaped blob ⇒ the
+    // SerialInfo positions (InternalSerialNumber2 / InternalSerialNumber). The
+    // blob is the serial_info unit-test vector `"ABC123XYZ" + "DEF456\0"` so the
+    // sub-parser actually decodes BOTH positions.
+    let serial_blob = b"ABC123XYZDEF456\x00"; // 16 bytes, out-of-line.
+    let ifd3 = crafted_canon_subtable_ifd(&[(0x96, 1, serial_blob.len() as u32, &[], serial_blob)]);
+    let em3 = assert_canon_special_matches(&ifd3, Some("Canon EOS 5D"));
+    assert_eq!(
+      em3.len(),
+      2,
+      "the 5D SerialInfo arm emits InternalSerialNumber2 + InternalSerialNumber"
+    );
+    assert_eq!(em3[0].tag().name(), "InternalSerialNumber2");
+    assert_eq!(em3[0].tag().value_ref(), &TagValue::Str("ABC123XYZ".into()));
+    assert_eq!(em3[1].tag().name(), "InternalSerialNumber");
+    assert_eq!(em3[1].tag().value_ref(), &TagValue::Str("DEF456".into()));
+
+    // ---- Case 4: 0x96 on a NON-5D body + an Ascii value WITH trailing 0xff ⇒
+    // InternalSerialNumber (the LIST's SECOND arm) with the `0xff` stripped
+    // (`$val=~s/\xff+$//`). The value falls to the normal leaf renderer (the
+    // walk-time rewrite already stripped it), proving the non-5D arm threads
+    // through `emit_canon_value` unchanged.
+    let serial_ff = b"SN12345\xff\xff\xff"; // 10 bytes, Ascii, out-of-line.
+    let ifd4 = crafted_canon_subtable_ifd(&[(0x96, 2, serial_ff.len() as u32, &[], serial_ff)]);
+    let em4 = assert_canon_special_matches(&ifd4, Some("Canon EOS Kiss X3"));
+    assert_eq!(
+      em4.len(),
+      1,
+      "the non-5D 0x96 emits one InternalSerialNumber"
+    );
+    assert_eq!(em4[0].tag().name(), "InternalSerialNumber");
+    assert_eq!(
+      em4[0].tag().value_ref(),
+      &TagValue::Str("SN12345".into()),
+      "the trailing 0xff bytes must be stripped at the raw-byte level \
+       (s/\\xff+$//), leaving the bare serial"
+    );
+  }
+
+  // ====================================================================// Canon engine migration — Step C isolation differential tests (#243 phase 2)
+  //
+  // The production switch routes `%Canon::Main` through the shared `Walker` as
+  // `process_subdir(.., IfdKind::ExifIfd, TableRef::Canon, .., ProcessProc::Canon)`.
+  // The `IfdKind` is `ExifIfd`, but the STRUCTURAL decisions must follow
+  // maker-note (vendor-table) semantics, NOT core ExifIFD semantics. These two
+  // tests pin the two places where a vendor walk diverges from a core walk —
+  // each is asserted byte-identical to the retired `canon::parse_in_tiff` oracle
+  // for `-j` AND `-n` (and, because `assert_canon_special_matches` drives BOTH
+  // paths, neither panics).
+  // ====================================================================
+
+  /// The SubDirectory-pointer-ID collision proof: a `%Canon::Main` tag whose ID
+  /// coincides with a CORE `%Exif::Main` pointer (0xa005 InteropOffset, 0x8769
+  /// ExifOffset, 0x927c MakerNotes) must be treated as a Canon leaf, NEVER
+  /// dispatched as a core sub-IFD.
+  ///
+  /// `walk_entry`'s SubDirectory dispatch (`sub_dir_for`) is gated on
+  /// `active_table.is_core_ifd()`; under `TableRef::Canon` it does not fire, so
+  /// the colliding ID flows to the Canon leaf path → `tags::lookup` finds no
+  /// `%Canon::Main` def for it → it is OMITTED — exactly as the oracle's
+  /// `walk_canon_in_tiff` collects it then `parse_in_tiff` drops it at the
+  /// `tags::lookup(..) else continue` site (`canon/mod.rs:742`). Without the
+  /// gate, 0xa005 (etc.) would recurse into a CORE Interop/ExifIFD sub-IFD that
+  /// pushes `ResolvedConv::Exif` entries — a byte-identity break, and a panic
+  /// once those scalar entries reach the `VendorEmissionSink` capture (now a
+  /// no-op, but the gate keeps them off it entirely). The valid Canon leaves
+  /// surrounding the collisions still emit, in order, on both paths.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_subdir_id_collision_matches_parse_in_tiff() {
+    // int16u=3, int32u=4, ASCII=2. The three core pointer IDs are encoded as a
+    // single int32u (count=1, inline ⇒ 4 bytes at `entry+8`) holding an
+    // offset-SHAPED value (0x0000_0042) — the exact encoding a real
+    // ExifIFD/Interop/MakerNote pointer uses, so the PRE-gate code path would
+    // have dispatched them as core sub-IFDs. IFD entries must be tag-ascending,
+    // so the colliding IDs sit between the low and high valid leaves.
+    let pointer_value = 0x0000_0042u32.to_le_bytes();
+    let ifd = crafted_canon_subtable_ifd(&[
+      // 0x07 CanonFirmwareVersion — ASCII leaf, conv None. Emitted.
+      (0x07, 2, 4, b"1.0\0", &[]),
+      // 0x10 CanonModelID — int32u, ModelId hash (0x412 ⇒ EOS M50). Emitted.
+      (0x10, 4, 1, &0x0000_0412u32.to_le_bytes(), &[]),
+      // 0x8769 (ExifOffset) — NOT a %Canon::Main tag ⇒ OMITTED, never an ExifIFD.
+      (0x8769, 4, 1, &pointer_value, &[]),
+      // 0x927c (MakerNotes) — NOT a %Canon::Main tag ⇒ OMITTED, never recursed.
+      (0x927c, 4, 1, &pointer_value, &[]),
+      // 0xa005 (InteropOffset) — NOT a %Canon::Main tag ⇒ OMITTED, never Interop.
+      (0xa005, 4, 1, &pointer_value, &[]),
+      // 0xb4 ColorSpace — int16u, hash PrintConv (1 ⇒ "sRGB"). Emitted.
+      (0xb4, 3, 1, &[0x01, 0x00], &[]),
+    ]);
+    // Drives BOTH paths for -j and -n and asserts the emitted stream matches in
+    // order (a divergence — e.g. a core sub-IFD recursion — would change the
+    // count/content; a panic on the collision would fail the test outright).
+    let em = assert_canon_special_matches(&ifd, Some("Canon EOS M50"));
+    // Exactly the three valid leaves survive; the three pointer-ID collisions
+    // are dropped (not in %Canon::Main), proving none was taken as a sub-IFD.
+    assert_eq!(
+      em.len(),
+      3,
+      "only the 3 real %Canon::Main leaves emit; 0x8769/0x927c/0xa005 are \
+       dropped as unknown Canon tags, NOT dispatched as core sub-IFDs: {em:?}"
+    );
+    let names: Vec<&str> = em.iter().map(|t| t.tag().name()).collect();
+    assert_eq!(
+      names,
+      ["CanonFirmwareVersion", "CanonModelID", "ColorSpace"],
+      "the surviving leaves are the non-colliding Canon tags, in IFD order"
+    );
+  }
+
+  /// The bad-offset isolation proof: a `%Canon::Main` entry whose out-of-line
+  /// value runs past EOF must SKIP (warn "Bad offset" + continue), NOT abort the
+  /// maker-note walk — so a later valid Canon leaf still emits.
+  ///
+  /// A maker-note directory IS `$inMakerNotes`, so ExifTool's
+  /// `return 0 unless $inMakerNotes …` (`Exif.pm:6602`) does NOT abort — it
+  /// continues with `$bad = 1`. `walk_entry` routes the bad-offset case to the
+  /// "Bad offset for {dir} {name}" + `warn_counted` + `Step::Skip` path whenever
+  /// `self.no_raf || !active_table.is_core_ifd()`; the production Canon walk runs
+  /// RAF-backed (`no_raf == false`) but with `TableRef::Canon`
+  /// (`!is_core_ifd()`), so it takes the skip — matching the oracle's
+  /// `classify_canon_entry` → `CanonEntryClass::BadOffset` (skip + continue). The
+  /// FIRST entry is the bad one (largest blast radius if it aborted); the later
+  /// inline OwnerName must still appear on both paths.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_bad_offset_then_valid_matches_parse_in_tiff() {
+    use crate::value::TagValue;
+    // Build a Canon Main IFD whose FIRST entry (0x06 CanonImageType, ASCII) is
+    // out-of-line (size 8 > 4) with an offset PAST EOF, followed by a valid
+    // inline OwnerName (0x09) leaf. `crafted_canon_subtable_ifd` only emits
+    // in-bounds offsets, so this IFD is built by hand to plant the bad offset.
+    let n = 2usize;
+    let mut ifd = Vec::new();
+    ifd.extend_from_slice(&(n as u16).to_le_bytes());
+    // Entry 0: 0x06 CanonImageType, ASCII, count=8 ⇒ size 8 (> 4, out-of-line).
+    // The 4 value bytes are an offset FAR past the end of the buffer.
+    ifd.extend_from_slice(&0x0006u16.to_le_bytes());
+    ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    ifd.extend_from_slice(&8u32.to_le_bytes()); // count = 8 ⇒ size 8
+    ifd.extend_from_slice(&0x0000_8000u32.to_le_bytes()); // offset past EOF ⇒ Bad offset
+    // Entry 1: 0x09 OwnerName, ASCII, count=4, INLINE "Al\0\0" — must survive.
+    ifd.extend_from_slice(&0x0009u16.to_le_bytes());
+    ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    ifd.extend_from_slice(&4u32.to_le_bytes()); // count = 4 (inline)
+    ifd.extend_from_slice(b"Al\0\0");
+    // Next-IFD pointer word = 0 (the ExifIfd-kind walk never follows the chain).
+    ifd.extend_from_slice(&0u32.to_le_bytes());
+
+    // Drives BOTH paths for -j and -n; an ABORT on the bad entry would drop
+    // OwnerName from the new path (a COUNT mismatch vs the oracle, which skips
+    // + continues), and any panic would fail outright.
+    let em = assert_canon_special_matches(&ifd, None);
+    assert_eq!(
+      em.len(),
+      1,
+      "the bad-offset 0x06 is SKIPPED (not aborting); the later inline \
+       OwnerName still emits: {em:?}"
+    );
+    assert_eq!(em[0].tag().name(), "OwnerName");
+    assert_eq!(
+      em[0].tag().value_ref(),
+      &TagValue::Str("Al".into()),
+      "OwnerName survives the bad-offset entry that precedes it"
+    );
+  }
+
+  // ====================================================================// Canon engine migration — Step C core-state-leak isolation (#243 phase 2)
+  //
+  // The production switch shares the Walker's MUTABLE STATE between the parent
+  // ExifIFD walk and the Canon (vendor) sub-walk. Three pieces of CORE state must
+  // NOT be affected by the vendor walk; these tests pin each against the retired
+  // `canon::parse_in_tiff` oracle (which has ZERO core/file-level side effects):
+  //   1. file-level `page_count`/`multi_page`/`dng_version` (the SubfileType /
+  //      OldSubfileType / DNGVersion RawConv taps) — core-table-gated, so a
+  //      collision-id Canon leaf does not synthesize a bogus `File:PageCount` or
+  //      finalize a standalone TIFF as DNG;
+  //   2. the per-directory `warn_count` abort cap — saved/restored across the
+  //      Canon sub-walk, so a Canon MakerNote full of bad entries does not abort
+  //      the PARENT ExifIFD (dropping its later tags);
+  //   3. the `%CameraSettings` DataMember pre-scan — last-readable-0x01-wins, so a
+  //      malformed FIRST 0x01 then a valid 0x01 yields the VALID one's members.
+  // ====================================================================
+
+  /// Build a Canon Main IFD whose leaves include the three CORE file-level
+  /// RawConv-tap collision IDs — `SubfileType` (0x00fe), `OldSubfileType`
+  /// (0x00ff), `DNGVersion` (0xc612) — each carrying a value that WOULD trip the
+  /// tap if it fired under `%Exif::Main`: SubfileType=2 (⇒ MultiPage),
+  /// OldSubfileType=3 (⇒ MultiPage), DNGVersion `1 1 0 0` (truthy ⇒ DNG). None of
+  /// these IDs is a `%Canon::Main` tag, so all three are dropped as unknown Canon
+  /// leaves; the surrounding valid Canon leaves (0x07/0x09) emit. Tag-ascending.
+  #[cfg(feature = "alloc")]
+  fn crafted_canon_ifd_with_tap_collision_ids() -> Vec<u8> {
+    crafted_canon_subtable_ifd(&[
+      // 0x07 CanonFirmwareVersion — ASCII leaf, conv None. Emitted.
+      (0x07, 2, 4, b"1.0\0", &[]),
+      // 0x09 OwnerName — ASCII leaf, conv None. Emitted.
+      (0x09, 2, 4, b"Al\0\0", &[]),
+      // 0x00fe SubfileType, int32u=4, count 1, value 2 (the `$val == 2` MultiPage
+      // trigger). NOT a %Canon::Main tag ⇒ dropped; the tap must NOT fire.
+      (0x00fe, 4, 1, &2u32.to_le_bytes(), &[]),
+      // 0x00ff OldSubfileType, int16u=3, count 1, value 3 (the `$val == 3`
+      // MultiPage trigger). NOT a %Canon::Main tag ⇒ dropped; tap must NOT fire.
+      (0x00ff, 3, 1, &[0x03, 0x00], &[]),
+      // 0xc612 DNGVersion, int8u=1, count 4, TRUTHY `1 1 0 0` ⇒ would finalize as
+      // DNG. NOT a %Canon::Main tag ⇒ dropped; the tap must NOT fire.
+      (0xc612, 1, 4, &[0x01, 0x01, 0x00, 0x00], &[]),
+    ])
+  }
+
+  /// Finding 2 (white-box): the three file-level RawConv taps (SubfileType /
+  /// OldSubfileType / DNGVersion) are gated on the CORE Exif/Interop tables, so
+  /// driving a Canon (`TableRef::Canon`) walk whose leaves carry the colliding
+  /// IDs leaves `page_count` / `multi_page` / `dng_version` UNTOUCHED — and the
+  /// emitted stream still matches `parse_in_tiff` (the collision IDs are dropped
+  /// as unknown Canon tags on both paths, for `-j` and `-n`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_walk_does_not_fire_core_file_level_taps() {
+    let blob = crafted_canon_ifd_with_tap_collision_ids();
+    let order = ByteOrder::Little;
+    // Differential: the unknown collision IDs are dropped on BOTH paths, so only
+    // the two valid leaves (0x07/0x09) emit — in order, for -j AND -n.
+    let em = assert_canon_special_matches(&blob, Some("Canon EOS 5D"));
+    let names: Vec<&str> = em.iter().map(|t| t.tag().name()).collect();
+    assert_eq!(
+      names,
+      ["CanonFirmwareVersion", "OwnerName"],
+      "the 0x00fe/0x00ff/0xc612 collision IDs are dropped as unknown Canon tags; \
+       only the valid leaves emit: {em:?}"
+    );
+    // THE DISCRIMINATOR: run the SAME blob through `process_subdir(TableRef::Canon)`
+    // and inspect the walker's file-level state directly. The taps must NOT have
+    // fired (they are gated on `active_table ∈ {Exif, Interop}`), so the
+    // standalone-TIFF finalization would synthesize neither a bogus PageCount nor
+    // a DNG re-type.
+    let mut w = test_walker(&blob);
+    w.order = order;
+    w.captured_model = Some("Canon EOS 5D".to_string());
+    w.process_subdir(
+      0,
+      IfdKind::ExifIfd,
+      TableRef::Canon,
+      ByteOrderRule::Fixed(order),
+      FixBaseMode::No,
+      ProcessProc::Canon,
+    );
+    assert_eq!(
+      w.page_count, 0,
+      "SubfileType (0x00fe) / OldSubfileType (0x00ff) taps must NOT bump \
+       page_count under %Canon::Main"
+    );
+    assert!(
+      !w.multi_page,
+      "neither SubfileType=2 nor OldSubfileType=3 may set multi_page under \
+       %Canon::Main (the tap is Exif/Interop-scoped)"
+    );
+    assert!(
+      !w.dng_version,
+      "the DNGVersion (0xc612) tap must NOT set dng_version under %Canon::Main \
+       (a vendor leaf must never re-type the file as DNG)"
+    );
+  }
+
+  /// Build a LITTLE-ENDIAN standalone TIFF whose Canon MakerNote is `canon_ifd`:
+  ///   IFD0@8: Make (0x010f) = "Canon\0" + ExifOffset (0x8769) -> ExifIFD.
+  ///   ExifIFD: MakerNote (0x927c, UNDEF) -> `canon_ifd`, then (optionally) an
+  ///   `extra` ExifIFD entry whose 12-byte record + out-of-line value bytes are
+  ///   supplied by the caller (used to place a parent tag AFTER the maker note in
+  ///   tag order). All values are out-of-line, appended after both IFDs.
+  ///
+  /// LITTLE-ENDIAN so the on-disk byte order matches the `to_le_bytes` Canon
+  /// blobs (`crafted_canon_subtable_ifd`, etc.) — the Canon MakerNote INHERITS
+  /// the parent order (`ByteOrderRule::Fixed(self.order)`), so a big-endian
+  /// parent would misread an LE Canon count word and abort the sub-walk.
+  ///
+  /// `extra` is `(entry_record_12_bytes, out_of_line_value_bytes)`; the record's
+  /// last 4 bytes (the value offset slot) are PATCHED to point at the appended
+  /// value. Pass an empty record for "no extra entry".
+  #[cfg(feature = "alloc")]
+  fn le_tiff_canon_makernote(canon_ifd: &[u8], extra: (&[u8], &[u8])) -> Vec<u8> {
+    let (extra_record, extra_value) = extra;
+    let has_extra = !extra_record.is_empty();
+    assert!(
+      !has_extra || extra_record.len() == 12,
+      "extra is one IFD entry"
+    );
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    // IFD0@8: 2 entries (Make, ExifOffset).
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&0x010fu16.to_le_bytes()); // Make
+    t.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    t.extend_from_slice(&6u32.to_le_bytes()); // count 6 ("Canon\0")
+    let make_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // Make value offset (patch)
+    t.extend_from_slice(&0x8769u16.to_le_bytes()); // ExifOffset
+    t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    let exif_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD offset (patch)
+    t.extend_from_slice(&0u32.to_le_bytes()); // IFD0 next = 0
+    // "Canon\0" value.
+    let make_val_off = t.len() as u32;
+    t.extend_from_slice(b"Canon\0");
+    t[make_ptr_pos..make_ptr_pos + 4].copy_from_slice(&make_val_off.to_le_bytes());
+    // ExifIFD: MakerNote (+ optional extra entry).
+    let exififd_off = t.len() as u32;
+    t[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&exififd_off.to_le_bytes());
+    let n_exif: u16 = if has_extra { 2 } else { 1 };
+    t.extend_from_slice(&n_exif.to_le_bytes());
+    // MakerNote (0x927c), UNDEFINED, count = blob len, value offset (patch).
+    t.extend_from_slice(&0x927cu16.to_le_bytes());
+    t.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+    t.extend_from_slice(&(canon_ifd.len() as u32).to_le_bytes());
+    let mn_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes());
+    let mut extra_ptr_pos = 0usize;
+    if has_extra {
+      // The caller's 12-byte record (tag/format/count + a placeholder offset).
+      extra_ptr_pos = t.len() + 8; // the value-offset slot is the last 4 bytes
+      t.extend_from_slice(extra_record);
+    }
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD next = 0
+    // The Canon MakerNote blob, then the extra value bytes; patch both pointers.
+    let mn_val_off = t.len() as u32;
+    t.extend_from_slice(canon_ifd);
+    t[mn_ptr_pos..mn_ptr_pos + 4].copy_from_slice(&mn_val_off.to_le_bytes());
+    if has_extra {
+      let extra_val_off = t.len() as u32;
+      t.extend_from_slice(extra_value);
+      t[extra_ptr_pos..extra_ptr_pos + 4].copy_from_slice(&extra_val_off.to_le_bytes());
+    }
+    t
+  }
+
+  /// Finding 2 (end-to-end): a STANDALONE TIFF whose Canon MakerNote carries the
+  /// 0x00fe / 0x00ff / 0xc612 collision IDs emits NO synthesized `File:PageCount`
+  /// and is NOT finalized as DNG — proving the taps stay off through the real
+  /// `parse_borrowed` dispatch (IFD0 Make="Canon" ⇒ the 0x927c MakerNote walks
+  /// `%Canon::Main` via the shared Walker). A leak would set `multi_page_count` /
+  /// `has_dng_version()` from the dropped vendor leaves.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn standalone_tiff_canon_makernote_collision_ids_do_not_leak_file_state() {
+    let canon_ifd = crafted_canon_ifd_with_tap_collision_ids();
+    let t = le_tiff_canon_makernote(&canon_ifd, (&[], &[]));
+    let meta = parse_borrowed(&t).expect("standalone TIFF parses");
+    // SANITY: the Canon MakerNote WAS dispatched (Make="Canon" ⇒ Vendor::Canon)
+    // AND its valid leaves emit — i.e. the collision-ID blob really walked
+    // `%Canon::Main` (otherwise the assertions below would be vacuous).
+    let mn = meta
+      .maker_note()
+      .expect("IFD0 Make=Canon + a 0x927c MakerNote must dispatch a Canon maker note");
+    // The Canon leaves emit via the cached vendor emissions (truncated off
+    // `entries`), so check there: the valid leaves must be present, proving the
+    // collision-ID blob really walked `%Canon::Main` (else this test is vacuous).
+    assert!(
+      mn.emissions_print_conv()
+        .iter()
+        .any(|e| e.name() == "CanonFirmwareVersion"),
+      "the Canon Main IFD's valid leaves must emit (the sub-walk really ran): {:?}",
+      mn.emissions_print_conv()
+        .iter()
+        .map(makernotes::VendorEmission::name)
+        .collect::<Vec<_>>()
+    );
+    // THE DISCRIMINATORS — the file-level state stays clean:
+    assert_eq!(
+      meta.multi_page_count(),
+      None,
+      "the Canon MakerNote's 0x00fe=2 / 0x00ff=3 collision leaves must NOT \
+       synthesize a bogus File:PageCount (the taps are Exif/Interop-scoped)"
+    );
+    assert!(
+      !meta.has_dng_version(),
+      "the Canon MakerNote's 0xc612 collision leaf must NOT finalize the \
+       standalone TIFF as DNG"
+    );
+  }
+
+  /// Finding 1: a Canon MakerNote with 11+ bad (warn-counted) entries must NOT
+  /// abort the PARENT ExifIFD. `warn_count` is saved/restored across the Canon
+  /// sub-walk (it is a per-`ProcessExif`-call `my` local in bundled), so the
+  /// child's accumulated count never reaches the parent's `> 10` abort — the
+  /// parent's later `UserComment` leaf still emits. Without the restore the
+  /// child's 11 warnings would trip the parent loop's abort and drop it.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_makernote_warn_count_does_not_abort_parent_exififd() {
+    // A Canon Main IFD with TWELVE bad-offset entries (each an out-of-line value
+    // past EOF ⇒ `CanonEntryClass::BadOffset` ⇒ ++warnCount, skip + continue).
+    // Twelve > 10, so the Canon sub-walk hits its OWN abort cap — that must NOT
+    // propagate to the parent. None is index-0 bad-FORMAT, so the Canon directory
+    // is not aborted at entry 0 (the bad entries are skips, and the directory
+    // shape itself is valid). Little-endian (inherits the parent order).
+    let bad_n = 12u16;
+    let mut canon_ifd = Vec::new();
+    canon_ifd.extend_from_slice(&bad_n.to_le_bytes());
+    for _ in 0..bad_n {
+      // 0x9a (a valid %Canon::Main id) out-of-line ASCII count=8 ⇒ size 8 > 4,
+      // offset far past EOF ⇒ Bad offset (warn-counted skip).
+      canon_ifd.extend_from_slice(&0x009au16.to_le_bytes());
+      canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+      canon_ifd.extend_from_slice(&8u32.to_le_bytes()); // count 8 ⇒ size 8
+      canon_ifd.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // offset past EOF
+    }
+    canon_ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    // UserComment (0x9286) is placed AFTER the maker note in the ExifIFD (0x927c <
+    // 0x9286), so the parent loop reaches it AFTER returning from the Canon
+    // sub-walk. UNDEFINED count 12: an 8-byte "ASCII\0\0\0" charset prefix + "Hi".
+    let uc_bytes: &[u8] = b"ASCII\0\0\0Hi\0\0";
+    let mut uc_record = Vec::new();
+    uc_record.extend_from_slice(&0x9286u16.to_le_bytes());
+    uc_record.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+    uc_record.extend_from_slice(&(uc_bytes.len() as u32).to_le_bytes());
+    uc_record.extend_from_slice(&0u32.to_le_bytes()); // value offset (patched)
+
+    let t = le_tiff_canon_makernote(&canon_ifd, (&uc_record, uc_bytes));
+    let meta = parse_borrowed(&t).expect("standalone TIFF parses");
+    // SANITY: the Canon MakerNote really dispatched (so the >10 warnings were
+    // actually generated by the sub-walk, not skipped).
+    assert!(
+      meta.maker_note().is_some(),
+      "the Canon MakerNote must dispatch (else the warn-count scenario is vacuous)"
+    );
+    // THE DISCRIMINATOR: the parent ExifIFD's UserComment survives — the Canon
+    // sub-walk's 12 warnings were scoped to it (saved/restored), so the parent
+    // loop's `> 10` abort never tripped.
+    assert!(
+      meta
+        .entries()
+        .iter()
+        .any(|e| e.ifd() == IfdKind::ExifIfd && e.name() == "UserComment"),
+      "UserComment (after the Canon MakerNote in tag order) must STILL emit — the \
+       child Canon walk's warn_count must not abort the parent ExifIFD: {:?}",
+      meta
+        .entries()
+        .iter()
+        .map(|e| (e.ifd(), e.name()))
+        .collect::<Vec<_>>()
+    );
+  }
+
+  /// R3-1 (warnings isolation): a Canon MakerNote whose entry is malformed
+  /// (out-of-line value past EOF ⇒ a `"Bad offset for ExifIFD <tag>"` warn-counted
+  /// SKIP) must NOT surface that warning on the parent `ExifMeta` — the isolated
+  /// Canon walk owns its own `warnings` channel, which is DISCARDED on return. The
+  /// oracle `canon::parse_in_tiff` emits no such warning (it walks Canon with no
+  /// core `$et->Warn` side effect), so the production stream must show none either,
+  /// while the later VALID Canon leaf still emits.
+  ///
+  /// Pre-isolation the Canon walk ran on `self`, so the bad-offset warning landed
+  /// in the parent's `warnings` and surfaced as a spurious `ExifTool:Warning` the
+  /// oracle never produces — the R3-1 leak this structural fix closes.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_makernote_bad_offset_does_not_leak_core_warning() {
+    // A Canon Main IFD: entry 0 is 0x06 CanonImageType (ASCII, count 8 ⇒ size 8 >
+    // 4, out-of-line) with an offset FAR past EOF ⇒ "Bad offset for ExifIFD
+    // CanonImageType" (warn-counted skip), then a valid inline OwnerName (0x09).
+    let mut canon_ifd = Vec::new();
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes());
+    canon_ifd.extend_from_slice(&0x0006u16.to_le_bytes()); // 0x06 CanonImageType
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&8u32.to_le_bytes()); // count 8 ⇒ size 8 (out-of-line)
+    canon_ifd.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // offset past EOF
+    canon_ifd.extend_from_slice(&0x0009u16.to_le_bytes()); // 0x09 OwnerName
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    canon_ifd.extend_from_slice(b"Al\0\0");
+    canon_ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    let t = le_tiff_canon_makernote(&canon_ifd, (&[], &[]));
+    let meta = parse_borrowed(&t).expect("standalone TIFF parses");
+
+    // SANITY: the Canon MakerNote really dispatched AND the valid leaf emitted —
+    // so the bad-offset entry really walked `%Canon::Main` (else this is vacuous).
+    let mn = meta
+      .maker_note()
+      .expect("IFD0 Make=Canon + a 0x927c MakerNote must dispatch a Canon maker note");
+    assert!(
+      mn.emissions_print_conv()
+        .iter()
+        .any(|e| e.name() == "OwnerName"),
+      "the later valid Canon OwnerName leaf must still emit after the bad-offset \
+       entry (a skip, not an abort): {:?}",
+      mn.emissions_print_conv()
+        .iter()
+        .map(makernotes::VendorEmission::name)
+        .collect::<Vec<_>>()
+    );
+
+    // THE DISCRIMINATOR: NO core warning leaked. The isolated Canon walk's
+    // "Bad offset for ExifIFD CanonImageType" warning is discarded with the fresh
+    // walker — it must NOT appear on the parent meta (the oracle emits none).
+    assert!(
+      !meta.warnings().iter().any(|w| w.contains("Bad offset")),
+      "the isolated Canon walk's Bad-offset warning must NOT leak to the parent \
+       ExifMeta (parse_in_tiff emits no such warning): {:?}",
+      meta.warnings()
+    );
+    assert!(
+      !meta.warnings().iter().any(|w| w.contains("ExifIFD")),
+      "no Canon-walk ExifIFD-directory warning may surface on the parent: {:?}",
+      meta.warnings()
+    );
+  }
+
+  /// R3-2 (active-path isolation, end-to-end): a Canon MakerNote whose value
+  /// offset coincides with a PARENT IFD offset on the active recursion path (here
+  /// 8, the IFD0 offset) must STILL be walked — the production stream must match
+  /// `canon::parse_in_tiff` driven at the SAME offset. The fresh, pathless walker
+  /// has no ancestor to collide with, so its [`walk_one_ifd`] cycle guard cannot
+  /// suppress the Canon Main IFD.
+  ///
+  /// IFD0@8 holds, in tag order, `OwnerName` (0x0009 — unknown to `%Exif::Main`
+  /// so dropped by the parent, but a valid `%Canon::Main` LEAF), `Make` (0x010f =
+  /// "Canon") and `ExifOffset` (0x8769). When the isolated Canon walk re-reads
+  /// offset 8 as a Canon Main IFD it emits `OwnerName` — a NON-empty proof the
+  /// walk proceeded. The MakerNote's out-of-line value window is kept small enough
+  /// (10 bytes) that it ends before the ExifIFD, so the suspicious/overlap guard
+  /// (`Exif.pm:6549`) admits the entry and the active-path guard is the only thing
+  /// that could (wrongly) suppress the walk.
+  ///
+  /// Pre-isolation the Canon walk ran on `self`, whose `active_ifd_offsets` held
+  /// {8, ExifIFD-offset}; a value offset of 8 hit the ancestor guard, the Canon
+  /// Main IFD was SUPPRESSED, and `OwnerName` was DROPPED — diverging from the
+  /// oracle (which always walks it). This is the R3-2 leak the structural fix
+  /// closes.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_makernote_value_offset_at_ancestor_is_still_walked() {
+    // A standalone LE TIFF built by hand so the MakerNote pointer can target
+    // offset 8 (the helpers append the blob, so they cannot).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    // IFD0@8: 3 entries (tag-ascending) — OwnerName(0x0009), Make(0x010f),
+    // ExifOffset(0x8769). OwnerName is a %Canon::Main LEAF but unknown to
+    // %Exif::Main (so the parent IFD0 walk drops it); the Canon re-read of
+    // offset 8 emits it.
+    t.extend_from_slice(&3u16.to_le_bytes());
+    // 0x0009 OwnerName, ASCII, count 4, INLINE "Al\0\0".
+    t.extend_from_slice(&0x0009u16.to_le_bytes());
+    t.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    t.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    t.extend_from_slice(b"Al\0\0");
+    // 0x010f Make, ASCII, count 6 ("Canon\0"), out-of-line (patched).
+    t.extend_from_slice(&0x010fu16.to_le_bytes());
+    t.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    t.extend_from_slice(&6u32.to_le_bytes()); // count 6
+    let make_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // Make value offset (patch)
+    // 0x8769 ExifOffset, LONG, count 1, value = ExifIFD offset (patched).
+    t.extend_from_slice(&0x8769u16.to_le_bytes());
+    t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    let exif_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD offset (patch)
+    t.extend_from_slice(&0u32.to_le_bytes()); // IFD0 next = 0
+    // "Canon\0" value.
+    let make_val_off = t.len() as u32;
+    t.extend_from_slice(b"Canon\0");
+    t[make_ptr_pos..make_ptr_pos + 4].copy_from_slice(&make_val_off.to_le_bytes());
+    // ExifIFD: ONE entry, MakerNote (0x927c) whose value offset = 8 (IFD0, an
+    // ACTIVE ancestor during the maker-note walk). UNDEFINED count 10 ⇒ size 10
+    // (> 4, out-of-line), and the window [8, 18) ends before this ExifIFD ⇒ the
+    // suspicious/overlap guard admits it. The Canon walk reads its OWN entry-count
+    // word at offset 8 (it is not limited to the 10-byte window).
+    let exififd_off = t.len() as u32;
+    t[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&exififd_off.to_le_bytes());
+    assert!(
+      exififd_off >= 18,
+      "the MakerNote window [8,18) must end before the ExifIFD@{exififd_off} so the \
+       overlap guard does not pre-empt the active-path scenario"
+    );
+    let mn_len = 10u32;
+    t.extend_from_slice(&1u16.to_le_bytes()); // 1 ExifIFD entry
+    t.extend_from_slice(&0x927cu16.to_le_bytes()); // MakerNote
+    t.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+    t.extend_from_slice(&mn_len.to_le_bytes()); // count 10 ⇒ size 10
+    t.extend_from_slice(&8u32.to_le_bytes()); // value offset = 8 (IFD0 — an ancestor)
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD next = 0
+
+    let meta = parse_borrowed(&t).expect("standalone TIFF parses");
+    // The MakerNote dispatched (Make=Canon ⇒ Vendor::Canon).
+    let mn = meta
+      .maker_note()
+      .expect("IFD0 Make=Canon + a 0x927c MakerNote must dispatch a Canon maker note");
+
+    // Oracle: walk the SAME bytes at the SAME offset (8) in isolation. parse_in_tiff
+    // has no active path, so it always walks offset 8 and emits OwnerName; the
+    // production walk must match it (proving the ancestor guard did not suppress it).
+    for print_conv in [true, false] {
+      let (_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &t,
+        8,
+        mn_len as usize,
+        ByteOrder::Little,
+        print_conv,
+        Some("Canon"),
+        None,
+      );
+      let got = if print_conv {
+        mn.emissions_print_conv().to_vec()
+      } else {
+        mn.emissions_value_conv()
+      };
+      // SANITY: the walk really emitted OwnerName (offset 8 was walked, not
+      // suppressed, and not vacuously empty).
+      assert!(
+        oracle.iter().any(|e| e.name() == "OwnerName"),
+        "oracle must emit OwnerName from the Canon IFD at offset 8 (else vacuous)"
+      );
+      assert_eq!(
+        got.len(),
+        oracle.len(),
+        "print_conv={print_conv}: the Canon Main IFD at the ancestor offset 8 must \
+         be walked identically to parse_in_tiff (the active-path guard must NOT \
+         suppress it). got={:?} oracle={:?}",
+        got
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>(),
+        oracle
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      for (g, w) in got.iter().zip(oracle.iter()) {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv}: leaf name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv}: leaf value");
+      }
+      assert!(
+        got.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: production must emit OwnerName from offset 8 — \
+         the active-path guard must not suppress the isolated Canon walk: {:?}",
+        got
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+    }
+  }
+
+  /// R3-2 (active-path isolation, white-box): [`canon_makernote_isolated`] builds
+  /// a FRESH walker, so it ignores any parent active recursion path. Driving it
+  /// with an `mn_offset` that a HYPOTHETICAL parent would hold on its
+  /// `active_ifd_offsets` still walks the Canon Main IFD and emits its leaves —
+  /// the structural guarantee the end-to-end test exercises, pinned directly.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_isolated_helper_ignores_parent_active_path() {
+    // A standalone Canon Main IFD with one valid inline leaf (OwnerName).
+    let mut canon_ifd = Vec::new();
+    canon_ifd.extend_from_slice(&1u16.to_le_bytes());
+    canon_ifd.extend_from_slice(&0x0009u16.to_le_bytes()); // 0x09 OwnerName
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    canon_ifd.extend_from_slice(b"Al\0\0");
+    canon_ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    // A parent walker whose active path ALREADY contains offset 0 (the Canon Main
+    // IFD start). The coupled (pre-fix) `process_subdir` on THIS walker would hit
+    // the ancestor guard and walk nothing; the isolated helper does not consult
+    // `parent`, so it walks regardless.
+    let mut parent = test_walker(&canon_ifd);
+    parent.active_ifd_offsets.push(0);
+
+    let (emissions, typed) = canon_makernote_isolated(
+      &canon_ifd,
+      0,
+      canon_ifd.len(),
+      ByteOrder::Little,
+      Some("Canon"),
+      None,
+      true,
+    );
+    assert!(typed.is_some(), "print_conv=true yields the typed slot");
+    assert!(
+      emissions.iter().any(|e| e.name() == "OwnerName"),
+      "the isolated helper walks the Canon Main IFD even when offset 0 is on a \
+       parent's active path (it uses a fresh, pathless walker): {:?}",
+      emissions
+        .iter()
+        .map(makernotes::VendorEmission::name)
+        .collect::<Vec<_>>()
+    );
+    // The parent's active path is UNTOUCHED by the isolated walk.
+    assert_eq!(
+      parent.active_ifd_offsets,
+      std::vec![0usize],
+      "the isolated walk must not mutate the parent's active path"
+    );
+  }
+
+  /// R7 (verify-before-fix): the Canon maker-note IFD entry walk is bounded by the
+  /// PARENT TIFF buffer (`data.len()` == ExifTool's `$dataLen`), NOT by the
+  /// declared maker-note length `mn_len` (`$dirLen`). ExifTool's `ProcessExif`
+  /// only undefs `$dirSize` — the abort/clamp trigger — when the claimed IFD ALSO
+  /// exceeds `$dataLen` (`Exif.pm:6356`, INSIDE `if ($dirSize > $dirLen)` at 6349);
+  /// `$dirLen` on its own drives only a VERBOSE-mode "Short directory size"
+  /// warning (`6349-6354`), never the entry bound. (`$dataLen` for an inline maker
+  /// note is the parent buffer — `$valueDataLen` defaults to the parent `$dataLen`,
+  /// `Exif.pm:6483`/`7124`.) So a maker note whose count word claims entries
+  /// extending past `mn_offset + mn_len`, but still within the parent buffer, is
+  /// FULLY walked — emitting tags from beyond the declared value EXACTLY as
+  /// ExifTool does. Bounding the walk by `mn_len` would make the port STRICTER
+  /// than ExifTool (a divergence), so [`canon_makernote_isolated`] uses `mn_len`
+  /// ONLY for the `< 2` count-word guard, never the walk extent. This pins that
+  /// faithfulness: an UNDER-DECLARED `mn_len` does NOT truncate the walk, and the
+  /// stream is byte-identical to `parse_in_tiff` (the retired oracle, likewise
+  /// parent-bounded). (The narrow `$dirLen`-clamp SALVAGE at `Exif.pm:6384-6388` —
+  /// reached only when the claim ALSO overruns the parent — is a SEPARATE
+  /// pre-existing gap shared with `parse_in_tiff`, tracked as a follow-up.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_isolated_walk_is_parent_bounded_not_mn_len_bounded() {
+    // A standalone Canon Main IFD with TWO inline ASCII leaves (count word = 2):
+    // 0x07 CanonFirmwareVersion then 0x09 OwnerName. Extent = 2 + 24 + 4 = 30.
+    let mut canon_ifd = Vec::new();
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // count word = 2 entries
+    canon_ifd.extend_from_slice(&0x0007u16.to_le_bytes()); // 0x07 FirmwareVersion
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    canon_ifd.extend_from_slice(b"1.0\0");
+    canon_ifd.extend_from_slice(&0x0009u16.to_le_bytes()); // 0x09 OwnerName @ offset 14
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    canon_ifd.extend_from_slice(b"Al\0\0");
+    canon_ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    assert_eq!(canon_ifd.len(), 30);
+
+    // mn_len = 14 UNDER-DECLARES the IFD (14 bytes = count word + ONE entry); the
+    // second entry (0x09 OwnerName) begins at offset 14 — ENTIRELY past mn_len.
+    // The count word claims TWO and both fit within the parent (len 30), so the
+    // parent-bounded walk (Exif.pm:6356) emits BOTH; an mn_len bound would
+    // wrongly drop OwnerName.
+    let under_declared_mn_len = 14;
+    let order = ByteOrder::Little;
+    let model = Some("Canon");
+
+    for print_conv in [true, false] {
+      let (emissions, _typed) = canon_makernote_isolated(
+        &canon_ifd,
+        0,
+        under_declared_mn_len,
+        order,
+        model,
+        None,
+        print_conv,
+      );
+      // Oracle: parse_in_tiff at the SAME under-declared mn_len — likewise
+      // parent-bounded (it uses tiff_data.len(), not mn_len, for the extent).
+      let (_otyped, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &canon_ifd,
+        0,
+        under_declared_mn_len,
+        order,
+        print_conv,
+        model,
+        None,
+      );
+      // The SECOND leaf — which begins past mn_len=14 — MUST still emit (the walk
+      // is parent-bounded, not mn_len-bounded).
+      assert!(
+        emissions.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: OwnerName (offset 14, past mn_len=14) MUST emit \
+         — the walk is parent-bounded, not mn_len-bounded (Exif.pm:6356): {:?}",
+        emissions
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      // Byte-identical to the retired oracle (both parent-bounded), proving the
+      // shared Walker introduces no stricter bound than parse_in_tiff.
+      assert_eq!(
+        emissions.len(),
+        oracle.len(),
+        "print_conv={print_conv}: isolated walk must match parse_in_tiff \
+         (both parent-bounded — neither truncates at mn_len)"
+      );
+      assert!(
+        emissions.len() >= 2,
+        "print_conv={print_conv}: BOTH leaves must walk (not truncated at mn_len)"
+      );
+      for (g, w) in emissions.iter().zip(oracle.iter()) {
+        assert_eq!(g.name(), w.name(), "print_conv={print_conv}: leaf name");
+        assert_eq!(g.value(), w.value(), "print_conv={print_conv}: leaf value");
+      }
+    }
+  }
+
+  /// Finding 3: the `%CameraSettings` DataMember pre-scan is LAST-readable-wins,
+  /// matching `parse_in_tiff`'s sub-pass. A Canon IFD with a malformed FIRST 0x01
+  /// (CameraSettings) — an out-of-line value past EOF (a `BadOffset` skip) —
+  /// followed by a VALID 0x01 carrying FocalUnits=10 / LensType=124, then a
+  /// FocalLength (0x02) and FileInfo (0x93), must thread the VALID 0x01's
+  /// DataMembers: FocalLength renders "55 mm" (550 ÷ 10, NOT "550 mm") and
+  /// FileInfo's MacroMagnification emits (gated on LensType==124). The old
+  /// pre-scan stopped at / bailed on the first 0x01, leaving both members `None`
+  /// (a DIVERGENCE). Both paths (`parse_in_tiff` oracle vs the shared Walker) must
+  /// agree, for -j AND -n, AND the concrete values prove the VALID 0x01 won.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_prescan_bad_first_camerasettings_then_valid_uses_valid() {
+    use crate::value::TagValue;
+    // ---- The VALID CameraSettings (0x01), int16s. Word 0 = blob byte-length;
+    // word 22 (LensType) = 124 (MP-E 65mm, the MacroMagnification gate); word 25
+    // (FocalUnits) = 10 (the FocalLength divisor).
+    let mut cs_words = [0i16; 26];
+    cs_words[0] = (cs_words.len() * 2) as i16;
+    cs_words[22] = 124;
+    cs_words[25] = 10;
+    let camera_settings = i16_words_le(&cs_words);
+    // ---- FocalLength (0x02), int16u: [FocalType=2, FocalLength=550, 0, 0] ⇒
+    // "55 mm" with FocalUnits=10 (a broken thread would yield "550 mm").
+    let fl_words: [u16; 4] = [2, 550, 0, 0];
+    let focal_length = u16_words_le(&fl_words);
+    // ---- FileInfo (0x93), int16s: word 16 (MacroMagnification) = 75 ⇒ "1.0x",
+    // emitted ONLY when LensType == 124.
+    let mut fi_words = [0i16; 17];
+    fi_words[16] = 75;
+    let file_info = i16_words_le(&fi_words);
+
+    // Hand-build the IFD: a bad FIRST 0x01 (out-of-line ASCII past EOF ⇒ skip),
+    // then the valid 0x01 / 0x02 / 0x93 as in-bounds out-of-line records. The
+    // `crafted_canon_subtable_ifd` helper can stage only in-bounds payloads, so
+    // build by hand to plant the bad first 0x01.
+    let n: u16 = 4;
+    let header_len = 2 + 12 * (n as usize) + 4; // count + entries + next-IFD word
+    // Stage the three valid payloads after the header, in entry order.
+    let valid_payloads: [&[u8]; 3] = [&camera_settings, &focal_length, &file_info];
+    let mut payload_offsets = [0u32; 3];
+    {
+      let mut off = header_len;
+      for (i, p) in valid_payloads.iter().enumerate() {
+        payload_offsets[i] = off as u32;
+        off += p.len();
+      }
+    }
+    let mut ifd = Vec::new();
+    ifd.extend_from_slice(&n.to_le_bytes());
+    // Entry 0: 0x01 CameraSettings, ASCII, count 8 ⇒ size 8 > 4, offset PAST EOF
+    // ⇒ BadOffset (skip + continue) — the malformed FIRST 0x01.
+    ifd.extend_from_slice(&0x0001u16.to_le_bytes());
+    ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    ifd.extend_from_slice(&8u32.to_le_bytes()); // count 8 ⇒ size 8
+    ifd.extend_from_slice(&0x0000_8000u32.to_le_bytes()); // offset past EOF
+    // Entry 1: 0x01 CameraSettings (VALID), int16s, out-of-line at payload[0].
+    ifd.extend_from_slice(&0x0001u16.to_le_bytes());
+    ifd.extend_from_slice(&8u16.to_le_bytes()); // int16s
+    ifd.extend_from_slice(&(cs_words.len() as u32).to_le_bytes());
+    ifd.extend_from_slice(&payload_offsets[0].to_le_bytes());
+    // Entry 2: 0x02 FocalLength, int16u, out-of-line at payload[1].
+    ifd.extend_from_slice(&0x0002u16.to_le_bytes());
+    ifd.extend_from_slice(&3u16.to_le_bytes()); // int16u
+    ifd.extend_from_slice(&(fl_words.len() as u32).to_le_bytes());
+    ifd.extend_from_slice(&payload_offsets[1].to_le_bytes());
+    // Entry 3: 0x93 FileInfo, int16s, out-of-line at payload[2].
+    ifd.extend_from_slice(&0x0093u16.to_le_bytes());
+    ifd.extend_from_slice(&8u16.to_le_bytes()); // int16s
+    ifd.extend_from_slice(&(fi_words.len() as u32).to_le_bytes());
+    ifd.extend_from_slice(&payload_offsets[2].to_le_bytes());
+    // Next-IFD word = 0.
+    ifd.extend_from_slice(&0u32.to_le_bytes());
+    for p in valid_payloads {
+      ifd.extend_from_slice(p);
+    }
+
+    // `Canon EOS 20D`: keys the FileInfo position-1 FileNumber AND is NOT a
+    // MacroMagnification-excluded body — exactly as the Step-B2 differential test.
+    let em = assert_canon_special_matches(&ifd, Some("Canon EOS 20D"));
+    // FocalLength scaled by the VALID 0x01's FocalUnits(10): 550 ÷ 10 = "55 mm".
+    assert!(
+      em.iter().any(|t| t.tag().name() == "FocalLength"
+        && t.tag().value_ref() == &TagValue::Str("55 mm".into())),
+      "FocalLength must be 55 mm (550 ÷ FocalUnits 10 from the VALID 0x01); a \
+       bailed-on-first-bad-0x01 pre-scan would leave FocalUnits=None ⇒ 550 mm: {em:?}"
+    );
+    // MacroMagnification emits ONLY because the VALID 0x01's LensType == 124.
+    assert!(
+      em.iter().any(|t| t.tag().name() == "MacroMagnification"),
+      "MacroMagnification must emit (LensType==124 from the VALID 0x01); a \
+       bailed pre-scan would leave LensType=None ⇒ it is SUPPRESSED: {em:?}"
+    );
+  }
+
+  // ====================================================================
+  // Canon Step-C R4 finding 1: a SHORT MakerNote (`mn_len < 2`) must NOT be
+  // walked — [`canon_makernote_isolated`] mirrors `walk_canon_in_tiff`'s
+  // top-of-function guard (`body.rs:299`), so a malformed 0x927c with count 0/1
+  // yields the SAME EMPTY result as the `parse_in_tiff` oracle (it never
+  // re-reads inline padding / following ExifIFD bytes as a Canon Main IFD).
+  // ====================================================================
+
+  /// White-box: [`canon_makernote_isolated`] over a buffer that IS a fully
+  /// walkable Canon Main IFD (one inline OwnerName leaf) returns EMPTY emissions
+  /// + `None` typed when `mn_len < 2` (count 0 AND count 1) — byte-identical to
+  /// `canon::parse_in_tiff` at the same `(offset, mn_len)`. A sanity pass with a
+  /// sufficient `mn_len` proves the buffer is NOT vacuously empty (it DOES emit
+  /// OwnerName when the short-directory guard does not fire).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_isolated_short_makernote_yields_empty_like_parse_in_tiff() {
+    // A standalone Canon Main IFD: count 1 + one inline OwnerName(0x09) leaf +
+    // next-IFD word 0. Walked in full, it emits `OwnerName` — so any non-empty
+    // result below is a genuine leak, not vacuity.
+    let mut canon_ifd: Vec<u8> = Vec::new();
+    canon_ifd.extend_from_slice(&1u16.to_le_bytes());
+    canon_ifd.extend_from_slice(&0x0009u16.to_le_bytes()); // 0x09 OwnerName
+    canon_ifd.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    canon_ifd.extend_from_slice(&4u32.to_le_bytes()); // count 4 (inline)
+    canon_ifd.extend_from_slice(b"Al\0\0");
+    canon_ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    let full_len = canon_ifd.len();
+
+    // SANITY: a sufficient `mn_len` walks the IFD and BOTH paths emit OwnerName —
+    // so the bytes are walkable and the emptiness below is the guard, not vacuity.
+    let (sane_emi, sane_typed) = canon_makernote_isolated(
+      &canon_ifd,
+      0,
+      full_len,
+      ByteOrder::Little,
+      Some("Canon"),
+      None,
+      true,
+    );
+    assert!(
+      sane_emi.iter().any(|e| e.name() == "OwnerName"),
+      "sanity: a full-length walk MUST emit OwnerName (else the short-mn_len \
+       assertions below are vacuous): {:?}",
+      sane_emi
+        .iter()
+        .map(makernotes::VendorEmission::name)
+        .collect::<Vec<_>>()
+    );
+    assert!(
+      sane_typed.is_some(),
+      "sanity: print_conv=true yields the typed slot"
+    );
+
+    // The guard fires for mn_len 0 and 1 (the malformed-count cases). Both modes
+    // return EMPTY emissions, MATCHING `parse_in_tiff` at the SAME `(0, mn_len)`;
+    // the TYPED slot is `Some(empty)` in `-j` (parse_in_tiff always returns a
+    // `MakerNotesCanon`, so the typed API must NOT drop to `None` — #243 phase 2
+    // R8) and `None` in `-n` (discarded by the recompute).
+    for mn_len in [0usize, 1usize] {
+      for print_conv in [true, false] {
+        let (emi, typed) = canon_makernote_isolated(
+          &canon_ifd,
+          0,
+          mn_len,
+          ByteOrder::Little,
+          Some("Canon"),
+          None,
+          print_conv,
+        );
+        // Oracle: `parse_in_tiff` at the SAME short window — `body.rs:299`
+        // returns empty for `mn_len < 2`.
+        let (_oracle_typed, oracle) = makernotes::vendors::canon::parse_in_tiff(
+          &canon_ifd,
+          0,
+          mn_len,
+          ByteOrder::Little,
+          print_conv,
+          Some("Canon"),
+          None,
+        );
+        assert!(
+          oracle.is_empty(),
+          "oracle parse_in_tiff must be EMPTY for a short mn_len={mn_len} \
+           (body.rs:299 mn_len<2 guard)"
+        );
+        assert!(
+          emi.is_empty(),
+          "mn_len={mn_len} print_conv={print_conv}: a short MakerNote must yield \
+           NO emissions (the fresh Walker must not re-read the buffer as a Canon \
+           Main IFD) — got {:?}",
+          emi
+            .iter()
+            .map(makernotes::VendorEmission::name)
+            .collect::<Vec<_>>()
+        );
+        assert!(
+          !emi.iter().any(|e| e.name() == "OwnerName"),
+          "mn_len={mn_len} print_conv={print_conv}: the bogus OwnerName must NOT \
+           leak from the under-declared MakerNote value"
+        );
+        // The TYPED surface is PRESERVED for a short MakerNote: `parse_in_tiff`
+        // ALWAYS returns a `MakerNotesCanon` (here empty), which the dispatch
+        // installs — so `canon() == Some(empty)`. The `-j` isolated helper must
+        // likewise return `Some(empty)`, NOT collapse to `None` (#243 phase 2 R8);
+        // the `-n` recompute discards the typed slot, so `None` there.
+        if print_conv {
+          assert!(
+            typed.is_some(),
+            "mn_len={mn_len}: a short MakerNote must KEEP the (empty) typed Canon \
+             surface (Some), matching parse_in_tiff — not drop it to None"
+          );
+        } else {
+          assert!(
+            typed.is_none(),
+            "mn_len={mn_len}: the -n recompute discards the typed slot"
+          );
+        }
+      }
+    }
+  }
+
+  /// End-to-end: a dispatched Canon TIFF whose 0x927c MakerNote declares count 1
+  /// (so the dispatch passes `read_len == 1`) must produce an EMPTY Canon maker
+  /// note — even though the bytes at the MakerNote value offset form a fully
+  /// walkable Canon Main IFD (a 1-entry OwnerName IFD spilling out of the inline
+  /// slot into the following ExifIFD/trailing bytes). The `mn_len < 2` guard
+  /// rejects the walk; the oracle does too. A sanity pass with a sufficient
+  /// `mn_len` proves those same bytes WOULD emit OwnerName, so the empty result
+  /// is the guard at work, not vacuity.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_short_inline_makernote_does_not_leak_following_bytes() {
+    // Standalone LE TIFF: IFD0@8 = { Make="Canon", ExifOffset } ⇒ Vendor::Canon.
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    // IFD0@8: 2 entries — Make(0x010f, out-of-line "Canon\0"), ExifOffset(0x8769).
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&0x010fu16.to_le_bytes());
+    t.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    t.extend_from_slice(&6u32.to_le_bytes()); // count 6
+    let make_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // Make value offset (patch)
+    t.extend_from_slice(&0x8769u16.to_le_bytes());
+    t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    let exif_ptr_pos = t.len();
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD offset (patch)
+    t.extend_from_slice(&0u32.to_le_bytes()); // IFD0 next = 0
+    let make_val_off = t.len() as u32;
+    t.extend_from_slice(b"Canon\0");
+    t[make_ptr_pos..make_ptr_pos + 4].copy_from_slice(&make_val_off.to_le_bytes());
+    // ExifIFD: ONE entry, MakerNote(0x927c), UNDEFINED, count 1 ⇒ size 1 ≤ 4 ⇒
+    // INLINE. The dispatch reads `value_offset = entry+8` (the 4-byte inline
+    // slot) with `read_len == 1`. We plant bytes so that a walk FROM that
+    // value_offset (slot + the ExifIFD next-IFD word + appended trailing bytes)
+    // is a valid 1-entry Canon Main IFD emitting OwnerName — the very leak the
+    // guard must prevent.
+    let exififd_off = t.len() as u32;
+    t[exif_ptr_pos..exif_ptr_pos + 4].copy_from_slice(&exififd_off.to_le_bytes());
+    t.extend_from_slice(&1u16.to_le_bytes()); // 1 ExifIFD entry
+    let mn_entry_off = t.len();
+    t.extend_from_slice(&0x927cu16.to_le_bytes()); // MakerNote
+    t.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+    t.extend_from_slice(&1u32.to_le_bytes()); // count 1 ⇒ size 1 ⇒ INLINE
+    // Inline 4-byte value slot @ mn_entry_off+8 = the START of a bogus Canon IFD:
+    // count word `1` + the first half of an OwnerName(0x09) entry.
+    t.extend_from_slice(&1u16.to_le_bytes()); // [slot 0..2] Canon IFD count = 1
+    t.extend_from_slice(&0x0009u16.to_le_bytes()); // [slot 2..4] entry tag = OwnerName
+    // The ExifIFD next-IFD word doubles as the entry's format+count-low bytes.
+    t.extend_from_slice(&2u16.to_le_bytes()); // [+0..2] format = ASCII
+    t.extend_from_slice(&4u16.to_le_bytes()); // [+2..4] count low = 4
+    // Trailing bytes complete the bogus entry: count high + inline "Al\0\0" +
+    // the bogus IFD's next-IFD word.
+    t.extend_from_slice(&0u16.to_le_bytes()); // count high (count = 4)
+    t.extend_from_slice(b"Al\0\0"); // inline OwnerName value
+    t.extend_from_slice(&0u32.to_le_bytes()); // bogus IFD next-IFD = 0
+    let mn_value_offset = mn_entry_off + 8;
+
+    // SANITY: walked with a SUFFICIENT mn_len (18 = the bogus IFD's full extent),
+    // the oracle DOES emit OwnerName from these exact bytes — proving the bytes
+    // are walkable and the empty result below is the short-mn_len guard.
+    let (_st, sane) = makernotes::vendors::canon::parse_in_tiff(
+      &t,
+      mn_value_offset,
+      18,
+      ByteOrder::Little,
+      true,
+      Some("Canon"),
+      None,
+    );
+    assert!(
+      sane.iter().any(|e| e.name() == "OwnerName"),
+      "sanity: the planted bytes MUST form a walkable Canon IFD emitting \
+       OwnerName when mn_len is sufficient (else this test is vacuous): {:?}",
+      sane
+        .iter()
+        .map(makernotes::VendorEmission::name)
+        .collect::<Vec<_>>()
+    );
+
+    let meta = parse_borrowed(&t).expect("standalone TIFF parses");
+    let mn = meta
+      .maker_note()
+      .expect("IFD0 Make=Canon + a 0x927c MakerNote must dispatch a Canon maker note");
+    // The production dispatch passed `read_len == 1` (inline size 1) — the guard
+    // fires, so the Canon walk is rejected and NOTHING leaks. Matches the oracle
+    // at `(value_offset, 1)`.
+    for print_conv in [true, false] {
+      let (_ot, oracle) = makernotes::vendors::canon::parse_in_tiff(
+        &t,
+        mn_value_offset,
+        1,
+        ByteOrder::Little,
+        print_conv,
+        Some("Canon"),
+        None,
+      );
+      assert!(
+        oracle.is_empty(),
+        "print_conv={print_conv}: oracle is EMPTY for mn_len=1"
+      );
+      let got = if print_conv {
+        mn.emissions_print_conv().to_vec()
+      } else {
+        mn.emissions_value_conv()
+      };
+      assert!(
+        got.is_empty(),
+        "print_conv={print_conv}: a count-1 MakerNote must emit NOTHING — the \
+         following ExifIFD/trailing bytes must NOT be walked as a Canon IFD: {:?}",
+        got
+          .iter()
+          .map(makernotes::VendorEmission::name)
+          .collect::<Vec<_>>()
+      );
+      assert!(
+        !got.iter().any(|e| e.name() == "OwnerName"),
+        "print_conv={print_conv}: the bogus OwnerName must NOT leak"
+      );
+    }
+    // The typed Canon surface is PRESERVED for a short MakerNote: `parse_in_tiff`
+    // ALWAYS returns a (here empty) `MakerNotesCanon`, so the migrated dispatch
+    // must install `Some(empty)`, NOT drop it to `None` (#243 phase 2 R8 — a
+    // typed-API divergence the byte-identical JSON gate cannot see). The emissions
+    // above are empty; the typed slot is present-but-empty.
+    assert!(
+      mn.meta().canon().is_some(),
+      "a short Canon MakerNote must KEEP the (empty) typed MakerNotesCanon \
+       surface, matching parse_in_tiff (the typed API must not collapse to None)"
+    );
+  }
+
+  // ====================================================================
+  // Canon Step-C R4 finding 2: DUPLICATE CanonFocalLength (0x02) entries.
+  // `parse_in_tiff`'s pre-pass caches the LAST readable 0x02 `$$valPt` and
+  // renders EVERY 0x02 SubDirectory from that final blob ("last,last"). The
+  // migrated emit must match — the pre-scan caches the last 0x02 into
+  // `canon_focal_length_blob`, read by EVERY FocalLength emit.
+  // ====================================================================
+
+  /// Two `CanonFocalLength` (0x02) entries with DISTINCT blobs: both 0x02
+  /// emissions must decode the LAST entry's blob ("last,last"), matching
+  /// `parse_in_tiff` for `-j` AND `-n`. A "first,last" (current-entry) decode —
+  /// the divergence this fix closes — would render the FIRST 0x02 from its own
+  /// blob. The differential (`assert_canon_special_matches`) proves byte-identity
+  /// to the oracle; the concrete value asserts pin that BOTH emissions are the
+  /// LAST blob's (so the test cannot pass on a "first,last" emit).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn canon_two_focal_length_entries_emit_last_blob_like_parse_in_tiff() {
+    use crate::value::TagValue;
+    // FocalLength A (FIRST 0x02): FocalType=Fixed(1), FocalLength raw 300.
+    let fl_a: [u16; 4] = [1, 300, 0, 0];
+    // FocalLength B (LAST 0x02): FocalType=Zoom(2), FocalLength raw 550.
+    let fl_b: [u16; 4] = [2, 550, 0, 0];
+    let blob_a = u16_words_le(&fl_a);
+    let blob_b = u16_words_le(&fl_b);
+    // A Canon Main IFD with TWO 0x02 entries (both int16u[4], out-of-line). No
+    // CameraSettings ⇒ FocalUnits stays None ⇒ divisor 1 (the raw mm). Tag order
+    // is non-decreasing (0x02, 0x02), and the helper stages each payload past the
+    // directory extent so neither is `Suspicious`.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x02, 3, fl_a.len() as u32, &[], &blob_a),
+      (0x02, 3, fl_b.len() as u32, &[], &blob_b),
+    ];
+    let ifd = crafted_canon_subtable_ifd(entries);
+
+    // Byte-identity to the oracle (parse_in_tiff) for -j AND -n.
+    let em = assert_canon_special_matches(&ifd, None);
+
+    // CONCRETE pins (PrintConv `-j`): BOTH FocalType emissions are the LAST
+    // blob's "Zoom", BOTH FocalLength emissions the LAST blob's "550 mm". A
+    // "first,last" emit would instead surface the FIRST blob's "Fixed"/"300 mm".
+    let focal_types: Vec<&TagValue> = em
+      .iter()
+      .filter(|t| t.tag().name() == "FocalType")
+      .map(|t| t.tag().value_ref())
+      .collect();
+    assert_eq!(
+      focal_types,
+      vec![&TagValue::Str("Zoom".into()), &TagValue::Str("Zoom".into())],
+      "both FocalType emissions must be the LAST 0x02 blob's Zoom (last,last), \
+       NOT the first blob's Fixed (first,last): {em:?}"
+    );
+    let focal_lengths: Vec<&TagValue> = em
+      .iter()
+      .filter(|t| t.tag().name() == "FocalLength")
+      .map(|t| t.tag().value_ref())
+      .collect();
+    assert_eq!(
+      focal_lengths,
+      vec![
+        &TagValue::Str("550 mm".into()),
+        &TagValue::Str("550 mm".into())
+      ],
+      "both FocalLength emissions must be the LAST 0x02 blob's 550 mm \
+       (last,last), NOT the first blob's 300 mm (first,last): {em:?}"
     );
   }
 }

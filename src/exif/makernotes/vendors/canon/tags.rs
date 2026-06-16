@@ -272,6 +272,34 @@ impl SubTable {
         | SubTable::ColorBalance
     )
   }
+
+  /// `true` for the SIMPLE walked sub-tables — those with NO `DataMember`
+  /// dependency and NO 2-pass: `ShotInfo` / `AFInfo` / `AFInfo2` / `AFInfo3` /
+  /// `SensorInfo` / `ColorBalance`. Each decodes from a single `$$valPt` blob
+  /// with only `model`/`file_type` context (no `FocalUnits` or `$$self{LensType}`
+  /// capture across sibling entries).
+  ///
+  /// The complement within [`is_walked`](Self::is_walked) is the DataMember
+  /// 2-pass group — `CameraSettings` (0x01) / `FocalLength` (0x02) / `FileInfo`
+  /// (0x93). Step B1 of the Canon engine migration (#243 phase 2) routed only
+  /// THIS simple set through the shared `Walker`'s `emit_canon_subtable`; step B2
+  /// added the 2-pass group (threading the pre-scanned `$$self{FocalUnits}` /
+  /// `$$self{LensType}`), so the emit dispatch now keys on the full
+  /// [`is_walked`](Self::is_walked) set and this narrower predicate marks which
+  /// tables need NO cross-entry DataMember thread.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_simple_walked(self) -> bool {
+    matches!(
+      self,
+      SubTable::ShotInfo
+        | SubTable::AfInfo
+        | SubTable::AfInfo2
+        | SubTable::AfInfo3
+        | SubTable::SensorInfo
+        | SubTable::ColorBalance
+    )
+  }
 }
 
 /// `%Canon::Main` (`Canon.pm:1221-2209`). Sorted by tag ID.
