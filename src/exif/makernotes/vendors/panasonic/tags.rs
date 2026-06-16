@@ -69,6 +69,27 @@ pub struct PanasonicTag {
 }
 
 impl PanasonicTag {
+  /// The resolved tag name (`Name => '…'` from bundled). Accessor mirroring the
+  /// Apple/Canon/Sony `name()` so the shared `Walker`'s `ResolvedConv::Panasonic`
+  /// arm reads it the same way (#243 phase 3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+
+  /// The tag's optional `Format =>` directive (`Exif.pm:6728-6745`) — the format
+  /// the value bytes are RE-READ as, overriding the on-disk format. `None` ⇒ read
+  /// with the on-disk format. The shared `Walker` resolves this per-table when
+  /// `active_table == Panasonic` (the same way the Exif/GPS/Sony tables resolve
+  /// their own overrides), reproducing `walk_panasonic_in_tiff`'s
+  /// `resolve_read_format` step (#243 phase 3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn format_override(&self) -> Option<FormatOverride> {
+    self.format
+  }
+
   /// `true` when bundled marks this tag `Unknown => 1` — suppressed in the
   /// default (`-j`, no `-u`) output (`ExifTool.pm:9179-9185`). Mirrors the
   /// Apple/Canon `is_unknown()` accessor.
@@ -1351,6 +1372,22 @@ pub fn lookup(tag_id: u16) -> Option<&'static PanasonicTag> {
     Ok(i) => PANASONIC_TAGS.get(i),
     Err(_) => None,
   }
+}
+
+/// The `Format =>` directive's FORMAT for tag `id` under `%Panasonic::Main`, if
+/// any — the per-table override the shared `Walker` resolves when `active_table
+/// == Panasonic` (`Exif.pm:6729` reads the override off the active
+/// `$tagTablePtr`). `None` for an unknown tag or a tag with no directive. Returns
+/// the bare [`Format`] (NOT the [`FormatOverride`]) so it has the SAME
+/// `Option<Format>` shape the Walker's `table_override` block expects from
+/// `tables::format_override` / `gps::format_override` / `sony::format_override` —
+/// the bundled `Count` hint is the walker's `int(size/elemsize)` recompute, not
+/// this value (#243 phase 3).
+#[must_use]
+pub fn format_override(id: u16) -> Option<Format> {
+  lookup(id)
+    .and_then(PanasonicTag::format_override)
+    .map(FormatOverride::format)
 }
 
 #[cfg(test)]
