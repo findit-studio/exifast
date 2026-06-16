@@ -51,11 +51,14 @@ impl ApplePrintConv {
   /// `print_conv = false` (-n mode) emits the post-ValueConv raw scalar;
   /// `print_conv = true` (the `-j` default) renders the human string.
   ///
-  /// `raw_i64` is the first integer from the decoded value (the dominant
-  /// Apple shape — most tags are int32s scalars). `raw` is the full
-  /// decoded value for the tags that read multiple components.
+  /// `raw` is the full decoded [`RawValue`](crate::exif::ifd::RawValue); the
+  /// scalar PrintConvs read its first integer (the dominant Apple shape — most
+  /// tags are int32s scalars) and the multi-component ones read the rest.
+  /// Taking the borrowed `RawValue` directly (NOT a `ParsedValue` wrapper) lets
+  /// the shared-Walker emit path render Apple leaves with ZERO per-tag clone,
+  /// matching `CanonPrintConv::apply` (#243 phase 3).
   #[must_use]
-  pub fn apply(self, raw: &super::body::ParsedValue, print_conv: bool) -> TagValue {
+  pub fn apply(self, raw: &crate::exif::ifd::RawValue, print_conv: bool) -> TagValue {
     match self {
       ApplePrintConv::None => raw.to_default_tag_value(),
       ApplePrintConv::NoYes => {

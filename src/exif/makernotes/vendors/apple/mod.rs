@@ -46,7 +46,7 @@ pub use body::{AppleEntry, ParsedValue, walk_apple_body};
 pub use printconv::ApplePrintConv;
 pub use tags::{APPLE_TAGS, AppleTag, lookup};
 
-use super::super::super::ifd::ByteOrder;
+use super::super::super::ifd::{ByteOrder, RawValue};
 
 /// Decoded Apple iOS MakerNotes data — populated by [`parse`] when the
 /// dispatcher resolved [`Vendor::Apple`](crate::exif::makernotes::Vendor).
@@ -215,31 +215,41 @@ impl MakerNotesApple {
 ///
 /// `blob` is the raw 0x927C value; `parent_order` is the parent IFD
 /// walk's byte order (used as the body-marker-fallback per
-/// [`super::super::byte_order::resolve_child_byte_order`]).
+/// [`super::super::byte_order::resolve_child_byte_order`]). `make` is the
+/// parent IFD0 `Make` — threaded into the body walker so the format-16
+/// (`int64u`) Apple carve-out gates on `Make eq 'Apple'` exactly
+/// (`Exif.pm:6464`); pass the captured IFD0 Make (`None` if unknown, which
+/// then rejects code 16 like any non-Apple Make).
 ///
 /// Returns `(typed, emissions)` — the typed struct + the ordered
 /// [`VendorEmission`] list (each carrying the `Unknown => 1` flag) for the
 /// emission engine.
 #[must_use]
-pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesApple, Vec<VendorEmission>) {
-  parse_with_print_conv(blob, parent_order, true)
+pub fn parse(
+  blob: &[u8],
+  parent_order: ByteOrder,
+  make: Option<&str>,
+) -> (MakerNotesApple, Vec<VendorEmission>) {
+  parse_with_print_conv(blob, parent_order, true, make)
 }
 
 /// Like [`parse`] but lets the caller toggle PrintConv (`-n` mode emits
 /// the post-ValueConv raw scalar; the typed struct is the same either
-/// way).
+/// way). `make` is the parent IFD0 `Make`, threaded into the body walker for
+/// the `Make eq 'Apple'` format-16 carve-out gate (`Exif.pm:6464`).
 #[must_use]
 pub fn parse_with_print_conv(
   blob: &[u8],
   parent_order: ByteOrder,
   print_conv: bool,
+  make: Option<&str>,
 ) -> (MakerNotesApple, Vec<VendorEmission>) {
   let mut typed = MakerNotesApple::new();
   let mut emissions: Vec<VendorEmission> = Vec::new();
   if blob.len() < 14 {
     return (typed, emissions);
   }
-  let entries = body::walk_apple_body(blob, 14, parent_order);
+  let entries = body::walk_apple_body(blob, 14, parent_order, make);
   for entry in &entries {
     let Some(def) = tags::lookup(entry.tag_id) else {
       continue;
@@ -251,7 +261,7 @@ pub fn parse_with_print_conv(
     // so no per-vendor `if def.is_unknown() { continue; }`. The typed
     // accessors are not populated from any Unknown tag, so nothing else
     // depends on the old skip.
-    let value = def.conv().apply(&entry.value, print_conv);
+    let value = def.conv().apply(entry.value.raw(), print_conv);
     emissions.push(VendorEmission::new(
       def.name().into(),
       value,
@@ -269,10 +279,11 @@ pub fn parse_into_metadata(
   blob: &[u8],
   parent_order: ByteOrder,
   print_conv: bool,
+  make: Option<&str>,
   into: &mut Metadata,
 ) {
   let group = Group::new("MakerNotes", "MakerNotes");
-  let (_typed, emissions) = parse_with_print_conv(blob, parent_order, print_conv);
+  let (_typed, emissions) = parse_with_print_conv(blob, parent_order, print_conv, make);
   for e in emissions {
     // Unknown-suppression is the engine's job; this raw `Metadata`-sink
     // helper applies it inline so it matches the default-output contract.
@@ -287,39 +298,48 @@ pub fn parse_into_metadata(
 /// the tags surfaced via accessor on [`MakerNotesApple`] are routed
 /// here; other tags surface only via the emissions list.
 fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
-  use crate::exif::ifd::RawValue;
-  match entry.tag_id {
+  populate_typed_value(typed, entry.tag_id, entry.value.raw());
+}
+
+/// Populate the typed struct from a `(tag_id, value)` pair — the per-tag
+/// routing the oracle ([`populate_typed`]) and the shared-`Walker` isolated
+/// path ([`crate::exif::apple_makernote_isolated`]) BOTH call, so the typed
+/// surface is single-sourced (#243 phase 3). Only the tags surfaced via
+/// accessor on [`MakerNotesApple`] are routed here; other tags surface only
+/// via the emissions list.
+pub fn populate_typed_value(typed: &mut MakerNotesApple, tag_id: u16, value: &RawValue) {
+  match tag_id {
     0x0001 => {
-      typed.maker_note_version = entry.value.first_i64();
+      typed.maker_note_version = value.first_i64();
     }
     0x002e => {
-      typed.camera_type = entry.value.first_i64();
+      typed.camera_type = value.first_i64();
     }
     0x000a => {
-      typed.hdr_image_type = entry.value.first_i64();
+      typed.hdr_image_type = value.first_i64();
     }
     0x0014 => {
-      typed.image_capture_type = entry.value.first_i64();
+      typed.image_capture_type = value.first_i64();
     }
     0x000b => {
-      if let RawValue::Text { text: s, .. } = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = value {
         typed.burst_uuid = Some(s.as_str().into());
       }
     }
     0x0011 => {
-      if let RawValue::Text { text: s, .. } = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = value {
         typed.content_identifier = Some(s.as_str().into());
       }
     }
     0x0015 => {
-      if let RawValue::Text { text: s, .. } = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = value {
         typed.image_unique_id = Some(s.as_str().into());
       }
     }
     0x0008 => {
       // `[r0, r1, r2, ..]` matches len ≥ 3 and binds the first three — the
       // checked form is byte-identical to the `rs.len() >= 3` guard + `rs[0..2]`.
-      if let RawValue::Rational(rs) = entry.value.raw()
+      if let RawValue::Rational(rs) = value
         && let [r0, r1, r2, ..] = rs.as_slice()
       {
         let x = rational_f64(r0);
@@ -333,7 +353,7 @@ fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
     0x000c => {
       // `[r0, r1, ..]` matches len ≥ 2 and binds the first two — the checked
       // form is byte-identical to the `rs.len() >= 2` guard + `rs[0..1]`.
-      if let RawValue::Rational(rs) = entry.value.raw()
+      if let RawValue::Rational(rs) = value
         && let [r0, r1, ..] = rs.as_slice()
       {
         let a = rational_f64(r0);
@@ -345,17 +365,17 @@ fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
       }
     }
     0x002d => {
-      typed.color_temperature = entry.value.first_i64();
+      typed.color_temperature = value.first_i64();
     }
     0x0021 => {
-      if let RawValue::Rational(rs) = entry.value.raw()
+      if let RawValue::Rational(rs) = value
         && let Some(r) = rs.first()
       {
         typed.hdr_headroom = Some((r.numerator(), r.denominator()));
       }
     }
     0x000f => {
-      typed.ois_mode = entry.value.first_i64();
+      typed.ois_mode = value.first_i64();
     }
     _ => {}
   }
@@ -395,7 +415,7 @@ mod tests {
   fn parse_makernoteversion_populates_typed() {
     // int32s = format code 9, count 1, value 4
     let blob = one_entry_blob(0x0001, 0x0009, 1, [0x00, 0x00, 0x00, 0x04]);
-    let (typed, emissions) = parse(&blob, ByteOrder::Big);
+    let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.maker_note_version(), Some(4));
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].name(), "MakerNoteVersion");
@@ -405,7 +425,7 @@ mod tests {
   #[test]
   fn parse_hdr_image_type_print_conv() {
     let blob = one_entry_blob(0x000a, 0x0009, 1, [0x00, 0x00, 0x00, 0x03]); // 3 = HDR Image
-    let (typed, emissions) = parse(&blob, ByteOrder::Big);
+    let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.hdr_image_type(), Some(3));
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].value(), &TagValue::Str("HDR Image".into()));
@@ -414,7 +434,7 @@ mod tests {
   #[test]
   fn parse_camera_type_print_conv() {
     let blob = one_entry_blob(0x002e, 0x0009, 1, [0x00, 0x00, 0x00, 0x00]); // 0 = Back Wide Angle
-    let (typed, emissions) = parse(&blob, ByteOrder::Big);
+    let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.camera_type(), Some(0));
     assert_eq!(typed.camera_type_label(), Some("Back Wide Angle"));
     assert_eq!(
@@ -426,7 +446,7 @@ mod tests {
   #[test]
   fn parse_unknown_image_capture_type_renders_unknown_label() {
     let blob = one_entry_blob(0x0014, 0x0009, 1, [0x00, 0x00, 0x00, 0x05]); // 5 = unknown
-    let (typed, emissions) = parse(&blob, ByteOrder::Big);
+    let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.image_capture_type(), Some(5));
     assert_eq!(emissions[0].value(), &TagValue::Str("Unknown (5)".into()));
   }
@@ -434,20 +454,20 @@ mod tests {
   #[test]
   fn parse_with_print_conv_off_emits_raw_int() {
     let blob = one_entry_blob(0x000a, 0x0009, 1, [0x00, 0x00, 0x00, 0x03]);
-    let (_typed, emissions) = parse_with_print_conv(&blob, ByteOrder::Big, false);
+    let (_typed, emissions) = parse_with_print_conv(&blob, ByteOrder::Big, false, Some("Apple"));
     assert_eq!(emissions[0].value(), &TagValue::I64(3));
   }
 
   #[test]
   fn empty_blob_yields_empty() {
-    let (typed, emissions) = parse(&[], ByteOrder::Big);
+    let (typed, emissions) = parse(&[], ByteOrder::Big, Some("Apple"));
     assert_eq!(typed, MakerNotesApple::new());
     assert!(emissions.is_empty());
   }
 
   #[test]
   fn too_short_blob_yields_empty() {
-    let (typed, emissions) = parse(b"Apple iOS\x00", ByteOrder::Big);
+    let (typed, emissions) = parse(b"Apple iOS\x00", ByteOrder::Big, Some("Apple"));
     assert_eq!(typed, MakerNotesApple::new());
     assert!(emissions.is_empty());
   }

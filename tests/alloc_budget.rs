@@ -236,10 +236,33 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // P1+P4 took -j 2085 → 1547; P0 then took it 1547 → 907. -n stays ~1632
     // (one value-conv decode, now on demand). Contract A: (907,1632) → (916,1644).
     "MakerNotes_Canon.jpg" => (985, 1750), // measured (916, 1644)
-    "MakerNotes_Apple.jpg" => (385, 510),  // measured (357, 474)
-    "ID3v2_4_big.mp3" => (130, 130),       // measured (118, 117)
+    // RE-BASELINED for #243 phase 3 (Apple → shared Walker). Routing Apple
+    // through the shared `Walker` (instead of the bespoke `walk_apple_body`
+    // oracle) adds the Walker's own structural allocations on the `-n` recompute
+    // walk (its `entries` / `active_ifd_offsets` Vecs + chain-guard `HashSet`),
+    // which the leaner hand-written oracle did not allocate: `-n` rises 474 → 511.
+    // This is the migration's INTENDED structural cost, NOT a redundant clone —
+    // BOTH per-tag `RawValue` clones (`emit_apple_value` + the typed-populate
+    // capture) were removed (matching Canon, which passes `&RawValue` straight
+    // to its PrintConv), which is what keeps `media_metadata` BELOW its 160
+    // budget (149) and `-j` within its 385 budget (377). The `-j` ceiling is
+    // unchanged (377 < 385).
+    //
+    // RE-BASELINED AGAIN for #243 phase 3 Apple R4 (format-16 `Make eq 'Apple'`
+    // gate): the isolated Apple walk now threads the parent IFD0 `Make` into its
+    // fresh `Walker` (`captured_make: make.map(String::from)`) so the BigTIFF
+    // `int64u` (code 16) carve-out gates on `$$et{Make} eq 'Apple'`
+    // (`Exif.pm:6464`), faithful to ExifTool. The real Apple fixture's Make is
+    // "Apple", so each isolated walk allocates ONE short `String`; the `-n` path
+    // runs TWO isolated walks (the dispatch's eager `-j` decode for the typed slot
+    // + the on-demand recompute), so `-n` rises 511 → 513 (+2). This is the
+    // correctness fix's INTENDED, minimal cost (a non-Apple container must NOT
+    // admit code 16), NOT a redundant clone. `-n` ceiling raised to 514. `-j`
+    // runs ONE isolated walk (+1: 377 → 378), still within its 385 budget.
+    "MakerNotes_Apple.jpg" => (385, 514), // measured (378, 513) — R4 Make-gate threads IFD0 Make into the isolated walk(s)
+    "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
     "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
-    "Real.ra" => (100, 100),               // measured (88, 87)
+    "Real.ra" => (100, 100),              // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }
 }

@@ -273,7 +273,10 @@ impl MakerNotesMeta {
     let mut meta = Self::from_detected(detected);
     match detected.vendor() {
       Vendor::Apple => {
-        let (typed, _emissions) = vendors::apple::parse(blob, parent_order);
+        // Thread the IFD0 `Make` so the format-16 (`int64u`) Apple carve-out
+        // gates on `Make eq 'Apple'` (`Exif.pm:6464`) — a non-Apple container
+        // with an Apple-signature blob rejects code 16.
+        let (typed, _emissions) = vendors::apple::parse(blob, parent_order, make);
         meta.apple = Some(typed);
       }
       Vendor::Canon => {
