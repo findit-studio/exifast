@@ -69,6 +69,27 @@ pub struct SonyTag {
 }
 
 impl SonyTag {
+  /// The resolved tag name (`Name => '…'` from bundled). Accessor mirroring the
+  /// Apple/Canon `name()` so the shared `Walker`'s `ResolvedConv::Sony` arm reads
+  /// it the same way (#243 phase 3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+
+  /// The tag's optional `Format =>` directive (`Exif.pm:6728-6745`) — the format
+  /// the value bytes are RE-READ as, overriding the on-disk format. `None` ⇒ read
+  /// with the on-disk format. The shared `Walker` resolves this per-table when
+  /// `active_table == Sony` (the same way the Exif/GPS tables resolve their own
+  /// overrides), reproducing `walk_sony_in_tiff`'s `resolve_read_format` step
+  /// (#243 phase 3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn format_override(&self) -> Option<FormatOverride> {
+    self.format
+  }
+
   /// `true` when bundled marks this tag `Unknown => 1` — suppressed in the
   /// default (`-j`, no `-u`) output (`ExifTool.pm:9179-9185`). Mirrors the
   /// Apple/Canon/Panasonic `is_unknown()` accessor.
@@ -77,6 +98,21 @@ impl SonyTag {
   pub const fn is_unknown(&self) -> bool {
     self.unknown
   }
+}
+
+/// The `Format =>` directive's FORMAT for tag `id` under `%Sony::Main`, if any —
+/// the per-table override the shared `Walker` resolves when `active_table == Sony`
+/// (`Exif.pm:6729` reads the override off the active `$tagTablePtr`). `None` for an
+/// unknown tag or a tag with no directive. Returns the bare [`Format`] (NOT the
+/// `FormatOverride`) so it has the SAME `Option<Format>` shape the Walker's
+/// `table_override` block expects from `tables::format_override` /
+/// `gps::format_override` — the bundled `Count` hint is the walker's
+/// `int(size/elemsize)` recompute, not this value (#243 phase 3).
+#[must_use]
+pub fn format_override(id: u16) -> Option<Format> {
+  lookup(id)
+    .and_then(SonyTag::format_override)
+    .map(FormatOverride::format)
 }
 
 /// Sony Main SubDirectory targets — Phase 3 doesn't walk any of these
