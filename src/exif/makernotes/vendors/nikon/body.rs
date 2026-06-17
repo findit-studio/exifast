@@ -398,14 +398,32 @@ pub fn walk_nikon_ifd(
     if warn_count > 10 {
       break;
     }
-    let entry_off = entries_start + 12 * i;
+    // `$entry = $entryBased ? … : $dirStart + 2 + 12 * $index` (`Exif.pm:6459`):
+    // the byte offset of the 12-byte entry. On 64-bit `i < num_entries <= 65535`
+    // and `entries_start` is framing-bounded so this cannot overflow, but make the
+    // `2 + 12*i + ifd_offset` chain explicit (the deny-overflow class) — an
+    // overflow is unreachable, so `break` matches the in-bounds walk's tail
+    // (mirrors `sony/body.rs`'s `index.checked_mul(12)…` with `break`).
+    let Some(entry_off) = i
+      .checked_mul(12)
+      .and_then(|o| o.checked_add(2))
+      .and_then(|o| ifd_offset.checked_add(o))
+    else {
+      break;
+    };
     let Some(tag_id) = read_u16(blob, entry_off, order) else {
       continue;
     };
-    let Some(format_code) = read_u16(blob, entry_off + 2, order) else {
+    let Some(fmt_pos) = entry_off.checked_add(2) else {
       continue;
     };
-    let Some(count) = read_u32(blob, entry_off + 4, order) else {
+    let Some(format_code) = read_u16(blob, fmt_pos, order) else {
+      continue;
+    };
+    let Some(count_pos) = entry_off.checked_add(4) else {
+      continue;
+    };
+    let Some(count) = read_u32(blob, count_pos, order) else {
       continue;
     };
     let count = count as usize;
@@ -474,9 +492,15 @@ pub fn walk_nikon_ifd(
     // `$valuePtr` at `Exif.pm:6510`, BEFORE the 6544/6546 conversion to a
     // buffer pointer) — the suspicious-offset gate below tests it RAW.
     let (value_data_offset, raw_offset) = if total_size <= 4 {
-      (entry_off + 8, None)
+      let Some(inline) = entry_off.checked_add(8) else {
+        continue;
+      };
+      (inline, None)
     } else {
-      let Some(off) = read_u32(blob, entry_off + 8, order) else {
+      let Some(value_field) = entry_off.checked_add(8) else {
+        continue;
+      };
+      let Some(off) = read_u32(blob, value_field, order) else {
         continue;
       };
       let Some(abs) = (off as usize).checked_add(value_base) else {
@@ -658,10 +682,27 @@ pub fn walk_nikon_ifd(
     let value = if implicit_undef {
       RawValue::Bytes(Vec::new())
     } else {
+      // `$formatStr = 'int8u' if $format == 7 and $count == 1` (`Exif.pm:6644`,
+      // "treat single unknown byte as int8u") — a single-element `undef` LEAF
+      // decodes as an INTEGER (`int8u` ⇒ `RawValue::U64`), NOT a 1-byte
+      // `RawValue::Bytes` blob. The shared `Walker`'s `ProcessExif` leaf path
+      // (`src/exif/mod.rs`, the `decode_format` coercion) applies this on the
+      // POST-`Format`-override `format`/`count`; this ORACLE must match it byte
+      // for byte (the now-aligned oracle, mirroring the Apple migration's
+      // `walk_apple_body` alignment — `apple_undef_count1_leaf_coerces_int8u…`),
+      // so the differential `undef[1]` edge is byte-identical. The implicit-`undef`
+      // SubDirectory branch above is NOT a leaf (its block is materialized for the
+      // child walker, never coerced), so the carve-out is scoped to this leaf path
+      // only. Real Nikon leaves are never `undef[1]`; this pins the crafted edge.
+      let decode_format = if matches!(read_format, Format::Undef) && read_count == 1 {
+        Format::Int8u
+      } else {
+        read_format
+      };
       let Some(raw) = read_value(
         blob,
         value_data_offset,
-        read_format,
+        decode_format,
         read_count,
         total_size,
         order,
@@ -737,7 +778,17 @@ pub fn prescan_decrypt_keys(
     return (serial, count);
   }
   for index in 0..num_entries {
-    let entry_off = ifd_offset + 2 + 12 * index; // < table_end ≤ blob.len()
+    // `$entry = $dirStart + 2 + 12 * $index` (`Nikon.pm:14094`): the entry byte
+    // offset. Bounded `< table_end <= blob.len()` (framing-checked above), so this
+    // never overflows on 64-bit; the explicit `checked_*` chain (deny-overflow
+    // class) `break`s on the unreachable overflow, mirroring `walk_nikon_ifd`.
+    let Some(entry_off) = index
+      .checked_mul(12)
+      .and_then(|o| o.checked_add(2))
+      .and_then(|o| ifd_offset.checked_add(o))
+    else {
+      break;
+    };
     let Some(tag_id) = read_u16(blob, entry_off, order) else {
       continue;
     };
@@ -747,7 +798,10 @@ pub fn prescan_decrypt_keys(
       0x00a7 => &mut count,
       _ => continue,
     };
-    let Some(format_code) = read_u16(blob, entry_off + 2, order) else {
+    let Some(fmt_pos) = entry_off.checked_add(2) else {
+      continue;
+    };
+    let Some(format_code) = read_u16(blob, fmt_pos, order) else {
       continue;
     };
     // `next if $format < 1 or $format > 13` (`:14104`) — drops code 129, which
@@ -756,18 +810,28 @@ pub fn prescan_decrypt_keys(
       continue;
     }
     let format = Format::from_code(format_code);
-    let Some(count_n) = read_u32(blob, entry_off + 4, order) else {
+    let Some(count_pos) = entry_off.checked_add(4) else {
+      continue;
+    };
+    let Some(count_n) = read_u32(blob, count_pos, order) else {
       continue;
     };
     let count_n = count_n as usize;
     let size = format.byte_size().saturating_mul(count_n);
     let value_off = if size <= 4 {
-      entry_off + 8 // inline value (`$valuePtr = $entry + 8`)
+      // inline value (`$valuePtr = $entry + 8`)
+      let Some(inline) = entry_off.checked_add(8) else {
+        continue;
+      };
+      inline
     } else {
       if size > 0x0100_0000 {
         continue; // `next if $size > 0x1000000` — the 16 MB cap (`:14110`).
       }
-      let Some(off) = read_u32(blob, entry_off + 8, order) else {
+      let Some(value_field) = entry_off.checked_add(8) else {
+        continue;
+      };
+      let Some(off) = read_u32(blob, value_field, order) else {
         continue;
       };
       let Some(abs) = (off as usize).checked_add(value_base) else {
@@ -830,7 +894,11 @@ pub fn parse_embedded_tiff(blob: &[u8], tiff_at: usize) -> Option<(ByteOrder, us
 }
 
 fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
-  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
+  // `pos + 2` via `checked_add` (deny-overflow class) — byte-identical to
+  // `ifd::get_u16`'s bounds check: an out-of-range `pos` yields `None`, exactly
+  // as the slice `get` does for an in-range `pos`.
+  let end = pos.checked_add(2)?;
+  let arr: [u8; 2] = data.get(pos..end)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -838,7 +906,10 @@ fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
 }
 
 fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
-  let arr: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
+  // `pos + 4` via `checked_add` (deny-overflow class) — byte-identical to
+  // `ifd::get_u32`'s bounds check (see [`read_u16`]).
+  let end = pos.checked_add(4)?;
+  let arr: [u8; 4] = data.get(pos..end)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),

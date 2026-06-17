@@ -683,6 +683,72 @@ pub fn lookup(id: u16) -> Option<&'static NikonTag> {
   NikonTable::Main.lookup(id)
 }
 
+/// The `$readFormat` OVERRIDE for tag `id` under `%Nikon::Main`, if any — the
+/// per-table override the shared `Walker` resolves when `active_table ∈ {Nikon,
+/// NikonType2}` (`Exif.pm:6729-6733` reads the override off the active
+/// `$tagTablePtr`). Reproduces `walk_nikon_ifd`'s `resolve_read_format` step
+/// (`body.rs:592-600`) for the shared Walker, returning the bare [`Format`] (NOT
+/// the [`FormatOverride`]) so it has the SAME `Option<Format>` shape the Walker's
+/// `table_override` block expects from `tables::format_override` /
+/// `sony::format_override`. `None` for an unknown tag or a tag with no override.
+///
+/// TWO sources, in `Exif.pm:6730-6733` precedence (explicit wins):
+/// 1. an explicit `Format => '…'` directive ([`NikonTag::format`]); and
+/// 2. the IMPLICIT `'undef'` ExifTool forces for a SubDirectory tag that is NOT a
+///    `SubIFD` and has NO explicit `Format` (`$readFormat = 'undef' if $subdir and
+///    not $$tagInfo{SubIFD} and not $readFormat;`, `Exif.pm:6733`) — so a
+///    binary-block sub-table (AFInfo 0x0088, ColorBalance 0x0097, …) is read as
+///    `undef` (the whole block reaches the child `ProcessBinaryData` walker),
+///    while a `SubIFD` pointer (PreviewIFD 0x0011, NikonScanIFD 0x0e10) keeps its
+///    integer on-disk format because its value is an IFD OFFSET.
+///
+/// KEYED AGAINST `%Nikon::Main` (a `tag_id`-only fn, Sony parity) — SAFE for the
+/// Type2 walk because the two tables DO NOT collide on any SubDirectory ID: the
+/// `%Nikon::Type2` IDs are 0x0003..0x000b (all plain leaves), and the lowest
+/// `%Nikon::Main` SubDirectory ID is 0x0011, so a Type2 ID resolves (under Main)
+/// to a non-SubDirectory leaf with no `Format` ⇒ `None`, identical to keying
+/// against `%Nikon::Type2` (whose tags also carry neither `Format` nor a
+/// sub-table). Verified against [`NIKON_TAGS`] / [`NIKON_TYPE2_TAGS`].
+#[must_use]
+pub fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
+  let tag = lookup(id)?;
+  if let Some(over) = tag.format() {
+    // (1) explicit `Format => '…'` directive — takes precedence (`Exif.pm:6730`).
+    return Some(over.format());
+  }
+  // (2) implicit-`undef` SubDirectory override (`Exif.pm:6733`): a non-SubIFD
+  // SubDirectory tag with NO explicit `Format` reads as `undef`.
+  if is_implicit_undef_subdir_tag(tag) {
+    return Some(crate::exif::ifd::Format::Undef);
+  }
+  None
+}
+
+/// Whether tag `id` is an IMPLICIT-`undef` SubDirectory — a non-`SubIFD`
+/// SubDirectory tag with NO explicit `Format` directive (`Exif.pm:6733`,
+/// `$readFormat = 'undef' if $subdir and not $$tagInfo{SubIFD} and not
+/// $readFormat`). These are the binary-block sub-tables (AFInfo 0x0088,
+/// ColorBalance 0x0097, LensData 0x0098, …) whose WHOLE value block is fed to a
+/// child `ProcessBinaryData` walker; the shared `Walker` materializes their leaf
+/// value as a dead `undef[N]` copy that the Nikon capture loop never reads (it
+/// re-slices the on-disk SPAN instead, #243 phase 3-bis), so the value is stored
+/// EMPTY to avoid an `N`-copy heap amplification — mirroring the oracle's
+/// zero-copy `RawValue::Bytes(Vec::new())` for the same predicate
+/// (`body.rs` `walk_nikon_ifd`'s `implicit_undef` branch). A `SubIFD` pointer
+/// (PreviewIFD 0x0011 / NikonScanIFD 0x0e10, `Flags => 'SubIFD'`) keeps its real
+/// integer offset value (it is excluded here). Keyed against `%Nikon::Main` — SAFE
+/// for the Type2 walk for the same no-collision reason as [`format_override`].
+#[must_use]
+pub fn is_implicit_undef_subdir(id: u16) -> bool {
+  lookup(id).is_some_and(is_implicit_undef_subdir_tag)
+}
+
+/// The implicit-`undef` SubDirectory predicate on an already-resolved tag.
+#[must_use]
+fn is_implicit_undef_subdir_tag(tag: &NikonTag) -> bool {
+  tag.format().is_none() && tag.sub_table().is_some() && !tag.is_sub_ifd()
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
