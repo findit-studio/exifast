@@ -56,7 +56,10 @@ use std::vec::Vec;
 
 pub use body::{NikonEntry, ParsedValue, walk_nikon_ifd};
 pub use printconv::NikonConv;
-pub use tags::{NIKON_TAGS, NIKON_TYPE2_TAGS, NikonTable, NikonTag, SubTable};
+pub use tags::{
+  NIKON_TAGS, NIKON_TYPE2_TAGS, NikonTable, NikonTag, SubTable, format_override,
+  is_implicit_undef_subdir,
+};
 
 /// Decoded Nikon MakerNotes — the typed camera-identity surface populated by
 /// [`parse`].
@@ -182,7 +185,10 @@ impl MakerNotesNikon {
 ///   the IFD, NO `Base` override ⇒ PARENT-TIFF-relative: walk the parent
 ///   `data`, IFD at `mn_offset`, `value_base = 0`. The byte order inherits the
 ///   parent walk (`ByteOrder => 'Unknown'`).
-fn resolve_layout(blob: &[u8], parent_order: ByteOrder) -> Option<Layout> {
+///
+/// `pub(crate)` so the shared `Walker`'s `nikon_makernote_isolated`
+/// path resolves the SAME layout the oracle does (#243 phase 3-bis).
+pub(crate) fn resolve_layout(blob: &[u8], parent_order: ByteOrder) -> Option<Layout> {
   if blob.starts_with(b"Nikon\x00\x02") {
     // Type 3: `%Nikon::Main`, self-contained embedded TIFF at blob offset 10.
     let (order, ifd_offset) = body::parse_embedded_tiff(blob, 10)?;
@@ -218,8 +224,12 @@ fn resolve_layout(blob: &[u8], parent_order: ByteOrder) -> Option<Layout> {
 }
 
 /// The resolved walk parameters (see [`resolve_layout`]).
+///
+/// `pub(crate)` (accessor-only, per D8) so the shared `Walker`'s
+/// `nikon_makernote_isolated` reads the
+/// SAME slice/IFD-offset/order/base/table the oracle resolves (#243 phase 3-bis).
 #[derive(Debug, Clone, Copy)]
-struct Layout {
+pub(crate) struct Layout {
   /// The tag table this IFD is walked against (type-2 ⇒ [`NikonTable::Type2`];
   /// type-3 / headerless ⇒ [`NikonTable::Main`]). Drives BOTH the walker's
   /// unknown-tag skip and the emission-loop lookup, so a type-2 IFD's
@@ -234,6 +244,45 @@ struct Layout {
   order: ByteOrder,
   /// Out-of-line value base within the chosen slice (type-3 ⇒ 10; else 0).
   value_base: usize,
+}
+
+impl Layout {
+  /// The tag table this IFD walks against ([`NikonTable::Main`] /
+  /// [`NikonTable::Type2`]).
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn table(&self) -> NikonTable {
+    self.table
+  }
+
+  /// `true` ⇒ the walk operates on the captured blob (type-3, self-contained);
+  /// `false` ⇒ the parent TIFF `data` (type-2 / headerless Nikon3).
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn walk_in_blob(&self) -> bool {
+    self.walk_in_blob
+  }
+
+  /// IFD start offset within the chosen slice.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn ifd_offset(&self) -> usize {
+    self.ifd_offset
+  }
+
+  /// Byte order of the IFD walk.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn order(&self) -> ByteOrder {
+    self.order
+  }
+
+  /// Out-of-line value base within the chosen slice (type-3 ⇒ 10; else 0).
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn value_base(&self) -> usize {
+    self.value_base
+  }
 }
 
 /// Parse the captured Nikon MakerNote blob into a [`MakerNotesNikon`] + the
@@ -298,6 +347,29 @@ pub fn parse_in_tiff(
   let Some(layout) = resolve_layout(blob, parent_order) else {
     return (typed, emissions);
   };
+  // Short-MakerNote guard — the captured MakerNote VALUE must contain the IFD
+  // count word. For the type-2 / headerless layouts the walk reads `data` at
+  // `mn_offset + ifd_offset` (out-of-line offsets are parent-TIFF-relative); the
+  // count word at `[mn_offset+ifd_offset, +2)` must sit INSIDE the declared
+  // MakerNote value (`ifd_offset + 2 <= mn_len`), else a truncated `mn_len`
+  // would let the walker read its count word from the UNRELATED following
+  // parent-TIFF bytes — emitting tags ExifTool never does. The type-3 layout is
+  // self-contained (the window IS `blob`, already bounds-checked by
+  // `parse_embedded_tiff` inside `resolve_layout`), so its window measure is
+  // `blob.len()`. Mirrors `nikon_makernote_isolated`'s guard EXACTLY so the
+  // isolated path and this oracle stay byte-identical (Sony parity:
+  // `sony_makernote_isolated` carries the same guard, and `walk_sony_in_tiff`
+  // returns empty for the short case). `checked_add` covers the usize-overflow
+  // class — an overflow can never satisfy `window >=`, so it trips the guard.
+  let window = if layout.walk_in_blob {
+    blob.len()
+  } else {
+    mn_len
+  };
+  match layout.ifd_offset.checked_add(2) {
+    Some(min) if window >= min => {}
+    _ => return (typed, emissions),
+  }
   // Choose the slice + IFD offset the walker operates on. Type-3 walks the
   // captured blob (self-contained embedded TIFF); type-2 / headerless walk the
   // PARENT TIFF (out-of-line offsets are TIFF-relative). The walker bounds the
@@ -370,18 +442,31 @@ pub fn parse_in_tiff(
       // SubDirectory pointer NEVER emits the parent value (`Exif.pm:7103`
       // `next` skips `FoundTag`), so a deferred subdir is silent — the
       // #177/#223 bogus-parent rule.
+      //
+      // Slice the SubDirectory value block ONCE from the chosen walk buffer at
+      // the entry's recorded `value_offset`/`value_size` (the
+      // `walk_data[value_offset .. value_offset+value_size]` each emitter used
+      // to re-slice internally). An out-of-bounds extent means the emitter saw
+      // `None` and emitted nothing, so skip the whole subdir — identical to the
+      // emitters' prior `let Some(sub) = … else { return; }`.
+      let Some(block) = entry
+        .value_offset
+        .checked_add(entry.value_size)
+        .and_then(|end| walk_data.get(entry.value_offset..end))
+      else {
+        continue;
+      };
       match sub {
         SubTable::AfInfo => {
-          emit_af_info(walk_data, entry, layout, print_conv, model, &mut emissions);
+          emit_af_info(block, print_conv, model, &mut emissions);
         }
         SubTable::ColorBalance0103 => {
-          emit_color_balance(walk_data, entry, layout, print_conv, &mut emissions);
+          emit_color_balance(block, layout.order, print_conv, &mut emissions);
         }
         SubTable::LensData => {
           emit_lens_data(
-            walk_data,
-            entry,
-            layout,
+            block,
+            layout.order,
             print_conv,
             decrypt_keys,
             focus_mode.as_deref(),
@@ -389,18 +474,10 @@ pub fn parse_in_tiff(
           );
         }
         SubTable::FlashInfo => {
-          emit_flash_info(walk_data, entry, layout, print_conv, &mut emissions);
+          emit_flash_info(block, layout.order, print_conv, &mut emissions);
         }
         SubTable::ShotInfo => {
-          emit_shot_info(
-            walk_data,
-            entry,
-            layout,
-            print_conv,
-            model,
-            decrypt_keys,
-            &mut emissions,
-          );
+          emit_shot_info(block, print_conv, decrypt_keys, &mut emissions);
         }
         // Deferred (encrypted / unported child table): emit nothing.
         SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
@@ -437,10 +514,8 @@ pub fn parse_in_tiff(
 /// read BigEndian for DSLRs (`$$self{Model} =~ /^NIKON D/i`), LittleEndian
 /// otherwise (`Nikon.pm:2113-2158`). The AFInfo blob is the entry's value
 /// bytes (read fresh from the blob via the recorded `value_offset`/`size`).
-fn emit_af_info(
-  walk_data: &[u8],
-  entry: &NikonEntry,
-  layout: Layout,
+pub(crate) fn emit_af_info(
+  sub: &[u8],
   print_conv: bool,
   model: Option<&str>,
   emissions: &mut Vec<VendorEmission>,
@@ -453,10 +528,6 @@ fn emit_af_info(
     ByteOrder::Big
   } else {
     ByteOrder::Little
-  };
-  let _ = layout;
-  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
-    return;
   };
   for pos in tags::AF_INFO {
     // Read `pos.format` at byte offset `pos.offset` within the sub-blob.
@@ -488,16 +559,12 @@ fn emit_af_info(
 /// NOT walked here — the version prefix gates them; a non-`0103` prefix emits
 /// nothing (deferred). This keeps the byte-exact D70/.nef WB_RGBGLevels while
 /// the encrypted variants await `Nikon::Decrypt`.
-fn emit_color_balance(
-  walk_data: &[u8],
-  entry: &NikonEntry,
-  layout: Layout,
+pub(crate) fn emit_color_balance(
+  sub: &[u8],
+  order: ByteOrder,
   print_conv: bool,
   emissions: &mut Vec<VendorEmission>,
 ) {
-  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
-    return;
-  };
   // The version prefix is the first 4 ASCII bytes of the ColorBalance value.
   let prefix = sub.get(0..4).unwrap_or(&[]);
   if prefix != b"0103" {
@@ -509,20 +576,20 @@ fn emit_color_balance(
   // 8 bytes. The child read is bounded by the PARENT tag's declared value
   // (ExifTool's `ProcessBinaryData` `DirLen` = the parent value size adjusted
   // by the `Start` delta, and it stops when no bytes remain), so read EXACTLY
-  // those 8 bytes from WITHIN `sub` at offset 20 — NOT from the remaining
-  // `walk_data` tail. A ColorBalance value shorter than 28 bytes (20-byte
+  // those 8 bytes from WITHIN `sub` at offset 20 — NOT from any bytes past the
+  // parent value's declared extent. A ColorBalance value shorter than 28 bytes (20-byte
   // `Start` delta + the 8-byte record) cannot hold the record: emit nothing
   // rather than over-reading the next IFD entry / trailing buffer.
   let Some(record) = sub.get(20..28) else {
     return;
   };
   // 4 × int16u, in the SubDirectory's inherited byte order.
-  let Some(raw) = read_value(record, 0, Format::Int16u, 4, record.len(), layout.order) else {
+  let Some(raw) = read_value(record, 0, Format::Int16u, 4, record.len(), order) else {
     return;
   };
   let parsed = ParsedValue::new(raw);
   // `NikonConv::Raw` never suppresses; the `else` is unreachable in practice.
-  let Some(value) = NikonConv::Raw.apply(&parsed, print_conv, None, layout.order) else {
+  let Some(value) = NikonConv::Raw.apply(&parsed, print_conv, None, order) else {
     return;
   };
   emissions.push(VendorEmission::new("WB_RGBGLevels".into(), value, false));
@@ -545,16 +612,12 @@ fn emit_color_balance(
 /// conditionals, and the offset-11/12/13 `RawConv => '$val ? $val : undef'`
 /// drops. A field whose offset is past the available value length emits nothing
 /// (bounds-safe, like [`emit_color_balance`]).
-fn emit_flash_info(
-  walk_data: &[u8],
-  entry: &NikonEntry,
-  layout: Layout,
+pub(crate) fn emit_flash_info(
+  sub: &[u8],
+  order: ByteOrder,
   print_conv: bool,
   emissions: &mut Vec<VendorEmission>,
 ) {
-  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
-    return;
-  };
   // `FlashInfoVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
   let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
     return;
@@ -581,7 +644,7 @@ fn emit_flash_info(
         return;
       };
       let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
-      if let Some(value) = conv.apply(&parsed, print_conv, None, layout.order) {
+      if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
         emissions.push(VendorEmission::new(name.into(), value, false));
       }
     };
@@ -626,7 +689,7 @@ fn emit_flash_info(
   let flash_control_mode: Option<i64> = sub.get(9).map(|&b9| {
     let commander = i64::from((b9 & 0x80) >> 7);
     let parsed = ParsedValue::new(RawValue::I64(std::vec![commander]));
-    if let Some(value) = NikonConv::OffOn.apply(&parsed, print_conv, None, layout.order) {
+    if let Some(value) = NikonConv::OffOn.apply(&parsed, print_conv, None, order) {
       emissions.push(VendorEmission::new(
         "FlashCommanderMode".into(),
         value,
@@ -635,8 +698,7 @@ fn emit_flash_info(
     }
     let control = i64::from(b9 & 0x7f);
     let parsed = ParsedValue::new(RawValue::I64(std::vec![control]));
-    if let Some(value) = NikonConv::FlashControlMode.apply(&parsed, print_conv, None, layout.order)
-    {
+    if let Some(value) = NikonConv::FlashControlMode.apply(&parsed, print_conv, None, order) {
       emissions.push(VendorEmission::new("FlashControlMode".into(), value, false));
     }
     control
@@ -652,7 +714,7 @@ fn emit_flash_info(
     10,
     flash_control_mode,
     print_conv,
-    layout.order,
+    order,
     "FlashOutput",
     "FlashCompensation",
     NikonConv::FlashCompensation,
@@ -694,7 +756,7 @@ fn emit_flash_info(
     15,
     "FlashGroupAControlMode",
     print_conv,
-    layout.order,
+    order,
     emissions,
   );
   let group_b_mode = emit_masked_control_mode(
@@ -702,7 +764,7 @@ fn emit_flash_info(
     16,
     "FlashGroupBControlMode",
     print_conv,
-    layout.order,
+    order,
     emissions,
   );
 
@@ -713,7 +775,7 @@ fn emit_flash_info(
     17,
     group_a_mode,
     print_conv,
-    layout.order,
+    order,
     "FlashGroupAOutput",
     "FlashGroupACompensation",
     NikonConv::FlashGroupCompensation,
@@ -725,7 +787,7 @@ fn emit_flash_info(
     18,
     group_b_mode,
     print_conv,
-    layout.order,
+    order,
     "FlashGroupBOutput",
     "FlashGroupBCompensation",
     NikonConv::FlashGroupCompensation,
@@ -773,18 +835,12 @@ const SHOT_INFO_READ_EXTENT: usize = 0x24d + 4;
 ///
 /// Bounds-safe like [`emit_lens_data`]: a field whose offset + size exceeds the
 /// value length emits nothing.
-fn emit_shot_info(
-  walk_data: &[u8],
-  entry: &NikonEntry,
-  layout: Layout,
+pub(crate) fn emit_shot_info(
+  sub: &[u8],
   print_conv: bool,
-  model: Option<&str>,
   keys: Option<DecryptKeys>,
   emissions: &mut Vec<VendorEmission>,
 ) {
-  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
-    return;
-  };
   // `ShotInfoVersion` (offset 0, `Format => 'string[4]'`): the first 4 ASCII
   // bytes. Read from the ORIGINAL (cleartext) bytes — the version prefix is
   // NEVER encrypted (`DecryptStart => 4`).
@@ -838,10 +894,11 @@ fn emit_shot_info(
   // at the `ShotInfoD80` arm notes "Capture NX can change the makernote byte order,
   // but this stays big-endian"). So a LITTLE-endian-carrier Nikon MakerNote that
   // reaches base `0204`/`0211` still decodes `ShutterCount`/`DeletedImageCount`
-  // big-endian, matching the oracle — NOT the parent `layout.order`. The 0x157
+  // big-endian, matching the oracle — NOT the parent IFD order. The 0x157
   // `ShutterCount` is big-endian regardless (its `unpack("n",$val)`, `:6066`).
-  // `model` is unused now that `DistortionControl` is deferred (see below).
-  let _ = (layout, model);
+  // So this emitter needs NEITHER the parent walk order NOR the model: the order
+  // is fixed BigEndian here, and the only model-gated base field
+  // (`DistortionControl`) is deferred (see below).
   let order = ByteOrder::Big;
   // offset 0 `ShotInfoVersion` — the 4-char cleartext version string, emitted
   // ONLY when the all-digit RawConv passed (else the tag is `undef`; the table
@@ -1098,8 +1155,13 @@ fn emit_flash_output_or_comp(
 /// The decryption keys captured for the encrypted Nikon sub-tables —
 /// ExifTool's `$$et{NikonSerialKey}` (the derived serial key) and
 /// `$$et{NikonCountKey}` (the raw ShutterCount).
+///
+/// `pub(crate)` so `nikon_makernote_isolated`
+/// threads the prescan-captured keys into the sub-table emitters (#243 phase
+/// 3-bis); the fields stay private (accessor-free — the type is an opaque
+/// token the emitters consume).
 #[derive(Debug, Clone, Copy)]
-struct DecryptKeys {
+pub(crate) struct DecryptKeys {
   /// `SerialKey($et, SerialNumber)` (`Nikon.pm:14202`) — the serial key, after
   /// the numeric/string derivation ([`decrypt::serial_key`]).
   serial: u32,
@@ -1126,7 +1188,12 @@ struct DecryptKeys {
 /// format (see [`decrypt::serial_key`] and [`ParsedValue::single_digit_count`]).
 ///
 /// `model` threads IFD0 `Model` for the `SerialKey` `D50` discriminator.
-fn scan_decrypt_keys(
+///
+/// `pub(crate)` (Option A, the plan's prescan decision) so
+/// `nikon_makernote_isolated` reuses the
+/// EXACT same prescan the oracle does — the shared `Walker`'s gated walk would
+/// drop a key the looser `PrescanExif` still captures (#243 phase 3-bis).
+pub(crate) fn scan_decrypt_keys(
   blob: &[u8],
   ifd_offset: usize,
   order: ByteOrder,
@@ -1338,18 +1405,14 @@ fn lens_data_read_extent(plan: &LensDataLayout) -> usize {
   table_max.max(z_max)
 }
 
-fn emit_lens_data(
-  walk_data: &[u8],
-  entry: &NikonEntry,
-  layout: Layout,
+pub(crate) fn emit_lens_data(
+  sub: &[u8],
+  order: ByteOrder,
   print_conv: bool,
   keys: Option<DecryptKeys>,
   focus_mode: Option<&str>,
   emissions: &mut Vec<VendorEmission>,
 ) {
-  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
-    return;
-  };
   // `LensDataVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
   let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
     return;
@@ -1406,7 +1469,7 @@ fn emit_lens_data(
   // the layout overrides it (`0800` ⇒ LittleEndian, `Nikon.pm:2887`), else the
   // parent MakerNote IFD's order. The legacy block's int8u members are
   // order-agnostic, but the Z block's int16u/int32s reads need it.
-  let sub_order = plan.order.unwrap_or(layout.order);
+  let sub_order = plan.order.unwrap_or(order);
   // The `0800` OldLensData members are gated on the forward-looking flag; when
   // it is clear (the `undef[17]` is `/^.\0+$/`), skip the LEGACY block (no member
   // emits) — but the NEW Z telemetry below is INDEPENDENTLY gated on
@@ -1427,7 +1490,7 @@ fn emit_lens_data(
           };
           let raw = RawValue::U64(std::vec![u64::from(byte)]);
           let parsed = ParsedValue::new(raw);
-          let Some(value) = pos.conv.apply(&parsed, print_conv, None, layout.order) else {
+          let Some(value) = pos.conv.apply(&parsed, print_conv, None, order) else {
             continue;
           };
           emissions.push(VendorEmission::new(pos.name.into(), value, false));
@@ -1804,7 +1867,16 @@ fn model_is_nikon_dslr(model: &str) -> bool {
 }
 
 /// Populate the typed struct from a leaf tag's rendered value.
-fn populate_typed(typed: &mut MakerNotesNikon, tag_id: u16, value: &TagValue, _name: &str) {
+///
+/// `pub(crate)` so the shared `Walker`'s `emit_nikon_value` can feed the typed
+/// surface from the SAME gate-passing entries the `parse_in_tiff` oracle does
+/// (#243 phase 3-bis), mirroring Sony's `pub(crate) fn populate_typed`.
+pub(crate) fn populate_typed(
+  typed: &mut MakerNotesNikon,
+  tag_id: u16,
+  value: &TagValue,
+  _name: &str,
+) {
   let as_str = |v: &TagValue| -> Option<SmolStr> {
     match v {
       TagValue::Str(s) => Some(s.clone()),

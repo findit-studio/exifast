@@ -50,6 +50,13 @@ pub enum TableRef {
   Panasonic,
   /// `%Nikon::Main`.
   Nikon,
+  /// `%Nikon::Type2` — the `"Nikon\0\x01"` headerless layout (`Nikon.pm`
+  /// `%Image::ExifTool::Nikon::Type2`). A SIBLING table of [`Nikon`](Self::Nikon)
+  /// because the same maker-note dispatch produces either depending on the
+  /// header; the two tables REUSE tag IDs 0x0003..0x000b for DIFFERENT tags
+  /// (0x0003 is `ColorMode` in `%Nikon::Main` but `Quality` in `%Nikon::Type2`),
+  /// so the resolved table must distinguish them (#243 phase 3-bis).
+  NikonType2,
   /// `%Apple::Main`.
   Apple,
   /// `%Samsung::Type2`.
