@@ -8594,6 +8594,24 @@ pub(in crate::exif) fn nikon_makernote_isolated(
 /// `print_conv = false` the `-n` emissions (the typed slot is the SAME for both
 /// and ALWAYS returned inside the `Some`). Returns `None` for a degenerate blob
 /// too short to hold the IFD count word (the Pentax slot stays absent).
+/// ExifTool's `$count` for a Pentax binary SubDirectory entry — the IFD entry's
+/// element COUNT (`$count`, the value a `%Pentax::Main` SubDirectory-list
+/// `Condition` reads, `Exif.pm` `GetTagInfo`). The Walker carries the ON-DISK
+/// byte size (`value_size`) and the ON-DISK format; `count = value_size /
+/// byte_size`. For the implicit-`undef` SubDirectory rows (`CameraSettings` /
+/// `AEInfo` / `FlashInfo`) the on-disk format is `undef` (1 byte), so `$count`
+/// equals the byte length — matching the `(N bytes, undef[N])` ExifTool reports.
+/// A zero-byte format (unreachable for a real entry) yields 0 (no decode).
+#[cfg(feature = "alloc")]
+fn pentax_subdir_count(entry: &ExifEntry) -> usize {
+  let unit = entry.on_disk_format().byte_size();
+  if unit == 0 {
+    0
+  } else {
+    entry.value_size() / unit
+  }
+}
+
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::exif) fn pentax_makernote_isolated(
@@ -8730,7 +8748,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
       let ResolvedConv::Pentax(pentax_tag) = entry.conv else {
         continue;
       };
-      if let Some(SubTable::LensRec) = pentax_tag.sub_table() {
+      if let Some(sub) = pentax_tag.sub_table() {
         // Re-slice the ON-DISK value SPAN from the Walker's buffer at the entry's
         // resolved `value_offset` + on-disk `value_size` (the Nikon CRUX-#2
         // pattern). An out-of-bounds extent yields `&[]` ⇒ the emitter emits
@@ -8740,9 +8758,39 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           .checked_add(entry.value_size())
           .and_then(|end| w.data.get(entry.value_offset()..end))
           .unwrap_or(&[]);
-        pentax::emit_lens_rec(block, print_conv, &mut *sink.emissions);
-        if print_conv {
-          pentax::populate_lens_type(&mut typed, block);
+        match sub {
+          SubTable::LensRec => {
+            pentax::emit_lens_rec(block, print_conv, &mut *sink.emissions);
+            if print_conv {
+              pentax::populate_lens_type(&mut typed, block);
+            }
+          }
+          // The `$count`-gated binary SubDirectory tables (#262 Phase 2a). `$count`
+          // is the IFD entry COUNT — `value_size / on_disk_format.byte_size()`,
+          // ExifTool's `$count` (the value the SubDirectory-list `Condition`
+          // selects on). The per-table emitter re-checks the exact K10D `Condition`
+          // and emits nothing for a non-K10D count (the scope-fence); a non-K10D
+          // body's differently-sized record never mis-decodes through the K10D
+          // layout. `CameraSettings` additionally model-gates its offset-13+ leaves
+          // on the threaded `$$self{Model}` (K10D / GX10 only).
+          SubTable::CameraSettings => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_camera_settings(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          SubTable::AEInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_aeinfo(block, count, print_conv, &mut *sink.emissions);
+          }
+          SubTable::FlashInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_flashinfo(block, count, print_conv, &mut *sink.emissions);
+          }
         }
         continue;
       }
