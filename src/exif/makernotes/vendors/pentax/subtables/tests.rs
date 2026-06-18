@@ -42,6 +42,17 @@ const LENSINFO2_K10D: &[u8] = &[
   0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// The verbatim K10D `CameraInfo` (0x0215) block from the `Pentax.jpg` fixture
+/// (`exiftool -v3`: 20 bytes, `int32u[5]` read as `undef[20]`, BigEndian).
+/// offset 0 = PentaxModelID `00 01 2c 1e` (=0x12c1e=76830, K10D); offset 1 =
+/// ManufactureDate `01 32 42 01` (=20070913); offset 2 = ProductionCode int32u[2]
+/// `00 00 00 02` + `00 00 00 01` (=2, 1); offset 4 = InternalSerialNumber
+/// `00 02 05 00` (=132352).
+const CAMERAINFO_K10D: &[u8] = &[
+  0x00, 0x01, 0x2c, 0x1e, 0x01, 0x32, 0x42, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+  0x00, 0x02, 0x05, 0x00,
+];
+
 fn find<'a>(em: &'a [VendorEmission], name: &str) -> Option<&'a TagValue> {
   em.iter()
     .find(|e| e.name() == name)
@@ -586,4 +597,154 @@ fn lens_info_old_format_short_block_falls_through() {
     find(&em, "NominalMaxAperture").is_none(),
     "short block: offset-10 leaf skipped, but the record still decodes (not old)"
   );
+}
+
+#[test]
+fn camera_info_k10d_print_conv_byte_exact() {
+  // -j (PrintConv) — the K10D `CameraInfo` (0x0215). Values verified against
+  // `exiftool -G1 -j Pentax.jpg`: ManufactureDate "2007:09:13",
+  // ProductionCode 2.1, InternalSerialNumber 132352.
+  let mut em = Vec::new();
+  emit_camera_info(CAMERAINFO_K10D, true, &mut em);
+  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
+  // ProductionCode is the dotted ValueConv string "2.1" (renders as a JSON number);
+  // the "(camera has been serviced)" suffix applies only to an 8.x value.
+  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.1")));
+  assert_eq!(
+    find(&em, "InternalSerialNumber"),
+    Some(&TagValue::I64(132352))
+  );
+  // PentaxModelID (offset 0) is NOT re-emitted from this path — Phase 1's 0x0005
+  // leaf owns it (the guardrail).
+  assert!(
+    find(&em, "PentaxModelID").is_none(),
+    "CameraInfo must not re-emit PentaxModelID (0x0005 owns it)"
+  );
+  assert_eq!(em.len(), 3, "CameraInfo emits exactly the 3 ported scalars");
+}
+
+#[test]
+fn camera_info_k10d_value_conv() {
+  // -n (ValueConv) — ManufactureDate has no PrintConv (same string), ProductionCode
+  // is the bare dotted string, InternalSerialNumber the raw int.
+  let mut em = Vec::new();
+  emit_camera_info(CAMERAINFO_K10D, false, &mut em);
+  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.1")));
+  assert_eq!(
+    find(&em, "InternalSerialNumber"),
+    Some(&TagValue::I64(132352))
+  );
+  assert!(find(&em, "PentaxModelID").is_none());
+}
+
+#[test]
+fn camera_info_kx_avi_byte_exact() {
+  // The K-x `Pentax.avi` CameraInfo (also BigEndian, `exiftool -v3`): offset 1 =
+  // ManufactureDate `01 32 90 18` (=20090904), offset 2 = ProductionCode
+  // `00 00 00 02` + `00 00 00 03` (=2, 3), offset 4 = InternalSerialNumber
+  // `00 7a 30 2d` (=8007725). Verified against `exiftool -G1 -j Pentax.avi`.
+  const CAMERAINFO_KX: &[u8] = &[
+    0x00, 0x01, 0x2d, 0xfe, 0x01, 0x32, 0x90, 0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+    0x00, 0x7a, 0x30, 0x2d,
+  ];
+  let mut em = Vec::new();
+  emit_camera_info(CAMERAINFO_KX, true, &mut em);
+  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2009:09:04")));
+  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.3")));
+  assert_eq!(
+    find(&em, "InternalSerialNumber"),
+    Some(&TagValue::I64(8007725))
+  );
+  assert!(find(&em, "PentaxModelID").is_none());
+}
+
+#[test]
+fn camera_info_production_code_serviced_suffix() {
+  // A crafted 8.x ProductionCode triggers the PrintConv service-check suffix
+  // (`$val=~/^8\./ ? "$val (camera has been serviced)"`, `Pentax.pm:4750`); under
+  // -n it stays the bare dotted string. Block: offset 2 = int32u[2] (8, 1).
+  let block: &[u8] = &[
+    0x00, 0x00, 0x00, 0x00, // offset 0 PentaxModelID (ignored)
+    0x01, 0x32, 0x42, 0x01, // offset 1 ManufactureDate = 20070913
+    0x00, 0x00, 0x00, 0x08, // offset 2a = 8
+    0x00, 0x00, 0x00, 0x01, // offset 2b = 1
+    0x00, 0x00, 0x00, 0x05, // offset 4 InternalSerialNumber = 5
+  ];
+  let mut em = Vec::new();
+  emit_camera_info(block, true, &mut em);
+  assert_eq!(
+    find(&em, "ProductionCode"),
+    Some(&s("8.1 (camera has been serviced)"))
+  );
+  // -n: the bare dotted string, no suffix.
+  let mut emn = Vec::new();
+  emit_camera_info(block, false, &mut emn);
+  assert_eq!(find(&emn, "ProductionCode"), Some(&s("8.1")));
+}
+
+#[test]
+fn camera_info_manufacture_date_optio_and_unknown() {
+  // The 5-digit Optio A10/A20 branch (`/^(\d)(\d{2})(\d{2})$/` ⇒ "200Y:MM:DD"):
+  // raw 70913 ⇒ "2007:09:13". A value matching NEITHER regex ⇒ "Unknown ($val)".
+  assert_eq!(manufacture_date(70913), SmolStr::from("2007:09:13"));
+  // 8 digits ⇒ the primary branch.
+  assert_eq!(manufacture_date(20070913), SmolStr::from("2007:09:13"));
+  // 7 digits (neither 8 nor 5) ⇒ Unknown.
+  assert_eq!(
+    manufacture_date(2007091),
+    SmolStr::from("Unknown (2007091)")
+  );
+  // 0 (1 digit) ⇒ Unknown.
+  assert_eq!(manufacture_date(0), SmolStr::from("Unknown (0)"));
+}
+
+#[test]
+fn camera_info_truncated_block_partial_emit_no_panic() {
+  // CameraInfo is UNCONDITIONAL (no $count gate), so a short/truncated block emits
+  // only the in-range scalars — bounds-checked, no panic. The 3 ported scalars
+  // live at byte 4 (ManufactureDate), bytes 8-15 (ProductionCode int32u[2]) and
+  // byte 16 (InternalSerialNumber).
+
+  // 8 bytes: only ManufactureDate (byte 4) is fully in range; ProductionCode needs
+  // bytes 8-15, InternalSerialNumber needs byte 16 — both skipped.
+  let mut em8 = Vec::new();
+  emit_camera_info(&CAMERAINFO_K10D[..8], true, &mut em8);
+  assert_eq!(find(&em8, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert!(
+    find(&em8, "ProductionCode").is_none(),
+    "int32u[2] ProductionCode needs bytes 8-15"
+  );
+  assert!(find(&em8, "InternalSerialNumber").is_none());
+  assert_eq!(em8.len(), 1);
+
+  // 12 bytes: ManufactureDate in range, but ProductionCode's SECOND int32u (byte
+  // 12-15) is out of range ⇒ ProductionCode skipped (both elements required).
+  let mut em12 = Vec::new();
+  emit_camera_info(&CAMERAINFO_K10D[..12], true, &mut em12);
+  assert_eq!(find(&em12, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert!(
+    find(&em12, "ProductionCode").is_none(),
+    "the second int32u element (byte 12-15) is out of range"
+  );
+  assert!(find(&em12, "InternalSerialNumber").is_none());
+
+  // 16 bytes: ManufactureDate + ProductionCode in range; InternalSerialNumber
+  // (byte 16) skipped.
+  let mut em16 = Vec::new();
+  emit_camera_info(&CAMERAINFO_K10D[..16], true, &mut em16);
+  assert_eq!(find(&em16, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert_eq!(find(&em16, "ProductionCode"), Some(&s("2.1")));
+  assert!(find(&em16, "InternalSerialNumber").is_none());
+  assert_eq!(em16.len(), 2);
+
+  // 3 bytes: nothing in range (byte 4 absent) ⇒ zero emissions, no panic.
+  let mut em3 = Vec::new();
+  emit_camera_info(&CAMERAINFO_K10D[..3], true, &mut em3);
+  assert!(em3.is_empty(), "a block shorter than byte 4 emits nothing");
+
+  // Empty block ⇒ zero emissions, no panic.
+  let mut em0 = Vec::new();
+  emit_camera_info(&[], true, &mut em0);
+  assert!(em0.is_empty());
 }

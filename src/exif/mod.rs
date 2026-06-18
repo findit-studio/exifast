@@ -8807,6 +8807,15 @@ pub(in crate::exif) fn pentax_makernote_isolated(
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_flashinfo(block, count, print_conv, &mut *sink.emissions);
           }
+          // The UNCONDITIONAL `%Pentax::CameraInfo` (0x0215) fixed `int32u` table
+          // (#262 Phase 2c). NO `$count` gate (the Main row has no `Condition`),
+          // so — unlike the gated tables above — `count` is not read. Emits the
+          // three serviceable-data scalars (ManufactureDate / ProductionCode /
+          // InternalSerialNumber); the offset-0 PentaxModelID is owned by the
+          // Phase-1 0x0005 leaf and is NOT re-emitted here.
+          SubTable::CameraInfo => {
+            pentax::subtables::emit_camera_info(block, print_conv, &mut *sink.emissions);
+          }
         }
         continue;
       }

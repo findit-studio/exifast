@@ -86,5 +86,8 @@
   "Pentax:MinFocusDistance": 2,
   "Pentax:LensFocalLength": 23.125,
   "Pentax:NominalMaxAperture": 4,
-  "Pentax:NominalMinAperture": 26.9086852881189
+  "Pentax:NominalMinAperture": 26.9086852881189,
+  "Pentax:ManufactureDate": "2009:09:04",
+  "Pentax:ProductionCode": 2.3,
+  "Pentax:InternalSerialNumber": 8007725
 }]
