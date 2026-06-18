@@ -503,9 +503,11 @@ pub enum AnyMeta<'a> {
   /// tags (row 14) are inside this same Meta.
   #[cfg(feature = "exif")]
   Exif(crate::exif::ExifMeta<'a>),
-  /// RIFF / AVI (FORMATS.md row 26). `RiffMeta` owns its data (FourCCs are
-  /// transformed to SmolStr, dates run through `ConvertRIFFDate`); `'a` is
-  /// a phantom kept for GAT uniformity.
+  /// RIFF / AVI (FORMATS.md row 26). `RiffMeta` owns most of its data
+  /// (FourCCs are transformed to SmolStr, dates run through `ConvertRIFFDate`),
+  /// but BORROWS the raw Pentax AVI MakerNote payload as a `&'a [u8]` sub-slice
+  /// of the input (zero-copy — decoded at emit time, #157), so `'a` is a real
+  /// input borrow here.
   #[cfg(feature = "riff")]
   Riff(crate::formats::riff::RiffMeta<'a>),
   /// XMP (`.xmp` sidecar — RDF/XML metadata, FORMATS.md XMP). `XmpMeta` owns

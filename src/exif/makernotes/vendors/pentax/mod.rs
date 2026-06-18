@@ -238,6 +238,71 @@ pub(crate) fn populate_lens_type(typed: &mut MakerNotesPentax, block: &[u8]) {
   typed.lens_name = lens_types::lookup_with_other(series, model);
 }
 
+/// Decode the Pentax AVI MakerNote (the `hymn` / `mknt` RIFF chunk) through the
+/// shared `%Pentax::Main` walker — the bridge from [`crate::formats::riff`] to
+/// the Phase-1 Pentax module (#157), mirroring the Canon CTMD precedent
+/// [`crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote`].
+///
+/// ExifTool's `%Pentax::AVI` (`Pentax.pm:6373-6395`) routes the `hymn` (and the
+/// Q-S1 `mknt`) chunk into a `SubDirectory` with `TagTable => Pentax::Main`,
+/// `Start => 10`, `Base => '$start'`, `ByteOrder => 'Unknown'`. The chunk
+/// payload is `'PENTAX \0'` (8) + the `MM`/`II` byte-order marker (2) — a
+/// 10-byte header — then the IFD entry-count word at offset 10; offsets inside
+/// the IFD are relative to the chunk-data start (`Base => '$start'`).
+///
+/// This builds the matching [`DetectedMakerNote`] (`body_offset 10`,
+/// [`BaseRule::StartItself`], [`ChildByteOrder::Unknown`], `NotIFD` off, no
+/// `FixBase` — the AVI table carries none) and walks the chunk through the SAME
+/// isolated shared-`Walker` helper the static-file `-j`/`-n` dispatch uses
+/// ([`crate::exif::pentax_makernote_isolated`]) with `mn_offset 0` over the
+/// chunk payload (so `Base => '$start'` ⇒ `value_offset_base 0` resolves
+/// pointers at `payload[off]`). The parent byte order is `Little` — ExifTool's
+/// global order during `ProcessRIFF` (RIFF is little-endian); the `ByteOrder =>
+/// 'Unknown'` entry-count probe then flips it to big-endian for a big-endian
+/// body (the K-x), faithful to `Exif.pm:6982-6993`. No `$$self{Make}`/`Model`
+/// is in effect in the RIFF context, so both are `None` (the AVI path runs no
+/// `FixBase` heuristic that would read them).
+///
+/// Returns the [`VendorEmission`]s for `print_conv` (`Unknown => 1` preserved
+/// for the caller's engine to suppress). An empty `Vec` for a chunk too short to
+/// hold the IFD count word. The typed [`MakerNotesPentax`] slot is discarded —
+/// the RIFF output is the emission stream only.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub fn redispatch_avi_makernote(
+  hymn_payload: &[u8],
+  print_conv: bool,
+) -> std::vec::Vec<super::VendorEmission> {
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::{BaseRule, ChildByteOrder, DetectedMakerNote, Vendor};
+  // `%Pentax::AVI` hymn/mknt SubDirectory directives (`Pentax.pm:6376-6394`):
+  // `Start => 10` ⇒ `body_offset 10`; `Base => '$start'` ⇒ `StartItself`;
+  // `ByteOrder => 'Unknown'` ⇒ probe; `NotIFD` off (it IS an IFD); no `FixBase`.
+  let detected = DetectedMakerNote::new(
+    Vendor::Pentax,
+    10,
+    BaseRule::StartItself,
+    ChildByteOrder::Unknown,
+    false,
+  );
+  // Walk the chunk payload as a standalone blob at `mn_offset 0` (so the
+  // `Base => '$start'` ⇒ blob-relative pointers resolve against `payload[..]`).
+  // The parent order is RIFF's little-endian; the `Unknown` probe flips it for a
+  // big-endian body. No Make/Model in the RIFF context.
+  let (emissions, _typed) = crate::exif::pentax_makernote_isolated(
+    hymn_payload,
+    0,
+    hymn_payload.len(),
+    detected,
+    ByteOrder::Little,
+    /* make */ None,
+    /* model */ None,
+    print_conv,
+  )
+  .unwrap_or_default();
+  emissions
+}
+
 fn first_u32(raw: &RawValue) -> Option<u32> {
   match raw {
     RawValue::U64(v) => v.first().copied().and_then(|n| u32::try_from(n).ok()),
