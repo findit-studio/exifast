@@ -7602,42 +7602,90 @@ pub(in crate::exif) fn panasonic_makernote_isolated(
   // dispatcher classified (`data[mn_offset .. mn_offset + mn_len]`), computed
   // EXACTLY as `parse_main_gated` (saturating end, clamped to the buffer). A blob
   // routing elsewhere (the `MKE` Type2 BinaryData) ⇒ `None` (the Panasonic slot
-  // stays absent — no spurious Main tags).
+  // stays absent — no spurious Main tags). The cross-table Leica1/Leica10 routes
+  // have their OWN make/signature gate on the `Vendor::Leica` arm (and call
+  // [`panasonic_makernote_isolated_with_offset`] directly at body offset 8/18),
+  // so this `routes_to_main` prefix check is the AUTOMATIC `%Panasonic::Main`
+  // route's gate and applies the canonical `HEADER_LEN` (12) body offset.
   let blob_end = mn_offset.saturating_add(mn_len).min(data.len());
   let blob = data.get(mn_offset..blob_end)?;
   if !panasonic::routes_to_main(blob) {
     return None;
   }
+  panasonic_makernote_isolated_with_offset(
+    data,
+    mn_offset,
+    mn_len,
+    panasonic::HEADER_LEN,
+    base_offset,
+    order,
+    model,
+    print_conv,
+  )
+}
+
+/// The body of [`panasonic_makernote_isolated`] generalized over the `body_offset`
+/// — the IFD's start WITHIN the MakerNote value (`MakerNotes.pm` `Start =>
+/// '$valuePtr + N'`: `HEADER_LEN` = 12 for `MakerNotePanasonic`/`Panasonic3`, 8
+/// for the cross-table `MakerNoteLeica` (Leica1, `:606`), 18 for
+/// `MakerNoteLeica10` (`:728`)). It runs `%Panasonic::Main` UNCONDITIONALLY — the
+/// route gate is the CALLER's: [`panasonic_makernote_isolated`] applies the
+/// `Panasonic`-prefix [`routes_to_main`](makernotes::vendors::panasonic::routes_to_main)
+/// then passes `HEADER_LEN`; the Leica gated entries
+/// ([`parse_leica1_gated`](makernotes::vendors::panasonic::parse_leica1_gated) /
+/// [`parse_leica10_gated`](makernotes::vendors::panasonic::parse_leica10_gated))
+/// apply their make/signature gate then pass 8/18. This is the cross-vendor
+/// generalization of the DC-FT7 base-threading: BOTH the body offset and the
+/// dynamic base (`base_offset`) are threaded from the dispatcher rather than
+/// hard-coded, so a single shared `Walker` drives the canonical Panasonic Main
+/// route AND the two cross-table Leica routes (#243 phase 3 / #255).
+///
+/// See [`panasonic_makernote_isolated`] for the full walk / dynamic-base /
+/// per-entry-gate / isolation contract (this fn IS that body, with `HEADER_LEN`
+/// replaced by `body_offset`).
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  body_offset: usize,
+  base_offset: usize,
+  order: ByteOrder,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::panasonic::MakerNotesPanasonic,
+)> {
+  use makernotes::vendors::panasonic;
   // Short-MakerNote guard (the oracle's `walk_panasonic_in_tiff:100` pre-check, in
   // the REVERSE direction): the dispatcher's variant-gate window must at least
   // contain the IFD count word INSIDE the declared MakerNote value (`mn_len >=
-  // HEADER_LEN + 2`); below that the value has no room for an IFD. Without this, a
+  // body_offset + 2`); below that the value has no room for an IFD. Without this, a
   // truncated MakerNote (e.g. the value is only `Panasonic\0\0\0`, `mn_len = 12`,
   // body offset `HEADER_LEN = 12`) would still walk `data` at `mn_offset +
-  // HEADER_LEN` and read its count word from the UNRELATED following parent-TIFF
+  // body_offset` and read its count word from the UNRELATED following parent-TIFF
   // bytes — emitting spurious Panasonic tags the oracle (`walk_panasonic_in_tiff`,
   // which returns empty here) never does, and a migration regression vs the
-  // pre-migration body walker. `routes_to_main` already classified the blob as a
-  // Main variant, so the faithful result is present-but-empty (`Some((empty,
-  // empty))`), NOT `None` (which would drop the typed slot the oracle's
-  // `parse_in_tiff` still returns). The production body offset is always
-  // [`HEADER_LEN`](panasonic::HEADER_LEN) (12 — the `Panasonic\0\0\0` prefix both
-  // Main variants use); `HEADER_LEN + 2` is `checked_add`ed for the
-  // usize-overflow class — an overflow can never satisfy `mn_len >=`, so it trips
-  // the guard exactly as the oracle's `<` test does. (The cross-table Leica1/
-  // Leica10 routes — body offset 8/18 — go through `parse_leica*_gated`, not this
-  // helper, so the constant `HEADER_LEN` is the only body offset reachable here.)
-  match panasonic::HEADER_LEN.checked_add(2) {
+  // pre-migration body walker. The caller already classified the blob (the
+  // `routes_to_main` prefix for the Panasonic route, the make/signature gate for
+  // Leica), so the faithful result is present-but-empty (`Some((empty, empty))`),
+  // NOT `None` (which would drop the typed slot the oracle's `parse_in_tiff` still
+  // returns). `body_offset + 2` is `checked_add`ed for the usize-overflow class —
+  // an overflow can never satisfy `mn_len >=`, so it trips the guard exactly as the
+  // oracle's `<` test does.
+  match body_offset.checked_add(2) {
     Some(min_len) if mn_len >= min_len => {}
     _ => {
       return Some((std::vec::Vec::new(), panasonic::MakerNotesPanasonic::new()));
     }
   }
-  // The IFD sits at `mn_offset + HEADER_LEN` (12) in `data` — the
-  // `Panasonic\0\0\0` prefix both Main variants use (`MakerNotes.pm:738`/`:757`).
-  // A body offset past the buffer yields an empty walk (no entries) — the oracle's
-  // same out-of-bounds guard; `process_subdir` is bounds-checked.
-  let ifd_offset = mn_offset.saturating_add(panasonic::HEADER_LEN);
+  // The IFD sits at `mn_offset + body_offset` in `data` (`Panasonic\0\0\0` ⇒ 12,
+  // `LEICA\0\0\0` ⇒ 8, `LEICA CAMERA AG\0` + pad ⇒ 18). A body offset past the
+  // buffer yields an empty walk (no entries) — the oracle's same out-of-bounds
+  // guard; `process_subdir` is bounds-checked.
+  let ifd_offset = mn_offset.saturating_add(body_offset);
   let mut w = Walker {
     data,
     order,

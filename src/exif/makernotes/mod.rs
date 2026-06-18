@@ -54,14 +54,29 @@
 //! enforcement: the oracle entry points and their pub-use re-exports are gone,
 //! so any reintroduced reference fails to build.
 //!
-//! EXCEPTIONS, by design: Panasonic keeps `parse_in_tiff` +
-//! `walk_panasonic_in_tiff` solely as the body the CROSS-VENDOR Leica gated
-//! entries (`parse_leica1_gated` / `parse_leica10_gated`) call — Leica was not
-//! migrated to an isolated path (a tracked follow-up). Canon's CTMD re-dispatch
+//! The two cross-vendor **Leica** routes that decode with `%Panasonic::Main`
+//! (`MakerNoteLeica` / Leica1 @ body offset 8, `MakerNoteLeica10` @ body offset
+//! 18) were FOLDED onto the same shared `Walker` in #255: `parse_leica1_gated`
+//! / `parse_leica10_gated` apply their make / signature gate then call the
+//! generalized `crate::exif::panasonic_makernote_isolated_with_offset` (the
+//! body of `panasonic_makernote_isolated` parameterized over the body offset).
+//! Panasonic/Leica therefore have NO per-vendor walker — the last
+//! `walk_panasonic_in_tiff` + `parse_in_tiff` oracle is gone, so the shared
+//! `Walker` is the SOLE Main-IFD walker for EVERY migrated vendor + the Leica
+//! cross-tables. The other nine **Leica2-9** `MakerNotes.pm` variants route to
+//! the unported `Panasonic::Leica2..Leica9` tables (the dispatcher classifies
+//! them but emits nothing) and are a SEPARATE follow-up; if ported, Leica7
+//! (`MakerNoteLeica7`, M-Monochrom Typ 246, `MakerNotes.pm:690-700`) carries
+//! `Base => '-$base'` ("uses absolute file offsets, not based on TIFF header
+//! offset") AND is a `LeicaTrailer` special-case — a NEGATED out-of-line base,
+//! distinct from the inherit (0) / `Base => 12` addends the current
+//! `value_offset_base` thread handles, so it needs a signed/negated base path.
+//!
+//! EXCEPTIONS, by design: Canon's CTMD re-dispatch
 //! (`redispatch_ctmd_makernote`) and the Panasonic `%Panasonic::Main` automatic
 //! route both go through the shared `Walker` (the isolated helpers), NOT a
-//! per-vendor oracle. DJI is unmigrated and retains its own `parse` /
-//! `parse_in_tiff`.
+//! per-vendor oracle. DJI is the one unmigrated vendor and retains its own
+//! `parse` / `parse_in_tiff`.
 
 // NOTE: no file-level `#![deny(clippy::indexing_slicing)]` here. This is a
 // PARENT module (it declares `pub mod dispatcher;` + `pub mod vendors;`), and

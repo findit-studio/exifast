@@ -221,7 +221,8 @@ pub enum PanasonicPrintConv {
   /// `ValueConv => '$_=sprintf("%.4x",$val); s/(..)(..)/$2 $1/; $_'` that
   /// renders the int16u as two space-separated hex byte-pairs, low byte
   /// first: `0x1234 → "34 12"`. No PrintConv, so `-n` and `-j` are identical.
-  /// The undef-drop is observed by [`super::parse_in_tiff`] (which calls
+  /// The undef-drop is observed by the shared-`Walker` Panasonic capture
+  /// (`exif::mod::emit_panasonic_value`, which calls
   /// [`apply_lens_type_model`](Self::apply_lens_type_model)); the
   /// Olympus-Composite-`LensID` cross-table that combines this with
   /// `LensTypeMake` (`Panasonic.pm:1410-1411`) is deferred — only the DIRECT
@@ -313,10 +314,11 @@ impl PanasonicPrintConv {
   /// with the bundled `RawConv`'s undef-drop honoured: returns `None` when
   /// the raw int16u is `0` (`RawConv => 'return undef unless $val;'` ⇒ the
   /// tag is suppressed from output), else `Some` of the byte-swap
-  /// `ValueConv` string (`0x1234 → "34 12"`). [`super::parse_in_tiff`] uses
-  /// this for 0xc5/0xe4 so a zero value yields NO emission (matching
-  /// ExifTool); the plain [`apply`](Self::apply) path can't drop a tag and
-  /// renders the (rare) zero as `"00 00"`.
+  /// `ValueConv` string (`0x1234 → "34 12"`). The shared-`Walker` Panasonic
+  /// capture (`exif::mod::emit_panasonic_value`) uses this for 0xc5/0xe4 so a
+  /// zero value yields NO emission (matching ExifTool); the plain
+  /// [`apply`](Self::apply) path can't drop a tag and renders the (rare) zero
+  /// as `"00 00"`.
   #[must_use]
   pub fn apply_lens_type_model(raw: &RawValue, print_conv: bool) -> Option<TagValue> {
     lens_type_model(raw, print_conv)
