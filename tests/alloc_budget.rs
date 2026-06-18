@@ -214,7 +214,7 @@ fn media_metadata_budget(name: &str) -> usize {
     // took its `media_metadata` from 1391 → 756; Contract A adds the per-string
     // `raw` box (756 → 765).
     "MakerNotes_Canon.jpg" => 820, // measured 765 (Contract A: 756 → 765)
-    "MakerNotes_Apple.jpg" => 160, // measured 148 (Contract A: 133 → 148)
+    "MakerNotes_Apple.jpg" => 165, // measured 151 (#261 SOF File dims: 148 → 151)
     "ID3v2_4_big.mp3" => 225,      // measured 209 (Contract A: 194 → 209)
     "QuickTime_frea_rexing17b.mov" => 40, // measured 31 (no EXIF string leaf)
     "Real.ra" => 30,               // measured 21 (P8: 31 → 21)
@@ -259,7 +259,15 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // correctness fix's INTENDED, minimal cost (a non-Apple container must NOT
     // admit code 16), NOT a redundant clone. `-n` ceiling raised to 514. `-j`
     // runs ONE isolated walk (+1: 377 → 378), still within its 385 budget.
-    "MakerNotes_Apple.jpg" => (385, 514), // measured (378, 513) — R4 Make-gate threads IFD0 Make into the isolated walk(s)
+    // RE-BASELINED for #261 (JPEG SOF `File:*` dimension tags): emitting the six
+    // SOF tags (`ImageWidth`/`ImageHeight`/`EncodingProcess`/`BitsPerSample`/
+    // `ColorComponents`/`YCbCrSubSampling`) grows the per-render `tags` Vec by 6
+    // EmittedTags, so `-j` rises 378 → 384 and `-n` 513 → 520. An intentional,
+    // faithful cost (these tags are byte-identical to bundled ExifTool), NOT a
+    // redundant clone — the names are `SmolStr::new_static` and the dimension
+    // values are integer `TagValue`s (no heap), the only heap touch being the Vec
+    // growth. Ceilings raised to (395, 528).
+    "MakerNotes_Apple.jpg" => (395, 528), // measured (384, 520) — #261 SOF tags
     "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
     "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
     "Real.ra" => (100, 100),              // measured (88, 87)

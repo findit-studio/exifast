@@ -74,7 +74,7 @@
 use std::{string::String, vec::Vec};
 
 use super::ifd::{ByteOrder, get_u16};
-use super::{ExifEntry, ExifMeta, MakerNote, parse_exif_block_with_base};
+use super::{ExifEntry, ExifMeta, MakerNote, SofInfo, parse_exif_block_with_base};
 
 /// The 6-byte Exif `APP1` header — bundled `$exifAPP1hdr = "Exif\0\0"`
 /// (`ExifTool.pm:1239`). Stripped before the TIFF block (`DirStart(…,
@@ -354,6 +354,15 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     byte_order,
     maker_note,
   );
+  // The `File:*` Start-Of-Frame dimension tags (`ExifTool.pm:7419-7462`): the
+  // FIRST SOF segment yields `ImageWidth`/`ImageHeight`/`EncodingProcess`/
+  // `BitsPerSample`/`ColorComponents`/`YCbCrSubSampling`. ExifTool `HandleTag`s
+  // these in `ProcessJPEG` BEFORE the IFD walk (the `Marker:` loop reaches the
+  // SOF before SOS), so `Taggable::tags` emits them right after the `File:`
+  // prefix and ahead of the IFD blocks. A short / absent SOF yields `None`.
+  if let Some(sof) = parse_sof_segment(data, &segments) {
+    meta.set_jpeg_sof(sof);
+  }
   // `APP6` "GoPro" GPMF (JPEG.pm:196-198): a GoPro still (`GOPR*.JPG`) carries
   // its device-settings GPMF stream in an `APP6` (`0xe6`) segment whose payload
   // begins with the 6-byte `GoPro\0` identifier. ExifTool's JPEG.pm `APP6`
@@ -591,6 +600,157 @@ fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
     });
     // Advance past this segment to the next marker.
     pos = payload_end;
+  }
+}
+
+/// `true` for a JPEG Start-Of-Frame marker — bundled `ExifTool.pm:7419`
+/// `($marker & 0xf0) == 0xc0 and ($marker == 0xc0 or $marker & 0x03)`. This is
+/// the SOF0-SOF15 set EXCEPT DHT (`0xc4`), JPGA (`0xc8`) and DAC (`0xcc`) — the
+/// three `0xcX` markers that are NOT frame headers.
+#[inline]
+const fn is_sof_marker(marker: u8) -> bool {
+  marker & 0xf0 == 0xc0 && (marker == 0xc0 || marker & 0x03 != 0)
+}
+
+/// Parse the FIRST JPEG Start-Of-Frame segment into a [`SofInfo`] — a faithful
+/// port of the SOF arm of `ProcessJPEG` (`ExifTool.pm:7419-7462`).
+///
+/// Bundled handles the first SOF marker it reaches (`$gotSize` ignores any
+/// later one in a corrupted JPEG, `ExifTool.pm:7430`) and `HandleTag`s the
+/// `Image::ExifTool::JPEG::SOF` tags (group `File`, `ExifTool.pm:2163`). The
+/// payload (after the 2-byte length word) is ALL big-endian regardless of the
+/// embedded TIFF byte order — `unpack('Cn2C', …)` (`ExifTool.pm:7434`):
+///
+/// - byte 0: precision → `BitsPerSample`
+/// - bytes 1-2: height (`n`, u16be) → `ImageHeight`
+/// - bytes 3-4: width (`n`, u16be) → `ImageWidth`
+/// - byte 5: component count → `ColorComponents`
+/// - `EncodingProcess` = `marker - 0xc0`
+/// - then `count` × 3-byte components `(id, samplingFactors, quantTable)`;
+///   `YCbCrSubSampling` is derived from the sampling factors (below).
+///
+/// `ExifTool.pm:7429` `next if $length < 6` — a payload shorter than the 6-byte
+/// header yields NO tags. Every read is bounds-checked (`.get()` / `get_u16`),
+/// so a truncated SOF returns `None` rather than panicking.
+fn parse_sof_segment(data: &[u8], segments: &[Segment]) -> Option<SofInfo> {
+  // The FIRST SOF segment with a complete header. ExifTool advances `$gotSize`
+  // only AFTER the length guard (`next if $length < 6 or $gotSize`,
+  // ExifTool.pm:7429-7430), so a short/truncated SOF is SKIPPED and a later
+  // valid SOF still supplies the dimensions — only once a valid SOF parses is a
+  // subsequent SOF ignored.
+  let (seg, payload) = segments.iter().find_map(|seg| {
+    if !is_sof_marker(seg.marker) {
+      return None;
+    }
+    // `next if $length < 6` (ExifTool.pm:7429): the 6-byte SOF header
+    // (precision + height + width + components) must be present, else skip.
+    let payload = data.get(seg.payload_start..seg.payload_end)?;
+    (payload.len() >= 6).then_some((seg, payload))
+  })?;
+  // `unpack('Cn2C', …)` — precision(C), height(n), width(n), components(C); all
+  // big-endian (`get_u16(_, _, ByteOrder::Big)`) irrespective of the Exif byte
+  // order. The `< 6` guard above makes these `.get()`/`get_u16` reads succeed,
+  // but they stay checked (panic-safe by construction).
+  let bits_per_sample = *payload.first()?;
+  let image_height = get_u16(payload, 1, ByteOrder::Big)?;
+  let image_width = get_u16(payload, 3, ByteOrder::Big)?;
+  let color_components = *payload.get(5)?;
+  // `EncodingProcess = $marker - 0xc0` (ExifTool.pm:7437). `is_sof_marker`
+  // guarantees `marker & 0xf0 == 0xc0`, so `marker >= 0xc0` and the subtraction
+  // cannot underflow.
+  let encoding_process = seg.marker.wrapping_sub(0xc0);
+
+  // `YCbCrSubSampling` — `next unless $n == 3 and $length >= 15`
+  // (ExifTool.pm:7438): derived ONLY for a 3-component frame whose payload holds
+  // all three components' sampling factors (6-byte header + 3×3 = 15 bytes).
+  let ycbcr_subsampling = parse_ycbcr_subsampling(payload, color_components);
+
+  Some(SofInfo::new(
+    image_width,
+    image_height,
+    encoding_process,
+    bits_per_sample,
+    color_components,
+    ycbcr_subsampling,
+  ))
+}
+
+/// Derive the raw `YCbCrSubSampling` string ("`h v`", e.g. `"2 2"`) from the SOF
+/// component sampling factors — bundled `ExifTool.pm:7438-7462`.
+///
+/// `next unless $n == 3 and $length >= 15` (`ExifTool.pm:7438`): the value is
+/// computed ONLY for a 3-component frame whose payload carries all three
+/// components' sampling factors. The loop reads each component's
+/// `samplingFactors` byte (`Get8u($segDataPt, 7 + 3*$i)`, `ExifTool.pm:7444`),
+/// splits it into `hf = sf >> 4` / `vf = sf & 0x0f` (`ExifTool.pm:7450`), and
+/// tracks the min/max horizontal & vertical frequencies. The result is emitted
+/// only `if ($hmin and $vmin)` (`ExifTool.pm:7458`) — both minimums non-zero —
+/// as `"$hmax/$hmin $vmax/$vmin"` (`ExifTool.pm:7459-7460`). The division is the
+/// faithful `$hmax / $hmin`: an exact integer ratio renders as that integer
+/// (matching the `%yCbCrSubSampling` map keys, ExifTool.pm:2149-2158); a rare
+/// non-integer ratio renders as Perl's float stringification. Returns `None`
+/// when not 3-component, the payload is short of 15 bytes, or a minimum is 0.
+fn parse_ycbcr_subsampling(payload: &[u8], components: u8) -> Option<smol_str::SmolStr> {
+  // `$n == 3 and $length >= 15`.
+  if components != 3 || payload.len() < 15 {
+    return None;
+  }
+  let mut hmin = 0u8;
+  let mut hmax = 0u8;
+  let mut vmin = 0u8;
+  let mut vmax = 0u8;
+  for i in 0..3usize {
+    // `Get8u($segDataPt, 7 + 3 * $i)` — the component's sampling-factors byte.
+    // `7 + 3*2 = 13 < 15`, so the read is in-bounds given the `>= 15` guard; it
+    // stays a checked `.get()`.
+    let sf = *payload.get(7 + 3 * i)?;
+    let hf = sf >> 4;
+    let vf = sf & 0x0f;
+    if i == 0 {
+      hmin = hf;
+      hmax = hf;
+      vmin = vf;
+      vmax = vf;
+    } else {
+      hmin = hmin.min(hf);
+      hmax = hmax.max(hf);
+      vmin = vmin.min(vf);
+      vmax = vmax.max(vf);
+    }
+  }
+  // `if ($hmin and $vmin)` — both minimums must be non-zero (else a divide and a
+  // meaningless value). A zero minimum ⇒ no tag (ExifTool.pm:7458).
+  if hmin == 0 || vmin == 0 {
+    return None;
+  }
+  // `sprintf` is not used: bundled interpolates `"$hs $vs"` with
+  // `$hs = $hmax / $hmin` (a Perl number). An EXACT integer ratio (every real
+  // JPEG — the `%yCbCrSubSampling` keys are integer pairs) stringifies as the
+  // integer; a non-integer ratio uses the float form Perl would print.
+  let mut out = String::with_capacity(7);
+  push_ratio(&mut out, hmax, hmin);
+  out.push(' ');
+  push_ratio(&mut out, vmax, vmin);
+  Some(smol_str::SmolStr::from(out))
+}
+
+/// Append the Perl-faithful stringification of `num / den` (both `> 0`) to
+/// `out` — an exact integer quotient as that integer (the universal case for
+/// real JPEG sampling factors), otherwise the `f64` ratio formatted as Perl's
+/// default number stringification.
+fn push_ratio(out: &mut String, num: u8, den: u8) {
+  use std::fmt::Write as _;
+  // `is_multiple_of(0)` is `num == 0`, so the `den != 0` intent is preserved:
+  // a zero denominator falls to the `else` (the callers never pass one — `hmin`/
+  // `vmin` are non-zero at the single call site).
+  if den != 0 && num.is_multiple_of(den) {
+    // Exact integer ratio — Perl prints `2`, not `2.0`.
+    let _ = write!(out, "{}", num / den);
+  } else {
+    // A non-integer ratio (no real JPEG hits this; the map then falls back to
+    // the raw string). Perl's `$hmax/$hmin` is a double; its default
+    // stringification is `%.15g`-equivalent.
+    let _ = write!(out, "{}", f64::from(num) / f64::from(den));
   }
 }
 
@@ -1329,6 +1489,197 @@ mod tests {
       mn.bytes(),
       &[0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8],
       "the FIRST block's MakerNote wins (the primary)"
+    );
+  }
+
+  /// Build a JPEG carrying a Baseline-DCT `SOF0` (`0xc0`) segment plus a minimal
+  /// `APP1` Exif block (so it is a complete, valid JPEG). The SOF payload is a
+  /// 3-component frame: precision 8, height 80, width 120, component sampling
+  /// factors `0x22`/`0x11`/`0x11` (→ `YCbCrSubSampling` "2 2"). Mirrors the
+  /// real `t/images/GPS.jpg` SOF the conformance fixture exercises.
+  fn jpeg_with_sof0() -> Vec<u8> {
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    // SOF0 (0xc0): length word covers itself + the 15-byte payload (= 17).
+    j.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11]);
+    j.push(0x08); // precision → BitsPerSample
+    j.extend_from_slice(&80u16.to_be_bytes()); // height → ImageHeight
+    j.extend_from_slice(&120u16.to_be_bytes()); // width → ImageWidth
+    j.push(0x03); // 3 components → ColorComponents
+    j.extend_from_slice(&[0x01, 0x22, 0x00]); // comp 0: id, sf (hf=2,vf=2), q
+    j.extend_from_slice(&[0x02, 0x11, 0x01]); // comp 1: id, sf (hf=1,vf=1), q
+    j.extend_from_slice(&[0x03, 0x11, 0x01]); // comp 2: id, sf (hf=1,vf=1), q
+    // A minimal APP1 Exif block (IFD0 Make = "Canon") so the JPEG is complete.
+    let tiff = minimal_tiff();
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(b"Exif\0\0");
+    payload.extend_from_slice(&tiff);
+    j.push(0xff);
+    j.push(0xe1);
+    let len = (payload.len() + 2) as u16;
+    j.extend_from_slice(&len.to_be_bytes());
+    j.extend_from_slice(&payload);
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    j
+  }
+
+  /// Collect the `File:*` SOF tags `ExifMeta::tags` emits for `mode`, as
+  /// `(name, rendered-string)` pairs. The value is stringified so the `-j`
+  /// PrintConv text and the `-n` raw value are both comparable.
+  fn sof_file_tags(
+    meta: &ExifMeta<'_>,
+    mode: crate::emit::ConvMode,
+  ) -> std::collections::BTreeMap<String, String> {
+    use crate::emit::Taggable as _;
+    use crate::value::TagValue;
+    let mut out = std::collections::BTreeMap::new();
+    for et in meta.tags(crate::emit::EmitOptions::g1(mode, false)) {
+      let tag = et.tag();
+      if tag.group_ref().family1() != "File" {
+        continue;
+      }
+      let name = tag.name();
+      // Only the six SOF tags (ExifByteOrder is the other File:* tag).
+      if !matches!(
+        name,
+        "ImageWidth"
+          | "ImageHeight"
+          | "EncodingProcess"
+          | "BitsPerSample"
+          | "ColorComponents"
+          | "YCbCrSubSampling"
+      ) {
+        continue;
+      }
+      let rendered = match tag.value_ref() {
+        TagValue::U64(n) => n.to_string(),
+        TagValue::I64(n) => n.to_string(),
+        TagValue::Str(s) => s.to_string(),
+        other => std::format!("{other:?}"),
+      };
+      out.insert(name.to_string(), rendered);
+    }
+    out
+  }
+
+  #[test]
+  fn emits_sof_file_tags_print_and_raw() {
+    use crate::emit::ConvMode;
+    let j = jpeg_with_sof0();
+    let meta = parse_jpeg_exif(&j).expect("JPEG with SOF0 decoded");
+
+    // `-j` (PrintConv): EncodingProcess + YCbCrSubSampling are mapped strings;
+    // the four dimension tags are bare integers.
+    let pj = sof_file_tags(&meta, ConvMode::PrintConv);
+    assert_eq!(pj.get("ImageWidth").map(String::as_str), Some("120"));
+    assert_eq!(pj.get("ImageHeight").map(String::as_str), Some("80"));
+    assert_eq!(pj.get("BitsPerSample").map(String::as_str), Some("8"));
+    assert_eq!(pj.get("ColorComponents").map(String::as_str), Some("3"));
+    assert_eq!(
+      pj.get("EncodingProcess").map(String::as_str),
+      Some("Baseline DCT, Huffman coding"),
+      "EncodingProcess -j is the SOF PrintConv label for code 0"
+    );
+    assert_eq!(
+      pj.get("YCbCrSubSampling").map(String::as_str),
+      Some("YCbCr4:2:0 (2 2)"),
+      "YCbCrSubSampling -j maps the raw \"2 2\" via %yCbCrSubSampling"
+    );
+
+    // `-n` (ValueConv): EncodingProcess is the raw code; YCbCrSubSampling the
+    // raw "h v" string; the dimension tags are unchanged.
+    let nj = sof_file_tags(&meta, ConvMode::ValueConv);
+    assert_eq!(nj.get("ImageWidth").map(String::as_str), Some("120"));
+    assert_eq!(nj.get("ImageHeight").map(String::as_str), Some("80"));
+    assert_eq!(nj.get("BitsPerSample").map(String::as_str), Some("8"));
+    assert_eq!(nj.get("ColorComponents").map(String::as_str), Some("3"));
+    assert_eq!(
+      nj.get("EncodingProcess").map(String::as_str),
+      Some("0"),
+      "EncodingProcess -n is the raw code (marker 0xc0 - 0xc0 = 0)"
+    );
+    assert_eq!(
+      nj.get("YCbCrSubSampling").map(String::as_str),
+      Some("2 2"),
+      "YCbCrSubSampling -n is the raw component-derived string"
+    );
+  }
+
+  #[test]
+  fn sof_absent_when_no_sof_segment() {
+    // A valid JPEG with an APP1 Exif block but NO SOF segment (SOS then EOI)
+    // emits NONE of the SOF File:* tags — matching ExifTool's SOF-less crafted
+    // fixtures (JPEG_two_app1_exif etc.).
+    let tiff = minimal_tiff();
+    let j = jpeg_with_app1_exif(&tiff, 0, &[]);
+    let meta = parse_jpeg_exif(&j).expect("JPEG decoded");
+    assert!(
+      sof_file_tags(&meta, crate::emit::ConvMode::PrintConv).is_empty(),
+      "no SOF segment ⇒ no File:* SOF tags"
+    );
+  }
+
+  #[test]
+  fn sof_short_payload_emits_nothing() {
+    // A SOF0 whose payload is < 6 bytes (only 3 bytes present) is below
+    // ExifTool's `next if $length < 6` guard — no tags, no panic.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    // SOF0 length = 5 (covers itself + 3 payload bytes).
+    j.extend_from_slice(&[0xff, 0xc0, 0x00, 0x05, 0x08, 0x00, 0x50]);
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    assert!(
+      sof_file_tags(&meta, crate::emit::ConvMode::PrintConv).is_empty(),
+      "a SOF payload shorter than 6 bytes emits no tags"
+    );
+  }
+
+  #[test]
+  fn sof_short_then_valid_emits_valid_dims() {
+    // A short bogus SOF (`next if $length < 6`) must be SKIPPED, not consumed,
+    // so the LATER valid SOF still emits the dimensions (ExifTool.pm:7429-7430).
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    // Short SOF1 (0xc1), length 5 -> 3 payload bytes, below the `< 6` guard.
+    j.extend_from_slice(&[0xff, 0xc1, 0x00, 0x05, 0x08, 0x00, 0x50]);
+    // The real, valid SOF0 (0xc0): 80x120, 3 components (15-byte payload).
+    j.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11]);
+    j.push(0x08);
+    j.extend_from_slice(&80u16.to_be_bytes());
+    j.extend_from_slice(&120u16.to_be_bytes());
+    j.push(0x03);
+    j.extend_from_slice(&[0x01, 0x22, 0x00]);
+    j.extend_from_slice(&[0x02, 0x11, 0x01]);
+    j.extend_from_slice(&[0x03, 0x11, 0x01]);
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let tags = sof_file_tags(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      tags.get("ImageWidth").map(String::as_str),
+      Some("120"),
+      "valid SOF0 after a short bogus SOF must still emit ImageWidth"
+    );
+    assert_eq!(tags.get("ImageHeight").map(String::as_str), Some("80"));
+  }
+
+  #[test]
+  fn sof_grayscale_has_no_ycbcr_subsampling() {
+    // A 1-component (grayscale) SOF0 still emits the 5 base tags but NOT
+    // YCbCrSubSampling (`next unless $n == 3`, ExifTool.pm:7438).
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    // SOF0, payload 9 bytes: precision 8, h 16, w 16, 1 component (id, sf, q).
+    j.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b]);
+    j.push(0x08);
+    j.extend_from_slice(&16u16.to_be_bytes());
+    j.extend_from_slice(&16u16.to_be_bytes());
+    j.push(0x01); // 1 component
+    j.extend_from_slice(&[0x01, 0x11, 0x00]);
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("grayscale JPEG accepted");
+    let pj = sof_file_tags(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(pj.get("ColorComponents").map(String::as_str), Some("1"));
+    assert_eq!(pj.get("ImageWidth").map(String::as_str), Some("16"));
+    assert!(
+      !pj.contains_key("YCbCrSubSampling"),
+      "a 1-component frame has no YCbCrSubSampling"
     );
   }
 }
