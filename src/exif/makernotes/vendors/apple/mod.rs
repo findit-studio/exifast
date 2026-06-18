@@ -8,9 +8,11 @@
 //!
 //! ## Phase 2 scope
 //!
-//! - The Apple body walker ([`body::walk_apple_body`]) — strips the
-//!   14-byte `Apple iOS\0\0\x01MM` header, reads the body's `MM`/`II`
-//!   marker, walks the IFD entries.
+//! - The Apple body walk — strips the 14-byte `Apple iOS\0\0\x01MM`
+//!   header, reads the body's `MM`/`II` marker, walks the IFD entries.
+//!   This now runs through the shared `Walker` isolated helper
+//!   `crate::exif::apple_makernote_isolated`; the standalone
+//!   `body::walk_apple_body` oracle was deleted in #243 phase 5.
 //! - The faithful tag table ([`tags::APPLE_TAGS`]) — every named tag
 //!   from `%Apple::Main` with a clean Format. The `ConvertPLIST`
 //!   ValueConv tags emit raw bytes (Phase 2 forward-item: a follow-up
@@ -33,23 +35,19 @@
 
 #![deny(clippy::indexing_slicing)]
 
-pub mod body;
 pub mod printconv;
 pub mod tags;
 
-use crate::exif::makernotes::VendorEmission;
-use crate::value::{Group, Metadata};
 use smol_str::SmolStr;
-use std::vec::Vec;
 
-pub use body::{AppleEntry, ParsedValue, walk_apple_body};
 pub use printconv::ApplePrintConv;
 pub use tags::{APPLE_TAGS, AppleTag, lookup};
 
-use super::super::super::ifd::{ByteOrder, RawValue};
+use super::super::super::ifd::RawValue;
 
-/// Decoded Apple iOS MakerNotes data — populated by [`parse`] when the
-/// dispatcher resolved [`Vendor::Apple`](crate::exif::makernotes::Vendor).
+/// Decoded Apple iOS MakerNotes data — populated by
+/// `crate::exif::apple_makernote_isolated` when the dispatcher resolved
+/// [`Vendor::Apple`](crate::exif::makernotes::Vendor).
 ///
 /// D8: no public fields; accessor-only. `PartialEq` only (NOT `Eq`)
 /// because the struct carries `f64` fields (Apple's `AccelerationVector`
@@ -89,8 +87,8 @@ pub struct MakerNotesApple {
 }
 
 impl MakerNotesApple {
-  /// Build an empty Apple metadata bag. Phase 2's [`parse`] populates
-  /// the per-tag fields.
+  /// Build an empty Apple metadata bag. The isolated decode path
+  /// (`crate::exif::apple_makernote_isolated`) populates the per-tag fields.
   #[must_use]
   #[inline(always)]
   pub const fn new() -> Self {
@@ -209,104 +207,12 @@ impl MakerNotesApple {
   }
 }
 
-/// Parse the captured Apple MakerNote blob into a [`MakerNotesApple`]
-/// plus the (group, name, value) triples for the `MakerNotes:` JSON
-/// group.
-///
-/// `blob` is the raw 0x927C value; `parent_order` is the parent IFD
-/// walk's byte order (used as the body-marker-fallback per
-/// [`super::super::byte_order::resolve_child_byte_order`]). `make` is the
-/// parent IFD0 `Make` — threaded into the body walker so the format-16
-/// (`int64u`) Apple carve-out gates on `Make eq 'Apple'` exactly
-/// (`Exif.pm:6464`); pass the captured IFD0 Make (`None` if unknown, which
-/// then rejects code 16 like any non-Apple Make).
-///
-/// Returns `(typed, emissions)` — the typed struct + the ordered
-/// [`VendorEmission`] list (each carrying the `Unknown => 1` flag) for the
-/// emission engine.
-#[must_use]
-pub fn parse(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  make: Option<&str>,
-) -> (MakerNotesApple, Vec<VendorEmission>) {
-  parse_with_print_conv(blob, parent_order, true, make)
-}
-
-/// Like [`parse`] but lets the caller toggle PrintConv (`-n` mode emits
-/// the post-ValueConv raw scalar; the typed struct is the same either
-/// way). `make` is the parent IFD0 `Make`, threaded into the body walker for
-/// the `Make eq 'Apple'` format-16 carve-out gate (`Exif.pm:6464`).
-#[must_use]
-pub fn parse_with_print_conv(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  make: Option<&str>,
-) -> (MakerNotesApple, Vec<VendorEmission>) {
-  let mut typed = MakerNotesApple::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
-  if blob.len() < 14 {
-    return (typed, emissions);
-  }
-  let entries = body::walk_apple_body(blob, 14, parent_order, make);
-  for entry in &entries {
-    let Some(def) = tags::lookup(entry.tag_id) else {
-      continue;
-    };
-    // Render the value with the per-tag PrintConv and emit it WITH the
-    // `Unknown => 1` flag (`Apple.pm`). Unknown-suppression is the emission
-    // engine's job (`ExifTool.pm:9179-9185` returns undef for Unknown tags
-    // unless `-u`/Verbose/HTML_DUMP/Validate) — carried here, dropped there,
-    // so no per-vendor `if def.is_unknown() { continue; }`. The typed
-    // accessors are not populated from any Unknown tag, so nothing else
-    // depends on the old skip.
-    let value = def.conv().apply(entry.value.raw(), print_conv);
-    emissions.push(VendorEmission::new(
-      def.name().into(),
-      value,
-      def.is_unknown(),
-    ));
-    populate_typed(&mut typed, entry);
-  }
-  (typed, emissions)
-}
-
-/// Mirror of [`parse_with_print_conv`] that emits straight into a
-/// [`Metadata`] sink under the `("MakerNotes","MakerNotes")` group —
-/// used by the engine when emitting Apple tags into the JSON document.
-pub fn parse_into_metadata(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  make: Option<&str>,
-  into: &mut Metadata,
-) {
-  let group = Group::new("MakerNotes", "MakerNotes");
-  let (_typed, emissions) = parse_with_print_conv(blob, parent_order, print_conv, make);
-  for e in emissions {
-    // Unknown-suppression is the engine's job; this raw `Metadata`-sink
-    // helper applies it inline so it matches the default-output contract.
-    if e.unknown() {
-      continue;
-    }
-    into.push(group.clone(), e.name(), e.value().clone());
-  }
-}
-
-/// Populate the typed struct with the parsed value for `entry`. Only
-/// the tags surfaced via accessor on [`MakerNotesApple`] are routed
-/// here; other tags surface only via the emissions list.
-fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
-  populate_typed_value(typed, entry.tag_id, entry.value.raw());
-}
-
 /// Populate the typed struct from a `(tag_id, value)` pair — the per-tag
-/// routing the oracle ([`populate_typed`]) and the shared-`Walker` isolated
-/// path ([`crate::exif::apple_makernote_isolated`]) BOTH call, so the typed
-/// surface is single-sourced (#243 phase 3). Only the tags surfaced via
-/// accessor on [`MakerNotesApple`] are routed here; other tags surface only
-/// via the emissions list.
+/// routing the shared-`Walker` isolated path
+/// (`crate::exif::apple_makernote_isolated`) calls, so the typed surface is
+/// single-sourced (#243 phase 3). Only the tags surfaced via accessor on
+/// [`MakerNotesApple`] are routed here; other tags surface only via the
+/// emissions list.
 pub fn populate_typed_value(typed: &mut MakerNotesApple, tag_id: u16, value: &RawValue) {
   match tag_id {
     0x0001 => {
@@ -396,7 +302,36 @@ fn rational_f64(r: &crate::value::Rational) -> Option<f64> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::VendorEmission;
   use crate::value::TagValue;
+  use std::vec::Vec;
+
+  // The per-vendor oracle entry points (`apple::parse` / `parse_with_print_conv`)
+  // were retired in #243 phase 5; the production decode now runs through the
+  // shared-`Walker` isolated helper `crate::exif::apple_makernote_isolated` (proven
+  // byte-identical by the conformance suite). These thin shims preserve the old
+  // signature so the decode tests below exercise the SAME tables/convs/gates
+  // through the surviving path. The isolated helper installs the typed slot only
+  // for `-j` (`print_conv.then(...)`); the `-n` tests below ignore the typed
+  // surface, so an empty fallback there is never observed.
+  fn parse(
+    blob: &[u8],
+    order: ByteOrder,
+    make: Option<&str>,
+  ) -> (MakerNotesApple, Vec<VendorEmission>) {
+    parse_with_print_conv(blob, order, true, make)
+  }
+
+  fn parse_with_print_conv(
+    blob: &[u8],
+    order: ByteOrder,
+    print_conv: bool,
+    make: Option<&str>,
+  ) -> (MakerNotesApple, Vec<VendorEmission>) {
+    let (emissions, typed) = crate::exif::apple_makernote_isolated(blob, order, print_conv, make);
+    (typed.unwrap_or_else(MakerNotesApple::new), emissions)
+  }
 
   /// Build a 1-entry Apple MakerNote blob with the given tag.
   fn one_entry_blob(tag_id: u16, format_code: u16, count: u32, value_bytes: [u8; 4]) -> Vec<u8> {

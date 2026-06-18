@@ -3,6 +3,16 @@
 
 //! Panasonic MakerNote IFD body walker — Phase-3 port.
 //!
+//! Single-walker invariant (#243 phase 5): the automatic `%Panasonic::Main`
+//! route walks through the shared `Walker`
+//! (`crate::exif::panasonic_makernote_isolated`); the per-vendor standalone-blob
+//! `walk_panasonic_body` wrapper + the `parse` / `parse_main_gated` oracle entry
+//! points were deleted. `walk_panasonic_in_tiff` (+ `parse_in_tiff`) survive
+//! SOLELY as the body the CROSS-VENDOR Leica gated entries
+//! (`super::parse_leica1_gated` / `parse_leica10_gated`) call — Leica was not
+//! migrated to an isolated path (a tracked follow-up). Do not route the
+//! automatic Panasonic path back through this walker.
+//!
 //! Panasonic's MakerNote (`MakerNotePanasonic`, `MakerNotes.pm:732-740`)
 //! starts with the 12-byte header `Panasonic\0\0\0` and is followed by a
 //! standard IFD body (`count`, `entries[]`). `Start => '$valuePtr + 12'`,
@@ -468,18 +478,6 @@ fn large_array_placeholder(count: usize, format: Format) -> String {
   std::format!("(large array of {count} {} values)", format.name())
 }
 
-/// Compatibility wrapper — walk Panasonic body when only the captured
-/// BLOB is available (no parent TIFF context). Out-of-line offsets
-/// resolve against the blob; correct only when the blob is
-/// self-contained (synthetic test fixtures). Uses `base_offset == 0` —
-/// the inherit variant (`MakerNotePanasonic`); the `Base => 12` DC-FT7
-/// variant must go through [`walk_panasonic_in_tiff`] with `base_offset
-/// = 12`.
-#[must_use]
-pub fn walk_panasonic_body(blob: &[u8], parent_order: ByteOrder) -> Vec<PanasonicEntry> {
-  walk_panasonic_in_tiff(blob, 0, blob.len(), HEADER_LEN, parent_order, 0)
-}
-
 fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
   // `pos.checked_add(2)?` for the usize-overflow class — byte-identical to the
   // shared IFD helper `ifd::get_u16` and `walk_sony_in_tiff`'s `read_u16` (a `pos`
@@ -504,179 +502,4 @@ fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
   })
-}
-
-#[cfg(test)]
-// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
-// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
-// freely (an out-of-range index is a test-assertion failure, not a shipped
-// panic), so the deny is relaxed here.
-#[allow(clippy::indexing_slicing)]
-mod tests {
-  use super::*;
-
-  /// Synthetic Panasonic body: 1 entry — `ImageQuality` (tag 0x01, int16u,
-  /// count 1, value 2 = "High"), little-endian.
-  #[test]
-  fn synthetic_panasonic_image_quality_inline() {
-    let mut blob: Vec<u8> = Vec::new();
-    // 12-byte header "Panasonic\0\0\0"
-    blob.extend_from_slice(b"Panasonic\x00\x00\x00");
-    // 1 entry LE
-    blob.extend_from_slice(&[0x01, 0x00]);
-    // Entry: tag 0x01, int16u (3), count 1, value=2 in the 4-byte inline slot.
-    blob.extend_from_slice(&[0x01, 0x00]); // tag
-    blob.extend_from_slice(&[0x03, 0x00]); // format 3 = int16u
-    blob.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
-    blob.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // value 2 inline
-    let entries = walk_panasonic_body(&blob, ByteOrder::Little);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].tag_id, 0x01);
-    match &entries[0].value {
-      RawValue::U64(v) => assert_eq!(v, &[2]),
-      other => panic!("expected U64, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn empty_blob_yields_no_entries() {
-    let blob: Vec<u8> = Vec::new();
-    assert!(walk_panasonic_body(&blob, ByteOrder::Little).is_empty());
-  }
-
-  #[test]
-  fn header_too_short_yields_empty() {
-    let blob = b"Panasonic\x00\x00\x00\x01".to_vec(); // 13 bytes — but only the header + 1 byte
-    let entries = walk_panasonic_body(&blob, ByteOrder::Little);
-    assert!(entries.is_empty());
-  }
-
-  #[test]
-  fn implausible_count_short_circuits() {
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(b"Panasonic\x00\x00\x00");
-    blob.extend_from_slice(&[0x0f, 0x27]); // 9999 LE
-    assert!(walk_panasonic_body(&blob, ByteOrder::Little).is_empty());
-  }
-
-  /// `MakerNotePanasonic3` (`Base => 12`, `MakerNotes.pm:758`): an
-  /// OUT-OF-LINE string tag's stored offset is interpreted as `off + 12`
-  /// in buffer coordinates. Build a blob whose 0x51 LensType (string,
-  /// out-of-line) stores an offset 12 LESS than the real string position;
-  /// `base_offset = 12` reads it correctly, `base_offset = 0` reads 12
-  /// bytes early ⇒ wrong bytes.
-  #[test]
-  fn panasonic3_base12_out_of_line_offset() {
-    // Layout (blob-relative, == buffer-relative since mn_offset = 0):
-    //   [0..12)  "Panasonic\0\0\0"
-    //   [12..14) count = 1
-    //   [14..26) entry: tag 0x51, string(2), count 6, value-offset field
-    //   [26..30) next-IFD ptr = 0
-    //   [30..36) "ABCDE\0"  (the real string, 6 bytes, > 4 ⇒ out-of-line)
-    let lens = b"ABCDE\x00";
-    let str_pos = 30usize;
-    // DC-FT7 stores the offset relative to base+12, so stored = real - 12.
-    let stored = (str_pos - 12) as u32;
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(b"Panasonic\x00\x00\x00");
-    blob.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
-    blob.extend_from_slice(&0x51u16.to_le_bytes()); // tag
-    blob.extend_from_slice(&2u16.to_le_bytes()); // format 2 = string
-    blob.extend_from_slice(&(lens.len() as u32).to_le_bytes()); // count 6
-    blob.extend_from_slice(&stored.to_le_bytes()); // out-of-line offset (base-12)
-    blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
-    assert_eq!(blob.len(), str_pos);
-    blob.extend_from_slice(lens);
-
-    // base_offset = 12 ⇒ reads the real string bytes. body_offset = 12
-    // (the `Panasonic\0\0\0` header).
-    let entries = walk_panasonic_in_tiff(&blob, 0, blob.len(), HEADER_LEN, ByteOrder::Little, 12);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].tag_id, 0x51);
-    match &entries[0].value {
-      RawValue::Text { text: s, .. } => assert_eq!(s.as_str(), "ABCDE"),
-      other => panic!("expected Text(\"ABCDE\"), got {other:?}"),
-    }
-
-    // base_offset = 0 (the OLD behaviour) resolves the out-of-line offset 12
-    // bytes early — at `stored = 18`, which lands INSIDE the IFD directory
-    // (`[ifd_start=12 .. dir_end=26)`). The ProcessExif-faithful walk flags that
-    // as a "Suspicious offset" (the value overlaps the IFD, `Exif.pm:6549`) and
-    // SKIPS the entry ⇒ NO entry, byte-identical to the shared `Walker`'s
-    // `walk_entry` (which the OLD oracle, lacking the suspect check, did not
-    // match — it wrongly decoded a corrupted entry). Either way, base-0 does NOT
-    // recover "ABCDE": the +12 thread is load-bearing. Assert no surviving entry
-    // carries the real string (robust to both the suspect-skip and any
-    // corrupted-decode shape).
-    let bad = walk_panasonic_in_tiff(&blob, 0, blob.len(), HEADER_LEN, ByteOrder::Little, 0);
-    assert!(
-      !bad
-        .iter()
-        .any(|e| matches!(&e.value, RawValue::Text { text: s, .. } if s.as_str() == "ABCDE")),
-      "base_offset=0 must NOT recover the real string (reads 12 bytes early ⇒ \
-       lands in the IFD ⇒ suspect-skip)"
-    );
-  }
-
-  /// `MakerNotePanasonic` (no `Base` ⇒ inherit, `base_offset == 0`): an
-  /// out-of-line string resolves against the buffer directly. Pins that
-  /// the inherit variant is unchanged by the `base_offset` plumbing.
-  #[test]
-  fn panasonic1_inherit_out_of_line_offset() {
-    let lens = b"ABCDE\x00";
-    let str_pos = 30usize;
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(b"Panasonic\x00\x00\x00");
-    blob.extend_from_slice(&1u16.to_le_bytes());
-    blob.extend_from_slice(&0x51u16.to_le_bytes());
-    blob.extend_from_slice(&2u16.to_le_bytes());
-    blob.extend_from_slice(&(lens.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&(str_pos as u32).to_le_bytes()); // base-0 offset
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    assert_eq!(blob.len(), str_pos);
-    blob.extend_from_slice(lens);
-
-    let entries = walk_panasonic_in_tiff(&blob, 0, blob.len(), HEADER_LEN, ByteOrder::Little, 0);
-    assert_eq!(entries.len(), 1);
-    match &entries[0].value {
-      RawValue::Text { text: s, .. } => assert_eq!(s.as_str(), "ABCDE"),
-      other => panic!("expected Text(\"ABCDE\"), got {other:?}"),
-    }
-  }
-
-  /// `MakerNoteLeica10` (`MakerNotes.pm:724-730`): a `LEICA CAMERA AG\0`
-  /// blob routes to `%Panasonic::Main` with `Start => '$valuePtr + 18'`.
-  /// The walker must read the IFD at `body_offset = 18` (NOT the
-  /// `Panasonic\0\0\0` default of 12). Build a self-contained blob and pin
-  /// that body_offset=18 finds the inline ImageQuality entry.
-  #[test]
-  fn leica10_body_offset_18_inline() {
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(b"LEICA CAMERA AG\x00"); // 16-byte signature
-    blob.extend_from_slice(&[0x00, 0x00]); // 2 pad ⇒ body starts at 18
-    blob.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
-    blob.extend_from_slice(&0x01u16.to_le_bytes()); // tag 0x01 ImageQuality
-    blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
-    blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
-    blob.extend_from_slice(&2u32.to_le_bytes()); // value 2 inline
-    blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
-
-    // body_offset = 18 reads the entry; the inherit base ⇒ base_offset = 0.
-    let entries = walk_panasonic_in_tiff(&blob, 0, blob.len(), 18, ByteOrder::Little, 0);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].tag_id, 0x01);
-    match &entries[0].value {
-      RawValue::U64(v) => assert_eq!(v, &[2]),
-      other => panic!("expected U64([2]), got {other:?}"),
-    }
-
-    // body_offset = 12 (the Panasonic default) reads garbage from inside
-    // the 16-byte signature ⇒ NOT a valid 1-entry ImageQuality IFD: proves
-    // the 18 is load-bearing for the cross-table Leica10 route.
-    let wrong = walk_panasonic_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little, 0);
-    assert!(
-      wrong.first().is_none_or(|e| e.tag_id != 0x01),
-      "body_offset=12 must NOT decode the ImageQuality entry (header is 18 for Leica10)"
-    );
-  }
 }

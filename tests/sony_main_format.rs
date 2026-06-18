@@ -11,9 +11,8 @@
 //! format and a count recomputed from the on-disk byte size
 //! (`Exif.pm:6728-6745`: `$formatStr = $$tagInfo{Format}` and, when the new
 //! format number differs from the on-disk one, `$count = int($size /
-//! $formatSize[$format])`). The Sony body walker
-//! ([`walk_sony_in_tiff`](exifast::exif::makernotes::vendors::sony::walk_sony_in_tiff))
-//! applies this via the tag def's
+//! $formatSize[$format])`). The Sony body walk (the shared `Walker`'s Sony
+//! capture) applies this via the tag def's
 //! [`SonyTag::format`](exifast::exif::makernotes::vendors::sony::SonyTag)
 //! override; the on-disk format is preserved separately for the `$format`
 //! `Condition` gate.

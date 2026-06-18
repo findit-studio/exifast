@@ -83,12 +83,11 @@ pub mod shot_info;
 pub mod tags;
 
 use crate::exif::makernotes::VendorEmission;
-use crate::value::{Group, Metadata, TagValue};
+use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
 
 pub use af_info::CanonAFInfo;
-pub use body::{CanonEntry, walk_canon_body, walk_canon_in_tiff};
 pub use camera_settings::CAMERA_SETTINGS;
 pub use file_info::{FILE_INFO, FileInfoDecoded};
 pub use lens_types::{CANON_LENS_TYPES, CanonLensType};
@@ -99,8 +98,9 @@ pub use tags::{CANON_TAGS, CanonTag, SubTable};
 
 use super::super::super::ifd::{ByteOrder, RawValue};
 
-/// Decoded Canon MakerNotes data — populated by [`parse`] when the
-/// dispatcher resolved [`Vendor::Canon`](crate::exif::makernotes::Vendor).
+/// Decoded Canon MakerNotes data — populated by
+/// `crate::exif::canon_makernote_isolated` when the dispatcher resolved
+/// [`Vendor::Canon`](crate::exif::makernotes::Vendor).
 ///
 /// D8: no public fields; accessor-only. `PartialEq` only because the
 /// struct carries `(f64, f64)` for `focal_range_mm`; `f64` is not `Eq`.
@@ -334,20 +334,6 @@ impl MakerNotesCanon {
   }
 }
 
-/// Parse a Canon MakerNote blob into a [`MakerNotesCanon`] + the
-/// `(group, name, value)` emissions for the MakerNotes JSON sink.
-///
-/// This wrapper treats the blob as a stand-alone byte slice — out-of-
-/// line offsets resolve against the blob itself. Use [`parse_in_tiff`]
-/// when the caller has the surrounding TIFF block (the faithful
-/// behaviour, since Canon's MakerNotes inherit the parent's `Base`).
-#[must_use]
-pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesCanon, Vec<VendorEmission>) {
-  // Standalone-blob convenience entry: no parent container context, so
-  // `model`/`file_type` are `None` (the FILE_TYPE-keyed CRW clause is off).
-  parse_in_tiff(blob, 0, blob.len(), parent_order, true, None, None)
-}
-
 /// Re-dispatch a Canon CTMD `MakerNoteCanon` (`0x927c`) embedded TIFF block
 /// through `Canon::Main` — the `%Canon::ExifInfo` `ProcessProc => ProcessTIFF`
 /// hop (`Canon.pm:9845-9852`).
@@ -357,9 +343,10 @@ pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesCanon, Vec<Vend
 /// `ProcessTIFF` (Canon.pm:10745-10751), so it carries its own `II*\0` / `MM\0*`
 /// header + IFD0 offset, and IFD0 IS the Canon MakerNote (`Canon::Main` tags at
 /// the top level). This parses the header (the block's OWN byte order, which may
-/// differ from the parent), then walks IFD0 with [`parse_in_tiff`] at `mn_offset
-/// = ifd0_offset` — the block is self-contained (its out-of-line value offsets
-/// are relative to its own start, ExifTool's `DataPos => -($pos + 8)`,
+/// differ from the parent), then walks IFD0 with the shared `Walker`'s
+/// `canon_makernote_isolated` at
+/// `mn_offset = ifd0_offset` — the block is self-contained (its out-of-line value
+/// offsets are relative to its own start, ExifTool's `DataPos => -($pos + 8)`,
 /// Canon.pm:10748), so it walks at base 0.
 ///
 /// Returns the cached [`VendorEmission`]s for `print_conv` (the `Unknown => 1`
@@ -397,14 +384,21 @@ pub fn redispatch_ctmd_makernote(
   // `mn_len` spans from IFD0 to the block end (the walker bounds-checks each
   // entry against `tiff_data.len()` anyway).
   let mn_len = tiff_block.len() - ifd0_offset;
-  let (_, emissions) = parse_in_tiff(
+  // Route through the SAME isolated shared-`Walker` helper the static-file
+  // `-j`/`-n` dispatch uses (`exif::canon_makernote_isolated`) — byte-identical
+  // to the retired `parse_in_tiff` oracle for this self-contained TIFF block
+  // (base 0, the Canon Main IFD at `ifd0_offset`). A `.cr3`/`.mov` container is
+  // never "CRW", so `file_type` is `None` (the ShotInfo CRW clause stays off);
+  // only the emissions are needed here (the typed slot is `-j`-only and is
+  // discarded).
+  let (emissions, _typed) = crate::exif::canon_makernote_isolated(
     tiff_block,
     ifd0_offset,
     mn_len,
     order,
-    print_conv,
     model,
     /* file_type */ None,
+    print_conv,
   );
   emissions
 }
@@ -498,7 +492,8 @@ pub fn redispatch_ctmd_makernote_diagnostics(
 /// `$inMakerNotes = 1` (`$$et{INDENT}`-level state set by `ProcessTIFF`), so it
 /// takes the no-RAF `else` branch and warns the DIFFERENT text — and CONTINUES
 /// the walk (`$bad = 1`, not an abort). This diagnostic-only walk models that
-/// branch directly, mirroring [`body::walk_canon_in_tiff`]'s IFD0 parse:
+/// branch directly, mirroring the shared `Walker`'s Canon IFD0 parse
+/// (`canon_makernote_isolated`):
 ///
 /// - `$suspect = $warnCount` if the offset points into the TIFF header
 ///   (`$valuePtr < 8 and not ZeroOffsetOK`, `Exif.pm:6538`) OR overlaps the
@@ -514,7 +509,7 @@ pub fn redispatch_ctmd_makernote_diagnostics(
 ///
 /// EMISSION: a SUSPECT offset is IN bounds, so bundled's `next`
 /// (Exif.pm:6672-6678) SKIPS the entry and emits no value. The shared emission
-/// walker [`body::walk_canon_in_tiff`] now `next`-skips the same suspect-offset
+/// walker (`canon_makernote_isolated`) `next`-skips the same suspect-offset
 /// entry (the identical `value_ptr < 8 || (value_ptr < dir_end && value_end >
 /// dir_start)` condition), so the SKIP and this WARNING always agree and no
 /// spurious tag is emitted. The `Bad offset` (out-of-bounds) case is likewise
@@ -671,451 +666,6 @@ pub fn redispatch_ctmd_makernote_value_offset_diagnostics(
   out
 }
 
-/// Parse with the parent TIFF context.
-///
-/// `tiff_data` is the parent TIFF block; `mn_offset` is the MakerNote
-/// blob's position within `tiff_data`; `mn_len` is the blob length.
-/// Out-of-line value offsets in the Canon IFD are TIFF-relative (Canon
-/// inherits the parent `Base`). `model` is the parent body's
-/// `$$self{Model}` (from IFD0), used to evaluate the FocalLength
-/// FocalPlaneX/YSize `Condition` (`Canon.pm:2735-2739`).
-///
-/// `file_type` is the container's detected `$$self{FILE_TYPE}` — threaded
-/// into `Canon::ShotInfo` position 22's RawConv (`Canon.pm:2977`/`:2990`),
-/// which keeps a raw-0 ExposureTime only for a CRW container. `None` when the
-/// container type is unknown; the embedded JPEG/PNG callers pass `None` (a
-/// JPEG/PNG container is never "CRW", so the CRW clause is correctly false).
-#[must_use]
-pub fn parse_in_tiff(
-  tiff_data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-  file_type: Option<&str>,
-) -> (MakerNotesCanon, Vec<VendorEmission>) {
-  let mut typed = MakerNotesCanon::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
-  let entries = body::walk_canon_in_tiff(tiff_data, mn_offset, mn_len, parent_order, model);
-  // Pass 1: walk the Main IFD entries, surfacing leaves and dispatching
-  // recognized binary sub-tables. We need to capture FocalUnits from
-  // the CameraSettings sub-table (position 25) BEFORE we process the
-  // FocalLength sub-table (which uses FocalUnits for scaling). So we
-  // do this in TWO passes: first compute the FocalUnits hint by
-  // dispatching CameraSettings, then process FocalLength with it.
-  let mut focal_units: Option<u16> = None;
-  let mut focal_length_data: Option<Vec<u8>> = None;
-  // `$$self{LensType}` DataMember — set by CameraSettings position 22's
-  // `RawConv => '$val ? $$self{LensType} = $val : undef'` (`Canon.pm:2503`).
-  // FileInfo position 16 (`MacroMagnification`, `Canon.pm:6998-7005`) gates
-  // on it (`$$self{LensType} == 124`). ExifTool resolves it during the
-  // CameraSettings walk (Canon tag 0x01), which precedes FileInfo
-  // (0x93) in IFD tag order; we capture it in this sub-pass so the
-  // dependency holds regardless of IFD entry order.
-  let mut lens_type: Option<u16> = None;
-  // Sub-pass: find CameraSettings + FocalLength sub-table data.
-  for entry in &entries {
-    let Some(def) = tags::lookup(entry.tag_id) else {
-      continue;
-    };
-    let Some(sub) = def.sub_table() else { continue };
-    if sub == SubTable::CameraSettings {
-      focal_units = read_focal_units(&entry.value, parent_order);
-      // Capture the `$$self{LensType}` DataMember (CameraSettings pos 22,
-      // `Canon.pm:2503`) for FileInfo position 16's `Condition`.
-      let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-      camera_settings::parse_with_lens_id_capture(
-        &blob_bytes,
-        parent_order,
-        print_conv,
-        &mut lens_type,
-      );
-    }
-    if sub == SubTable::FocalLength {
-      // Reserialize the int16u words into bytes for the sub-table parser.
-      focal_length_data = Some(reserialize_int_array(&entry.value, parent_order));
-    }
-  }
-  // Now do the main walk.
-  for entry in &entries {
-    let Some(def) = tags::lookup(entry.tag_id) else {
-      continue; // Unknown tag — bundled would emit it under 'Tag 0xNNNN'; we omit.
-    };
-    // `Unknown => 1` tags (e.g. `0x3 CanonFlashInfo`, `Canon.pm:1239`) are
-    // SUPPRESSED in the default (`-j`, no `-u`) output —
-    // `ExifTool.pm:9179-9185` returns undef for them unless
-    // `-u`/Verbose/HTML_DUMP/Validate is set. We no longer skip them at the
-    // collection site: each leaf emission carries `def.is_unknown()` and the
-    // emission engine drops the Unknown ones (the legacy `serialize_tags`
-    // read-path filters them too). The single `Unknown` Canon::Main tag
-    // (`0x03 CanonFlashInfo`) has no sub-table, so it reaches the leaf arm
-    // below and is emitted with the flag set; no `Unknown` tag is a
-    // typed-accessor source, so nothing else changes.
-    if let Some(sub) = def.sub_table() {
-      // SubDirectory tag: process the sub-table if Phase 2 handles it;
-      // otherwise emit the SubDirectory tag's RAW bytes/name so the
-      // caller can see it was present (faithful to ExifTool's verbose
-      // output, but simplified — bundled would emit each sub-tag with
-      // its own group; the port defers the sub-walk to a follow-up).
-      match sub {
-        SubTable::CameraSettings => {
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let mut lens_id: Option<u16> = None;
-          let cs = camera_settings::parse_with_lens_id_capture(
-            &blob_bytes,
-            parent_order,
-            print_conv,
-            &mut lens_id,
-          );
-          // Capture focal range from the parsed CameraSettings results.
-          let mut min_focal: Option<f64> = None;
-          let mut max_focal: Option<f64> = None;
-          for (n, v) in &cs {
-            match n.as_str() {
-              "MaxFocalLength" => {
-                if let Some(mm) = focal_mm_from_tag_value(v) {
-                  max_focal = Some(mm);
-                }
-              }
-              "MinFocalLength" => {
-                if let Some(mm) = focal_mm_from_tag_value(v) {
-                  min_focal = Some(mm);
-                }
-              }
-              _ => {}
-            }
-          }
-          if let (Some(min), Some(max)) = (min_focal, max_focal) {
-            typed.focal_range_mm = Some((min, max));
-          }
-          // Capture lens identity from the parsed CameraSettings.
-          if let Some(id) = lens_id {
-            typed.lens_type = Some(id);
-            typed.lens_name = lens_types::lookup_name(id);
-          }
-          // Sub-table position tags are never `Unknown` (they are explicit
-          // BinaryData positions), so each emits with `unknown = false`.
-          for (name, value) in cs {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::FileInfo => {
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          // Thread the `$$self{LensType}` DataMember (captured from
-          // CameraSettings above) and `$$self{Model}` (the parent IFD0 Model,
-          // `$$self{Model}`): `lens_type` + `model` gate FileInfo position 16
-          // (`MacroMagnification`, `Canon.pm:7002-7005`), and `model`
-          // additionally keys the position-1 conditional list
-          // (FileNumber/ShutterCount, `Canon.pm:6848-6927`, issue #88). We use
-          // the IFD0 Model (not the resolved `%canonModelID` name) because
-          // bundled keys these Conditions on `$$self{Model}`.
-          let (fi, decoded) =
-            file_info::parse_with_model(&blob_bytes, parent_order, print_conv, lens_type, model);
-          if decoded != FileInfoDecoded::default() {
-            typed.file_info = Some(decoded);
-          }
-          // Sub-table position tags are never `Unknown` (they are explicit
-          // BinaryData positions), so each emits with `unknown = false`.
-          for (name, value) in fi {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::ShotInfo => {
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          // Thread the container `$$self{FILE_TYPE}` into ShotInfo position
-          // 22's RawConv (CRW-allows-0, `Canon.pm:2977`/`:2990`).
-          let (si, em) = shot_info::parse(&blob_bytes, parent_order, print_conv, model, file_type);
-          if !si.is_empty() {
-            typed.shot_info = Some(si);
-          }
-          // ShotInfo decodes explicit BinaryData positions; the `Unknown`
-          // ones are already excluded inside `shot_info::parse`, so each
-          // emitted leaf carries `unknown = false`.
-          for (name, value) in em {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::AfInfo => {
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let (af, em) = af_info::parse_af_info(&blob_bytes, parent_order, print_conv, model);
-          if !af.is_empty() {
-            typed.af_info = Some(af);
-          }
-          // AFInfo's `Unknown` scalars (AFInfoSize, etc.) are excluded inside
-          // `parse_af_info` (bundled hides them without `-u`); the emitted
-          // leaves are explicit positions, so `unknown = false`.
-          for (name, value) in em {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::AfInfo2 => {
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          // `Canon::Main` 0x26 `Condition => '$$valPt !~ /^\0\0\0\0/'`
-          // (`Canon.pm:1713`): the AFInfo2 SubDirectory is NOT entered when
-          // the first four bytes are all zero (e.g. the all-zero 0x26 record
-          // in 60D MOV-video thumbnails). Bundled emits NOTHING for it;
-          // skipping the walk keeps the default `-j`/`-n` output faithful.
-          if !first4_all_zero(&blob_bytes) {
-            let (af, em) = af_info::parse_af_info2(&blob_bytes, parent_order, print_conv, model);
-            if !af.is_empty() {
-              typed.af_info = Some(af);
-            }
-            for (name, value) in em {
-              emissions.push(VendorEmission::new(name, value, false));
-            }
-          }
-        }
-        SubTable::AfInfo3 => {
-          // `Canon::Main` 0x3c `AFInfo3` (`Canon.pm:1764-1770`): the SAME
-          // `Canon::AFInfo2` walker, but `$$self{AFInfo3} = 1` is set (which
-          // suppresses the index-14 PrimaryAFPoint). Unlike 0x26 there is NO
-          // all-zero `Condition` on 0x3c, so the walk always runs.
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let (af, em) = af_info::parse_af_info3(&blob_bytes, parent_order, print_conv, model);
-          if !af.is_empty() {
-            typed.af_info = Some(af);
-          }
-          for (name, value) in em {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::FocalLength => {
-          if let Some(ref bytes) = focal_length_data {
-            let fl = focal_length::parse(bytes, parent_order, print_conv, focal_units, model);
-            for (name, value) in fl {
-              emissions.push(VendorEmission::new(name, value, false));
-            }
-          }
-        }
-        SubTable::SensorInfo => {
-          // `Canon::SensorInfo` (`Canon.pm:7411-7434`): FORMAT int16s,
-          // FIRST_ENTRY 1. Sensor + black-mask border coordinates. No
-          // `PrintConv` on any position ⇒ `-j` and `-n` agree.
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let si = sensor_info::parse(&blob_bytes, parent_order, print_conv);
-          // Explicit BinaryData positions are never `Unknown`.
-          for (name, value) in si {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        SubTable::ColorBalance => {
-          // `Canon::ColorBalance` (`Canon.pm:7268-7293`): FORMAT int16s,
-          // FIRST_ENTRY 0. The WB_RGGBLevels quads. `model` selects the
-          // position-29 name (WB_RGGBLevelsCustom vs the D60 BlackLevels,
-          // `Canon.pm:7282-7290`). No `PrintConv` ⇒ `-j` and `-n` agree.
-          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let cb = color_balance::parse(&blob_bytes, parent_order, print_conv, model);
-          for (name, value) in cb {
-            emissions.push(VendorEmission::new(name, value, false));
-          }
-        }
-        _ => {
-          // Every deferred Canon::Main SubDirectory (`is_walked() == false`):
-          // the Phase-2 raw set (Panorama / MyColors / FaceDetect1 / FaceDetect2
-          // / ContrastInfo / WBInfo / ProcessingInfo / MovieInfo / LensInfo) PLUS
-          // the #223 swept-from-`None` set (CameraInfo / CropInfo /
-          // CustomFunctions{,1D,2} / AspectInfo / MeasuredColor / ColorData /
-          // AFMicroAdj / UnknownD30 / FaceDetect3 / TimeInfo / PersonalFunctions
-          // / PersonalFunctionValues / CanonFlags / ModifiedInfo /
-          // PreviewImageInfo / ColorInfo / VignettingCorr{,2} / LightingOpt /
-          // AmbienceInfo / MultiExp / FilterInfo / HDRInfo / LogInfo / AFConfig /
-          // RawBurstModeRoll / FocusBracketingInfo / LevelInfo). A SubDirectory
-          // row DESCENDS into a child table and NEVER emits the parent pointer as
-          // a value: ExifTool's
-          // `ProcessExif` enters the `if ($subdir)` block (`Exif.pm:6919`),
-          // processes the sub-directory, then hits `next unless $doMaker or
-          // $$et{REQ_TAG_LOOKUP}{…} or $$tagInfo{BlockExtract}`
-          // (`Exif.pm:7103-7104`) — for a plain SubDirectory tag in default
-          // output (no value emission) that `next` SKIPS `FoundTag`
-          // (`Exif.pm:7180`), so the parent is ABSENT from default `-j` output
-          // (every deferred `%Canon::Main` SubDirectory row here is a pure
-          // descend-no-parent-value pointer — none is `Writable`/`MakerNotes`/
-          // `BlockExtract`). The port DEFERS the child-table walk, so the
-          // faithful behaviour is to emit NEITHER the parent nor (for now) the
-          // children: skip the emission. Mirrors the Sony/Panasonic
-          // `if def.sub_table.is_some() { continue; }` guard (issue #177).
-          // Previously this arm emitted the SubDirectory's raw value, leaking a
-          // bogus `Canon:ProcessingInfo` (and the other deferred parents) that
-          // ExifTool never emits.
-        }
-      }
-    } else if entry.tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d) {
-      // `0x96` MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`): for an
-      // EOS-5D body the FIRST arm wins — `SerialInfo`, the SubDirectory
-      // pointer to `%Canon::SerialInfo` (`Canon.pm:1836-1838`). ExifTool
-      // descends into that child table and emits ITS leaves
-      // (`InternalSerialNumber2` / `InternalSerialNumber`) but NEVER the
-      // `SerialInfo` parent value (`Exif.pm:7103-7104` `next` skips `FoundTag`
-      // for a no-value SubDirectory) — so the parent is correctly absent (issue
-      // #177). The walker captured the raw on-disk SerialInfo blob verbatim
-      // (`RawValue::Bytes`, un-stripped — the trailing-`0xff`/NUL `string`
-      // semantics belong only to the SECOND arm `InternalSerialNumber`), so
-      // decode it here (`serial_info::parse`). The two leaves are
-      // family-1 `Canon` like every other Canon MakerNote tag; each carries the
-      // `Camera` family-2 group of the SerialInfo table, but the JSON sink keys
-      // on family-1 (`-G1`). `populate_typed` is (correctly) not run for this
-      // arm — the typed `internal_serial_number` accessor tracks only the
-      // model-agnostic SECOND-arm leaf, which an EOS-5D body never takes.
-      let blob = match &entry.value {
-        // The faithful `$$valPt` view the body walker captured for the 5D arm.
-        RawValue::Bytes(b) => b.as_slice(),
-        // Defensive: the walker always rewrites a 5D `0x96` to `Bytes`; any
-        // other shape means no SerialInfo blob to decode — emit nothing.
-        _ => &[],
-      };
-      for (name, value) in serial_info::parse(blob, print_conv) {
-        // Explicit BinaryData positions are never `Unknown`.
-        emissions.push(VendorEmission::new(name, value, false));
-      }
-    } else if entry.tag_id == 0x28 {
-      // `ImageUniqueID` (`Canon.pm:1726-1735`): the table forces
-      // `Format => 'undef'`, so the walker captured the ORIGINAL on-disk
-      // value bytes as `RawValue::Bytes` ([`body::walk_canon_in_tiff`]) —
-      // ExifTool reads `int8u[16]` / `int16u[8]` / `int32u[4]` / `undef[16]`
-      // / `float[4]` / `double[2]` / `rational[2]` all as the SAME literal
-      // bytes (the verbose dump: `int8u[16] read as undef[16]`;
-      // oracle-verified identical hex across every shape and both byte
-      // orders). `RawConv => '$val eq "\0" x 16 ? undef : $val'` drops the
-      // value ONLY when it is EXACTLY sixteen NUL bytes (Perl string
-      // equality — NOT `/^\0+$/`, so a SHORT all-zero value of any other
-      // length is NOT dropped); `ValueConv => 'unpack("H*", $val)'` renders
-      // the survivor as lowercase hex. Operate on the original undef bytes,
-      // never the lossy numeric decode.
-      let val_bytes: &[u8] = match &entry.value {
-        // The faithful `Format => 'undef'` view captured at walk time.
-        RawValue::Bytes(b) => b,
-        // Defensive: if the walker did not rewrite this entry (it always
-        // does for an in-bounds 0x28), treat as no value — emit nothing.
-        _ => &[],
-      };
-      // `$val eq "\0" x 16` — EXACTLY sixteen NUL bytes (oracle: an all-zero
-      // `int8u[16]` is dropped, but an all-zero `int8u[8]` emits
-      // "0000000000000000"). A length other than 16 — or any non-NUL byte —
-      // is NOT equal and survives the RawConv.
-      let is_undef = val_bytes.len() == 16 && val_bytes.iter().all(|&b| b == 0);
-      if is_undef {
-        // RawConv undef ⇒ tag not extracted (emit NOTHING; the typed
-        // `image_unique_id` stays unset).
-      } else {
-        let hex = hex_lower(val_bytes);
-        typed.image_unique_id = Some(SmolStr::from(&hex));
-        // No `PrintConv` on 0x28, so `-j` and `-n` agree (the ValueConv hex
-        // is the final value). `Writable`, non-`Unknown` ⇒ `unknown = false`.
-        emissions.push(VendorEmission::new(
-          "ImageUniqueID".into(),
-          TagValue::Str(SmolStr::from(hex)),
-          false,
-        ));
-      }
-    } else {
-      // Leaf tag: apply PrintConv + emit. `model` threads the parent
-      // body `$$self{Model}` into the conditional SerialNumber PrintConv
-      // (`Canon.pm:1282-1306`). For non-EOS-5D bodies tag `0x96` falls
-      // here as the LIST's SECOND arm, `InternalSerialNumber`
-      // (`Canon.pm:1840-1845`) — the `0xff` strip already ran in
-      // `walk_canon_in_tiff`.
-      let val = def.conv().apply(&entry.value, print_conv, model);
-      populate_typed(&mut typed, entry);
-      // Carry the tag's `Unknown` flag (the single Unknown Canon::Main tag,
-      // `0x03 CanonFlashInfo`, lands here); the engine suppresses it.
-      emissions.push(VendorEmission::new(
-        def.name().into(),
-        val,
-        def.is_unknown(),
-      ));
-    }
-  }
-  (typed, emissions)
-}
-
-/// Emit Canon MakerNotes into a [`Metadata`] sink under the
-/// `("MakerNotes","MakerNotes")` group. Uses the blob as a stand-alone
-/// byte slice — for parent-TIFF-context resolution use [`parse_in_tiff`]
-/// directly.
-pub fn parse_into_metadata(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  into: &mut Metadata,
-) {
-  let group = Group::new("MakerNotes", "MakerNotes");
-  // Standalone-blob entry point — no parent `$$self{Model}` / `$$self{FILE_TYPE}`
-  // context, so the FocalPlaneX/YSize `Condition` and the ShotInfo pos-22
-  // CRW clause both evaluate as for an undef container.
-  let (_typed, emissions) =
-    parse_in_tiff(blob, 0, blob.len(), parent_order, print_conv, None, None);
-  for e in emissions {
-    // Unknown-suppression is the engine's job; this raw `Metadata`-sink
-    // helper applies it inline so it matches the default-output contract.
-    if e.unknown() {
-      continue;
-    }
-    into.push(group.clone(), e.name(), e.value().clone());
-  }
-}
-
-/// Populate the typed struct from one Main-IFD leaf-tag emission. Reads the
-/// entry's pre-PrintConv [`RawValue`] directly (every typed source here is a
-/// string/integer leaf, not a PrintConv string), so the converted `TagValue`
-/// is not needed.
-fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry) {
-  match entry.tag_id {
-    0x06 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
-        typed.image_type = Some(s.as_str().into());
-      }
-    }
-    0x07 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
-        typed.firmware_version = Some(s.as_str().into());
-      }
-    }
-    0x08 => {
-      if let RawValue::U64(v) = &entry.value
-        && let Some(&n) = v.first()
-      {
-        typed.file_number = Some(n as u32);
-      }
-    }
-    0x09 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
-        typed.owner_name = Some(s.as_str().into());
-      }
-    }
-    0x0c => {
-      if let RawValue::U64(v) = &entry.value
-        && let Some(&n) = v.first()
-      {
-        typed.serial_number = Some(n);
-      }
-    }
-    0x10 => {
-      if let RawValue::U64(v) = &entry.value
-        && let Some(&n) = v.first()
-      {
-        let id = n as u32;
-        typed.model_id = Some(id);
-        typed.model_name = model_ids::lookup_name(id);
-      }
-    }
-    // 0x28 (`ImageUniqueID`) is handled in the dispatch loop's dedicated
-    // `Format => 'undef'` arm (raw-byte RawConv + hex ValueConv) and never
-    // reaches the generic leaf path, so it has no `populate_typed` case.
-    0x95 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
-        typed.lens_model_string = Some(s.as_str().into());
-      }
-    }
-    0x96 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
-        typed.internal_serial_number = Some(s.as_str().into());
-      }
-    }
-    _ => {}
-  }
-}
-
 /// Build the typed [`MakerNotesCanon`] from the Canon Main IFD leaves the
 /// shared `Walker` produced (#243 phase 2 step C). The shared-walk emit path is
 /// CAPTURED into the MakerNote's cached vendor emissions (the JSON stream), but
@@ -1138,13 +688,12 @@ fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry) {
 /// here — the typed focal RANGE comes from CameraSettings Max/MinFocalLength,
 /// exactly as in `parse_in_tiff`.)
 ///
-/// Mirrors `parse_in_tiff` (`mod.rs` collection-time path): the CameraSettings
+/// Covers every typed-population site: the CameraSettings
 /// (0x01) capture of `focal_range_mm` + `lens_type`/`lens_name`; the
 /// ShotInfo (0x04) / AFInfo (0x12) / AFInfo2 (0x26) / AFInfo3 (0x3c) /
 /// FileInfo (0x93) typed sub-structs; the `0x28` ImageUniqueID RawConv + hex
-/// ValueConv; and the leaf [`populate_typed`] sites (0x06/0x07/0x08/0x09/0x0c/
-/// 0x10/0x95/0x96). Deferred / `Unknown` sub-tables contribute no typed field
-/// (their `parse_in_tiff` arms do not either).
+/// ValueConv; and the leaf [`populate_typed_raw`] sites (0x06/0x07/0x08/0x09/0x0c/
+/// 0x10/0x95/0x96). Deferred / `Unknown` sub-tables contribute no typed field.
 #[must_use]
 pub(crate) fn build_typed_from_entries(
   entries: &[(u16, &RawValue)],
@@ -1261,11 +810,10 @@ pub(crate) fn build_typed_from_entries(
   typed
 }
 
-/// Populate the typed struct from ONE Main-IFD leaf's `(tag_id, RawValue)` —
-/// the `(tag_id, &RawValue)` form of [`populate_typed`] used by
-/// [`build_typed_from_entries`] (the shared-Walker path, which carries the
-/// decoded value without a [`CanonEntry`] wrapper). Reads the pre-PrintConv
-/// [`RawValue`] directly (every typed source is a string/integer leaf).
+/// Populate the typed struct from ONE Main-IFD leaf's `(tag_id, &RawValue)` —
+/// the per-leaf routing [`build_typed_from_entries`] (the shared-`Walker` path)
+/// calls for each decoded value. Reads the pre-PrintConv [`RawValue`] directly
+/// (every typed source is a string/integer leaf).
 fn populate_typed_raw(typed: &mut MakerNotesCanon, tag_id: u16, raw: &RawValue) {
   match tag_id {
     0x06 => {
@@ -1448,6 +996,33 @@ pub(crate) fn reserialize_int_array(raw: &RawValue, order: ByteOrder) -> Vec<u8>
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+
+  // The per-vendor oracle entry points (`canon::parse` / `parse_in_tiff`) were
+  // retired in #243 phase 5; the production decode now runs through the
+  // shared-`Walker` isolated helper `crate::exif::canon_makernote_isolated` (proven
+  // byte-identical by the conformance suite). These thin shims preserve the old
+  // signature so the decode tests below exercise the SAME tables/convs/sub-table
+  // dispatch through the surviving path. The isolated helper installs the typed
+  // slot only for `-j` (`print_conv.then(...)`); every `typed`-asserting test
+  // below runs `-j`, so the empty `-n` fallback is never observed.
+  fn parse(blob: &[u8], order: ByteOrder) -> (MakerNotesCanon, Vec<VendorEmission>) {
+    parse_in_tiff(blob, 0, blob.len(), order, true, None, None)
+  }
+
+  fn parse_in_tiff(
+    tiff_data: &[u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+    file_type: Option<&str>,
+  ) -> (MakerNotesCanon, Vec<VendorEmission>) {
+    let (emissions, typed) = crate::exif::canon_makernote_isolated(
+      tiff_data, mn_offset, mn_len, order, model, file_type, print_conv,
+    );
+    (typed.unwrap_or_else(MakerNotesCanon::new), emissions)
+  }
 
   /// Synthetic Canon body with one Main entry (CanonImageType, ASCII).
   ///

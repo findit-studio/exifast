@@ -8,8 +8,10 @@
 //! passthrough logic that was duplicated between two emitters:
 //!
 //! - [`super::emit_raw`] — the EXIF `Conv::None` default path (`exif/mod.rs`);
-//! - [`super::makernotes::vendors::apple::body::ParsedValue::to_default_tag_value`]
-//!   — the Apple MakerNote "no PrintConv" default rendering.
+//! - the Apple MakerNote "no PrintConv" default rendering (formerly the
+//!   per-vendor `apple::body::ParsedValue::to_default_tag_value`, deleted with
+//!   the oracle in #243 phase 5; the isolated decode path now renders through
+//!   this same `render_value`).
 //!
 //! Both render an un-converted `$val` the same way ExifTool's `ReadValue`
 //! does (`ExifTool.pm:6275-6321`): a multi-element value is space-joined

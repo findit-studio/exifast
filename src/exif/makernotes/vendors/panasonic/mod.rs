@@ -8,8 +8,14 @@
 //!
 //! ## Phase 3 scope
 //!
-//! - The Panasonic body walker ([`body::walk_panasonic_body`]) — strips
-//!   the 12-byte `Panasonic\0\0\0` header, walks the IFD entries.
+//! - The Panasonic body walk — strips the 12-byte `Panasonic\0\0\0`
+//!   header, walks the IFD entries. The `%Panasonic::Main` route runs
+//!   through the shared `Walker` isolated helper
+//!   `crate::exif::panasonic_makernote_isolated`; the cross-vendor Leica1
+//!   / Leica10 routes (`parse_leica1_gated` / `parse_leica10_gated`) still
+//!   walk through [`body::walk_panasonic_in_tiff`] (kept by design — Leica
+//!   has not been migrated to an isolated path). The standalone
+//!   `body::walk_panasonic_body` blob wrapper was deleted in #243 phase 5.
 //! - The faithful tag table ([`tags::PANASONIC_TAGS`]) — every named tag
 //!   from `%Panasonic::Main` with a clean Format. Conditional rows
 //!   collapse to the most-common branch (e.g. `0x2c` ContrastMode uses
@@ -59,17 +65,19 @@ pub mod tags;
 
 use crate::exif::makernotes::detected::BaseRule;
 use crate::exif::makernotes::vendors::VendorEmission;
-use crate::value::{Group, Metadata, TagValue};
+use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
 
-pub use body::{HEADER_LEN, PanasonicEntry, walk_panasonic_body, walk_panasonic_in_tiff};
+pub use body::{HEADER_LEN, PanasonicEntry, walk_panasonic_in_tiff};
 pub use printconv::{CONDITION_GATED_IDS, PanasonicPrintConv, RAWCONV_DROP_IDS};
 pub use tags::{PANASONIC_TAGS, PanasonicTag, SubTable, format_override, lookup};
 
 use super::super::super::ifd::{ByteOrder, RawValue};
 
-/// Decoded Panasonic MakerNotes data — populated by [`parse`] when the
+/// Decoded Panasonic MakerNotes data — populated by
+/// `crate::exif::panasonic_makernote_isolated` (or, for the cross-vendor
+/// Leica routes, [`parse_leica1_gated`] / [`parse_leica10_gated`]) when the
 /// dispatcher resolved [`Vendor::Panasonic`](crate::exif::makernotes::Vendor).
 ///
 /// D8: no public fields; accessor-only. `PartialEq` only (NOT `Eq`)
@@ -123,8 +131,9 @@ pub struct MakerNotesPanasonic {
 }
 
 impl MakerNotesPanasonic {
-  /// Build an empty Panasonic metadata bag. Phase 3's [`parse`] populates
-  /// the per-tag fields.
+  /// Build an empty Panasonic metadata bag. The decode path
+  /// (`crate::exif::panasonic_makernote_isolated` / the Leica gated entries)
+  /// populates the per-tag fields.
   #[must_use]
   #[inline(always)]
   pub const fn new() -> Self {
@@ -264,46 +273,6 @@ impl MakerNotesPanasonic {
   }
 }
 
-/// Parse the captured Panasonic MakerNote blob into a [`MakerNotesPanasonic`]
-/// plus the `(name, value)` emissions for the `MakerNotes:` JSON group.
-///
-/// **Low-level primitive — NOT variant-gated, and hardcodes `base_offset
-/// = 0`.** It runs `%Panasonic::Main` unconditionally; an automatic-dispatch
-/// caller must route through [`parse_main_gated`] instead, so a Type2/`MKE`
-/// blob does not decode spurious Main tags and a DC-FT7 `Base => 12` blob is
-/// read at base 12 (this `parse`/`parse_with_print_conv` path reads it 12
-/// bytes early).
-///
-/// `blob` is the raw 0x927C value (including the 12-byte `Panasonic\0\0\0`
-/// header); `parent_order` is the parent IFD walk's byte order. The
-/// model-conditional `0x0f`/`0x2c` PrintConvs evaluate against an absent
-/// Model (use [`parse_in_tiff`] to thread the IFD0 `$$self{Model}`).
-#[must_use]
-pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
-  parse_with_print_conv(blob, parent_order, true)
-}
-
-/// Like [`parse`] but lets the caller toggle PrintConv.
-#[must_use]
-pub fn parse_with_print_conv(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
-  // Standalone-blob path is the inherit variant (`MakerNotePanasonic`):
-  // `body_offset = 12` (the `Panasonic\0\0\0` header), `base_offset = 0`.
-  parse_in_tiff(
-    blob,
-    0,
-    blob.len(),
-    body::HEADER_LEN,
-    parent_order,
-    print_conv,
-    None,
-    0,
-  )
-}
-
 /// The OUT-OF-LINE value-offset buffer addend for a `%Panasonic::Main`
 /// variant, derived from the dispatched [`BaseRule`].
 ///
@@ -356,65 +325,6 @@ pub fn routes_to_main(blob: &[u8]) -> bool {
   blob.starts_with(b"Panasonic")
 }
 
-/// **The single gated entry into the Panasonic `%Panasonic::Main` parser.**
-/// Every caller that wants to run the Panasonic Main IFD walker on a captured
-/// `Vendor::Panasonic` blob MUST go through this function — it is the ONE
-/// place the [`routes_to_main`] signature gate AND the
-/// [`main_base_offset`] base-rule threading live, so neither can be
-/// bypassed by a parallel code path (the production `ProcessExif` IFD walk,
-/// the public [`MakerNotesMeta::from_blob`](crate::exif::makernotes::MakerNotesMeta::from_blob)
-/// constructor, and any future entry all funnel through here).
-///
-/// Returns:
-///
-/// - `Some((typed, emissions))` — the blob starts with `Panasonic` (one of
-///   the two Main variants); the Main walker ran via [`parse_in_tiff`] with
-///   `base_offset = main_base_offset(base_rule)` (0 for `MakerNotePanasonic`,
-///   12 for `MakerNotePanasonic3`'s `Base => 12`).
-/// - `None` — the blob is the `MKE`/Type2 variant (`Panasonic::Type2`
-///   `ProcessBinaryData`, unported); the caller must leave the Panasonic
-///   slot ABSENT (no spurious Main tags).
-///
-/// `tiff_data`/`mn_offset`/`mn_len` give the parent-TIFF context so
-/// out-of-line offsets resolve correctly; `base_rule` is the dispatched
-/// [`DetectedMakerNote::base_rule`](crate::exif::makernotes::DetectedMakerNote::base_rule)
-/// that distinguishes the inherit base from DC-FT7's `Base => 12` — reading
-/// a DC-FT7 out-of-line value at base 0 lands 12 bytes early (corruption),
-/// the exact bug this gate's `main_base_offset` threading prevents.
-#[must_use]
-pub fn parse_main_gated(
-  tiff_data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-  base_rule: BaseRule,
-) -> Option<(MakerNotesPanasonic, Vec<VendorEmission>)> {
-  // The gate reads the captured MakerNote blob (the bytes the dispatcher
-  // classified) — `tiff_data[mn_offset .. mn_offset + mn_len]`.
-  let blob_end = mn_offset.saturating_add(mn_len).min(tiff_data.len());
-  let blob = tiff_data.get(mn_offset..blob_end)?;
-  if !routes_to_main(blob) {
-    return None;
-  }
-  let base_offset = main_base_offset(base_rule);
-  // The `Panasonic`-prefixed variants both use the 12-byte `Panasonic\0\0\0`
-  // header (`Start => '$valuePtr + 12'`, `MakerNotes.pm:738`/`:757`). The
-  // cross-table `MakerNoteLeica10` (`Start => 18`) routes through
-  // [`parse_leica10_gated`] instead.
-  Some(parse_in_tiff(
-    tiff_data,
-    mn_offset,
-    mn_len,
-    body::HEADER_LEN,
-    parent_order,
-    print_conv,
-    model,
-    base_offset,
-  ))
-}
-
 /// The `MakerNoteLeica10` signature — bundled
 /// `Condition => '$$valPt =~ /^LEICA CAMERA AG\0/'` (`MakerNotes.pm:725`).
 /// The 16-byte prefix the D-Lux7 (and rebadged Lumix bodies) carry before
@@ -459,8 +369,8 @@ pub fn routes_to_leica10(blob: &[u8]) -> bool {
 /// (they ARE `%Panasonic::Main` tags), so the call-site emits them with
 /// [`Vendor::Panasonic.group1()`](crate::exif::makernotes::Vendor::group1).
 ///
-/// Mirrors [`parse_main_gated`] but with the Leica10 signature gate
-/// ([`routes_to_leica10`]) and the Leica10 body offset
+/// A gated entry like [`parse_leica1_gated`] but with the Leica10 signature
+/// gate ([`routes_to_leica10`]) and the Leica10 body offset
 /// ([`LEICA10_BODY_OFFSET`] = 18, vs the `Panasonic`-prefix's 12). The
 /// `Base` is INHERITED (Leica10 has no `Base` line, `:726-730`), so the
 /// out-of-line `base_offset` is 0 — out-of-line values are TIFF-relative.
@@ -621,10 +531,13 @@ pub fn parse_leica1_gated(
 /// [`BaseRule`].
 ///
 /// **Low-level primitive — NOT variant-gated.** It runs `%Panasonic::Main`
-/// unconditionally; an automatic-dispatch caller must route through
-/// [`parse_main_gated`] (which applies the `Panasonic`-prefix gate + the
-/// base-rule threading) so a Type2/`MKE` blob does not decode spurious
-/// Main tags and a DC-FT7 blob is read at the right base.
+/// unconditionally; the only callers are the cross-vendor Leica gated entries
+/// ([`parse_leica1_gated`] / [`parse_leica10_gated`]), which apply their
+/// make/signature gate FIRST. (The automatic `%Panasonic::Main` dispatch routes
+/// through the shared `Walker`'s `crate::exif::panasonic_makernote_isolated`
+/// instead, with its own `Panasonic`-prefix gate + base-rule threading, so a
+/// Type2/`MKE` blob never decodes spurious Main tags and a DC-FT7 blob is read
+/// at the right base.)
 ///
 /// `tiff_data` is the parent TIFF block; `mn_offset` is the MakerNote
 /// blob's start within `tiff_data`; `mn_len` is the blob length;
@@ -733,44 +646,6 @@ pub fn parse_in_tiff(
     emissions.push(VendorEmission::new(def.name.into(), value, def.unknown));
   }
   (typed, emissions)
-}
-
-/// Mirror of [`parse_with_print_conv`] that emits straight into a
-/// [`Metadata`] sink under the Panasonic MakerNote group.
-///
-/// **Low-level primitive — NOT variant-gated, hardcodes `base_offset = 0`**
-/// (like [`parse`]): it runs `%Panasonic::Main` unconditionally. An
-/// automatic-dispatch caller must gate with [`routes_to_main`] /
-/// [`parse_main_gated`] first.
-///
-/// The group's family-1 name is
-/// [`Vendor::Panasonic.group1()`](crate::exif::makernotes::Vendor::group1)
-/// = `"Panasonic"` (`Panasonic.pm:268` declares only `GROUPS => { 0 =>
-/// 'MakerNotes', … }`, so ExifTool derives the family-1 group from the
-/// vendor module — `exiftool -j -G1` emits `Panasonic:ImageQuality` on a
-/// Lumix). This matches the cached serializer, which already routes through
-/// `group1()`.
-pub fn parse_into_metadata(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  into: &mut Metadata,
-) {
-  use crate::exif::makernotes::Vendor;
-  let g1 = Vendor::Panasonic.group1();
-  let group = Group::new(g1, g1);
-  let (_typed, emissions) = parse_with_print_conv(blob, parent_order, print_conv);
-  for e in emissions {
-    // Unknown-suppression is the engine's job; this raw `Metadata`-sink
-    // helper applies it inline so it matches the default-output contract
-    // (`ExifTool.pm:9179-9185`), exactly like `run_emission`. Mirrors
-    // Apple/Canon's `parse_into_metadata` (only 0x63 RecognizedFaceFlags is
-    // `Unknown => 1` in `%Panasonic::Main`).
-    if e.unknown() {
-      continue;
-    }
-    into.push(group.clone(), e.name(), e.value().clone());
-  }
 }
 
 /// Populate the typed struct from one Panasonic Main-IFD leaf-tag emission.
@@ -891,7 +766,76 @@ fn first_i64(raw: &RawValue) -> Option<i64> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+  use crate::value::{Group, Metadata};
   use std::vec::Vec;
+
+  // The per-vendor oracle entry points (`panasonic::parse` / `parse_with_print_conv`
+  // / `parse_in_tiff` / `parse_into_metadata`) were retired in #243 phase 5; the
+  // production decode now runs through the shared-`Walker` isolated helper
+  // `crate::exif::panasonic_makernote_isolated` (proven byte-identical by the
+  // conformance suite + the deleted differential tests). These thin shims preserve
+  // the old signatures so the per-entry-gate decode tests below exercise the SAME
+  // tables/convs/gates through the surviving path. Every test body carries the
+  // `Panasonic\0\0\0` prefix ⇒ `routes_to_main` ⇒ `Some`. The isolated helper's
+  // body offset is always `HEADER_LEN` (the only reachable Main body offset), so
+  // the `body_offset` argument the oracle took is always `HEADER_LEN` here; the
+  // dynamic-base addend is the separate `base_offset`. The typed slot is installed
+  // for both modes by this helper, so the `-n` typed tests are unaffected.
+  fn parse(blob: &[u8], order: ByteOrder) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+    parse_with_print_conv(blob, order, true)
+  }
+
+  fn parse_with_print_conv(
+    blob: &[u8],
+    order: ByteOrder,
+    print_conv: bool,
+  ) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+    parse_in_tiff(blob, 0, blob.len(), HEADER_LEN, order, print_conv, None, 0)
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  fn parse_in_tiff(
+    tiff_data: &[u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_offset: usize,
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+    base_offset: usize,
+  ) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+    debug_assert_eq!(
+      body_offset, HEADER_LEN,
+      "the isolated Panasonic Main walk uses HEADER_LEN as the body offset"
+    );
+    // A blob that does not route to `%Panasonic::Main` (e.g. the empty-blob test)
+    // yields `None`; the oracle returned empties there, so preserve that contract.
+    match crate::exif::panasonic_makernote_isolated(
+      tiff_data,
+      mn_offset,
+      mn_len,
+      base_offset,
+      order,
+      model,
+      print_conv,
+    ) {
+      Some((emissions, typed)) => (typed, emissions),
+      None => (MakerNotesPanasonic::new(), Vec::new()),
+    }
+  }
+
+  fn parse_into_metadata(blob: &[u8], order: ByteOrder, print_conv: bool, into: &mut Metadata) {
+    use crate::exif::makernotes::Vendor;
+    let g1 = Vendor::Panasonic.group1();
+    let group = Group::new(g1, g1);
+    let (_typed, emissions) = parse_with_print_conv(blob, order, print_conv);
+    for e in emissions {
+      if e.unknown() {
+        continue;
+      }
+      into.push(group.clone(), e.name(), e.value().clone());
+    }
+  }
 
   /// Build a synthetic Panasonic blob with `entries` (each `(tag, format, count, value_bytes)`).
   fn build_blob(entries: &[(u16, u16, u32, Vec<u8>)]) -> Vec<u8> {
