@@ -105,7 +105,7 @@ pub use vendor::{Vendor, VendorStatus};
 pub use vendors::VendorEmission;
 pub use vendors::{
   AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesNikon, MakerNotesPentax,
-  PanasonicMakerNote, SonyMakerNote,
+  MakerNotesSamsung, PanasonicMakerNote, SonyMakerNote,
 };
 
 /// Typed MakerNotes metadata — the top-level surface for vendor MakerNote
@@ -143,6 +143,10 @@ pub struct MakerNotesMeta {
   /// Pentax decoded data — populated when [`Vendor::Pentax`] dispatched AND
   /// the Pentax port runs (`%Pentax::Main`, the readable scalars + LensType).
   pentax: Option<MakerNotesPentax>,
+  /// Samsung decoded data — populated when [`Vendor::Samsung`] dispatched AND
+  /// the Samsung Type2 port runs (`%Samsung::Type2`, the plain leaves +
+  /// PictureWizard).
+  samsung: Option<MakerNotesSamsung>,
 }
 
 impl MakerNotesMeta {
@@ -161,6 +165,7 @@ impl MakerNotesMeta {
       dji: None,
       nikon: None,
       pentax: None,
+      samsung: None,
     }
   }
 
@@ -207,6 +212,12 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub fn set_pentax(&mut self, pentax: MakerNotesPentax) {
     self.pentax = Some(pentax);
+  }
+
+  /// Replace the Samsung slot — used by the IFD walker during walk.
+  #[inline(always)]
+  pub fn set_samsung(&mut self, samsung: MakerNotesSamsung) {
+    self.samsung = Some(samsung);
   }
 
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
@@ -521,6 +532,35 @@ impl MakerNotesMeta {
           .unwrap_or_default(),
         );
       }
+      Vendor::Samsung => {
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::samsung_makernote_isolated`), over the
+        // captured blob (`mn_offset = 0`, `mn_len = blob.len()`). The
+        // `MakerNoteSamsung2` body offset is 0, it inherits the parent base and
+        // probes its own byte order (`ByteOrder => Unknown`), so the
+        // standalone-blob walk is faithful when the blob is the captured Type2
+        // value; the dispatched `detected` carries the `FixBase => 1` heuristic
+        // the helper threads. With `print_conv = true` it returns the typed slot
+        // built from the walked entries; a short/rejected MakerNote yields
+        // `Some(empty)`. The emissions are discarded — `from_blob` sets only the
+        // typed slot. Note: a standalone JPEG/PNG-embedded Samsung2 body relies
+        // on its EXIF-format magic to dispatch here; an SRW-only body needs the
+        // container's `TIFF_TYPE`, which the production walk threads.
+        meta.samsung = Some(
+          crate::exif::samsung_makernote_isolated(
+            blob,
+            0,
+            blob.len(),
+            detected,
+            parent_order,
+            make,
+            model,
+            true,
+          )
+          .map(|(_emissions, typed)| typed)
+          .unwrap_or_default(),
+        );
+      }
       _ => {}
     }
     meta
@@ -595,6 +635,14 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub const fn pentax(&self) -> Option<&MakerNotesPentax> {
     self.pentax.as_ref()
+  }
+
+  /// Samsung decoded data. `None` unless [`Vendor::Samsung`] dispatched and the
+  /// Samsung Type2 port ran.
+  #[must_use]
+  #[inline(always)]
+  pub const fn samsung(&self) -> Option<&MakerNotesSamsung> {
+    self.samsung.as_ref()
   }
 }
 

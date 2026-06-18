@@ -8781,6 +8781,55 @@ fn makernotes_dji_phantom4_conformance() {
   check("DJIPhantom4.jpg", "DJIPhantom4.jpg.n.json", false);
 }
 #[test]
+fn makernotes_samsung_nx500_conformance() {
+  // SamsungNX500.srw (NX500) — the Samsung Type2 MakerNote conformance backstop
+  // on a REAL .srw raw (#210). The `0x927c` MakerNote dispatches to
+  // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`, EXIF-format magic) and walks
+  // `%Samsung::Type2` through the shared `Walker` (body offset 0, inherit base,
+  // `ByteOrder => Unknown` probed to big-endian, `FixBase => 1`, `ProcessProc =>
+  // ProcessUnknown`). exifast emits all 27 plain `Samsung:*` leaves
+  // byte-identically to bundled ExifTool 13.59 — the camera-indexing identity
+  // (`DeviceType` = "High-end NX Camera", `SamsungModelID` = "Various Models
+  // (0x5001038)", `LensType` = "Samsung NX 45mm F1.8" via %samsungLensTypes,
+  // `FirmwareName` = "1.10", `LensFirmware` = "01.00_01.10",
+  // `InternalLensSerialNumber`), the exposure leaves (`ExposureTime` = "1/160"
+  // via PrintExposureTime, `FNumber` = 8.9, `FocalLengthIn35mmFormat` = "69 mm"
+  // with the /10 ValueConv, `ISO` = 20000, `ExposureCompensation`), the enum
+  // leaves (`WhiteBalanceSetup`/`RawDataByteOrder`/`ColorSpace`/`SmartRange`/
+  // `FaceDetect`/`FaceRecognition`), `MakerNoteVersion` = "0100" (the undef
+  // ASCII-string render), the `CameraTemperature` undef rational, `SensorAreas`,
+  // `SmartAlbumColor` = "n/a" (the `\0{4}` branch), and the five
+  // `%Samsung::PictureWizard` ProcessBinaryData members (PictureWizardMode =
+  // "Standard", Color = 65535, the -4-shifted Saturation/Sharpness/Contrast).
+  // The "[minor] Unrecognized MakerNotes" warning bundled emitted while Samsung
+  // was undecoded is GONE (the vendor now decodes). All 27 match for BOTH the
+  // `-j` PrintConv and `-n` numeric snapshots.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
+  // exifast does NOT emit — every exclusion is a documented deferral (none masks
+  // a Samsung-Type2 faithfulness gap; the diff carries NO tag exifast emits that
+  // bundled does not):
+  //   -x Samsung:<16 Crypt tags> — the `RawConv => Samsung::Crypt(...)`
+  //                        encrypted block `0xa021`..`0xa057` EXCEPT the plain
+  //                        `0xa025` (WB_RGGBLevels*, ColorMatrix*, CbCr*,
+  //                        ToneCurve*) — raw-processing data, deferred.
+  //                        (`0xa020 EncryptionKey` + `0xa025`
+  //                        HighlightLinearityLimit are plain leaves, EMITTED.)
+  //   -x PreviewIFD:all  — the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD
+  //                        (PreviewImage + its IFD tags), deferred.
+  //   -x SubIFD:all -x SubIFD1:all — the SRW raw/JpgFromRaw sub-IFDs (the raw
+  //                        image strips + the embedded JPEG), not walked.
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (drops the
+  //                        Composite:LensID/ImageSize/WB_RGGBLevels/… synthesis).
+  // (The `0x0011 OrientationInfo` row is absent from this body. The
+  // `0xa002 SerialNumber` row IS present, but its value is `"0"` + NULs, which
+  // fails the `Condition => '$$valPt =~ /^\w{5}/'` gate (`Samsung.pm:404-409`)
+  // — bundled emits no `Samsung:SerialNumber` and exifast's emit-time
+  // `condition_holds` gate drops it identically, so no exclusion is needed.)
+  check("SamsungNX500.srw", "SamsungNX500.srw.json", true);
+  check("SamsungNX500.srw", "SamsungNX500.srw.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`

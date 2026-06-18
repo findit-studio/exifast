@@ -623,7 +623,9 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
 /// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
 /// fixture must bump this constant (the per-PR convention above).
-const EXPECTED_ACTIVE_FIXTURES: usize = 525;
+/// 525 → 526: SamsungNX500.srw (#210) — the Samsung Type2 Phase-1 port adds a
+/// paired .json/.n.json golden (byte-exact plain leaves).
+const EXPECTED_ACTIVE_FIXTURES: usize = 526;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
