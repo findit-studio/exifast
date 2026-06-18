@@ -11,11 +11,13 @@
 //! - The Panasonic body walk — strips the 12-byte `Panasonic\0\0\0`
 //!   header, walks the IFD entries. The `%Panasonic::Main` route runs
 //!   through the shared `Walker` isolated helper
-//!   `crate::exif::panasonic_makernote_isolated`; the cross-vendor Leica1
-//!   / Leica10 routes (`parse_leica1_gated` / `parse_leica10_gated`) still
-//!   walk through [`body::walk_panasonic_in_tiff`] (kept by design — Leica
-//!   has not been migrated to an isolated path). The standalone
-//!   `body::walk_panasonic_body` blob wrapper was deleted in #243 phase 5.
+//!   `crate::exif::panasonic_makernote_isolated`; the cross-vendor Leica1 /
+//!   Leica10 routes (`parse_leica1_gated` / `parse_leica10_gated`) call the
+//!   generalized `crate::exif::panasonic_makernote_isolated_with_offset` at
+//!   body offset 8 / 18 — the SAME shared `Walker`. The standalone
+//!   `body::walk_panasonic_body` blob wrapper was deleted in #243 phase 5;
+//!   the per-vendor `walk_panasonic_in_tiff` body walker + the `parse_in_tiff`
+//!   oracle that drove the Leica routes were deleted in #255.
 //! - The faithful tag table ([`tags::PANASONIC_TAGS`]) — every named tag
 //!   from `%Panasonic::Main` with a clean Format. Conditional rows
 //!   collapse to the most-common branch (e.g. `0x2c` ContrastMode uses
@@ -69,7 +71,7 @@ use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
 
-pub use body::{HEADER_LEN, PanasonicEntry, walk_panasonic_in_tiff};
+pub use body::HEADER_LEN;
 pub use printconv::{CONDITION_GATED_IDS, PanasonicPrintConv, RAWCONV_DROP_IDS};
 pub use tags::{PANASONIC_TAGS, PanasonicTag, SubTable, format_override, lookup};
 
@@ -378,7 +380,9 @@ pub fn routes_to_leica10(blob: &[u8]) -> bool {
 /// Returns:
 ///
 /// - `Some((typed, emissions))` — the blob starts with `LEICA CAMERA AG\0`;
-///   the Main walker ran via [`parse_in_tiff`] at `body_offset = 18`.
+///   the Main walker ran via the shared `Walker`
+///   (`crate::exif::panasonic_makernote_isolated_with_offset`) at
+///   `body_offset = 18`.
 /// - `None` — the blob is NOT the Leica10 shape (one of the nine
 ///   Leica-specific-table variants); the caller leaves the Panasonic slot
 ///   ABSENT (no spurious Main tags — those tables are unported/deferred).
@@ -405,17 +409,25 @@ pub fn parse_leica10_gated(
     return None;
   }
   // Leica10 has no `Base` line (`MakerNotes.pm:726-730`) ⇒ inherit ⇒ the
-  // out-of-line buffer addend is 0 (out-of-line values are TIFF-relative).
-  Some(parse_in_tiff(
+  // out-of-line buffer addend is 0 (out-of-line values are TIFF-relative). After
+  // the signature gate passes, the SHARED `Walker` decodes `%Panasonic::Main`
+  // via the cross-vendor `panasonic_makernote_isolated_with_offset` at the
+  // dispatched Leica10 body offset (18) — the sole walker, no per-vendor oracle
+  // (#255). The helper returns `(emissions, typed)`; the gated-entry contract is
+  // `(typed, emissions)`, hence the swap. The helper is total here (its only
+  // gate is the caller's, already passed; a too-short blob returns
+  // `Some((empty, empty))`, matching the retired `parse_in_tiff`).
+  crate::exif::panasonic_makernote_isolated_with_offset(
     tiff_data,
     mn_offset,
     mn_len,
     body_offset,
-    parent_order,
-    print_conv,
-    model,
     0,
-  ))
+    parent_order,
+    model,
+    print_conv,
+  )
+  .map(|(emissions, typed)| (typed, emissions))
 }
 
 /// `true` iff a body routes to the cross-vendor **`MakerNoteLeica` (Leica1)**
@@ -478,7 +490,9 @@ pub fn routes_to_leica1(make: Option<&str>) -> bool {
 /// Returns:
 ///
 /// - `Some((typed, emissions))` — `make` is exactly `"LEICA"`; the Main
-///   walker ran via [`parse_in_tiff`] at `body_offset` (8 for Leica1).
+///   walker ran via the shared `Walker`
+///   (`crate::exif::panasonic_makernote_isolated_with_offset`) at
+///   `body_offset` (8 for Leica1).
 /// - `None` — `make` is NOT exactly `"LEICA"` (a Leica2-9 / Leica10 body,
 ///   or a non-Leica body); the caller leaves the Panasonic slot ABSENT
 ///   (Leica2-9 route to unported Leica-specific tables; Leica10 routes via
@@ -510,142 +524,25 @@ pub fn parse_leica1_gated(
     return None;
   }
   // Leica1 has no `Base` line (`MakerNotes.pm:603-607`) ⇒ inherit ⇒ the
-  // out-of-line buffer addend is 0 (out-of-line values are TIFF-relative).
-  Some(parse_in_tiff(
+  // out-of-line buffer addend is 0 (out-of-line values are TIFF-relative). After
+  // the make gate passes, the SHARED `Walker` decodes `%Panasonic::Main` via the
+  // cross-vendor `panasonic_makernote_isolated_with_offset` at the dispatched
+  // Leica1 body offset (8) — the sole walker, no per-vendor oracle (#255). The
+  // helper returns `(emissions, typed)`; the gated-entry contract is
+  // `(typed, emissions)`, hence the swap. The helper is total here (its only
+  // gate is the caller's, already passed; a too-short blob returns
+  // `Some((empty, empty))`, matching the retired `parse_in_tiff`).
+  crate::exif::panasonic_makernote_isolated_with_offset(
     tiff_data,
     mn_offset,
     mn_len,
     body_offset,
-    parent_order,
-    print_conv,
-    model,
     0,
-  ))
-}
-
-/// Parse with the parent TIFF context — out-of-line offsets resolve
-/// against `tiff_data`, rebased by `base_offset` (the bundled
-/// `SubDirectory{Base}` directive; `0` for `MakerNotePanasonic`'s
-/// inherited base, `12` for `MakerNotePanasonic3`'s `Base => 12`). Use
-/// [`main_base_offset`] to derive `base_offset` from the dispatched
-/// [`BaseRule`].
-///
-/// **Low-level primitive — NOT variant-gated.** It runs `%Panasonic::Main`
-/// unconditionally; the only callers are the cross-vendor Leica gated entries
-/// ([`parse_leica1_gated`] / [`parse_leica10_gated`]), which apply their
-/// make/signature gate FIRST. (The automatic `%Panasonic::Main` dispatch routes
-/// through the shared `Walker`'s `crate::exif::panasonic_makernote_isolated`
-/// instead, with its own `Panasonic`-prefix gate + base-rule threading, so a
-/// Type2/`MKE` blob never decodes spurious Main tags and a DC-FT7 blob is read
-/// at the right base.)
-///
-/// `tiff_data` is the parent TIFF block; `mn_offset` is the MakerNote
-/// blob's start within `tiff_data`; `mn_len` is the blob length;
-/// `body_offset` is the BODY start within the blob (bundled `Start =>
-/// '$valuePtr + N'`: [`HEADER_LEN`](body::HEADER_LEN) = 12 for
-/// `MakerNotePanasonic`/`Panasonic3`, 18 for the cross-table
-/// `MakerNoteLeica10`); `parent_order` is the parent IFD's byte order.
-/// `model` is the body `$$self{Model}` (from IFD0) used to select the
-/// model-conditional `0x0f AFAreaMode` (`Panasonic.pm:336-382`) and `0x2c
-/// ContrastMode` (`Panasonic.pm:549-660`) branches; an absent Model selects
-/// the same branch ExifTool picks for `undef`.
-#[must_use]
-pub fn parse_in_tiff(
-  tiff_data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  body_offset: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-  base_offset: usize,
-) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
-  let mut typed = MakerNotesPanasonic::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
-  let entries = body::walk_panasonic_in_tiff(
-    tiff_data,
-    mn_offset,
-    mn_len,
-    body_offset,
     parent_order,
-    base_offset,
-  );
-  for entry in &entries {
-    let Some(def) = tags::lookup(entry.tag_id) else {
-      continue;
-    };
-    // SubDirectory rows DESCEND into a child table and NEVER emit the parent
-    // pointer as a value. ExifTool's `ProcessExif` enters the `if ($subdir)`
-    // block (`Exif.pm:6919`), processes the sub-directory via
-    // `ProcessDirectory` (`:7091`), then hits `next unless $doMaker or
-    // $$et{REQ_TAG_LOOKUP}{…} or $$tagInfo{BlockExtract}` (`:7103-7104`) — for
-    // a plain SubDirectory tag in default output that `next` SKIPS `FoundTag`
-    // (`:7180`), so the parent is ABSENT from default `-j` output. All four
-    // `%Panasonic::Main` SubDirectory rows are pure descend-no-parent-value
-    // pointers (none is `Writable`/`MakerNotes`/`BlockExtract` on the
-    // SubDirectory — verified against bundled `Panasonic.pm`): 0x4e
-    // FaceDetInfo (`:936-942`, the `PrintConv => 'length $val'` runs only IF
-    // emitted, which it is not), 0x61 FaceRecInfo (`:1007-1012`), 0x0e00
-    // PrintIM (`:1518-1523`, explicitly `Writable => 0`), 0x2003 TimeInfo
-    // (`:1524-1527`). Phase 3 DEFERS the child-table walk (documented scope),
-    // so the faithful behaviour is to emit NEITHER the parent nor (for now)
-    // the children: skip the emission for any deferred SubDirectory row.
-    if def.sub_table.is_some() {
-      continue;
-    }
-    // Single-HASH `Condition` suppression (`Panasonic.pm` rows of the form
-    // `0xNN => { Condition=>…, … }`): ExifTool's `GetTagInfo` evaluates the
-    // `Condition` and, when it does NOT hold, returns no tag info ⇒ the entry
-    // is ABSENT from default output. Port that gate here — skip the emission
-    // entirely on a miss. Covers the `$format`/`$$valPt`-gated LensType rows
-    // 0xc4/0xc5/0xe4 (these tag ids are reused with other formats on other
-    // bodies, so a non-int16u entry must be suppressed, not rendered).
-    if !PanasonicPrintConv::single_hash_condition_holds(
-      entry.tag_id,
-      entry.format.name(),
-      &entry.value,
-    ) {
-      continue;
-    }
-    // RawConv undef-drop (sentinel suppression): 0x86 ManometerPressure
-    // (`$val==65535 ? undef`) and 0xd1 ISO (`$val > 0xfffffff0 ? undef`) are
-    // NOT extracted on their sentinel raw value ⇒ ABSENT from output. Skip the
-    // emission entirely on a drop so the sentinel never leaks as a converted
-    // value (e.g. ManometerPressure's `"6553.5 kPa"`). The 0xc5/0xe4 zero-drop
-    // is handled by `apply_lens_type_model` below. Citations:
-    // `printconv::PanasonicPrintConv::rawconv_drops`.
-    if PanasonicPrintConv::rawconv_drops(entry.tag_id, &entry.value) {
-      continue;
-    }
-    // 0xc5 / 0xe4 LensTypeModel (`Panasonic.pm:1417-1428,1461-1472`): the
-    // `RawConv => 'return undef unless $val;'` DROPS a zero value (the tag is
-    // absent from output) — separate from the `$format` Condition gated
-    // above. Honour that by skipping the emission on `None` rather than
-    // rendering a raw zero.
-    if matches!(entry.tag_id, 0xc5 | 0xe4) {
-      // `Some(v)` ⇒ emit the byte-swapped value; `None` ⇒ RawConv undef-drop
-      // (zero value) ⇒ no emission for this entry.
-      if let Some(value) = PanasonicPrintConv::apply_lens_type_model(&entry.value, print_conv) {
-        populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
-        emissions.push(VendorEmission::new(def.name.into(), value, def.unknown));
-      }
-      continue;
-    }
-    // Model-conditional rows override the table's default conv with the
-    // branch ExifTool's `Condition` chain selects for this body.
-    let conv = match entry.tag_id {
-      0x0f => PanasonicPrintConv::af_area_mode_for_model(model),
-      0x2c => PanasonicPrintConv::contrast_mode_for_model(model),
-      _ => def.conv,
-    };
-    let value = conv.apply(&entry.value, print_conv);
-    populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
-    // Carry the bundled `Unknown => 1` flag through the emission so the
-    // shared `run_emission` engine suppresses it from default output —
-    // exactly like Apple/Canon (only 0x63 RecognizedFaceFlags is Unknown).
-    emissions.push(VendorEmission::new(def.name.into(), value, def.unknown));
-  }
-  (typed, emissions)
+    model,
+    print_conv,
+  )
+  .map(|(emissions, typed)| (typed, emissions))
 }
 
 /// Populate the typed struct from one Panasonic Main-IFD leaf-tag emission.
@@ -653,13 +550,14 @@ pub fn parse_in_tiff(
 /// already-rendered [`TagValue`] (read by the 0x02/0x25/0x26/0x8000 string
 /// fields).
 ///
-/// MUST be called ONLY for an entry that PASSED every suppression gate (the
-/// oracle [`parse_in_tiff`] calls it AFTER the SubDirectory-skip / single-HASH /
-/// RawConv-drop / 0xc5/0xe4-undef-drop checks, alongside the emission) — a
-/// rawconv-dropped 0xd1, for instance, must populate NOTHING. The
-/// shared-`Walker` Panasonic capture (`exif::mod::emit_panasonic_value`)
-/// preserves that ordering by calling this from the SAME gate-passing path it
-/// emits from (#243 phase 3).
+/// MUST be called ONLY for an entry that PASSED every suppression gate — the
+/// SubDirectory-skip / single-HASH `Condition` / RawConv-drop / 0xc5/0xe4-undef-drop
+/// checks must all run BEFORE this, alongside the emission, so a rawconv-dropped
+/// 0xd1 (for instance) populates NOTHING. The shared-`Walker` Panasonic capture
+/// (`exif::mod::emit_panasonic_value`) is the sole caller and preserves that
+/// ordering by calling this from the SAME gate-passing path it emits from (#243
+/// phase 3 / #255 — the per-vendor `parse_in_tiff` oracle that formerly drove it
+/// has been deleted).
 pub(crate) fn populate_typed(
   typed: &mut MakerNotesPanasonic,
   tag_id: u16,

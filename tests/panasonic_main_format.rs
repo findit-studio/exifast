@@ -12,9 +12,8 @@
 //! (`Exif.pm:6728-6745`). Many Panasonic rows are `Writable => 'int16u'` but
 //! `Format => 'int16s'` — the on-disk UNSIGNED bytes are read SIGNED (e.g.
 //! 0x23 WhiteBalanceBias `ff fd` ⇒ int16s -3 ⇒ ValueConv -1, not 65533). The
-//! Panasonic body walker
-//! ([`walk_panasonic_in_tiff`](exifast::exif::makernotes::vendors::panasonic::walk_panasonic_in_tiff))
-//! applies this via the tag def's
+//! shared `Walker`'s Panasonic Main route (`panasonic_makernote_isolated` /
+//! `…_with_offset`) applies this via the tag def's
 //! [`PanasonicTag::format`](exifast::exif::makernotes::vendors::panasonic::PanasonicTag)
 //! override; the on-disk format is preserved separately for the `$format`
 //! `Condition` gate (0xc4/0xc5/0xe4 — which carry NO Format directive).
