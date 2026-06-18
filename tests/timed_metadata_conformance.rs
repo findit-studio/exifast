@@ -3179,3 +3179,121 @@ fn insta360_atomspan_trailer_byte_exact() {
     true,
   );
 }
+
+// The REAL Sony FX3 `.mp4` rtmd metadata track (#76). Unlike the synthetic
+// `.mov` fixtures (a hand-built minimal `moov`), this is a genuine `ILME-FX3`
+// clip: a full `moov` — video (Track1) + audio (Track2) + `rtmd` timed-metadata
+// (Track3) — whose `mdat` precedes the `moov` and whose rtmd `stsz` is a
+// FIXED-size table (`sample-size = 11264`, `count = 24`, body exactly 12 bytes).
+// The rtmd track is a `meta`-handler `trak` (`stsd` 4cc `rtmd`); sample 1
+// carries the FX3 camera scalars (FNumber/FrameRate/ExposureTime/
+// MasterGainAdjustment/ISO/ElectricalExtenderMagnification/SerialNumber/
+// WhiteBalance/DateTime) plus the `PitchRollYaw`/`Accelerometer` IMU arrays. No
+// GPS on this clip. ExifTool collapses the duplicate samples to ONE record at
+// `-ee -G1`.
+//
+// Every Sony `rtmd` payload tag — FNumber … Accelerometer, plus the structural
+// `Track3:MetaFormat` (the stsd rtmd 4cc) and the sample-table `Track3:
+// SampleTime`/`SampleDuration` — is compared BYTE-EXACT. The decode is enabled
+// by the `parse_stsz` precedence fix (the Perl `length > 12` guard gates
+// `stz2`, NOT `stsz`; the 12-byte fixed-size rtmd `stsz` must still expand to
+// `($sz) x $num`).
+//
+// EXCLUDED ([`FX3_STRUCT_EXCL`]) are the GENERAL-QuickTime container tags this
+// Sony-rtmd port does not target — the `vide`/`soun` `stsd` sample-description
+// fields (BitDepth/Compressor*/GraphicsMode/OpColor/SourceImage*/XResolution/
+// YResolution/VideoFrameRate, Audio*/Balance), the per-`trak`
+// HandlerDescription/TrackProperty, the `tref` `ContentDescribes`, and the
+// `mvhd`-region `TimeZone`. They are absent from the synthetic `.mov` goldens
+// (minimal `moov`) and are a deferred structural-decode item, NOT an rtmd gap.
+// The `-ee` run ALSO excludes `Track3:Warning` "Error reading meta data [x22]":
+// that is `ProcessSamples`' GENERIC short-read diagnostic
+// (QuickTimeStream.pl:1438 `$et->Warn("Error reading $type data")`) for the 22
+// rtmd samples whose fixed-size offsets run past EOF — a per-track read-error
+// channel exifast does not yet model (it skips a past-EOF sample). The no-`ee`
+// `Track3:Warning` "[minor] The ExtractEmbedded option may find more tags…"
+// already matches byte-exact, so the no-`ee` test does NOT exclude it.
+const FX3_STRUCT_EXCL: &[&str] = &[
+  "TimeZone",
+  "BitDepth",
+  "CompressorID",
+  "CompressorName",
+  "GraphicsMode",
+  "OpColor",
+  "SourceImageWidth",
+  "SourceImageHeight",
+  "XResolution",
+  "YResolution",
+  "VideoFrameRate",
+  "AudioFormat",
+  "AudioChannels",
+  "AudioBitsPerSample",
+  "AudioSampleRate",
+  "Balance",
+  "HandlerDescription",
+  "TrackProperty",
+  "ContentDescribes",
+];
+
+/// `FX3_STRUCT_EXCL` plus `Track3:Warning` — the `-ee` short-read diagnostic
+/// (`Error reading meta data [x22]`) for the past-EOF rtmd samples, a per-track
+/// read-error channel exifast does not yet model.
+const FX3_EE_EXCL: &[&str] = &[
+  "TimeZone",
+  "BitDepth",
+  "CompressorID",
+  "CompressorName",
+  "GraphicsMode",
+  "OpColor",
+  "SourceImageWidth",
+  "SourceImageHeight",
+  "XResolution",
+  "YResolution",
+  "VideoFrameRate",
+  "AudioFormat",
+  "AudioChannels",
+  "AudioBitsPerSample",
+  "AudioSampleRate",
+  "Balance",
+  "HandlerDescription",
+  "TrackProperty",
+  "ContentDescribes",
+  "Warning",
+];
+
+#[test]
+fn sony_fx3_rtmd_mp4_ee_byte_exact() {
+  // `-ee -G1`: the duplicate full samples (the rtmd chunk offset `0x24` is read
+  // by BOTH chunk-1 sample 1 AND chunk-2 sample 13 — `stsc` = 12 samples/chunk,
+  // 2 chunks) collapse to ONE record. Every rtmd payload tag is byte-exact.
+  check_ee_excluding(
+    "QuickTime_sony_fx3_rtmd.mp4",
+    "QuickTime_sony_fx3_rtmd.mp4.ee.json",
+    false,
+    FX3_EE_EXCL,
+  );
+  // The `-ee -G3:1` Doc-axis golden is NOT asserted: it depends on the same
+  // unmodeled partial/past-EOF sample handling as `Track3:Warning`. The fixed-
+  // size rtmd `stsz` (24 samples × 11264 B all from offset `0x24`) lays samples
+  // back-to-back, so samples 2 and 14 PARTIAL-read the file tail (2239 B of the
+  // trailing `moov`) and samples 3-12 / 15-24 read 0 B past EOF. ExifTool opens
+  // a `Doc<N>` for every sample that read ≥1 byte and emits its timing-only
+  // `SampleTime`/`SampleDuration` (golden Docs: 1 full, 2 timing-only, 3 full,
+  // 4 timing-only). exifast SKIPS a past-EOF/partial sample wholesale
+  // (`data.get(start..start+size)` → `None` → `continue` in `process_samples`),
+  // so it opens only the 2 FULL-read docs and numbers them 1/2 — a different
+  // Doc multiset the name-tail exclusion cannot reconcile. Modeling the
+  // ExifTool clamp-and-parse (partial read → warn `Error reading meta data`,
+  // open a timing-only doc, parse the clamped bytes) is the deferred per-track
+  // read-error feature noted on `FX3_EE_EXCL`'s `Warning`; the `-G1` record
+  // above is the byte-exact rtmd proof.
+}
+
+#[test]
+fn sony_fx3_rtmd_mp4_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_fx3_rtmd.mp4",
+    "QuickTime_sony_fx3_rtmd.mp4.json",
+    FX3_STRUCT_EXCL,
+  );
+}

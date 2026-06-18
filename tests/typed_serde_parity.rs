@@ -116,6 +116,17 @@ const NOT_ACTIVE: &[&str] = &[
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
+  // The REAL Sony FX3 `.mp4` (#76) carries paired `.json` / `.n.json` goldens
+  // but is accept-deferred from the active byte-exact set: its full `ILME-FX3`
+  // `moov` exercises GENERAL-QuickTime container tags this Sony-rtmd port does
+  // not yet emit (the `vide`/`soun` `stsd` sample-description fields,
+  // HandlerDescription/TrackProperty, `tref` ContentDescribes, the `TimeZone`),
+  // so the no-`ee` `.json`/`.n.json` differ from the golden by those structural
+  // tags. The rtmd PAYLOAD proof (FNumber/ExposureTime/ISO/… byte-exact, the
+  // `parse_stsz` fixed-size-`stsz` fix) is pinned at `-ee` in
+  // `tests/timed_metadata_conformance.rs` (`sony_fx3_rtmd_mp4_*`), with the
+  // structural tags + the past-EOF `Track3:Warning` excluded there.
+  "QuickTime_sony_fx3_rtmd.mp4",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
