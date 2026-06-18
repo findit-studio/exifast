@@ -1671,6 +1671,108 @@ fn quicktime_nested_invalid_tkhd_conformance() {
   );
 }
 
+// ============================================================================
+// QuickTime SP4 brand-variant real-fixture conformance (#151)
+// ============================================================================
+//
+// Three REAL bundled brand-variant containers prove the already-merged SP4
+// `ftyp`-driven brand-detection dispatch (HEIC/AVIF/iso5/msf1) end-to-end: the
+// brand routes to the correct `File:FileType`/`File:MIMEType` and the
+// `ProcessMOV` walk emits the `ftyp` brand tags (`QuickTime:MajorBrand`/
+// `MinorVersion`/`CompatibleBrands`) plus whatever structural atoms the port
+// supports, BYTE-EXACT against the bundled ExifTool oracle.
+//
+// The goldens (`tools/gen_golden.sh` with the per-fixture `EXCLUDE` below) drop
+// `System:all` + `Composite:all` (the QuickTime Composite subsystem is the
+// Phase-2 forward item) AND the container/codec-config atoms this port does not
+// decode — the HEVC/AV1 `*Configuration*` sample-description fields, the HEIF
+// `ispe` `ImageSpatialExtent`, the codec-detail `stsd` `OtherFormat`, the
+// `mvex/mehd` `MovieFragmentSequence`, and the file-`meta` `hdlr`
+// `HandlerType`/`HandlerDescription`. exifast emits a strict SUBSET of the
+// oracle (verified: it produces NO tag the oracle lacks); every excluded key is
+// an unsupported container-structure tag, deferred via `-x`, never a value the
+// port gets wrong.
+
+#[test]
+fn avif_brand_conformance() {
+  // `tests/fixtures/AVIF_sample.avif` — a real AV1 Image File. Oracle (bundled
+  // `exiftool -G1 -j`): File:FileType AVIF, File:MIMEType image/avif,
+  // QuickTime:MajorBrand "AV1 Image File Format (.AVIF)" (brand `avif`),
+  // CompatibleBrands [avif, mif1, miaf, MA1B], File:ImageWidth 1204,
+  // File:ImageHeight 800, Meta:PrimaryItemReference 1.
+  //
+  // EXCLUDE (gen_golden.sh): `-x System:all -x Composite:all -x HandlerType
+  // -x HandlerDescription -x PixelAspectRatio -x ImageSpatialExtent
+  // -x ImagePixelDepth -x AV1ConfigurationVersion -x ChromaFormat
+  // -x ChromaSamplePosition`. The AVIF has only a file-`meta` `pict` handler
+  // (no `trak`), so the bare `-x HandlerType`/`HandlerDescription` are
+  // collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
+  // unsupported codec-config / spatial-extent fields. The brand routing +
+  // `pitm` + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  check("AVIF_sample.avif", "AVIF_sample.avif.json", true);
+  check("AVIF_sample.avif", "AVIF_sample.avif.n.json", false);
+}
+
+#[test]
+fn heic_msf1_brand_conformance() {
+  // `tests/fixtures/HEIF_C001_msf1.heic` — a real HEVC still image whose `msf1`
+  // compatible brand sits ahead of `heic`. Oracle: File:FileType HEIC,
+  // File:MIMEType image/heic, QuickTime:MajorBrand "High Efficiency Image Format
+  // HEVC still image (.HEIC)" (brand `heic`), CompatibleBrands
+  // [msf1, mif1, heic, hevc, iso8], Meta:PrimaryItemReference 20001. The file
+  // ALSO carries a `moov`/`trak` (the HEVC image track) whose `mvhd`/`tkhd`/
+  // `mdhd`/`hdlr` core atoms the port decodes byte-exact (CreateDate,
+  // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
+  // -x ImageSpatialExtent` + the `hvcC` HEVC sample-description config block
+  // (`HEVCConfigurationVersion`, `General*`, `*ProfileCompatibilityFlags`,
+  // `Constraint*`, `MinSpatialSegmentationIDC`, `ParallelismType`,
+  // `ChromaFormat`, `BitDepth*`, `*FrameRate`, `NumTemporalLayers`,
+  // `TemporalIDNested`) + the track `stsd`/`vmhd` detail (`GraphicsMode`,
+  // `OpColor`, `OtherFormat`).
+  //
+  // `-x Copy1:HandlerType` is the ONE non-obvious exclusion: the file carries
+  // TWO `hdlr` boxes with the SAME tag NAME — the file-`meta` `hdlr` (which the
+  // port's `walk_heif_meta` reads only for `pitm`, NOT `hdlr` — a deliberate
+  // unsupported container tag) and the `trak` `hdlr` (which the port DOES emit
+  // as `Track1:HandlerType`). They are distinguished only by ExifTool's
+  // family-4 copy-number group (`Copy1` = the file-`meta` duplicate, `Main` =
+  // the track), so excluding `Copy1:HandlerType` drops EXACTLY the unsupported
+  // file-`meta` `QuickTime:HandlerType` while keeping the port-emitted
+  // `Track1:HandlerType` — no value is altered.
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.json", true);
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.n.json", false);
+}
+
+#[test]
+fn iso5_brand_conformance() {
+  // `tests/fixtures/ISOBMFF_iso5_brand.mp4` — a real fragmented MP4 whose major
+  // brand `iso5` ("MP4 Base Media v5") has no `(.EXT)` substring, so the brand
+  // dispatch falls through to MP4 (no `mp41`/`mp42`/`f4v`/`qt` compatible
+  // brand). Oracle: File:FileType MP4, File:MIMEType video/mp4,
+  // QuickTime:MajorBrand "MP4 Base Media v5", MinorVersion "0.0.1",
+  // CompatibleBrands [iso5, dsms, msix, dash]. The `moov`/`trak` (a GPAC text
+  // track) decodes byte-exact incl. Track1:MediaLanguageCode "und",
+  // Track1:HandlerType "Text", and the no-`-ee` Track1:Warning.
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x MovieFragmentSequence
+  // -x HandlerDescription -x OtherFormat` — the `mvex/mehd`
+  // `MovieFragmentSequence`, the `trak` `hdlr` `HandlerDescription`
+  // ("nhml@GPAC…", collision-free — only the track carries one), and the
+  // `stsd` codec `OtherFormat` ("depi") are the unsupported container tags.
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.json",
+    true,
+  );
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.n.json",
+    false,
+  );
+}
+
 #[test]
 fn mxf_utf16_bom_conformance() {
   // Codex R2/F1 regression: `MXF.mxf` with every UTF-16 `ApplicationName` /

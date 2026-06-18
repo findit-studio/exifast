@@ -612,7 +612,14 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
 /// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
 /// fixture must bump this constant (the per-PR convention above).
-const EXPECTED_ACTIVE_FIXTURES: usize = 525;
+/// 525 → 528 after the SP4 brand-variant real-fixture conformance (#151) added
+/// paired `.json`+`.n.json` goldens for three brand-detection fixtures, ALL
+/// ACTIVE (each routes through the golden-migrated QuickTime `Taggable` engine,
+/// so the typed-serde path equals the writer path byte-for-byte):
+/// `AVIF_sample.avif` (brand `avif` → AVIF), `HEIF_C001_msf1.heic` (brand
+/// `heic`, `msf1`-compatible → HEIC), `ISOBMFF_iso5_brand.mp4` (brand `iso5` →
+/// MP4).
+const EXPECTED_ACTIVE_FIXTURES: usize = 528;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
