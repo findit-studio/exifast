@@ -137,7 +137,7 @@ pub struct MakerNotesMeta {
   dji: Option<DjiMakerNote>,
   /// Nikon decoded data — populated when [`Vendor::Nikon`] dispatched AND
   /// the Nikon port runs (`%Nikon::Main`, the readable scalars + AFInfo +
-  /// the unencrypted ColorBalance0103).
+  /// ColorBalance).
   nikon: Option<MakerNotesNikon>,
 }
 

@@ -3556,7 +3556,7 @@ fn canon_1dmk3_real_fixture_no_mismarked_subdir_parents() {
 }
 
 /// Nikon.nef (D70 NEF, type-3 embedded-TIFF MakerNote). The ported
-/// `%Nikon::Main` scalars + the unencrypted `ColorBalance0103`
+/// `%Nikon::Main` scalars + the unencrypted `ColorBalance` `0103` arm
 /// (WB_RGBGLevels) + the UNENCRYPTED `LensData0101` (0x0098) children match
 /// the oracle; the deferred ENCRYPTED sub-tables (ShotInfo/FlashInfo) stay
 /// absent without a bogus parent. Make/Model from IFD0.
@@ -3587,7 +3587,7 @@ fn real_fixture_nikon_nef_makernotes() {
       ("Nikon:LightSource", r#""Natural""#),
       ("Nikon:NEFCompression", r#""Lossy (type 1)""#),
       ("Nikon:NoiseReduction", r#""Off""#),
-      // ColorBalance0103 (UNENCRYPTED, walked): WB_RGBGLevels = int16u[4].
+      // ColorBalance `0103` arm (UNENCRYPTED, walked): WB_RGBGLevels = int16u[4].
       ("Nikon:WB_RGBGLevels", r#""478 265 493 265""#),
       ("Nikon:SerialNumber", "12345678"),
       ("Nikon:ShutterCount", "3619"),
@@ -3679,8 +3679,8 @@ fn real_fixture_nikon_jpg_makernotes() {
 
 /// NikonD2Hs.jpg (type-3) — exercises the FlashType empty string, the
 /// `ColorSpace` hash, AFInfo (BigEndian DSLR path), the UNENCRYPTED
-/// `FlashInfo0100` (0x00a8) block, the deferred ENCRYPTED ColorBalance
-/// (WB_RGGBLevels) which must NOT appear, AND the ENCRYPTED `LensData0201`
+/// `FlashInfo0100` (0x00a8) block, the ENCRYPTED ColorBalance02 (WB_RGGBLevels,
+/// decrypted #256), AND the ENCRYPTED `LensData0201`
 /// block: decrypted with serial key `3001006` + count `2`, then decoded against
 /// `%LensData01` to LensIDNumber 118 / LensFStops 7.33 / FocalLength 50.4 mm
 /// etc. A wrong serial/count key or a wrong cipher would decode garbage, not
@@ -3750,12 +3750,15 @@ fn real_fixture_nikon_d2hs_makernotes() {
       // no 0206-conditional base field exists ⇒ ShotInfoVersion is the ONLY new
       // ShotInfo tag.
       ("Nikon:ShotInfoVersion", r#""0206""#),
+      // ColorBalance: ENCRYPTED 0206 (%ColorBalance2) WB_RGGBLevels, decrypted
+      // via the prescanned keys (#256).
+      ("Nikon:WB_RGGBLevels", r#""562 256 256 537""#),
     ],
   );
   // The D2Hs ColorBalance is the ENCRYPTED 0206 variant ⇒ WB_RGGBLevels is
-  // deferred (oracle-only), and no bogus ColorBalance / LensData / FlashInfo
+  // now emitted (562 256 256 537, decrypted via the prescanned keys, #256). The
+  // ColorBalance SubDirectory PARENT is suppressed; no bogus LensData / FlashInfo
   // parent is emitted.
-  assert!(!map.contains_key("Nikon:WB_RGGBLevels"));
   assert!(!map.contains_key("Nikon:ColorBalance"));
   assert!(!map.contains_key("Nikon:LensData"));
   assert!(!map.contains_key("Nikon:FlashInfo"));

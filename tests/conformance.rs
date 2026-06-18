@@ -8669,13 +8669,13 @@ fn makernotes_nikon_d2hs_conformance() {
   //                          documented engine-wide gap).
   //   -x ExifIFD:CFAPattern  — a standard EXIF tag (0xa302) not in exifast's
   //                          EXIF table; unrelated to MakerNotes.
-  //   -x Nikon:WB_RGGBLevels — this file's ColorBalance is the ENCRYPTED `02xx`
-  //                          (ColorBalance02) variant; `emit_color_balance`
-  //                          ports only the unencrypted `0103` (D70/D70s) arm,
-  //                          and the encrypted variants are a documented
-  //                          Phase-2/3 follow-up (nikon/tags.rs ColorBalance-
-  //                          Encrypted). The ONE deferred Nikon tag on this
-  //                          file; the other 65 Nikon tags are byte-identical.
+  //
+  // `Nikon:WB_RGGBLevels` is NO LONGER excluded — this file's ColorBalance is
+  // the ENCRYPTED `02xx` (ColorBalance02, version `0206`) variant, now PORTED
+  // (`emit_color_balance` decrypts the block with the serial-3001006 /
+  // ShutterCount keystream and reads `WB_RGGBLevels` = 562 256 256 537 at
+  // `DecryptStart 284 + DirOffset 6`, #256). All 66 Nikon tags are now
+  // byte-identical to bundled ExifTool.
   check("NikonD2Hs.jpg", "NikonD2Hs.jpg.json", true);
   check("NikonD2Hs.jpg", "NikonD2Hs.jpg.n.json", false);
 }
