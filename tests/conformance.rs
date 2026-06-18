@@ -8659,14 +8659,13 @@ fn makernotes_nikon_d2hs_conformance() {
   // faithfulness gap:
   //   -x Composite:all     — exifast has no EXIF Composite subsystem.
   //   -x PreviewIFD:all    — Nikon SubIFD 0x0011 PreviewIFD is OtherDeferred.
-  //   -x File:ImageWidth -x File:ImageHeight -x File:EncodingProcess
-  //   -x File:BitsPerSample -x File:ColorComponents -x File:YCbCrSubSampling
-  //                        — the JPEG SOF-segment `File:*` tags the engine does
-  //                          not parse (a documented engine-wide gap shared by
-  //                          the Canon/Apple/Sony/Panasonic JPEG fixtures — the
-  //                          reason none of them is a conformance entry either).
   //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder (same
   //                          documented engine-wide gap).
+  // The JPEG SOF-segment `File:*` dimension tags (`File:ImageWidth`/
+  // `ImageHeight`/`EncodingProcess`/`BitsPerSample`/`ColorComponents`/
+  // `YCbCrSubSampling`) are NOW EMITTED (#261) and are part of this golden —
+  // this file's `8x8 / Baseline DCT, Huffman coding / 8 / 3 / YCbCr4:2:0 (2 2)`
+  // SOF0 is byte-identical to bundled.
   //   -x ExifIFD:CFAPattern  — a standard EXIF tag (0xa302) not in exifast's
   //                          EXIF table; unrelated to MakerNotes.
   //   -x Nikon:WB_RGGBLevels — this file's ColorBalance is the ENCRYPTED `02xx`
@@ -9116,15 +9115,17 @@ fn jpeg_exif_gps_conformance() {
   // and the File:* JPEG triplet.
   //
   // Goldens are bundled `tools/gen_golden.sh` output with `System:*` +
-  // `Composite:*` stripped uniformly (every format conformance does this),
-  // PLUS the DEFERRED JPEG-container tags removed (a JPEG-container follow-up
-  // — see `docs/tracking.md`): the `SOF` size tags (`File:ImageWidth`/
-  // `ImageHeight`/`BitsPerSample`/`ColorComponents`/`EncodingProcess`/
-  // `YCbCrSubSampling`, ExifTool.pm:7430-7470), the APP13 Photoshop/IPTC
-  // segment (`IPTC:*` + `File:CurrentIPTCDigest`, ExifTool.pm:7861), and the
-  // binary `IFD1:ThumbnailImage` body (offset/length ARE extracted). The
-  // Exif/GPS arm of `ProcessJPEG` is what this PR ports; the remaining
-  // segments are out of scope (only the Exif `APP1` is dispatched).
+  // `Composite:*` stripped uniformly (every format conformance does this).
+  // The `SOF` size tags (`File:ImageWidth`/`ImageHeight`/`BitsPerSample`/
+  // `ColorComponents`/`EncodingProcess`/`YCbCrSubSampling`,
+  // ExifTool.pm:7419-7462) are NOW EMITTED (#261) — this file's
+  // `120x80 / Baseline DCT, Huffman coding / 8 / 3 / YCbCr4:2:0 (2 2)` SOF0 is
+  // byte-identical to bundled and part of this golden. Still DEFERRED (a
+  // JPEG-container follow-up — see `docs/tracking.md`): the APP13
+  // Photoshop/IPTC segment (`IPTC:*` + `File:CurrentIPTCDigest`,
+  // ExifTool.pm:7861) and the binary `IFD1:ThumbnailImage` body (offset/length
+  // ARE extracted). The Exif/GPS + SOF arms of `ProcessJPEG` are ported; the
+  // remaining segments are out of scope.
   check("ExifGPS.jpg", "ExifGPS.jpg.json", true);
   check("ExifGPS.jpg", "ExifGPS.jpg.n.json", false);
 }

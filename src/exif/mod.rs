@@ -1168,6 +1168,159 @@ impl JpegAuxBlock {
   }
 }
 
+/// The JPEG Start-Of-Frame (`SOF`) dimension tags — bundled
+/// `%Image::ExifTool::JPEG::SOF` (`ExifTool.pm:2160-2193`, group `File`),
+/// `HandleTag`'d by `ProcessJPEG` from the FIRST SOF segment
+/// (`ExifTool.pm:7419-7462`). Populated by the JPEG marker walk
+/// ([`crate::exif::jpeg::parse_sof_segment`]) and emitted by
+/// [`Taggable::tags`](crate::emit::Taggable::tags) right after the `File:`
+/// prefix (ahead of the IFD blocks — ExifTool reaches the SOF before the IFD
+/// walk). The raw values; PrintConv (`EncodingProcess` / `YCbCrSubSampling`
+/// maps) is applied at emission time. All fields are private (D8) — construct
+/// via [`SofInfo::new`].
+#[derive(Debug, Clone)]
+pub(crate) struct SofInfo {
+  /// `ImageWidth` — the SOF `n` width word (`ExifTool.pm:7434`). Bare integer
+  /// in both `-j` and `-n`.
+  image_width: u16,
+  /// `ImageHeight` — the SOF `n` height word. Bare integer in both modes.
+  image_height: u16,
+  /// `EncodingProcess` = `marker - 0xc0` (`ExifTool.pm:7437`). The raw code in
+  /// `-n`; the `%Image::ExifTool::JPEG::SOF` `EncodingProcess` PrintConv text
+  /// in `-j` (`ExifTool.pm:2169-2185`).
+  encoding_process: u8,
+  /// `BitsPerSample` — the SOF precision byte. Bare integer in both modes.
+  bits_per_sample: u8,
+  /// `ColorComponents` — the SOF component count. Bare integer in both modes.
+  color_components: u8,
+  /// `YCbCrSubSampling` — the raw `"h v"` string derived from the component
+  /// sampling factors (`ExifTool.pm:7438-7460`), or `None` when not emitted
+  /// (not 3-component / short payload / a zero minimum). `-n` is this raw
+  /// string; `-j` maps it via `%Image::ExifTool::JPEG::yCbCrSubSampling`
+  /// (`ExifTool.pm:2149-2158`), falling back to the raw string when unmapped.
+  ycbcr_subsampling: Option<smol_str::SmolStr>,
+}
+
+impl SofInfo {
+  /// Build a [`SofInfo`] from the parsed SOF values. (`pub(crate)`: a JPEG
+  /// front-end construction-time internal, called by
+  /// [`crate::exif::jpeg::parse_sof_segment`].)
+  #[must_use]
+  pub(crate) const fn new(
+    image_width: u16,
+    image_height: u16,
+    encoding_process: u8,
+    bits_per_sample: u8,
+    color_components: u8,
+    ycbcr_subsampling: Option<smol_str::SmolStr>,
+  ) -> Self {
+    Self {
+      image_width,
+      image_height,
+      encoding_process,
+      bits_per_sample,
+      color_components,
+      ycbcr_subsampling,
+    }
+  }
+
+  /// The `%Image::ExifTool::JPEG::SOF` `EncodingProcess` PrintConv
+  /// (`ExifTool.pm:2169-2185`): the code-to-text map for `-j`. An UNMAPPED code
+  /// (none occurs in a real JPEG) renders as the raw decimal — `PrintHex => 1`
+  /// only affects ExifTool's own unmapped display and never the mapped values
+  /// this emits.
+  fn encoding_process_print(code: u8) -> Option<&'static str> {
+    Some(match code {
+      0x0 => "Baseline DCT, Huffman coding",
+      0x1 => "Extended sequential DCT, Huffman coding",
+      0x2 => "Progressive DCT, Huffman coding",
+      0x3 => "Lossless, Huffman coding",
+      0x5 => "Sequential DCT, differential Huffman coding",
+      0x6 => "Progressive DCT, differential Huffman coding",
+      0x7 => "Lossless, Differential Huffman coding",
+      0x9 => "Extended sequential DCT, arithmetic coding",
+      0xa => "Progressive DCT, arithmetic coding",
+      0xb => "Lossless, arithmetic coding",
+      0xd => "Sequential DCT, differential arithmetic coding",
+      0xe => "Progressive DCT, differential arithmetic coding",
+      0xf => "Lossless, differential arithmetic coding",
+      _ => return None,
+    })
+  }
+
+  /// The `%Image::ExifTool::JPEG::yCbCrSubSampling` PrintConv
+  /// (`ExifTool.pm:2149-2158`): the `"h v"`-to-label map for `-j`. An unmapped
+  /// value falls back to the raw string (PrintConv hash miss ⇒ raw).
+  fn ycbcr_subsampling_print(raw: &str) -> &str {
+    match raw {
+      "1 1" => "YCbCr4:4:4 (1 1)",
+      "2 1" => "YCbCr4:2:2 (2 1)",
+      "2 2" => "YCbCr4:2:0 (2 2)",
+      "4 1" => "YCbCr4:1:1 (4 1)",
+      "4 2" => "YCbCr4:1:0 (4 2)",
+      "1 2" => "YCbCr4:4:0 (1 2)",
+      "1 4" => "YCbCr4:4:1 (1 4)",
+      "2 4" => "YCbCr4:2:1 (2 4)",
+      other => other,
+    }
+  }
+
+  /// Push the SOF `File:*` tags onto `tags` in ExifTool's `HandleTag` order
+  /// (`ExifTool.pm:7434-7460`): `ImageWidth`, `ImageHeight`, `EncodingProcess`,
+  /// `BitsPerSample`, `ColorComponents`, then `YCbCrSubSampling` (only when
+  /// present). Group `File`/`File` (`ExifTool.pm:2163`). `print_conv` selects
+  /// the `-j` map text vs the `-n` raw value for `EncodingProcess` /
+  /// `YCbCrSubSampling`; the four dimension tags are identical in both modes.
+  fn push_tags(&self, print_conv: bool, tags: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+    use smol_str::SmolStr;
+    let file = || Group::new("File", "File");
+    let push_u64 = |tags: &mut std::vec::Vec<EmittedTag>, name: &'static str, v: u64| {
+      tags.push(EmittedTag::new(
+        file(),
+        SmolStr::new_static(name),
+        TagValue::U64(v),
+        false,
+      ));
+    };
+    push_u64(tags, "ImageWidth", u64::from(self.image_width));
+    push_u64(tags, "ImageHeight", u64::from(self.image_height));
+    // `EncodingProcess`: `-j` the PrintConv label, `-n` the raw code.
+    let encoding = if print_conv {
+      match Self::encoding_process_print(self.encoding_process) {
+        Some(text) => TagValue::Str(SmolStr::new_static(text)),
+        None => TagValue::U64(u64::from(self.encoding_process)),
+      }
+    } else {
+      TagValue::U64(u64::from(self.encoding_process))
+    };
+    tags.push(EmittedTag::new(
+      file(),
+      SmolStr::new_static("EncodingProcess"),
+      encoding,
+      false,
+    ));
+    push_u64(tags, "BitsPerSample", u64::from(self.bits_per_sample));
+    push_u64(tags, "ColorComponents", u64::from(self.color_components));
+    // `YCbCrSubSampling` — only when derived. `-j` maps the raw `"h v"` to its
+    // label (falling back to raw on a miss); `-n` is the raw string.
+    if let Some(raw) = self.ycbcr_subsampling.as_deref() {
+      let value = if print_conv {
+        SmolStr::from(Self::ycbcr_subsampling_print(raw))
+      } else {
+        SmolStr::from(raw)
+      };
+      tags.push(EmittedTag::new(
+        file(),
+        SmolStr::new_static("YCbCrSubSampling"),
+        TagValue::Str(value),
+        false,
+      ));
+    }
+  }
+}
+
 // ====================================================================// Typed Meta — `ExifMeta<'a>`
 // ====================================================================
 /// Typed Exif/TIFF metadata — the lib-first output of [`ProcessExif`] and
@@ -1248,6 +1401,16 @@ pub struct ExifMeta<'a> {
   /// `None`, faithful to bundled gating the emit on the OUTER file type
   /// being "TIFF" (`Parent='TIFF'`, `ExifTool.pm:8704`).
   multi_page_count: Option<u32>,
+  /// The JPEG Start-Of-Frame dimension tags ([`SofInfo`] — `File:ImageWidth`/
+  /// `ImageHeight`/`EncodingProcess`/`BitsPerSample`/`ColorComponents`/
+  /// `YCbCrSubSampling`), set by the JPEG marker walk
+  /// ([`crate::exif::jpeg`]) from the FIRST SOF segment. `None` for every
+  /// non-JPEG source (a standalone TIFF / an embedded eXIf block) and for a
+  /// JPEG with no parseable SOF segment.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) emits these right after the
+  /// `File:` prefix (ahead of the IFD blocks), matching ExifTool reaching the
+  /// SOF before the IFD walk (`ExifTool.pm:7419-7462`).
+  sof: Option<SofInfo>,
   /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — `Some("CRW")`
   /// for a CIFF/CRW raw, the standalone-TIFF candidate's `Parent`
   /// (`"TIFF"`/`"DNG"`/`"NEF"`/`"CR2"`/…) for a standalone TIFF, `None` for an
@@ -1495,6 +1658,10 @@ impl<'a> ExifMeta<'a> {
       byte_order,
       maker_note,
       multi_page_count: None,
+      // The SOF dimension tags are attached AFTER construction by the JPEG
+      // marker walk via [`set_jpeg_sof`](Self::set_jpeg_sof) once the first SOF
+      // segment is parsed; a freshly merged JPEG `ExifMeta` starts with none.
+      sof: None,
       // A JPEG container's `APP1` Exif block is embedded — `$$self{FILE_TYPE}`
       // is the JPEG ("JPEG"), never "CRW", so the ShotInfo pos-22 CRW clause is
       // correctly off. We model that as `None` (no CRW), matching the embedded
@@ -1521,6 +1688,19 @@ impl<'a> ExifMeta<'a> {
       #[cfg(feature = "quicktime")]
       jpeg_aux_blocks: std::vec::Vec::new(),
     }
+  }
+
+  /// Attach the JPEG Start-Of-Frame dimension tags ([`SofInfo`]) parsed from the
+  /// FIRST SOF segment by the marker walk ([`crate::exif::jpeg::parse_sof_segment`]).
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) then emits them
+  /// (`File:ImageWidth`/`ImageHeight`/`EncodingProcess`/`BitsPerSample`/
+  /// `ColorComponents`/`YCbCrSubSampling`) right after the `File:` prefix and
+  /// ahead of the IFD blocks, matching `ProcessJPEG` reaching the SOF before the
+  /// IFD walk (`ExifTool.pm:7419-7462`). Not feature-gated — the SOF tags are
+  /// emitted in every build. (`pub(crate)`: a JPEG-front-end construction-time
+  /// internal.)
+  pub(crate) fn set_jpeg_sof(&mut self, sof: SofInfo) {
+    self.sof = Some(sof);
   }
 
   /// Record the marker (file) position of the EXIF metadata block — the index
@@ -2124,6 +2304,9 @@ fn parse_tiff_with_base_no_raf<'a>(
     byte_order: Some(order),
     maker_note: w.maker_note,
     multi_page_count,
+    // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
+    // has no JPEG SOF segment.
+    sof: None,
     file_type,
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     dng_version: w.dng_version,
@@ -2251,6 +2434,9 @@ fn parse_bigtiff<'a>(
     } else {
       None
     },
+    // The SOF dimension tags are a JPEG-container concern; a BigTIFF has no
+    // JPEG SOF segment.
+    sof: None,
     // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) FORCES the file
     // type to `BTF` on the 0x2b magic, REGARDLESS of extension — so a BigTIFF
     // named `.tif` / dotless still finalizes `File:FileType = BTF`. Carry that
@@ -2420,6 +2606,8 @@ fn parse_tiff_with_base_shared<'a>(
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
     multi_page_count: None,
+    // An embedded eXIf / CTMD block is not a JPEG marker walk — no SOF segment.
+    sof: None,
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
@@ -5830,6 +6018,17 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         crate::value::TagValue::U64(u64::from(n)),
         false,
       ));
+    }
+    // The JPEG `File:*` Start-Of-Frame dimension tags (`ImageWidth`/
+    // `ImageHeight`/`EncodingProcess`/`BitsPerSample`/`ColorComponents`/
+    // `YCbCrSubSampling`). `HandleTag`'d in `ProcessJPEG` from the FIRST SOF
+    // segment (`ExifTool.pm:7434-7460`), which the `Marker:` loop reaches BEFORE
+    // the IFD walk — so they emit here, right after the `File:` prefix and ahead
+    // of the IFD blocks (matching ExifTool's `FoundTag` order). `Some` only for
+    // a JPEG container with a parseable SOF segment; `None` (no tags) for a
+    // standalone TIFF / an embedded eXIf block / a SOF-less JPEG.
+    if let Some(sof) = &self.sof {
+      sof.push_tags(print_conv, &mut tags);
     }
     // Emit the metadata blocks in marker-POSITION order: the EXIF block (the
     // IFD entries + the captured MakerNote — one contiguous group, internal
