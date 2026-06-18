@@ -613,6 +613,16 @@ enum ResolvedConv {
   /// LensRec` SubDirectory whose `LensType` child the dedicated capture loop
   /// emits (the parent pointer is never emitted, the Nikon SubDirectory pattern).
   Pentax(&'static makernotes::vendors::pentax::tags::PentaxTag),
+  /// A Samsung maker-note leaf (`%Samsung::Type2` descriptor). Carries the
+  /// resolved [`SamsungTag`](makernotes::vendors::samsung::tags::SamsungTag) so
+  /// the emit ([`emit_samsung_value`]) reapplies its
+  /// [`SamsungPrintConv`](makernotes::vendors::samsung::printconv::SamsungPrintConv)
+  /// and reads its `Unknown=>1` flag. Samsung is a SIMPLE vendor (#210): a plain
+  /// LEAF table walked under `active_table == Samsung`, plus the ONE `0x0021
+  /// PictureWizard` `ProcessBinaryData` SubDirectory whose five members the
+  /// dedicated capture loop emits (the parent pointer is never emitted, the
+  /// Nikon/Pentax SubDirectory pattern).
+  Samsung(&'static makernotes::vendors::samsung::tags::SamsungTag),
 }
 
 impl ResolvedConv {
@@ -636,6 +646,7 @@ impl ResolvedConv {
       // `Nikon` arm covers it (the Type2 walk emits under the same vendor group).
       ResolvedConv::Nikon(_) => vendor_group1_of(TableRef::Nikon),
       ResolvedConv::Pentax(_) => vendor_group1_of(TableRef::Pentax),
+      ResolvedConv::Samsung(_) => vendor_group1_of(TableRef::Samsung),
     }
   }
 }
@@ -693,7 +704,12 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     TableRef::Pentax => Some("Pentax"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
     // tables never reach the emit through this walker.
-    TableRef::Exif | TableRef::Gps | TableRef::Interop | TableRef::Samsung => None,
+    // `%Samsung::Type2` (#210). A Samsung maker-note leaf emits under the
+    // `Samsung` family-1 group (`Samsung.pm:133` declares `GROUPS => { 0 =>
+    // 'MakerNotes' }`, so family-1 follows family-0's `MakerNotes`→vendor
+    // mapping — `exiftool -j -G1` emits `Samsung:LensType` on a Samsung body).
+    TableRef::Samsung => Some("Samsung"),
+    TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
 
@@ -815,6 +831,23 @@ enum MakerNoteValueConvDecode<'a> {
   /// heuristic's PENTAX absolute-addressing arm reads (retained so the `-n`
   /// recompute resolves the SAME base shift as the `-j` decode).
   Pentax {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    detected: makernotes::DetectedMakerNote,
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Samsung — re-drive the SHARED `Walker`'s Samsung Type2 walk + emission
+  /// capture ([`samsung_makernote_isolated`]) with `print_conv = false` (#210).
+  /// The walk is deterministic across the PrintConv flag (same bytes, same
+  /// `detected` modes; only the per-leaf render differs), so the recomputed `-n`
+  /// emissions are byte-identical to the eager `-n` cache. The dispatched
+  /// `detected` carries the body offset / `Unknown` byte order / `FixBase` the
+  /// walk threads; `make`/`model` are retained for symmetry with the other
+  /// vendors (the Samsung walk reads no model-conditional structure).
+  Samsung {
     data: &'a [u8],
     mn_offset: usize,
     mn_len: usize,
@@ -995,6 +1028,34 @@ impl MakerNoteValueConvDecode<'_> {
         // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
         // the defensive empty `Vec` for the impossible `None`.
         pentax_makernote_isolated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *detected,
+          *order,
+          make.as_deref(),
+          model.as_deref(),
+          false,
+        )
+        .map(|(e, _)| e)
+        .unwrap_or_default()
+      }
+      MakerNoteValueConvDecode::Samsung {
+        data,
+        mn_offset,
+        mn_len,
+        detected,
+        order,
+        make,
+        model,
+      } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and
+        // the typed slot discarded (the `-n` path needs only the ValueConv
+        // emissions), mirroring the other vendors (#210). A blob that walked in
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes are
+        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
+        // the defensive empty `Vec` for the impossible `None`.
+        samsung_makernote_isolated(
           data,
           *mn_offset,
           *mn_len,
@@ -3811,6 +3872,10 @@ impl Walker<'_, '_> {
       // unknown-tag warning form), matching `ProcessExif`'s `next unless
       // $tagInfo` skip for an unported id.
       TableRef::Pentax => makernotes::vendors::pentax::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Samsung::Type2` (#210). An unknown Samsung tag returns `None` (the
+      // Walker's verbose-only omit) — the deferred Crypt/SubDirectory rows are
+      // simply absent from `SAMSUNG_TAGS`.
+      TableRef::Samsung => makernotes::vendors::samsung::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -4313,6 +4378,12 @@ impl Walker<'_, '_> {
       // is exempt from the excessive-count guard. Without this the LensRec value
       // span never materializes and `LensType` cannot emit.
       TableRef::Pentax => makernotes::vendors::pentax::format_override(tag_id),
+      // `%Samsung::Type2` (#210) carries its OWN `Format =>` directives
+      // (`0xa01a FocalLengthIn35mmFormat` reads `int32u`; `0x0030
+      // LocalLocationName` reads `undef`); the Walker resolves them off the
+      // active Samsung table exactly as the Sony/Pentax walks do, recomputing
+      // the count per `int(size/elemsize)` (`Exif.pm:6743`).
+      TableRef::Samsung => makernotes::vendors::samsung::format_override(tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -5587,6 +5658,47 @@ impl Walker<'_, '_> {
                   };
                 }
               }
+              // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`) — the EXIF-format
+              // Samsung Type2 maker note (#210). The dispatcher gives body offset
+              // 0, `Base => Inherit`, `ByteOrder => Unknown` (probed) and
+              // `FixBase => 1`, carried on `detected`. Walk the Samsung Type2 IFD
+              // in a FRESH, ISOLATED `Walker` ([`samsung_makernote_isolated`]) —
+              // NOT on `self` — then capture its emissions into the cached buffer
+              // (structural isolation, mirroring Sony/Pentax). The isolated walk
+              // builds its own `Walker` over `self.data` (the IFD at `mn_offset`),
+              // walks under `TableRef::Samsung`, descends the `0x0021 PictureWizard`
+              // SubDirectory to its five binary members, and DISCARDS its
+              // `warnings` / `warn_count` / `active_ifd_offsets` / `chain_guard` —
+              // so a malformed Samsung entry cannot leak a core `ExifTool:Warning`
+              // or abort the parent walk. `print_conv = true` yields the cached
+              // `-j` emissions + the typed `MakerNotesSamsung`; the `-n` emissions
+              // are recomputed on demand via the SAME helper with `print_conv =
+              // false`. A degenerate too-short blob returns `None` and leaves the
+              // Samsung slot absent.
+              makernotes::Vendor::Samsung => {
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                // Threaded for symmetry with the other vendors; the Samsung walk
+                // reads no model-conditional structure (the FixBase heuristic is
+                // the generic offset-correction one, not the PENTAX make arm).
+                let make = self.captured_make.as_deref();
+                let model = self.captured_model.as_deref();
+                if let Some((emi_pc, typed_pc)) = samsung_makernote_isolated(
+                  self.data, mn_offset, mn_len, detected, self.order, make, model, true,
+                ) {
+                  meta.set_samsung(typed_pc);
+                  cached_pc = emi_pc;
+                  value_conv_decode = MakerNoteValueConvDecode::Samsung {
+                    data: self.data,
+                    mn_offset,
+                    mn_len,
+                    detected,
+                    order: self.order,
+                    make: make.map(smol_str::SmolStr::new),
+                    model: model.map(smol_str::SmolStr::new),
+                  };
+                }
+              }
               _ => {}
             }
             self.maker_note = Some(MakerNote {
@@ -5836,6 +5948,16 @@ impl Walker<'_, '_> {
       // unless $tagInfo` skip.
       TableRef::Pentax => match makernotes::vendors::pentax::tags::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Pentax(t)),
+        None => return,
+      },
+      // `%Samsung::Type2` (#210). The resolved [`SamsungTag`] rides in
+      // `ResolvedConv::Samsung` so the emit ([`emit_samsung_value`]) reapplies
+      // its `SamsungPrintConv` (and, for `0x0021 PictureWizard`, the capture
+      // loop descends to the binary members). An unknown Samsung tag is skipped
+      // here (the deferred Crypt/SubDirectory rows), matching `ProcessExif`'s
+      // `next unless $tagInfo` skip.
+      TableRef::Samsung => match makernotes::vendors::samsung::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Samsung(t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
@@ -6910,6 +7032,17 @@ fn emit_entry<S: ExifSink>(
       }
       emit_pentax_value(group1, name, raw, pentax_tag, print_conv, out)
     }
+    // `%Samsung::Type2` (#210). Like Sony/Panasonic/Pentax, the production
+    // Samsung capture runs in the dedicated isolated walker
+    // ([`samsung_makernote_isolated`]), and no core-IFD walk produces a
+    // `ResolvedConv::Samsung` entry (Samsung leaves exist only under
+    // `active_table == Samsung`). This arm keeps the match exhaustive: a
+    // SubDirectory row (PictureWizard) emits NOTHING (its members are the
+    // capture loop's job), and a plain LEAF renders via `emit_samsung_value`.
+    ResolvedConv::Samsung(samsung_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      emit_samsung_value(group1, entry, samsung_tag, print_conv, None, out)
+    }
   }
 }
 
@@ -6994,6 +7127,66 @@ fn emit_pentax_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   let value = pentax_tag.conv.apply(raw, print_conv);
   out.write_vendor_value("MakerNotes", group1, name, value, pentax_tag.is_unknown())
+}
+
+/// Render ONE Samsung Type2 maker-note LEAF into the sink — the emit-time
+/// reproduction of `%Samsung::Type2`'s per-tag emit through the shared `Walker`
+/// (#210).
+///
+/// Samsung is a near-SIMPLE vendor like Apple/Pentax: a plain LEAF renders via
+/// [`SamsungPrintConv::apply`](makernotes::vendors::samsung::printconv::SamsungPrintConv::apply)
+/// (taken BY VALUE — the conv is `Copy`) on the entry's RAW value, then writes
+/// the already-rendered [`TagValue`] under `("MakerNotes", group1)` carrying the
+/// row's `Unknown=>1` flag (`run_emission` drops it once, like the other
+/// vendors). The `0x0021 PictureWizard` SubDirectory is descended in the capture
+/// loop ([`samsung::emit_picture_wizard`]), never routed here — but a SubDirectory
+/// row that reaches this fn (defensively) emits NOTHING (neither parent pointer
+/// nor children), matching ExifTool's `if ($subdir) … next` (`Exif.pm:7103`).
+///
+/// The ONE non-simple step is a value-`Condition` gate
+/// ([`SamsungPrintConv::condition_holds`](makernotes::vendors::samsung::printconv::SamsungPrintConv::condition_holds)):
+/// the `0xa002 SerialNumber` row (`Samsung.pm:404-409`) is emitted only when its
+/// raw value matches `$$valPt =~ /^\w{5}/`; a failing Condition emits NOTHING and
+/// populates NO typed field (ExifTool's absent-tag behaviour, the Panasonic
+/// `single_hash_condition_holds` shape). Driving the gate INSIDE this single fn
+/// covers BOTH the production capture loop and the defensive `emit_entry` arm.
+#[cfg(feature = "alloc")]
+fn emit_samsung_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  samsung_tag: &makernotes::vendors::samsung::tags::SamsungTag,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::samsung::MakerNotesSamsung>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::samsung::{SamsungPrintConv, populate_typed};
+  // SubDirectory row — emit NEITHER the parent pointer NOR (here) the children;
+  // the capture loop dispatches the children from the on-disk span.
+  if samsung_tag.sub_table().is_some() {
+    return Ok(());
+  }
+  let raw = entry.value.raw();
+  // Value-`Condition` suppression (the `0xa002 SerialNumber`
+  // `$$valPt =~ /^\w{5}/` row, `Samsung.pm:404-409`). When the Condition fails
+  // ExifTool's `GetTagInfo` returns no tag ⇒ emit NOTHING and populate NO typed
+  // field (the absent-tag behaviour), exactly like the Panasonic
+  // `single_hash_condition_holds` gate. Every other Samsung leaf has no
+  // suppressible value-Condition, so this is a no-op for them.
+  if !SamsungPrintConv::condition_holds(entry.tag_id, raw) {
+    return Ok(());
+  }
+  let value = samsung_tag.conv.apply(raw, print_conv);
+  // Populate the typed surface (gate-passing only, exactly where the leaf emits).
+  if let Some(typed) = typed {
+    populate_typed(typed, entry.tag_id, raw);
+  }
+  out.write_vendor_value(
+    "MakerNotes",
+    group1,
+    samsung_tag.name(),
+    value,
+    samsung_tag.is_unknown(),
+  )
 }
 
 /// Render ONE Sony maker-note leaf into the sink — the emit-time reproduction of
@@ -8832,6 +9025,210 @@ pub(in crate::exif) fn pentax_makernote_isolated(
       if print_conv {
         pentax::populate_typed_value(&mut typed, entry.tag_id, entry.value.raw());
       }
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk the Samsung `%Samsung::Type2` IFD in a FRESH, ISOLATED [`Walker`] over
+/// the parent TIFF and capture its emissions + typed surface — the single entry
+/// point BOTH the `-j` production dispatch and the `-n` recompute drive (#210,
+/// structural isolation, mirroring [`pentax_makernote_isolated`]).
+///
+/// ## The walk
+///
+/// The `MakerNoteSamsung2` SubDirectory (`MakerNotes.pm:965-979`) gives body
+/// offset 0, `Base => Inherit`, `ByteOrder => 'Unknown'` and `FixBase => 1`,
+/// processed via `ProcessProc => \&ProcessUnknown` — Samsung "is very
+/// inconsistent here, and uses absolute offsets for some models and relative
+/// offsets for others". So this drives [`process_subdir`](Walker::process_subdir)
+/// with [`ProcessProc::Unknown`] (which runs `LocateIFD` then `ProcessExif`) +
+/// [`ByteOrderRule::Unknown`] (probe the entry-count word) +
+/// [`FixBaseMode::Heuristic`] (the standard offset-correction), exactly as the
+/// dispatched `detected` directs. The Type2 table's own `Format =>` directives
+/// (`0xa01a` int32u, `0x0030` undef) are resolved off the active Samsung table
+/// (`Exif.pm:6729`). `IfdKind::ExifIfd` is a non-Ifd0 kind, so the IFD0-only
+/// Make/Model tap never fires. The walk appends the Samsung leaves to `w.entries`
+/// from index 0, isolating every core side effect from the parent (FRESH warning
+/// channels / `warn_count` / `active_ifd_offsets` / `chain_guard`, all dropped on
+/// return).
+///
+/// ## The per-entry capture (the loop)
+///
+/// Each `ResolvedConv::Samsung` leaf renders via the plain
+/// [`emit_samsung_value`]; the ONE `0x0021 PictureWizard` SubDirectory row is
+/// descended by re-slicing its on-disk value SPAN (`value_offset` /
+/// `value_size`) from the Walker buffer and dispatching to
+/// [`samsung::emit_picture_wizard`] (the parent pointer is never emitted) —
+/// the Nikon/Pentax SubDirectory pattern. The typed [`MakerNotesSamsung`] is
+/// built from the SAME gate-passing entries.
+///
+/// A degenerate too-short blob (no room for the IFD count word) returns
+/// `Some(empty)` (vendor identified, nothing decoded), never `None`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+pub(in crate::exif) fn samsung_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  detected: makernotes::DetectedMakerNote,
+  parent_order: ByteOrder,
+  make: Option<&str>,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::samsung::MakerNotesSamsung,
+)> {
+  use makernotes::vendors::samsung::{self, MakerNotesSamsung, SubTable};
+  // The captured MakerNote bytes the dispatcher classified
+  // (`data[mn_offset .. mn_offset + mn_len]`, saturating end clamped).
+  let mn_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let _blob = data.get(mn_offset..mn_end)?;
+  // SAMSUNG2-ROUTE GATE. The dispatcher collapses THREE distinct routes onto
+  // `Vendor::Samsung`, but `%Samsung::Type2` (the table this helper walks) is the
+  // EXIF-format maker note of the `MakerNoteSamsung2` route ONLY:
+  //
+  //   * Samsung1a — `STMN\d{3}.\0{4}` (`MakerNotes.pm:951-956`): `Binary => 1`
+  //     ⇒ `NotIFD` (an old `%Samsung::Main` binary table, a future phase).
+  //   * Samsung1b — `STMN\d{3}` (`MakerNotes.pm:957-963`): a `%Samsung::Main`
+  //     `SubDirectory` (an IFD, but the OLD STMN table — not Type2).
+  //   * Samsung2 — `MakerNoteSamsung2` (`MakerNotes.pm:965-979`): the `%Type2`
+  //     EXIF-format IFD, the ONLY route carrying `FixBase => 1` (`:977`).
+  //
+  // `MakerNoteSamsung2` is the ONLY `Vendor::Samsung` arm that sets `FixBase`, and
+  // it is never `NotIFD`; the two STMN arms set NEITHER. So `fix_base && !is_not_ifd`
+  // selects EXACTLY the Samsung2 route. Without this gate an old STMN / Samsung1a
+  // payload (or a crafted `Make=SAMSUNG` blob) whose first bytes happen to look
+  // IFD-shaped in `LocateIFD`'s scan window would walk `%Type2` and emit BOGUS
+  // exifast-only `Samsung:*` leaves + populate the typed slot — a Phase-1 scope
+  // fence violation. The non-Samsung2 routes are deferred ⇒ emit NOTHING (the typed
+  // slot stays the empty default), mirroring the Pentax4 `NotIFD` discipline above.
+  // This single choke point also gates the `-n` recompute + `from_blob_with_context`.
+  if !detected.fix_base() || detected.is_not_ifd() {
+    return Some((std::vec::Vec::new(), MakerNotesSamsung::new()));
+  }
+  // The child IFD start: the MakerNote value offset + the dispatched body offset
+  // (0 for `MakerNoteSamsung2`). The IFD count word must sit inside the declared
+  // value, else a truncated `mn_len` lets the Walker read its count word from the
+  // UNRELATED following parent-TIFF bytes — spurious tags.
+  let body_offset = detected.body_offset() as usize;
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  match body_offset.checked_add(2) {
+    Some(min) if mn_len >= min => {}
+    _ => return Some((std::vec::Vec::new(), MakerNotesSamsung::new())),
+  }
+  // Translate the dispatched `SubDirectory` directives into the `process_subdir`
+  // modes. `Base => Inherit` ⇒ `value_offset_base 0` (out-of-line offsets are
+  // parent-TIFF-relative against `data`). The relocation Samsung needs for its
+  // absolute-offset models is handled by `ProcessProc::Unknown`'s `LocateIFD` +
+  // the `FixBase` heuristic, NOT a base shift.
+  let value_offset_base: i64 = match detected.base_rule() {
+    makernotes::BaseRule::Inherit => 0,
+    makernotes::BaseRule::RelativeToStart(_) => i64::try_from(mn_offset).unwrap_or(i64::MAX),
+    makernotes::BaseRule::Literal(n) if n >= 0 => n,
+    _ => 0,
+  };
+  // `ByteOrder => Unknown` ⇒ probe the entry-count word; `Explicit(o)` ⇒ fixed.
+  let byte_order_rule = match detected.byte_order() {
+    makernotes::ChildByteOrder::Unknown => ByteOrderRule::Unknown,
+    makernotes::ChildByteOrder::Explicit(o) => ByteOrderRule::Fixed(o),
+  };
+  // `FixBase => 1` ⇒ the standard offset-correction heuristic; absent ⇒ no fix.
+  let fix_base_mode = if detected.fix_base() {
+    FixBaseMode::Heuristic
+  } else {
+    FixBaseMode::No
+  };
+  let mut w = Walker {
+    data,
+    order: parent_order,
+    base: 0,
+    value_offset_base,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Samsung entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream.
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
+    // Samsung walk reads no model-conditional structure (no PENTAX-style make
+    // arm), but thread them for parity with the other vendors.
+    captured_make: make.map(String::from),
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Samsung leaf reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Samsung)` swaps it to
+    // the Samsung table for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Samsung Type2 IFD walk — `ProcessProc::Unknown` runs `LocateIFD`
+  // (Samsung's offsets are inconsistent, `MakerNotes.pm:976`) then `ProcessExif`.
+  // The probed order + `FixBase` heuristic are resolved inside `process_subdir`.
+  // It appends the Samsung leaves to `w.entries` from index 0. The Samsung
+  // table's implicit-`undef` SubDirectory `format_override` materializes the
+  // `0x0021 PictureWizard` block as an empty zero-copy `RawValue::Bytes`; the
+  // capture loop re-slices the on-disk span.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Samsung,
+    byte_order_rule,
+    fix_base_mode,
+    ProcessProc::Unknown,
+  );
+  // Capture the walked `ResolvedConv::Samsung` leaves + the PictureWizard child
+  // into the vendor-emission `Vec`; build the typed `MakerNotesSamsung` from the
+  // SAME entries (the typed leaf set is disjoint from PictureWizard).
+  let g1 = vendor_group1_of(TableRef::Samsung).unwrap_or("Samsung");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = MakerNotesSamsung::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // Only `ResolvedConv::Samsung` entries live in this run; a defensive
+      // non-Samsung conv (never produced under `TableRef::Samsung`) is skipped.
+      let ResolvedConv::Samsung(samsung_tag) = entry.conv else {
+        continue;
+      };
+      if let Some(sub) = samsung_tag.sub_table() {
+        match sub {
+          SubTable::PictureWizard => {
+            // The Walker decoded the `0x0021` entry as `int16u[N]` in the IFD's
+            // RESOLVED (probed) byte order — the SubDirectory inherits that order
+            // — so the members are exactly the decoded array. A non-int16u shape
+            // (never produced for this row) yields an empty slice ⇒ nothing
+            // emitted.
+            let members: &[u64] = match entry.value.raw() {
+              RawValue::U64(v) => v.as_slice(),
+              _ => &[],
+            };
+            samsung::emit_picture_wizard(members, print_conv, &mut *sink.emissions);
+          }
+        }
+        continue;
+      }
+      // Leaf tag — the plain Samsung renderer + the gate-passing typed populate.
+      let Ok(()) = emit_samsung_value(
+        g1,
+        entry,
+        samsung_tag,
+        print_conv,
+        Some(&mut typed),
+        &mut sink,
+      );
     }
   }
   Some((emissions, typed))
@@ -17079,5 +17476,101 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
       4,
       "bundled Panasonic::Main descend-no-parent SubDirectory count changed (was 4 @ 13.59)"
     );
+  }
+
+  /// `%Samsung::Type2` `0xa002 SerialNumber` value-`Condition`
+  /// (`$$valPt =~ /^\w{5}/`, `Samsung.pm:404-409`) at the EMISSION level, driven
+  /// end-to-end through the production isolated helper
+  /// [`samsung_makernote_isolated`]. A valid serial (first five raw bytes are
+  /// word chars) emits `SerialNumber`; the NX500-style value (`"0"` + NULs, fewer
+  /// than five leading word chars) emits NOTHING — exactly ExifTool's `GetTagInfo`
+  /// absent-tag outcome (bundled emits no `Samsung:SerialNumber` for NX500).
+  #[test]
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn samsung_serial_number_value_condition_emission() {
+    use crate::value::TagValue;
+    use makernotes::dispatch;
+
+    // A clean little-endian `%Samsung::Type2` IFD at offset 0, carrying:
+    //   - 0x0001 MakerNoteVersion, undef[4] = "0100" (inline) — this also makes
+    //     the `MakerNoteSamsung2` EXIF-format magic (`MakerNotes.pm:970`,
+    //     branch B / LE) match, so the blob dispatches as Samsung2.
+    //   - 0xa002 SerialNumber, string[N] (out-of-line value at an absolute
+    //     offset past the next-IFD word).
+    // `serial` is the on-disk string-value bytes (NUL-terminated).
+    fn samsung2_blob_with_serial(serial: &[u8]) -> Vec<u8> {
+      let count: u16 = 2;
+      // Entries start at offset 2; each entry is 12 bytes. next-IFD word follows.
+      // Out-of-line serial value lives right after the next-IFD word.
+      let entries_len = 2 + (count as usize) * 12 + 4; // count word + entries + next-IFD
+      let serial_off = entries_len as u32; // absolute (base 0)
+      let mut b: Vec<u8> = Vec::new();
+      b.extend_from_slice(&count.to_le_bytes()); // entry count = 2
+      // entry 0x0001 MakerNoteVersion — undef(7)[4] = "0100" inline.
+      b.extend_from_slice(&0x0001u16.to_le_bytes());
+      b.extend_from_slice(&7u16.to_le_bytes()); // format = undef
+      b.extend_from_slice(&4u32.to_le_bytes()); // count = 4
+      b.extend_from_slice(b"0100"); // inline value
+      // entry 0xa002 SerialNumber — string(2)[serial.len()], out-of-line.
+      b.extend_from_slice(&0xa002u16.to_le_bytes());
+      b.extend_from_slice(&2u16.to_le_bytes()); // format = string
+      b.extend_from_slice(&(serial.len() as u32).to_le_bytes());
+      b.extend_from_slice(&serial_off.to_le_bytes());
+      b.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+      b.extend_from_slice(serial); // out-of-line serial bytes
+      b
+    }
+
+    fn serial_emission(serial: &[u8], print_conv: bool) -> Option<TagValue> {
+      let blob = samsung2_blob_with_serial(serial);
+      // Dispatch with Make=SAMSUNG + TIFF_TYPE=SRW ⇒ the `MakerNoteSamsung2` arm
+      // (FixBase=1, an IFD), the only route that walks `%Type2`.
+      let detected = dispatch(&blob, Some("SAMSUNG"), None, Some("SRW"));
+      assert!(detected.vendor().is_samsung() && detected.fix_base() && !detected.is_not_ifd());
+      let (emissions, _typed) = samsung_makernote_isolated(
+        &blob,
+        0,
+        blob.len(),
+        detected,
+        ByteOrder::Little,
+        Some("SAMSUNG"),
+        None,
+        print_conv,
+      )
+      .expect("a well-formed Samsung2 IFD ⇒ Some");
+      // Sanity: MakerNoteVersion always emits (proves the walk located the IFD).
+      assert!(
+        emissions.iter().any(|e| e.name() == "MakerNoteVersion"),
+        "MakerNoteVersion must emit ⇒ the Type2 IFD was located"
+      );
+      emissions
+        .iter()
+        .find(|e| e.name() == "SerialNumber")
+        .map(|e| e.value().clone())
+    }
+
+    for print_conv in [true, false] {
+      // (a) Valid serial — first five bytes "AB12C" are word chars ⇒ emitted (no
+      // PrintConv on this row, so the value is the bare ASCII string in both modes).
+      assert_eq!(
+        serial_emission(b"AB12C7 ", print_conv),
+        Some(TagValue::Str("AB12C7".into())),
+        "a valid serial (first 5 bytes word chars) must emit Samsung:SerialNumber"
+      );
+      // (b) NX500-style value — "0" then NULs ⇒ NUL-trimmed `$$valPt` is "0"
+      // (< 5 leading word chars) ⇒ `/^\w{5}/` fails ⇒ NO emission (bundled emits
+      // no Samsung:SerialNumber for NX500).
+      assert_eq!(
+        serial_emission(b"0      ", print_conv),
+        None,
+        "the NX500-style 0xa002 fails /^\\w{{5}}/ ⇒ no Samsung:SerialNumber"
+      );
+      // (c) A non-word ASCII char inside the first five bytes also fails.
+      assert_eq!(
+        serial_emission(b"AB!CDE ", print_conv),
+        None,
+        "a non-word byte in the first five positions fails the Condition"
+      );
+    }
   }
 }

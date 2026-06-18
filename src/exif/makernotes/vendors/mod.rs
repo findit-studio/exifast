@@ -35,6 +35,7 @@ pub mod dji;
 pub mod nikon;
 pub mod panasonic;
 pub mod pentax;
+pub mod samsung;
 pub mod sony;
 
 pub use apple::MakerNotesApple;
@@ -43,6 +44,7 @@ pub use dji::MakerNotesDji;
 pub use nikon::MakerNotesNikon;
 pub use panasonic::MakerNotesPanasonic;
 pub use pentax::MakerNotesPentax;
+pub use samsung::MakerNotesSamsung;
 pub use sony::MakerNotesSony;
 
 /// Compatibility alias — Phase-1 API name preserved.
@@ -124,6 +126,8 @@ pub type PanasonicMakerNote = MakerNotesPanasonic;
 pub type DjiMakerNote = MakerNotesDji;
 /// Compatibility alias — Phase-1 API name preserved.
 pub type PentaxMakerNote = MakerNotesPentax;
+/// Compatibility alias — Phase-1 API name preserved.
+pub type SamsungMakerNote = MakerNotesSamsung;
 
 /// A `Format => '…'` (with an optional `Count => N`) directive on a vendor
 /// Main-table tag row that OVERRIDES the entry's on-disk TIFF format when the

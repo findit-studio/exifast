@@ -494,6 +494,152 @@ fn pentax4_notifd_blob_emits_no_main_tags() {
   assert_eq!(pentax.lens_type(), None, "no LensType from a NotIFD blob");
 }
 
+// ===========================================================================
+// Samsung SCOPE FENCE (#210 Codex R1-F1) — only the `MakerNoteSamsung2` route
+// decodes `%Samsung::Type2`. Samsung1a (`STMN…` NotIFD) + Samsung1b (old
+// `%Samsung::Main` SubDirectory) must emit NOTHING from the Type2 walker.
+// ===========================================================================
+
+/// A little-endian `%Samsung::Type2`-shaped IFD (count=1; one `0x0002 DeviceType`
+/// int32u=0x2000 entry; next-IFD=0) that the shared `Walker` WOULD decode into
+/// `Samsung:DeviceType` / the typed `device_type` slot if it ran. 18 bytes.
+fn samsung_type2_ifd_le() -> Vec<u8> {
+  let mut ifd: Vec<u8> = Vec::new();
+  ifd.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+  ifd.extend_from_slice(&0x0002u16.to_le_bytes()); // tag 0x0002 = DeviceType
+  ifd.extend_from_slice(&4u16.to_le_bytes()); // format = int32u
+  ifd.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+  ifd.extend_from_slice(&0x2000u32.to_le_bytes()); // value 0x2000 inline
+  ifd.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+  ifd
+}
+
+/// Samsung1a — `$$valPt =~ /^STMN\d{3}.\0{4}/s` (`MakerNotes.pm:951-956`) → the
+/// old `Binary => 1` `%Samsung::Main` table, modelled as `NotIFD`. A crafted
+/// `Make=SAMSUNG` Samsung1a payload whose tail is a Type2-shaped IFD must NOT
+/// emit any `%Samsung::Type2` tag — the Samsung2-route gate (`fix_base &&
+/// !is_not_ifd`) rejects it because Samsung1a is `NotIFD` and carries no FixBase.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn samsung1a_notifd_blob_emits_no_type2_tags() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch, fixbase};
+
+  // `STMN` + 3 digits + 1 byte + 4 NULs (12 bytes) ⇒ Samsung1a, then the IFD at
+  // offset 12 (LocateIFD's even-offset scan can lock here).
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"STMN123"); // STMN + 3 digits
+  blob.push(0x09); // the `.` byte
+  blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // \0{4}
+  blob.extend_from_slice(&samsung_type2_ifd_le()); // IFD at offset 12
+  blob.extend_from_slice(&[0u8; 8]); // slack so LocateIFD's size checks pass
+
+  // NON-VACUOUS: LocateIFD finds the Type2-shaped IFD at offset 12 — so WITHOUT
+  // the route gate `ProcessUnknown` would walk + emit `DeviceType`.
+  let located = fixbase::locate_ifd(&blob, 0, None, ByteOrder::Little, Some("SAMSUNG"), None);
+  assert_eq!(
+    located.map(|(off, _)| off),
+    Some(12),
+    "the crafted Samsung1a tail IS IFD-shaped — the gate, not a parse failure, suppresses it"
+  );
+
+  // Dispatch as bundled: STMN + 3 digits + byte + 4 NULs ⇒ Samsung1a (NotIFD).
+  let detected = dispatch(&blob, Some("SAMSUNG"), None, None);
+  assert!(
+    detected.vendor().is_samsung(),
+    "dispatches to Vendor::Samsung"
+  );
+  assert!(detected.is_not_ifd(), "Samsung1a is NotIFD (Binary => 1)");
+  assert!(
+    !detected.fix_base(),
+    "Samsung1a carries no FixBase (only Samsung2 does)"
+  );
+
+  // The gated decode emits NOTHING — the typed slot is the empty default.
+  let meta = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("SAMSUNG"),
+    None,
+  );
+  assert!(meta.vendor().is_samsung());
+  let s = meta
+    .samsung()
+    .expect("the typed slot is present (vendor detected) but empty");
+  assert_eq!(
+    s.device_type(),
+    None,
+    "a NotIFD Samsung1a blob must NOT decode a bogus Type2 DeviceType"
+  );
+  assert_eq!(s.model_id(), None);
+  assert_eq!(s.lens_type(), None);
+}
+
+/// Samsung1b — the `^STMN\d{3}` fallback (`MakerNotes.pm:957-963`) is an OLD
+/// `%Samsung::Main` `SubDirectory` (an IFD, but NOT `%Type2`). It is not `NotIFD`
+/// yet carries NO `FixBase` (only `MakerNoteSamsung2` sets it), so the
+/// Samsung2-route gate still rejects it — the Type2 walker emits NOTHING even
+/// though the payload IS an IFD.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn samsung1b_old_main_blob_emits_no_type2_tags() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch, fixbase};
+
+  // `STMN` + 3 digits but the bytes at 8..12 are NOT four NULs ⇒ Samsung1b (IFD,
+  // not NotIFD). Place the Type2-shaped IFD at offset 12.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"STMN123"); // STMN + 3 digits
+  blob.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]); // NOT (byte + 4 NULs)
+  blob.extend_from_slice(&samsung_type2_ifd_le()); // IFD at offset 12
+  blob.extend_from_slice(&[0u8; 8]); // slack
+
+  // NON-VACUOUS: LocateIFD locks onto the IFD at offset 12.
+  let located = fixbase::locate_ifd(&blob, 0, None, ByteOrder::Little, Some("SAMSUNG"), None);
+  assert_eq!(
+    located.map(|(off, _)| off),
+    Some(12),
+    "the crafted Samsung1b tail IS IFD-shaped — the gate, not a parse failure, suppresses it"
+  );
+
+  // Dispatch as bundled: STMN + 3 digits without the NotIFD tail ⇒ Samsung1b.
+  let detected = dispatch(&blob, Some("SAMSUNG"), None, None);
+  assert!(
+    detected.vendor().is_samsung(),
+    "dispatches to Vendor::Samsung"
+  );
+  assert!(
+    !detected.is_not_ifd(),
+    "Samsung1b is a SubDirectory (IFD), not NotIFD"
+  );
+  assert!(
+    !detected.fix_base(),
+    "Samsung1b carries no FixBase (only the Samsung2 EXIF-format route does)"
+  );
+
+  // The gated decode emits NOTHING — the typed slot is the empty default. The
+  // old `%Samsung::Main` STMN table is a deferred future phase, NOT `%Type2`.
+  let meta = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("SAMSUNG"),
+    None,
+  );
+  assert!(meta.vendor().is_samsung());
+  let s = meta
+    .samsung()
+    .expect("the typed slot is present (vendor detected) but empty");
+  assert_eq!(
+    s.device_type(),
+    None,
+    "a Samsung1b old-Main blob must NOT decode a bogus Type2 DeviceType"
+  );
+  assert_eq!(s.model_id(), None);
+  assert_eq!(s.lens_type(), None);
+}
+
 /// Canon EOS 300D / Digital Rebel JPEG (bundled from
 /// `exiftool/t/images/Canon.jpg`). Verify the Canon body decoder
 /// populates `MakerNotesCanon` with the per-tag values the bundled
@@ -4020,5 +4166,95 @@ fn real_fixture_nikon_d70_makernotes() {
     "Nikon:FlashGroupBOutput",
   ] {
     assert!(!map.contains_key(absent), "{absent} must be absent");
+  }
+}
+
+/// SamsungNX500.srw (NX500) — the Samsung Type2 dispatch + decode (#210). The
+/// bundled `.srw` raw's `0x927c` MakerNote dispatches to `MakerNoteSamsung2`
+/// (the EXIF-format magic clause) ⇒ [`Vendor::Samsung`], and the shared `Walker`
+/// (`ProcessUnknown` + `ByteOrder => Unknown` + `FixBase => 1`) decodes
+/// `%Samsung::Type2`. Assert the dispatch outcome + the typed surface + the
+/// key camera-indexing leaves, all from the bundled fixture (no env gate).
+#[cfg(feature = "json")]
+#[test]
+fn real_fixture_samsung_nx500_type2() {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/SamsungNX500.srw"))
+    .expect("read SamsungNX500.srw fixture");
+  let meta = exifast::parse_exif(&data).expect("SRW recognized");
+
+  // Dispatch: Samsung, body offset 0, inherit base, Unknown byte order, FixBase.
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert_eq!(mn.vendor(), Vendor::Samsung, "got {:?}", mn.vendor());
+  let det = mn.detected();
+  assert_eq!(det.body_offset(), 0);
+  assert!(det.fix_base(), "MakerNoteSamsung2 sets FixBase => 1");
+
+  // Typed surface — the camera-identity fields the port populates.
+  let s = mn.meta().samsung().expect("Samsung typed slot populated");
+  assert_eq!(s.device_type(), Some(0x2000));
+  assert_eq!(s.model_id(), Some(0x5001038));
+  assert_eq!(s.model_name(), Some("Various Models (0x5001038)"));
+  assert_eq!(s.lens_type(), Some(10));
+  assert_eq!(s.lens_name(), Some("Samsung NX 45mm F1.8"));
+  assert_eq!(s.firmware_name(), Some("1.10"));
+
+  // The full `-j` tag map: the key plain leaves match the bundled oracle, and
+  // the PictureWizard ProcessBinaryData members are present.
+  let json = exifast::parser::extract_info("SamsungNX500.srw", &data, true);
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("our json parses");
+  let map = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("object");
+  for (key, want) in [
+    ("Samsung:DeviceType", r#""High-end NX Camera""#),
+    ("Samsung:SamsungModelID", r#""Various Models (0x5001038)""#),
+    ("Samsung:LensType", r#""Samsung NX 45mm F1.8""#),
+    ("Samsung:MakerNoteVersion", r#""0100""#),
+    ("Samsung:ExposureTime", r#""1/160""#),
+    ("Samsung:FocalLengthIn35mmFormat", r#""69 mm""#),
+    ("Samsung:SmartAlbumColor", r#""n/a""#),
+    ("Samsung:PictureWizardMode", r#""Standard""#),
+    ("Samsung:PictureWizardSaturation", "-4"),
+    // 0xa020 EncryptionKey — its RawConv returns `$val` unchanged, so the raw
+    // int32u[11] (the cleartext key) is emitted, space-joined (NOT a Crypt tag).
+    (
+      "Samsung:EncryptionKey",
+      r#""305 72 737 456 282 307 519 724 13 505 193""#,
+    ),
+    // 0xa025 HighlightLinearityLimit — the LAST-WINS plain row of the table's
+    // only duplicate id (overwriting the earlier 0xa025 DigitalGain Crypt row);
+    // plain int32u ⇒ the raw value 3791 (Codex R3).
+    ("Samsung:HighlightLinearityLimit", "3791"),
+  ] {
+    let got = map
+      .get(key)
+      .unwrap_or_else(|| panic!("missing {key}; keys: {:?}", map.keys().collect::<Vec<_>>()));
+    let got_obj = format!("[{{\"v\":{}}}]", serde_json::to_string(got).unwrap());
+    let want_obj = format!("[{{\"v\":{want}}}]");
+    assert!(
+      exifast::jsondiff::json_equivalent(&got_obj, &want_obj).is_ok(),
+      "{key}: got {got:?}, want {want}"
+    );
+  }
+
+  // The deferred genuinely-Crypt leaves (RawConv => Samsung::Crypt) + the
+  // SubDirectory parent pointer must NOT leak a value. (0xa020 EncryptionKey and
+  // 0xa025 HighlightLinearityLimit are PLAIN leaves and ARE emitted — asserted
+  // above; they are NOT in this absent set.)
+  for absent in [
+    "Samsung:WB_RGGBLevelsAuto",
+    "Samsung:WB_RGGBLevelsUncorrected",
+    "Samsung:ColorMatrix",
+    "Samsung:CbCrGain",
+    "Samsung:ToneCurveSRGB",
+    "Samsung:PictureWizard",
+  ] {
+    assert!(
+      !map.contains_key(absent),
+      "deferred key {absent} must be absent"
+    );
   }
 }
