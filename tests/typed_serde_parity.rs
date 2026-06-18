@@ -608,7 +608,11 @@ const NOT_ACTIVE: &[&str] = &[
 /// the positional `[minor] Insta360 trailer …` warning + the mvhd-derived
 /// QuickTime tags; the `-ee` `.ee.*` goldens (the GPS fix + identity + that
 /// warning) are pinned by `tests/timed_metadata_conformance.rs`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 521;
+/// 521 → 525 after the recent real-fixture conformance merges added paired
+/// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
+/// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
+/// fixture must bump this constant (the per-PR convention above).
+const EXPECTED_ACTIVE_FIXTURES: usize = 525;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
