@@ -393,6 +393,31 @@ fn pentax_k10d_real_fixture_decodes_typed_and_emits() {
     val("LensRec").is_none(),
     "the LensRec SubDirectory parent pointer must not be emitted"
   );
+
+  // CameraInfo (0x0215, Phase 2c) — the three serviceable-data scalars, byte-exact
+  // (verified against `exiftool -G1 -j Pentax.jpg`).
+  assert_eq!(
+    val("ManufactureDate"),
+    Some(TagValue::Str("2007:09:13".into()))
+  );
+  assert_eq!(val("ProductionCode"), Some(TagValue::Str("2.1".into())));
+  assert_eq!(val("InternalSerialNumber"), Some(TagValue::I64(132352)));
+  // The CameraInfo SubDirectory PARENT is never emitted as a value.
+  assert!(
+    val("CameraInfo").is_none(),
+    "the CameraInfo SubDirectory parent pointer must not be emitted"
+  );
+  // GUARDRAIL: CameraInfo offset 0 is PentaxModelID, but the Phase-1 0x0005 leaf
+  // owns it — it must stay EXACTLY one emission with value 'K10D', not doubled by
+  // the 0x0215 path.
+  assert_eq!(
+    emissions
+      .iter()
+      .filter(|e| e.name() == "PentaxModelID")
+      .count(),
+    1,
+    "PentaxModelID stays a single emission (0x0215 must not re-emit it)"
+  );
 }
 
 /// Pentax4 NotIFD scope. The dispatcher's `MakerNotePentax4` arm

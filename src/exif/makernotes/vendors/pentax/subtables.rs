@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
-//! Pentax binary `ProcessBinaryData` SubDirectory tables — Phase 2a (#262).
+//! Pentax binary `ProcessBinaryData` SubDirectory tables — Phase 2a/2b/2c (#262).
 //!
 //! Three `%Pentax::Main` `SubDirectory` rows whose K10D variant the
 //! `Pentax.jpg` (K10D) fixture exercises:
@@ -905,6 +905,115 @@ fn external_flash_guide_number(raw: i64) -> f64 {
   }
   let v = if raw == 29 { -3.0 } else { raw as f64 };
   2.0_f64.powf(v / 16.0 + 4.0)
+}
+
+/// Read a BigEndian `int32u` at byte offset `at` in `block`, or `None` when the
+/// 4-byte field is out of range. `%Pentax::CameraInfo` is read in the inherited
+/// MakerNote (BigEndian) order — confirmed by `exiftool -v3` (the `0x0215`
+/// BinaryData directory is "Big-endian" for both the K10D `Pentax.jpg` and the
+/// K-x `Pentax.avi`, even though the AVI's other Pentax binary directories are
+/// LittleEndian) — matching the hardcoded-BigEndian reads in the sibling
+/// `CameraSettings`/`AEInfo` decoders.
+#[inline]
+fn be_u32(block: &[u8], at: usize) -> Option<u32> {
+  let end = at.checked_add(4)?;
+  match block.get(at..end) {
+    Some(&[a, b, c, d]) => Some(u32::from_be_bytes([a, b, c, d])),
+    _ => None,
+  }
+}
+
+/// `%Pentax::CameraInfo` `1 ManufactureDate` ValueConv (`Pentax.pm:4735-4740`):
+///
+/// ```text
+/// $val =~ /^(\d{4})(\d{2})(\d{2})$/ and return "$1:$2:$3";
+/// # Optio A10 and A20 leave "200" off the year
+/// $val =~ /^(\d)(\d{2})(\d{2})$/ and return "200$1:$2:$3";
+/// return "Unknown ($val)";
+/// ```
+///
+/// `$val` is the int32u rendered as a decimal string (no leading zeros), so the
+/// `^...$`-anchored regexes match a bare 8-digit (`YYYYMMDD`) or 5-digit
+/// (Optio `YMMDD`, year "200" stripped) value. There is NO PrintConv, so the
+/// ValueConv result is emitted for BOTH `-j` and `-n`.
+fn manufacture_date(raw: u32) -> SmolStr {
+  let s = raw.to_string();
+  let digits: &[u8] = s.as_bytes();
+  // `/^(\d{4})(\d{2})(\d{2})$/` — exactly 8 digits ⇒ `YYYY:MM:DD`.
+  if digits.len() == 8 {
+    if let (Some(y), Some(m), Some(d)) = (s.get(0..4), s.get(4..6), s.get(6..8)) {
+      return SmolStr::from(std::format!("{y}:{m}:{d}"));
+    }
+  }
+  // `/^(\d)(\d{2})(\d{2})$/` — exactly 5 digits ⇒ `200Y:MM:DD`.
+  if digits.len() == 5 {
+    if let (Some(y), Some(m), Some(d)) = (s.get(0..1), s.get(1..3), s.get(3..5)) {
+      return SmolStr::from(std::format!("200{y}:{m}:{d}"));
+    }
+  }
+  SmolStr::from(std::format!("Unknown ({s})"))
+}
+
+/// Decode `%Pentax::CameraInfo` (`0x0215`, `Pentax.pm:4717-4754`) — a fixed
+/// `int32u` (`FORMAT => 'int32u'`) binary record read in BigEndian order. The
+/// Main row (`Pentax.pm:2940`) is UNCONDITIONAL (no `Condition` / `$count` gate,
+/// no model variant), so — unlike the `$count`-gated `CameraSettings`/`AEInfo`/
+/// `LensInfo2`/`FlashInfo` decoders — there is no scope-fence; every Pentax body
+/// reaches it.
+///
+/// Emits ONLY the three serviceable-data scalars: offset 1 (byte 4)
+/// `ManufactureDate`, offset 2 (byte 8) `ProductionCode` (`int32u[2]`, two
+/// space-joined int32u → `tr/ /./`), offset 4 (byte 16) `InternalSerialNumber`.
+///
+/// ## `PentaxModelID` (offset 0) is NOT re-emitted
+///
+/// `CameraInfo` offset 0 (byte 0) is `PentaxModelID` (`Pentax.pm:4721-4727`), but
+/// Phase 1 already emits it from the `0x0005` Main leaf (byte-identical `'K10D'`
+/// for `Pentax.jpg`). This emitter SKIPS offset 0 entirely so `PentaxModelID`
+/// stays a single entry owned by `0x0005` (the same discipline as the Phase-2b
+/// `LensType` guardrail, where `0x003f` owns the leaf and `0x0207` does not
+/// double it).
+///
+/// ## Bounds-checking
+///
+/// Each int32u read is bounds-checked ([`be_u32`] returns `None` past the block
+/// end): a short / truncated `CameraInfo` emits only the in-range scalars and
+/// never panics, matching `ProcessBinaryData` reading whatever the record holds
+/// (`last if $entry >= $size`). `ProductionCode` (`int32u[2]`) needs BOTH 4-byte
+/// elements present, so a record reaching byte 8 but not byte 16 emits no
+/// `ProductionCode`.
+pub(crate) fn emit_camera_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // offset 0 (byte 0): PentaxModelID — NOT emitted (owned by the 0x0005 leaf).
+
+  // offset 1 (byte 4): ManufactureDate (int32u). ValueConv only (no PrintConv) ⇒
+  // the same value for -j and -n.
+  if let Some(v) = be_u32(block, 4) {
+    push(out, "ManufactureDate", TagValue::Str(manufacture_date(v)));
+  }
+  // offset 2 (byte 8): ProductionCode (int32u[2]) — the default multi-element
+  // ValueConv space-joins the two int32u, then `tr/ /./` (`Pentax.pm:4748`). The
+  // PrintConv (`Pentax.pm:4750`) appends " (camera has been serviced)" when the
+  // value starts with "8."; otherwise it is the bare dotted string (rendered as a
+  // JSON number by the serializer's number gate, e.g. "2.1" → 2.1). Both int32u
+  // elements must be present (byte 8 and byte 12).
+  if let (Some(a), Some(b)) = (be_u32(block, 8), be_u32(block, 12)) {
+    let dotted = std::format!("{a}.{b}");
+    let value = if print_conv && dotted.starts_with("8.") {
+      std::format!("{dotted} (camera has been serviced)")
+    } else {
+      dotted
+    };
+    push(out, "ProductionCode", TagValue::Str(SmolStr::from(value)));
+  }
+  // offset 4 (byte 16): InternalSerialNumber (int32u) — no conv (direct). The
+  // int32u value is emitted as an integer for both -j and -n.
+  if let Some(v) = be_u32(block, 16) {
+    push(out, "InternalSerialNumber", int_value(i64::from(v)));
+  }
 }
 
 /// `($val & mask) >> bitShift`, `bitShift` = the mask's trailing-zero-bit count
