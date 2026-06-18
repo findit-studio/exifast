@@ -1212,7 +1212,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize, doc_base: u32) -> Insta3
       out.warnings.push((
         sticky_doc,
         SmolStr::new(
-          "Insta360 accelerometer data is huge. Processing only the first 20000 records",
+          "[Minor] Insta360 accelerometer data is huge. Processing only the first 20000 records",
         ),
       ));
     }
@@ -1393,7 +1393,7 @@ where
   let mut visit = |rec: RecordView<'_>| -> core::ops::ControlFlow<()> {
     if rec.accel_capped {
       visitor(Insta360StreamItem::Warning(SmolStr::new(
-        "Insta360 accelerometer data is huge. Processing only the first 20000 records",
+        "[Minor] Insta360 accelerometer data is huge. Processing only the first 20000 records",
       )));
     }
     // QuickTimeStream.pl:3355-3357 — a non-multiple fixed-stride record decodes
@@ -1983,7 +1983,7 @@ mod tests {
       &[(
         0,
         SmolStr::new(
-          "Insta360 accelerometer data is huge. Processing only the first 20000 records"
+          "[Minor] Insta360 accelerometer data is huge. Processing only the first 20000 records"
         )
       )]
     );

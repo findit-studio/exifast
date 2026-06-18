@@ -127,6 +127,18 @@ const NOT_ACTIVE: &[&str] = &[
   // `tests/timed_metadata_conformance.rs` (`sony_fx3_rtmd_mp4_*`), with the
   // structural tags + the past-EOF `Track3:Warning` excluded there.
   "QuickTime_sony_fx3_rtmd.mp4",
+  // `QuickTime_insta360_real.insv` (the real OneRS capture, #91) — the
+  // Insta360 trailer decode is byte-exact (see
+  // `tests/timed_metadata_conformance.rs::insta360_real_oners_insv_byte_exact`),
+  // but the OneRS file's full QuickTime `stsd` sample-description boxes + its
+  // 470-sample timed-`text` track are a pre-existing QuickTime *container* gap
+  // (NOT Insta360): the structural trak parse surfaces neither the `stsd` codec
+  // sub-tags (`CompressorID`/`AudioFormat`/`HandlerDescription`/`Gen*`/…) nor the
+  // text-track per-sample `SampleTime`/`SampleDuration`. Its `.json`/`.n.json`
+  // goldens therefore carry 25 structural tags the typed-serde path does not yet
+  // emit, so it is accept-deferred here (the conformance test excludes exactly
+  // those tails and is byte-exact on everything else).
+  "QuickTime_insta360_real.insv",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
