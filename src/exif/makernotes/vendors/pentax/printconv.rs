@@ -713,5 +713,33 @@ pub(crate) const EXTERNAL_FLASH_EXPOSURE_COMP: &[(i64, &str)] = &[
 pub(crate) const EXTERNAL_FLASH_BOUNCE: &[(i64, &str)] =
   &[(0, "n/a"), (16, "Direct"), (48, "Bounce")];
 
+/// `%Pentax::LensData` `3 MinFocusDistance` (`Pentax.pm:4434-4467`) — the masked
+/// (`Mask => 0xf8`) lens minimum-focus-distance code. The keys are the raw
+/// masked value (`($val & 0xf8) >> 3`, 0-20); the labels are the verbatim range
+/// strings. Sorted by key for binary search.
+pub(crate) const MIN_FOCUS_DISTANCE: &[(i64, &str)] = &[
+  (0, "0.13-0.19 m"),
+  (1, "0.20-0.24 m"),
+  (2, "0.25-0.28 m"),
+  (3, "0.28-0.30 m"),
+  (4, "0.35-0.38 m"),
+  (5, "0.40-0.45 m"),
+  (6, "0.49-0.50 m"),
+  (7, "0.6 m"),
+  (8, "0.7 m"),
+  (9, "0.8-0.9 m"),
+  (10, "1.0 m"),
+  (11, "1.1-1.2 m"),
+  (12, "1.4-1.5 m"),
+  (13, "1.5 m"),
+  (14, "2.0 m"),
+  (15, "2.0-2.1 m"),
+  (16, "2.1 m"),
+  (17, "2.2-2.9 m"),
+  (18, "3.0 m"),
+  (19, "4-5 m"),
+  (20, "5.6 m"),
+];
+
 #[cfg(test)]
 mod tests;

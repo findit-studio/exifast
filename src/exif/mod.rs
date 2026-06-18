@@ -8787,6 +8787,22 @@ pub(in crate::exif) fn pentax_makernote_isolated(
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_aeinfo(block, count, print_conv, &mut *sink.emissions);
           }
+          // The nested `%Pentax::LensData` SubDirectory inside `%Pentax::LensInfo2`
+          // (#262 Phase 2b). `emit_lens_info` re-checks the K10D `$count`
+          // `Condition` (the scope-fence — a deferred `LensInfo3`/`4`/`5` count
+          // emits nothing), slices the offset-4 `undef[17]` `LensData` span, and
+          // emits ONLY the five nested lens-detail leaves. The offset-0 `LensType`
+          // is NOT re-emitted — Phase 1's `0x003f LensRec` owns it.
+          SubTable::LensInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_lens_info(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
           SubTable::FlashInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_flashinfo(block, count, print_conv, &mut *sink.emissions);

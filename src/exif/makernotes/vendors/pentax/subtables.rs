@@ -15,6 +15,16 @@
 //! - `%Pentax::FlashInfo` (`0x0208`, `Pentax.pm:4580-4708`) —
 //!   `ProcessBinaryData`. The K10D variant is selected by `Condition =>
 //!   '$count == 27'` (`Pentax.pm:2855`).
+//! - `%Pentax::LensInfo2` (`0x0207`, `Pentax.pm:4240-4271`) —
+//!   `ProcessBinaryData` / `BigEndian` (Phase 2b). Selected by the Main-row
+//!   `Condition => '$count != 90 and $count != 91 and $count != 80 and
+//!   $count != 128 and $count != 168'` (`Pentax.pm:2847`). Its offset-4
+//!   `LensData` `undef[17]` is a NESTED `%Pentax::LensData` SubDirectory
+//!   (`Pentax.pm:4385-4577`); [`emit_lens_info`] slices that 17-byte span and
+//!   emits the five non-`%lensCode` lens-detail leaves (LensFStops,
+//!   MinFocusDistance, LensFocalLength, NominalMaxAperture, NominalMinAperture).
+//!   The LensInfo2-offset-0 `LensType` is NOT re-emitted (Phase 1's `0x003f
+//!   LensRec` owns it).
 //!
 //! ## The `$count`-gated variant scope-fence (the load-bearing correctness point)
 //!
@@ -622,6 +632,168 @@ fn expo_value(secs: f64, print_conv: bool) -> TagValue {
     TagValue::Str(SmolStr::from(printconv::print_exposure_time(secs)))
   } else {
     TagValue::F64(secs)
+  }
+}
+
+/// Decode the nested `%Pentax::LensData` (`Pentax.pm:4385-4577`) leaves from a
+/// `%Pentax::LensInfo2` (`0x0207`) record for the K10D variant
+/// (`Pentax.pm:4240-4271`). `block` is the verbatim on-disk `LensInfo2` record
+/// (`LensType` `int8u[4]` at offset 0, then `LensData` `undef[17]` at offset 4);
+/// `count` is the IFD entry COUNT (the value the `0x0207` SubDirectory-list
+/// `Condition` selects on); `model` is the parent `$$self{Model}`.
+///
+/// ## Scope-fence (the load-bearing correctness point)
+///
+/// The Main-row `Condition => '$count != 90 and $count != 91 and $count != 80
+/// and $count != 128 and $count != 168'` (`Pentax.pm:2847`) selects `LensInfo2`.
+/// A `count` in `{90,91,80,128,168}` is a DIFFERENT model's `LensInfo3` (645D),
+/// `LensInfo4` (K-r/K-5/K-5II), `LensInfo5` (K-01/K-30/…) or the Ricoh GR III
+/// layout — those are deferred, so this emitter emits NOTHING for such a record
+/// (never a bogus decode through the K10D `LensData` offsets). The *ist /
+/// Samsung GX-1 old-`LensInfo` (`Pentax.pm:2825-2833`, table `LensInfo`) is a
+/// distinct earlier layout also deferred; ExifTool tests it FIRST — before the
+/// `$count` condition — via a Model+byte-20 regex, so this emitter mirrors that
+/// order with the old-`LensInfo` gate at the top of the body, which returns zero
+/// emissions for an *ist / GX-1[LS] (or an old-format K100D/K110D) record. The
+/// K10D (which fails that regex) falls through to the `$count` test and decodes.
+///
+/// ## `LensType` is NOT re-emitted
+///
+/// `LensInfo2` offset 0-3 is `LensType` (`Pentax.pm:4245`), but Phase 1 already
+/// emits `LensType` via the `0x003f LensRec` SubDirectory. This emitter reads
+/// ONLY the offset-4 `LensData` slice, so `LensType` stays owned by `0x003f`
+/// (byte-identical) and is never doubled.
+///
+/// ## Nested-slice approach
+///
+/// `LensData` is `Format => 'undef[17]'` at LensInfo2 offset 4
+/// (`Pentax.pm:4267-4270`), i.e. the 17-byte span `block[4..21]`. The five
+/// leaves are read at offsets RELATIVE to that slice start, mirroring the
+/// fixed-block-slice pattern of [`emit_camera_settings`] / [`emit_aeinfo`] —
+/// each read is bounds-checked, so a truncated record skips the out-of-range
+/// leaves (no panic), matching `ProcessBinaryData`'s `last if $entry >= $size`.
+pub(crate) fn emit_lens_info(
+  block: &[u8],
+  count: usize,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // The old-`LensInfo` (`%Pentax::LensInfo`) variant gate, which ExifTool tests
+  // FIRST — BEFORE the `LensInfo2` `$count` condition (`Pentax.pm:2825-2833`):
+  //
+  //   Condition => q{
+  //       $$self{Model}=~/(\*ist|GX-1[LS])/ or
+  //      ($$self{Model}=~/(K100D|K110D)/ and $$valPt=~/^.{20}(\xff|\0\0)/s)
+  //   }
+  //
+  // The `*ist` series and the Samsung `GX-1[LS]` ALWAYS use the old format; the
+  // `K100D`/`K110D`/`K100D Super` use it only when byte 20 of the record is `0xff`
+  // or bytes 20..22 are `00 00` (the old-vs-new marker). The old `%Pentax::LensInfo`
+  // table (`LensData` at offset 3, a distinct earlier layout) is DEFERRED, so —
+  // mirroring ExifTool's ordered variant list — when this condition matches we emit
+  // NOTHING here (the scope-fence) rather than misdecoding through the offset-4
+  // `LensInfo2` `LensData`. `$$valPt` is the verbatim record (`block`); the
+  // `/^.{20}.../s` regex simply fails to match on a record shorter than 21/22 bytes
+  // (byte 20/21 absent ⇒ NOT old-format), so a short block falls through to the
+  // `$count` test below — hence the bounds-checked `block.get` reads.
+  if let Some(m) = model {
+    let ist_or_gx1 = m.contains("*ist") || m.contains("GX-1L") || m.contains("GX-1S");
+    let k100_k110_old = (m.contains("K100D") || m.contains("K110D"))
+      && (block.get(20) == Some(&0xff)
+        || (block.get(20) == Some(&0x00) && block.get(21) == Some(&0x00)));
+    if ist_or_gx1 || k100_k110_old {
+      return;
+    }
+  }
+  // The K10D `LensInfo2` variant gate (`Pentax.pm:2847`): a `$count` in
+  // `{90,91,80,128,168}` is a deferred `LensInfo3`/`4`/`5`/Ricoh-GR-III layout ⇒
+  // emit nothing.
+  if matches!(count, 90 | 91 | 80 | 128 | 168) {
+    return;
+  }
+  // `LensData` = `Format => 'undef[17]'` at LensInfo2 offset 4 — the 17-byte span
+  // `block[4..21]`. A record too short for the full slice falls back to whatever
+  // tail begins at offset 4 (ExifTool extracts a SHORT `undef` value when fewer
+  // bytes remain, then `ProcessBinaryData` reads each leaf with `last if $entry
+  // >= $size`); a record shorter than offset 4 itself yields `&[]` ⇒ no leaf
+  // emits. Every per-leaf read below is additionally bounds-checked.
+  let lens_data: &[u8] = block.get(4..21).or_else(|| block.get(4..)).unwrap_or(&[]);
+  let b = |i: usize| lens_data.get(i).copied();
+
+  // 0.3: LensFStops — `Mask => 0x70` (>>4); `Condition => 'not $$self{NewLensData}'`
+  // (`Pentax.pm:4415-4421`). The K10D `LensInfo2` uses the OLD 17-byte `LensData`
+  // (the `NewLensData = 1` flag is set only by the size-18 `LensInfo4` path,
+  // `Pentax.pm:4340-4344`), so `NewLensData` is structurally FALSE here and the
+  // leaf emits. `ValueConv => '5 + ($val ^ 0x07) / 2'`; there is NO PrintConv, so
+  // BOTH `-j` and `-n` emit the raw ValueConv `f64` — the serializer's number gate
+  // renders an integral float without a trailing `.0` (`6.0` → `6`, matching
+  // ExifTool's JSON number formatting), while a fractional value keeps its
+  // decimals (`8.5`). (Contrast NominalMax/MinAperture below, which DO carry an
+  // `sprintf` PrintConv and so emit a formatted STRING under `-j`.)
+  if let Some(v) = b(0) {
+    let raw = mask(i64::from(v), 0x70);
+    let f = 5.0 + ((raw ^ 0x07) as f64) / 2.0;
+    push(out, "LensFStops", TagValue::F64(f));
+  }
+  // 3: MinFocusDistance — `Mask => 0xf8` (>>3); PrintConv HASH (the masked code →
+  // a range string), `-n` ⇒ the raw masked value (`Pentax.pm:4434-4467`).
+  if let Some(v) = b(3) {
+    let raw = mask(i64::from(v), 0xf8);
+    push(
+      out,
+      "MinFocusDistance",
+      hash(print_conv, raw, printconv::MIN_FOCUS_DISTANCE),
+    );
+  }
+  // 9: LensFocalLength — `Condition => '$$self{Model} !~ /645Z/'`
+  // (`Pentax.pm:4475-4486`); the K10D is not a 645Z, so the leaf emits.
+  // `ValueConv => '10*($val>>2) * 4**(($val&0x03)-2)'`; PrintConv
+  // `sprintf("%.1f mm", $val)`. `-n` ⇒ the raw ValueConv f64.
+  if let Some(v) = b(9) {
+    if model.is_none_or(|m| !m.contains("645Z")) {
+      let raw = i64::from(v);
+      let f = 10.0 * ((raw >> 2) as f64) * 4.0_f64.powi(((raw & 0x03) - 2) as i32);
+      push(
+        out,
+        "LensFocalLength",
+        if print_conv {
+          TagValue::Str(SmolStr::from(std::format!("{f:.1} mm")))
+        } else {
+          TagValue::F64(f)
+        },
+      );
+    }
+  }
+  // 10: NominalMaxAperture — `Mask => 0xf0` (>>4); `ValueConv => '2**($val/4)'`;
+  // PrintConv `sprintf("%.1f", $val)` (`Pentax.pm:4516-4521`).
+  if let Some(v) = b(10) {
+    let raw = mask(i64::from(v), 0xf0);
+    let f = 2.0_f64.powf(raw as f64 / 4.0);
+    push(
+      out,
+      "NominalMaxAperture",
+      if print_conv {
+        fixed1_print(f)
+      } else {
+        TagValue::F64(f)
+      },
+    );
+  }
+  // 10.1: NominalMinAperture — `Mask => 0x0f`; `ValueConv => '2**(($val+10)/4)'`;
+  // PrintConv `sprintf("%.0f", $val)` (`Pentax.pm:4523-4529`).
+  if let Some(v) = b(10) {
+    let raw = mask(i64::from(v), 0x0f);
+    let f = 2.0_f64.powf((raw as f64 + 10.0) / 4.0);
+    push(
+      out,
+      "NominalMinAperture",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{f:.0}")))
+      } else {
+        TagValue::F64(f)
+      },
+    );
   }
 }
 

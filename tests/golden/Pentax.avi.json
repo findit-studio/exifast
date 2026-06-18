@@ -81,5 +81,10 @@
   "Pentax:AEMaxAperture2": 3.8,
   "Pentax:AEMinAperture": 27,
   "Pentax:AEMeteringMode": "Multi-segment",
-  "Pentax:FlashExposureCompSet": -1.0
+  "Pentax:FlashExposureCompSet": -1.0,
+  "Pentax:LensFStops": 6,
+  "Pentax:MinFocusDistance": "0.25-0.28 m",
+  "Pentax:LensFocalLength": "23.1 mm",
+  "Pentax:NominalMaxAperture": 4.0,
+  "Pentax:NominalMinAperture": 27
 }]
