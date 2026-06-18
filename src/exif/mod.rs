@@ -8077,8 +8077,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
           .unwrap_or(&[]);
         match sub {
           SubTable::AfInfo => nikon::emit_af_info(block, print_conv, model, &mut *sink.emissions),
-          SubTable::ColorBalance0103 => {
-            nikon::emit_color_balance(block, order, print_conv, &mut *sink.emissions);
+          SubTable::ColorBalance => {
+            nikon::emit_color_balance(block, order, print_conv, decrypt_keys, &mut *sink.emissions);
           }
           SubTable::LensData => nikon::emit_lens_data(
             block,
@@ -8094,8 +8094,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
           SubTable::ShotInfo => {
             nikon::emit_shot_info(block, print_conv, decrypt_keys, &mut *sink.emissions);
           }
-          // Deferred (encrypted / unported child table): emit nothing.
-          SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
+          // Deferred (unported child table): emit nothing.
+          SubTable::OtherDeferred => {}
         }
         continue;
       }

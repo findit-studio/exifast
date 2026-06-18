@@ -15,9 +15,12 @@
 //! - `AFInfo` (0x0088, `Nikon.pm:2113-2158`) — a `ProcessBinaryData` table
 //!   (BigEndian for DSLRs), UNENCRYPTED → AFAreaMode / AFPoint /
 //!   AFPointsInFocus. WALKED.
-//! - `ColorBalance0103` (0x0097 `0103` variant, `Nikon.pm:2980`/
-//!   `Nikon.pm` `%ColorBalance3`) — D70/D70s, UNENCRYPTED, `Start =>
-//!   '$valuePtr + 20'`, 4×int16u → WB_RGBGLevels. WALKED.
+//! - `ColorBalance` (0x0097, `Nikon.pm:2681-2812`) — version-dispatched on the
+//!   4-byte `ColorBalanceVersion` prefix: the UNENCRYPTED `0103` D70/D70s arm
+//!   (`%ColorBalance3`, `Start => '$valuePtr + 20'`, 4×int16u → WB_RGBGLevels)
+//!   AND the ENCRYPTED `02xx` arms (`%ColorBalance2` → WB_RGGBLevels,
+//!   `%ColorBalance4` → WB_GRBGLevels, decrypted via the SerialNumber +
+//!   ShutterCount keystream). WALKED.
 //! - `LensData` (0x0098, `%Nikon::LensData00`/`LensData01`/…,
 //!   `Nikon.pm:5456`/`5497`/`5582`+) — a `ProcessBinaryData` table
 //!   version-dispatched on the 4-byte `LensDataVersion` prefix
@@ -46,17 +49,14 @@
 //!   `DecryptStart => 4`), else PLAINTEXT. The ~30 model-specific arms
 //!   (ShotInfoD40…Z9 EXTRA fields) are a phase-3 follow-up.
 //!
-//! ## Deferred (encrypted — need the remaining `ProcessNikonEncrypted` tables)
+//! ## Deferred follow-ups
 //!
-//! The ENCRYPTED `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) are
-//! `ProcessNikonEncrypted` sub-tables keyed on the SerialNumber + ShutterCount
-//! XOR keystream (`Nikon.pm:13604` `Decrypt`). They carry a deferred [`SubTable`]
-//! marker so the parent is NOT emitted (the #177/#223 bogus-parent rule), and
-//! their decrypted children stay unported here (a committed Phase 2 follow-up).
-//! The `%LensData0800` NEW Z-lens block (offsets
-//! 0x2f onward — int16u `LensID`/`MaxAperture`/`FNumber` + the
-//! `FocusMode`-gated focus telemetry) likewise stays a follow-up; its
-//! `LensDataVersion` + legacy OldLensData fields ARE emitted.
+//! The `%LensData0800` NEW Z-lens block (offsets 0x2f onward — int16u
+//! `LensID`/`MaxAperture`/`FNumber` + the `FocusMode`-gated focus telemetry)
+//! stays a follow-up; its `LensDataVersion` + legacy OldLensData fields ARE
+//! emitted. The WB-less 0x0097 ColorBalance arms (`0100` `%ColorBalance1`, the
+//! `%ColorBalanceUnknown`/`Unknown2` versions whose offset-0 member is the
+//! `ColorBalanceVersion` re-statement, not a WB-levels array) emit nothing.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -153,9 +153,15 @@ pub enum SubTable {
   /// BigEndian for DSLRs. AFAreaMode (0) / AFPoint (1) / AFPointsInFocus (2).
   /// WALKED.
   AfInfo,
-  /// `%Nikon::ColorBalance3` (`%ColorBalance3`) — D70/D70s, `Start =>
-  /// '$valuePtr + 20'`, 4×int16u → WB_RGBGLevels. UNENCRYPTED. WALKED.
-  ColorBalance0103,
+  /// `ColorBalance` (0x0097) — version-dispatched on the 4-byte
+  /// `ColorBalanceVersion` prefix (`Nikon.pm:2681-2812`): the UNENCRYPTED
+  /// `0103` D70/D70s arm (`%ColorBalance3`, `Start => '$valuePtr + 20'`,
+  /// `WB_RGBGLevels`) AND the ENCRYPTED `02xx` arms (`%ColorBalance2` ⇒
+  /// `WB_RGGBLevels`, `%ColorBalance4` ⇒ `WB_GRBGLevels`, decrypted via
+  /// [`super::decrypt`] with the SerialNumber + ShutterCount keystream). The
+  /// `0100`/`%ColorBalanceUnknown`/`Unknown2` (WB-less) arms emit nothing.
+  /// WALKED.
+  ColorBalance,
   /// `LensData00`/`01`/`02`/… (0x0098) — `ProcessNikonEncrypted`. DEFERRED.
   LensData,
   /// `ShotInfo` (0x0091, `%Nikon::ShotInfo`, `Nikon.pm:5976-6090`) — the BASE
@@ -172,10 +178,6 @@ pub enum SubTable {
   /// WALKED; the other versions (`0102`/`010[345]`/`0106`/`010[78]`/`030[01]`/
   /// other) are not yet ported (a committed follow-up) and emit nothing.
   FlashInfo,
-  /// The ENCRYPTED `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) —
-  /// `ProcessNikonEncrypted`. DEFERRED. (The unencrypted `0100`/`0102`/`0103`
-  /// route to [`Self::ColorBalance0103`] / are walked.)
-  ColorBalanceEncrypted,
   /// Any OTHER `%Nikon::Main` SubDirectory (`PreviewIFD`, `VRInfo`,
   /// `PictureControl`, `ISOInfo`, `WorldTime`, `LocationInfo`, `HDRInfo`,
   /// `AFInfo2`, `NikonSettings`, …) — present in the table so the parent
@@ -191,7 +193,7 @@ impl SubTable {
   pub const fn is_walked(self) -> bool {
     matches!(
       self,
-      SubTable::AfInfo | SubTable::ColorBalance0103 | SubTable::FlashInfo | SubTable::ShotInfo
+      SubTable::AfInfo | SubTable::ColorBalance | SubTable::FlashInfo | SubTable::ShotInfo
     )
   }
 }
@@ -305,10 +307,11 @@ pub const NIKON_TAGS: &[NikonTag] = &[
   tag(0x0095, "NoiseReduction", NikonConv::FormatString),
   // 0x0096 — NEFLinearizationTable (`Nikon.pm`) — `Binary`/`Drop`, no PrintConv.
   tag(0x0096, "NEFLinearizationTable", NikonConv::Raw),
-  // 0x0097 — ColorBalance: the unencrypted `0103` (D70/D70s) is WALKED; the
-  // other variants (encrypted `02xx`, the early `0100`/`0102`) carry a deferred
-  // marker (the dispatcher inspects the version prefix at parse time).
-  sub(0x0097, "ColorBalance", SubTable::ColorBalance0103),
+  // 0x0097 — ColorBalance: WALKED for the unencrypted `0103` (D70/D70s,
+  // WB_RGBGLevels) AND the encrypted `02xx` arms (WB_RGGBLevels / WB_GRBGLevels,
+  // decrypted in `emit_color_balance`); the `emit_color_balance` dispatcher
+  // inspects the 4-byte version prefix and decrypts as needed at parse time.
+  sub(0x0097, "ColorBalance", SubTable::ColorBalance),
   sub(0x0098, "LensData", SubTable::LensData),
   tag(0x0099, "RawImageCenter", NikonConv::Raw),
   tag(0x009a, "SensorPixelSize", NikonConv::SensorPixelSize),
@@ -812,9 +815,9 @@ mod tests {
     assert!(SubTable::AfInfo.is_walked());
     assert_eq!(
       lookup(0x0097).unwrap().sub_table(),
-      Some(SubTable::ColorBalance0103)
+      Some(SubTable::ColorBalance)
     );
-    assert!(SubTable::ColorBalance0103.is_walked());
+    assert!(SubTable::ColorBalance.is_walked());
   }
 
   /// `Flags => 'SubIFD'` (`$$tagInfo{SubIFD}`) is set on EXACTLY the two

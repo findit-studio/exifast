@@ -28,7 +28,7 @@
 //! ## Scope
 //!
 //! See [`tags`]: every readable `%Nikon::Main` scalar + the UNENCRYPTED
-//! fixture sub-tables (`AFInfo`, `ColorBalance0103`, `LensData00`/`01`, and the
+//! fixture sub-tables (`AFInfo`, `ColorBalance`, `LensData00`/`01`, and the
 //! UNENCRYPTED plaintext `FlashInfo0100`). `LensData` decrypts the `02xx`+ arms
 //! ([`decrypt`]); `FlashInfo` (0x00a8) is unencrypted `ProcessBinaryData`
 //! version-dispatched on the 4-byte `FlashInfoVersion` prefix
@@ -325,40 +325,164 @@ pub(crate) fn emit_af_info(
   }
 }
 
-/// Emit `%Nikon::ColorBalance3` (0x0097, the `0103` D70/D70s variant):
-/// `Start => '$valuePtr + 20'`, then `WB_RGBGLevels = int16u[4]` at the
-/// SubDirectory's offset 0, in the SubDirectory's byte order (inherited from
-/// the embedded TIFF). UNENCRYPTED.
+/// The decode plan for one 0x0097 ColorBalance version arm — the
+/// `(TagTable, DecryptStart, DirOffset, member-name)` quadruple transcribed from
+/// the `%Nikon::Main` 0x0097 SubDirectory conditions (`Nikon.pm:2681-2812`) and
+/// the per-table offset-0 `int16u[4]` member (`%ColorBalance2` `WB_RGGBLevels`,
+/// `Nikon.pm:5314`; `%ColorBalance3` `WB_RGBGLevels`, `Nikon.pm:5327`;
+/// `%ColorBalance4` `WB_GRBGLevels`, `Nikon.pm:5339`).
+struct ColorBalancePlan {
+  /// The decrypted-block byte offset at which the offset-0 member is read —
+  /// `ProcessNikonEncrypted`'s `DirStart = DirOffset + DecryptStart`
+  /// (`Nikon.pm:13989`). For the UNENCRYPTED `0103` arm this is the raw
+  /// `Start => '$valuePtr + 20'` delta (`Nikon.pm:2705`) with no decrypt.
+  member_offset: usize,
+  /// `DecryptStart` — the byte from which `ProcessNikonEncrypted` decrypts the
+  /// block (`Nikon.pm:13986`). `None` for the unencrypted `0103` arm (no
+  /// decrypt; the member is read straight from the cleartext value).
+  decrypt_start: Option<usize>,
+  /// The offset-0 member name of the chosen table (`WB_RGGBLevels` for
+  /// `%ColorBalance2`, `WB_RGBGLevels` for `%ColorBalance3`, `WB_GRBGLevels`
+  /// for `%ColorBalance4`).
+  member_name: &'static str,
+}
+
+/// Map the 4-byte `ColorBalanceVersion` prefix to its decode plan, faithfully
+/// transcribing the `%Nikon::Main` 0x0097 SubDirectory `Condition` chain
+/// (`Nikon.pm:2681-2812`). Only the arms whose TagTable carries a readable
+/// `int16u[4]` member are ported — `%ColorBalance2`/`3`/`4`; the
+/// `%ColorBalance1` (`0100`), `%ColorBalanceUnknown`/`Unknown2` arms decode no
+/// WB levels (their offset-0 member is `ColorBalanceVersion`, an `undef[4]`
+/// re-statement of the prefix) and return `None` here. The conditions are
+/// matched in the SAME ORDER as the Perl chain so a version satisfying two
+/// patterns (none do for the ported arms) picks the first.
+fn color_balance_plan(version: &[u8; 4]) -> Option<ColorBalancePlan> {
+  // `WB_RGGBLevels` = `%ColorBalance2` offset 0 (`Nikon.pm:5319`).
+  const CB2: &str = "WB_RGGBLevels";
+  // `WB_GRBGLevels` = `%ColorBalance4` offset 0 (`Nikon.pm:5343`).
+  const CB4: &str = "WB_GRBGLevels";
+  // The two ASCII digits after the leading `02` (e.g. `0206` ⇒ `06` ⇒ 6) for
+  // the numeric range conditions (`/^02(\d{2})/ and $1 < 11`, `Nikon.pm:2732`).
+  let two = |a: u8, b: u8| -> Option<u32> {
+    (a.is_ascii_digit() && b.is_ascii_digit())
+      .then(|| u32::from(a - b'0') * 10 + u32::from(b - b'0'))
+  };
+  // Helper for the encrypted CB2/CB4 arms: `member_offset = DirOffset +
+  // DecryptStart`, decrypt from `DecryptStart` (`Nikon.pm:13986-13989`).
+  let enc = |table: &'static str, decrypt_start: usize, dir_offset: usize| ColorBalancePlan {
+    member_offset: dir_offset + decrypt_start,
+    decrypt_start: Some(decrypt_start),
+    member_name: table,
+  };
+  match version {
+    // `/^0103/` (D70/D70s) — UNENCRYPTED `%ColorBalance3`, `Start =>
+    // '$valuePtr + 20'`, `WB_RGBGLevels` (`Nikon.pm:2700-2707`, `5327`).
+    b"0103" => Some(ColorBalancePlan {
+      member_offset: 20,
+      decrypt_start: None,
+      member_name: "WB_RGBGLevels",
+    }),
+    // `/^0205/` (D50) — `%ColorBalance2`, DecryptStart 4, DirOffset 14
+    // (`Nikon.pm:2709-2718`).
+    b"0205" => Some(enc(CB2, 4, 14)),
+    // `/^02(09|12|14)/` (D3/D300/…) — `%ColorBalance4`, DecryptStart 284,
+    // DirOffset 10 (`Nikon.pm:2720-2730`).
+    b"0209" | b"0212" | b"0214" => Some(enc(CB4, 284, 10)),
+    // `/^0211/` (D90/D5000) — `%ColorBalance4`, DecryptStart 284, DirOffset 16
+    // (`Nikon.pm:2742-2752`).
+    b"0211" => Some(enc(CB4, 284, 16)),
+    // `/^0213/` (D3000) — `%ColorBalance2`, DecryptStart 284, DirOffset 10
+    // (`Nikon.pm:2753-2763`).
+    b"0213" => Some(enc(CB2, 284, 10)),
+    // `/^021[567]/` (D3100/D7000/D5100/D4/…) — `%ColorBalance4`, DecryptStart
+    // 284, DirOffset 4 (`Nikon.pm:2764-2774`).
+    b"0215" | b"0216" | b"0217" => Some(enc(CB4, 284, 4)),
+    // `/^02(19|2[1234])/` (D5300/D3300/D4S/D750/D810/…) — `%ColorBalance2`,
+    // DecryptStart 4, DirOffset 0x7c (`Nikon.pm:2775-2786`).
+    b"0219" | b"0221" | b"0222" | b"0223" | b"0224" => Some(enc(CB2, 4, 0x7c)),
+    // `/^02(\d{2})/ and $1 < 11` (D2X/D2Hs=0206/D200/D40/D60/…) —
+    // `%ColorBalance2`, DecryptStart 284, DirOffset 6 (`Nikon.pm:2731-2741`).
+    // Placed AFTER the explicit `0205`/`0209`/`0211`/`0213` matches above —
+    // those would also satisfy `$1 < 11` (05/09) but the Perl chain tests them
+    // FIRST, so the explicit arms win; only the remaining `02xx` (`<11`) land
+    // here. `0210` (D60) and `0204`/`0207`/`0208` (D2X/D200/D40) match here.
+    [b'0', b'2', a, b] if two(*a, *b).is_some_and(|n| n < 11) => Some(enc(CB2, 284, 6)),
+    // Every other version — `%ColorBalance1` (`0100`), the `%ColorBalanceUnknown`
+    // / `Unknown2` arms (`0220`/`06xx`/`0218`/`02xx>=11 not listed`/`04xx`/`08xx`/
+    // the `0102`/`0500` fallbacks): their offset-0 member is `ColorBalance-
+    // Version` (an `undef[4]`), NOT a WB-levels array, so no `WB_*Levels` tag is
+    // emitted (a documented long-tail follow-up).
+    _ => None,
+  }
+}
+
+/// Emit the 0x0097 ColorBalance white-balance levels — the unencrypted
+/// `%ColorBalance3` (`0103` D70/D70s ⇒ `WB_RGBGLevels`) AND the ENCRYPTED
+/// `%ColorBalance2`/`%ColorBalance4` arms (`02xx` ⇒ `WB_RGGBLevels` /
+/// `WB_GRBGLevels`), version-dispatched on the 4-byte `ColorBalanceVersion`
+/// prefix ([`color_balance_plan`], `Nikon.pm:2681-2812`).
 ///
-/// The other 0x0097 variants (encrypted `02xx`, the early `0100`/`0102`) are
-/// NOT walked here — the version prefix gates them; a non-`0103` prefix emits
-/// nothing (deferred). This keeps the byte-exact D70/.nef WB_RGBGLevels while
-/// the encrypted variants await `Nikon::Decrypt`.
+/// The encrypted arms are processed by `ProcessNikonEncrypted` (`Nikon.pm:13942`):
+/// it RETURNS 0 — extracting NOTHING — when the serial/count decrypt keys are
+/// missing/invalid (`Nikon.pm:13948-13961`), so a `None` `keys` emits nothing for
+/// those versions (the unencrypted `0103` arm is `keys`-independent). For an
+/// encrypted arm with valid keys, the block is decrypted from `DecryptStart`
+/// (mirroring [`emit_lens_data`]); the offset-0 `int16u[4]` member is then read
+/// at `DirOffset + DecryptStart` (`ProcessNikonEncrypted`'s `DirStart`,
+/// `Nikon.pm:13989`), in the SubDirectory's inherited byte order. A short or
+/// malformed value (the member runs past the block) emits nothing.
 pub(crate) fn emit_color_balance(
   sub: &[u8],
   order: ByteOrder,
   print_conv: bool,
+  keys: Option<DecryptKeys>,
   emissions: &mut Vec<VendorEmission>,
 ) {
-  // The version prefix is the first 4 ASCII bytes of the ColorBalance value.
-  let prefix = sub.get(0..4).unwrap_or(&[]);
-  if prefix != b"0103" {
-    // Not the unencrypted D70 variant — deferred (encrypted or unported).
-    return;
-  }
-  // `Start => '$valuePtr + 20'` (`Nikon.pm:2705`) then `WB_RGBGLevels =
-  // int16u[4]` at the ColorBalance3 table's offset 0 (`Nikon.pm:5327-5335`) —
-  // 8 bytes. The child read is bounded by the PARENT tag's declared value
-  // (ExifTool's `ProcessBinaryData` `DirLen` = the parent value size adjusted
-  // by the `Start` delta, and it stops when no bytes remain), so read EXACTLY
-  // those 8 bytes from WITHIN `sub` at offset 20 — NOT from any bytes past the
-  // parent value's declared extent. A ColorBalance value shorter than 28 bytes (20-byte
-  // `Start` delta + the 8-byte record) cannot hold the record: emit nothing
-  // rather than over-reading the next IFD entry / trailing buffer.
-  let Some(record) = sub.get(20..28) else {
+  // `ColorBalanceVersion` = the first 4 ASCII bytes (`Condition => '$$valPt =~
+  // /^…/'`). A value shorter than 4 bytes matches no arm.
+  let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
     return;
   };
-  // 4 × int16u, in the SubDirectory's inherited byte order.
+  let Some(plan) = color_balance_plan(version) else {
+    return; // An unported / WB-less version (deferred long-tail).
+  };
+  // The decoded block: the raw bytes for the UNENCRYPTED `0103` arm, or a
+  // decrypted copy for the encrypted CB2/CB4 arms. The 4-byte version prefix is
+  // NEVER encrypted (every encrypted arm's `DecryptStart >= 4`).
+  let decoded: std::borrow::Cow<'_, [u8]> = match plan.decrypt_start {
+    Some(decrypt_start) => {
+      // `ProcessNikonEncrypted` returns 0 (NOTHING) without valid keys
+      // (`Nikon.pm:13948-13961`); `scan_decrypt_keys` returns `Some` IFF the
+      // keys are present + valid, so gate the whole emission on it.
+      let Some(keys) = keys else {
+        return;
+      };
+      // Cap the clone+decrypt to the byte range actually read (the member runs
+      // `[member_offset, member_offset + 8)`), so a large in-bounds value does
+      // not force a copy + linear decrypt of bytes never read (the
+      // [`emit_lens_data`] R2 discipline). `member_offset >= decrypt_start`, so
+      // the read window is within the decrypted region.
+      let cap = plan.member_offset.saturating_add(8).min(sub.len());
+      let mut buf = sub.get(..cap).unwrap_or(sub).to_vec();
+      let len = buf.len().saturating_sub(decrypt_start);
+      decrypt::decrypt(&mut buf, decrypt_start, len, keys.serial, keys.count);
+      std::borrow::Cow::Owned(buf)
+    }
+    None => std::borrow::Cow::Borrowed(sub),
+  };
+  let body = decoded.as_ref();
+  // The offset-0 `int16u[4]` member at the resolved `member_offset` — 8 bytes.
+  // The read is bounded by the value's declared extent (a value too short to
+  // hold the member emits nothing rather than over-reading), mirroring
+  // `ProcessBinaryData` stopping when no bytes remain.
+  let Some(record) = body
+    .get(plan.member_offset..)
+    .and_then(|tail| tail.get(..8))
+  else {
+    return;
+  };
+  // 4 × int16u, in the SubDirectory's inherited byte order (no table-level
+  // `ByteOrder` directive on any ColorBalance arm).
   let Some(raw) = read_value(record, 0, Format::Int16u, 4, record.len(), order) else {
     return;
   };
@@ -367,7 +491,7 @@ pub(crate) fn emit_color_balance(
   let Some(value) = NikonConv::Raw.apply(&parsed, print_conv, None, order) else {
     return;
   };
-  emissions.push(VendorEmission::new("WB_RGBGLevels".into(), value, false));
+  emissions.push(VendorEmission::new(plan.member_name.into(), value, false));
 }
 
 /// Emit the `%Nikon::FlashInfo0100` leaves (0x00a8) — an UNENCRYPTED plaintext
@@ -1966,6 +2090,98 @@ mod tests {
     );
     // And no bogus ColorBalance parent (the SubDirectory pointer never emits it).
     assert!(emissions.iter().all(|e| e.name() != "ColorBalance"));
+  }
+
+  /// The ENCRYPTED ColorBalance2 arm (`0206`, NikonD2Hs — `%ColorBalance2`,
+  /// `DecryptStart => 284`, `DirOffset => 6`): `emit_color_balance` decrypts the
+  /// block from offset 284 and reads `WB_RGGBLevels = int16u[4]` at the
+  /// `ProcessNikonEncrypted` `DirStart = DirOffset + DecryptStart = 290`. Forge a
+  /// known-plaintext block (the levels live at decrypted offset 290), ENCRYPT it
+  /// with the crafted keys (the symmetric cipher), and assert the round-trip
+  /// decode reproduces the levels. With `keys = None` (ProcessNikonEncrypted
+  /// returns nothing) the arm emits nothing.
+  #[test]
+  fn color_balance_encrypted_cb2_round_trips_wb_rggblevels() {
+    // DecryptStart 284 + DirOffset 6 = member at decrypted offset 290.
+    let mut plain = std::vec![0u8; 298];
+    plain.get_mut(0..4).unwrap().copy_from_slice(b"0206");
+    // WB_RGGBLevels = 562 256 256 537 (big-endian int16u[4]) at offset 290.
+    let levels: [u16; 4] = [562, 256, 256, 537];
+    for (i, v) in levels.iter().enumerate() {
+      plain
+        .get_mut(290 + i * 2..290 + i * 2 + 2)
+        .unwrap()
+        .copy_from_slice(&v.to_be_bytes());
+    }
+    // Encrypt from DecryptStart 284 (the cipher is symmetric).
+    let mut enc = plain.clone();
+    let len = enc.len().saturating_sub(284);
+    decrypt::decrypt(&mut enc, 284, len, KEY_SERIAL, KEY_COUNT);
+    assert_ne!(enc, plain, "the crafted block must actually be encrypted");
+
+    let keys = DecryptKeys {
+      serial: KEY_SERIAL,
+      count: KEY_COUNT,
+    };
+    let mut em: Vec<VendorEmission> = Vec::new();
+    emit_color_balance(&enc, ByteOrder::Big, false, Some(keys), &mut em);
+    let wb = em
+      .iter()
+      .find(|e| e.name() == "WB_RGGBLevels")
+      .map(|e| e.value().clone());
+    assert_eq!(
+      wb,
+      Some(TagValue::Str(SmolStr::new("562 256 256 537"))),
+      "encrypted ColorBalance2 must decode WB_RGGBLevels, got {em:?}"
+    );
+
+    // Without keys, ProcessNikonEncrypted extracts nothing.
+    let mut em_nokey: Vec<VendorEmission> = Vec::new();
+    emit_color_balance(&enc, ByteOrder::Big, false, None, &mut em_nokey);
+    assert!(
+      em_nokey.is_empty(),
+      "no decrypt keys ⇒ the encrypted arm emits nothing, got {em_nokey:?}"
+    );
+  }
+
+  /// The ENCRYPTED ColorBalance4 arm (`0211`, D90/D5000 — `%ColorBalance4`,
+  /// `DecryptStart => 284`, `DirOffset => 16`): the offset-0 member is
+  /// `WB_GRBGLevels` (a DIFFERENT name from CB2's `WB_RGGBLevels`), read at
+  /// `DirStart = 16 + 284 = 300`. Confirms the CB4 family is dispatched with its
+  /// own member name + offset.
+  #[test]
+  fn color_balance_encrypted_cb4_round_trips_wb_grbglevels() {
+    // DecryptStart 284 + DirOffset 16 = member at decrypted offset 300.
+    let mut plain = std::vec![0u8; 308];
+    plain.get_mut(0..4).unwrap().copy_from_slice(b"0211");
+    let levels: [u16; 4] = [600, 256, 256, 580];
+    for (i, v) in levels.iter().enumerate() {
+      plain
+        .get_mut(300 + i * 2..300 + i * 2 + 2)
+        .unwrap()
+        .copy_from_slice(&v.to_be_bytes());
+    }
+    let mut enc = plain.clone();
+    let len = enc.len().saturating_sub(284);
+    decrypt::decrypt(&mut enc, 284, len, KEY_SERIAL, KEY_COUNT);
+
+    let keys = DecryptKeys {
+      serial: KEY_SERIAL,
+      count: KEY_COUNT,
+    };
+    let mut em: Vec<VendorEmission> = Vec::new();
+    emit_color_balance(&enc, ByteOrder::Big, false, Some(keys), &mut em);
+    let wb = em
+      .iter()
+      .find(|e| e.name() == "WB_GRBGLevels")
+      .map(|e| e.value().clone());
+    assert_eq!(
+      wb,
+      Some(TagValue::Str(SmolStr::new("600 256 256 580"))),
+      "encrypted ColorBalance4 must decode WB_GRBGLevels, got {em:?}"
+    );
+    // And it must NOT use the CB2 name.
+    assert!(em.iter().all(|e| e.name() != "WB_RGGBLevels"));
   }
 
   /// An empty / too-short blob yields nothing (no panic).
