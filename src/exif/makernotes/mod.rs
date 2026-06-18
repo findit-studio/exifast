@@ -104,7 +104,8 @@ pub use vendor::{Vendor, VendorStatus};
 #[cfg(feature = "alloc")]
 pub use vendors::VendorEmission;
 pub use vendors::{
-  AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesNikon, PanasonicMakerNote, SonyMakerNote,
+  AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesNikon, MakerNotesPentax,
+  PanasonicMakerNote, SonyMakerNote,
 };
 
 /// Typed MakerNotes metadata — the top-level surface for vendor MakerNote
@@ -139,6 +140,9 @@ pub struct MakerNotesMeta {
   /// the Nikon port runs (`%Nikon::Main`, the readable scalars + AFInfo +
   /// ColorBalance).
   nikon: Option<MakerNotesNikon>,
+  /// Pentax decoded data — populated when [`Vendor::Pentax`] dispatched AND
+  /// the Pentax port runs (`%Pentax::Main`, the readable scalars + LensType).
+  pentax: Option<MakerNotesPentax>,
 }
 
 impl MakerNotesMeta {
@@ -156,6 +160,7 @@ impl MakerNotesMeta {
       panasonic: None,
       dji: None,
       nikon: None,
+      pentax: None,
     }
   }
 
@@ -196,6 +201,12 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub fn set_nikon(&mut self, nikon: MakerNotesNikon) {
     self.nikon = Some(nikon);
+  }
+
+  /// Replace the Pentax slot — used by the IFD walker during walk.
+  #[inline(always)]
+  pub fn set_pentax(&mut self, pentax: MakerNotesPentax) {
+    self.pentax = Some(pentax);
   }
 
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
@@ -481,6 +492,35 @@ impl MakerNotesMeta {
             .unwrap_or_default(),
         );
       }
+      Vendor::Pentax => {
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::pentax_makernote_isolated`), over the
+        // captured blob (`mn_offset = 0`, `mn_len = blob.len()`). The Pentax
+        // primary (`AOC\0`) inherits the parent base and is self-contained, so
+        // the standalone-blob walk is faithful; the dispatched `detected` carries
+        // the body offset / `Unknown` byte order / `FixBase` the helper threads.
+        // `make`/`model` are threaded so the FixBase heuristic's PENTAX
+        // absolute-addressing arm fires; a dispatched `NotIFD => 1` variant
+        // (Pentax4, an unported binary table) emits NOTHING — the helper gates it
+        // internally, so this arm never produces bogus `%Pentax::Main` tags.
+        // With `print_conv = true` it returns the typed slot built from the
+        // walked entries; a short/rejected/NotIFD MakerNote yields `Some(empty)`.
+        // The emissions are discarded — `from_blob` sets only the typed slot.
+        meta.pentax = Some(
+          crate::exif::pentax_makernote_isolated(
+            blob,
+            0,
+            blob.len(),
+            detected,
+            parent_order,
+            make,
+            model,
+            true,
+          )
+          .map(|(_emissions, typed)| typed)
+          .unwrap_or_default(),
+        );
+      }
       _ => {}
     }
     meta
@@ -547,6 +587,14 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub const fn nikon(&self) -> Option<&MakerNotesNikon> {
     self.nikon.as_ref()
+  }
+
+  /// Pentax decoded data. `None` unless [`Vendor::Pentax`] dispatched and the
+  /// Pentax port ran.
+  #[must_use]
+  #[inline(always)]
+  pub const fn pentax(&self) -> Option<&MakerNotesPentax> {
+    self.pentax.as_ref()
   }
 }
 

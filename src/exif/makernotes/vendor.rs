@@ -292,6 +292,11 @@ impl Vendor {
       // the family-1 group is the module name `Nikon`, so `-G1` emits
       // `Nikon:Quality` etc.
       Vendor::Nikon => "Nikon",
+      // Pentax MakerNotes route to `Image::ExifTool::Pentax::Main`
+      // (`Pentax.pm` `GROUPS => { 0 => 'MakerNotes', 2 => 'Camera' }`); the
+      // family-1 group is the module name `Pentax`, so `-G1` emits
+      // `Pentax:LensType` etc.
+      Vendor::Pentax => "Pentax",
       _ => "MakerNotes",
     }
   }

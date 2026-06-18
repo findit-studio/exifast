@@ -604,6 +604,15 @@ enum ResolvedConv {
   /// `walk_nikon_ifd`); the sub-table dispatch + the dedicated capture loop land
   /// in N2 — proven byte-identical by the differential test in `mod.rs`.
   Nikon(&'static makernotes::vendors::nikon::tags::NikonTag),
+  /// A Pentax maker-note leaf (`%Pentax::Main` descriptor). Carries the resolved
+  /// [`PentaxTag`](makernotes::vendors::pentax::tags::PentaxTag) so the emit
+  /// reapplies its
+  /// [`PentaxPrintConv`](makernotes::vendors::pentax::printconv::PentaxPrintConv)
+  /// and reads its `Unknown=>1` flag. Pentax is a SIMPLE vendor (#262): a plain
+  /// LEAF table walked under `active_table == Pentax`, plus the ONE `0x003f
+  /// LensRec` SubDirectory whose `LensType` child the dedicated capture loop
+  /// emits (the parent pointer is never emitted, the Nikon SubDirectory pattern).
+  Pentax(&'static makernotes::vendors::pentax::tags::PentaxTag),
 }
 
 impl ResolvedConv {
@@ -626,6 +635,7 @@ impl ResolvedConv {
       // arms return `Some("Nikon")`; the discriminant carries no table, so the
       // `Nikon` arm covers it (the Type2 walk emits under the same vendor group).
       ResolvedConv::Nikon(_) => vendor_group1_of(TableRef::Nikon),
+      ResolvedConv::Pentax(_) => vendor_group1_of(TableRef::Pentax),
     }
   }
 }
@@ -676,6 +686,11 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // and the Type2 layout group under `Nikon` (Type2 is the same vendor's
     // headerless variant, `%Image::ExifTool::Nikon::Type2`).
     TableRef::Nikon | TableRef::NikonType2 => Some("Nikon"),
+    // `%Pentax::Main` (#262). A Pentax maker-note leaf emits under the `Pentax`
+    // family-1 group, exactly as bundled derives family-1 from the vendor module
+    // (`Pentax.pm` `GROUPS => { 0 => 'MakerNotes', 2 => 'Camera' }`, so
+    // `exiftool -j -G1` emits `Pentax:LensType`).
+    TableRef::Pentax => Some("Pentax"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
     // tables never reach the emit through this walker.
     TableRef::Exif | TableRef::Gps | TableRef::Interop | TableRef::Samsung => None,
@@ -788,6 +803,24 @@ enum MakerNoteValueConvDecode<'a> {
     mn_offset: usize,
     mn_len: usize,
     order: ByteOrder,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Pentax — re-drive the SHARED `Walker`'s Pentax Main walk + emission capture
+  /// ([`pentax_makernote_isolated`]) with `print_conv = false` (#262). The walk
+  /// is deterministic across the PrintConv flag (same bytes, same `detected`
+  /// modes; only the per-leaf render differs), so the recomputed `-n` emissions
+  /// are byte-identical to the eager `-n` cache. The dispatched `detected`
+  /// carries the body offset / `Unknown` byte order / `FixBase` the walk threads.
+  /// `make`/`model` are the parent `$$self{Make}`/`$$self{Model}` the FixBase
+  /// heuristic's PENTAX absolute-addressing arm reads (retained so the `-n`
+  /// recompute resolves the SAME base shift as the `-j` decode).
+  Pentax {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    detected: makernotes::DetectedMakerNote,
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
     model: Option<smol_str::SmolStr>,
   },
 }
@@ -945,6 +978,34 @@ impl MakerNoteValueConvDecode<'_> {
         nikon_makernote_isolated(data, *mn_offset, *mn_len, *order, model.as_deref(), false)
           .map(|(e, _)| e)
           .unwrap_or_default()
+      }
+      MakerNoteValueConvDecode::Pentax {
+        data,
+        mn_offset,
+        mn_len,
+        detected,
+        order,
+        make,
+        model,
+      } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and
+        // the typed slot discarded (the `-n` path needs only the ValueConv
+        // emissions), mirroring the other vendors (#262). A blob that walked in
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes are
+        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
+        // the defensive empty `Vec` for the impossible `None`.
+        pentax_makernote_isolated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *detected,
+          *order,
+          make.as_deref(),
+          model.as_deref(),
+          false,
+        )
+        .map(|(e, _)| e)
+        .unwrap_or_default()
       }
     }
   }
@@ -2702,7 +2763,14 @@ struct Walker<'a, 'g> {
   /// user (#243 phase 3). INLINE values (`size <= 4`) carry no pointer and are
   /// NEVER shifted (`Exif.pm:6504`). DISTINCT from [`base`](Self::base) (the
   /// `IsOffset` file-offset addend, which Panasonic Main never uses).
-  value_offset_base: usize,
+  ///
+  /// SIGNED: the [`fix_base`](makernotes::fixbase::fix_base) correction `$fix =
+  /// makeDiff - diff` is of EITHER sign, so the `-new_data_pos` it stores can be
+  /// negative (value pointer AFTER the IFD ⇒ a BACKWARD shift) as well as
+  /// positive (the Panasonic `Base => 12` forward case). Out-of-line offsets
+  /// resolve with checked signed arithmetic (`off = raw_off as i64 +
+  /// value_offset_base`, bounds-checked BOTH ends) at the resolution site below.
+  value_offset_base: i64,
   /// Every emitted tag, in walk order (owned).
   entries: Vec<ExifEntry>,
   /// `$et->Warn(...)` messages collected during the walk, in emission
@@ -3739,6 +3807,10 @@ impl Walker<'_, '_> {
       TableRef::NikonType2 => makernotes::vendors::nikon::NikonTable::Type2
         .lookup(tag_id)
         .map(|t| t.name()),
+      // `%Pentax::Main` (#262). An unknown Pentax tag yields `None` (the
+      // unknown-tag warning form), matching `ProcessExif`'s `next unless
+      // $tagInfo` skip for an unported id.
+      TableRef::Pentax => makernotes::vendors::pentax::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -3905,11 +3977,25 @@ impl Walker<'_, '_> {
       // resolved pointer is `raw_off + value_offset_base` (`= raw_off + 12`),
       // reproducing `walk_panasonic_in_tiff`'s `abs_off` (`panasonic/body.rs:150`).
       // The shift is applied HERE, BEFORE every bounds check, exactly as ExifTool
-      // resolves `$valuePtr` before the `:6549` EOF / `:6675` suspect tests. A
-      // `saturating_add` keeps a degenerate `raw_off`/base near `usize::MAX` from
-      // wrapping the checks below (it lands past EOF ⇒ the read/bad-offset arm,
-      // never a low-address false pass).
-      let off = raw_off.saturating_add(self.value_offset_base);
+      // resolves `$valuePtr` before the `:6549` EOF / `:6675` suspect tests.
+      //
+      // SIGNED resolution (`Exif.pm:6549` `$valuePtr < 0 or $valuePtr + $size >
+      // $dataLen`): `value_offset_base` is the negated `$dataPos`, which a
+      // [`fix_base`](makernotes::fixbase::fix_base) `$fix = makeDiff - diff` can
+      // drive NEGATIVE (a value pointer farther AFTER the IFD than the make
+      // offset ⇒ a positive `$fix` ⇒ a positive `new_data_pos` ⇒ a NEGATIVE
+      // `value_offset_base` ⇒ the pointer must move BACKWARD). So resolve in
+      // `i64` and treat a resolved `off < 0` exactly as ExifTool's `$valuePtr <
+      // 0` arm — the SAME branch as the `off + size > dataLen` overrun below
+      // (`6549` ORs the two). The sum is range-checked, never wrapped — a pointer
+      // resolving outside the buffer is dropped/skipped, never re-cast low.
+      // `raw_off` is a `u32` value held in `usize` (from `get_u32`), so the
+      // `try_from` only saturates a (never-reached) 64-bit-huge `raw_off` to
+      // `i64::MAX`, which lands past EOF ⇒ the out-of-range arm; `saturating_add`
+      // likewise keeps a degenerate base near the `i64` bound from wrapping low.
+      let off_signed = i64::try_from(raw_off)
+        .unwrap_or(i64::MAX)
+        .saturating_add(self.value_offset_base);
       // An out-of-line value pointer is subject to two ExifTool bounds checks, in
       // this precedence:
       //
@@ -3956,12 +4042,21 @@ impl Walker<'_, '_> {
       // test (Exif.pm:6672); for an overrun-AND-suspect value the read's
       // `return 0` fires first, so the suspect `next` is never reached.
       let dir = kind.as_str();
-      // `$valuePtr + $size` (Exif.pm:6531) — `checked_add` so an out-of-line
-      // `off`/`size` near `usize::MAX` on a 32-bit target cannot wrap the
-      // EOF test (and so the wrapped sum cannot pass a low-address bounds
-      // check). The validated end is reused for the IFD-overlap test below.
-      let value_end = match off.checked_add(size) {
-        Some(end) if end <= data.len() => end,
+      // `$valuePtr < 0 or $valuePtr + $size > $dataLen` (Exif.pm:6549) — the
+      // SINGLE out-of-range test, with `value_offset_base` now SIGNED. Resolve
+      // `off_signed` to a `usize` pointer + non-overflowing end ONLY when it is
+      // BOTH non-negative AND `off + size <= dataLen`; either failure (a
+      // backward FixBase shift that underflows past 0, or a forward overrun)
+      // takes the SAME branch ExifTool's OR'd condition does (the no-RAF
+      // `Bad offset` skip / the RAF `Error reading value` abort below). Computed
+      // entirely in `usize` once `off_signed >= 0`, so a value pointer near
+      // `usize::MAX` cannot wrap the EOF test. The validated `off` + end are
+      // reused for the IFD-overlap test below.
+      let (off, value_end) = match usize::try_from(off_signed)
+        .ok()
+        .and_then(|off| off.checked_add(size).map(|end| (off, end)))
+      {
+        Some((off, end)) if end <= data.len() => (off, end),
         // Two cases take the no-RAF `else` branch (`Exif.pm:6616-6670`) —
         // `Bad offset for $dir $tagStr` (`Exif.pm:6660`) + `$bad = 1` (the
         // value is dropped) + CONTINUE the loop. `$tagStr` is the name-if-known
@@ -4211,6 +4306,13 @@ impl Walker<'_, '_> {
       // `nikon::format_override`). Resolving it here keeps the shared-Walker walk
       // byte-identical to the `walk_nikon_ifd` oracle.
       TableRef::Nikon | TableRef::NikonType2 => makernotes::vendors::nikon::format_override(tag_id),
+      // `%Pentax::Main` (#262). Like Nikon, `pentax::format_override` reproduces
+      // the IMPLICIT-`undef` SubDirectory override (`Exif.pm:6733`): the `0x003f
+      // LensRec` SubDirectory tag has no explicit `Format`, so it reads as
+      // `undef` — the whole `%Pentax::LensRec` block reaches the child walker AND
+      // is exempt from the excessive-count guard. Without this the LensRec value
+      // span never materializes and `LensType` cannot emit.
+      TableRef::Pentax => makernotes::vendors::pentax::format_override(tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -4345,25 +4447,28 @@ impl Walker<'_, '_> {
     } else {
       format
     };
-    // NIKON implicit-`undef` SubDirectory — the binary-block sub-tables (AFInfo /
-    // ColorBalance / LensData / FlashInfo / ShotInfo) whose decoded leaf value is
-    // DEAD: the Nikon capture loop dispatches them by re-slicing the on-disk SPAN
-    // (`value_offset`/`read_len`) from `self.data`, never the `ExifEntry`'s value
-    // (#243 phase 3-bis). So store a ZERO-COPY empty `RawValue::Bytes` instead of
-    // `read_value`-cloning the (possibly crafted-huge, in-bounds) `undef[N]` block —
-    // mirroring the oracle's own `RawValue::Bytes(Vec::new())` for the SAME
-    // `implicit_undef` predicate (`body.rs` `walk_nikon_ifd`). The full extent is
+    // VENDOR implicit-`undef` SubDirectory — a binary-block sub-table whose decoded
+    // leaf value is DEAD: the vendor capture loop dispatches it by re-slicing the
+    // on-disk SPAN (`value_offset`/`read_len`) from `self.data`, never the
+    // `ExifEntry`'s value. For Nikon these are AFInfo / ColorBalance / LensData /
+    // FlashInfo / ShotInfo (#243 phase 3-bis); for Pentax the `0x003f LensRec`
+    // block (whose `LensType` child the capture loop reads from the span, #262). So
+    // store a ZERO-COPY empty `RawValue::Bytes` instead of `read_value`-cloning the
+    // (possibly crafted-huge, in-bounds) `undef[N]` block — mirroring the oracle's
+    // own `RawValue::Bytes(Vec::new())` for the SAME predicate. The full extent is
     // already proven in-bounds (the out-of-line `value_end > data.len()` Bad-offset
     // drop / the inline `entry+12` bound above), so `read_value` here could only
     // return `Some` — skipping it changes NO walk decision, only the retained heap.
     // This CLOSES the heap-amplification the finding names: many SubDirectory
-    // entries (e.g. duplicated 0x0098 LensData) pointing at ONE large in-bounds
-    // block now retain NOTHING, where a per-entry materialized copy drove
-    // `N * value_size` growth from a sub-MB MakerNote. A `SubIFD` pointer is NOT
-    // implicit-`undef` (excluded by the predicate), so its real integer offset
-    // value is unaffected; every non-Nikon table also skips this branch.
-    let raw = if matches!(self.active_table, TableRef::Nikon | TableRef::NikonType2)
-      && makernotes::vendors::nikon::is_implicit_undef_subdir(tag_id)
+    // entries (e.g. duplicated 0x0098 LensData, or many 0x003f LensRec) pointing at
+    // ONE large in-bounds block now retain NOTHING, where a per-entry materialized
+    // copy drove `N * value_size` growth from a sub-MB MakerNote. A `SubIFD` pointer
+    // is NOT implicit-`undef` (excluded by each predicate), so its real integer
+    // offset value is unaffected; every other table skips this branch.
+    let raw = if (matches!(self.active_table, TableRef::Nikon | TableRef::NikonType2)
+      && makernotes::vendors::nikon::is_implicit_undef_subdir(tag_id))
+      || (self.active_table == TableRef::Pentax
+        && makernotes::vendors::pentax::is_implicit_undef_subdir(tag_id))
     {
       RawValue::Bytes(Vec::new())
     } else {
@@ -4533,11 +4638,13 @@ impl Walker<'_, '_> {
   ///
   /// `Fixed(parent_order)` resolves to `self.order` unchanged, `No` runs no
   /// `fix_base`, and `Exif` runs no `locate_ifd`, so the save/restore of
-  /// `self.order` and the `ifd_start` passed on are no-ops for every current
-  /// caller. The full base/`data_pos` mutation that a non-`No` `fix_base`
-  /// implies is applied by the Phase-2 vendor migration (the Walker's `base`
-  /// model is threaded then); here `fix_base` is INVOKED behind the
-  /// `!= No` gate (wiring the feature in) but the core path never reaches it.
+  /// `self.order` and the `ifd_start` passed on are no-ops for a core sub-IFD.
+  /// A non-`No` `fix_base` (the isolated Pentax walk, `FixBase => 1`) APPLIES the
+  /// heuristic's `$$dirInfo{Base}`/`$$dirInfo{DataPos}` mutation to the walker's
+  /// [`base`](Self::base) / [`value_offset_base`](Self::value_offset_base) before
+  /// the walk and RESTORES them after (the per-`$$dirInfo` scoping the order /
+  /// table / warn-count fields already get), so the value-offset correction is
+  /// live for that directory only.
   #[cfg_attr(not(feature = "alloc"), allow(dead_code))]
   fn process_subdir(
     &mut self,
@@ -4590,16 +4697,33 @@ impl Walker<'_, '_> {
 
     // ---- Pre-walk hook 3: FixBase (`MakerNotes.pm:1282-1484`). The offset-
     // correction heuristic runs ONLY when a `FixBase` directive is present
-    // (`!= No`); its base/`data_pos` mutation is applied by the Phase-2 vendor
-    // migration (the Walker's `base` is threaded then). Computing it here wires
-    // the feature behind the directive gate. INERT for `FixBaseMode::No` (every
-    // core sub-IFD), so the result is discarded with no effect on the walk.
+    // (`!= No`); it analyses the maker-note IFD's value offsets and APPLIES the
+    // resulting `$$dirInfo{Base} += $fix` / `$$dirInfo{DataPos} -= $fix` shift to
+    // the walker's value-offset resolution BEFORE the walk. INERT for
+    // `FixBaseMode::No` (every core sub-IFD / inherit-base vendor), where the
+    // block does not fire — so `base`/`value_offset_base` are untouched and the
+    // walk stays byte-identical. The ONLY caller passing `!= No` is the isolated
+    // Pentax walk (`pentax_makernote_isolated`, `FixBase => 1`), which threads the
+    // parent `$$self{Make}`/`$$self{Model}` (the PENTAX-make absolute-addressing
+    // arm of `GetMakerNoteOffset`) and discards the mutated walker on return — so
+    // the save/restore below is a no-op for it, but is kept for the recursion
+    // safety the other pre-walk fields (order / table / warn_count) already have.
+    let saved_base = self.base;
+    let saved_value_offset_base = self.value_offset_base;
     if let Some(dir_fix_base) = fix_base.dir_fix_base() {
+      // ExifTool's `$$dirInfo{DataPos}` is the NEGATIVE of the port's
+      // `value_offset_base` (an out-of-line pointer resolves at
+      // `raw_off + value_offset_base == raw_off - $dataPos`,
+      // [`value_offset_base`](Walker::value_offset_base) / `Exif.pm:6546`); feed
+      // it as such so the gap analysis sees the same `$expected` ExifTool does.
+      // `value_offset_base` is already `i64`; `saturating_neg` only guards the
+      // unreachable `i64::MIN` (no producer reaches a base near it).
+      let data_pos = self.value_offset_base.saturating_neg();
       let input = makernotes::fixbase::FixBaseInput::new(
         self.data,
         ifd_start,
         self.data.len().saturating_sub(ifd_start),
-        i64::from(self.base),
+        data_pos,
         i64::from(self.base),
         resolved_order,
         self.captured_make.as_deref().unwrap_or(""),
@@ -4607,9 +4731,21 @@ impl Walker<'_, '_> {
       )
       .with_file_types(self.file_type.as_deref(), None)
       .with_dir_fix_base(Some(dir_fix_base));
-      // Phase-0/1: the heuristic is wired but its base shift is consumed by the
-      // Phase-2 vendor migration; ignore it here (core never reaches this).
-      let _ = makernotes::fixbase::fix_base(&input);
+      let result = makernotes::fixbase::fix_base(&input);
+      // Apply the in-place `$$dirInfo` mutations: `Base` becomes `new_base` (the
+      // `IsOffset` file-offset addend; clamped to the non-negative `u32` the port
+      // models, a degenerate negative base ⇒ 0) and `value_offset_base` becomes
+      // `-new_data_pos`. `$fix = makeDiff - diff` is of EITHER sign: a POSITIVE
+      // `$fix` LOWERS `$dataPos` (raising the value-offset addend — the Pentax
+      // absolute-addressing correction, `new_data_pos < 0` ⇒ a POSITIVE base),
+      // while a value pointer farther AFTER the IFD than the make offset yields a
+      // NEGATIVE `$fix` ⇒ `new_data_pos > 0` ⇒ a NEGATIVE `value_offset_base`
+      // (the pointer resolves BACKWARD). With the field now SIGNED, `-new_data_pos`
+      // is stored verbatim for BOTH signs (the prior `usize` cast DROPPED the
+      // negative case to 0, leaving the raw uncorrected offset — the R2 bug).
+      // `saturating_neg` only guards the unreachable `i64::MIN`.
+      self.base = u32::try_from(result.new_base()).unwrap_or(0);
+      self.value_offset_base = result.new_data_pos().saturating_neg();
     }
 
     // ---- Pre-walk hook 4: the Canon `%CameraSettings` DataMember pre-pass
@@ -4659,6 +4795,11 @@ impl Walker<'_, '_> {
     self.warn_count = saved_warn_count;
     self.order = saved_order;
     self.active_table = saved_table;
+    // Restore the FixBase-mutated value-offset state (a no-op unless `fix_base !=
+    // No` fired above), so a sub-directory's offset correction never leaks to the
+    // caller — the per-`$$dirInfo` scoping the other restored fields already get.
+    self.value_offset_base = saved_value_offset_base;
+    self.base = saved_base;
   }
 
   /// The Canon `%CameraSettings` DataMember pre-pass (#243 phase 2 step B2) —
@@ -5403,6 +5544,49 @@ impl Walker<'_, '_> {
                   };
                 }
               }
+              makernotes::Vendor::Pentax => {
+                // Walk the Pentax Main IFD in a FRESH, ISOLATED `Walker`
+                // ([`pentax_makernote_isolated`]) — NOT on `self` — then capture
+                // its emissions into the cached-emission buffer (#262, structural
+                // isolation, mirroring the other vendors). The dispatcher gives the
+                // full `detected` (body offset / `Base => Inherit` / `ByteOrder =>
+                // Unknown` probe / `FixBase => 1` for the primary `AOC\0` variant,
+                // processed via `ProcessUnknown` `LocateIFD`), which the helper
+                // threads into `process_subdir`. The Pentax primary inherits the
+                // parent base, so out-of-line offsets resolve TIFF-relative against
+                // `self.data` (base 0). The isolated walk DISCARDS its `warnings` /
+                // `warn_count` / `active_ifd_offsets` / `chain_guard`. The `0x003f
+                // LensRec` SubDirectory is descended to its `LensType` child in the
+                // helper's capture loop.
+                //
+                // `print_conv = true` yields the cached `-j` emissions + the typed
+                // `MakerNotesPentax`; the `-n` emissions are recomputed on demand via
+                // the SAME helper with `print_conv = false`. A degenerate too-short
+                // blob returns `None` and leaves the Pentax slot absent.
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                // The captured IFD0 `$$self{Make}`/`$$self{Model}` feed the
+                // Pentax FixBase heuristic (the `make.starts_with("PENTAX")`
+                // absolute-addressing arm of `GetMakerNoteOffset`), threaded into
+                // the isolated walker exactly as Sony/Canon thread theirs.
+                let make = self.captured_make.as_deref();
+                let model = self.captured_model.as_deref();
+                if let Some((emi_pc, typed_pc)) = pentax_makernote_isolated(
+                  self.data, mn_offset, mn_len, detected, self.order, make, model, true,
+                ) {
+                  meta.set_pentax(typed_pc);
+                  cached_pc = emi_pc;
+                  value_conv_decode = MakerNoteValueConvDecode::Pentax {
+                    data: self.data,
+                    mn_offset,
+                    mn_len,
+                    detected,
+                    order: self.order,
+                    make: make.map(smol_str::SmolStr::new),
+                    model: model.map(smol_str::SmolStr::new),
+                  };
+                }
+              }
               _ => {}
             }
             self.maker_note = Some(MakerNote {
@@ -5643,6 +5827,15 @@ impl Walker<'_, '_> {
       },
       TableRef::NikonType2 => match makernotes::vendors::nikon::NikonTable::Type2.lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Nikon(t)),
+        None => return,
+      },
+      // `%Pentax::Main` (#262). The resolved [`PentaxTag`] rides in
+      // `ResolvedConv::Pentax` so the emit reapplies its `PentaxPrintConv` (and,
+      // for `0x003f LensRec`, the capture loop descends to the `LensType` child).
+      // An unknown Pentax tag is skipped here, matching `ProcessExif`'s `next
+      // unless $tagInfo` skip.
+      TableRef::Pentax => match makernotes::vendors::pentax::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Pentax(t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
@@ -6700,6 +6893,23 @@ fn emit_entry<S: ExifSink>(
         group1, entry, nikon_tag, model, order, print_conv, None, out,
       )
     }
+    // `%Pentax::Main` vendor leaf (#262). Production routes a Pentax Main walk
+    // through the DEDICATED capture loop in [`pentax_makernote_isolated`], which
+    // descends the `0x003f LensRec` SubDirectory to its `LensType` child.
+    // `emit_entry` is therefore NOT the Pentax capture path — but the match must
+    // be exhaustive, and no core-IFD walk produces a `ResolvedConv::Pentax` entry
+    // (Pentax leaves exist only under `active_table == Pentax`, set solely by the
+    // isolated Pentax walk). This arm is a panic-free fallback: a SubDirectory row
+    // (LensRec) emits NOTHING (its children are the capture loop's job, like
+    // Nikon's `emit_entry` defensive arm), and a plain LEAF renders via
+    // `emit_pentax_value`.
+    ResolvedConv::Pentax(pentax_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      if pentax_tag.sub_table().is_some() {
+        return Ok(());
+      }
+      emit_pentax_value(group1, name, raw, pentax_tag, print_conv, out)
+    }
   }
 }
 
@@ -6761,6 +6971,29 @@ fn emit_apple_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   let value = apple_tag.conv().apply(raw, print_conv);
   out.write_vendor_value("MakerNotes", group1, name, value, apple_tag.is_unknown())
+}
+
+/// Render ONE Pentax maker-note LEAF into the sink — the emit-time reproduction
+/// of `%Pentax::Main`'s per-tag emit through the shared `Walker` (#262).
+///
+/// Pentax is a SIMPLE vendor like Apple: a plain LEAF renders via
+/// [`PentaxPrintConv::apply`](makernotes::vendors::pentax::printconv::PentaxPrintConv::apply)
+/// (taken BY VALUE — the conv is `Copy`) on the entry's RAW value, then writes
+/// the already-rendered [`TagValue`] under `("MakerNotes", group1)` carrying the
+/// row's `Unknown=>1` flag (`run_emission` drops it once, like the other
+/// vendors). The `0x003f LensRec` SubDirectory is descended in the capture loop
+/// ([`pentax::emit_lens_rec`]), never routed here.
+#[cfg(feature = "alloc")]
+fn emit_pentax_value<S: ExifSink>(
+  group1: &str,
+  name: &str,
+  raw: &RawValue,
+  pentax_tag: &makernotes::vendors::pentax::tags::PentaxTag,
+  print_conv: bool,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  let value = pentax_tag.conv.apply(raw, print_conv);
+  out.write_vendor_value("MakerNotes", group1, name, value, pentax_tag.is_unknown())
 }
 
 /// Render ONE Sony maker-note leaf into the sink — the emit-time reproduction of
@@ -7898,7 +8131,9 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     // out-of-line value pointer resolves at `data[off + base_offset]`,
     // byte-identical to `walk_panasonic_in_tiff`'s `off + base_offset`
     // (`panasonic/body.rs:150`).
-    value_offset_base: base_offset,
+    // `base_offset` is a small non-negative buffer offset (`0`/`12`); cast to the
+    // SIGNED field — a forward shift is a positive `i64`.
+    value_offset_base: i64::try_from(base_offset).unwrap_or(i64::MAX),
     entries: Vec::new(),
     // FRESH warning channels: a malformed Panasonic entry warns into THESE, dropped
     // on return — never the parent's `ExifTool:Warning` stream (the oracle
@@ -8162,8 +8397,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     base: 0,
     // ★ CRUX #1 — the out-of-line value base: 10 for type-3 (embedded-TIFF
     // `Base => '$start - 8'`), 0 for type-2 / headerless. Reproduces the oracle's
-    // `abs = off + value_base`.
-    value_offset_base: layout.value_base(),
+    // `abs = off + value_base`. Non-negative buffer offset cast to the SIGNED field.
+    value_offset_base: i64::try_from(layout.value_base()).unwrap_or(i64::MAX),
     entries: Vec::new(),
     // FRESH warning channels: a malformed Nikon entry warns into THESE, dropped on
     // return — never the parent's `ExifTool:Warning` stream (the oracle
@@ -8305,6 +8540,225 @@ pub(in crate::exif) fn nikon_makernote_isolated(
       let Ok(()) = emit_nikon_value(
         g1, entry, nikon_tag, model, order, print_conv, typed_sink, &mut sink,
       );
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk the Pentax `%Pentax::Main` IFD in a FRESH, ISOLATED [`Walker`] over the
+/// parent TIFF and capture its emissions + typed surface — the single entry
+/// point BOTH the `-j` production dispatch and the `-n` recompute drive (#262,
+/// structural isolation, mirroring [`apple_makernote_isolated`] /
+/// [`nikon_makernote_isolated`]).
+///
+/// ## The walk
+///
+/// The dispatched [`DetectedMakerNote`] carries the SubDirectory directives the
+/// walk threads (`MakerNotes.pm:762-803`). For the primary `MakerNotePentax`
+/// (`AOC\0`, the K10D `Pentax.jpg` fixture): `body_offset 0`, `Base => Inherit`
+/// (out-of-line offsets are parent-TIFF-relative ⇒ `base: 0` over `data`
+/// resolves them at `data[off]`), `ByteOrder => Unknown` (probe the entry-count
+/// word), and `FixBase => 1` (`:777`), processed via `ProcessUnknown`
+/// (`LocateIFD` then `ProcessExif`, `:1816`). The `FixBase` heuristic runs inside
+/// [`process_subdir`](Walker::process_subdir) and APPLIES its base shift to the
+/// value-offset resolution; the parent `Make`/`Model` are threaded into the
+/// walker so its PENTAX-make absolute-addressing arm (`GetMakerNoteOffset`) can
+/// fire (the K10D's shift is 0, a no-op, but a model needing a correction now
+/// gets it). A dispatched `NotIFD => 1` variant (Pentax4) is rejected up front
+/// (emit nothing — its binary table is unported). The walk runs under `active_table
+/// == TableRef::Pentax` via [`process_subdir`](Walker::process_subdir), which
+/// resolves the Pentax table's IMPLICIT-`undef` SubDirectory override for the
+/// `0x003f LensRec` block (`pentax::format_override`). The directory `kind` is
+/// `ExifIfd` (a non-Ifd0 kind, so the IFD0-only Make/Model tap never fires).
+///
+/// ## The capture loop
+///
+/// Each walked `ResolvedConv::Pentax` entry is a plain LEAF (rendered via
+/// [`emit_pentax_value`] + the gate-passing typed populate
+/// [`pentax::populate_typed_value`]) EXCEPT the `0x003f LensRec` SubDirectory,
+/// whose ON-DISK value SPAN is re-sliced from the Walker's buffer and handed to
+/// [`pentax::emit_lens_rec`] (the `LensType` child) — the parent pointer is
+/// never emitted, the Nikon `emit_af_info` SubDirectory pattern (the bogus-parent
+/// rule). Reading the SPAN — not the decoded `entry.value` — is the make-or-break
+/// correctness point: the shared Walker applies the generic `undef[1] → int8u`
+/// carve-out to a degenerate SubDirectory entry, so deriving the block from the
+/// value shape would pass `&[]`.
+///
+/// ## Isolation
+///
+/// A FRESH `Walker` has its OWN `warnings` / `warn_count` / `active_ifd_offsets`
+/// / `chain_guard`, populated by THIS walk and DISCARDED on return — so a
+/// malformed Pentax entry cannot leak a core `ExifTool:Warning`, abort the
+/// parent ExifIFD's warn-count, or be suppressed by the parent's ancestor cycle
+/// guard. `print_conv = true` renders the `-j` emissions + the typed slot;
+/// `print_conv = false` the `-n` emissions (the typed slot is the SAME for both
+/// and ALWAYS returned inside the `Some`). Returns `None` for a degenerate blob
+/// too short to hold the IFD count word (the Pentax slot stays absent).
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::exif) fn pentax_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  detected: makernotes::DetectedMakerNote,
+  parent_order: ByteOrder,
+  make: Option<&str>,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::pentax::MakerNotesPentax,
+)> {
+  use makernotes::vendors::pentax::{self, MakerNotesPentax, SubTable};
+  // The captured MakerNote bytes the dispatcher classified
+  // (`data[mn_offset .. mn_offset + mn_len]`, saturating end clamped).
+  let mn_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let _blob = data.get(mn_offset..mn_end)?;
+  // NotIFD gate: the Pentax Main walker is an IFD walker, but the
+  // dispatcher's `MakerNotePentax4` arm (`$$self{Make}=~/^PENTAX/ and
+  // $$valPt=~/^\d{3}/`, `MakerNotes.pm:805-815`) sets `NotIFD => 1` — its blob is
+  // a binary/text table (3-digit-prefixed), NOT an IFD, and that table is a future
+  // phase. Running `ProcessUnknown`'s `LocateIFD` + `ProcessExif` over a Pentax4
+  // payload whose first bytes happen to look IFD-shaped would emit BOGUS
+  // `%Pentax::Main` tags (Pentax was a no-op before #262). Emit NOTHING (the typed
+  // slot stays empty), matching the unported-table contract — and the recompute /
+  // `from_blob_with_context` Pentax arms mirror this gate. Pentax4 is the ONLY
+  // `Vendor::Pentax` variant with `NotIFD => 1` (the AOC primary / Pentax5 / Pentax6
+  // / Asahi Pentax2/3 are all IFD variants).
+  if detected.is_not_ifd() {
+    return Some((std::vec::Vec::new(), MakerNotesPentax::new()));
+  }
+  // The child IFD start: the MakerNote value offset + the dispatched body offset
+  // (0 for the primary `AOC\0`, 10/12 for Pentax5/6). The IFD count word must sit
+  // inside the declared value, else a truncated `mn_len` lets the Walker read its
+  // count word from the UNRELATED following parent-TIFF bytes — spurious tags.
+  let body_offset = detected.body_offset() as usize;
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  match body_offset.checked_add(2) {
+    Some(min) if mn_len >= min => {}
+    _ => return Some((std::vec::Vec::new(), MakerNotesPentax::new())),
+  }
+  // Translate the dispatched `SubDirectory` directives into the `process_subdir`
+  // modes. `Base => Inherit` ⇒ `value_offset_base 0` (out-of-line offsets are
+  // parent-TIFF-relative against `data`); the `$start - N` Pentax5/6 variants
+  // rebase to the blob start (`$valuePtr + N - N == $valuePtr == mn_offset`).
+  let value_offset_base: i64 = match detected.base_rule() {
+    makernotes::BaseRule::Inherit => 0,
+    // `mn_offset` is a buffer offset (`usize`); a 64-bit-huge value (never
+    // reached for a real blob) saturates to `i64::MAX` ⇒ lands past EOF.
+    makernotes::BaseRule::RelativeToStart(_) => i64::try_from(mn_offset).unwrap_or(i64::MAX),
+    // `Literal` is already the signed `Base => n` literal — keep its sign.
+    makernotes::BaseRule::Literal(n) if n >= 0 => n,
+    _ => 0,
+  };
+  // `ByteOrder => Unknown` ⇒ probe the entry-count word; `Explicit(o)` ⇒ fixed.
+  let byte_order_rule = match detected.byte_order() {
+    makernotes::ChildByteOrder::Unknown => ByteOrderRule::Unknown,
+    makernotes::ChildByteOrder::Explicit(o) => ByteOrderRule::Fixed(o),
+  };
+  // `FixBase => 1` ⇒ the standard offset-correction heuristic; absent ⇒ no fix.
+  let fix_base_mode = if detected.fix_base() {
+    FixBaseMode::Heuristic
+  } else {
+    FixBaseMode::No
+  };
+  let mut w = Walker {
+    data,
+    order: parent_order,
+    base: 0,
+    value_offset_base,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Pentax entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream.
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // `$$self{Make}`/`$$self{Model}` feed the FixBase heuristic
+    // (`GetMakerNoteOffset`'s `make.starts_with("PENTAX")` absolute-addressing
+    // arm, `MakerNotes.pm:1215-1220`) the AOC/Asahi primaries run via
+    // `FixBaseMode::Heuristic` — without them the heuristic falls to the generic
+    // `else` offset and the Pentax model-conditional fix cannot fire. Threaded
+    // from the parent IFD0 captures, mirroring Sony/Canon.
+    captured_make: make.map(String::from),
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Pentax leaf reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Pentax)` swaps it to the
+    // Pentax table for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Pentax Main IFD walk — `ProcessProc::Unknown` runs `LocateIFD` (Pentax's
+  // offsets are inconsistent, `MakerNotes.pm:1816` / `subdir.rs`) then
+  // `ProcessExif`. The probed order + `FixBase` heuristic are resolved inside
+  // `process_subdir`. `IfdKind::ExifIfd` is a non-Ifd0 kind, so the IFD0-only
+  // Make/Model tap never fires. It appends the Pentax leaves to `w.entries` from
+  // index 0, isolating every core side effect from the parent. The Pentax table's
+  // implicit-`undef` SubDirectory `format_override` materializes the LensRec block
+  // as `undef[N]` into `entry.value`.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Pentax,
+    byte_order_rule,
+    fix_base_mode,
+    ProcessProc::Unknown,
+  );
+  // Capture the walked `ResolvedConv::Pentax` leaves + the LensRec child into the
+  // vendor-emission `Vec`; build the typed `MakerNotesPentax` from the SAME
+  // entries (the typed leaf set is disjoint from the LensRec block, so a clean
+  // single pass, like Apple).
+  let g1 = vendor_group1_of(TableRef::Pentax).unwrap_or("Pentax");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = MakerNotesPentax::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // Only `ResolvedConv::Pentax` entries live in this run; a defensive
+      // non-Pentax conv (never produced under `TableRef::Pentax`) is skipped.
+      let ResolvedConv::Pentax(pentax_tag) = entry.conv else {
+        continue;
+      };
+      if let Some(SubTable::LensRec) = pentax_tag.sub_table() {
+        // Re-slice the ON-DISK value SPAN from the Walker's buffer at the entry's
+        // resolved `value_offset` + on-disk `value_size` (the Nikon CRUX-#2
+        // pattern). An out-of-bounds extent yields `&[]` ⇒ the emitter emits
+        // nothing, matching ExifTool's `get(..)` → `None`.
+        let block: &[u8] = entry
+          .value_offset()
+          .checked_add(entry.value_size())
+          .and_then(|end| w.data.get(entry.value_offset()..end))
+          .unwrap_or(&[]);
+        pentax::emit_lens_rec(block, print_conv, &mut *sink.emissions);
+        if print_conv {
+          pentax::populate_lens_type(&mut typed, block);
+        }
+        continue;
+      }
+      // Leaf tag — the plain Pentax `PrintConv` renderer + the gate-passing typed
+      // populate.
+      let Ok(()) = emit_pentax_value(
+        g1,
+        entry.name(),
+        entry.value.raw(),
+        pentax_tag,
+        print_conv,
+        &mut sink,
+      );
+      if print_conv {
+        pentax::populate_typed_value(&mut typed, entry.tag_id, entry.value.raw());
+      }
     }
   }
   Some((emissions, typed))
@@ -13638,6 +14092,281 @@ mod tests {
     assert_eq!(
       subdir_entries, 3,
       "three 0x0098 LensData SubDirectory entries must be walked (got {subdir_entries})"
+    );
+  }
+
+  /// LensRec heap-amplification guard. A crafted Pentax MakerNote whose
+  /// `0x003f LensRec` SubDirectory is `Format => undef` (exempt from the excessive-
+  /// count guard) is repeated across MANY entries, all pointing at ONE large
+  /// in-bounds block. The implicit-`undef` zero-copy gate (extended to Pentax
+  /// LensRec) must store an EMPTY `RawValue::Bytes` for each — never a per-entry
+  /// `read_value` CLONE of the large block (the `N * value_size` OOM the class fix
+  /// closes for Nikon). The capture loop re-slices the SPAN, so `LensType` still
+  /// decodes from the block's first two bytes.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn pentax_lensrec_repeated_subdir_zero_copy_bounded() {
+    // A 4 KiB LensRec block: position 0 is the `int8u[2]` `(series, model)` pair
+    // `(3, 44)` ⇒ "Sigma or Tamron Lens (3 44)". The rest is padding that the
+    // pre-fix code would have CLONED per entry.
+    const BLOCK_LEN: usize = 4096;
+    let mut block = std::vec![0u8; BLOCK_LEN];
+    block[0] = 3;
+    block[1] = 44;
+    // 64 LensRec entries (tag 0x003f, undef, count = BLOCK_LEN) all referencing the
+    // SAME out-of-line block — a crafted in-bounds heap-amplification fan-out.
+    const N: usize = 64;
+    // Headerless big-endian Pentax IFD: [count u16][N×12 entries][next-IFD u32][block].
+    let dir_bytes = 2 + 12 * N;
+    let block_at = dir_bytes + 4; // first (only) out-of-line value, blob-relative
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&(N as u16).to_be_bytes());
+    for _ in 0..N {
+      blob.extend_from_slice(&0x003f_u16.to_be_bytes()); // tag = LensRec
+      blob.extend_from_slice(&7u16.to_be_bytes()); // format = undef
+      blob.extend_from_slice(&(BLOCK_LEN as u32).to_be_bytes()); // count
+      blob.extend_from_slice(&(block_at as u32).to_be_bytes()); // out-of-line offset
+    }
+    blob.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+    assert_eq!(blob.len(), block_at);
+    blob.extend_from_slice(&block);
+
+    // Drive the shared `Walker` directly over the Pentax table (the production
+    // helper runs the SAME walk under `process_subdir(TableRef::Pentax)`); the IFD
+    // sits at blob offset 0.
+    let mut w = test_walker(&blob);
+    w.process_subdir(
+      0,
+      IfdKind::ExifIfd,
+      TableRef::Pentax,
+      ByteOrderRule::Fixed(ByteOrder::Big),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+
+    // HEAP: every walked LensRec leaf retains a ZERO-LENGTH value (no per-entry
+    // copy), but its recorded SPAN still covers the full block. The total bytes
+    // retained across ALL entries is bounded by `N * 0`, NOT `N * BLOCK_LEN`.
+    let mut subdir_entries = 0usize;
+    let mut retained = 0usize;
+    for entry in &w.entries {
+      if let ResolvedConv::Pentax(t) = entry.conv
+        && t.sub_table().is_some()
+      {
+        subdir_entries += 1;
+        if let RawValue::Bytes(b) = entry.value_ref().raw() {
+          retained += b.len();
+        }
+        assert_eq!(
+          entry.value_ref().raw(),
+          &RawValue::Bytes(Vec::new()),
+          "a Pentax LensRec implicit-undef SubDirectory leaf must store EMPTY bytes"
+        );
+        assert_eq!(
+          entry.value_size(),
+          BLOCK_LEN,
+          "the on-disk value SPAN must cover the full LensRec block"
+        );
+      }
+    }
+    assert_eq!(subdir_entries, N, "all {N} LensRec entries must be walked");
+    assert_eq!(
+      retained, 0,
+      "ZERO bytes retained across {N} LensRec entries (bounded — no large clone)"
+    );
+
+    // CORRECTNESS: the capture loop re-slices the SPAN, so `LensType` still decodes.
+    // (Mirror the helper's capture-loop block derivation for the first entry.)
+    let entry = w
+      .entries
+      .iter()
+      .find(|e| matches!(e.conv, ResolvedConv::Pentax(t) if t.sub_table().is_some()))
+      .expect("a LensRec entry was walked");
+    let span: &[u8] = entry
+      .value_offset()
+      .checked_add(entry.value_size())
+      .and_then(|end| w.data.get(entry.value_offset()..end))
+      .unwrap_or(&[]);
+    assert_eq!(span.len(), BLOCK_LEN, "the SPAN re-slices the full block");
+    let mut emissions = std::vec::Vec::new();
+    makernotes::vendors::pentax::emit_lens_rec(span, true, &mut emissions);
+    let lens = emissions.iter().find(|e| e.name() == "LensType");
+    assert_eq!(
+      lens.map(|e| e.value().clone()),
+      Some(crate::value::TagValue::Str(
+        "Sigma or Tamron Lens (3 44)".into()
+      )),
+      "LensType still decodes from the re-sliced SPAN's first two bytes"
+    );
+  }
+
+  /// FixBase result is applied + parent Make is threaded. `process_subdir` with
+  /// `FixBaseMode::Heuristic` must APPLY the heuristic's base shift to the
+  /// value-offset resolution (the result was previously discarded with `let _`),
+  /// reading the parent `Make` so the PENTAX absolute-addressing arm of
+  /// `GetMakerNoteOffset` fires. A crafted Pentax IFD whose lone out-of-line value
+  /// pointer is "too low" (overlaps the IFD) forces a non-zero `$fix = makeDiff -
+  /// diff`; the walked entry's RESOLVED `value_offset` must reflect that shift, and
+  /// `base`/`value_offset_base` must be RESTORED to their pre-walk values after.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn pentax_process_subdir_applies_and_restores_fixbase() {
+    // Headerless big-endian Pentax IFD at blob offset 0, ONE entry: a leaf
+    // (`PentaxModelType` 0x0001, undef[8]) whose stored value pointer is 10 — an
+    // offset that OVERLAPS the 14-byte IFD (`ifd_end = 14`), so FixBase computes
+    // `diff = 10 - 14 = -4` ⇒ `fix = 4 - (-4) = 8` (verified against `fix_base`).
+    // The REAL value bytes live at the CORRECTED offset 18 (`10 + 8`); without the
+    // applied shift the entry would resolve at 10 (inside the IFD) — a different,
+    // wrong span. (`PentaxModelType` is undef-typed, so an 8-byte value is read as
+    // an `int8u[8]` block, decoded but harmless — we assert the SPAN, not a value.)
+    const RAW_OFF: u32 = 10;
+    const FIX: usize = 8;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&1u16.to_be_bytes()); // count = 1
+    blob.extend_from_slice(&0x0001u16.to_be_bytes()); // tag 0x0001 PentaxModelType
+    blob.extend_from_slice(&7u16.to_be_bytes()); // format = undef
+    blob.extend_from_slice(&8u32.to_be_bytes()); // count = 8 (> 4 ⇒ out-of-line)
+    blob.extend_from_slice(&RAW_OFF.to_be_bytes()); // value pointer = 10 (overlaps IFD)
+    blob.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+    // Pad so the CORRECTED span (18..26) is in-bounds with recognizable bytes.
+    while blob.len() < 18 {
+      blob.push(0x00);
+    }
+    blob.extend_from_slice(b"FIXBASE8"); // the real 8-byte value at offset 18
+
+    let mut w = test_walker(&blob);
+    // Thread the parent `$$self{Make}` — the FixBase heuristic's PENTAX arm reads
+    // it (`make.starts_with("PENTAX")`), exactly as the isolated helper threads it.
+    w.captured_make = Some(String::from("PENTAX"));
+    w.captured_model = Some(String::from("PENTAX K-x"));
+    w.process_subdir(
+      0,
+      IfdKind::ExifIfd,
+      TableRef::Pentax,
+      ByteOrderRule::Fixed(ByteOrder::Big),
+      FixBaseMode::Heuristic, // `FixBase => 1`
+      ProcessProc::Exif,      // skip LocateIFD to isolate the FixBase application
+    );
+
+    // The lone leaf was walked; its RESOLVED value_offset is `raw_off + fix` (the
+    // applied shift), NOT the unshifted `raw_off` — proving FixBase ran + applied.
+    let entry = w
+      .entries
+      .iter()
+      .find(|e| matches!(e.conv, ResolvedConv::Pentax(_)))
+      .expect("the Pentax leaf was walked");
+    assert_eq!(
+      entry.value_offset(),
+      RAW_OFF as usize + FIX,
+      "the entry's resolved value_offset must reflect the applied FixBase shift        (raw {RAW_OFF} + fix {FIX}); a discarded result would leave it at {RAW_OFF}"
+    );
+    // The corrected span re-slices the real bytes (proof the shift points at them).
+    let span = w
+      .data
+      .get(entry.value_offset()..entry.value_offset() + entry.value_size());
+    assert_eq!(
+      span,
+      Some(&b"FIXBASE8"[..]),
+      "the corrected span must re-slice the real value bytes at offset 18"
+    );
+
+    // STATE RESTORED: the FixBase mutation of `base`/`value_offset_base` does not
+    // leak to the caller (the per-`$$dirInfo` scoping).
+    assert_eq!(w.base, 0, "base restored after the FixBase sub-walk");
+    assert_eq!(
+      w.value_offset_base, 0,
+      "value_offset_base restored after the FixBase sub-walk"
+    );
+  }
+
+  /// FixBase computes a NEGATIVE `$fix` ⇒ a NEGATIVE `value_offset_base` ⇒ the
+  /// out-of-line value resolves BACKWARD. The R1 fix stored `value_offset_base =
+  /// -new_data_pos`, but the field was `usize`: when the value pointer sits
+  /// farther AFTER the IFD than the make offset, `$fix = makeDiff - diff` is
+  /// negative ⇒ `new_data_pos > 0` ⇒ `-new_data_pos < 0`, which the `usize` cast
+  /// silently DROPPED to 0 — the walk then used the UNCORRECTED raw pointer
+  /// (wrong bytes / dropped tag). With the field now SIGNED the negative shift is
+  /// applied, so the resolved span moves backward by the correct amount and
+  /// re-slices the real bytes. Complements
+  /// `pentax_process_subdir_applies_and_restores_fixbase` (the positive-shift,
+  /// `value_offset_base > 0` case, which the `usize` field already handled).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn pentax_process_subdir_applies_negative_fixbase_backward() {
+    // Headerless big-endian Pentax IFD at blob offset 0, ONE entry: a leaf
+    // (`PentaxModelType` 0x0001, undef[8]) whose stored value pointer is 22 — an
+    // offset that sits BELOW the make offset (PENTAX `offsets[0] = 4`, so
+    // `makeDiff = 4`). With `ifd_end = 14` (`2 + 12*1`) and `dataPos = 0`,
+    // `diff = (22 - 0) - 14 = 8` and `fix = makeDiff - diff = 4 - 8 = -4`
+    // (verified against `fix_base`): `new_data_pos = 0 - (-4) = 4` ⇒
+    // `value_offset_base = -4`. The corrected pointer is `22 + (-4) = 18` — a
+    // BACKWARD shift; the R2 bug (`usize` field) would have dropped the negative
+    // base to 0 and resolved at the UNCORRECTED 22. The real value bytes live at
+    // the corrected offset 18 (`22 - 4`). (8 is NOT 0/4 and NOT in `offsets`, so
+    // the early `return $shift` arms do not fire; `diff = 8` ≠ 12/16, so the IFD
+    // is NOT mis-detected as entry-based — the generic `$fix` path runs.)
+    const RAW_OFF: u32 = 22;
+    const BACKWARD: i64 = -4; // the applied (negative) shift
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&1u16.to_be_bytes()); // count = 1
+    blob.extend_from_slice(&0x0001u16.to_be_bytes()); // tag 0x0001 PentaxModelType
+    blob.extend_from_slice(&7u16.to_be_bytes()); // format = undef
+    blob.extend_from_slice(&8u32.to_be_bytes()); // count = 8 (> 4 ⇒ out-of-line)
+    blob.extend_from_slice(&RAW_OFF.to_be_bytes()); // value pointer = 22 (too high)
+    blob.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+    // The real 8-byte value at the CORRECTED offset 18 (the IFD body ends at 14,
+    // the next-IFD pointer at 14..18, then the value at 18..26).
+    debug_assert_eq!(blob.len(), 18);
+    blob.extend_from_slice(b"BACKWRD!"); // real bytes at 18..26
+
+    let mut w = test_walker(&blob);
+    // Thread the parent `$$self{Make}` so the FixBase heuristic's PENTAX arm reads
+    // it (`make.starts_with("PENTAX")` ⇒ `offsets = [4]`, absolute addressing).
+    w.captured_make = Some(String::from("PENTAX"));
+    w.captured_model = Some(String::from("PENTAX K-x"));
+    w.process_subdir(
+      0,
+      IfdKind::ExifIfd,
+      TableRef::Pentax,
+      ByteOrderRule::Fixed(ByteOrder::Big),
+      FixBaseMode::Heuristic, // `FixBase => 1`
+      ProcessProc::Exif,      // skip LocateIFD to isolate the FixBase application
+    );
+
+    // The lone leaf was walked; its RESOLVED value_offset is `raw_off + fix` with a
+    // NEGATIVE `fix` — i.e. moved BACKWARD to 18, NOT the unshifted 22. The R2 bug
+    // would have left it at the uncorrected 22 (negative base dropped to 0).
+    let entry = w
+      .entries
+      .iter()
+      .find(|e| matches!(e.conv, ResolvedConv::Pentax(_)))
+      .expect("the Pentax leaf was walked (not dropped by a wrapped/zeroed base)");
+    let expected_off = (i64::from(RAW_OFF) + BACKWARD) as usize; // 18
+    assert_eq!(
+      entry.value_offset(),
+      expected_off,
+      "the resolved value_offset must move BACKWARD by |fix| (raw {RAW_OFF} + fix {BACKWARD} = {expected_off}); the R2 bug left it at the uncorrected {RAW_OFF}"
+    );
+    // The corrected span re-slices the real bytes (proof the negative shift points
+    // at them, and the entry was NOT dropped).
+    let span = w
+      .data
+      .get(entry.value_offset()..entry.value_offset() + entry.value_size());
+    assert_eq!(
+      span,
+      Some(&b"BACKWRD!"[..]),
+      "the backward-corrected span must re-slice the real value bytes at offset 18"
+    );
+
+    // STATE RESTORED: the FixBase mutation of `base`/`value_offset_base` (now a
+    // NEGATIVE base) does not leak to the caller — both restore to their prior 0.
+    assert_eq!(
+      w.base, 0,
+      "base restored after the negative-FixBase sub-walk"
+    );
+    assert_eq!(
+      w.value_offset_base, 0,
+      "value_offset_base restored to its prior value after the negative-FixBase sub-walk"
     );
   }
 

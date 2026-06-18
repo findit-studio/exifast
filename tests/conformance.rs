@@ -8679,6 +8679,30 @@ fn makernotes_nikon_d2hs_conformance() {
   check("NikonD2Hs.jpg", "NikonD2Hs.jpg.n.json", false);
 }
 #[test]
+fn makernotes_pentax_k10d_conformance() {
+  // Pentax.jpg (K10D) — the first Pentax-MakerNote conformance backstop (#262).
+  // The 47 ported `Pentax:*` tags (the camera-indexing leaves + the `0x003f
+  // LensRec` → `LensType` SubDirectory child) are emitted byte-identically to
+  // bundled ExifTool 13.59: `LensType` = "Sigma or Tamron Lens (3 44)",
+  // `PentaxModelID` = "K10D", `Quality` = "Better", `FNumber` = 13.0, the
+  // %pentaxCities world-time pair (Toronto/New York), the dotted PentaxVersion
+  // ("3.0.0.0"), the LV-converted metering segments, and the WB_RGGBLevels run.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
+  // exifast intentionally does NOT emit — every exclusion is a Phase-1 deferral
+  // (the `%Pentax::Main` long-tail: the binary SubDirectory tables CameraSettings
+  // 0x0205 / AEInfo 0x0206 / LensInfo 0x0207 / FlashInfo 0x0208 / CameraInfo
+  // 0x0215 / BatteryInfo 0x0216 / AFInfo 0x021f, the encrypted ShutterCount
+  // 0x005d, the model-/count-conditional FocusMode/AFPoint/ExposureCompensation
+  // leaves, the `IsOffset => 2` PreviewImageStart/PreviewImage pointers) — OR a
+  // documented engine-wide deferral (Composite:all — no EXIF Composite subsystem;
+  // JFIF:all + IFD1:ThumbnailImage + PrintIM:PrintIMVersion — the same gaps the
+  // Nikon golden excludes). None masks a faithfulness gap in the ported subset.
+  // The JPEG SOF `File:*` dimension tags (#261/#263) ARE part of this golden.
+  check("Pentax.jpg", "Pentax.jpg.json", true);
+  check("Pentax.jpg", "Pentax.jpg.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`
