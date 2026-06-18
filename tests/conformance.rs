@@ -8703,6 +8703,34 @@ fn makernotes_pentax_k10d_conformance() {
   check("Pentax.jpg", "Pentax.jpg.n.json", false);
 }
 #[test]
+fn pentax_avi_conformance() {
+  // Pentax.avi (K-x) — the Pentax AVI MakerNote bridge (#157). The RIFF parser
+  // routes the `LIST_hydt` → `hymn` chunk through the shared `%Pentax::Main`
+  // walker (`%Pentax::AVI` SubDirectory: `Start => 10`, `Base => '$start'`,
+  // `ByteOrder => 'Unknown'`, `Pentax.pm:6373-6395`), so the 15 Phase-1 Pentax
+  // camera-indexing leaves emit byte-identically to bundled ExifTool 13.59
+  // under family-1 `Pentax`: the K-x lens `LensType` = "smc PENTAX-DA L 18-55mm
+  // F3.5-5.6" (the `0x003f LensRec` child), `PentaxModelID` = "K-x", `Quality`
+  // = "Best", `WhiteBalance` = "Flash", the dotted `PentaxVersion` ("5.1.0.0"),
+  // Contrast/Saturation/Sharpness, ImageTone "Natural", and the DSP/CPU
+  // firmware versions — alongside the AVI `RIFF:`/`File:` stream (incl.
+  // `RIFF:Software` "PENTAX K-x …").
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
+  // tags exifast does NOT emit — every exclusion is a Phase-1 deferral (the
+  // `%Pentax::Main` long-tail the K10D `Pentax.jpg` golden also drops: the
+  // binary SubDirectory tables AEInfo 0x0206 / LensInfo 0x0207 / CameraInfo
+  // 0x0215 / SRInfo / FlashInfo, the model-/count-conditional DriveMode /
+  // PictureMode / ExposureCompensation / FocusMode leaves, the
+  // ExtenderStatus/Hue/SerialNumber/FirmwareVersion long-tail) OR the
+  // engine-wide Composite deferral (Composite:LensID/ImageSize/Megapixels/
+  // Duration — no EXIF Composite subsystem). None masks a faithfulness gap in
+  // the ported subset; the diff carries NO tag exifast emits that bundled does
+  // not.
+  check("Pentax.avi", "Pentax.avi.json", true);
+  check("Pentax.avi", "Pentax.avi.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`

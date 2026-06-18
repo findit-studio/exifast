@@ -294,10 +294,12 @@ impl RiffStream {
 /// [`RiffStream`] records, the resolved variant (`AVI`/`WAV`/`WEBP`/…), and
 /// the MIME the engine will surface via [`FileTypeFinalize::ExplicitWithMime`].
 ///
-/// The Meta owns its data; the `'a` GAT lifetime is a phantom (RIFF values
-/// are heavily transformed during the walk — date conversion, FourCC slicing,
-/// PCM/codec-table lookup — so nothing borrows from the input buffer). This
-/// matches the MXF port (Codex AF2 uniformity).
+/// The Meta owns MOST of its data — RIFF values are heavily transformed during
+/// the walk (date conversion, FourCC slicing, PCM/codec-table lookup), so the
+/// emitted entries borrow nothing. The one exception is the raw Pentax AVI
+/// MakerNote payload, held as a `&'a [u8]` sub-slice of the input (zero-copy;
+/// decoded at emit time, #157) — so the `'a` GAT lifetime is a real input
+/// borrow rather than the MXF-style phantom.
 #[derive(Debug, Clone)]
 pub struct RiffMeta<'a> {
   entries: Vec<RiffEntry>,
@@ -323,8 +325,13 @@ pub struct RiffMeta<'a> {
   /// [`RiffMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics) as an
   /// `ExifTool:Warning`.
   unsupported_charset: Option<u16>,
-  /// Phantom anchor for the GAT lifetime.
-  _marker: core::marker::PhantomData<&'a ()>,
+  /// The raw Pentax AVI MakerNote payload (`hymn`/`mknt` sub-chunk of
+  /// `LIST_hydt`/`LIST_pntx`, `Pentax.pm:6373-6395`) — a sub-slice BORROWED
+  /// from the input (no second allocation; the `'a` input lifetime carries it),
+  /// decoded at emit time (when the `-j`/`-n` mode is known) through the shared
+  /// `%Pentax::Main` walker, mirroring the Canon CTMD re-dispatch. `None` for a
+  /// non-Pentax AVI (#157).
+  pentax_makernote: Option<&'a [u8]>,
 }
 
 impl Default for RiffMeta<'_> {
@@ -337,7 +344,7 @@ impl Default for RiffMeta<'_> {
       rf64: false,
       corrupted: false,
       unsupported_charset: None,
-      _marker: core::marker::PhantomData,
+      pentax_makernote: None,
     }
   }
 }
@@ -394,7 +401,8 @@ pub struct ProcessRiff;
 impl parser_sealed::Sealed for ProcessRiff {}
 
 impl FormatParser for ProcessRiff {
-  /// GAT: the Meta is fully owned; `'a` is a phantom (Codex AF2 uniformity).
+  /// GAT: `'a` is the input borrow carrying the zero-copy Pentax AVI
+  /// MakerNote sub-slice (#157); all other RIFF data is owned.
   type Meta<'a> = RiffMeta<'a>;
   /// Leaf-format Context — `&'a [u8]` (no chained state).
   type Context<'a> = &'a [u8];
@@ -461,6 +469,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     charset: Charset::Latin,
     unsupported_charset: None,
     err: false,
+    pentax_makernote: None,
   };
 
   // RIFF.pm:2058: `my $riffEnd = Get32u(\$buff, 4) + 8; $riffEnd += $riffEnd & 0x01;`
@@ -479,7 +488,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     rf64,
     corrupted: walker.err,
     unsupported_charset: walker.unsupported_charset,
-    _marker: core::marker::PhantomData,
+    pentax_makernote: walker.pentax_makernote,
   })
 }
 
@@ -513,6 +522,12 @@ struct Walker<'a> {
   /// not be fully read (truncated). Drives the terminal
   /// `Error reading RIFF file (corrupted?)` warning.
   err: bool,
+  /// The Pentax AVI MakerNote payload — the `hymn` (or Q-S1 `mknt`) sub-chunk
+  /// of `LIST_hydt`/`LIST_pntx` (`Pentax.pm:6373-6395`). A sub-slice BORROWED
+  /// from `data` (zero-copy — no owned duplicate of the payload); decoded at
+  /// emit time (when the `-j`/`-n` mode is known) through the shared
+  /// `%Pentax::Main` walker. `None` for a non-Pentax AVI (#157).
+  pentax_makernote: Option<&'a [u8]>,
 }
 
 impl<'a> Walker<'a> {
@@ -617,9 +632,13 @@ impl<'a> Walker<'a> {
           b"adtl" => {
             process_chunks_adtl(body, &mut self.entries);
           }
-          // LIST_ncdt / LIST_hydt / LIST_pntx — Nikon/Pentax AVI maker
-          // notes. Deferred (separate ports).
-          b"ncdt" | b"hydt" | b"pntx" => {}
+          // LIST_ncdt — Nikon AVI maker notes. Deferred (a separate
+          // follow-up; no fixture in the suite).
+          b"ncdt" => {}
+          // LIST_hydt / LIST_pntx — Pentax AVI maker notes (`Pentax.pm:6373-
+          // 6395`, `%Pentax::AVI`). Capture the `hymn`/`mknt` sub-chunk payload
+          // for the emit-time `%Pentax::Main` re-dispatch (#157).
+          b"hydt" | b"pntx" => self.process_chunks_hydt(body),
           _ => {
             // Unknown LIST type — skip silently (bundled would emit
             // an Unknown_LIST_xxxx in -U mode; we don't generate
@@ -860,6 +879,44 @@ impl<'a> Walker<'a> {
         // nothing.
         b"strd" => {}
         _ => {}
+      }
+      p += len + (len & 1);
+    }
+  }
+
+  /// `LIST_hydt` / `LIST_pntx` — Pentax AVI MakerNotes (`Pentax.pm:6373-6395`,
+  /// the `%Pentax::AVI` table). Scan the LIST's sub-chunks for the `hymn` (the
+  /// K-x/K-70 form) or the Q-S1 `mknt` chunk and capture its RAW payload for the
+  /// emit-time `%Pentax::Main` re-dispatch (#157). The walk is mode-agnostic
+  /// (the `-j`/`-n` rendering happens at `tags()` time), so this only stores the
+  /// bytes; the decode runs in [`RiffMeta::tags`]
+  /// ([`crate::emit::Taggable`]) via
+  /// [`crate::exif::makernotes::vendors::pentax::redispatch_avi_makernote`],
+  /// mirroring the Canon CTMD precedent. The LIST_ncdt (Nikon AVI) path stays a
+  /// no-op — a separate follow-up (no fixture).
+  ///
+  /// `body` is the LIST payload AFTER the 4-byte LIST type (it begins at the
+  /// first sub-chunk header). Sub-chunk framing is the standard
+  /// `[FourCC][int32u len][payload][pad]`. The FIRST `hymn`/`mknt` wins (a
+  /// single MakerNote per file in practice; bundled's `%Pentax::AVI` has one row
+  /// each and last would overwrite, but there is never more than one).
+  fn process_chunks_hydt(&mut self, body: &'a [u8]) {
+    let mut p = 0usize;
+    while p + 8 <= body.len() {
+      let tag: [u8; 4] = fourcc_at(body, p);
+      let len = le_u32_at(body, p + 4) as usize;
+      p += 8;
+      let Some(payload) = body.get(p..p.checked_add(len).unwrap_or(usize::MAX)) else {
+        // A sub-chunk whose declared length runs past the LIST body — stop
+        // (bundled's read fails and aborts the sub-walk).
+        return;
+      };
+      if (&tag == b"hymn" || &tag == b"mknt") && self.pentax_makernote.is_none() {
+        // Borrow the sub-slice of the input (it already carries `'a`) — NO
+        // owned copy, so a crafted multi-MB hymn payload cannot double resident
+        // memory during parse (#157 Codex R1). The emit-time re-dispatch in
+        // `RiffMeta::tags` operates over this borrow.
+        self.pentax_makernote = Some(payload);
       }
       p += len + (len & 1);
     }
@@ -2604,6 +2661,30 @@ impl crate::emit::Taggable for RiffMeta<'_> {
     for entry in &self.entries {
       tags.push(emit_one(entry, print_conv));
     }
+    // Pentax AVI MakerNote (`hymn`/`mknt`, `%Pentax::AVI` → `%Pentax::Main`,
+    // `Pentax.pm:6373-6395`): decode the captured payload through the shared
+    // `%Pentax::Main` walker at the now-known mode, and emit each leaf under
+    // family-0 `MakerNotes`, family-1 `Pentax` (the `%Pentax::Main` `GROUPS`
+    // — `exiftool -G1 -j` emits `Pentax:LensType` etc.), mirroring the
+    // QuickTime Canon CTMD re-dispatch. ExifTool walks the `LIST_hydt` after
+    // the AVI header/stream chunks, so these append AFTER the `RIFF:`/`File:`
+    // stream (the conformance gate is object-key-order-insensitive regardless).
+    // The engine's central Unknown-suppression drops any `Unknown=>1` leaf, so
+    // the flag is carried through verbatim.
+    #[cfg(feature = "alloc")]
+    if let Some(payload) = self.pentax_makernote.as_deref() {
+      let group = crate::value::Group::new("MakerNotes", "Pentax");
+      let emissions =
+        crate::exif::makernotes::vendors::pentax::redispatch_avi_makernote(payload, print_conv);
+      for e in emissions {
+        tags.push(crate::emit::EmittedTag::new(
+          group.clone(),
+          smol_str::SmolStr::new(e.name()),
+          e.value().clone(),
+          e.unknown(),
+        ));
+      }
+    }
     tags.into_iter()
   }
 }
@@ -3936,6 +4017,49 @@ mod tests {
   }
 
   #[test]
+  fn pentax_avi_hymn_payload_is_borrowed_not_copied() {
+    // #157 Codex R1: `process_chunks_hydt` must BORROW the `hymn` payload as a
+    // sub-slice of the input, never clone it — else a crafted multi-MB `hymn`
+    // in an otherwise-small AVI would double resident memory during parse. Build
+    // a `LIST_hydt` body with a large (256 KiB) `hymn` chunk and assert the
+    // captured payload points INTO the input buffer (zero-copy), full length.
+    const HYMN_LEN: usize = 256 * 1024;
+    let mut body = Vec::new();
+    body.extend_from_slice(b"hymn");
+    body.extend_from_slice(&(HYMN_LEN as u32).to_le_bytes());
+    body.resize(body.len() + HYMN_LEN, 0xab); // the large payload
+    let mut walker = Walker {
+      data: &body,
+      pos: 0,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+      pentax_makernote: None,
+    };
+    walker.process_chunks_hydt(&body);
+    let captured = walker
+      .pentax_makernote
+      .expect("the hymn payload is captured");
+    assert_eq!(
+      captured.len(),
+      HYMN_LEN,
+      "the full hymn payload is captured"
+    );
+    // ZERO-COPY PROOF: the captured slice lives INSIDE the input buffer's
+    // address range — a borrow, not an owned second allocation. A reintroduced
+    // `.to_vec()` would place it outside this range and fail the assert.
+    let base = body.as_ptr() as usize;
+    let cap_ptr = captured.as_ptr() as usize;
+    assert!(
+      cap_ptr >= base && cap_ptr.saturating_add(captured.len()) <= base.saturating_add(body.len()),
+      "the captured hymn payload borrows from the input buffer (no copy)"
+    );
+  }
+
+  #[test]
   fn repeated_cset_code_page_zero_resets_prior_raw_to_latin() {
     // RIFF.pm:1067-1069 — the `CodePage` RawConv (`$$self{CodePage} = $val`)
     // overwrites `$$self{CodePage}` on EVERY CSET, and the truthiness gate
@@ -3987,6 +4111,7 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
+      pentax_makernote: None,
     };
     walker.walk_top();
     assert_eq!(
