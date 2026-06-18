@@ -1315,6 +1315,51 @@ fn quicktime_gopro_gpmf_conformance() {
 }
 
 #[test]
+fn quicktime_gopro_gpmf_mp4_conformance() {
+  // GoPro Hero8 `.mp4` variant of `QuickTime_gopro_gpmf` (#127). UNLIKE the
+  // synthetic `.mov` sibling (whose `moov/udta/GPMF` blob carries the typed
+  // `%GoPro::GPMF` device tags), this is a real transcoded `.mp4` (98 kB,
+  // muxed by `Lavf62.12.101`): THREE tracks (`vide`/`soun`/`tmcd`, all with a
+  // `GoPro AVC/AAC` `HandlerDescription`) and a `moov/udta/LocationInformation`
+  // atom (`Lat=33.12650 Lon=-117.32719`) — but NO `gpmd` GPMF timed track and
+  // NO `GoPro:*` device record at all. Because there is no embedded/timed
+  // metadata, the bundled oracle's default (`-j`) and `-ee` outputs are
+  // byte-identical (124 tags each): the Composite `GPSLatitude`/`Longitude`
+  // come from the always-extracted `LocationInformation` udta atom, NOT from a
+  // `-ee`-gated gpmd stream — so there is no `-ee`-gating divergence to pin
+  // (cf. #211), and only the two standard goldens are needed.
+  //
+  // exifast emits a clean SUBSET of the bundled tags (zero extra). The deferred
+  // tags, excluded via `tools/gen_golden.sh EXCLUDE` (`-x` is ExifTool TRUTH;
+  // we defer the unported, never edit a value):
+  //   - `System:all`/`Composite:all` — filesystem + the deferred QuickTime
+  //     Composite subsystem (incl. the `LocationInformation`-derived
+  //     `GPSLatitude`/`Longitude`/`Position`), matching the `.mov` goldens;
+  //   - `ItemList:all` (`©too` Encoder) + `UserData:all`
+  //     (`LocationInformation`) — udta atoms this port does not decode;
+  //   - the movie-level `1QuickTime:HandlerType`/`HandlerVendorID` (the
+  //     `udta/hdlr` `mdir`/`appl`), family-1-scoped so the per-track
+  //     `Track<N>:HandlerType` the port DOES emit is retained;
+  //   - the per-track `stsd` sample-description / codec tags the port walks
+  //     only for the `MetaFormat` 4cc, never the full sub-table
+  //     (`CompressorID`/`CompressorName`/`HandlerDescription`/`AudioFormat`/
+  //     color/bitrate/resolution/`TimecodeTrack`/`PlaybackFrameRate`/…).
+  // The retained set (movie header + per-track `tkhd`/`mdhd`/`hdlr` scalars)
+  // is byte-exact vs the bundled `perl exiftool 13.59 -j -G1 -struct
+  // -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
+  check(
+    "QuickTime_gopro_gpmf.mp4",
+    "QuickTime_gopro_gpmf.mp4.json",
+    true,
+  );
+  check(
+    "QuickTime_gopro_gpmf.mp4",
+    "QuickTime_gopro_gpmf.mp4.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_gopro_scen_conformance() {
   // GoPro Codex R13: a complex `?` record (`SCEN` SceneClassification,
   // GoPro.pm:482) whose preceding `TYPE` is `Ff` — a 4-char FourCC scene code
