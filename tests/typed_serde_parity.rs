@@ -612,7 +612,11 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
 /// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
 /// fixture must bump this constant (the per-PR convention above).
-const EXPECTED_ACTIVE_FIXTURES: usize = 525;
+/// 525 → 526: `QuickTime_gopro_gpmf.mp4` (#127) — the real GoPro Hero8 `.mp4`
+/// gains paired `.json`/`.n.json` goldens (no embedded/timed data, so default
+/// `==` `-ee`; movie-header + per-track scalars, the unported container/codec
+/// tags deferred via `-x`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 526;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
