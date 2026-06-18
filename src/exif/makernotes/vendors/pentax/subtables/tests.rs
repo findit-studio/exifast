@@ -29,6 +29,19 @@ const FLASHINFO_K10D: &[u8] = &[
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// The verbatim K10D `LensInfo2` (0x0207) record from the `Pentax.jpg` fixture
+/// (`exiftool -v3`: 69 bytes, `undef[69]`, BigEndian). Offset 0-3 = `LensType`
+/// (`83 00 00 2c`); offset 4-20 = the nested `LensData` `undef[17]`
+/// (`00 28 94 33 5b 53 86 ea 41 40 88 50 38 01 40 6c 03`); the trailing bytes are
+/// the rest of the record (unused by the five ported leaves).
+const LENSINFO2_K10D: &[u8] = &[
+  0x83, 0x00, 0x00, 0x2c, 0x00, 0x28, 0x94, 0x33, 0x5b, 0x53, 0x86, 0xea, 0x41, 0x40, 0x88, 0x50,
+  0x38, 0x01, 0x40, 0x6c, 0x03, 0xff, 0xff, 0xff, 0x00, 0x00, 0x53, 0x86, 0xea, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xbf, 0xea, 0x00, 0x00, 0x00, 0x86, 0x16, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 fn find<'a>(em: &'a [VendorEmission], name: &str) -> Option<&'a TagValue> {
   em.iter()
     .find(|e| e.name() == name)
@@ -329,4 +342,248 @@ fn aeinfo_aeflags_shift_follows_byte_size_not_count() {
   let mut em20 = Vec::new();
   emit_aeinfo(&AEINFO_KX[..20], 12, true, &mut em20);
   assert_eq!(find(&em20, "AEApertureSteps"), Some(&TagValue::I64(161)));
+}
+
+#[test]
+fn lens_info2_k10d_print_conv_byte_exact() {
+  // -j (PrintConv) — the K10D `LensInfo2` ($count == 69, not in the deferred
+  // set). Values verified against `exiftool -G1 -j Pentax.jpg`.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), true, &mut em);
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+  // ONLY the five LensData leaves — LensType (offset 0-3) is NOT re-emitted here
+  // (Phase 1's 0x003f LensRec owns it), and the deferred LensData leaves
+  // (AutoAperture, MinAperture, FocusRangeIndex, MaxAperture) are NOT emitted.
+  assert!(
+    find(&em, "LensType").is_none(),
+    "LensType is owned by 0x003f, not 0x0207"
+  );
+  assert!(find(&em, "AutoAperture").is_none());
+  assert!(find(&em, "MinAperture").is_none());
+  assert!(find(&em, "FocusRangeIndex").is_none());
+  assert!(find(&em, "MaxAperture").is_none());
+  assert_eq!(
+    em.len(),
+    5,
+    "LensInfo2 emits exactly the 5 ported LensData leaves"
+  );
+}
+
+#[test]
+fn lens_info2_k10d_value_conv_floats() {
+  // -n (ValueConv) — the raw f64 / hash-key values (verified against
+  // `exiftool -G1 -n Pentax.jpg`: LensFStops 8.5, MinFocusDistance 6,
+  // LensFocalLength 10, NominalMaxAperture 4, NominalMinAperture 22.6274…).
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), false, &mut em);
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  // MinFocusDistance under -n is the raw masked value (no PrintConv hash).
+  assert_eq!(find(&em, "MinFocusDistance"), Some(&TagValue::I64(6)));
+  assert_eq!(find(&em, "LensFocalLength"), Some(&TagValue::F64(10.0)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&TagValue::F64(4.0)));
+  let approx = |name: &str, want: f64| {
+    let TagValue::F64(g) = find(&em, name).expect(name) else {
+      panic!("{name} is not F64");
+    };
+    assert!((g - want).abs() < 1e-9, "{name} = {g}, want {want}");
+  };
+  approx("NominalMinAperture", 2.0_f64.powf((8.0 + 10.0) / 4.0)); // 22.627416997969522
+}
+
+#[test]
+fn lens_info2_deferred_variant_count_does_not_misdecode() {
+  // The deferred LensInfo3 (645D, $count == 90), LensInfo4 (K-r/K-5, 91),
+  // LensInfo5 (K-01/…, 80 or 128) and Ricoh GR III (168) layouts MUST NOT decode
+  // through the K10D LensData offsets (the scope-fence): ZERO emissions.
+  for count in [90usize, 91, 80, 128, 168] {
+    let mut em = Vec::new();
+    emit_lens_info(LENSINFO2_K10D, count, Some("PENTAX 645D"), true, &mut em);
+    assert!(
+      em.is_empty(),
+      "a deferred-variant $count ({count}) must not decode the K10D LensData"
+    );
+  }
+}
+
+#[test]
+fn lens_info2_focal_length_645z_gate() {
+  // LensFocalLength carries `Condition => '$$self{Model} !~ /645Z/'`
+  // (`Pentax.pm:4475`) — a 645Z body must NOT emit it, but the other four leaves
+  // still do.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX 645Z"), true, &mut em);
+  assert!(
+    find(&em, "LensFocalLength").is_none(),
+    "645Z must not emit LensFocalLength"
+  );
+  // The other leaves are unaffected.
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(em.len(), 4, "645Z drops only LensFocalLength");
+}
+
+#[test]
+fn lens_info2_truncated_block_no_panic() {
+  // A record shorter than LensInfo2 offset 4 itself: the LensData slice is empty
+  // ⇒ no leaf emits, no panic / OOB.
+  let mut em0 = Vec::new();
+  emit_lens_info(
+    &LENSINFO2_K10D[..3],
+    69,
+    Some("PENTAX K10D"),
+    true,
+    &mut em0,
+  );
+  assert!(
+    em0.is_empty(),
+    "a record shorter than offset 4 emits nothing"
+  );
+
+  // A record holding only LensData offsets 0-5 (block[4..10], a 6-byte tail): the
+  // in-range leaves (offset 0 LensFStops, offset 3 MinFocusDistance) decode; the
+  // offset-9 LensFocalLength and offset-10 NominalMax/Min leaves are skipped (no
+  // panic), matching ProcessBinaryData's `last if $entry >= $size`.
+  let mut em1 = Vec::new();
+  emit_lens_info(
+    &LENSINFO2_K10D[..10],
+    69,
+    Some("PENTAX K10D"),
+    true,
+    &mut em1,
+  );
+  assert_eq!(find(&em1, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em1, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert!(
+    find(&em1, "LensFocalLength").is_none(),
+    "offset-9 leaf skipped when truncated"
+  );
+  assert!(find(&em1, "NominalMaxAperture").is_none());
+
+  // A record holding LensData offsets 0-9 but not 10 (block[4..14]): offset-10
+  // NominalMax/Min are skipped, offset-9 LensFocalLength decodes.
+  let mut em2 = Vec::new();
+  emit_lens_info(
+    &LENSINFO2_K10D[..14],
+    69,
+    Some("PENTAX K10D"),
+    true,
+    &mut em2,
+  );
+  assert_eq!(find(&em2, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em2, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert!(
+    find(&em2, "NominalMaxAperture").is_none(),
+    "offset-10 leaf skipped when truncated"
+  );
+  assert!(find(&em2, "NominalMinAperture").is_none());
+}
+
+#[test]
+fn lens_info_old_format_ist_emits_nothing() {
+  // ExifTool tests the old `%Pentax::LensInfo` variant FIRST, before the
+  // `LensInfo2` `$count` condition (`Pentax.pm:2825-2833`): the *ist series ALWAYS
+  // uses the deferred old format (`/(\*ist|GX-1[LS])/`). Even with an otherwise
+  // valid (K10D) block at an in-gate count (69, not in {90,91,80,128,168}), an
+  // *ist body must emit NOTHING — never misdecode through the offset-4 LensInfo2
+  // `LensData`. (`LENSINFO2_K10D` byte 20 == 0x03, so this is the Model-regex
+  // branch, independent of the byte-20 marker.)
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX *ist DS"), true, &mut em);
+  assert!(
+    em.is_empty(),
+    "an *ist body uses the deferred old LensInfo ⇒ zero emissions"
+  );
+}
+
+#[test]
+fn lens_info_old_format_gx1l_emits_nothing() {
+  // The Samsung `GX-1[LS]` also always uses the old format (`/GX-1[LS]/`).
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX GX-1L"), true, &mut em);
+  assert!(
+    em.is_empty(),
+    "a GX-1L body uses the deferred old LensInfo ⇒ zero emissions"
+  );
+}
+
+#[test]
+fn lens_info_old_format_k100d_byte20_ff_emits_nothing() {
+  // The K100D/K110D use the old format only when byte 20 of the record is `0xff`
+  // (`$$valPt=~/^.{20}(\xff|\0\0)/s`). Craft a block whose byte 20 == 0xff: the
+  // old-format marker matches ⇒ zero emissions (the deferred old LensInfo), NOT a
+  // decode through LensInfo2.
+  let mut block = LENSINFO2_K10D.to_vec();
+  block[20] = 0xff;
+  let mut em = Vec::new();
+  emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
+  assert!(
+    em.is_empty(),
+    "a K100D with byte 20 == 0xff uses the deferred old LensInfo ⇒ zero emissions"
+  );
+}
+
+#[test]
+fn lens_info_old_format_k100d_bytes20_21_zero_emits_nothing() {
+  // The other old-format marker: bytes 20..22 == `00 00`.
+  let mut block = LENSINFO2_K10D.to_vec();
+  block[20] = 0x00;
+  block[21] = 0x00;
+  let mut em = Vec::new();
+  emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
+  assert!(
+    em.is_empty(),
+    "a K100D with bytes 20..22 == 00 00 uses the deferred old LensInfo ⇒ zero emissions"
+  );
+}
+
+#[test]
+fn lens_info_k100d_not_old_format_falls_through_to_lensinfo2() {
+  // The byte-20 gate is SPECIFIC to the old-format marker: a K100D whose byte 20 is
+  // NEITHER 0xff NOR (0x00 with byte 21 == 0x00) is the NEWER format and MUST fall
+  // through to the LensInfo2 `$count` test and decode, matching ExifTool (only the
+  // K100D/K110D with the marker take the old path). `LENSINFO2_K10D` byte 20 ==
+  // 0x03 already; set byte 20 = 0x01 to be explicit it is non-old.
+  let mut block = LENSINFO2_K10D.to_vec();
+  block[20] = 0x01;
+  let mut em = Vec::new();
+  emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
+  // Decodes through LensInfo2 — the same five leaves as the K10D path. Byte 20 is
+  // not read by any of the five ported leaves (they live at LensData offsets
+  // 0/3/9/10 = block 4/7/13/14), so the values match the K10D fixture exactly.
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+  assert_eq!(
+    em.len(),
+    5,
+    "a non-old-format K100D decodes through LensInfo2 (5 leaves)"
+  );
+}
+
+#[test]
+fn lens_info_old_format_short_block_falls_through() {
+  // The byte-20/21 reads are bounds-checked: a K100D record shorter than 21 bytes
+  // can't carry the old-format marker (ExifTool's `/^.{20}.../s` simply fails to
+  // match a short value) ⇒ NOT-old, fall through to the `$count` test. With a
+  // 14-byte block the in-range leaves (offsets 0/3/9) decode; offset-10 is skipped.
+  let mut em = Vec::new();
+  emit_lens_info(
+    &LENSINFO2_K10D[..14],
+    69,
+    Some("PENTAX K100D"),
+    true,
+    &mut em,
+  );
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert!(
+    find(&em, "NominalMaxAperture").is_none(),
+    "short block: offset-10 leaf skipped, but the record still decodes (not old)"
+  );
 }
