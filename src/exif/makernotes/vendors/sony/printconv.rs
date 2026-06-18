@@ -236,9 +236,9 @@ impl SonyPrintConv {
   /// this body. Each of these rows is a fully-conditional `[ {Condition=>…},
   /// … ]` with no unconditional catch-all branch, so ExifTool's `GetTagInfo`
   /// finds no tag info and the entry is ABSENT from default output
-  /// (`Sony.pm:1256-1306,1321-1421,1426-1468,1487-1507`). The caller
-  /// ([`super::parse_in_tiff`]) drops the emission on `None`. Every other
-  /// variant (and a matched AF branch) returns `Some(value)`.
+  /// (`Sony.pm:1256-1306,1321-1421,1426-1468,1487-1507`). The caller (the shared
+  /// `Walker`'s Sony capture, `exif::mod::emit_sony_value`) drops the emission on
+  /// `None`. Every other variant (and a matched AF branch) returns `Some(value)`.
   #[must_use]
   pub fn apply_with_context(
     self,
@@ -1231,8 +1231,9 @@ fn model_matches_dsc_rx1rm3_wb(model: &str) -> bool {
 /// is absent from default output — e.g. `Model=DSC-RX100`).
 ///
 /// Note the DataMember set by branches 2/3 (`AFAreaILCE`/`AFAreaILCA`) is
-/// captured by the caller during the IFD walk (see [`super::parse_in_tiff`]),
-/// not here — this fn only renders the displayed value.
+/// captured by the caller during the IFD walk (the shared `Walker`'s Sony
+/// capture, via [`super::af_area_data_member_from_raw`]), not here — this fn only
+/// renders the displayed value.
 fn af_area_mode_setting(raw: &RawValue, print_conv: bool, model: Option<&str>) -> Option<TagValue> {
   let m = model.unwrap_or("");
   if model_is_slt_hv(m) {

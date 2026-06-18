@@ -50,11 +50,11 @@ pub mod tags;
 
 use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
 use crate::exif::makernotes::VendorEmission;
-use crate::value::{Group, Metadata, TagValue};
+use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
 
-pub use body::{NikonEntry, ParsedValue, walk_nikon_ifd};
+pub use body::ParsedValue;
 pub use printconv::NikonConv;
 pub use tags::{
   NIKON_TAGS, NIKON_TYPE2_TAGS, NikonTable, NikonTag, SubTable, format_override,
@@ -62,7 +62,7 @@ pub use tags::{
 };
 
 /// Decoded Nikon MakerNotes — the typed camera-identity surface populated by
-/// [`parse`].
+/// `crate::exif::nikon_makernote_isolated`.
 ///
 /// D8: no public fields; accessor-only. `#[non_exhaustive]` so future Nikon
 /// sub-tables can add fields without a breaking change.
@@ -283,231 +283,6 @@ impl Layout {
   pub(crate) const fn value_base(&self) -> usize {
     self.value_base
   }
-}
-
-/// Parse the captured Nikon MakerNote blob into a [`MakerNotesNikon`] + the
-/// ordered [`VendorEmission`] list for the `MakerNotes:Nikon` group.
-///
-/// Standalone-blob entry point: the blob IS the TIFF context (out-of-line
-/// offsets resolve against the blob itself). Correct for the SELF-CONTAINED
-/// type-3 layout; for type-2 / headerless Nikon3 (whose offsets are
-/// parent-TIFF-relative) use [`parse_in_tiff`] with the real TIFF block.
-///
-/// `parent_order` is the parent IFD walk's byte order (the headerless
-/// fallback); `model` threads the `ShootingMode` bit-5 + AFInfo byte-order
-/// `Condition`s.
-#[must_use]
-pub fn parse(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  model: Option<&str>,
-) -> (MakerNotesNikon, Vec<VendorEmission>) {
-  parse_in_tiff(blob, 0, blob.len(), parent_order, true, model)
-}
-
-/// Standalone-blob parse with the PrintConv flag (`-n` toggle). Equivalent to
-/// [`parse_in_tiff`] over the whole blob; the type-3 layout is self-contained
-/// so this is faithful for it, and a standalone type-2 / Nikon3 blob (no
-/// parent TIFF) still walks its IFD (only its out-of-line offsets, which would
-/// be TIFF-relative, may not resolve — the captured-blob case the JSON walker
-/// uses passes the FULL parent TIFF via [`parse_in_tiff`]).
-#[must_use]
-pub fn parse_with_print_conv(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-) -> (MakerNotesNikon, Vec<VendorEmission>) {
-  parse_in_tiff(blob, 0, blob.len(), parent_order, print_conv, model)
-}
-
-/// Like [`parse`] but resolves out-of-line offsets against the PARENT TIFF
-/// block (`data`), at `mn_offset`/`mn_len` — needed for the type-2 /
-/// headerless Nikon3 layouts whose offsets are TIFF-relative. The type-3
-/// embedded-TIFF layout is self-contained and walks the captured blob
-/// regardless of `data`.
-///
-/// `print_conv` toggles PrintConv (`-n` mode emits the post-ValueConv scalar).
-#[must_use]
-pub fn parse_in_tiff(
-  data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-) -> (MakerNotesNikon, Vec<VendorEmission>) {
-  let mut typed = MakerNotesNikon::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
-  // The captured MakerNote bytes (for header detection).
-  let mn_end = mn_offset.saturating_add(mn_len);
-  let Some(blob) = data.get(mn_offset..mn_end.min(data.len())) else {
-    return (typed, emissions);
-  };
-  let Some(layout) = resolve_layout(blob, parent_order) else {
-    return (typed, emissions);
-  };
-  // Short-MakerNote guard — the captured MakerNote VALUE must contain the IFD
-  // count word. For the type-2 / headerless layouts the walk reads `data` at
-  // `mn_offset + ifd_offset` (out-of-line offsets are parent-TIFF-relative); the
-  // count word at `[mn_offset+ifd_offset, +2)` must sit INSIDE the declared
-  // MakerNote value (`ifd_offset + 2 <= mn_len`), else a truncated `mn_len`
-  // would let the walker read its count word from the UNRELATED following
-  // parent-TIFF bytes — emitting tags ExifTool never does. The type-3 layout is
-  // self-contained (the window IS `blob`, already bounds-checked by
-  // `parse_embedded_tiff` inside `resolve_layout`), so its window measure is
-  // `blob.len()`. Mirrors `nikon_makernote_isolated`'s guard EXACTLY so the
-  // isolated path and this oracle stay byte-identical (Sony parity:
-  // `sony_makernote_isolated` carries the same guard, and `walk_sony_in_tiff`
-  // returns empty for the short case). `checked_add` covers the usize-overflow
-  // class — an overflow can never satisfy `window >=`, so it trips the guard.
-  let window = if layout.walk_in_blob {
-    blob.len()
-  } else {
-    mn_len
-  };
-  match layout.ifd_offset.checked_add(2) {
-    Some(min) if window >= min => {}
-    _ => return (typed, emissions),
-  }
-  // Choose the slice + IFD offset the walker operates on. Type-3 walks the
-  // captured blob (self-contained embedded TIFF); type-2 / headerless walk the
-  // PARENT TIFF (out-of-line offsets are TIFF-relative). The walker bounds the
-  // directory + values to the chosen buffer length, matching ExifTool's
-  // `ProcessExif` `DataLen` bound (the parent EXIF buffer for an in-place
-  // MakerNote — see [`walk_nikon_ifd`]).
-  let (walk_data, ifd_offset): (&[u8], usize) = if layout.walk_in_blob {
-    (blob, layout.ifd_offset)
-  } else {
-    (data, mn_offset.saturating_add(layout.ifd_offset))
-  };
-  let entries = walk_nikon_ifd(
-    walk_data,
-    ifd_offset,
-    layout.order,
-    layout.value_base,
-    layout.table,
-  );
-  // PRE-SCAN for the decryption keys (`Nikon.pm:14199-14203`
-  // `PrescanExif(... 0x001d, 0x00a7 ...)`): ExifTool reads SerialNumber
-  // (0x001d) and ShutterCount (0x00a7) from the IFD BEFORE processing it, so
-  // the keys are available to ANY encrypted sub-table regardless of its IFD
-  // position. The MakerNote IFD is tag-ID-ordered (0x001d < 0x00a7 < 0x0098),
-  // so they precede LensData in walk order anyway, but a separate pass makes
-  // the capture order-independent (and only ever runs on the Main table — the
-  // Type2 layout has no encrypted sub-tables / 0x001d/0x00a7 semantics).
-  let decrypt_keys = if layout.table == NikonTable::Main {
-    scan_decrypt_keys(
-      walk_data,
-      ifd_offset,
-      layout.order,
-      layout.value_base,
-      model,
-    )
-  } else {
-    None
-  };
-  // The RAW `FocusMode` (`$$self{FocusMode}`) from tag 0x0007 (`Nikon.pm:1816`,
-  // RawConv `$$self{FocusMode} = $val`) — gates the LensData0800 Z telemetry's
-  // `FocusMode ne "Manual"` members (0x4c/0x56). UNLIKE the decrypt keys (which
-  // ExifTool genuinely pre-scans, `Nikon.pm:14199-14203`), 0x0007 is a NORMAL
-  // RawConv DataMember set DURING the IFD walk: `$$self{FocusMode}` holds
-  // whatever the LAST-walked 0x0007 entry stored AT the moment the 0x0098
-  // LensData SubDirectory is processed. So the gate must see the value
-  // POSITIONALLY — the last 0x0007 BEFORE this 0x0098 in walk order (`None` /
-  // `undef ne "Manual"` = open when no 0x0007 precedes it). The IFD is normally
-  // tag-ID-ordered (0x0007 < 0x0098), so this matches the pre-scan for a
-  // well-formed MakerNote; it differs only for an unsorted/duplicate IFD where a
-  // `FocusMode = Manual` follows the LensData. The type-2 layout reuses 0x0007
-  // for a different tag, so only the Main table tracks it.
-  let track_focus_mode = layout.table == NikonTable::Main;
-  let mut focus_mode: Option<SmolStr> = None;
-  for entry in &entries {
-    // Capture the running `$$self{FocusMode}` the instant tag 0x0007 is walked,
-    // BEFORE any later 0x0098 reaches `emit_lens_data` (the RawConv stores the
-    // raw on-disk string; a non-`Text` 0x0007 leaves the member unchanged, as
-    // `as_text` returns `None` and we keep the prior value).
-    if track_focus_mode
-      && entry.tag_id == 0x0007
-      && let Some(s) = ParsedValue::new(entry.value.clone()).as_text()
-    {
-      focus_mode = Some(SmolStr::new(s));
-    }
-    let Some(def) = layout.table.lookup(entry.tag_id) else {
-      continue; // Unknown tag — verbose-only in ExifTool; omit.
-    };
-    if let Some(sub) = def.sub_table() {
-      // SubDirectory tag: walk the readable sub-tables; DEFER (emit nothing —
-      // neither parent nor children) for the encrypted/long-tail ones. A
-      // SubDirectory pointer NEVER emits the parent value (`Exif.pm:7103`
-      // `next` skips `FoundTag`), so a deferred subdir is silent — the
-      // #177/#223 bogus-parent rule.
-      //
-      // Slice the SubDirectory value block ONCE from the chosen walk buffer at
-      // the entry's recorded `value_offset`/`value_size` (the
-      // `walk_data[value_offset .. value_offset+value_size]` each emitter used
-      // to re-slice internally). An out-of-bounds extent means the emitter saw
-      // `None` and emitted nothing, so skip the whole subdir — identical to the
-      // emitters' prior `let Some(sub) = … else { return; }`.
-      let Some(block) = entry
-        .value_offset
-        .checked_add(entry.value_size)
-        .and_then(|end| walk_data.get(entry.value_offset..end))
-      else {
-        continue;
-      };
-      match sub {
-        SubTable::AfInfo => {
-          emit_af_info(block, print_conv, model, &mut emissions);
-        }
-        SubTable::ColorBalance0103 => {
-          emit_color_balance(block, layout.order, print_conv, &mut emissions);
-        }
-        SubTable::LensData => {
-          emit_lens_data(
-            block,
-            layout.order,
-            print_conv,
-            decrypt_keys,
-            focus_mode.as_deref(),
-            &mut emissions,
-          );
-        }
-        SubTable::FlashInfo => {
-          emit_flash_info(block, layout.order, print_conv, &mut emissions);
-        }
-        SubTable::ShotInfo => {
-          emit_shot_info(block, print_conv, decrypt_keys, &mut emissions);
-        }
-        // Deferred (encrypted / unported child table): emit nothing.
-        SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
-      }
-      continue;
-    }
-    // Leaf tag.
-    let parsed = ParsedValue::new(entry.value.clone());
-    // A `None` is a `RawConv => … : undef` drop (only JPGCompression 0 among
-    // the ported tags) — the tag is NOT emitted (neither typed nor parity).
-    // `layout.order` is `GetByteOrder()` for the Main IFD (PowerUpTime RawConv).
-    let Some(value) = def.conv().apply(&parsed, print_conv, model, layout.order) else {
-      continue;
-    };
-    // The typed convenience surface ([`MakerNotesNikon`]) is keyed by the
-    // `%Nikon::Main` tag IDs it documents; the type-2 layout reuses those IDs
-    // (0x0003..0x000b) for DIFFERENT `%Nikon::Type2` tags, so populating the
-    // Main-semantic fields from a type-2 walk would mislabel them. Only the
-    // Main path feeds `typed`; the type-2 path emits through the authoritative
-    // `emissions` list alone (with its faithful `%Nikon::Type2` names).
-    if layout.table == NikonTable::Main {
-      populate_typed(&mut typed, entry.tag_id, &value, def.name());
-    }
-    emissions.push(VendorEmission::new(
-      def.name().into(),
-      value,
-      def.is_unknown(),
-    ));
-  }
-  (typed, emissions)
 }
 
 /// Emit the `%Nikon::AFInfo` (0x0088) leaves — a `ProcessBinaryData` table
@@ -1916,30 +1691,51 @@ pub(crate) fn populate_typed(
   }
 }
 
-/// Emit Nikon MakerNotes into a [`Metadata`] sink under the
-/// `("MakerNotes","Nikon")` group — the family-0 `MakerNotes`, family-1
-/// `Nikon` axis bundled `exiftool -G1` uses.
-pub fn parse_into_metadata(
-  blob: &[u8],
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-  into: &mut Metadata,
-) {
-  let group = Group::new("MakerNotes", "Nikon");
-  let (_typed, emissions) = parse_with_print_conv(blob, parent_order, print_conv, model);
-  for e in emissions {
-    if e.unknown() {
-      continue;
-    }
-    into.push(group.clone(), e.name(), e.value().clone());
-  }
-}
-
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+
+  // The per-vendor oracle entry points (`nikon::parse` / `parse_with_print_conv` /
+  // `parse_in_tiff`) were retired in #243 phase 5; the production decode now runs
+  // through the shared-`Walker` isolated helper
+  // `crate::exif::nikon_makernote_isolated` (proven byte-identical by the
+  // conformance suite + the deleted differential tests). These thin shims preserve
+  // the old signatures so the layout/prescan/decrypt/sub-table decode tests below
+  // exercise the SAME path. The isolated helper returns `None` for a blob whose
+  // layout cannot be resolved (`resolve_layout` fail); the oracle returned empties
+  // there, so the shim maps `None` to `(MakerNotesNikon::new(), empty)` to preserve
+  // that contract (e.g. the empty-blob test).
+  fn parse(
+    blob: &[u8],
+    order: ByteOrder,
+    model: Option<&str>,
+  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+    parse_in_tiff(blob, 0, blob.len(), order, true, model)
+  }
+
+  fn parse_with_print_conv(
+    blob: &[u8],
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+    parse_in_tiff(blob, 0, blob.len(), order, print_conv, model)
+  }
+
+  fn parse_in_tiff(
+    blob: &[u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+    match crate::exif::nikon_makernote_isolated(blob, mn_offset, mn_len, order, model, print_conv) {
+      Some((emissions, typed)) => (typed, emissions),
+      None => (MakerNotesNikon::new(), Vec::new()),
+    }
+  }
 
   /// A synthetic type-3 blob with Quality + LensType decodes through the full
   /// parse path, emitting title-cased Quality + the LensType bitmask string.

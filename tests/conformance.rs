@@ -8646,6 +8646,40 @@ fn exif_makernote_subdirectory_deferred_conformance() {
   check("Exif_makernote.tif", "Exif_makernote.tif.n.json", false);
 }
 #[test]
+fn makernotes_nikon_d2hs_conformance() {
+  // NikonD2Hs.jpg — the riskiest Nikon production path AND the first IFD-
+  // MakerNote conformance backstop: the ~66 `Nikon:*` tags (incl. encrypted
+  // LensData0201, the serial-3001006 decrypt-key prescan, ShotInfo 0206,
+  // FlashInfo 0100) are emitted byte-identically to bundled ExifTool 13.59.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
+  // tags exifast intentionally does NOT emit — every exclusion is a PRE-
+  // EXISTING, documented, NON-Nikon-MakerNote-path deferral (not a regression
+  // in the migrated Nikon path), so excluding them does not mask any Nikon
+  // faithfulness gap:
+  //   -x Composite:all     — exifast has no EXIF Composite subsystem.
+  //   -x PreviewIFD:all    — Nikon SubIFD 0x0011 PreviewIFD is OtherDeferred.
+  //   -x File:ImageWidth -x File:ImageHeight -x File:EncodingProcess
+  //   -x File:BitsPerSample -x File:ColorComponents -x File:YCbCrSubSampling
+  //                        — the JPEG SOF-segment `File:*` tags the engine does
+  //                          not parse (a documented engine-wide gap shared by
+  //                          the Canon/Apple/Sony/Panasonic JPEG fixtures — the
+  //                          reason none of them is a conformance entry either).
+  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder (same
+  //                          documented engine-wide gap).
+  //   -x ExifIFD:CFAPattern  — a standard EXIF tag (0xa302) not in exifast's
+  //                          EXIF table; unrelated to MakerNotes.
+  //   -x Nikon:WB_RGGBLevels — this file's ColorBalance is the ENCRYPTED `02xx`
+  //                          (ColorBalance02) variant; `emit_color_balance`
+  //                          ports only the unencrypted `0103` (D70/D70s) arm,
+  //                          and the encrypted variants are a documented
+  //                          Phase-2/3 follow-up (nikon/tags.rs ColorBalance-
+  //                          Encrypted). The ONE deferred Nikon tag on this
+  //                          file; the other 65 Nikon tags are byte-identical.
+  check("NikonD2Hs.jpg", "NikonD2Hs.jpg.json", true);
+  check("NikonD2Hs.jpg", "NikonD2Hs.jpg.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`

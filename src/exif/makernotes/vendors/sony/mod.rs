@@ -10,9 +10,11 @@
 //!
 //! ## Phase 3 scope
 //!
-//! - The Sony body walker ([`body::walk_sony_in_tiff`]) — accepts the
-//!   dispatcher-provided body-offset (12 for the `SONY DSC `/`SONY CAM `
-//!   variants, 0 for `MakerNoteSony5` headerless), walks the IFD entries.
+//! - The Sony body walk — accepts the dispatcher-provided body-offset
+//!   (12 for the `SONY DSC `/`SONY CAM ` variants, 0 for `MakerNoteSony5`
+//!   headerless), walks the IFD entries. This now runs through the shared
+//!   `Walker` isolated helper `crate::exif::sony_makernote_isolated`; the
+//!   standalone `body::walk_sony_in_tiff` oracle was deleted in #243 phase 5.
 //! - The faithful tag table ([`tags::SONY_TAGS`]) — every named LEAF tag
 //!   in `%Sony::Main` with a clean PrintConv. The big conditional-list
 //!   SubDirectory rows (`CameraInfo`/`CameraSettings`/`FocusInfo`/
@@ -69,18 +71,14 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod amount_lens_types;
-pub mod body;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
 pub mod tags;
 
-use crate::exif::makernotes::vendors::VendorEmission;
-use crate::value::{Group, Metadata, TagValue};
+use crate::value::TagValue;
 use smol_str::SmolStr;
-use std::vec::Vec;
 
-pub use body::{SonyEntry, walk_sony_body, walk_sony_in_tiff};
 pub use lens_types::{SONY_LENS_TYPES, SonyLensType};
 pub use model_ids::{SONY_MODEL_IDS, SonyModelEntry};
 pub use printconv::{
@@ -88,10 +86,11 @@ pub use printconv::{
 };
 pub use tags::{SONY_TAGS, SonyTag, SubTable, format_override, lookup};
 
-use super::super::super::ifd::{ByteOrder, RawValue};
+use super::super::super::ifd::RawValue;
 
-/// Decoded Sony MakerNotes data — populated by [`parse`] when the
-/// dispatcher resolved [`Vendor::Sony`](crate::exif::makernotes::Vendor).
+/// Decoded Sony MakerNotes data — populated by
+/// `crate::exif::sony_makernote_isolated` when the dispatcher resolved
+/// [`Vendor::Sony`](crate::exif::makernotes::Vendor).
 ///
 /// D8: no public fields; accessor-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -248,165 +247,9 @@ impl MakerNotesSony {
   }
 }
 
-/// Parse the captured Sony MakerNote blob (standalone-blob variant — no
-/// parent TIFF context). Use [`parse_in_tiff`] when the parent TIFF block
-/// is available.
-///
-/// **Low-level primitive — NOT variant-gated.** This runs `%Sony::Main`
-/// UNCONDITIONALLY on `blob`; it is the building block the gated entry
-/// [`parse_main_gated`] calls AFTER [`routes_to_main`] admits the blob.
-/// An automatic vendor-dispatch caller (the production `ProcessExif` walk,
-/// the public [`MakerNotesMeta::from_blob`](crate::exif::makernotes::MakerNotesMeta::from_blob)
-/// constructor) must route through [`parse_main_gated`] instead, so a
-/// non-Main Sony variant (SonyEricsson `SEMC MS\0`, etc.) does not decode
-/// spurious Main tags.
-///
-/// `blob` is the raw 0x927C value; `body_offset` is 12 for the
-/// `SONY DSC `/`SONY CAM `/`SONY MOBILE`/`VHAB     \0`/`\0\0SONY PIC\0`
-/// variants, 0 for `MakerNoteSony5`. `parent_order` is the parent IFD
-/// walk's byte order. The per-`$$self{Model}` conditional AF tags
-/// (0x201c/0x201e/0x2020/0x2022) evaluate against an absent Model (use
-/// [`parse_in_tiff`] to thread the IFD0 `$$self{Model}`).
-#[must_use]
-pub fn parse(
-  blob: &[u8],
-  body_offset: usize,
-  parent_order: ByteOrder,
-) -> (MakerNotesSony, Vec<VendorEmission>) {
-  parse_in_tiff(blob, 0, blob.len(), body_offset, parent_order, true, None)
-}
-
-/// Parse with the parent TIFF context. `tiff_data` is the parent TIFF
-/// block, `mn_offset` is the MakerNote blob's position in it, `mn_len` is
-/// the blob length, `body_offset` is 12 or 0 (see [`parse`]).
-///
-/// `model` is the body `$$self{Model}` (from IFD0) used to select the
-/// model-conditional AF-tag branches: `0x201c AFAreaModeSetting`
-/// (`Sony.pm:1256-1306`), `0x201e AFPointSelected` (`Sony.pm:1321-1421`),
-/// `0x2020 AFPointsUsed` (`Sony.pm:1426-1468`) and `0x2022
-/// FocalPlaneAFPointsUsed` (`Sony.pm:1487-1507`). 0x201c also sets the
-/// `AFAreaILCE`/`AFAreaILCA` DataMember (`Sony.pm:1278-1279,1295-1296`)
-/// that 0x201e's `Condition` reads — captured here from 0x201c during the
-/// walk (entries are in tag-id order, so 0x201c precedes 0x201e, matching
-/// ExifTool's in-order DataMember side-effect). An absent Model selects
-/// the same branch ExifTool picks for `undef` (i.e. no branch ⇒ raw).
-#[must_use]
-pub fn parse_in_tiff(
-  tiff_data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  body_offset: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-) -> (MakerNotesSony, Vec<VendorEmission>) {
-  let mut typed = MakerNotesSony::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
-  let entries = body::walk_sony_in_tiff(tiff_data, mn_offset, mn_len, body_offset, parent_order);
-  // `AFAreaILCE`/`AFAreaILCA` DataMember (`Sony.pm:1278-1279,1295-1296`):
-  // 0x201c's RawConv stores its raw `$val` into this member iff the body
-  // matches the NEX/ILCE (branch 2) or ILCA (branch 3) `Condition`; 0x201e
-  // reads it. Set as we walk past 0x201c (which precedes 0x201e).
-  let mut af_area: Option<i64> = None;
-  for entry in &entries {
-    let Some(def) = tags::lookup(entry.tag_id) else {
-      continue;
-    };
-    // SubDirectory rows DESCEND into a child table and NEVER emit the parent
-    // pointer as a value. ExifTool's `ProcessExif` enters the `if ($subdir)`
-    // block (`Exif.pm:6919`), processes the sub-directory via
-    // `ProcessDirectory` (`:7091`), then hits `next unless $doMaker or
-    // $$et{REQ_TAG_LOOKUP}{…} or $$tagInfo{BlockExtract}` (`:7103-7104`) — for
-    // a plain SubDirectory tag in default output (MakerNotes option off, tag
-    // not requested, no BlockExtract) that `next` SKIPS `FoundTag` (`:7180`),
-    // so the parent is ABSENT from default `-j` output. Every `%Sony::Main`
-    // SubDirectory row here is a pure descend-no-parent-value pointer (none is
-    // `Writable`/`MakerNotes`/`BlockExtract` on the SubDirectory branch —
-    // verified against bundled `Sony.pm`; e.g. 0x0010 CameraInfo `:716-747`,
-    // 0x0114 CameraSettings `:803-835`, 0x3000 ShotInfo `:1768-1771`, the
-    // 0x9xxx encrypted series `:1789-2118`, 0xb028 MinoltaMakerNote SubIFD
-    // `:2373-2384`). Phase 3 DEFERS the child-table walk (documented scope),
-    // so the faithful behaviour is to emit NEITHER the parent nor (for now)
-    // the children: skip the emission for any deferred SubDirectory row.
-    //
-    // For the conditional-ARRAY 0x9xxx rows whose trailing fallback branch is
-    // `%unknownCipherData` (`Sony.pm:675-681`, `Unknown => 1`), this matches
-    // bundled either way: a model-matched body descends a SubDirectory branch
-    // (parent suppressed); an unmatched body selects the `Sony_0x90xx`
-    // `Unknown` leaf which is itself suppressed from default output
-    // (`ExifTool.pm:9179-9185`). The Rust row carries the first-branch name +
-    // `sub_table = Some`, so suppressing it leaks no bogus parent in either case.
-    if def.sub_table.is_some() {
-      continue;
-    }
-    // 0x201c sets the AFAreaILCx DataMember (RawConv side-effect) — capture
-    // it BEFORE rendering so 0x201e (later in the IFD) can read it. The
-    // RawConv runs only on branches 2/3, whose `Condition` is the same
-    // model match `af_area_mode_setting` uses for those branches.
-    if entry.tag_id == 0x201c {
-      af_area = af_area_data_member(entry, model);
-    }
-    // Single-HASH `Condition` suppression (`Sony.pm` rows of the form
-    // `0xNN => { Condition=>…, … }`): ExifTool's `GetTagInfo` evaluates the
-    // `Condition` and, when it does NOT hold, returns no tag info ⇒ the entry
-    // is ABSENT from default output. Port that gate here — skip the emission
-    // entirely (no raw fallback) on a miss. This covers the model-gated rows
-    // 0x201b/0x201d/0x2021/0x205c/0xb050 and the `$format`-gated MultiBurst
-    // rows 0x1000/0x1001/0x1002 (the conditional-ARRAY AF tags
-    // 0x201c/0x201e/0x2020/0x2022 instead suppress via `apply_with_context`
-    // returning `None`, below).
-    if !printconv::single_hash_condition_holds(entry.tag_id, def_format(entry), model) {
-      continue;
-    }
-    // RawConv undef-drop (sentinel suppression): a `%Sony::Main` row whose
-    // `RawConv` returns `undef` for a sentinel raw value (the 0xb04x
-    // `$val == 65535 ? undef : $val` rows, and 0xb048's model-conditional
-    // `-1`-on-DSLR-A100 drop) is NOT extracted ⇒ ABSENT from output. Port that
-    // here BEFORE the conv/emission: skip the emission entirely on a drop, so
-    // the sentinel never leaks as a converted value. The drop reads the RAW
-    // value (pre-conv) + the threaded Model, exactly like ExifTool's RawConv
-    // (`printconv::rawconv_drops`, citations there).
-    if printconv::rawconv_drops(entry.tag_id, &entry.value, model) {
-      continue;
-    }
-    // The four conditional-ARRAY AF tags need `$$self{Model}` (+ the
-    // DataMember for 0x201e); everything else ignores both. These four rows
-    // are fully conditional (no unconditional catch-all branch), so when no
-    // `Condition` matches this body ExifTool's `GetTagInfo` returns NO tag
-    // info and the entry is ABSENT from default output
-    // (`Sony.pm:1256-1306,1321-1421,1426-1468,1487-1507`) — signalled here as
-    // `None`, on which we skip the emission entirely (matching that absence)
-    // rather than falling back to the raw value.
-    let value = match entry.tag_id {
-      0x201c | 0x201e | 0x2020 | 0x2022 => {
-        match def
-          .conv
-          .apply_with_context(&entry.value, print_conv, model, af_area)
-        {
-          Some(v) => v,
-          // No branch matched ⇒ suppress (no VendorEmission for this entry).
-          None => continue,
-        }
-      }
-      _ => def.conv.apply(&entry.value, print_conv),
-    };
-    populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
-    // Emit WITH the bundled `Unknown => 1` flag (`Sony.pm:675-681`
-    // `%unknownCipherData`). Unknown-suppression is the emission engine's
-    // job (`ExifTool.pm:9179-9185` returns undef for Unknown tags unless
-    // `-u`/Verbose/HTML_DUMP/Validate) — carried here, dropped there, so no
-    // per-vendor `if def.is_unknown() { continue; }`. Mirrors Apple/Canon.
-    emissions.push(VendorEmission::new(
-      def.name.into(),
-      value,
-      def.is_unknown(),
-    ));
-  }
-  (typed, emissions)
-}
-
 /// `true` iff a `Vendor::Sony` blob routes to `%Sony::Main` (and so the
-/// Sony Main IFD walker [`parse_in_tiff`] should run on it).
+/// Sony Main IFD walker `crate::exif::sony_makernote_isolated` should run on
+/// it).
 ///
 /// The dispatcher collapses ALL seven Sony `MakerNotes.pm` variants
 /// (`:1031-1099`) to [`Vendor::Sony`](crate::exif::makernotes::Vendor::Sony),
@@ -494,122 +337,16 @@ pub fn routes_to_main(blob: &[u8], make: Option<&str>, model: Option<&str>) -> b
   false
 }
 
-/// **The single gated entry into the Sony `%Sony::Main` parser.** Every
-/// caller that wants to run the Sony Main IFD walker on a captured
-/// `Vendor::Sony` blob MUST go through this function — it is the ONE place
-/// the `routes_to_main` variant gate lives, so the gate cannot be bypassed
-/// by a parallel code path (the production `ProcessExif` IFD walk, the
-/// public [`MakerNotesMeta::from_blob`](crate::exif::makernotes::MakerNotesMeta::from_blob)
-/// constructor, and any future entry all funnel through here).
-///
-/// The dispatcher collapses ALL seven Sony `MakerNotes.pm` variants
-/// (`:1031-1099`) to [`Vendor::Sony`](crate::exif::makernotes::Vendor::Sony),
-/// but only `MakerNoteSony`/`MakerNoteSony5` use `%Sony::Main`. The others
-/// (`Sony2`/`Sony3` → `Olympus::Main`, `Sony4` → `Sony::PIC`,
-/// `SonyEricsson` → `Sony::Ericsson`, `SonySRF` → `Sony::SRF`) route to
-/// tables this Phase-3 port has not ported, so running the Main walker on
-/// them is UNFAITHFUL (a coincidental tag-id collision decodes a bogus tag —
-/// e.g. a `SEMC MS\0` Ericsson blob decoding a spurious `Quality`). This
-/// function applies [`routes_to_main`] (the `%Main`-order classifier) and
-/// returns:
-///
-/// - `Some((typed, emissions))` — the blob is one of the two Main variants;
-///   the Main walker ran via [`parse_in_tiff`].
-/// - `None` — the blob routes ELSEWHERE; the caller must leave the Sony
-///   slot ABSENT (no spurious tags).
-///
-/// Args mirror [`parse_in_tiff`] plus the gate inputs `make`/`model`
-/// (`$$self{Make}`/`$$self{Model}` from IFD0, which `routes_to_main` reads
-/// for the headerless Sony5 make-gate and for the model-conditional AF
-/// branches). `mn_offset`/`mn_len`/`tiff_data` give the parent-TIFF context
-/// so out-of-line offsets resolve correctly (both Main variants INHERIT the
-/// parent base — no `Base =>` override, `MakerNotes.pm:1037-1041,1076-1080` —
-/// so there is no base addend, unlike Panasonic3).
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn parse_main_gated(
-  tiff_data: &[u8],
-  mn_offset: usize,
-  mn_len: usize,
-  body_offset: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  make: Option<&str>,
-  model: Option<&str>,
-) -> Option<(MakerNotesSony, Vec<VendorEmission>)> {
-  // The gate reads the captured MakerNote blob (the bytes the dispatcher
-  // classified) — `tiff_data[mn_offset .. mn_offset + mn_len]`.
-  let blob_end = mn_offset.saturating_add(mn_len).min(tiff_data.len());
-  let blob = tiff_data.get(mn_offset..blob_end)?;
-  if !routes_to_main(blob, make, model) {
-    return None;
-  }
-  Some(parse_in_tiff(
-    tiff_data,
-    mn_offset,
-    mn_len,
-    body_offset,
-    parent_order,
-    print_conv,
-    model,
-  ))
-}
-
-/// Mirror that emits straight into a [`Metadata`] sink under the Sony
-/// MakerNote group.
-///
-/// **Low-level primitive — NOT variant-gated** (like [`parse`]): it runs
-/// `%Sony::Main` unconditionally. An automatic-dispatch caller must gate
-/// with [`routes_to_main`] / [`parse_main_gated`] first.
-///
-/// The group's family-1 name is [`Vendor::Sony.group1()`](crate::exif::makernotes::Vendor::group1)
-/// = `"Sony"` (`Sony.pm:710` declares only `GROUPS => { 0 => 'MakerNotes',
-/// … }`, so ExifTool derives the family-1 group from the vendor module —
-/// `exiftool -j -G1` emits `Sony:Quality` on a Sony body). This matches the
-/// cached serializer, which already routes through `group1()`.
-pub fn parse_into_metadata(
-  blob: &[u8],
-  body_offset: usize,
-  parent_order: ByteOrder,
-  print_conv: bool,
-  model: Option<&str>,
-  into: &mut Metadata,
-) {
-  use crate::exif::makernotes::Vendor;
-  let g1 = Vendor::Sony.group1();
-  let group = Group::new(g1, g1);
-  let (_typed, emissions) = parse_in_tiff(
-    blob,
-    0,
-    blob.len(),
-    body_offset,
-    parent_order,
-    print_conv,
-    model,
-  );
-  for e in emissions {
-    // Unknown-suppression is the engine's job; this raw `Metadata`-sink
-    // helper applies it inline so it matches the default-output contract
-    // (`ExifTool.pm:9179-9185`), exactly like `run_emission`. Mirrors
-    // Apple's `parse_into_metadata`.
-    if e.unknown() {
-      continue;
-    }
-    into.push(group.clone(), e.name(), e.value().clone());
-  }
-}
-
 /// Populate the typed struct from one Sony Main-IFD leaf-tag emission. `raw` is
 /// the entry's post-Format-decode [`RawValue`]; `val` the already-rendered
 /// [`TagValue`] (read ONLY by 0xb020's string fallback).
 ///
 /// MUST be called ONLY for an entry that PASSED every suppression gate (the
-/// oracle [`parse_in_tiff`] calls it AFTER the SubDirectory-skip / single-HASH /
-/// RawConv-drop / conditional-AF checks, alongside the emission) — a rawconv-
-/// dropped 0xb041, for instance, must populate NEITHER the emission NOR
-/// `exposure_mode`. The shared-`Walker` Sony capture
-/// (`exif::mod::emit_sony_value`) preserves that ordering by calling this from the
-/// SAME gate-passing path it emits from (#243 phase 3).
+/// SubDirectory-skip / single-HASH / RawConv-drop / conditional-AF checks,
+/// alongside the emission) — a rawconv-dropped 0xb041, for instance, must
+/// populate NEITHER the emission NOR `exposure_mode`. The shared-`Walker` Sony
+/// capture (`exif::mod::emit_sony_value`) preserves that ordering by calling this
+/// from the SAME gate-passing path it emits from (#243 phase 3).
 pub(crate) fn populate_typed(
   typed: &mut MakerNotesSony,
   tag_id: u16,
@@ -679,19 +416,14 @@ fn first_u32(raw: &RawValue) -> Option<u32> {
   }
 }
 
-/// `0x201c`'s `AFAreaILCE`/`AFAreaILCA` DataMember side-effect
-/// (`Sony.pm:1278-1279,1295-1296`): the `RawConv => '$$self{AFAreaILCx} =
-/// $val'` runs only on the NEX/ILCE (branch 2) or ILCA (branch 3) Condition,
-/// storing 0x201c's raw `$val`. Returns `Some(raw)` when this body sets it,
-/// else `None` (SLT/HV branch 1, or no branch — neither sets a DataMember).
-fn af_area_data_member(entry: &SonyEntry, model: Option<&str>) -> Option<i64> {
-  af_area_data_member_from_raw(&entry.value, model)
-}
-
-/// 0x201c's `AFAreaILCx` DataMember from its RAW value + the body `$$self{Model}`
-/// — the [`af_area_data_member`] core, taking the [`RawValue`] directly so the
-/// shared-`Walker` Sony capture (`exif::mod::sony_makernote_isolated`) can thread
-/// the same in-IFD side-effect 0x201e reads (#243 phase 3).
+/// 0x201c's `AFAreaILCE`/`AFAreaILCA` DataMember side-effect
+/// (`Sony.pm:1278-1279,1295-1296`): the `RawConv => '$$self{AFAreaILCx} = $val'`
+/// runs only on the NEX/ILCE (branch 2) or ILCA (branch 3) `Condition`, storing
+/// 0x201c's raw `$val`. Takes the [`RawValue`] + the body `$$self{Model}`
+/// directly so the shared-`Walker` Sony capture
+/// (`exif::mod::sony_makernote_isolated`) can thread the same in-IFD side-effect
+/// 0x201e reads (#243 phase 3). Returns `Some(raw)` when this body sets it, else
+/// `None` (SLT/HV branch 1, or no branch — neither sets a DataMember).
 #[must_use]
 pub(crate) fn af_area_data_member_from_raw(raw: &RawValue, model: Option<&str>) -> Option<i64> {
   if SonyPrintConv::af_area_sets_data_member(model) {
@@ -709,13 +441,6 @@ fn first_i64(raw: &RawValue) -> Option<i64> {
   }
 }
 
-/// The entry's on-disk TIFF format name (`$format` in a bundled `Condition`,
-/// e.g. `"undef"`/`"int16u"`) — what `single_hash_condition_holds` tests for
-/// the `$format`-gated MultiBurst rows (0x1000/0x1001/0x1002).
-fn def_format(entry: &SonyEntry) -> &'static str {
-  entry.format.name()
-}
-
 #[cfg(test)]
 // The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
 // contract (Phase C S2); the test-builder helpers index fixed-layout buffers
@@ -724,9 +449,99 @@ fn def_format(entry: &SonyEntry) -> &'static str {
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::vendors::VendorEmission;
+  use crate::value::{Group, Metadata};
+  use std::vec::Vec;
+
+  // The per-vendor oracle entry points (`sony::parse` / `parse_in_tiff` /
+  // `parse_into_metadata`) were retired in #243 phase 5; the production decode now
+  // runs through the shared-`Walker` isolated helper
+  // `crate::exif::sony_makernote_isolated` (proven byte-identical by the
+  // conformance suite + the deleted differential tests). These thin shims preserve
+  // the old signatures so the per-entry-gate decode tests below exercise the SAME
+  // tables/convs/gates through the surviving path. The isolated helper gates on
+  // `routes_to_main`, which the un-gated oracle did not; every parse test below
+  // uses a `%Sony::Main` body (`SONY DSC` header or a headerless Sony5 shape), so
+  // the shims pass `make = Some("SONY")` — the Sony5 make-gate (and a no-op for the
+  // prefixed variants) — to route them exactly as the oracle decoded. (Routes-AWAY
+  // bodies are covered by the surviving `routes_to_main` unit tests above.)
+  fn parse(
+    blob: &[u8],
+    body_offset: usize,
+    order: ByteOrder,
+  ) -> (MakerNotesSony, Vec<VendorEmission>) {
+    parse_in_tiff(blob, 0, blob.len(), body_offset, order, true, None)
+  }
+
+  fn parse_in_tiff(
+    blob: &[u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_offset: usize,
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+  ) -> (MakerNotesSony, Vec<VendorEmission>) {
+    // `build_blob` always materializes the 12-byte `SONY DSC` prefix, so the IFD
+    // is at the fixed body offset 12 (the `MakerNoteSony` Start) regardless of the
+    // caller's `body_offset` argument (the retired headerless oracle path took 0).
+    debug_assert!(
+      body_offset == 0 || body_offset == 12,
+      "sony test bodies use the headerless(0)/SONY-DSC(12) offsets"
+    );
+    match crate::exif::sony_makernote_isolated(
+      blob,
+      mn_offset,
+      mn_len,
+      12,
+      order,
+      Some("SONY"),
+      model,
+      print_conv,
+    ) {
+      Some((emissions, typed)) => (typed, emissions),
+      None => (MakerNotesSony::new(), Vec::new()),
+    }
+  }
+
+  fn parse_into_metadata(
+    blob: &[u8],
+    body_offset: usize,
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+    into: &mut Metadata,
+  ) {
+    use crate::exif::makernotes::Vendor;
+    let g1 = Vendor::Sony.group1();
+    let group = Group::new(g1, g1);
+    let (_typed, emissions) =
+      parse_in_tiff(blob, 0, blob.len(), body_offset, order, print_conv, model);
+    for e in emissions {
+      if e.unknown() {
+        continue;
+      }
+      into.push(group.clone(), e.name(), e.value().clone());
+    }
+  }
 
   /// Build a synthetic Sony blob: optional header + N entries.
+  ///
+  /// An EMPTY `header` is materialized as the 12-byte `SONY DSC \0\0\0`
+  /// `MakerNoteSony` prefix so the body unambiguously routes to `%Sony::Main`
+  /// through the gated `sony_makernote_isolated` (the retired oracle decoded
+  /// headerless bodies un-gated, but a bare IFD whose count word is `\x01\x00`
+  /// collides with the SonySRF signature and a make-less body fails the Sony5
+  /// make-gate). Every parse shim below therefore walks the body at the fixed
+  /// `SONY DSC` offset 12; `build_blob` computes out-of-line offsets against the
+  /// full (prefixed) buffer, so the leaf decode is unchanged.
   fn build_blob(header: &[u8], entries: &[(u16, u16, u32, Vec<u8>)]) -> Vec<u8> {
+    let header: &[u8] = if header.is_empty() {
+      b"SONY DSC \x00\x00\x00"
+    } else {
+      header
+    };
     let mut blob = Vec::new();
     blob.extend_from_slice(header);
     blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());

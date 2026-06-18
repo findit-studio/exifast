@@ -39,6 +39,29 @@
 //! No public struct fields. Every accessor is `const fn` where possible.
 //! Enums are unit-variant or carry only newtype payloads. See
 //! `exifast-api-conventions`.
+//!
+//! ## Single-walker invariant (#243)
+//!
+//! For each migrated vendor (Apple, Canon, Sony, Panasonic, Nikon) the
+//! Main-IFD MakerNote walk is the ONE isolated helper
+//! `crate::exif::<v>_makernote_isolated` — a fresh shared `Walker` (the
+//! faithful `ProcessExif`) routed from BOTH the `-j` collection path and the
+//! `-n` `MakerNoteValueConvDecode::recompute`. The parallel per-vendor
+//! `walk_<v>_in_tiff` / `parse_in_tiff` oracle was DELETED in #243 phase 5
+//! (closes #230 / #231); do not reintroduce a second per-vendor Main walker —
+//! a single walker is the only way the `-j`/`-n` byte-identity contract is
+//! enforced by construction (two walkers can drift). The compiler is the
+//! enforcement: the oracle entry points and their pub-use re-exports are gone,
+//! so any reintroduced reference fails to build.
+//!
+//! EXCEPTIONS, by design: Panasonic keeps `parse_in_tiff` +
+//! `walk_panasonic_in_tiff` solely as the body the CROSS-VENDOR Leica gated
+//! entries (`parse_leica1_gated` / `parse_leica10_gated`) call — Leica was not
+//! migrated to an isolated path (a tracked follow-up). Canon's CTMD re-dispatch
+//! (`redispatch_ctmd_makernote`) and the Panasonic `%Panasonic::Main` automatic
+//! route both go through the shared `Walker` (the isolated helpers), NOT a
+//! per-vendor oracle. DJI is unmigrated and retains its own `parse` /
+//! `parse_in_tiff`.
 
 // NOTE: no file-level `#![deny(clippy::indexing_slicing)]` here. This is a
 // PARENT module (it declares `pub mod dispatcher;` + `pub mod vendors;`), and
@@ -181,9 +204,10 @@ impl MakerNotesMeta {
   /// The dispatcher collapses every Sony/Panasonic `MakerNotes.pm` variant
   /// to [`Vendor::Sony`] / [`Vendor::Panasonic`], but only a SUBSET routes
   /// to `%Sony::Main` / `%Panasonic::Main`. This constructor runs the Main
-  /// parser through the SAME gated entry the production `ProcessExif` IFD
-  /// walk uses — [`vendors::sony::parse_main_gated`] and
-  /// [`vendors::panasonic::parse_main_gated`] — so:
+  /// parser through the SAME gated path the production `ProcessExif` IFD
+  /// walk uses — the shared `Walker`'s isolated Sony/Panasonic helpers, which
+  /// apply the [`vendors::sony::routes_to_main`] /
+  /// [`vendors::panasonic::routes_to_main`] variant gate FIRST — so:
   ///
   /// - A non-Main Sony variant (a `SEMC MS\0` SonyEricsson blob, a
   ///   `SONY PIC\0` Sony4 blob, …) returns `None` from the gate and the
@@ -275,48 +299,73 @@ impl MakerNotesMeta {
       Vendor::Apple => {
         // Thread the IFD0 `Make` so the format-16 (`int64u`) Apple carve-out
         // gates on `Make eq 'Apple'` (`Exif.pm:6464`) — a non-Apple container
-        // with an Apple-signature blob rejects code 16.
-        let (typed, _emissions) = vendors::apple::parse(blob, parent_order, make);
-        meta.apple = Some(typed);
+        // with an Apple-signature blob rejects code 16. Route through the SAME
+        // isolated shared-`Walker` helper the production `-j`/`-n` dispatch uses
+        // (`exif::apple_makernote_isolated`); with `print_conv = true` it builds
+        // the typed slot from the walked entries (byte-identical to the retired
+        // `apple::parse` oracle). The emissions are discarded — `from_blob` sets
+        // only the typed slot.
+        let (_emissions, typed) =
+          crate::exif::apple_makernote_isolated(blob, parent_order, true, make);
+        meta.apple = typed;
       }
       Vendor::Canon => {
-        let (typed, _emissions) = vendors::canon::parse(blob, parent_order);
-        meta.canon = Some(typed);
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::canon_makernote_isolated`), over the
+        // captured blob (`mn_offset = 0`, `mn_len = blob.len()`). With
+        // `print_conv = true` it returns the typed slot built from the walked
+        // entries (byte-identical to the retired `canon::parse` oracle — a
+        // short/rejected MakerNote still yields `Some(empty)`, never `None`).
+        // The emissions are discarded — `from_blob` sets only the typed slot.
+        let (_emissions, typed) = crate::exif::canon_makernote_isolated(
+          blob,
+          0,
+          blob.len(),
+          parent_order,
+          None,
+          None,
+          true,
+        );
+        meta.canon = typed;
       }
       Vendor::Sony => {
-        // Route through the SINGLE gated entry (same as `ProcessExif`): the
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::sony_makernote_isolated`): the
         // `routes_to_main` variant gate lives inside it. `make`/`model` are
         // threaded so the headerless Sony5 make-gate + the model-conditional
         // AF rows resolve; without them (the `from_blob` path) only the
         // prefixed Main variants parse.
         let body_off = detected.body_offset() as usize;
-        if let Some((typed, _emissions)) = vendors::sony::parse_main_gated(
+        if let Some((_emissions, typed)) = crate::exif::sony_makernote_isolated(
           blob,
           0,
           blob.len(),
           body_off,
           parent_order,
-          true,
           make,
           model,
+          true,
         ) {
           meta.sony = Some(typed);
         }
       }
       Vendor::Panasonic => {
-        // Route through the SINGLE gated entry (same as `ProcessExif`): the
-        // `Panasonic`-prefix gate + the `Base => 12` base-rule threading
-        // live inside it. A Type2/`MKE` blob leaves the slot absent; a
-        // DC-FT7 out-of-line value is read at the correct `+12` base.
-        // `model` selects the 0x0f/0x2c model-conditional branches.
-        if let Some((typed, _emissions)) = vendors::panasonic::parse_main_gated(
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::panasonic_makernote_isolated`): the
+        // `Panasonic`-prefix variant gate lives inside it, and the `Base => 12`
+        // base-rule is resolved at the call site (`main_base_offset`) EXACTLY as
+        // the production dispatch does, then threaded as the out-of-line-offset
+        // base. A Type2/`MKE` blob leaves the slot absent; a DC-FT7 out-of-line
+        // value is read at the correct `+12` base. `model` selects the
+        // 0x0f/0x2c model-conditional branches.
+        if let Some((_emissions, typed)) = crate::exif::panasonic_makernote_isolated(
           blob,
           0,
           blob.len(),
+          vendors::panasonic::main_base_offset(detected.base_rule()),
           parent_order,
-          true,
           model,
-          detected.base_rule(),
+          true,
         ) {
           meta.panasonic = Some(typed);
         }
@@ -396,8 +445,26 @@ impl MakerNotesMeta {
       //     identified via `detected`).
       // `model` threads the AFInfo byte-order + ShootingMode bit-5 `Condition`s.
       Vendor::Nikon if blob.starts_with(b"Nikon\x00\x02") => {
-        let (typed, _emissions) = vendors::nikon::parse(blob, parent_order, model);
-        meta.nikon = Some(typed);
+        // Route through the SAME isolated shared-`Walker` helper the production
+        // `-j`/`-n` dispatch uses (`exif::nikon_makernote_isolated`), over the
+        // captured blob (`mn_offset = 0`, `mn_len = blob.len()`). The guard above
+        // restricts this to the self-contained type-3 layout, so the standalone
+        // walk is faithful when the embedded TIFF is well-formed. With
+        // `print_conv = true` the helper returns the typed slot built from the
+        // walked entries (byte-identical to the retired `nikon::parse` oracle).
+        // The 8-byte `Nikon\0\x02` signature guard does NOT prove a valid
+        // embedded TIFF at offset 10, so a SHORT/MALFORMED type-3 header makes
+        // `resolve_layout`/`parse_embedded_tiff` reject it and the helper
+        // returns `None`. In that case fall back to the empty-but-PRESENT typed
+        // slot, preserving the retired `nikon::parse` constructor contract: a
+        // signature match ALWAYS populates `meta.nikon` (empty if the walk
+        // yields nothing), never leaving it absent. The emissions are discarded
+        // — `from_blob` sets only the typed slot.
+        meta.nikon = Some(
+          crate::exif::nikon_makernote_isolated(blob, 0, blob.len(), parent_order, model, true)
+            .map(|(_emissions, typed)| typed)
+            .unwrap_or_default(),
+        );
       }
       _ => {}
     }

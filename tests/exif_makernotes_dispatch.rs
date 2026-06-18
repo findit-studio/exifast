@@ -625,42 +625,6 @@ fn sony_dsc_real_fixture_dispatches_with_no_recognized_tags() {
   assert!(sony.lens_type().is_none());
 }
 
-/// Synthetic Sony JPEG: build the same dispatch path used in the real
-/// fixture but with a HEADERLESS Sony body that carries a single
-/// `Quality` (0x0102) tag. Verify the typed surface and emissions
-/// populate the print-conv label.
-#[test]
-fn synthetic_sony_typed_populates_quality_and_model_id() {
-  // Direct parse via the public sony API (the dispatcher integration is
-  // already covered by `synthetic_sony_makernote_dispatches`).
-  use exifast::exif::makernotes::vendors::sony;
-  // Headerless body: 2 entries — Quality=2 ("Fine") + SonyModelID=358 ("ILCE-9")
-  let mut blob: Vec<u8> = Vec::new();
-  blob.extend_from_slice(&[0x02, 0x00]); // 2 entries LE
-  // Entry 1: Quality (0x0102, int32u, count=1, value=2)
-  blob.extend_from_slice(&[0x02, 0x01, 0x04, 0x00]);
-  blob.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-  blob.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
-  // Entry 2: SonyModelID (0xb001, int16u, count=1, value=358)
-  blob.extend_from_slice(&[0x01, 0xb0, 0x03, 0x00]);
-  blob.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-  blob.extend_from_slice(&[0x66, 0x01, 0x00, 0x00]);
-  let (typed, emissions) = sony::parse(&blob, 0, exifast::exif::ifd::ByteOrder::Little);
-  assert_eq!(typed.quality(), Some(2));
-  assert_eq!(typed.model_id(), Some(358));
-  assert_eq!(typed.model_name(), Some("ILCE-9"));
-  assert_eq!(emissions.len(), 2);
-  use exifast::value::TagValue;
-  let find = |n: &str| {
-    emissions
-      .iter()
-      .find(|e| e.name() == n)
-      .map(|e| e.value().clone())
-  };
-  assert_eq!(find("Quality"), Some(TagValue::Str("Fine".into())));
-  assert_eq!(find("SonyModelID"), Some(TagValue::Str("ILCE-9".into())));
-}
-
 /// Panasonic Lumix DMC-FZ3 JPEG (bundled from `exiftool/t/images/Panasonic.jpg`).
 /// Verify the Panasonic body decoder populates `MakerNotesPanasonic` with
 /// the per-tag values the bundled `perl exiftool -j` oracle emits.
@@ -1724,6 +1688,45 @@ fn from_blob_with_context_resolves_headerless_sony5() {
   );
 }
 
+/// `from_blob` with a SHORT/MALFORMED type-3 Nikon blob — just the 8-byte
+/// `Nikon\0\x02` signature with NO embedded TIFF at offset 10. The dispatcher
+/// matches the signature and routes it to `Vendor::Nikon` (`MakerNotes.pm:51-58`,
+/// `Base => '$start - 8'`), but the isolated shared-`Walker` helper
+/// (`exif::nikon_makernote_isolated`) rejects the truncated header
+/// (`resolve_layout`/`parse_embedded_tiff` find no valid TIFF) and returns
+/// `None`. The retired `nikon::parse` oracle returned an empty-but-PRESENT
+/// `MakerNotesNikon` for ANY signature match, so the constructor must do the
+/// same: `from_blob` ALWAYS populates `meta.nikon` (empty when the walk yields
+/// nothing), never leaving it absent — a public-API contract regression guard
+/// for the oracle deletion. (Also asserts no panic on the truncated input.)
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_nikon_short_type3_header_populates_empty_slot() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Bare 8-byte `Nikon\0\x02` signature — the dispatcher's type-3 check only
+  // needs this prefix, but there is NO embedded TIFF at the body offset, so
+  // the helper's layout resolution rejects it.
+  let blob: &[u8] = b"Nikon\x00\x02";
+
+  let detected = dispatch(blob, Some("NIKON CORPORATION"), Some("NIKON D70"), None);
+  assert!(
+    detected.vendor().is_nikon(),
+    "Nikon\\0\\x02 signature dispatches to Vendor::Nikon, got {:?}",
+    detected.vendor()
+  );
+
+  let meta = MakerNotesMeta::from_blob(detected, blob, ByteOrder::Little);
+  assert!(meta.vendor().is_nikon());
+  assert!(
+    meta.nikon().is_some(),
+    "from_blob must populate the Nikon slot (empty but PRESENT) for a \
+     signature-matched type-3 blob even when the embedded-TIFF walk rejects a \
+     short/malformed header — preserving the retired nikon::parse contract"
+  );
+}
+
 /// `from_blob` with a Panasonic Type2 (`MKE`) blob (`MakerNotePanasonic2`,
 /// `MakerNotes.pm:743` → `Panasonic::Type2` `ProcessBinaryData`, NOT
 /// `%Panasonic::Main`). The dispatcher collapses it to `Vendor::Panasonic`,
@@ -1835,123 +1838,6 @@ fn from_blob_panasonic3_dcft7_base12_reads_out_of_line_at_correct_offset() {
     Some("LUMIX-LENS-12"),
     "a base-0 (Inherit) read must NOT recover the real string from a \
      base-12-stored offset"
-  );
-}
-
-/// `MakerNotesMeta::from_blob_with_context` is a blob-ONLY constructor with no
-/// parent TIFF. Nikon's type-2 (`Nikon\0\x01`) and headerless-Nikon3 layouts
-/// have NO `Base` override ⇒ their out-of-line value offsets are
-/// PARENT-TIFF-relative; with only the blob, an absolute offset would index
-/// INTO the blob and read out-of-line values from the WRONG bytes (garbage).
-/// The constructor must therefore NOT decode those layouts (leave the Nikon
-/// slot ABSENT) — only the self-contained type-3 (`Nikon\0\x02`) embedded TIFF,
-/// whose `Base => '$start - 8'` makes the blob its own context, may decode.
-/// (The production decode never hits this path — `Exif` calls
-/// `nikon::parse_in_tiff` with the real parent TIFF — so the gate is purely
-/// defensive.)
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn nikon_blob_constructor_type2_headerless_no_garbage() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::{MakerNotesMeta, dispatch, vendors};
-
-  // ---- Type-2 (`Nikon\0\x01`): IFD at offset 8, LE, offsets TIFF-relative,
-  // walked against `%Nikon::Type2`. A single OUT-OF-LINE ColorMode (0x0004 =
-  // ColorMode in Type2, ASCII[6]) whose stored offset (26) is a
-  // parent-TIFF-absolute position. With only the blob, offset 26 lands on
-  // bytes spelling "WRONG\0" — exactly the mis-rebased garbage the gate must
-  // suppress.
-  let mut t2: Vec<u8> = Vec::new();
-  t2.extend_from_slice(b"Nikon\x00\x01\x00"); // 8-byte header, IFD @8
-  t2.extend_from_slice(&1u16.to_le_bytes()); // count = 1
-  t2.extend_from_slice(&0x0004u16.to_le_bytes()); // tag 0x0004 = ColorMode (Type2)
-  t2.extend_from_slice(&2u16.to_le_bytes()); // ASCII
-  t2.extend_from_slice(&6u32.to_le_bytes()); // count 6 (out-of-line)
-  t2.extend_from_slice(&26u32.to_le_bytes()); // TIFF-absolute offset
-  t2.extend_from_slice(&0u32.to_le_bytes()); // next IFD
-  assert_eq!(
-    t2.len(),
-    26,
-    "the out-of-line bytes must start at offset 26"
-  );
-  t2.extend_from_slice(b"WRONG\x00"); // bytes a blob-only walk would mis-read
-
-  let detected_t2 = dispatch(&t2, Some("NIKON CORPORATION"), Some("E990"), None);
-  assert!(detected_t2.vendor().is_nikon());
-
-  // The gated constructor must leave the Nikon slot ABSENT.
-  let meta_t2 = MakerNotesMeta::from_blob(detected_t2, &t2, ByteOrder::Little);
-  assert!(
-    meta_t2.nikon().is_none(),
-    "from_blob must NOT decode a type-2 Nikon blob (no parent TIFF ⇒ \
-     out-of-line offsets cannot be faithfully rebased)"
-  );
-
-  // NEGATIVE CONTROL: the ungated blob-only walk (`vendors::nikon::parse`)
-  // DOES mis-read the out-of-line value from the blob — emitting it as the
-  // Type2 name `ColorMode` = "WRONG" (raw, no PrintConv). Proves the gate is
-  // load-bearing — without it the constructor would emit this garbage. (The
-  // emission name is `ColorMode`, the `%Nikon::Type2` 0x0004 tag, confirming
-  // the type-2 walk uses Type2, not `%Nikon::Main` where 0x0004 = Quality.)
-  let (_mis, mis_emit) = vendors::nikon::parse(&t2, ByteOrder::Little, Some("E990"));
-  let mis_color_mode = mis_emit
-    .iter()
-    .find(|e| e.name() == "ColorMode")
-    .map(|e| e.value().clone());
-  assert_eq!(
-    mis_color_mode,
-    Some(exifast::value::TagValue::Str("WRONG".into())),
-    "the ungated blob-only walk reads the mis-rebased out-of-line value as \
-     the Type2 ColorMode (0x0004), proving the Type2 table is used"
-  );
-
-  // ---- Headerless Nikon3: the blob IS the IFD (offset 0), offsets
-  // TIFF-relative. Same hazard ⇒ same gate.
-  let mut t3less: Vec<u8> = Vec::new();
-  t3less.extend_from_slice(&1u16.to_le_bytes()); // count = 1 (IFD @0)
-  t3less.extend_from_slice(&0x0004u16.to_le_bytes()); // Quality
-  t3less.extend_from_slice(&2u16.to_le_bytes()); // ASCII
-  t3less.extend_from_slice(&6u32.to_le_bytes()); // count 6 (out-of-line)
-  t3less.extend_from_slice(&18u32.to_le_bytes()); // TIFF-absolute offset
-  t3less.extend_from_slice(&0u32.to_le_bytes()); // next IFD
-  assert_eq!(t3less.len(), 18, "headerless out-of-line bytes start at 18");
-  t3less.extend_from_slice(b"WRONG\x00");
-
-  // Headerless Nikon3 needs a `^NIKON` make to dispatch (`MakerNotes.pm:550`).
-  let detected_hl = dispatch(&t3less, Some("NIKON"), Some("COOLPIX"), None);
-  assert!(detected_hl.vendor().is_nikon());
-  let meta_hl = MakerNotesMeta::from_blob(detected_hl, &t3less, ByteOrder::Little);
-  assert!(
-    meta_hl.nikon().is_none(),
-    "from_blob must NOT decode a headerless Nikon3 blob (offsets are \
-     parent-TIFF-relative, no parent TIFF available)"
-  );
-
-  // ---- Type-3 (`Nikon\0\x02`) self-contained embedded TIFF (BE): the blob IS
-  // its own context, so the SAME constructor decodes it correctly. Inline
-  // LensType = 0x06 → "G" (no out-of-line offset involved).
-  let mut t3: Vec<u8> = Vec::new();
-  t3.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00"); // 10-byte header
-  t3.extend_from_slice(b"MM"); // embedded TIFF: big-endian
-  t3.extend_from_slice(&[0x00, 0x2a]);
-  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]); // IFD0 @ embedded-TIFF +8
-  t3.extend_from_slice(&[0x00, 0x01]); // 1 entry
-  t3.extend_from_slice(&[0x00, 0x83]); // tag 0x0083 = LensType
-  t3.extend_from_slice(&[0x00, 0x01]); // int8u
-  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
-  t3.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]); // inline value 6 → "G"
-  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD
-
-  let detected_t3 = dispatch(&t3, Some("NIKON CORPORATION"), Some("NIKON D70"), None);
-  assert!(detected_t3.vendor().is_nikon());
-  let meta_t3 = MakerNotesMeta::from_blob(detected_t3, &t3, ByteOrder::Big);
-  let nikon_t3 = meta_t3
-    .nikon()
-    .expect("from_blob must still decode the self-contained type-3 layout");
-  assert_eq!(
-    nikon_t3.lens_type(),
-    Some("G"),
-    "the type-3 self-contained path through from_blob still decodes correctly"
   );
 }
 
@@ -2889,176 +2775,6 @@ fn phase4_vendor_surface_is_observable() {
 // `perl exiftool 13.59` binary (see the per-test cites).
 // ===========================================================================
 
-/// Build a one-entry Canon Main IFD blob (little-endian) carrying `tag` as an
-/// `int16u[count]` array stored OUT-OF-LINE, with `words` the array contents.
-/// The blob is laid out so `canon::parse_in_tiff(blob, 0, blob.len(), ..)`
-/// resolves the value offset (blob-relative, Canon inherits the parent base).
-#[cfg(all(feature = "exif", feature = "std"))]
-fn canon_mn_one_int16u_array(tag: u16, words: &[i16]) -> Vec<u8> {
-  let mut blob: Vec<u8> = Vec::new();
-  blob.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
-  blob.extend_from_slice(&tag.to_le_bytes()); // tag id
-  blob.extend_from_slice(&3u16.to_le_bytes()); // format 3 = int16u
-  blob.extend_from_slice(&(words.len() as u32).to_le_bytes()); // count
-  // value offset: after the 2-byte count + one 12-byte entry + 4-byte next = 18.
-  let data_off = 2 + 12 + 4;
-  blob.extend_from_slice(&(data_off as u32).to_le_bytes());
-  blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
-  for &w in words {
-    blob.extend_from_slice(&w.to_le_bytes());
-  }
-  blob
-}
-
-/// 0x26 all-zero suppression (`Canon.pm:1713`,
-/// `Condition => '$$valPt !~ /^\0\0\0\0/'`).
-///
-/// When the CanonAFInfo2 record's first four bytes are all zero (the all-zero
-/// 0x26 record bundled documents for "thumbnail of 60D MOV video"), bundled
-/// does NOT enter the AFInfo2 SubDirectory and emits NOTHING for it. Oracle:
-/// a crafted Canon TIFF with a zeroed 0x26 → `perl exiftool -j -G1` produces
-/// no `Canon:AF*` keys (verified). The port must likewise emit nothing.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_afinfo2_0x26_all_zero_is_suppressed() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-  // A 48-word record whose FIRST TWO words (= first 4 bytes) are zero, but
-  // whose later words would decode to real AF tags if the walk ran. (AFInfoSize
-  // = word 0 = 0, AFAreaMode = word 1 = 0.)
-  let mut words = vec![0i16; 48];
-  words[2] = 9; // NumAFPoints — would drive arrays if (wrongly) parsed
-  words[3] = 9; // ValidAFPoints
-  let blob = canon_mn_one_int16u_array(0x26, &words);
-  let (typed, em) = canon::parse_in_tiff(
-    &blob,
-    0,
-    blob.len(),
-    ByteOrder::Little,
-    true,
-    Some("Canon EOS 60D"),
-    None,
-  );
-  // No AFInfo2 leaves emitted, and the typed AF surface stays unset.
-  assert!(
-    !em.iter().any(|e| e.name() == "NumAFPoints"
-      || e.name() == "AFAreaMode"
-      || e.name() == "ValidAFPoints"),
-    "all-zero 0x26 must emit no AFInfo2 tags; got {:?}",
-    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
-  );
-  assert!(
-    typed.af_info().is_none(),
-    "all-zero 0x26 must not populate the typed AFInfo surface"
-  );
-}
-
-/// A NON-zero 0x26 (only the first word zero, second word non-zero) is NOT
-/// suppressed — `/^\0\0\0\0/` requires the first FOUR bytes zero. With
-/// AFInfoSize=0 but AFAreaMode!=0, the first 4 bytes are `00 00 02 00`, which
-/// does not match, so bundled enters the SubDirectory.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_afinfo2_0x26_only_first_word_zero_is_not_suppressed() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-  let mut words = vec![0i16; 48];
-  words[0] = 0; // AFInfoSize = 0 (bytes 0-1 zero)
-  words[1] = 2; // AFAreaMode = 2 (bytes 2-3 = 02 00, non-zero) → not all-zero
-  words[2] = 9; // NumAFPoints
-  words[3] = 9; // ValidAFPoints
-  let blob = canon_mn_one_int16u_array(0x26, &words);
-  let (_typed, em) = canon::parse_in_tiff(
-    &blob,
-    0,
-    blob.len(),
-    ByteOrder::Little,
-    true,
-    Some("Canon EOS 60D"),
-    None,
-  );
-  assert!(
-    em.iter()
-      .any(|e| e.name() == "NumAFPoints" && *e.value() == exifast::value::TagValue::I64(9)),
-    "0x26 with a non-zero second word must still decode NumAFPoints; got {:?}",
-    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
-  );
-}
-
-/// 0x3c AFInfo3 dispatch (`Canon.pm:1764-1770`): the SAME `Canon::AFInfo2`
-/// walker runs, but `$$self{AFInfo3} = 1` suppresses the index-14
-/// `PrimaryAFPoint` (`Condition => '$$self{Model} !~ /EOS/ and not
-/// $$self{AFInfo3}'`, `Canon.pm:6602`).
-///
-/// Oracle: a crafted G1XmkII (non-EOS) TIFF with a 0x3c record →
-/// `perl exiftool -j -G1` emits `Canon:AFAreaMode "Single-point AF"`,
-/// `Canon:NumAFPoints 9`, `Canon:AFAreaWidths`, `Canon:AFAreaXPositions`,
-/// `Canon:AFPointsInFocus "0,2"`, and crucially NO `Canon:PrimaryAFPoint`
-/// (verified). Before this fix the port left 0x3c as `sub_table: None`, so it
-/// emitted a bogus raw `AFInfo3` leaf and decoded none of the AF tags.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_afinfo3_0x3c_dispatches_to_afinfo2_and_suppresses_primary() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-  use exifast::value::TagValue;
-  // Same non-EOS AFInfo2 layout used to oracle the non-EOS path: NumAFPoints=9,
-  // AFAreaMode=2, AFPointsInFocus word = 5 (bits 0,2), then the index-13 filler
-  // (2 words) and a trailing PrimaryAFPoint candidate (3) that must NOT emit.
-  let words: [i16; 48] = [
-    96, 2, 9, 9, 4000, 3000, 4000, 3000, // 0-7 (AFInfoSize=96 = byte length)
-    50, 50, 50, 50, 50, 50, 50, 50, 50, // AFAreaWidths[9]
-    60, 60, 60, 60, 60, 60, 60, 60, 60, // AFAreaHeights[9]
-    -400, -300, -200, -100, 0, 100, 200, 300, 400, // AFAreaXPositions[9]
-    -200, -150, -100, -50, 0, 50, 100, 150, 200, // AFAreaYPositions[9]
-    5,   // AFPointsInFocus[1] = 5 → DecodeBits "0,2"
-    7, 0, // Canon_AFInfo2_0x000d[2] filler (Unknown → not emitted)
-    3, // index 14 PrimaryAFPoint candidate — suppressed by AFInfo3
-  ];
-  let blob = canon_mn_one_int16u_array(0x3c, &words);
-  let (typed, em) = canon::parse_in_tiff(
-    &blob,
-    0,
-    blob.len(),
-    ByteOrder::Little,
-    true,
-    Some("Canon PowerShot G1 X Mark II"),
-    None,
-  );
-  let find = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.value().clone());
-  assert_eq!(
-    find("AFAreaMode"),
-    Some(TagValue::Str("Single-point AF".into())),
-    "0x3c must decode AFAreaMode via the AFInfo2 table"
-  );
-  assert_eq!(find("NumAFPoints"), Some(TagValue::I64(9)));
-  assert_eq!(
-    find("AFAreaXPositions"),
-    Some(TagValue::Str(
-      "-400 -300 -200 -100 0 100 200 300 400".into()
-    ))
-  );
-  assert_eq!(find("AFPointsInFocus"), Some(TagValue::Str("0,2".into())));
-  // PrimaryAFPoint MUST be suppressed (AFInfo3 flag), even though non-EOS.
-  assert_eq!(
-    find("PrimaryAFPoint"),
-    None,
-    "AFInfo3 (0x3c) must suppress index-14 PrimaryAFPoint"
-  );
-  // The bogus raw `AFInfo3` leaf (the pre-fix deferred-arm output) is gone.
-  assert!(
-    !em.iter().any(|e| e.name() == "AFInfo3"),
-    "0x3c must be walked, not emitted as a raw AFInfo3 leaf"
-  );
-  // Typed surface populated and flagged as the v2 record shape.
-  let af = typed
-    .af_info()
-    .expect("AFInfo3 populates the typed surface");
-  assert!(af.is_v2());
-  assert_eq!(af.num_af_points(), Some(9));
-  assert_eq!(af.primary_af_point(), None);
-}
-
 /// FileInfo `-n` (ValueConv-only) fidelity (`Canon.pm:6842-7140`). The real
 /// 1D Mark III FileInfo record (extracted via `perl exiftool` FoundTag hook,
 /// byte order II) decodes — under `-n` — to raw ints for every PrintConv tag
@@ -3839,235 +3555,6 @@ fn canon_1dmk3_real_fixture_no_mismarked_subdir_parents() {
   }
 }
 
-/// Build a one-entry Canon Main IFD blob (little-endian) carrying tag 0x28
-/// `ImageUniqueID`, with `value_bytes` stored OUT-OF-LINE (>4 bytes) and the
-/// entry declaring TIFF format code `format` with element count `count`. The
-/// 16 on-disk value bytes are written verbatim regardless of the declared
-/// numeric shape — mirroring how ExifTool's `Format => 'undef'` reads the
-/// literal bytes. Mirrors [`canon_mn_one_int16u_array`].
-#[cfg(all(feature = "exif", feature = "std"))]
-fn canon_mn_image_unique_id_shape(format: u16, count: u32, value_bytes: &[u8]) -> Vec<u8> {
-  let mut blob: Vec<u8> = Vec::new();
-  blob.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
-  blob.extend_from_slice(&0x28u16.to_le_bytes()); // tag 0x28 ImageUniqueID
-  blob.extend_from_slice(&format.to_le_bytes()); // declared on-disk format
-  blob.extend_from_slice(&count.to_le_bytes()); // element count
-  // value offset: 2-byte count + one 12-byte entry + 4-byte next-IFD = 18.
-  let data_off = 2 + 12 + 4;
-  blob.extend_from_slice(&(data_off as u32).to_le_bytes());
-  blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
-  blob.extend_from_slice(value_bytes);
-  blob
-}
-
-/// #223 — `ImageUniqueID` (0x28) `Format => 'undef'` raw-byte handling
-/// (`Canon.pm:1726-1735`): `RawConv => '$val eq "\0" x 16 ? undef : $val'`
-/// then `ValueConv => 'unpack("H*", $val)'`.
-///
-/// ExifTool forces `Format => 'undef'` (`Exif.pm:6735-6744`: override the
-/// declared numeric format with `undef` and re-derive `$count = $size /
-/// $formatSize['undef']`, so `ReadValue` returns the ORIGINAL on-disk
-/// `$size` bytes — the verbose dump literally reads `int8u[16] read as
-/// undef[16]`). It therefore reads the SAME 16 raw value bytes whether the
-/// entry is declared `int8u[16]`, `int16u[8]`, `int32u[4]`, `undef[16]`,
-/// `float[4]`, `double[2]`, or `rational[2]` — a *16-NUL* value is dropped
-/// (undef), and a non-zero value is lowercase-hex-encoded to the SAME string
-/// across every shape. The expected hex string is oracle-cited: a crafted
-/// Canon TIFF with these bytes in each shape was confirmed against `perl
-/// exiftool -G1 -j` to yield
-/// `Canon:ImageUniqueID = "00112233445566778899aabbccddeeff"` identically
-/// (and identically under `-n`); the float/double/rational shapes were
-/// individually oracle-checked to yield the SAME hex (NOT a numeric decode).
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_image_unique_id_all_zero_dropped() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  // The oracle-cited 16 raw bytes and their `unpack("H*")` rendering.
-  const ID_BYTES: [u8; 16] = [
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-  ];
-  const ID_HEX: &str = "00112233445566778899aabbccddeeff";
-
-  // (format code, element count) for the same 16 raw bytes — every TIFF
-  // shape that multiplies out to 16 on-disk bytes: int8u[16], int16u[8],
-  // int32u[4], undef[16], AND the FLOAT (11) / DOUBLE (12) / RATIONAL (5)
-  // shapes that the previous decode-then-reserialize path zeroed out
-  // (`reserialize_value_bytes` fell through to `Vec::new()` for those).
-  // ExifTool's `undef` read ignores the numeric shape, so every shape yields
-  // the IDENTICAL result (each oracle-verified via `perl exiftool -G1 -j`).
-  for &(format, count) in &[
-    (1u16, 16u32), // int8u[16]
-    (3, 8),        // int16u[8]
-    (4, 4),        // int32u[4]
-    (7, 16),       // undef[16]
-    (11, 4),       // float[4]
-    (12, 2),       // double[2]
-    (5, 2),        // rational[2]
-  ] {
-    // All-zero 16-byte value ⇒ `$val eq "\0" x 16` ⇒ RawConv undef ⇒ dropped
-    // (no emission, typed surface unset). Oracle: an all-zero `int8u[16]`
-    // emits NO `Canon:ImageUniqueID`.
-    let zero_blob = canon_mn_image_unique_id_shape(format, count, &[0u8; 16]);
-    let (typed, em) = canon::parse(&zero_blob, ByteOrder::Little);
-    assert!(
-      !em.iter().any(|e| e.name() == "ImageUniqueID"),
-      "all-zero 16-byte ImageUniqueID must NOT be emitted (format {format}, count {count}); got {:?}",
-      em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
-    );
-    assert!(
-      typed.image_unique_id().is_none(),
-      "all-zero 16-byte ImageUniqueID must not populate the typed surface (format {format}, count {count})"
-    );
-
-    // Non-zero ⇒ emitted hex-encoded, typed surface populated — SAME string
-    // across all shapes (the `undef` read sees the literal 16 bytes).
-    let nz_blob = canon_mn_image_unique_id_shape(format, count, &ID_BYTES);
-    let (typed, em) = canon::parse(&nz_blob, ByteOrder::Little);
-    let emitted = em
-      .iter()
-      .find(|e| e.name() == "ImageUniqueID")
-      .map(|e| e.value().clone());
-    assert_eq!(
-      emitted,
-      Some(exifast::value::TagValue::Str(ID_HEX.into())),
-      "non-zero ImageUniqueID must be hex-encoded from the raw 16 bytes (format {format}, count {count})"
-    );
-    assert_eq!(
-      typed.image_unique_id(),
-      Some(ID_HEX),
-      "non-zero ImageUniqueID must populate the typed surface (format {format}, count {count})"
-    );
-  }
-}
-
-/// #223 R3 — a SHORT all-zero `ImageUniqueID` is EMITTED, not dropped. The
-/// RawConv is `$val eq "\0" x 16` (Perl string equality to EXACTLY sixteen
-/// NUL bytes), NOT `/^\0+$/` — so an all-zero value of any length OTHER than
-/// 16 is NOT equal and survives. Oracle (`perl exiftool -G1 -j` on a crafted
-/// Canon TIFF, tag 0x28 declared `int8u[8]`/`int16u[4]` with eight NUL value
-/// bytes): `"Canon:ImageUniqueID": "0000000000000000"` (eight bytes ⇒ sixteen
-/// hex zeros) — it does NOT drop. The previous port wrongly suppressed ANY
-/// all-zero byte string (`val_bytes.iter().all(|&b| b == 0)`).
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_image_unique_id_short_all_zero_is_emitted() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  // Eight NUL bytes ⇒ NOT `"\0" x 16` ⇒ emitted as sixteen hex zeros.
-  const SHORT_ZERO_HEX: &str = "0000000000000000";
-
-  // int8u[8] and int16u[4] both multiply to 8 on-disk bytes; the `undef`
-  // read sees the SAME eight NUL bytes (oracle-identical hex for both).
-  for &(format, count) in &[(1u16, 8u32), (3, 4)] {
-    let blob = canon_mn_image_unique_id_shape(format, count, &[0u8; 8]);
-    let (typed, em) = canon::parse(&blob, ByteOrder::Little);
-    let emitted = em
-      .iter()
-      .find(|e| e.name() == "ImageUniqueID")
-      .map(|e| e.value().clone());
-    assert_eq!(
-      emitted,
-      Some(exifast::value::TagValue::Str(SHORT_ZERO_HEX.into())),
-      "a SHORT (8-byte) all-zero ImageUniqueID must be EMITTED as hex zeros, not dropped (format {format}, count {count})"
-    );
-    assert_eq!(
-      typed.image_unique_id(),
-      Some(SHORT_ZERO_HEX),
-      "a SHORT all-zero ImageUniqueID must populate the typed surface (format {format}, count {count})"
-    );
-  }
-}
-
-/// #223 R3 — a 16-byte value with EMBEDDED NULs (but not all-zero) keeps its
-/// NULs in the hex render — the `Format => 'undef'` read is byte-exact and
-/// does NOT NUL-trim (the previous `Ascii`/`Text` path would have truncated
-/// at the first NUL). Oracle (`perl exiftool -G1 -j` on a crafted Canon TIFF,
-/// tag 0x28 declared `int8u[16]` with bytes `00 ff 00 … 00 aa`):
-/// `"Canon:ImageUniqueID": "00ff00000000000000000000000000aa"` — the full 32
-/// hex chars, including the internal NULs.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_image_unique_id_embedded_nuls_not_truncated() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  // Leading NUL, embedded NUL run, trailing non-NUL — not all-zero, so it
-  // survives the RawConv, and the hex must include every NUL byte.
-  const NUL_BYTES: [u8; 16] = [
-    0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa,
-  ];
-  const NUL_HEX: &str = "00ff00000000000000000000000000aa";
-
-  let blob = canon_mn_image_unique_id_shape(1, 16, &NUL_BYTES);
-  let (typed, em) = canon::parse(&blob, ByteOrder::Little);
-  let emitted = em
-    .iter()
-    .find(|e| e.name() == "ImageUniqueID")
-    .map(|e| e.value().clone());
-  assert_eq!(
-    emitted,
-    Some(exifast::value::TagValue::Str(NUL_HEX.into())),
-    "an ImageUniqueID with embedded NULs must hex-render the FULL 16 bytes (no NUL-trim)"
-  );
-  assert_eq!(typed.image_unique_id(), Some(NUL_HEX));
-}
-
-/// #223 R4 — a `0x28` entry with `count == 0` must take the `Format => 'undef'`
-/// raw-byte view BEFORE `read_value`, so the declared-format decode (and its
-/// count-zero expansion) is skipped: the `undef[0]` value is the EMPTY string,
-/// derived WITHOUT reading/allocating the trailing buffer that follows the IFD.
-///
-/// ExifTool overrides the format to `undef` and re-derives `$count =
-/// int($size / 1)` where `$size = $count_declared * $formatSize[$declared] = 0`
-/// (`Exif.pm:6740-6743`). With a DEFINED `$count == 0`, `ReadValue` returns `''`
-/// immediately (`ExifTool.pm:6296-6298` — it does NOT fall through to `$count =
-/// int($size / $len)`, which only runs for an UNDEFINED count). The `RawConv`
-/// (`'' eq "\0" x 16` is false) keeps `''`, and `unpack("H*", '')` is `''`.
-/// Oracle (`perl exiftool -G1 -j` on a crafted Canon TIFF, tag 0x28 declared
-/// `int8u[0]` with 16 trailing value bytes): `"Canon:ImageUniqueID": ""` — an
-/// EMPTY string, not the hex of the trailing bytes. The pre-R4 code called
-/// `read_value` first, which (seeing `count == 0`, `size == avail`) expanded
-/// `$count` from the WHOLE remaining buffer and allocated a discarded `Vec`
-/// before the `0x28` override replaced it with the (empty) `total_size` window.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_0x28_count_zero_no_trailing_decode() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  // Sixteen NON-zero trailing bytes sit right after the IFD (the helper stores
-  // `value_bytes` at offset 18). A `count == 0` entry is classified INLINE
-  // (`$size == 0 <= 4`), so the raw window is the empty slice at `entry+8`; if
-  // the declared-numeric path ran instead, `read_value` would expand into
-  // these trailing bytes and the hex would be non-empty.
-  const TRAILING: [u8; 16] = [
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
-  ];
-  // int8u[0] and int32u[0] both multiply to size 0 (inline, empty window).
-  for &(format, count) in &[(1u16, 0u32), (4, 0)] {
-    let blob = canon_mn_image_unique_id_shape(format, count, &TRAILING);
-    let (typed, em) = canon::parse(&blob, ByteOrder::Little);
-    let emitted = em
-      .iter()
-      .find(|e| e.name() == "ImageUniqueID")
-      .map(|e| e.value().clone());
-    // Oracle: `undef[0]` ⇒ empty string (the trailing bytes are NOT decoded).
-    assert_eq!(
-      emitted,
-      Some(exifast::value::TagValue::Str("".into())),
-      "count-0 ImageUniqueID must emit the EMPTY string (undef[0]), not decode the trailing buffer (format {format})"
-    );
-    assert_eq!(
-      typed.image_unique_id(),
-      Some(""),
-      "count-0 ImageUniqueID must populate the typed surface with the empty string (format {format})"
-    );
-  }
-}
-
 /// Nikon.nef (D70 NEF, type-3 embedded-TIFF MakerNote). The ported
 /// `%Nikon::Main` scalars + the unencrypted `ColorBalance0103`
 /// (WB_RGBGLevels) + the UNENCRYPTED `LensData0101` (0x0098) children match
@@ -4187,140 +3674,6 @@ fn real_fixture_nikon_jpg_makernotes() {
       !map.contains_key(absent),
       "bogus key {absent} must be absent"
     );
-  }
-}
-
-/// #223 R4 — a `0x28` entry declaring a HUGE element count must be bounds-safe:
-/// the checked window computation (`byte_size().checked_mul(count)` +
-/// `checked_add` + `get`) never panics and never allocates the discarded
-/// multi-gigabyte numeric `Vec` the pre-R4 `read_value`-first path would have.
-///
-/// `int32u[0x40000000]` ⇒ `$size = 0x40000000 * 4 = 0x1_0000_0000 >
-/// 0x7fffffff`, so `ProcessExif` warns `Invalid size (...)` and skips the entry
-/// (`Exif.pm:6505`); ExifTool emits NO `ImageUniqueID`. The exifast classifier
-/// reaches the SAME verdict (`CanonEntryClass::InvalidSize`, `body.rs`), so the
-/// entry never reaches the `0x28` raw-window code — proving the huge count is
-/// rejected WITHOUT a panic or a large allocation. Oracle (`perl exiftool -G1
-/// -j`): the tag is absent.
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_0x28_large_count_bounded() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  // int32u, count 0x40000000 → declared size 4 GiB, value region truncated to
-  // 16 bytes. Must not panic, must not allocate, must emit nothing.
-  let blob = canon_mn_image_unique_id_shape(4, 0x4000_0000, &[0u8; 16]);
-  let (typed, em) = canon::parse(&blob, ByteOrder::Little);
-  assert!(
-    !em.iter().any(|e| e.name() == "ImageUniqueID"),
-    "a huge-count (int32u[0x40000000]) ImageUniqueID must be rejected with no emission; got {:?}",
-    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
-  );
-  assert!(
-    typed.image_unique_id().is_none(),
-    "a huge-count ImageUniqueID must not populate the typed surface"
-  );
-}
-
-/// The 23 Canon::Main `SubDirectory` parents the SECOND #223 pass corrected
-/// from `sub_table: None` to a deferred `Some(..)` (`0x90 CustomFunctions1D` is
-/// the one Codex flagged). None appears in any available fixture, so the
-/// suppression is exercised SYNTHETICALLY: each is a real SubDirectory pointer
-/// that — left as `None` — would hit the leaf arm and leak a bogus raw-array
-/// parent ExifTool never emits.
-#[cfg(all(feature = "exif", feature = "std"))]
-const CANON_223_SECOND_PASS_PARENTS: &[(u16, &str)] = &[
-  (0x0a, "UnknownD30"),             // Canon::UnknownD30
-  (0x0f, "CustomFunctions"),        // CanonCustom::Functions<Model>
-  (0x2f, "FaceDetect3"),            // Canon::FaceDetect3
-  (0x35, "TimeInfo"),               // Canon::TimeInfo
-  (0x90, "CustomFunctions1D"),      // CanonCustom::Functions1D
-  (0x91, "PersonalFunctions"),      // CanonCustom::PersonalFuncs
-  (0x92, "PersonalFunctionValues"), // CanonCustom::PersonalFuncValues
-  (0xb0, "CanonFlags"),             // Canon::Flags
-  (0xb1, "ModifiedInfo"),           // Canon::ModifiedInfo
-  (0xb6, "PreviewImageInfo"),       // Canon::PreviewImageInfo
-  (0x4003, "ColorInfo"),            // Canon::ColorInfo
-  (0x4015, "VignettingCorr"),       // Canon::VignettingCorr{,Unknown}
-  (0x4016, "VignettingCorr2"),      // Canon::VignettingCorr2
-  (0x4018, "LightingOpt"),          // Canon::LightingOpt
-  (0x4020, "AmbienceInfo"),         // Canon::Ambience
-  (0x4021, "MultiExp"),             // Canon::MultiExp
-  (0x4024, "FilterInfo"),           // Canon::FilterInfo
-  (0x4025, "HDRInfo"),              // Canon::HDRInfo
-  (0x4026, "LogInfo"),              // Canon::LogInfo
-  (0x4028, "AFConfig"),             // Canon::AFConfig
-  (0x403f, "RawBurstModeRoll"),     // Canon::RawBurstInfo
-  (0x4053, "FocusBracketingInfo"),  // Canon::FocusBracketingInfo
-  (0x4059, "LevelInfo"),            // Canon::LevelInfo
-];
-
-/// #223 (second pass) — a Canon Main IFD carrying tag `id` as an int16u array
-/// must emit NO `Canon:<parent>` raw value: it is a deferred SubDirectory and
-/// is suppressed (the same descend-no-parent-value rule as #177). A co-present
-/// real leaf (`CanonImageType` 0x06) is still emitted, proving the suppression
-/// is surgical and the walk did run. Driven through the public standalone
-/// `canon::parse`, in BOTH `-j` (PrintConv on) and `-n` (off).
-#[cfg(all(feature = "exif", feature = "std"))]
-#[test]
-fn canon_223_second_pass_subdir_parents_suppressed() {
-  use exifast::exif::ifd::ByteOrder;
-  use exifast::exif::makernotes::vendors::canon;
-
-  for &(id, parent) in CANON_223_SECOND_PASS_PARENTS {
-    // Two-entry Main IFD (LE): the SubDirectory tag (out-of-line int16u[8]) +
-    // CanonImageType (0x06, ASCII, out-of-line). If `id` were mis-marked
-    // `None`, the int16u[8] would leak as a bogus `Canon:<parent>` array.
-    let words: [i16; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-    let image_type = b"CanonTest\x00"; // 10 bytes, out-of-line
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
-    // Entry 1: the deferred SubDirectory tag, int16u(3) count 8, out-of-line.
-    let entries_end = 2 + 12 * 2 + 4; // count + 2 entries + next-IFD
-    let words_off = entries_end;
-    let it_off = words_off + words.len() * 2;
-    blob.extend_from_slice(&id.to_le_bytes());
-    blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
-    blob.extend_from_slice(&(words.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&(words_off as u32).to_le_bytes());
-    // Entry 2: CanonImageType 0x06, ASCII(2), out-of-line.
-    blob.extend_from_slice(&0x06u16.to_le_bytes());
-    blob.extend_from_slice(&2u16.to_le_bytes()); // ASCII
-    blob.extend_from_slice(&(image_type.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&(it_off as u32).to_le_bytes());
-    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
-    for &w in &words {
-      blob.extend_from_slice(&w.to_le_bytes());
-    }
-    blob.extend_from_slice(image_type);
-
-    for print_on in [true, false] {
-      let mode = if print_on { "-j" } else { "-n" };
-      let (_typed, em) = canon::parse_in_tiff(
-        &blob,
-        0,
-        blob.len(),
-        ByteOrder::Little,
-        print_on,
-        // Use a 1D body so the 0x0f/0x90 model-conditional SubDirectory arms
-        // resolve (they are SubDirectories for EVERY model; the body only
-        // affects WHICH child table, which we defer regardless).
-        Some("Canon EOS-1D"),
-        None,
-      );
-      assert!(
-        !em.iter().any(|e| e.name() == parent),
-        "deferred SubDirectory parent Canon:{parent} (0x{id:04x}) must NOT be emitted ({mode}); \
-         got {:?}",
-        em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
-      );
-      // The co-present real leaf still emits — suppression is surgical.
-      assert!(
-        em.iter().any(|e| e.name() == "CanonImageType"),
-        "co-present real leaf Canon:CanonImageType must still be emitted ({mode}) for 0x{id:04x}"
-      );
-    }
   }
 }
 
