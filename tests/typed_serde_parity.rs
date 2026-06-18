@@ -116,6 +116,17 @@ const NOT_ACTIVE: &[&str] = &[
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
+  // The REAL Sony FX3 `.mp4` (#76) carries paired `.json` / `.n.json` goldens
+  // but is accept-deferred from the active byte-exact set: its full `ILME-FX3`
+  // `moov` exercises GENERAL-QuickTime container tags this Sony-rtmd port does
+  // not yet emit (the `vide`/`soun` `stsd` sample-description fields,
+  // HandlerDescription/TrackProperty, `tref` ContentDescribes, the `TimeZone`),
+  // so the no-`ee` `.json`/`.n.json` differ from the golden by those structural
+  // tags. The rtmd PAYLOAD proof (FNumber/ExposureTime/ISO/… byte-exact, the
+  // `parse_stsz` fixed-size-`stsz` fix) is pinned at `-ee` in
+  // `tests/timed_metadata_conformance.rs` (`sony_fx3_rtmd_mp4_*`), with the
+  // structural tags + the past-EOF `Track3:Warning` excluded there.
+  "QuickTime_sony_fx3_rtmd.mp4",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
@@ -612,11 +623,14 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
 /// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
 /// fixture must bump this constant (the per-PR convention above).
-/// 525 → 526: `QuickTime_gopro_gpmf.mp4` (#127) — the real GoPro Hero8 `.mp4`
-/// gains paired `.json`/`.n.json` goldens (no embedded/timed data, so default
-/// `==` `-ee`; movie-header + per-track scalars, the unported container/codec
-/// tags deferred via `-x`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 526;
+/// 525 → 528 after the SP4 brand-variant real-fixture conformance (#151) added
+/// paired `.json`+`.n.json` goldens for three brand-detection fixtures, ALL
+/// ACTIVE (each routes through the golden-migrated QuickTime `Taggable` engine,
+/// so the typed-serde path equals the writer path byte-for-byte):
+/// `AVIF_sample.avif` (brand `avif` → AVIF), `HEIF_C001_msf1.heic` (brand
+/// `heic`, `msf1`-compatible → HEIC), `ISOBMFF_iso5_brand.mp4` (brand `iso5` →
+/// MP4).
+const EXPECTED_ACTIVE_FIXTURES: usize = 528;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

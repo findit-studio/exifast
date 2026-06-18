@@ -1716,6 +1716,108 @@ fn quicktime_nested_invalid_tkhd_conformance() {
   );
 }
 
+// ============================================================================
+// QuickTime SP4 brand-variant real-fixture conformance (#151)
+// ============================================================================
+//
+// Three REAL bundled brand-variant containers prove the already-merged SP4
+// `ftyp`-driven brand-detection dispatch (HEIC/AVIF/iso5/msf1) end-to-end: the
+// brand routes to the correct `File:FileType`/`File:MIMEType` and the
+// `ProcessMOV` walk emits the `ftyp` brand tags (`QuickTime:MajorBrand`/
+// `MinorVersion`/`CompatibleBrands`) plus whatever structural atoms the port
+// supports, BYTE-EXACT against the bundled ExifTool oracle.
+//
+// The goldens (`tools/gen_golden.sh` with the per-fixture `EXCLUDE` below) drop
+// `System:all` + `Composite:all` (the QuickTime Composite subsystem is the
+// Phase-2 forward item) AND the container/codec-config atoms this port does not
+// decode — the HEVC/AV1 `*Configuration*` sample-description fields, the HEIF
+// `ispe` `ImageSpatialExtent`, the codec-detail `stsd` `OtherFormat`, the
+// `mvex/mehd` `MovieFragmentSequence`, and the file-`meta` `hdlr`
+// `HandlerType`/`HandlerDescription`. exifast emits a strict SUBSET of the
+// oracle (verified: it produces NO tag the oracle lacks); every excluded key is
+// an unsupported container-structure tag, deferred via `-x`, never a value the
+// port gets wrong.
+
+#[test]
+fn avif_brand_conformance() {
+  // `tests/fixtures/AVIF_sample.avif` — a real AV1 Image File. Oracle (bundled
+  // `exiftool -G1 -j`): File:FileType AVIF, File:MIMEType image/avif,
+  // QuickTime:MajorBrand "AV1 Image File Format (.AVIF)" (brand `avif`),
+  // CompatibleBrands [avif, mif1, miaf, MA1B], File:ImageWidth 1204,
+  // File:ImageHeight 800, Meta:PrimaryItemReference 1.
+  //
+  // EXCLUDE (gen_golden.sh): `-x System:all -x Composite:all -x HandlerType
+  // -x HandlerDescription -x PixelAspectRatio -x ImageSpatialExtent
+  // -x ImagePixelDepth -x AV1ConfigurationVersion -x ChromaFormat
+  // -x ChromaSamplePosition`. The AVIF has only a file-`meta` `pict` handler
+  // (no `trak`), so the bare `-x HandlerType`/`HandlerDescription` are
+  // collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
+  // unsupported codec-config / spatial-extent fields. The brand routing +
+  // `pitm` + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  check("AVIF_sample.avif", "AVIF_sample.avif.json", true);
+  check("AVIF_sample.avif", "AVIF_sample.avif.n.json", false);
+}
+
+#[test]
+fn heic_msf1_brand_conformance() {
+  // `tests/fixtures/HEIF_C001_msf1.heic` — a real HEVC still image whose `msf1`
+  // compatible brand sits ahead of `heic`. Oracle: File:FileType HEIC,
+  // File:MIMEType image/heic, QuickTime:MajorBrand "High Efficiency Image Format
+  // HEVC still image (.HEIC)" (brand `heic`), CompatibleBrands
+  // [msf1, mif1, heic, hevc, iso8], Meta:PrimaryItemReference 20001. The file
+  // ALSO carries a `moov`/`trak` (the HEVC image track) whose `mvhd`/`tkhd`/
+  // `mdhd`/`hdlr` core atoms the port decodes byte-exact (CreateDate,
+  // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
+  // -x ImageSpatialExtent` + the `hvcC` HEVC sample-description config block
+  // (`HEVCConfigurationVersion`, `General*`, `*ProfileCompatibilityFlags`,
+  // `Constraint*`, `MinSpatialSegmentationIDC`, `ParallelismType`,
+  // `ChromaFormat`, `BitDepth*`, `*FrameRate`, `NumTemporalLayers`,
+  // `TemporalIDNested`) + the track `stsd`/`vmhd` detail (`GraphicsMode`,
+  // `OpColor`, `OtherFormat`).
+  //
+  // `-x Copy1:HandlerType` is the ONE non-obvious exclusion: the file carries
+  // TWO `hdlr` boxes with the SAME tag NAME — the file-`meta` `hdlr` (which the
+  // port's `walk_heif_meta` reads only for `pitm`, NOT `hdlr` — a deliberate
+  // unsupported container tag) and the `trak` `hdlr` (which the port DOES emit
+  // as `Track1:HandlerType`). They are distinguished only by ExifTool's
+  // family-4 copy-number group (`Copy1` = the file-`meta` duplicate, `Main` =
+  // the track), so excluding `Copy1:HandlerType` drops EXACTLY the unsupported
+  // file-`meta` `QuickTime:HandlerType` while keeping the port-emitted
+  // `Track1:HandlerType` — no value is altered.
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.json", true);
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.n.json", false);
+}
+
+#[test]
+fn iso5_brand_conformance() {
+  // `tests/fixtures/ISOBMFF_iso5_brand.mp4` — a real fragmented MP4 whose major
+  // brand `iso5` ("MP4 Base Media v5") has no `(.EXT)` substring, so the brand
+  // dispatch falls through to MP4 (no `mp41`/`mp42`/`f4v`/`qt` compatible
+  // brand). Oracle: File:FileType MP4, File:MIMEType video/mp4,
+  // QuickTime:MajorBrand "MP4 Base Media v5", MinorVersion "0.0.1",
+  // CompatibleBrands [iso5, dsms, msix, dash]. The `moov`/`trak` (a GPAC text
+  // track) decodes byte-exact incl. Track1:MediaLanguageCode "und",
+  // Track1:HandlerType "Text", and the no-`-ee` Track1:Warning.
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x MovieFragmentSequence
+  // -x HandlerDescription -x OtherFormat` — the `mvex/mehd`
+  // `MovieFragmentSequence`, the `trak` `hdlr` `HandlerDescription`
+  // ("nhml@GPAC…", collision-free — only the track carries one), and the
+  // `stsd` codec `OtherFormat` ("depi") are the unsupported container tags.
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.json",
+    true,
+  );
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.n.json",
+    false,
+  );
+}
+
 #[test]
 fn mxf_utf16_bom_conformance() {
   // Codex R2/F1 regression: `MXF.mxf` with every UTF-16 `ApplicationName` /
@@ -8824,6 +8926,55 @@ fn makernotes_dji_phantom4_conformance() {
   //                        are part of this golden.
   check("DJIPhantom4.jpg", "DJIPhantom4.jpg.json", true);
   check("DJIPhantom4.jpg", "DJIPhantom4.jpg.n.json", false);
+}
+#[test]
+fn makernotes_samsung_nx500_conformance() {
+  // SamsungNX500.srw (NX500) — the Samsung Type2 MakerNote conformance backstop
+  // on a REAL .srw raw (#210). The `0x927c` MakerNote dispatches to
+  // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`, EXIF-format magic) and walks
+  // `%Samsung::Type2` through the shared `Walker` (body offset 0, inherit base,
+  // `ByteOrder => Unknown` probed to big-endian, `FixBase => 1`, `ProcessProc =>
+  // ProcessUnknown`). exifast emits all 27 plain `Samsung:*` leaves
+  // byte-identically to bundled ExifTool 13.59 — the camera-indexing identity
+  // (`DeviceType` = "High-end NX Camera", `SamsungModelID` = "Various Models
+  // (0x5001038)", `LensType` = "Samsung NX 45mm F1.8" via %samsungLensTypes,
+  // `FirmwareName` = "1.10", `LensFirmware` = "01.00_01.10",
+  // `InternalLensSerialNumber`), the exposure leaves (`ExposureTime` = "1/160"
+  // via PrintExposureTime, `FNumber` = 8.9, `FocalLengthIn35mmFormat` = "69 mm"
+  // with the /10 ValueConv, `ISO` = 20000, `ExposureCompensation`), the enum
+  // leaves (`WhiteBalanceSetup`/`RawDataByteOrder`/`ColorSpace`/`SmartRange`/
+  // `FaceDetect`/`FaceRecognition`), `MakerNoteVersion` = "0100" (the undef
+  // ASCII-string render), the `CameraTemperature` undef rational, `SensorAreas`,
+  // `SmartAlbumColor` = "n/a" (the `\0{4}` branch), and the five
+  // `%Samsung::PictureWizard` ProcessBinaryData members (PictureWizardMode =
+  // "Standard", Color = 65535, the -4-shifted Saturation/Sharpness/Contrast).
+  // The "[minor] Unrecognized MakerNotes" warning bundled emitted while Samsung
+  // was undecoded is GONE (the vendor now decodes). All 27 match for BOTH the
+  // `-j` PrintConv and `-n` numeric snapshots.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
+  // exifast does NOT emit — every exclusion is a documented deferral (none masks
+  // a Samsung-Type2 faithfulness gap; the diff carries NO tag exifast emits that
+  // bundled does not):
+  //   -x Samsung:<16 Crypt tags> — the `RawConv => Samsung::Crypt(...)`
+  //                        encrypted block `0xa021`..`0xa057` EXCEPT the plain
+  //                        `0xa025` (WB_RGGBLevels*, ColorMatrix*, CbCr*,
+  //                        ToneCurve*) — raw-processing data, deferred.
+  //                        (`0xa020 EncryptionKey` + `0xa025`
+  //                        HighlightLinearityLimit are plain leaves, EMITTED.)
+  //   -x PreviewIFD:all  — the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD
+  //                        (PreviewImage + its IFD tags), deferred.
+  //   -x SubIFD:all -x SubIFD1:all — the SRW raw/JpgFromRaw sub-IFDs (the raw
+  //                        image strips + the embedded JPEG), not walked.
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (drops the
+  //                        Composite:LensID/ImageSize/WB_RGGBLevels/… synthesis).
+  // (The `0x0011 OrientationInfo` row is absent from this body. The
+  // `0xa002 SerialNumber` row IS present, but its value is `"0"` + NULs, which
+  // fails the `Condition => '$$valPt =~ /^\w{5}/'` gate (`Samsung.pm:404-409`)
+  // — bundled emits no `Samsung:SerialNumber` and exifast's emit-time
+  // `condition_holds` gate drops it identically, so no exclusion is needed.)
+  check("SamsungNX500.srw", "SamsungNX500.srw.json", true);
+  check("SamsungNX500.srw", "SamsungNX500.srw.n.json", false);
 }
 #[test]
 fn exif_manyifd_conformance() {
