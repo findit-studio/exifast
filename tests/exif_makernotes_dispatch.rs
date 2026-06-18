@@ -340,6 +340,135 @@ fn apple_iphone_real_fixture_emits_makernote_group() {
   assert!(mnv.is_some(), "MakerNoteVersion emitted");
 }
 
+/// Verify the Pentax body decoder populates `MakerNotesPentax` with the per-tag
+/// camera-identity values the bundled ExifTool oracle emits for the K10D
+/// `Pentax.jpg` fixture, AND emits the named `LensType` (from the `0x003f
+/// LensRec` SubDirectory child) + `PentaxModelID` under the `Pentax` group (#262).
+#[test]
+fn pentax_k10d_real_fixture_decodes_typed_and_emits() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/Pentax.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Pentax JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(
+    mn.vendor().is_pentax(),
+    "vendor = Pentax, got {:?}",
+    mn.vendor()
+  );
+
+  // Typed surface — the camera-identity fields.
+  let pentax = mn.meta().pentax().expect("Pentax typed populated");
+  // PentaxModelID (0x0005) = 76830 => "K10D".
+  assert_eq!(pentax.model_id(), Some(76830));
+  assert_eq!(pentax.model_name(), Some("K10D"));
+  // LensType — the `(3, 44)` pair packed + resolved.
+  assert_eq!(pentax.lens_type(), Some((3 << 8) | 44));
+  assert_eq!(pentax.lens_name(), Some("Sigma or Tamron Lens (3 44)"));
+  // Quality (0x0008) = 1; ImageTone (0x004f) = 0 (Natural).
+  assert_eq!(pentax.quality(), Some(1));
+  assert_eq!(pentax.image_tone(), Some(0));
+
+  // Emissions — the named tags under the Pentax group, byte-exact PrintConv.
+  let emissions = mn.emissions_print_conv();
+  assert!(!emissions.is_empty(), "Pentax emissions populated");
+  let val = |name: &str| {
+    emissions
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  };
+  use exifast::value::TagValue;
+  assert_eq!(
+    val("LensType"),
+    Some(TagValue::Str("Sigma or Tamron Lens (3 44)".into())),
+    "LensType emitted from the LensRec SubDirectory child"
+  );
+  assert_eq!(val("PentaxModelID"), Some(TagValue::Str("K10D".into())));
+  assert_eq!(val("Quality"), Some(TagValue::Str("Better".into())));
+  // The SubDirectory PARENT (LensRec) is NEVER emitted as a value.
+  assert!(
+    val("LensRec").is_none(),
+    "the LensRec SubDirectory parent pointer must not be emitted"
+  );
+}
+
+/// Pentax4 NotIFD scope. The dispatcher's `MakerNotePentax4` arm
+/// (`$$self{Make}=~/^PENTAX/ and $$valPt=~/^\d{3}/`, `MakerNotes.pm:805-815`)
+/// sets `NotIFD => 1` — its blob is a 3-digit-prefixed BINARY/text table that is
+/// NOT yet ported. The Pentax Main walker is an IFD walker, so a Pentax4 payload
+/// whose first 32 bytes contain an IFD-shaped sequence would make
+/// `ProcessUnknown`'s `LocateIFD` lock onto it and `ProcessExif` emit BOGUS
+/// `%Pentax::Main` tags (Pentax was a no-op before #262). The NotIFD gate must
+/// make the decode emit NOTHING — the typed slot stays empty. (Pentax4 is the
+/// ONLY `Vendor::Pentax` variant with `NotIFD => 1`.)
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn pentax4_notifd_blob_emits_no_main_tags() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch, fixbase};
+
+  // A 3-digit prefix ("100") + 1 pad byte, then a little-endian 1-entry IFD that
+  // WOULD decode `Quality = 1` ("Better") via `%Pentax::Main` if the walker ran.
+  // The IFD sits at blob offset 4, where `LocateIFD`'s even-offset scan locks on.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"100"); // 3 ASCII digits ⇒ Pentax4
+  blob.push(0x99); // pad: keeps offsets 0/2 from looking IFD-shaped
+  // IFD at offset 4: count=1, then one 12-byte entry (Quality 0x0008, int16u, 1).
+  blob.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+  blob.extend_from_slice(&0x0008u16.to_le_bytes()); // tag 0x0008 = Quality
+  blob.extend_from_slice(&3u16.to_le_bytes()); // format = int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+  blob.extend_from_slice(&1u16.to_le_bytes()); // value 1 ("Better") inline
+  blob.extend_from_slice(&0u16.to_le_bytes()); // value padding
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+  blob.extend_from_slice(&[0u8; 8]); // trailing slack so LocateIFD's size checks pass
+
+  // NON-VACUOUS: prove the blob IS IFD-shaped — `LocateIFD` finds the IFD at
+  // offset 4, so WITHOUT the NotIFD gate `ProcessUnknown` would walk + emit it.
+  let located = fixbase::locate_ifd(&blob, 0, None, ByteOrder::Little, Some("PENTAX"), None);
+  assert_eq!(
+    located.map(|(off, _)| off),
+    Some(4),
+    "the crafted Pentax4 payload IS IFD-shaped (LocateIFD locks at offset 4) —      so the NotIFD gate, not a parse failure, is what suppresses the tags"
+  );
+
+  // Dispatch as bundled would: PENTAX make + 3-digit body ⇒ Pentax4 (NotIFD).
+  let detected = dispatch(&blob, Some("PENTAX"), Some("PENTAX Optio 33WR"), None);
+  assert!(
+    detected.vendor().is_pentax(),
+    "dispatches to Vendor::Pentax"
+  );
+  assert!(
+    detected.is_not_ifd(),
+    "the Pentax4 arm sets NotIFD => 1 (binary table, not an IFD)"
+  );
+
+  // The gated decode must emit NOTHING — the typed slot is the empty default
+  // (no Quality / ModelID / LensType), NOT the bogus `Quality = 1` the IFD-shaped
+  // bytes would otherwise yield.
+  let meta = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("PENTAX"),
+    Some("PENTAX Optio 33WR"),
+  );
+  assert!(meta.vendor().is_pentax());
+  let pentax = meta
+    .pentax()
+    .expect("the typed slot is present (vendor detected) but empty");
+  assert_eq!(
+    pentax.quality(),
+    None,
+    "a NotIFD Pentax4 blob must NOT emit a bogus Quality from the IFD-shaped bytes"
+  );
+  assert_eq!(pentax.model_id(), None, "no ModelID from a NotIFD blob");
+  assert_eq!(pentax.lens_type(), None, "no LensType from a NotIFD blob");
+}
+
 /// Canon EOS 300D / Digital Rebel JPEG (bundled from
 /// `exiftool/t/images/Canon.jpg`). Verify the Canon body decoder
 /// populates `MakerNotesCanon` with the per-tag values the bundled

@@ -59,6 +59,8 @@ pub enum TableRef {
   NikonType2,
   /// `%Apple::Main`.
   Apple,
+  /// `%Pentax::Main`.
+  Pentax,
   /// `%Samsung::Type2`.
   Samsung,
 }
