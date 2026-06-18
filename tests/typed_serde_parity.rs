@@ -623,14 +623,16 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
 /// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
 /// fixture must bump this constant (the per-PR convention above).
-/// 525 → 528 after the SP4 brand-variant real-fixture conformance (#151) added
-/// paired `.json`+`.n.json` goldens for three brand-detection fixtures, ALL
-/// ACTIVE (each routes through the golden-migrated QuickTime `Taggable` engine,
-/// so the typed-serde path equals the writer path byte-for-byte):
-/// `AVIF_sample.avif` (brand `avif` → AVIF), `HEIF_C001_msf1.heic` (brand
-/// `heic`, `msf1`-compatible → HEIC), `ISOBMFF_iso5_brand.mp4` (brand `iso5` →
-/// MP4).
-const EXPECTED_ACTIVE_FIXTURES: usize = 528;
+/// 525 → 530 after the #266 real-device-fixture batch merged four conformance
+/// PRs, each adding paired `.json`+`.n.json` goldens for ALL-ACTIVE fixtures
+/// (each routes through the golden-migrated `Taggable` engine, so the
+/// typed-serde path equals the writer path byte-for-byte): `SamsungNX500.srw`
+/// (#276, +1); the three SP4 brand-detection fixtures `AVIF_sample.avif`,
+/// `HEIF_C001_msf1.heic`, `ISOBMFF_iso5_brand.mp4` (#151/#277, +3); and
+/// `QuickTime_gopro_gpmf.mp4` (#127/#278, +1). (The sequential squash-merges of
+/// these PRs landed a stale 528 — only the brand +3 — silently dropping
+/// Samsung's and GoPro's +1 each; corrected to 530 here.)
+const EXPECTED_ACTIVE_FIXTURES: usize = 530;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
