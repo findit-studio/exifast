@@ -8742,6 +8742,45 @@ fn pentax_avi_conformance() {
   check("Pentax.avi", "Pentax.avi.n.json", false);
 }
 #[test]
+fn makernotes_dji_phantom4_conformance() {
+  // DJIPhantom4.jpg (FC330) — the DJI-MakerNote conformance backstop on a REAL
+  // drone JPEG (#121, MakerNote #163). The `0x927c` MakerNote is the verbatim
+  // `%DJI::Main` text-record block (DJI.pm) — exifast emits all 10 `DJI:*`
+  // leaves byte-identically to bundled ExifTool 13.59: `Make` = "DJI", the
+  // three `SpeedX/Y/Z` (`+0.00`, the signed `%+.2f` PrintConv), the flight
+  // `Pitch`/`Yaw`/`Roll` (-7.40 / -7.90 / -2.30) and `CameraPitch`/`CameraYaw`/
+  // `CameraRoll` (-29.80 / -7.80 / +0.00) gimbal angles. The standard EXIF GPS
+  // IFD is ALSO byte-exact (exifast emits the GPS IFD directly): `GPSLatitude`
+  // = 32 deg 28' 42.95" N, `GPSLongitude` = 90 deg 15' 36.01" W, `GPSAltitude`
+  // = 109.786 m — these are the raw GPS IFD tags, NOT the `Composite:GPS*`
+  // synthesis (which exifast cannot emit). All 83 shared tags match for BOTH
+  // the `-j` PrintConv and `-n` numeric snapshots.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
+  // tags exifast does NOT emit — every exclusion is a documented, NON-DJI-
+  // MakerNote-path deferral (none masks a DJI faithfulness gap):
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (this drops
+  //                        the `Composite:GPS{Latitude,Longitude,Altitude,
+  //                        Position}` synthesis; the RAW GPS IFD above is kept).
+  //   -x XMP:all         — the XMP-drone-dji / XMP-crs / XMP-tiff / … packet is
+  //                        not ported (no XMP subsystem).
+  //   -x MPF:all         — the MPF (Multi-Picture Format) APP2 block
+  //                        (MPF0/MPImage1/MPImage2, incl. the second-image
+  //                        PreviewImage) is not ported.
+  //   -x IFD0:XPComment -x IFD0:XPKeywords — the Windows XP* tags (0x9c9c/
+  //                        0x9c9e) are not in exifast's EXIF table (pre-existing
+  //                        standard-EXIF gap, unrelated to MakerNotes).
+  //   -x ExifIFD:DeviceSettingDescription — EXIF 0xa40b, likewise not in the
+  //                        table (standard-EXIF gap).
+  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder (the
+  //                        same documented engine-wide gap the Nikon/Pentax
+  //                        goldens drop; the `ThumbnailOffset`/`Length` ARE
+  //                        kept). The JPEG SOF `File:*` dimension tags (#261)
+  //                        are part of this golden.
+  check("DJIPhantom4.jpg", "DJIPhantom4.jpg.json", true);
+  check("DJIPhantom4.jpg", "DJIPhantom4.jpg.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`
