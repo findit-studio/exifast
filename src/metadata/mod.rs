@@ -62,7 +62,8 @@ pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
 };
 pub use gopro::{
-  GoProConv, GoProGlpiSample, GoProGpsSample, GoProKbat, GoProMeta, GoProTag, GoProTagValue,
+  GoProConv, GoProDocSample, GoProFdscSample, GoProGlpiSample, GoProGpsSample, GoProKbat,
+  GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta,
 };
 pub(crate) use gopro::{GoProIdentity, GoProMainGroupTag, GoProScalar};
 pub use insta360::{

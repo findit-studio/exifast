@@ -121,8 +121,8 @@ use alloc::{
 use smol_str::SmolStr;
 
 use crate::metadata::{
-  GoProConv, GoProGlpiSample, GoProGpsSample, GoProIdentity, GoProKbat, GoProMeta, GoProScalar,
-  GoProTag, GoProTagValue,
+  GoProConv, GoProFdscSample, GoProGlpiSample, GoProGpsSample, GoProIdentity, GoProKbat, GoProMeta,
+  GoProScalar, GoProTag, GoProTagValue,
 };
 
 // ===========================================================================
@@ -272,6 +272,40 @@ pub fn process_gopro(data: &[u8], out: &mut GoProMeta) -> bool {
     unit: None,
   };
   walker.walk(data)
+}
+
+/// Decode one GoPro `fdsc` timed-metadata sample — the
+/// `Image::ExifTool::GoPro::fdsc` `ProcessBinaryData` block (GoPro.pm:651-665).
+/// The sample is dispatched only when it starts `GPRO`
+/// (QuickTimeStream.pl:213-218 `Condition => '$$valPt =~ /^GPRO/'`); the four
+/// named fields are fixed-offset NUL-trimmed strings:
+///  - `0x08` `FirmwareVersion` `string[15]`,
+///  - `0x17` `SerialNumber` `string[16]`,
+///  - `0x57` `OtherSerialNumber` `string[15]`,
+///  - `0x66` `Model` `string[16]`.
+///
+/// A field whose `offset + len` runs past the sample is left `None` (ExifTool's
+/// `ProcessBinaryData` simply does not emit a tag whose bytes are out of range).
+/// Returns the decoded [`GoProFdscSample`] (its `track_index`/`doc`/timing are
+/// stamped by the caller). The `GPRO` magic is the caller's gate; this function
+/// trusts it (mirrors `ProcessBinaryData` running after the `Condition` match).
+#[must_use]
+pub fn process_fdsc(data: &[u8]) -> GoProFdscSample {
+  // `ReadValue('string', offset, len)`: read `len` bytes, then NUL-trim at the
+  // first `\0` (the same `read_ascii` shape every GoPro `c`-string field uses).
+  let field = |offset: usize, len: usize| -> Option<SmolStr> {
+    data
+      .get(offset..offset.saturating_add(len))
+      .and_then(read_ascii)
+      .map(SmolStr::from)
+  };
+  let mut sample = GoProFdscSample::new();
+  sample
+    .set_firmware_version(field(0x08, 15))
+    .set_serial_number(field(0x17, 16))
+    .set_other_serial_number(field(0x57, 15))
+    .set_model(field(0x66, 16));
+  sample
 }
 
 /// Container-walk state. ExifTool tracks `$type`, `$scal`, `$unit` per

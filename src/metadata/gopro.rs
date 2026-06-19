@@ -1192,6 +1192,29 @@ impl GoProMeta {
       && self.generic_tags.is_empty()
   }
 
+  /// `true` when this meta carries a real CAMERA-IDENTITY field with a
+  /// NON-EMPTY value — a `Model` (`MINF`) or `DeviceName` (`DVNM`, the model
+  /// fallback in [`Self::project_into`]), a `CameraSerialNumber` (`CASN`), or a
+  /// `FirmwareVersion` (`FMWR`). Distinct from [`Self::is_empty`]: a sample that
+  /// carries ONLY GPS / generic telemetry is non-empty yet has NO identity, so
+  /// it must not stamp a make-only `CameraInfo` over a later identity-bearing
+  /// sample (the timed-projection identity selector, GoProTimedMeta).
+  ///
+  /// An identity field is decoded via the GoPro `c`-string path
+  /// ([`crate::formats::gopro`] `read_ascii`), which returns `Some("")` for a
+  /// non-zero-size all-NUL payload (a defined-but-empty record ExifTool still
+  /// `HandleTag`s). Such an EMPTY identity is NOT a real identity and must not
+  /// gate the timed make-only stamp, so each field counts ONLY when present AND
+  /// non-empty.
+  #[inline]
+  #[must_use]
+  pub fn has_camera_identity(&self) -> bool {
+    nonempty(self.model()).is_some()
+      || nonempty(self.device_name()).is_some()
+      || nonempty(self.camera_serial_number()).is_some()
+      || nonempty(self.firmware_version()).is_some()
+  }
+
   /// The FIRST Karma `GLPI` sample carrying a GPS coordinate pair.
   #[inline(always)]
   #[must_use]
@@ -1399,6 +1422,445 @@ impl Default for GoProMeta {
   }
 }
 
+/// One GoPro `gpmd` timed-metadata SAMPLE — one `DEVC` container = one
+/// `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` (GoPro.pm:794-797, ProcessGP6 /
+/// QuickTimeStream.pl ProcessSamples). Each sample's GPMF KLV is decoded into
+/// its OWN [`GoProMeta`] (one DEVC's worth of leaves, in walk order), and is
+/// stamped with the enclosing `gpmd` `trak`'s 1-based `Track<N>` index, the
+/// global `Doc<N>` ordinal off the shared `QuickTimeStreamMeta` counter, and
+/// the sample-table `(SampleTime, SampleDuration)`.
+///
+/// ExifTool emits this under `Track<N>:` (family-1; `ProcessGoPro` keeps the
+/// `Track<N>` `SET_GROUP1`, GoPro.pm:826-828) in `-ee` mode ONLY — the FULL
+/// per-sample sensor/GPS block at `-ee -G3` (one `Doc<N>` per sample, the
+/// multi-row `GPS5`/`GPS9` rows split into `Doc<N>-<M>` by `ProcessString`,
+/// GoPro.pm:749-774), collapsed first-wins to the first `Doc` per `Track` at
+/// `-ee -G1`. Distinct from the `moov/udta/GPMF` box, which is processed
+/// WITHOUT `-ee` and emits under `GoPro:` (the [`GoProMeta`] on `Meta::gopro`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoProDocSample {
+  /// The decoded GPMF leaves of this ONE `DEVC` sample (one fresh
+  /// [`GoProMeta`] per gpmd sample). `gps_samples` holds the `GPS5`/`GPS9`
+  /// rows of this sample; `main_group_order` + `generic_tags` the sensor /
+  /// settings / GPS-scalar leaves.
+  meta: GoProMeta,
+  /// The enclosing `gpmd` `trak`'s 1-based `Track<N>` index (family-1).
+  track_index: u32,
+  /// The global `Doc<N>` ordinal (`++DOC_COUNT`), shared across every embedded
+  /// source in the file (so a `gpmd` `trak` after a `camm`/`mebx` `trak`
+  /// continues the ordinal).
+  doc: u32,
+  /// The sample-table `SampleTime` (seconds), emitted ahead of the payload.
+  sample_time: Option<f64>,
+  /// The sample-table `SampleDuration` (seconds).
+  sample_duration: Option<f64>,
+}
+
+impl GoProDocSample {
+  /// Build a gpmd timed sample from its decoded per-DEVC meta and stamping.
+  #[inline]
+  #[must_use]
+  pub fn new(
+    meta: GoProMeta,
+    track_index: u32,
+    doc: u32,
+    sample_time: Option<f64>,
+    sample_duration: Option<f64>,
+  ) -> Self {
+    Self {
+      meta,
+      track_index,
+      doc,
+      sample_time,
+      sample_duration,
+    }
+  }
+
+  /// The decoded GPMF leaves of this DEVC sample.
+  #[inline(always)]
+  #[must_use]
+  pub const fn meta(&self) -> &GoProMeta {
+    &self.meta
+  }
+
+  /// The 1-based `Track<N>` index of the enclosing `gpmd` `trak`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> u32 {
+    self.track_index
+  }
+
+  /// The global `Doc<N>` ordinal.
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc(&self) -> u32 {
+    self.doc
+  }
+
+  /// The sample-table `SampleTime` (seconds).
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// The sample-table `SampleDuration` (seconds).
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
+}
+
+/// One GoPro `fdsc` timed-metadata SAMPLE — the `Image::ExifTool::GoPro::fdsc`
+/// `ProcessBinaryData` block (GoPro.pm:651-665) extracted from an `fdsc`
+/// metadata `trak` whose sample starts `GPRO` (QuickTimeStream.pl:213-218,
+/// `Condition => '$$valPt =~ /^GPRO/'`). Hero5/Hero6/Hero8 write the camera
+/// identity here too. Like [`GoProDocSample`] it emits under `Track<N>:` in
+/// `-ee` mode only (one `Doc<N>` per sample), with the sample-table timing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoProFdscSample {
+  /// `FirmwareVersion` (offset 0x08, `string[15]`).
+  firmware_version: Option<SmolStr>,
+  /// `SerialNumber` (offset 0x17, `string[16]`).
+  serial_number: Option<SmolStr>,
+  /// `OtherSerialNumber` (offset 0x57, `string[15]`).
+  other_serial_number: Option<SmolStr>,
+  /// `Model` (offset 0x66, `string[16]`).
+  model: Option<SmolStr>,
+  /// The enclosing `fdsc` `trak`'s 1-based `Track<N>` index (family-1).
+  track_index: u32,
+  /// The global `Doc<N>` ordinal (`++DOC_COUNT`).
+  doc: u32,
+  /// The sample-table `SampleTime` (seconds).
+  sample_time: Option<f64>,
+  /// The sample-table `SampleDuration` (seconds).
+  sample_duration: Option<f64>,
+}
+
+impl GoProFdscSample {
+  /// An empty fdsc sample (every field `None`, unstamped).
+  #[inline]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      firmware_version: None,
+      serial_number: None,
+      other_serial_number: None,
+      model: None,
+      track_index: 0,
+      doc: 0,
+      sample_time: None,
+      sample_duration: None,
+    }
+  }
+
+  /// `FirmwareVersion`.
+  #[inline(always)]
+  #[must_use]
+  pub fn firmware_version(&self) -> Option<&str> {
+    self.firmware_version.as_deref()
+  }
+
+  /// `SerialNumber`.
+  #[inline(always)]
+  #[must_use]
+  pub fn serial_number(&self) -> Option<&str> {
+    self.serial_number.as_deref()
+  }
+
+  /// `OtherSerialNumber`.
+  #[inline(always)]
+  #[must_use]
+  pub fn other_serial_number(&self) -> Option<&str> {
+    self.other_serial_number.as_deref()
+  }
+
+  /// `Model`.
+  #[inline(always)]
+  #[must_use]
+  pub fn model(&self) -> Option<&str> {
+    self.model.as_deref()
+  }
+
+  /// The 1-based `Track<N>` index of the enclosing `fdsc` `trak`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> u32 {
+    self.track_index
+  }
+
+  /// The global `Doc<N>` ordinal.
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc(&self) -> u32 {
+    self.doc
+  }
+
+  /// The sample-table `SampleTime` (seconds).
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// The sample-table `SampleDuration` (seconds).
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
+
+  /// `true` when no identity field was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.firmware_version.is_none()
+      && self.serial_number.is_none()
+      && self.other_serial_number.is_none()
+      && self.model.is_none()
+  }
+
+  /// `true` when this `fdsc` sample carries a real CAMERA-IDENTITY value — a
+  /// NON-EMPTY `Model` / `SerialNumber` / `FirmwareVersion` (the three fields
+  /// the timed `fdsc` `CameraInfo` projection consumes,
+  /// [`GoProTimedMeta::project_into`]). Mirrors [`GoProMeta::has_camera_identity`]
+  /// so the timed-projection identity selector reads the same predicate shape
+  /// across both sample kinds.
+  ///
+  /// Distinct from [`Self::is_empty`]: an `fdsc` field is decoded via the GoPro
+  /// `c`-string path ([`crate::formats::gopro`] `process_fdsc` / `read_ascii`),
+  /// which returns `Some("")` for a non-zero-size all-NUL payload — so a sample
+  /// whose only set fields are EMPTY strings is non-empty yet carries no real
+  /// identity and must not stamp a make-only `CameraInfo` over a later
+  /// identity-bearing `gpmd` sample or lower-priority container metadata.
+  /// `OtherSerialNumber` is deliberately EXCLUDED: it is not one of the fields
+  /// the projection writes into `CameraInfo`, so it alone cannot justify the
+  /// make-only stamp.
+  #[inline]
+  #[must_use]
+  pub fn has_camera_identity(&self) -> bool {
+    nonempty(self.model()).is_some()
+      || nonempty(self.serial_number()).is_some()
+      || nonempty(self.firmware_version()).is_some()
+  }
+
+  /// Assign `FirmwareVersion`.
+  #[inline(always)]
+  pub fn set_firmware_version(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.firmware_version = v;
+    self
+  }
+
+  /// Assign `SerialNumber`.
+  #[inline(always)]
+  pub fn set_serial_number(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.serial_number = v;
+    self
+  }
+
+  /// Assign `OtherSerialNumber`.
+  #[inline(always)]
+  pub fn set_other_serial_number(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.other_serial_number = v;
+    self
+  }
+
+  /// Assign `Model`.
+  #[inline(always)]
+  pub fn set_model(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.model = v;
+    self
+  }
+
+  /// Stamp the `trak` index / `Doc<N>` ordinal / sample-table timing onto this
+  /// sample (the stream walker calls this after decoding the `GPRO` block).
+  #[inline]
+  pub fn stamp(
+    &mut self,
+    track_index: u32,
+    doc: u32,
+    sample_time: Option<f64>,
+    sample_duration: Option<f64>,
+  ) -> &mut Self {
+    self.track_index = track_index;
+    self.doc = doc;
+    self.sample_time = sample_time;
+    self.sample_duration = sample_duration;
+    self
+  }
+}
+
+impl Default for GoProFdscSample {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The GoPro `gpmd` + `fdsc` TIMED-metadata accumulator — the per-sample
+/// `Doc<N>` sources distinct from the always-on `moov/udta/GPMF` box (which
+/// lives in [`GoProMeta`]). Populated by the `gpmd` / `fdsc` MetaFormat
+/// dispatch in [`crate::formats::quicktime_stream`], emitted under `Track<N>:`
+/// in `-ee` mode only (#211 / #189). Empty for a GoPro file whose data comes
+/// only from the `udta/GPMF` box (the four crafted-minimal fixtures) or for a
+/// non-GoPro video.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GoProTimedMeta {
+  /// One [`GoProDocSample`] per `gpmd` timed-metadata sample, in walk order.
+  doc_samples: Vec<GoProDocSample>,
+  /// One [`GoProFdscSample`] per `fdsc` (`GPRO`) timed-metadata sample.
+  fdsc_samples: Vec<GoProFdscSample>,
+}
+
+impl GoProTimedMeta {
+  /// An empty accumulator (no timed gpmd / fdsc samples).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      doc_samples: Vec::new(),
+      fdsc_samples: Vec::new(),
+    }
+  }
+
+  /// `true` when neither a `gpmd` nor an `fdsc` timed sample was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.doc_samples.is_empty() && self.fdsc_samples.is_empty()
+  }
+
+  /// The decoded `gpmd` timed samples in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn doc_samples(&self) -> &[GoProDocSample] {
+    self.doc_samples.as_slice()
+  }
+
+  /// The decoded `fdsc` timed samples in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn fdsc_samples(&self) -> &[GoProFdscSample] {
+    self.fdsc_samples.as_slice()
+  }
+
+  /// Append a decoded `gpmd` timed sample.
+  #[inline(always)]
+  pub fn push_doc_sample(&mut self, sample: GoProDocSample) -> &mut Self {
+    self.doc_samples.push(sample);
+    self
+  }
+
+  /// Append a decoded `fdsc` timed sample.
+  #[inline(always)]
+  pub fn push_fdsc_sample(&mut self, sample: GoProFdscSample) -> &mut Self {
+    self.fdsc_samples.push(sample);
+    self
+  }
+
+  /// The FIRST timed `gpmd` sample whose decoded GPMF carries a GPS coordinate
+  /// pair — a `GPS5`/`GPS9` fix, or (Karma drone) a `GLPI` fix — the entry that
+  /// feeds the [`MediaMetadata`] GPS projection. Mirrors the per-sample
+  /// `first_fix`/`first_glpi_fix` of [`GoProMeta`] across the timed-sample axis;
+  /// returns the enclosing [`GoProDocSample`] so the caller can reach its
+  /// `Doc<N>`/`Track<N>` stamping if needed.
+  #[inline]
+  #[must_use]
+  pub fn first_fix(&self) -> Option<&GoProDocSample> {
+    self
+      .doc_samples
+      .iter()
+      .find(|s| s.meta().first_fix().is_some() || s.meta().first_glpi_fix().is_some())
+  }
+}
+
+// ===========================================================================
+// GoProTimedMeta projection into MediaMetadata (golden L2)
+// ===========================================================================
+
+impl GoProTimedMeta {
+  /// Project the GoPro `gpmd` / `fdsc` TIMED-metadata camera identity + GPS into
+  /// [`MediaMetadata`].
+  ///
+  /// This is the ALWAYS-ON normalized projection (the product's actual output),
+  /// distinct from the per-sample timed TAG stream emitted only at `-ee`: a GoPro
+  /// file whose GPS lives ONLY in the timed `gpmd` track (e.g. the HERO8 sample —
+  /// the `udta/GPMF` box carries identity but NO `GPS5`/`GPS9`) must still surface
+  /// its [`GpsLocation`] here. Mirrors the CAMM / Sony rtmd / Insta360 timed-GPS
+  /// projections: the FIRST coordinate-bearing sample summarizes the track.
+  ///
+  /// The two domains are projected INDEPENDENTLY (a `gpmd` sample may carry GPS
+  /// telemetry while the real camera identity lives elsewhere):
+  ///
+  /// - **CameraInfo:** the FIRST `gpmd` sample carrying real identity (a
+  ///   `Model`/`DeviceName`/`CameraSerialNumber`/`FirmwareVersion` —
+  ///   [`GoProMeta::has_camera_identity`]) sets it via
+  ///   [`GoProMeta::project_camera_into`]. A GPS-only sample is SKIPPED for
+  ///   identity so it cannot stamp a make-only `CameraInfo` that masks a later
+  ///   identity-bearing sample. When NO `gpmd` sample carries identity (the
+  ///   camera fields live in an `fdsc` `GPRO` block instead — Hero5/6/8), the
+  ///   first identity-bearing [`GoProFdscSample`] fills `CameraInfo` (`fdsc`
+  ///   carries no GPS).
+  /// - **GpsLocation:** the FIRST coordinate-bearing `gpmd` sample
+  ///   ([`Self::first_fix`]) summarizes the track via
+  ///   [`GoProMeta::project_gps_into`] — the "first valid fix" precedent — at
+  ///   the SAME HIGHEST GPS priority tier as the always-on `udta/GPMF` box,
+  ///   regardless of which sample supplied the identity.
+  ///
+  /// Set-once per domain throughout (each step no-ops when a higher-priority
+  /// source already populated the domain it would write), so this composes into
+  /// the QuickTime priority chain at the GoPro on-device-GNSS tier. An inherent
+  /// helper (not the golden [`Project`](crate::metadata::Project) trait) — GoPro
+  /// is reached only through the QuickTime container, whose projection
+  /// ([`crate::formats::quicktime::Meta::media_metadata`]) calls this.
+  pub(crate) fn project_into(&self, md: &mut MediaMetadata) {
+    if self.is_empty() {
+      return;
+    }
+    // ── CameraInfo (identity) ──────────────────────────────────────────
+    // Take identity from the FIRST `gpmd` sample that carries REAL identity —
+    // NOT a GPS-only/make-only sample, which would otherwise stamp a make-only
+    // `CameraInfo` and mask both later identity-bearing `gpmd` samples and the
+    // `fdsc` fallback. Each `gpmd` sample is one `DEVC` with its own decoded
+    // `GoProMeta`; `project_camera_into` is set-once (no-ops when a
+    // higher-priority source already set the camera).
+    if let Some(s) = self
+      .doc_samples
+      .iter()
+      .find(|s| s.meta().has_camera_identity())
+    {
+      s.meta().project_camera_into(md);
+    } else if md.camera().is_none()
+      && let Some(f) = self.fdsc_samples.iter().find(|f| f.has_camera_identity())
+    {
+      // No `gpmd` sample carried identity: fall back to the `fdsc` (`GPRO`)
+      // block (firmware / serial / model — no GPS), when no higher-priority
+      // source already set the camera. `f` passed `has_camera_identity`, so at
+      // least one field is non-empty; each field is still `nonempty`-filtered so
+      // an empty sibling field is never written as an empty string (the same
+      // rule the predicate uses). `fdsc` has no `DeviceName` fallback.
+      let model = nonempty(f.model());
+      let serial = nonempty(f.serial_number());
+      let software = nonempty(f.firmware_version());
+      let mut cam = CameraInfo::new();
+      cam
+        .update_make(Some("GoPro".into()))
+        .update_model(model.map(str::to_string))
+        .update_serial(serial.map(str::to_string))
+        .update_software(software.map(str::to_string));
+      md.set_camera(cam);
+    }
+    // ── GpsLocation ────────────────────────────────────────────────────
+    // Summarize GPS from the FIRST coordinate-bearing `gpmd` sample,
+    // INDEPENDENTLY of which sample supplied the identity above
+    // (`project_gps_into` is set-once at the HIGHEST GPS priority tier).
+    if let Some(s) = self.first_fix() {
+      s.meta().project_gps_into(md);
+    }
+  }
+}
+
 // ===========================================================================
 // GoPro projection into MediaMetadata (golden L2)
 // ===========================================================================
@@ -1432,24 +1894,58 @@ impl GoProMeta {
     if self.is_empty() {
       return;
     }
-    // ── CameraInfo ─────────────────────────────────────────────────────
+    self.project_camera_into(md);
+    self.project_gps_into(md);
+  }
+
+  /// Project ONLY this meta's [`CameraInfo`] (the `Make`/`Model`/`Serial`/
+  /// `Software` half of [`Self::project_into`]) into `md`, set-once. Split out
+  /// so the timed-sample projection ([`GoProTimedMeta::project_into`]) can take
+  /// identity from one sample and GPS from a DIFFERENT sample.
+  ///
+  /// Every identity field is filtered through [`nonempty`] (the SAME non-empty
+  /// rule as [`Self::has_camera_identity`], so predicate and projection agree):
+  /// `Model` (`MINF`) falls back to `DeviceName` (`DVNM`) only when `MINF` is
+  /// empty/absent; `Serial` (`CASN`) and `Software` (`FMWR`) are written only
+  /// when non-empty. The `Make`-only `GoPro` stamp + `set_camera` fire ONLY when
+  /// at least one projected identity field is non-empty — so a GPS-only or an
+  /// empty-identity sample writes NO `CameraInfo`, and a selected sample never
+  /// writes an empty value that would shadow a later real identity in the
+  /// priority chain. The timed path additionally gates the SELECTION of the
+  /// sample on [`Self::has_camera_identity`].
+  fn project_camera_into(&self, md: &mut MediaMetadata) {
     if md.camera().is_none() {
-      let mut cam = CameraInfo::new();
-      cam
-        .update_make(Some("GoPro".into()))
-        .update_model(
-          self
-            .model()
-            .or_else(|| self.device_name())
-            .map(str::to_string),
-        )
-        .update_serial(self.camera_serial_number().map(str::to_string))
-        .update_software(self.firmware_version().map(str::to_string));
-      if !cam.is_empty() {
+      // The GoPro `c`-string decoder yields `Some("")` for a defined-but-empty
+      // (all-NUL) record, so each identity field is filtered through `nonempty`:
+      // `Model` (`MINF`) falls back to `DeviceName` (`DVNM`) only when MINF is
+      // empty/absent, and an empty `DVNM` falls through to absent. Serial /
+      // software are written only when non-empty. This is the SAME non-empty
+      // rule as `has_camera_identity`, so predicate and projection agree — a
+      // selected sample never writes an empty value into `CameraInfo`.
+      let model = nonempty(self.model()).or_else(|| nonempty(self.device_name()));
+      let serial = nonempty(self.camera_serial_number());
+      let software = nonempty(self.firmware_version());
+      // Never stamp make-only `CameraInfo` for a sample whose every projected
+      // identity field is empty/absent (it would otherwise shadow a later real
+      // identity in the priority chain).
+      if model.is_some() || serial.is_some() || software.is_some() {
+        let mut cam = CameraInfo::new();
+        cam
+          .update_make(Some("GoPro".into()))
+          .update_model(model.map(str::to_string))
+          .update_serial(serial.map(str::to_string))
+          .update_software(software.map(str::to_string));
         md.set_camera(cam);
       }
     }
-    // ── GpsLocation (HIGHEST tier of the GPS priority chain) ───────────
+  }
+
+  /// Project ONLY this meta's [`GpsLocation`] (the HIGHEST-tier GPS half of
+  /// [`Self::project_into`]) into `md`, set-once. Split out alongside
+  /// [`Self::project_camera_into`] so the timed-sample projection can summarize
+  /// GPS from the first COORDINATE-bearing sample independently of which sample
+  /// supplied the camera identity.
+  fn project_gps_into(&self, md: &mut MediaMetadata) {
     if md.gps().is_none() {
       if let Some(f) = self.first_fix() {
         // Primary: GPS5/GPS9 hardware GNSS.
@@ -1494,6 +1990,22 @@ impl GoProMeta {
 #[inline]
 fn usable_glpi_time(s: &str) -> bool {
   !s.is_empty() && !s.starts_with('<') && !s.starts_with("0000:")
+}
+
+/// Map an EMPTY string to absent: `Some("")` -> `None`, every other value
+/// unchanged. The single non-empty rule shared by the GoPro camera-identity
+/// predicate ([`GoProMeta::has_camera_identity`] /
+/// [`GoProFdscSample::has_camera_identity`]) AND the identity projection
+/// ([`GoProMeta::project_camera_into`] + the `fdsc` fallback in
+/// [`GoProTimedMeta::project_into`]). The GoPro `c`-string decoder
+/// ([`crate::formats::gopro`] `read_ascii`) returns `Some("")` for a non-zero
+/// all-NUL payload (a defined-but-empty record ExifTool still `HandleTag`s), so
+/// such a field is present yet carries no real value — it must neither gate the
+/// make-only stamp nor be written into [`CameraInfo`], where it would shadow a
+/// later real identity in the priority chain.
+#[inline]
+fn nonempty(s: Option<&str>) -> Option<&str> {
+  s.filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
@@ -1643,5 +2155,627 @@ mod tests {
     m.project_into(&mut md);
     // The higher-priority Sony Make wins — GoPro doesn't overwrite it.
     assert_eq!(md.camera().expect("camera").make(), Some("Sony"));
+  }
+
+  // ── GoProTimedMeta (gpmd / fdsc) projection — #211 finding 1 ──────────────
+
+  /// A hand-built timed `gpmd` sample carrying a `GPS5`-style fix projects its
+  /// camera identity AND GpsLocation into MediaMetadata — proving the timed
+  /// `gpmd` GPS (which no longer reaches the flat `GoProMeta`) reaches the typed
+  /// projection (the regression the finding flagged). Mirrors the CAMM / rtmd /
+  /// Insta360 first-fix precedent.
+  #[test]
+  fn timed_project_into_surfaces_gpmd_camera_and_gps() {
+    let mut sample_meta = GoProMeta::new();
+    sample_meta
+      .set_device_name(Some("HERO8 Black".into()))
+      .set_camera_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01".into()))
+      .set_gps_date_time(Some("2019:11:18 23:42:08.645".into()));
+    let mut fix = GoProGpsSample::new();
+    fix
+      .set_latitude(Some(42.026625))
+      .set_longitude(Some(-129.294339))
+      .set_altitude_m(Some(9540.24));
+    sample_meta.push_gps_sample(fix);
+
+    let mut timed = GoProTimedMeta::new();
+    timed.push_doc_sample(GoProDocSample::new(sample_meta, 4, 1, Some(0.0), Some(1.0)));
+    assert!(!timed.is_empty());
+    assert!(
+      timed.first_fix().is_some(),
+      "first coordinate-bearing sample"
+    );
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    let cam = md.camera().expect("timed gpmd CameraInfo projected");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    let gps = md.gps().expect("timed gpmd GpsLocation projected");
+    assert!((gps.latitude().unwrap() - 42.026625).abs() < 1e-9);
+    assert!((gps.longitude().unwrap() + 129.294339).abs() < 1e-9);
+    assert!((gps.altitude_m().unwrap() - 9540.24).abs() < 1e-6);
+    assert_eq!(gps.timestamp(), Some("2019:11:18 23:42:08.645"));
+  }
+
+  /// The FIRST coordinate-bearing `gpmd` sample wins the GPS summary (later
+  /// samples do not overwrite), mirroring the first-fix-wins precedent; camera
+  /// identity comes from the first sample carrying it.
+  #[test]
+  fn timed_project_into_uses_first_coordinate_bearing_sample() {
+    let mut timed = GoProTimedMeta::new();
+    // Sample 1: identity but NO coordinates (altitude only).
+    let mut m1 = GoProMeta::new();
+    m1.set_model(Some("HERO8 Black".into()));
+    let mut s1 = GoProGpsSample::new();
+    s1.set_altitude_m(Some(10.0));
+    m1.push_gps_sample(s1);
+    timed.push_doc_sample(GoProDocSample::new(m1, 4, 1, None, None));
+    // Sample 2: the first real fix.
+    let mut m2 = GoProMeta::new();
+    let mut s2 = GoProGpsSample::new();
+    s2.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+    m2.push_gps_sample(s2);
+    timed.push_doc_sample(GoProDocSample::new(m2, 4, 2, None, None));
+    // Sample 3: a LATER fix that must NOT win.
+    let mut m3 = GoProMeta::new();
+    let mut s3 = GoProGpsSample::new();
+    s3.set_latitude(Some(9.0)).set_longitude(Some(9.0));
+    m3.push_gps_sample(s3);
+    timed.push_doc_sample(GoProDocSample::new(m3, 4, 3, None, None));
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+    let gps = md.gps().expect("gps from first coordinate-bearing sample");
+    assert_eq!(gps.latitude(), Some(1.0));
+    assert_eq!(gps.longitude(), Some(2.0));
+    assert_eq!(md.camera().expect("camera").model(), Some("HERO8 Black"));
+  }
+
+  /// An `fdsc` (`GPRO`) sample carries camera identity but NO GPS — it fills
+  /// CameraInfo when the `gpmd` samples did not, and leaves GpsLocation unset.
+  #[test]
+  fn timed_project_into_camera_from_fdsc_when_no_gpmd_identity() {
+    let mut fdsc = GoProFdscSample::new();
+    fdsc
+      .set_model(Some("HERO8 Black".into()))
+      .set_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01.01.20.00".into()));
+    let mut timed = GoProTimedMeta::new();
+    timed.push_fdsc_sample(fdsc);
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+    let cam = md.camera().expect("fdsc CameraInfo projected");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), Some("HD8.01.01.20.00"));
+    assert!(md.gps().is_none(), "fdsc carries no GPS");
+  }
+
+  /// An empty timed meta writes nothing, and the projection no-ops when a
+  /// higher-priority source already populated the domain.
+  #[test]
+  fn timed_project_into_empty_and_priority_chain() {
+    let empty = GoProTimedMeta::new();
+    let mut md = MediaMetadata::new();
+    empty.project_into(&mut md);
+    assert!(md.camera().is_none());
+    assert!(md.gps().is_none());
+
+    // A higher-priority GPS already set — the timed gpmd fix must not overwrite.
+    let mut m = GoProMeta::new();
+    let mut s = GoProGpsSample::new();
+    s.set_latitude(Some(5.0)).set_longitude(Some(6.0));
+    m.push_gps_sample(s);
+    let mut timed = GoProTimedMeta::new();
+    timed.push_doc_sample(GoProDocSample::new(m, 4, 1, None, None));
+    let mut md2 = MediaMetadata::new();
+    let mut existing = GpsLocation::new();
+    existing
+      .update_latitude(Some(1.0))
+      .update_longitude(Some(2.0));
+    md2.set_gps(existing);
+    timed.project_into(&mut md2);
+    assert_eq!(md2.gps().expect("gps").latitude(), Some(1.0));
+  }
+
+  /// #211 R2 — a GPS-only `gpmd` sample (coordinates, NO model/serial/firmware)
+  /// followed by an identity-bearing `fdsc` (`GPRO`) sample: the GPS-only
+  /// sample must NOT stamp a make-only `CameraInfo` that blocks the `fdsc`
+  /// fallback. The projection ends with BOTH the GPS (from the `gpmd`
+  /// coordinate sample) AND the real camera identity (from `fdsc`).
+  #[test]
+  fn timed_gps_only_gpmd_does_not_block_fdsc_identity() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: a coordinate fix, but NO identity (GPS-only telemetry).
+    let mut gps_only = GoProMeta::new();
+    let mut fix = GoProGpsSample::new();
+    fix
+      .set_latitude(Some(42.026625))
+      .set_longitude(Some(-129.294339))
+      .set_altitude_m(Some(9540.24));
+    gps_only.push_gps_sample(fix);
+    assert!(!gps_only.is_empty(), "GPS-only meta is non-empty");
+    assert!(
+      !gps_only.has_camera_identity(),
+      "GPS-only meta carries no camera identity"
+    );
+    timed.push_doc_sample(GoProDocSample::new(gps_only, 4, 1, Some(0.0), Some(1.0)));
+    // fdsc (GPRO) sample: the real camera identity (no GPS).
+    let mut fdsc = GoProFdscSample::new();
+    fdsc
+      .set_model(Some("HERO8 Black".into()))
+      .set_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01.01.20.00".into()));
+    assert!(fdsc.has_camera_identity());
+    timed.push_fdsc_sample(fdsc);
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    // The GPS-only sample no longer blocks identity: fdsc fills CameraInfo.
+    let cam = md
+      .camera()
+      .expect("fdsc identity projected past the GPS-only gpmd sample");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), Some("HD8.01.01.20.00"));
+    // ...and the GPS still comes from the gpmd coordinate sample.
+    let gps = md.gps().expect("gps from the GPS-only gpmd sample");
+    assert!((gps.latitude().unwrap() - 42.026625).abs() < 1e-9);
+    assert!((gps.longitude().unwrap() + 129.294339).abs() < 1e-9);
+    assert!((gps.altitude_m().unwrap() - 9540.24).abs() < 1e-6);
+  }
+
+  /// #211 R2 — a GPS-only `gpmd` sample followed by a LATER identity-bearing
+  /// `gpmd` sample: identity is taken from the later sample (not masked by a
+  /// make-only `CameraInfo` from the GPS-only sample), while the GPS still
+  /// summarizes from the FIRST coordinate-bearing sample.
+  #[test]
+  fn timed_gps_only_gpmd_does_not_block_later_gpmd_identity() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: a coordinate fix, but NO identity.
+    let mut gps_only = GoProMeta::new();
+    let mut fix = GoProGpsSample::new();
+    fix.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+    gps_only.push_gps_sample(fix);
+    assert!(!gps_only.has_camera_identity());
+    timed.push_doc_sample(GoProDocSample::new(gps_only, 4, 1, None, None));
+    // gpmd sample 2 (LATER): carries the real identity (and its own later fix
+    // that must NOT win the GPS summary).
+    let mut identity = GoProMeta::new();
+    identity
+      .set_model(Some("HERO8 Black".into()))
+      .set_camera_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01".into()));
+    let mut later_fix = GoProGpsSample::new();
+    later_fix.set_latitude(Some(9.0)).set_longitude(Some(9.0));
+    identity.push_gps_sample(later_fix);
+    assert!(identity.has_camera_identity());
+    timed.push_doc_sample(GoProDocSample::new(identity, 4, 2, None, None));
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    // Identity comes from the LATER gpmd sample (the GPS-only sample didn't
+    // mask it with a make-only CameraInfo).
+    let cam = md
+      .camera()
+      .expect("later gpmd identity projected past the GPS-only sample");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), Some("HD8.01"));
+    // GPS still summarizes from the FIRST coordinate-bearing sample.
+    let gps = md
+      .gps()
+      .expect("gps from the first coordinate-bearing sample");
+    assert_eq!(gps.latitude(), Some(1.0));
+    assert_eq!(gps.longitude(), Some(2.0));
+  }
+
+  /// #211 R3/R4 — the GoPro `c`-string decoder returns `Some("")` for a
+  /// non-zero-size all-NUL payload (`read_ascii`), so an EMPTY identity string
+  /// (`DVNM`/`MINF`/`CASN`/`FMWR` = `Some("")`) is non-empty yet carries NO real
+  /// identity. The non-empty predicate rejects every such field individually,
+  /// in any mix, so an empty-only sample never gates the make-only stamp.
+  #[test]
+  fn timed_empty_identity_strings_are_not_camera_identity() {
+    // Each field present-but-empty does NOT count as identity.
+    for set_one in [
+      GoProMeta::set_device_name as fn(&mut GoProMeta, Option<SmolStr>) -> &mut GoProMeta,
+      GoProMeta::set_model,
+      GoProMeta::set_camera_serial_number,
+      GoProMeta::set_firmware_version,
+    ] {
+      let mut m = GoProMeta::new();
+      set_one(&mut m, Some(SmolStr::default())); // Some("")
+      assert!(
+        !m.has_camera_identity(),
+        "an empty-string identity field is not a real identity"
+      );
+    }
+    // ALL four empty at once: still no identity.
+    let mut all_empty = GoProMeta::new();
+    all_empty
+      .set_device_name(Some(SmolStr::default()))
+      .set_model(Some(SmolStr::default()))
+      .set_camera_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()));
+    assert!(!all_empty.has_camera_identity());
+    // A single NON-empty field flips it back on (empties on the rest don't mask).
+    let mut mixed = GoProMeta::new();
+    mixed
+      .set_device_name(Some(SmolStr::default()))
+      .set_model(Some("HERO8 Black".into()))
+      .set_camera_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()));
+    assert!(
+      mixed.has_camera_identity(),
+      "one non-empty field is a real identity even amid empties"
+    );
+  }
+
+  /// #211 R3/R4 — the same hole on the `fdsc` (`GPRO`) helper: `process_fdsc`
+  /// uses the same `read_ascii` NUL-trim path, so an `fdsc` sample whose
+  /// identity fields are all `Some("")` is non-empty yet carries no real
+  /// identity. `OtherSerialNumber` is excluded entirely (the projection never
+  /// writes it into `CameraInfo`), so a sample identified ONLY by a non-empty
+  /// `OtherSerialNumber` must NOT pass — it would otherwise stamp a make-only
+  /// `CameraInfo`.
+  #[test]
+  fn timed_empty_fdsc_identity_strings_are_not_camera_identity() {
+    // All projected fields present-but-empty → no identity.
+    let mut empty = GoProFdscSample::new();
+    empty
+      .set_model(Some(SmolStr::default()))
+      .set_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()));
+    assert!(
+      !empty.has_camera_identity(),
+      "empty-string fdsc identity fields are not a real identity"
+    );
+    // A non-empty `OtherSerialNumber` ALONE (not a projected field) → no
+    // identity, so no make-only stamp can be justified by it.
+    let mut other_only = GoProFdscSample::new();
+    other_only.set_other_serial_number(Some("OSN123".into()));
+    assert!(
+      !other_only.has_camera_identity(),
+      "OtherSerialNumber is not a projected CameraInfo field"
+    );
+    // Each projected field non-empty individually → identity.
+    for set_one in [
+      GoProFdscSample::set_model
+        as fn(&mut GoProFdscSample, Option<SmolStr>) -> &mut GoProFdscSample,
+      GoProFdscSample::set_serial_number,
+      GoProFdscSample::set_firmware_version,
+    ] {
+      let mut s = GoProFdscSample::new();
+      set_one(&mut s, Some("X".into()));
+      assert!(s.has_camera_identity());
+    }
+  }
+
+  /// #211 R3/R4 — a GPS + `gpmd` sample whose ONLY identity field is an EMPTY
+  /// `DVNM` (`Some("")`), followed by a real-identity `fdsc`: the empty sample
+  /// must NOT stamp a make-only `CameraInfo` that blocks the `fdsc` fallback.
+  /// The projection ends with BOTH the `fdsc` identity AND the `gpmd` GPS.
+  #[test]
+  fn timed_empty_dvnm_gpmd_does_not_block_fdsc_identity() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: a coordinate fix + an EMPTY DVNM (defined-but-empty).
+    let mut empty_id = GoProMeta::new();
+    empty_id.set_device_name(Some(SmolStr::default())); // DVNM = Some("")
+    let mut fix = GoProGpsSample::new();
+    fix
+      .set_latitude(Some(42.026625))
+      .set_longitude(Some(-129.294339))
+      .set_altitude_m(Some(9540.24));
+    empty_id.push_gps_sample(fix);
+    assert!(
+      !empty_id.is_empty(),
+      "an empty-DVNM + GPS meta is non-empty"
+    );
+    assert!(
+      !empty_id.has_camera_identity(),
+      "an empty DVNM carries no real identity"
+    );
+    timed.push_doc_sample(GoProDocSample::new(empty_id, 4, 1, Some(0.0), Some(1.0)));
+    // fdsc (GPRO) sample: the real camera identity (no GPS).
+    let mut fdsc = GoProFdscSample::new();
+    fdsc
+      .set_model(Some("HERO8 Black".into()))
+      .set_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01.01.20.00".into()));
+    assert!(fdsc.has_camera_identity());
+    timed.push_fdsc_sample(fdsc);
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    // The empty-DVNM sample no longer blocks identity: fdsc fills CameraInfo.
+    let cam = md
+      .camera()
+      .expect("fdsc identity projected past the empty-DVNM gpmd sample");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), Some("HD8.01.01.20.00"));
+    // ...and the GPS still comes from the gpmd coordinate sample.
+    let gps = md.gps().expect("gps from the empty-DVNM gpmd sample");
+    assert!((gps.latitude().unwrap() - 42.026625).abs() < 1e-9);
+    assert!((gps.longitude().unwrap() + 129.294339).abs() < 1e-9);
+    assert!((gps.altitude_m().unwrap() - 9540.24).abs() < 1e-6);
+  }
+
+  /// #211 R3/R4 — a GPS + `gpmd` sample whose ONLY identity field is an EMPTY
+  /// `MINF` (`Model` = `Some("")`), followed by a LATER real-identity `gpmd`
+  /// sample: identity is taken from the later sample (the empty-model sample
+  /// does not mask it with a make-only `CameraInfo`), while the GPS summarizes
+  /// from the FIRST coordinate-bearing sample.
+  #[test]
+  fn timed_empty_model_gpmd_does_not_block_later_gpmd_identity() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: a coordinate fix + an EMPTY Model (defined-but-empty).
+    let mut empty_id = GoProMeta::new();
+    empty_id.set_model(Some(SmolStr::default())); // MINF = Some("")
+    let mut fix = GoProGpsSample::new();
+    fix.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+    empty_id.push_gps_sample(fix);
+    assert!(
+      !empty_id.has_camera_identity(),
+      "an empty Model carries no real identity"
+    );
+    timed.push_doc_sample(GoProDocSample::new(empty_id, 4, 1, None, None));
+    // gpmd sample 2 (LATER): the real identity (and a later fix that must NOT
+    // win the GPS summary).
+    let mut identity = GoProMeta::new();
+    identity
+      .set_model(Some("HERO8 Black".into()))
+      .set_camera_serial_number(Some("C347".into()))
+      .set_firmware_version(Some("HD8.01".into()));
+    let mut later_fix = GoProGpsSample::new();
+    later_fix.set_latitude(Some(9.0)).set_longitude(Some(9.0));
+    identity.push_gps_sample(later_fix);
+    assert!(identity.has_camera_identity());
+    timed.push_doc_sample(GoProDocSample::new(identity, 4, 2, None, None));
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    // Identity comes from the LATER gpmd sample (the empty-model sample didn't
+    // mask it).
+    let cam = md
+      .camera()
+      .expect("later gpmd identity projected past the empty-model sample");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("HERO8 Black"));
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), Some("HD8.01"));
+    // GPS still summarizes from the FIRST coordinate-bearing sample.
+    let gps = md
+      .gps()
+      .expect("gps from the first coordinate-bearing sample");
+    assert_eq!(gps.latitude(), Some(1.0));
+    assert_eq!(gps.longitude(), Some(2.0));
+  }
+
+  /// #211 R3/R4 — the definitive class assertion: when EVERY timed sample's
+  /// identity is empty/absent (an empty-DVNM `gpmd` GPS sample + an all-empty
+  /// `fdsc` sample), NO `CameraInfo` is created at all, while the GPS still
+  /// projects. Proves no non-identity sample can produce a make-only stamp.
+  #[test]
+  fn timed_all_empty_identity_produces_no_camera_info() {
+    let mut timed = GoProTimedMeta::new();
+    let mut empty_id = GoProMeta::new();
+    empty_id.set_device_name(Some(SmolStr::default()));
+    let mut fix = GoProGpsSample::new();
+    fix.set_latitude(Some(3.0)).set_longitude(Some(4.0));
+    empty_id.push_gps_sample(fix);
+    timed.push_doc_sample(GoProDocSample::new(empty_id, 4, 1, None, None));
+    let mut empty_fdsc = GoProFdscSample::new();
+    empty_fdsc
+      .set_model(Some(SmolStr::default()))
+      .set_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()));
+    timed.push_fdsc_sample(empty_fdsc);
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    assert!(
+      md.camera().is_none(),
+      "no real identity anywhere → no make-only CameraInfo"
+    );
+    let gps = md
+      .gps()
+      .expect("gps still projects from the coordinate sample");
+    assert_eq!(gps.latitude(), Some(3.0));
+    assert_eq!(gps.longitude(), Some(4.0));
+  }
+
+  /// #211 R4-review — the PROJECTION complement of the empty-identity class: a
+  /// selected `gpmd` sample with an EMPTY `MINF` (`Model` = `Some("")`) but a
+  /// NON-EMPTY `DVNM` (`DeviceName`). `has_camera_identity` passes (DVNM is
+  /// real), so the sample is SELECTED — and the projection must fall through the
+  /// empty `Model` to the non-empty `DeviceName`, writing `DVNM` as the model
+  /// (NOT an empty-string model). The empty `Model` must never reach
+  /// `CameraInfo`, and the later real-identity sample is not needed.
+  #[test]
+  fn timed_empty_minf_nonempty_dvnm_projects_dvnm_as_model() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: an EMPTY MINF + a NON-EMPTY DVNM (+ a coordinate fix).
+    let mut first = GoProMeta::new();
+    first
+      .set_model(Some(SmolStr::default())) // MINF = Some("") — empty
+      .set_device_name(Some("GoPro Max".into())); // DVNM = real
+    let mut fix = GoProGpsSample::new();
+    fix.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+    first.push_gps_sample(fix);
+    assert!(
+      first.has_camera_identity(),
+      "a non-empty DVNM is a real identity even with an empty MINF"
+    );
+    timed.push_doc_sample(GoProDocSample::new(first, 4, 1, None, None));
+    // gpmd sample 2 (LATER): a DIFFERENT real identity that must NOT be reached
+    // (the first sample already carries real identity via DVNM).
+    let mut later = GoProMeta::new();
+    later
+      .set_model(Some("HERO8 Black".into()))
+      .set_camera_serial_number(Some("C347".into()));
+    timed.push_doc_sample(GoProDocSample::new(later, 4, 2, None, None));
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    let cam = md
+      .camera()
+      .expect("identity projected from the first sample");
+    assert_eq!(cam.make(), Some("GoPro"));
+    // The empty MINF falls through to the non-empty DVNM — NOT an empty model,
+    // and NOT the later sample's "HERO8 Black".
+    assert_eq!(
+      cam.model(),
+      Some("GoPro Max"),
+      "empty MINF must fall back to the non-empty DVNM"
+    );
+    // The first sample carried no serial/firmware → those stay absent (the
+    // later sample's serial is never reached).
+    assert_eq!(cam.serial(), None, "empty/absent serial is never written");
+    assert_eq!(
+      cam.software(),
+      None,
+      "empty/absent software is never written"
+    );
+  }
+
+  /// #211 R4-review — an EMPTY `MINF` + EMPTY `DVNM` (+ empty serial/firmware)
+  /// `gpmd` sample is NOT selected as identity (the projection complement of the
+  /// predicate): a LATER real-identity sample / `fdsc` fills `CameraInfo`. Proves
+  /// the empty-everything sample neither selects nor stamps an empty model.
+  #[test]
+  fn timed_empty_minf_empty_dvnm_not_selected_later_identity_wins() {
+    let mut timed = GoProTimedMeta::new();
+    // gpmd sample 1: EVERY identity field present-but-empty (+ a fix).
+    let mut empty = GoProMeta::new();
+    empty
+      .set_model(Some(SmolStr::default()))
+      .set_device_name(Some(SmolStr::default()))
+      .set_camera_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()));
+    let mut fix = GoProGpsSample::new();
+    fix.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+    empty.push_gps_sample(fix);
+    assert!(
+      !empty.has_camera_identity(),
+      "all-empty identity fields → not selected"
+    );
+    timed.push_doc_sample(GoProDocSample::new(empty, 4, 1, None, None));
+    // gpmd sample 2 (LATER): the real identity.
+    let mut later = GoProMeta::new();
+    later
+      .set_device_name(Some("GoPro Max".into()))
+      .set_camera_serial_number(Some("C999".into()));
+    timed.push_doc_sample(GoProDocSample::new(later, 4, 2, None, None));
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    let cam = md.camera().expect("later real identity fills CameraInfo");
+    assert_eq!(cam.make(), Some("GoPro"));
+    // DVNM fallback for the later sample (no MINF) → model is the DVNM value.
+    assert_eq!(cam.model(), Some("GoPro Max"));
+    assert_eq!(cam.serial(), Some("C999"));
+    // GPS still summarizes from the first coordinate-bearing sample.
+    let gps = md.gps().expect("gps from the first coordinate sample");
+    assert_eq!(gps.latitude(), Some(1.0));
+    assert_eq!(gps.longitude(), Some(2.0));
+  }
+
+  /// #211 R4-review — the FLAT `udta` projection complement (shared
+  /// `project_camera_into`): a flat `GoProMeta` with an EMPTY `MINF` + a
+  /// NON-EMPTY `DVNM` projects the `DeviceName` as the model, never an empty
+  /// string, and an all-empty identity writes NO `CameraInfo` (no make-only
+  /// stamp). Guards the udta path against the same class.
+  #[test]
+  fn project_camera_into_empty_minf_falls_back_to_dvnm_no_empty_write() {
+    // Empty MINF + non-empty DVNM → model is the DVNM.
+    let mut m = GoProMeta::new();
+    m.set_model(Some(SmolStr::default())) // empty MINF
+      .set_device_name(Some("GoPro Max".into()));
+    let mut md = MediaMetadata::new();
+    m.project_into(&mut md);
+    let cam = md.camera().expect("DVNM fallback projected");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), Some("GoPro Max"));
+    assert_eq!(cam.serial(), None);
+    assert_eq!(cam.software(), None);
+
+    // Every identity field empty (but other GPMF telemetry present so `is_empty`
+    // is false) → NO CameraInfo at all (no make-only stamp).
+    let mut all_empty = GoProMeta::new();
+    all_empty
+      .set_model(Some(SmolStr::default()))
+      .set_device_name(Some(SmolStr::default()))
+      .set_camera_serial_number(Some(SmolStr::default()))
+      .set_firmware_version(Some(SmolStr::default()))
+      .set_gps_date_time(Some("2024:01:01 00:00:00".into())); // non-identity field
+    assert!(!all_empty.is_empty(), "telemetry present → non-empty meta");
+    assert!(!all_empty.has_camera_identity());
+    let mut md2 = MediaMetadata::new();
+    all_empty.project_into(&mut md2);
+    assert!(
+      md2.camera().is_none(),
+      "all-empty identity must not stamp a make-only CameraInfo"
+    );
+
+    // An empty serial/firmware sibling beside a real DVNM is never written as an
+    // empty string.
+    let mut mixed = GoProMeta::new();
+    mixed
+      .set_device_name(Some("GoPro Max".into()))
+      .set_camera_serial_number(Some(SmolStr::default())) // empty CASN
+      .set_firmware_version(Some(SmolStr::default())); // empty FMWR
+    let mut md3 = MediaMetadata::new();
+    mixed.project_into(&mut md3);
+    let cam = md3.camera().expect("DVNM identity");
+    assert_eq!(cam.model(), Some("GoPro Max"));
+    assert_eq!(cam.serial(), None, "empty CASN is not written");
+    assert_eq!(cam.software(), None, "empty FMWR is not written");
+  }
+
+  /// #211 R4-review — the `fdsc` projection complement: a selected `fdsc` sample
+  /// with a NON-EMPTY serial but an EMPTY model (`Some("")`) must write the
+  /// serial WITHOUT an empty-string model (the `fdsc` fallback also goes through
+  /// `nonempty`). `fdsc` has no `DeviceName` fallback, so an empty model simply
+  /// stays absent.
+  #[test]
+  fn timed_fdsc_empty_model_nonempty_serial_writes_no_empty_model() {
+    let mut timed = GoProTimedMeta::new();
+    let mut fdsc = GoProFdscSample::new();
+    fdsc
+      .set_model(Some(SmolStr::default())) // empty model
+      .set_serial_number(Some("C347".into())) // real serial
+      .set_firmware_version(Some(SmolStr::default())); // empty firmware
+    assert!(
+      fdsc.has_camera_identity(),
+      "a non-empty serial is a real fdsc identity"
+    );
+    timed.push_fdsc_sample(fdsc);
+
+    let mut md = MediaMetadata::new();
+    timed.project_into(&mut md);
+
+    let cam = md.camera().expect("fdsc identity projected");
+    assert_eq!(cam.make(), Some("GoPro"));
+    assert_eq!(cam.model(), None, "empty fdsc model is never written");
+    assert_eq!(cam.serial(), Some("C347"));
+    assert_eq!(cam.software(), None, "empty fdsc firmware is never written");
   }
 }

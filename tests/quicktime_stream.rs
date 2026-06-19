@@ -732,6 +732,54 @@ fn quicktime_gopro_gpmf_projects_camera_and_gps_into_media_metadata() {
 }
 
 #[test]
+fn quicktime_gopro_hero8_timed_gpmd_projects_gps_into_media_metadata() {
+  // #211 finding 1 — REAL GoPro HERO8 file whose GPS lives ONLY in the timed
+  // `gpmd` track (`Track4:GPS*`, decoded into `GoProTimedMeta`); the `udta/GPMF`
+  // box carries camera identity but NO `GPS5`/`GPS9` (no `GoPro:GPSLatitude` in
+  // the default golden). The always-on `MediaMetadata` projection must still
+  // surface the timed GpsLocation — this is the product's actual output and was
+  // the regression the finding flagged. NOTE: the typed `GpsLocation` carries
+  // decimal degrees (the `GPS::ToDMS` PrintConv is deferred); the `-ee` golden's
+  // `42 deg 1' 35.85" N` / `129 deg 17' 39.62" W` / `9540.24 m` are the first fix.
+  let data = fixture("QuickTime_gopro_hero8_gpmf.mp4");
+  let meta = parse_quicktime(&data).expect("recognized");
+
+  // The flat `udta/GPMF` box surfaced camera identity but no GPS coordinates.
+  assert!(!meta.gopro().is_empty(), "udta/GPMF identity present");
+  assert!(
+    meta.gopro().first_fix().is_none(),
+    "the udta/GPMF box carries NO GPS5/GPS9 fix (GPS is only in the gpmd track)"
+  );
+  // The timed gpmd samples are accessible via the public accessor and carry GPS.
+  let timed = meta.gopro_timed();
+  assert!(!timed.is_empty(), "the gpmd timed samples decoded");
+  assert!(
+    timed.first_fix().is_some(),
+    "a timed gpmd sample carries a GPS coordinate fix"
+  );
+
+  // The always-on projection now surfaces the timed GPS (the finding-1 fix).
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("GoPro CameraInfo projected");
+  assert_eq!(cam.make(), Some("GoPro"));
+  let gps = md
+    .gps()
+    .expect("GpsLocation projected from the timed gpmd track");
+  // 42 deg 1' 35.85" N = 42.026625; 129 deg 17' 39.62" W = -129.294339.
+  assert!(
+    (gps.latitude().unwrap() - 42.026_625).abs() < 1e-4,
+    "lat {:?}",
+    gps.latitude()
+  );
+  assert!(
+    (gps.longitude().unwrap() + 129.294_339).abs() < 1e-4,
+    "lon {:?}",
+    gps.longitude()
+  );
+  assert!((gps.altitude_m().unwrap() - 9540.24).abs() < 1e-1);
+}
+
+#[test]
 fn quicktime_gopro_gpmf_emits_gopro_group_tags_speed_in_kph() {
   // SP4 — the golden `Meta::tags()` path emits the GoPro GPMF tags under
   // family-0/family-1 `GoPro` (the `%GoPro::GPMF`/`GPS5` tables,

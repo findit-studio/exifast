@@ -1508,7 +1508,7 @@ mod tests {
     // No MPC:* tags emitted (sv7_header is None). The format-tag entries
     // carry the `"<Group1>:<Name>"` keys; warnings live in their own
     // accumulator (`TagMap::warnings`).
-    assert!(w.entries().iter().all(|(_, g, _, _, _)| g != "MPC"));
+    assert!(w.entries().iter().all(|(_, _, g, _, _, _)| g != "MPC"));
     // The warning is pushed through write_warning ⇒ TagMap::warnings.
     assert_eq!(
       w.warnings(),
@@ -1723,7 +1723,7 @@ mod tests {
     let keys: std::vec::Vec<&str> = w
       .entries()
       .iter()
-      .map(|(_, g, _, _, _)| g.as_str())
+      .map(|(_, _, g, _, _, _)| g.as_str())
       .collect();
     let mpc_pos = keys.iter().position(|g| *g == "MPC");
     let ape_pos = keys.iter().position(|g| *g == "APE");

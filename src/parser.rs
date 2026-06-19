@@ -1047,6 +1047,7 @@ struct DocObject<'a> {
   obj: &'a serde_json::Map<String, serde_json::Value>,
   entries: &'a [(
     u32,
+    u32,
     smol_str::SmolStr,
     smol_str::SmolStr,
     u8,
@@ -1071,8 +1072,8 @@ impl serde::Serialize for DocObject<'_> {
     // `Doc<N>:`), skip any key already emitted by `obj` (first-wins), and
     // serialize the value straight through `TagValue::Serialize`.
     let mut key = String::new();
-    for (doc, group, name, _priority, value) in self.entries {
-      crate::serialize_key::group_key_into(&mut key, *doc, group, name, self.group_mode);
+    for (doc, doc_sub, group, name, _priority, value) in self.entries {
+      crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, self.group_mode);
       if self.obj.contains_key(key.as_str()) {
         continue;
       }

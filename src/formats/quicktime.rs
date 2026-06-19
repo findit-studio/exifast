@@ -60,8 +60,9 @@ use crate::{
   },
   metadata::{
     AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
-    GoProConv, GoProMeta, GoProTag, GoProTagValue, Insta360Meta, LigoGpsMeta, MediaTrack,
-    ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta, VisualSampleDesc,
+    GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta, LigoGpsMeta,
+    MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
+    VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -4057,6 +4058,13 @@ pub struct Meta<'a> {
   /// scan in `mdat` (see [`crate::formats::gopro`]). Empty
   /// ([`GoProMeta::is_empty`]) for a non-GoPro video.
   gopro: GoProMeta,
+  /// **SP4** — the GoPro `gpmd` + `fdsc` TIMED-metadata per-sample `Doc<N>`
+  /// sources (#211 / #189), decoded through the `gpmd` / `fdsc` MetaFormat
+  /// dispatch in [`quicktime_stream`]. Distinct from [`Self::gopro`] (the
+  /// always-on `moov/udta/GPMF` box emitted under `GoPro:`): these emit under
+  /// `Track<N>:` in `-ee` mode only. Empty ([`GoProTimedMeta::is_empty`]) for a
+  /// GoPro video whose data is only in the `udta/GPMF` box, or a non-GoPro one.
+  gopro_timed: GoProTimedMeta,
   /// **SP4** — Android Google CAMM (Camera Motion Metadata) — decoded
   /// through the `camm` MetaFormat dispatch in [`quicktime_stream`]. Empty
   /// ([`CammMeta::is_empty`]) for a non-Android video (or one whose CAMM
@@ -4228,6 +4236,19 @@ impl Meta<'_> {
     &self.gopro
   }
 
+  /// **SP4** — the GoPro `gpmd` + `fdsc` TIMED-metadata per-sample `Doc<N>`
+  /// sources (#211). Distinct from [`Self::gopro`] (the always-on `moov/udta/GPMF`
+  /// box emitted under `GoPro:`): these per-sample telemetry samples emit under
+  /// `Track<N>:` in `-ee` mode only, but their GPS / camera identity is folded
+  /// into the always-on [`crate::metadata::MediaMetadata`] projection.
+  /// [`GoProTimedMeta::is_empty`] for a GoPro video whose data is only in the
+  /// `udta/GPMF` box, or a non-GoPro one.
+  #[must_use]
+  #[inline(always)]
+  pub const fn gopro_timed(&self) -> &GoProTimedMeta {
+    &self.gopro_timed
+  }
+
   /// **SP4** — Android Google CAMM (Camera Motion Metadata).
   /// [`CammMeta::is_empty`] for a non-Android video (or one whose `camm`
   /// metadata track is absent).
@@ -4396,6 +4417,15 @@ impl Meta<'_> {
     // if a higher-priority source already populated the domain it would
     // write). GoPro on-device GNSS is the HIGHEST GPS tier.
     self.gopro.project_into(&mut md);
+    // **SP4** — the GoPro `gpmd` / `fdsc` TIMED-metadata samples (#211). SAME
+    // on-device-GNSS tier as the always-on `udta/GPMF` box above: a GoPro file
+    // whose GPS lives ONLY in the timed `gpmd` track (e.g. HERO8 — the `GPMF`
+    // box carries identity but no `GPS5`/`GPS9`) surfaces its `GpsLocation` (and
+    // camera identity) HERE. Set-once per domain, so it no-ops whenever the flat
+    // `GoProMeta` above already populated camera / GPS. Always-on (the normalized
+    // projection is the product's output); the per-sample timed TAG stream is
+    // still `-ee`-gated separately (see [`emit_gopro_doc`]).
+    self.gopro_timed.project_into(&mut md);
     // **SP2** — the `udta` / Keys camera identity, capture date and GPS. Sits
     // BELOW GoPro on-device telemetry but ABOVE the SP3 timed-metadata scan: it
     // is explicit container camera metadata. Keys (the iOS `mdta` ItemList) is
@@ -5042,6 +5072,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // by the brute-force `GP\x06\0\0` scan (some GoPro firmware writes
   // unreferenced GPMF records in `mdat` outside of a metadata track).
   let mut gopro_meta = GoProMeta::new();
+  // **SP4 — GoPro `gpmd`/`fdsc` timed `Doc<N>`** accumulator (#211/#189),
+  // populated by the `gpmd`/`fdsc` MetaFormat dispatch in [`quicktime_stream`].
+  // Additive to the per-format sample dispatch, like `camm_meta`.
+  let mut gopro_timed_meta = GoProTimedMeta::new();
   // **SP4 — Android CAMM**: the `camm` MetaFormat dispatch in
   // [`quicktime_stream`] populates `camm_meta` for each timed-metadata sample
   // whose track carries Google Camera Motion Metadata. Threaded ALONGSIDE the
@@ -5117,6 +5151,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     kodak_version,
     &mut stream,
     &mut gopro_meta,
+    &mut gopro_timed_meta,
     &mut camm_meta,
     &mut sony_rtmd_meta,
     &mut canon_ctmd_meta,
@@ -5392,6 +5427,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     qt,
     stream,
     gopro: gopro_meta,
+    gopro_timed: gopro_timed_meta,
     android_camm: camm_meta,
     sony_rtmd: sony_rtmd_meta,
     canon_ctmd: canon_ctmd_meta,
@@ -7491,6 +7527,20 @@ impl crate::emit::Taggable for Meta<'_> {
     // family-1 = `GoPro`; the JPEG `APP6` path reuses [`emit_gopro_tags`] with
     // the `APP6` family-0).
     emit_gopro_tags(&self.gopro, "GoPro", "GoPro", print_conv, &mut tags);
+
+    // ── SP4: GoPro `gpmd` + `fdsc` TIMED-metadata per-sample `Doc<N>` ───────
+    // (#211 / #189) Distinct from the always-on `udta/GPMF` box above: the
+    // `gpmd` track's per-sample GPMF + the `fdsc` track's identity emit under
+    // `Track<N>:` (family-1) in `-ee` mode ONLY — one `Doc<N>` per sample, the
+    // multi-row `GPS5`/`GPS9` rows split into `Doc<N>-<M>` (ProcessString,
+    // GoPro.pm:759-774), collapsed first-wins per `(Track<N>, name)` at `-G1`.
+    emit_gopro_doc(
+      &self.gopro_timed,
+      opts,
+      print_conv,
+      &mut first_seen,
+      &mut tags,
+    );
 
     // ── SP4: Android CAMM cross-kind `-G1` SampleTime/SampleDuration ────────
     // At `-ee -G1` the single `Track<N>:SampleTime`/`SampleDuration` is the timing
@@ -11494,6 +11544,436 @@ fn sony_rtmd_exposure_time_read_value(
   }
 }
 
+/// Emit the GoPro `gpmd` + `fdsc` TIMED-metadata per-sample `Doc<N>` sources
+/// (#211 / #189) under `Track<N>:`, in `-ee` mode ONLY. Each `gpmd`
+/// [`crate::metadata::GoProDocSample`] is one `DEVC` = one `Doc<N>`:
+///  - `Track<N>:SampleTime` / `Track<N>:SampleDuration` (the sample-table
+///    timing `ProcessSamples` emits ahead of the payload);
+///  - the per-`DEVC` [`GoProMeta`]'s main-group leaves (DeviceName, the sensor /
+///    settings streams, the GPS scalars `GPSMeasureMode`/`GPSDateTime`/
+///    `GPSHPositioningError`) via [`emit_gopro_main_group`];
+///  - the `GPS5`/`GPS9` ROWS: row 0 at `Doc<N>`, each subsequent row at the
+///    `ProcessString` two-level sub-document `Doc<N>-<M>` (GoPro.pm:759-774),
+///    each carrying `GPSLatitude`/`GPSLongitude`/`GPSAltitude`/`GPSSpeed`/
+///    `GPSSpeed3D` rendered with the `%GoPro::GPS5`/`GPS9` PrintConvs (lat/lon
+///    `ToDMS` + N/E hemisphere, altitude `"$val m"`, speed `$val * 3.6` km/h).
+///
+/// Each `fdsc` [`crate::metadata::GoProFdscSample`] is one `Doc<N>` carrying
+/// `SampleTime`/`SampleDuration` + the `GoPro::fdsc` identity fields.
+///
+/// At `-ee -G3` every `Doc<N>` / `Doc<N>-<M>` keeps its own group + payload; at
+/// `-ee -G1` the doc axis collapses to ONE row per `(Track<N>, name)`,
+/// first-wins (the shared `first_seen` gate over the doc-ORDERED walk), so the
+/// first sample's first GPS row + first sensor block survive — matching the
+/// `.ee.json` `-G1` golden. NOT gated by `-ee` → emits nothing at the default.
+#[cfg(feature = "alloc")]
+fn emit_gopro_doc<F: FnMut(&str, &str) -> bool>(
+  timed: &GoProTimedMeta,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  if !opts.extract_embedded {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+  // ExifTool's `%noDups` is PER TAG NAME, decided by which document OWNS a tag's
+  // primary key (ExifTool.pm:9514-9566) — NOT a single document-wide rule. Flush
+  // ONE sample's (= one `DEVC` = one `Doc<N>`) collected leaves under that
+  // mechanism, mirroring `HandleTag`/`FoundTag` exactly:
+  //   * The FIRST document to carry a `(family1, name)` key OWNS the primary slot
+  //     (`$$valueHash{$tag}`). Within THAT document a repeated key (the same tag
+  //     `HandleTag`'d once per `STRM` of the `DEVC`) overwrites the primary in
+  //     place — the existing key's `G3` equals the current `DOC_NUM`, so the
+  //     overwrite branch fires (ExifTool.pm:9565) ⇒ WITHIN-doc LAST-wins.
+  //   * A LATER document that repeats an ALREADY-OWNED key cannot overwrite (the
+  //     primary's `G3` is the earlier doc), so each `STRM` spawns a numbered copy
+  //     `$tag (N)` (ExifTool.pm:9514-9517); the FIRST copy is the one a `-G3`
+  //     `Doc<N>:Track<N>:` render keeps ⇒ WITHIN-doc FIRST-wins for that key in
+  //     that document, and at `-G1` the across-doc first-wins drops it entirely.
+  // So the within-doc rule is LAST-wins for a key whose primary THIS document
+  // owns (its FIRST-appearing document) and FIRST-wins for a key an EARLIER
+  // document already owns — tracked per key in `committed`. The prior code used a
+  // single `first_doc_collapsed` boolean (Doc1 last-wins, Doc2..N first-wins),
+  // which only matches when EVERY key first appears in Doc1 (it does for the
+  // hero8 fixture); it WRONGLY gave first-wins to a key that first appears in a
+  // LATER document (absent/truncated in Doc1), losing that document's real last
+  // `STRM` value. `committed` (the per-key owner set, mirroring the
+  // `camm`/`emit_timed_samples` `committed`) fixes that while preserving hero8.
+  //
+  // ACROSS documents (`-G1`): FIRST-document-wins, PER KEY — the file-wide
+  // `first_seen(family1, name)` gate (records each key on first sight, drops a
+  // later document's repeat). At `-G3` each `Doc<N>` is its own group, so the gate
+  // does not apply; the per-key within-doc collapse above is the only dedup and
+  // each `Doc<N>` keeps its own value.
+  let mut committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
+  let mut flush = |scratch: &mut std::vec::Vec<EmittedTag>,
+                   first_seen: &mut F,
+                   tags: &mut std::vec::Vec<EmittedTag>| {
+    // Collapse this DEVC to ONE value per `(family1, name)`, preserving
+    // first-occurrence ORDER. A key whose primary THIS document owns (not yet in
+    // `committed`) takes the LAST occurrence's value (within-doc last-wins); a key
+    // an EARLIER document already owns keeps its FIRST occurrence here (within-doc
+    // first-wins = the surviving numbered copy). Applied in BOTH modes.
+    let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+      std::vec::Vec::new();
+    for tag in scratch.drain(..) {
+      let key = (
+        smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+        smol_str::SmolStr::new(tag.tag().name()),
+      );
+      if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+        // Repeated key WITHIN this document: overwrite (last-wins) only when this
+        // document owns the key's primary; otherwise keep the first occurrence.
+        if !committed.contains(&key) {
+          slot.1 = tag;
+        }
+      } else {
+        doc_vals.push((key, tag));
+      }
+    }
+    // This document now OWNS every key it first carried — record them so a later
+    // document treats them as earlier-owned (first-wins). Done in BOTH modes (the
+    // `-G3` path has no `first_seen` gate to carry the ownership otherwise).
+    for (key, _) in &doc_vals {
+      if !committed.contains(key) {
+        committed.push(key.clone());
+      }
+    }
+    if g3 {
+      for (_key, tag) in doc_vals {
+        tags.push(tag);
+      }
+    } else {
+      for (_key, tag) in doc_vals {
+        if first_seen(tag.tag().group_ref().family1(), tag.tag().name()) {
+          tags.push(tag);
+        }
+      }
+    }
+  };
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  // ── gpmd `DEVC` samples ──────────────────────────────────────────────────
+  for s in timed.doc_samples() {
+    let ti = if s.track_index() == 0 {
+      1
+    } else {
+      s.track_index()
+    };
+    let track = std::format!("Track{ti}");
+    let doc = s.doc();
+    // The parent-`Doc<N>` group for the sample-timing + main-group leaves + the
+    // GPS5/GPS9 ROW 0 (`Doc<N>`); `-G1` collapses the doc to a plain `Track<N>`.
+    let parent = if g3 {
+      Group::with_doc("QuickTime", track.as_str(), doc)
+    } else {
+      Group::new("QuickTime", track.as_str())
+    };
+    scratch.clear();
+    // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw at `-n`).
+    for (val, name) in [
+      (s.sample_time(), "SampleTime"),
+      (s.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        scratch.push(EmittedTag::new(parent.clone(), name.into(), value, false));
+      }
+    }
+    // The main-group leaves of this DEVC (identity / settings / GPS scalars).
+    emit_gopro_main_group(s.meta(), &parent, print_conv, &mut scratch);
+    // The GPS5/GPS9 ROWS — ExifTool's `ProcessString` (GoPro.pm:749-774) keeps
+    // ROW 0 at the parent `DOC_NUM` (`Doc<N>`) and splits each SUBSEQUENT row
+    // into its OWN sub-document `Doc<N>-<M>`. Row 0's columns join this DEVC's
+    // `scratch` (so they share the within-doc last-wins + the parent `Doc<N>`);
+    // each later row is a DISTINCT document, flushed on its own — at `-G1` the
+    // across-doc `first_seen` then drops it (row 0 already committed
+    // `GPSLatitude`/… for this `Track<N>`, faithful first-doc-wins), at `-G3` it
+    // emits under its `Doc<N>-<M>` group.
+    let mut rows = s.meta().gps_samples().iter();
+    if let Some(row0) = rows.next() {
+      emit_gopro_gps_row(row0, &parent, print_conv, &mut scratch);
+    }
+    // Flush this DEVC's `Doc<N>` (main-group + GPS row 0) under the two-rule
+    // collapse before the sub-document rows (which are later documents).
+    flush(&mut scratch, first_seen, tags);
+    for (row_idx, fix) in rows.enumerate() {
+      // `enumerate()` here starts at 0 for the SECOND row, so the sub-document
+      // index is `row_idx + 1` (`Doc<N>-1`, `Doc<N>-2`, …). `row_idx + 1` fits
+      // u32 for any realistic GPS payload (u16 sample count); saturate for a
+      // pathological one.
+      let sub = u32::try_from(row_idx).unwrap_or(u32::MAX).saturating_add(1);
+      let group = if g3 {
+        Group::with_subdoc("QuickTime", track.as_str(), doc, sub)
+      } else {
+        Group::new("QuickTime", track.as_str())
+      };
+      scratch.clear();
+      emit_gopro_gps_row(fix, &group, print_conv, &mut scratch);
+      flush(&mut scratch, first_seen, tags);
+    }
+  }
+  // ── fdsc samples ─────────────────────────────────────────────────────────
+  for f in timed.fdsc_samples() {
+    let ti = if f.track_index() == 0 {
+      1
+    } else {
+      f.track_index()
+    };
+    let track = std::format!("Track{ti}");
+    let group = if g3 {
+      Group::with_doc("QuickTime", track.as_str(), f.doc())
+    } else {
+      Group::new("QuickTime", track.as_str())
+    };
+    scratch.clear();
+    for (val, name) in [
+      (f.sample_time(), "SampleTime"),
+      (f.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+    // `GoPro::fdsc` identity fields in table order (GoPro.pm:659-664).
+    for (val, name) in [
+      (f.firmware_version(), "FirmwareVersion"),
+      (f.serial_number(), "SerialNumber"),
+      (f.other_serial_number(), "OtherSerialNumber"),
+      (f.model(), "Model"),
+    ] {
+      if let Some(v) = val {
+        scratch.push(EmittedTag::new(
+          group.clone(),
+          name.into(),
+          TagValue::Str(v.into()),
+          false,
+        ));
+      }
+    }
+    flush(&mut scratch, first_seen, tags);
+  }
+}
+
+/// Emit one GoPro `GPS5`/`GPS9` ROW's value columns under `group` — the
+/// `%GoPro::GPS5`/`GPS9` PrintConvs (GoPro.pm:489-513/543-562): `GPSLatitude`/
+/// `GPSLongitude` via `GPS::ToDMS` + N/E hemisphere at `-j` (raw decimal at
+/// `-n`), `GPSAltitude` `"$val m"`, `GPSSpeed`/`GPSSpeed3D` `$val * 3.6` (km/h,
+/// a `ValueConv` so bare in BOTH modes). The `GPS9`-only `GPSDateTime`/`GPSDOP`/
+/// `GPSMeasureMode` columns are emitted when present (a `GPS5` row leaves them
+/// `None`). The block-level `GPSMeasureMode`/`GPSDateTime`/`GPSHPositioningError`
+/// (GPSF/GPSU/GPSP scalars) ride the main-group block, not here.
+#[cfg(feature = "alloc")]
+fn emit_gopro_gps_row(
+  fix: &crate::metadata::GoProGpsSample,
+  group: &crate::value::Group,
+  print_conv: bool,
+  scratch: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
+    let lat_v = if print_conv {
+      TagValue::Str(dms_signed(lat, 'N', 'S').into())
+    } else {
+      TagValue::F64(lat)
+    };
+    let lon_v = if print_conv {
+      TagValue::Str(dms_signed(lon, 'E', 'W').into())
+    } else {
+      TagValue::F64(lon)
+    };
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSLatitude".into(),
+      lat_v,
+      false,
+    ));
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSLongitude".into(),
+      lon_v,
+      false,
+    ));
+  }
+  if let Some(alt) = fix.altitude_m() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSAltitude".into(),
+      unit_suffix_value(alt, " m", print_conv),
+      false,
+    ));
+  }
+  // `GPSSpeed`/`GPSSpeed3D`: ValueConv `$val * 3.6` (m/s stored → km/h), no
+  // PrintConv ⇒ the same numeric value in `-j` and `-n`.
+  if let Some(spd) = fix.speed_2d_mps() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSSpeed".into(),
+      TagValue::F64(spd * 3.6),
+      false,
+    ));
+  }
+  if let Some(s3d) = fix.speed_3d_mps() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSSpeed3D".into(),
+      TagValue::F64(s3d * 3.6),
+      false,
+    ));
+  }
+  // GPS9-only columns (a GPS5 row leaves these `None`).
+  if let Some(dt) = fix.date_time() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSDateTime".into(),
+      TagValue::Str(dt.into()),
+      false,
+    ));
+  }
+  if let Some(dop) = fix.dop() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSDOP".into(),
+      TagValue::F64(dop),
+      false,
+    ));
+  }
+  if let Some(mode) = fix.measure_mode() {
+    scratch.push(EmittedTag::new(
+      group.clone(),
+      "GPSMeasureMode".into(),
+      gps_measure_mode_value(mode, print_conv),
+      false,
+    ));
+  }
+}
+
+/// Emit a [`GoProMeta`]'s MAIN-GROUP tags — the camera-identity fields, the
+/// generic table-driven settings, and the flat GPS / system scalars
+/// (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`) — under `group`, in GPMF-walk
+/// (first-occurrence) order ([`GoProMeta::main_group_order`]). Shared by the
+/// always-on `moov/udta/GPMF` path ([`emit_gopro_tags`], `group = GoPro:`) and
+/// the per-sample `gpmd` `Doc<N>` path ([`emit_gopro_doc`], `group =
+/// Doc<N>:Track<N>`). The per-sample GPS5/GPS9 ROW columns are NOT emitted here
+/// (they are the caller's `Doc<N>-<M>` ProcessString split) — only the
+/// scalar/identity/settings leaves a `DEVC`/`udta` GPMF directory carries.
+#[cfg(feature = "alloc")]
+fn emit_gopro_main_group(
+  gp: &GoProMeta,
+  group: &crate::value::Group,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::metadata::{GoProIdentity, GoProMainGroupTag, GoProScalar};
+  use crate::value::TagValue;
+  let str_value = |s: &str| TagValue::Str(s.into());
+  let emit_identity = |field: GoProIdentity, tags: &mut std::vec::Vec<EmittedTag>| {
+    let value = match field {
+      GoProIdentity::DeviceName => gp.device_name().map(str_value),
+      GoProIdentity::FirmwareVersion => gp.firmware_version().map(str_value),
+      GoProIdentity::CameraSerialNumber => gp.camera_serial_number().map(str_value),
+      GoProIdentity::Model => gp.model().map(str_value),
+      GoProIdentity::MediaUniqueID => gp.media_uid().map(|raw| media_uid_value(raw, print_conv)),
+    };
+    if let Some(v) = value {
+      tags.push(EmittedTag::new(
+        group.clone(),
+        field.as_str().into(),
+        v,
+        false,
+      ));
+    }
+  };
+  let emit_scalar = |field: GoProScalar, tags: &mut std::vec::Vec<EmittedTag>| {
+    let entry: Option<(&str, TagValue)> = match field {
+      GoProScalar::GpsDateTime => gp
+        .gps_date_time()
+        .map(|dt| ("GPSDateTime", TagValue::Str(dt.into()))),
+      GoProScalar::GpsMeasureMode => gp
+        .gps_measure_mode()
+        .map(|m| ("GPSMeasureMode", gps_measure_mode_value(m, print_conv))),
+      GoProScalar::GpsHPositioningError => gp
+        .gps_h_positioning_error_m()
+        .map(|e| ("GPSHPositioningError", TagValue::F64(e))),
+      GoProScalar::GpsAltitudeSystem => gp
+        .gps_altitude_system()
+        .map(|s| ("GPSAltitudeSystem", TagValue::Str(s.into()))),
+      GoProScalar::SystemTime => gp
+        .system_time()
+        .map(|st| ("SystemTime", TagValue::Str(st.into()))),
+    };
+    if let Some((name, value)) = entry {
+      tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+    }
+  };
+  let emit_generic = |idx: usize, tags: &mut std::vec::Vec<EmittedTag>| {
+    // A recorded index is always in range, but the `.get()` keeps the access
+    // checked (the file-wide indexing deny is honoured).
+    if let Some(gt) = gp.generic_tags().get(idx) {
+      tags.push(EmittedTag::new(
+        group.clone(),
+        gt.name().into(),
+        gopro_generic_value(gt, print_conv),
+        false,
+      ));
+    }
+  };
+  let recorded = gp.main_group_order();
+  if recorded.is_empty() {
+    // Fallback for an order-less hand-built meta: canonical identity order,
+    // then the GPS / system scalars, then the generic settings in their stored
+    // (push) order.
+    const CANONICAL: [GoProIdentity; 5] = [
+      GoProIdentity::DeviceName,
+      GoProIdentity::FirmwareVersion,
+      GoProIdentity::CameraSerialNumber,
+      GoProIdentity::Model,
+      GoProIdentity::MediaUniqueID,
+    ];
+    for field in CANONICAL {
+      emit_identity(field, tags);
+    }
+    const SCALARS: [GoProScalar; 5] = [
+      GoProScalar::GpsDateTime,
+      GoProScalar::GpsMeasureMode,
+      GoProScalar::GpsHPositioningError,
+      GoProScalar::GpsAltitudeSystem,
+      GoProScalar::SystemTime,
+    ];
+    for field in SCALARS {
+      emit_scalar(field, tags);
+    }
+    for idx in 0..gp.generic_tags().len() {
+      emit_generic(idx, tags);
+    }
+  } else {
+    // The faithful path: emit every main-group tag at its recorded walk
+    // position.
+    for entry in recorded {
+      match entry {
+        GoProMainGroupTag::Identity(field) => emit_identity(*field, tags),
+        GoProMainGroupTag::Scalar(field) => emit_scalar(*field, tags),
+        GoProMainGroupTag::Generic(idx) => emit_generic(*idx, tags),
+      }
+    }
+  }
+}
+
 /// Emit every default-visible `%GoPro::GPMF` tag a [`GoProMeta`] carries, under
 /// the group `(family0, family1)`, into `tags`. The faithful `HandleTag` stream
 /// of `ProcessGoPro` (GoPro.pm:846-896), shared by the QuickTime `GPMF` /
@@ -11559,95 +12039,7 @@ pub(crate) fn emit_gopro_tags(
   //
   // A hand-built [`GoProMeta`] with no recorded order (e.g. a test fixture)
   // falls back to the canonical identity → GPS-scalars → settings sequence.
-  {
-    use crate::metadata::{GoProIdentity, GoProMainGroupTag, GoProScalar};
-    let str_value = |s: &str| TagValue::Str(s.into());
-    let emit_identity = |field: GoProIdentity, tags: &mut std::vec::Vec<EmittedTag>| {
-      let value = match field {
-        GoProIdentity::DeviceName => gp.device_name().map(str_value),
-        GoProIdentity::FirmwareVersion => gp.firmware_version().map(str_value),
-        GoProIdentity::CameraSerialNumber => gp.camera_serial_number().map(str_value),
-        GoProIdentity::Model => gp.model().map(str_value),
-        GoProIdentity::MediaUniqueID => gp.media_uid().map(|raw| media_uid_value(raw, print_conv)),
-      };
-      if let Some(v) = value {
-        tags.push(EmittedTag::new(gpg(), field.as_str().into(), v, false));
-      }
-    };
-    let emit_scalar = |field: GoProScalar, tags: &mut std::vec::Vec<EmittedTag>| {
-      let entry: Option<(&str, TagValue)> = match field {
-        GoProScalar::GpsDateTime => gp
-          .gps_date_time()
-          .map(|dt| ("GPSDateTime", TagValue::Str(dt.into()))),
-        GoProScalar::GpsMeasureMode => gp
-          .gps_measure_mode()
-          .map(|m| ("GPSMeasureMode", gps_measure_mode_value(m, print_conv))),
-        GoProScalar::GpsHPositioningError => gp
-          .gps_h_positioning_error_m()
-          .map(|e| ("GPSHPositioningError", TagValue::F64(e))),
-        GoProScalar::GpsAltitudeSystem => gp
-          .gps_altitude_system()
-          .map(|s| ("GPSAltitudeSystem", TagValue::Str(s.into()))),
-        GoProScalar::SystemTime => gp
-          .system_time()
-          .map(|st| ("SystemTime", TagValue::Str(st.into()))),
-      };
-      if let Some((name, value)) = entry {
-        tags.push(EmittedTag::new(gpg(), name.into(), value, false));
-      }
-    };
-    let emit_generic = |idx: usize, tags: &mut std::vec::Vec<EmittedTag>| {
-      // A recorded index is always in range, but the `.get()` keeps the access
-      // checked (the file-wide indexing deny is honoured).
-      if let Some(gt) = gp.generic_tags().get(idx) {
-        tags.push(EmittedTag::new(
-          gpg(),
-          gt.name().into(),
-          gopro_generic_value(gt, print_conv),
-          false,
-        ));
-      }
-    };
-    let recorded = gp.main_group_order();
-    if recorded.is_empty() {
-      // Fallback for an order-less hand-built meta: canonical identity order,
-      // then the GPS / system scalars, then the generic settings in their stored
-      // (push) order.
-      const CANONICAL: [GoProIdentity; 5] = [
-        GoProIdentity::DeviceName,
-        GoProIdentity::FirmwareVersion,
-        GoProIdentity::CameraSerialNumber,
-        GoProIdentity::Model,
-        GoProIdentity::MediaUniqueID,
-      ];
-      for field in CANONICAL {
-        emit_identity(field, tags);
-      }
-      const SCALARS: [GoProScalar; 5] = [
-        GoProScalar::GpsDateTime,
-        GoProScalar::GpsMeasureMode,
-        GoProScalar::GpsHPositioningError,
-        GoProScalar::GpsAltitudeSystem,
-        GoProScalar::SystemTime,
-      ];
-      for field in SCALARS {
-        emit_scalar(field, tags);
-      }
-      for idx in 0..gp.generic_tags().len() {
-        emit_generic(idx, tags);
-      }
-    } else {
-      // The faithful path: emit every main-group tag at its recorded walk
-      // position.
-      for entry in recorded {
-        match entry {
-          GoProMainGroupTag::Identity(field) => emit_identity(*field, tags),
-          GoProMainGroupTag::Scalar(field) => emit_scalar(*field, tags),
-          GoProMainGroupTag::Generic(idx) => emit_generic(*idx, tags),
-        }
-      }
-    }
-  }
+  emit_gopro_main_group(gp, &gpg(), print_conv, tags);
   // ── first GPS5/GPS9 fix (summarized; full list via `Meta::gopro`) ──
   if let Some(fix) = gp.first_fix() {
     // GPSLatitude/GPSLongitude: the `GPS::ToDMS` PrintConv
@@ -18073,6 +18465,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18112,6 +18505,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18158,6 +18552,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta_a,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18190,6 +18585,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta_b,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18220,6 +18616,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18243,6 +18640,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -18266,6 +18664,7 @@ mod tests {
       None,
       &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta2,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -20844,5 +21243,154 @@ mod tests {
     assert_eq!(acc.audio_format(), Some("lpcm"));
     assert_eq!(acc.channels(), Some(2));
     assert_eq!(acc.sample_rate(), Some(44100.0));
+  }
+
+  /// #211 finding 2 — GoPro `%noDups` is PER `(family1, name)`, decided by which
+  /// document OWNS each key's primary slot, NOT one document-wide rule. A
+  /// multi-`STRM` DEVC repeats a tag under one `Doc<N>`; the WITHIN-document rule
+  /// is LAST-wins for the doc that OWNS the key (its first-appearing document) and
+  /// FIRST-wins for a doc that repeats an already-owned key. The prior
+  /// `first_doc_collapsed` boolean conflated this into "Doc1 last, Doc2..N first",
+  /// which is only right when every key first appears in Doc1; this exercises both
+  /// the bug it caused and the behavior it happened to get right.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn gopro_doc_nodups_is_per_key_not_document_wide() {
+    use crate::emit::{EmitOptions, EmittedTag};
+    use crate::metadata::{
+      GoProConv, GoProDocSample, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta,
+    };
+    use crate::value::TagValue;
+
+    let plain = |v: f64| GoProTagValue::Num(v);
+    // Doc1 (Track4): owns "Gamma" (= 10.0), "Alpha", and "Delta" (single STRM,
+    // 7.0) — but NOT "Beta".
+    let mut m1 = GoProMeta::new();
+    m1.push_generic_tag(GoProTag::new("Gamma".into(), plain(10.0), GoProConv::Plain));
+    m1.push_generic_tag(GoProTag::new("Alpha".into(), plain(1.0), GoProConv::Plain));
+    m1.push_generic_tag(GoProTag::new("Delta".into(), plain(7.0), GoProConv::Plain));
+    // Doc2 (Track4): "Beta" is OWNED HERE and appears in TWO STRMs (1.0 then 2.0)
+    // → within-doc last-wins ⇒ 2.0. "Delta" is ALREADY OWNED by Doc1 and repeats
+    // in TWO STRMs (100.0 then 200.0) → within-doc first-wins ⇒ 100.0 (the
+    // surviving numbered copy; the hero8 `PredominantHue` Doc2..N case). "Gamma"
+    // re-states (= 99.0) and must NOT win across docs.
+    let mut m2 = GoProMeta::new();
+    m2.push_generic_tag(GoProTag::new("Beta".into(), plain(1.0), GoProConv::Plain));
+    m2.push_generic_tag(GoProTag::new("Beta".into(), plain(2.0), GoProConv::Plain));
+    m2.push_generic_tag(GoProTag::new(
+      "Delta".into(),
+      plain(100.0),
+      GoProConv::Plain,
+    ));
+    m2.push_generic_tag(GoProTag::new(
+      "Delta".into(),
+      plain(200.0),
+      GoProConv::Plain,
+    ));
+    m2.push_generic_tag(GoProTag::new("Gamma".into(), plain(99.0), GoProConv::Plain));
+
+    let mut timed = GoProTimedMeta::new();
+    timed.push_doc_sample(GoProDocSample::new(m1, 4, 1, None, None));
+    timed.push_doc_sample(GoProDocSample::new(m2, 4, 2, None, None));
+
+    // ── `-G3`: each `Doc<N>` is its own group, so the per-key within-doc collapse
+    // is the only dedup; both Doc1 and Doc2 values survive under their own group.
+    let mut g3_keys: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+    let mut g3_seen = |grp: &str, name: &str| -> bool {
+      let key = smol_str::SmolStr::new(std::format!("{grp}:{name}"));
+      if g3_keys.contains(&key) {
+        return false;
+      }
+      g3_keys.push(key);
+      true
+    };
+    let mut g3 = std::vec::Vec::new();
+    emit_gopro_doc(
+      &timed,
+      EmitOptions::with_group_mode(
+        crate::emit::ConvMode::ValueConv,
+        true,
+        crate::serialize_key::GroupMode::G3,
+      ),
+      false,
+      &mut g3_seen,
+      &mut g3,
+    );
+    let g3_at = |doc: u32, name: &str| -> Option<f64> {
+      g3.iter()
+        .find(|t| t.tag().group_ref().doc() == doc && t.tag().name() == name)
+        .and_then(|t| match t.tag().value_ref() {
+          TagValue::F64(v) => Some(*v),
+          _ => None,
+        })
+    };
+    // Doc2 OWNS "Beta" → within-doc LAST-wins (2.0); Doc2 repeats Doc1-owned
+    // "Delta" → within-doc FIRST-wins (100.0, NOT 200.0). The latter is exactly
+    // the hero8 `Doc<N>:Track4:PredominantHue` first-`STRM`-wins behavior that a
+    // naive "always last-wins" would have regressed.
+    assert_eq!(
+      g3_at(2, "Beta"),
+      Some(2.0),
+      "Doc2 owns Beta: within-doc last"
+    );
+    assert_eq!(
+      g3_at(2, "Delta"),
+      Some(100.0),
+      "Doc2 repeats Doc1-owned Delta: within-doc FIRST-wins (numbered copy)"
+    );
+    assert_eq!(g3_at(1, "Delta"), Some(7.0));
+    assert_eq!(g3_at(1, "Gamma"), Some(10.0));
+    assert_eq!(
+      g3_at(2, "Gamma"),
+      Some(99.0),
+      "-G3 keeps each doc's own value"
+    );
+
+    // ── `-G1`: the file-wide first-wins gate collapses to one row per key.
+    let mut emitted_keys: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+    let mut first_seen = |grp: &str, name: &str| -> bool {
+      let key = smol_str::SmolStr::new(std::format!("{grp}:{name}"));
+      if emitted_keys.contains(&key) {
+        return false;
+      }
+      emitted_keys.push(key);
+      true
+    };
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+    emit_gopro_doc(
+      &timed,
+      EmitOptions::g1(crate::emit::ConvMode::ValueConv, true),
+      false,
+      &mut first_seen,
+      &mut tags,
+    );
+    let lookup = |name: &str| -> Option<f64> {
+      tags
+        .iter()
+        .find(|t| t.tag().name() == name)
+        .and_then(|t| match t.tag().value_ref() {
+          TagValue::F64(v) => Some(*v),
+          _ => None,
+        })
+    };
+    // "Beta" first appears (and is owned) in Doc2 with two STRMs → within-doc
+    // LAST-wins = 2.0 surfaces (the bug: the old boolean kept Doc2's FIRST = 1.0).
+    assert_eq!(
+      lookup("Beta"),
+      Some(2.0),
+      "a key first owned in Doc2 takes Doc2's within-doc LAST value, not its first"
+    );
+    // "Gamma"/"Delta" are owned by Doc1 → Doc1's value survives (first-doc-wins).
+    assert_eq!(lookup("Gamma"), Some(10.0), "across-doc first-wins per key");
+    assert_eq!(lookup("Delta"), Some(7.0));
+    assert_eq!(lookup("Alpha"), Some(1.0));
+    // Each key emits exactly once at -G1.
+    for name in ["Alpha", "Beta", "Gamma", "Delta"] {
+      assert_eq!(
+        tags.iter().filter(|t| t.tag().name() == name).count(),
+        1,
+        "-G1 collapses {name} to one row"
+      );
+    }
   }
 }

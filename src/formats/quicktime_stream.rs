@@ -1989,6 +1989,7 @@ fn process_samples(
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  gopro_timed_out: &mut crate::metadata::GoProTimedMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
@@ -2054,6 +2055,7 @@ fn process_samples(
       free_gps_state,
       out,
       gopro_out,
+      gopro_timed_out,
       camm_out,
       sony_rtmd_out,
       canon_ctmd_out,
@@ -2086,7 +2088,12 @@ fn decode_one_sample(
   create_date_raw: Option<u64>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
-  gopro_out: &mut crate::metadata::GoProMeta,
+  // The `gpmd` GoPro fallback now records per-sample `Doc<N>` into
+  // `gopro_timed_out` (not the flat `gopro_out`, which the `moov/udta/GPMF`
+  // path in `walk_moov` owns), so this sample-level dispatcher no longer
+  // touches the flat meta — kept in the signature for caller symmetry.
+  _gopro_out: &mut crate::metadata::GoProMeta,
+  gopro_timed_out: &mut crate::metadata::GoProTimedMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
@@ -2223,8 +2230,51 @@ fn decode_one_sample(
     // non-variant `gpmd` sample leave `FoundEmbedded` unset, and the later
     // brute-force `mdat` scan would emit extra GP6/freeGPS tags ExifTool skips.
     // So: extract via the walker, but report `true` UNCONDITIONALLY.
-    let _extracted = crate::formats::gopro::process_gopro(buff, gopro_out);
+    //
+    // **Per-sample `Doc<N>` (#211 / #189).** This `gpmd` sample is ONE `DEVC`
+    // container — ExifTool's `ProcessGP6` / `ProcessSamples` opens ONE
+    // `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` for it (GoPro.pm:794-797) and emits
+    // the decoded GPMF under `Track<N>:` (the `gpmd` `trak`'s `SET_GROUP1`,
+    // GoPro.pm:826-828), in `-ee` mode only. Decode this sample into its OWN
+    // [`GoProMeta`] (one DEVC's worth of leaves) and record it as a
+    // [`crate::metadata::GoProDocSample`] stamped with the global `Doc<N>`
+    // ordinal, the enclosing `Track<N>` index, and the sample-table timing —
+    // the emission ([`crate::formats::quicktime::emit_gopro_doc`]) gates it on
+    // `-ee`. This is SEPARATE from the always-on `moov/udta/GPMF` box (which
+    // stays in the flat `gopro_out` → `GoPro:`, processed without `-ee`); a
+    // `gpmd` track no longer pollutes the `GoPro:` group at the default (no-ee)
+    // output. `open_doc` bumps the SHARED global counter (so a `gpmd` `trak`
+    // after a `camm`/`mebx` `trak` continues the ordinal — #214).
+    let mut sample_meta = crate::metadata::GoProMeta::new();
+    let _extracted = crate::formats::gopro::process_gopro(buff, &mut sample_meta);
+    let doc = out.open_doc();
+    gopro_timed_out.push_doc_sample(crate::metadata::GoProDocSample::new(
+      sample_meta,
+      track_index,
+      doc,
+      sample.time,
+      sample.dur,
+    ));
     return true;
+  }
+  // The `fdsc` MetaFormat (QuickTimeStream.pl:213-218) — GoPro Hero5/6/8
+  // "frame description" timed metadata. ExifTool dispatches `ProcessBinaryData`
+  // on the `Image::ExifTool::GoPro::fdsc` table ONLY when the sample starts
+  // `GPRO` (`Condition => '$$valPt =~ /^GPRO/'`; other `fdsc` shapes `GP\x00` /
+  // `GP\x04` are not yet parsed by bundled). Like `gpmd` it emits under
+  // `Track<N>:` in `-ee` mode (one `Doc<N>` per sample). Returns `false`:
+  // `ProcessBinaryData` does NOT set `$$et{FoundEmbedded}` (only `ProcessGoPro`
+  // / a `gps `-box freeGPS decode do), so an `fdsc` track must not suppress the
+  // brute-force `mdat` scan.
+  if &track.meta_format == b"fdsc" {
+    if !buff.starts_with(b"GPRO") {
+      return false;
+    }
+    let mut fdsc = crate::formats::gopro::process_fdsc(buff);
+    let doc = out.open_doc();
+    fdsc.stamp(track_index, doc, sample.time, sample.dur);
+    gopro_timed_out.push_fdsc_sample(fdsc);
+    return false;
   }
   // The `camm` MetaFormat (QuickTimeStream.pl:251-309) — Google's Camera
   // Motion Metadata. Bundled dispatches by the int16u-LE packet-type at
@@ -2767,6 +2817,7 @@ pub(crate) fn extract_stream(
   kodak_version: Option<&str>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  gopro_timed_out: &mut crate::metadata::GoProTimedMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
@@ -2806,6 +2857,7 @@ pub(crate) fn extract_stream(
           &mut free_gps_state,
           &mut *out,
           gopro_out,
+          gopro_timed_out,
           camm_out,
           sony_rtmd_out,
           canon_ctmd_out,
@@ -3022,6 +3074,7 @@ fn walk_moov(
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  gopro_timed_out: &mut crate::metadata::GoProTimedMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
@@ -3060,6 +3113,7 @@ fn walk_moov(
             free_gps_state,
             out,
             gopro_out,
+            gopro_timed_out,
             camm_out,
             sony_rtmd_out,
             canon_ctmd_out,
@@ -3221,6 +3275,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3249,6 +3304,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3276,6 +3332,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3299,6 +3356,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3327,6 +3385,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3354,6 +3413,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3491,6 +3551,7 @@ mod tests {
         &mut free_gps_state,
         &mut out,
         &mut gopro,
+        &mut crate::metadata::GoProTimedMeta::new(),
         &mut camm,
         &mut sony,
         &mut canon,
@@ -3526,6 +3587,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3588,6 +3650,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3643,6 +3706,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3732,6 +3796,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3799,6 +3864,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3840,6 +3906,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3915,6 +3982,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3934,6 +4002,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -3994,6 +4063,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut camm,
       &mut sony,
       &mut canon,
@@ -4355,6 +4425,7 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     let mut free_gps_state = FreeGpsState::new();
     let mut gopro_out = crate::metadata::GoProMeta::new();
+    let mut gopro_timed_out = crate::metadata::GoProTimedMeta::new();
     let mut camm_out = crate::metadata::CammMeta::new();
     let mut sony_rtmd_out = crate::metadata::SonyRtmdMeta::new();
     let mut canon_ctmd_out = crate::metadata::CanonCtmdMeta::new();
@@ -4369,6 +4440,7 @@ mod tests {
       &mut free_gps_state,
       &mut out,
       &mut gopro_out,
+      &mut gopro_timed_out,
       &mut camm_out,
       &mut sony_rtmd_out,
       &mut canon_ctmd_out,
@@ -4975,7 +5047,18 @@ mod tests {
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut meta = QuickTimeStreamMeta::new();
     let found_embedded = extract_stream(
-      &data, None, None, &mut meta, &mut gp, &mut cm, &mut sr, &mut cc, &mut pr, &mut dj, &mut lg,
+      &data,
+      None,
+      None,
+      &mut meta,
+      &mut gp,
+      &mut crate::metadata::GoProTimedMeta::new(),
+      &mut cm,
+      &mut sr,
+      &mut cc,
+      &mut pr,
+      &mut dj,
+      &mut lg,
     );
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
@@ -5134,6 +5217,7 @@ mod tests {
       None,
       &mut meta,
       &mut gp,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
@@ -5239,6 +5323,7 @@ mod tests {
       None,
       &mut meta,
       &mut gp,
+      &mut crate::metadata::GoProTimedMeta::new(),
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
