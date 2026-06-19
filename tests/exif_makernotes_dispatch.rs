@@ -4228,6 +4228,25 @@ fn real_fixture_samsung_nx500_type2() {
     // only duplicate id (overwriting the earlier 0xa025 DigitalGain Crypt row);
     // plain int32u ⇒ the raw value 3791 (Codex R3).
     ("Samsung:HighlightLinearityLimit", "3791"),
+    // The decrypted Crypt leaves (#242) — `Samsung::Crypt` decrypts each with
+    // the captured 0xa020 EncryptionKey; the plaintext space-joined integers
+    // match bundled ExifTool byte-exact (real-input proof).
+    (
+      "Samsung:WB_RGGBLevelsUncorrected",
+      r#""6576 4096 4096 8608""#,
+    ),
+    ("Samsung:WB_RGGBLevelsAuto", r#""6576 4096 4096 8608""#),
+    ("Samsung:WB_RGGBLevelsBlack", r#""128 128 128 128""#),
+    (
+      "Samsung:ColorMatrix",
+      r#""436 -120 -60 -42 312 -14 2 -94 348""#,
+    ),
+    ("Samsung:CbCrMatrix", r#""233 235 -218 524""#),
+    ("Samsung:CbCrGain", r#""3359 3640""#),
+    (
+      "Samsung:ToneCurveSRGB",
+      r#""11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255""#,
+    ),
   ] {
     let got = map
       .get(key)
@@ -4240,17 +4259,16 @@ fn real_fixture_samsung_nx500_type2() {
     );
   }
 
-  // The deferred genuinely-Crypt leaves (RawConv => Samsung::Crypt) + the
-  // SubDirectory parent pointer must NOT leak a value. (0xa020 EncryptionKey and
-  // 0xa025 HighlightLinearityLimit are PLAIN leaves and ARE emitted — asserted
+  // The SubDirectory parent pointer must NOT leak a value (its members are
+  // surfaced separately, asserted above), and the still-deferred `Unknown => 1`
+  // Crypt rows (0xa048 RawData, 0xa050 Distortion) must be absent — ExifTool
+  // suppresses Unknown tags from default output. (The 16 emitted Crypt leaves +
+  // 0xa020 EncryptionKey + 0xa025 HighlightLinearityLimit ARE present — asserted
   // above; they are NOT in this absent set.)
   for absent in [
-    "Samsung:WB_RGGBLevelsAuto",
-    "Samsung:WB_RGGBLevelsUncorrected",
-    "Samsung:ColorMatrix",
-    "Samsung:CbCrGain",
-    "Samsung:ToneCurveSRGB",
     "Samsung:PictureWizard",
+    "Samsung:RawData",
+    "Samsung:Distortion",
   ] {
     assert!(
       !map.contains_key(absent),

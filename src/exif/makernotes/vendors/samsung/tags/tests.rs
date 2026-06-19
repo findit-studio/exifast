@@ -48,15 +48,29 @@ fn lookup_resolves_key_leaves() {
     Some(SamsungPrintConv::None)
   ));
   assert_eq!(lookup(0xa025).and_then(|t| t.sub_table()), None);
-  // The genuinely-Crypt rows (RawConv => Samsung::Crypt) + the deferred
-  // SubDirectory rows are NOT ported.
-  assert!(
-    lookup(0xa021).is_none(),
-    "WB_RGGBLevelsUncorrected (Crypt) must be deferred"
+  // The 16 emitted Crypt rows (RawConv => Samsung::Crypt, #242) ARE ported and
+  // carry a `crypt` directive; the deferred SubDirectory rows are NOT ported.
+  assert_eq!(
+    lookup(0xa021).map(|t| t.name()),
+    Some("WB_RGGBLevelsUncorrected")
   );
   assert!(
-    lookup(0xa030).is_none(),
-    "ColorMatrix (Crypt) must be deferred"
+    lookup(0xa021).and_then(|t| t.crypt()).is_some(),
+    "WB_RGGBLevelsUncorrected (Crypt) must carry a crypt directive"
+  );
+  assert_eq!(lookup(0xa030).map(|t| t.name()), Some("ColorMatrix"));
+  assert!(
+    lookup(0xa030).and_then(|t| t.crypt()).is_some(),
+    "ColorMatrix (Crypt) must carry a crypt directive"
+  );
+  // A plain leaf carries NO crypt directive.
+  assert!(lookup(0xa020).and_then(|t| t.crypt()).is_none());
+  // The Unknown=>1 Crypt rows (0xa048/0xa05x) stay DEFERRED (suppressed from
+  // default -j output) — not part of the 16.
+  assert!(lookup(0xa048).is_none(), "RawData (Unknown Crypt) deferred");
+  assert!(
+    lookup(0xa050).is_none(),
+    "Distortion (Unknown Crypt) deferred"
   );
   assert!(lookup(0x0011).is_none(), "OrientationInfo must be deferred");
   assert!(lookup(0x0035).is_none(), "PreviewIFD must be deferred");

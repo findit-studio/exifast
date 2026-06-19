@@ -61,5 +61,21 @@
   "Samsung:FNumber": 8.9,
   "Samsung:FocalLengthIn35mmFormat": "69 mm",
   "Samsung:EncryptionKey": "305 72 737 456 282 307 519 724 13 505 193",
-  "Samsung:HighlightLinearityLimit": 3791
+  "Samsung:WB_RGGBLevelsUncorrected": "6576 4096 4096 8608",
+  "Samsung:WB_RGGBLevelsAuto": "6576 4096 4096 8608",
+  "Samsung:WB_RGGBLevelsIlluminator1": "5280 4096 4096 9808",
+  "Samsung:WB_RGGBLevelsIlluminator2": "7312 4096 4096 5968",
+  "Samsung:HighlightLinearityLimit": 3791,
+  "Samsung:WB_RGGBLevelsBlack": "128 128 128 128",
+  "Samsung:ColorMatrix": "436 -120 -60 -42 312 -14 2 -94 348",
+  "Samsung:ColorMatrixSRGB": "378 -102 -20 -28 328 -44 8 -100 348",
+  "Samsung:ColorMatrixAdobeRGB": "244 36 -24 -26 320 -38 8 -72 320",
+  "Samsung:CbCrMatrixDefault": "256 0 0 256",
+  "Samsung:CbCrMatrix": "233 235 -218 524",
+  "Samsung:CbCrGainDefault": "3791 4024",
+  "Samsung:CbCrGain": "3359 3640",
+  "Samsung:ToneCurveSRGBDefault": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
+  "Samsung:ToneCurveAdobeRGBDefault": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
+  "Samsung:ToneCurveSRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
+  "Samsung:ToneCurveAdobeRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255"
 }]
