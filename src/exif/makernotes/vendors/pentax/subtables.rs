@@ -736,6 +736,29 @@ pub(crate) fn emit_lens_info(
     let f = 5.0 + ((raw ^ 0x07) as f64) / 2.0;
     push(out, "LensFStops", TagValue::F64(f));
   }
+  // 0.1: AutoAperture — `Mask => 0x01`; `Condition => 'not $$self{NewLensData}'`
+  // (`Pentax.pm:4395-4400`). The K10D uses the OLD 17-byte `LensData`
+  // (`NewLensData` structurally false here), so the leaf emits. Direct hash
+  // `{ 0 => 'On', 1 => 'Off' }`.
+  if let Some(v) = b(0) {
+    let raw = mask(i64::from(v), 0x01);
+    push(
+      out,
+      "AutoAperture",
+      hash(print_conv, raw, printconv::AUTO_APERTURE),
+    );
+  }
+  // 0.2: MinAperture — `Mask => 0x06` (>>1); `Condition => 'not $$self{NewLensData}'`
+  // (`Pentax.pm:4402-4412`). Direct hash (`{ 0 => 22, 1 => 32, 2 => 45, 3 => 16 }`,
+  // numeric-string labels render as JSON numbers).
+  if let Some(v) = b(0) {
+    let raw = mask(i64::from(v), 0x06);
+    push(
+      out,
+      "MinAperture",
+      hash(print_conv, raw, printconv::LENS_MIN_APERTURE),
+    );
+  }
   // 3: MinFocusDistance — `Mask => 0xf8` (>>3); PrintConv HASH (the masked code →
   // a range string), `-n` ⇒ the raw masked value (`Pentax.pm:4434-4467`).
   if let Some(v) = b(3) {
@@ -744,6 +767,15 @@ pub(crate) fn emit_lens_info(
       out,
       "MinFocusDistance",
       hash(print_conv, raw, printconv::MIN_FOCUS_DISTANCE),
+    );
+  }
+  // 3.1: FocusRangeIndex — `Mask => 0x07`; direct hash (`Pentax.pm:4469-4482`).
+  if let Some(v) = b(3) {
+    let raw = mask(i64::from(v), 0x07);
+    push(
+      out,
+      "FocusRangeIndex",
+      hash(print_conv, raw, printconv::FOCUS_RANGE_INDEX),
     );
   }
   // 9: LensFocalLength — `Condition => '$$self{Model} !~ /645Z/'`
@@ -798,6 +830,39 @@ pub(crate) fn emit_lens_info(
         TagValue::F64(f)
       },
     );
+  }
+  // 14.1: MaxAperture — `Mask => 0x7f`; `RawConv => '$val > 1 ? $val : undef'`;
+  // `ValueConv => '2**(($val-1)/32)'`; PrintConv `sprintf("%.1f", $val)`
+  // (`Pentax.pm:4557-4567`). `Condition => '$$self{Model} ne "K-5"'`
+  // (`Pentax.pm:4559`) — the gate is `ne` against the BARE literal `"K-5"`, an
+  // EXACT-string compare (NOT a `=~ /K-5/` regex). `$$self{Model}` is the full
+  // IFD0 Model (e.g. `"PENTAX K10D"`, `"PENTAX K-5"`) — never the bare `"K-5"`
+  // (contrast `Pentax.pm:5148` which keys on the full `"PENTAX K-3 II"`), so a
+  // real PENTAX K-5 body (model `"PENTAX K-5"`) STILL passes `ne "K-5"` and
+  // emits; the suppression fires only for a model that is exactly `"K-5"`. A
+  // faithful 1:1 port must replicate this exact-equality quirk — a substring /
+  // regex match here would wrongly suppress the real `"PENTAX K-5"`. The K10D
+  // `LensData` is the OLD 17-byte layout (no `NewLensDataHook` +1 shift, which
+  // fires only for `NewLensData`), so MaxAperture sits at `LensData` byte 14.
+  // The `RawConv` drops a raw value <= 1 (a sentinel meaning "n/a") — then
+  // NOTHING is emitted for this leaf.
+  if let Some(v) = b(14) {
+    let raw = mask(i64::from(v), 0x7f);
+    // `raw > 1` is the `RawConv` "n/a" drop; `model != Some("K-5")` is the
+    // `Condition => '$$self{Model} ne "K-5"'` exact-equality gate. Both must
+    // hold for the single emission.
+    if raw > 1 && model != Some("K-5") {
+      let f = 2.0_f64.powf((raw as f64 - 1.0) / 32.0);
+      push(
+        out,
+        "MaxAperture",
+        if print_conv {
+          fixed1_print(f)
+        } else {
+          TagValue::F64(f)
+        },
+      );
+    }
   }
 }
 
@@ -1017,6 +1082,419 @@ pub(crate) fn emit_camera_info(
   // int32u value is emitted as an integer for both -j and -n.
   if let Some(v) = be_u32(block, 16) {
     push(out, "InternalSerialNumber", int_value(i64::from(v)));
+  }
+}
+
+/// Decode `%Pentax::SRInfo` (`0x005c`) for the `$count == 4` variant
+/// (`Pentax.pm:3172-3228`). A `count != 4` entry (the 2-byte K-3 `SRInfo2`
+/// variant) emits NOTHING (the scope-fence). `block` is the verbatim 4-byte
+/// on-disk record; `count` is the IFD entry COUNT; `print_conv` selects `-j`/`-n`.
+pub(crate) fn emit_sr_info(
+  block: &[u8],
+  count: usize,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // `Condition => '$count == 4'` (`Pentax.pm:2260`) — the SRInfo (vs SRInfo2)
+  // variant gate.
+  if count != 4 {
+    return;
+  }
+  let b = |i: usize| block.get(i).copied();
+
+  // 0: SRResult — `{ 0 => 'Not stabilized', BITMASK => { 0 => 'Stabilized',
+  // 6 => 'Not ready' } }`.
+  if let Some(v) = b(0) {
+    push(
+      out,
+      "SRResult",
+      bitmask0(
+        print_conv,
+        i64::from(v),
+        "Not stabilized",
+        printconv::SR_RESULT_BITS,
+      ),
+    );
+  }
+  // 1: ShakeReduction — direct hash.
+  if let Some(v) = b(1) {
+    push(
+      out,
+      "ShakeReduction",
+      hash(print_conv, i64::from(v), printconv::SHAKE_REDUCTION),
+    );
+  }
+  // 2: SRHalfPressTime — `$val / 60`; PrintConv `sprintf("%.2f s", $val) .
+  // ($val > 254.5/60 ? " or longer" : "")`.
+  if let Some(v) = b(2) {
+    let secs = f64::from(v) / 60.0;
+    push(
+      out,
+      "SRHalfPressTime",
+      if print_conv {
+        let mut t = std::format!("{secs:.2} s");
+        if secs > 254.5 / 60.0 {
+          t.push_str(" or longer");
+        }
+        TagValue::Str(SmolStr::from(t))
+      } else {
+        TagValue::F64(secs)
+      },
+    );
+  }
+  // 3: SRFocalLength — `$val & 0x01 ? $val * 4 : $val / 2`; PrintConv `"$val mm"`.
+  if let Some(v) = b(3) {
+    let n = i64::from(v);
+    let fl = if n & 0x01 != 0 {
+      (n * 4) as f64
+    } else {
+      n as f64 / 2.0
+    };
+    push(
+      out,
+      "SRFocalLength",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!(
+          "{} mm",
+          crate::value::format_g(fl, 15)
+        )))
+      } else {
+        TagValue::F64(fl)
+      },
+    );
+  }
+}
+
+/// `sprintf("%d (%.1fV, %d%%)", $val, $val*8.18/186, ($val-empty)*100/range)` —
+/// the shared K10D `BodyBatteryADNoLoad` / `BodyBatteryADLoad` PrintConv
+/// (`Pentax.pm:4854`/`:4898`, differing only in the empty/range constants).
+/// `int(...)` truncates toward zero for the `%d` percent field.
+fn battery_ad_print(val: i64, empty: f64, range: f64) -> SmolStr {
+  let volts = val as f64 * 8.18 / 186.0;
+  let pct = ((val as f64 - empty) * 100.0 / range).trunc() as i64;
+  SmolStr::from(std::format!("{val} ({volts:.1}V, {pct}%)"))
+}
+
+/// Decode `%Pentax::BatteryInfo` (`0x0216`, `Pentax.pm:4757-4989`) — a BigEndian
+/// `ProcessBinaryData` record. The Main `0x0216` row is UNCONDITIONAL (no
+/// `$count` gate), but EVERY leaf is `$$self{Model}`-gated and several offsets
+/// hold an ENTIRELY DIFFERENT tag/format per model (offset 2 is the K10D-family
+/// `BodyBatteryADNoLoad` int8u byte but the K-x/K-5/K-r/K-3 etc.
+/// `BodyBatteryVoltage1` int16u; offset 4 likewise `GripBatteryADNoLoad` vs
+/// `BodyBatteryVoltage2`; the K-3 Mark III re-lays the whole record). So each
+/// leaf is emitted ONLY for the exact `$$self{Model}` regex its ExifTool
+/// variant carries; any other model emits NOTHING at that offset — never the
+/// K10D byte-layout reinterpreted as a foreign model's int16u voltage (the
+/// scope-fence). The non-K10D-fixtured voltage/percent variants are DEFERRED
+/// (see the #173 follow-up issue).
+///
+/// `block` is the verbatim on-disk record; `model` is the parent
+/// `$$self{Model}`; `print_conv` selects `-j`/`-n`. The K10D `BatteryInfo` is 6
+/// bytes (offsets 0-5); the K-3III/K-5/K-r-only offsets 6/8/16/17/18 are out of
+/// range AND model-gated out, so they never emit. The default element format is
+/// `int8u`; the K10D leaves are all single bytes.
+pub(crate) fn emit_battery_info(
+  block: &[u8],
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // The exact `$$self{Model}` regexes from the BatteryInfo table, per offset.
+  let is_k3iii = is_k3_mark_iii(model);
+  let body_state_k10d = is_body_state_k10d(model); // offset 1.1 variant A
+  let grip_state_k10d = is_grip_state_k10d(model); // offset 1.2
+  let body_ad_pc = is_body_ad_printconv(model); // offset 2/3 PrintConv variant (A)
+  let body_ad_noload_raw = is_body_ad_noload_raw(model); // offset 2 raw variant (B)
+  let body_ad_load_raw = is_body_ad_load_raw(model); // offset 3 raw variant (B)
+  let grip_ad_noload = is_grip_ad_noload(model); // offset 4
+  let grip_ad_load = is_grip_ad_load(model); // offset 5
+  let b = |i: usize| block.get(i).copied();
+
+  // 0.1: PowerSource (mask 0x0f) — `Condition => '$$self{Model} !~ /K-3 Mark
+  // III/'` (`Pentax.pm:4767-4779`). The K-3III variant (a DIFFERENT 3-entry
+  // hash) + the K-3III-only `0.2 PowerAvailable` are DEFERRED ⇒ for a K-3III the
+  // leaf emits nothing here.
+  if !is_k3iii {
+    if let Some(v) = b(0) {
+      push(
+        out,
+        "PowerSource",
+        hash(
+          print_conv,
+          mask(i64::from(v), 0x0f),
+          printconv::POWER_SOURCE,
+        ),
+      );
+    }
+  }
+  // 1.1: BodyBatteryState (mask 0xf0) — variant A
+  // `/(\*ist|K100D|K200D|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (the 4-entry hash,
+  // `Pentax.pm:4806-4815`); the K10D matches this FIRST arm. Variant B (the
+  // 5-entry 'Close to Full' hash for most other models) is DEFERRED, so a
+  // model matching only variant B emits nothing here (never variant A's labels).
+  if body_state_k10d {
+    if let Some(v) = b(1) {
+      push(
+        out,
+        "BodyBatteryState",
+        hash(
+          print_conv,
+          mask(i64::from(v), 0xf0),
+          printconv::BODY_BATTERY_STATE_K10D,
+        ),
+      );
+    }
+  }
+  // 1.2: GripBatteryState (mask 0x0f) — `/(K10D|GX10|K20D|GX20)\b/` only
+  // (`Pentax.pm:4833`).
+  if grip_state_k10d {
+    if let Some(v) = b(1) {
+      push(
+        out,
+        "GripBatteryState",
+        hash(
+          print_conv,
+          mask(i64::from(v), 0x0f),
+          printconv::GRIP_BATTERY_STATE_K10D,
+        ),
+      );
+    }
+  }
+  // 2: BodyBatteryADNoLoad — variant A `/(K10D|GX10|K20D|GX20)\b/` (the int8u
+  // byte WITH the `%d (%.1fV, %d%%)` PrintConv, `Pentax.pm:4848-4856`); variant
+  // B `/(\*ist|K100D|K200D|GX-1[LS]?)\b/` (the same byte, NO PrintConv ⇒ raw).
+  // For any OTHER model offset 2 is `BodyBatteryVoltage1` (int16u, `$val/100`)
+  // or the K-3III `BodyBatteryState` — a DIFFERENT tag/format, DEFERRED ⇒ emit
+  // nothing here (never the byte mis-read).
+  if let Some(v) = b(2) {
+    let n = i64::from(v);
+    if body_ad_pc {
+      push(
+        out,
+        "BodyBatteryADNoLoad",
+        if print_conv {
+          TagValue::Str(battery_ad_print(n, 155.0, 35.0))
+        } else {
+          int_value(n)
+        },
+      );
+    } else if body_ad_noload_raw {
+      push(out, "BodyBatteryADNoLoad", int_value(n));
+    }
+  }
+  // 3: BodyBatteryADLoad — variant A `/(K10D|GX10|K20D|GX20)\b/` (PrintConv,
+  // `Pentax.pm:4893-4899`); variant B `/(\*ist|K100D|K200D)\b/` (raw). Other
+  // models: `BodyBatteryPercent` (K-3III) or nothing — DEFERRED.
+  if let Some(v) = b(3) {
+    let n = i64::from(v);
+    if body_ad_pc {
+      push(
+        out,
+        "BodyBatteryADLoad",
+        if print_conv {
+          TagValue::Str(battery_ad_print(n, 152.0, 34.0))
+        } else {
+          int_value(n)
+        },
+      );
+    } else if body_ad_load_raw {
+      push(out, "BodyBatteryADLoad", int_value(n));
+    }
+  }
+  // 4: GripBatteryADNoLoad — `/(\*ist|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (no
+  // PrintConv ⇒ raw int, `Pentax.pm:4913-4916`). Other models: `BodyBatteryVoltage2`
+  // (int16u) / `BodyBatteryVoltage` (K-3III int32u) — DEFERRED.
+  if grip_ad_noload {
+    if let Some(v) = b(4) {
+      push(out, "GripBatteryADNoLoad", int_value(i64::from(v)));
+    }
+  }
+  // 5: GripBatteryADLoad — `/(\*ist|K10D|GX10|K20D|GX20)\b/` (no PrintConv,
+  // `Pentax.pm:4936-4940`).
+  if grip_ad_load {
+    if let Some(v) = b(5) {
+      push(out, "GripBatteryADLoad", int_value(i64::from(v)));
+    }
+  }
+}
+
+/// `true` when `model` matches `/K-3 Mark III/` (a plain substring — ExifTool's
+/// regex has no anchor/`\b`) — the gate that DESELECTS every non-K-3III
+/// BatteryInfo variant and SELECTS the deferred K-3III re-layout.
+fn is_k3_mark_iii(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.contains("K-3 Mark III"))
+}
+
+/// `true` for the BatteryInfo `1.1 BodyBatteryState` variant A
+/// `/(\*ist|K100D|K200D|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (`Pentax.pm:4807`).
+fn is_body_state_k10d(model: Option<&str>) -> bool {
+  model_matches_any(
+    model,
+    &[
+      "*ist", "K100D", "K200D", "K10D", "GX10", "K20D", "GX20", "GX-1L", "GX-1S", "GX-1",
+    ],
+  )
+}
+
+/// `true` for the BatteryInfo `1.2 GripBatteryState` / `2`/`3`
+/// `BodyBatteryAD*` PrintConv variant model regex `/(K10D|GX10|K20D|GX20)\b/`
+/// (`Pentax.pm:4833`/`:4850`/`:4895`).
+fn is_grip_state_k10d(model: Option<&str>) -> bool {
+  model_matches_any(model, &["K10D", "GX10", "K20D", "GX20"])
+}
+
+/// `true` for the BatteryInfo `2`/`3` `BodyBatteryADNoLoad`/`ADLoad` PrintConv
+/// variant (A) `/(K10D|GX10|K20D|GX20)\b/`.
+fn is_body_ad_printconv(model: Option<&str>) -> bool {
+  model_matches_any(model, &["K10D", "GX10", "K20D", "GX20"])
+}
+
+/// `true` for the BatteryInfo `2 BodyBatteryADNoLoad` raw variant (B)
+/// `/(\*ist|K100D|K200D|GX-1[LS]?)\b/` (`Pentax.pm:4860`).
+fn is_body_ad_noload_raw(model: Option<&str>) -> bool {
+  model_matches_any(model, &["*ist", "K100D", "K200D", "GX-1L", "GX-1S", "GX-1"])
+}
+
+/// `true` for the BatteryInfo `3 BodyBatteryADLoad` raw variant (B)
+/// `/(\*ist|K100D|K200D)\b/` (`Pentax.pm:4904`).
+fn is_body_ad_load_raw(model: Option<&str>) -> bool {
+  model_matches_any(model, &["*ist", "K100D", "K200D"])
+}
+
+/// `true` for the BatteryInfo `4 GripBatteryADNoLoad`
+/// `/(\*ist|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (`Pentax.pm:4915`).
+fn is_grip_ad_noload(model: Option<&str>) -> bool {
+  model_matches_any(
+    model,
+    &[
+      "*ist", "K10D", "GX10", "K20D", "GX20", "GX-1L", "GX-1S", "GX-1",
+    ],
+  )
+}
+
+/// `true` for the BatteryInfo `5 GripBatteryADLoad`
+/// `/(\*ist|K10D|GX10|K20D|GX20)\b/` (`Pentax.pm:4938`).
+fn is_grip_ad_load(model: Option<&str>) -> bool {
+  model_matches_any(model, &["*ist", "K10D", "GX10", "K20D", "GX20"])
+}
+
+/// `true` when `model` contains any of `needles` followed by a `\b` word
+/// boundary (Perl `\b` after the token; the model strings are ASCII). The `*ist`
+/// token has no trailing word char in practice, so a plain substring suffices
+/// for it; for the alphanumeric body tokens the trailing-boundary check avoids a
+/// false `K10D` match inside e.g. `K10DX` (no such model exists, but faithful).
+fn model_matches_any(model: Option<&str>, needles: &[&str]) -> bool {
+  let Some(m) = model else {
+    return false;
+  };
+  for &needle in needles {
+    let mut from = 0;
+    while let Some(rel) = m.get(from..).and_then(|sub| sub.find(needle)) {
+      let start = from + rel;
+      let end = start + needle.len();
+      let boundary_ok = m
+        .get(end..)
+        .and_then(|sub| sub.chars().next())
+        .is_none_or(|c| !is_word_char(c));
+      if boundary_ok {
+        return true;
+      }
+      from = end;
+    }
+  }
+  false
+}
+
+/// Read a BigEndian `int16u` at byte offset `at` in `block`, or `None` past the
+/// end. `%Pentax::AFInfo` declares `ByteOrder => 'BigEndian'`
+/// (`Pentax.pm:2987`).
+#[inline]
+fn be_i16(block: &[u8], at: usize) -> Option<i16> {
+  let end = at.checked_add(2)?;
+  match block.get(at..end) {
+    Some(&[a, b]) => Some(i16::from_be_bytes([a, b])),
+    _ => None,
+  }
+}
+
+/// Decode `%Pentax::AFInfo` (`0x021f`, `Pentax.pm:4992-...`) — a BigEndian
+/// `ProcessBinaryData` record. The Main `0x021f` row is UNCONDITIONAL, but the
+/// `0x0b AFPointsInFocus` leaf is `$$self{Model}`-gated. Emits AFPredictor
+/// (int16s @ 4), AFDefocus (int8u @ 6), AFIntegrationTime (@ 7) and — only for
+/// the `/(K-(1|3|70|S1|S2)|KP)\b/`-EXCLUDING models — AFPointsInFocus (@ 11).
+/// The two `Unknown => 1` AFPointsUnknown1/2 (int16u @ 0/2) are suppressed
+/// without `-U`; the K-3III-only leaves (offsets 0x14+) are model-gated out.
+/// `model` is the parent `$$self{Model}`.
+pub(crate) fn emit_af_info(
+  block: &[u8],
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let b = |i: usize| block.get(i).copied();
+
+  // 0x00 AFPointsUnknown1 / 0x02 AFPointsUnknown2 — `Unknown => 1` (suppressed).
+  // 0x04: AFPredictor — int16s (BigEndian), no conv.
+  if let Some(n) = be_i16(block, 4) {
+    push(out, "AFPredictor", int_value(i64::from(n)));
+  }
+  // 0x06: AFDefocus — int8u, no conv.
+  if let Some(v) = b(6) {
+    push(out, "AFDefocus", int_value(i64::from(v)));
+  }
+  // 0x07: AFIntegrationTime — `$val * 2`; PrintConv `"$val ms"`.
+  if let Some(v) = b(7) {
+    let n = i64::from(v) * 2;
+    push(
+      out,
+      "AFIntegrationTime",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{n} ms")))
+      } else {
+        int_value(n)
+      },
+    );
+  }
+  // 0x0b: AFPointsInFocus — `Condition => '$$self{Model} !~ /(K-(1|3|70|S1|S2)|KP)\b/'`
+  // (`Pentax.pm:5070`). The K-1/K-3/K-70/KP/K-S1/S2 models have NO `0x0b`
+  // definition that matches ⇒ ExifTool emits nothing there; the K10D matches the
+  // EXCLUDING gate, so it emits the 21-entry hash. Suppressing for the excluded
+  // models avoids flattening this hash onto a record that has no such tag.
+  if !is_af_points_in_focus_excluded(model) {
+    if let Some(v) = b(11) {
+      push(
+        out,
+        "AFPointsInFocus",
+        hash(print_conv, i64::from(v), printconv::AF_POINTS_IN_FOCUS),
+      );
+    }
+  }
+}
+
+/// `true` when `model` matches the AFPointsInFocus EXCLUSION regex
+/// `/(K-(1|3|70|S1|S2)|KP)\b/` (`Pentax.pm:5070`) — i.e. the K-1, K-3, K-70,
+/// K-S1, K-S2 or KP, for which the `0x0b AFPointsInFocus` leaf is NOT defined.
+/// `K-3` here also matches `K-3 II` / `K-3 Mark III` via the `\b` after `K-3`
+/// (a space is a non-word char), exactly as the Perl regex does.
+fn is_af_points_in_focus_excluded(model: Option<&str>) -> bool {
+  model_matches_any(model, &["K-1", "K-3", "K-70", "K-S1", "K-S2", "KP"])
+}
+
+/// Decode `%Pentax::ColorInfo` (`0x0222`, `Pentax.pm:5258-5270`) — a
+/// `ProcessBinaryData` record with `FORMAT => 'int8s'`. UNCONDITIONAL. Emits the
+/// two white-balance-shift leaves WBShiftAB (@ 16) and WBShiftGM (@ 17), both
+/// signed bytes with no conv.
+pub(crate) fn emit_color_info(
+  block: &[u8],
+  _print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // FORMAT => 'int8s' — read each leaf as a signed byte.
+  if let Some(v) = block.get(16) {
+    push(out, "WBShiftAB", int_value(i64::from(*v as i8)));
+  }
+  if let Some(v) = block.get(17) {
+    push(out, "WBShiftGM", int_value(i64::from(*v as i8)));
   }
 }
 

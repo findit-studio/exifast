@@ -8872,8 +8872,9 @@ fn makernotes_nikon_d2hs_conformance() {
 }
 #[test]
 fn makernotes_pentax_k10d_conformance() {
-  // Pentax.jpg (K10D) — the Pentax-MakerNote conformance backstop (#262). The 99
-  // ported `Pentax:*` tags emit byte-identically to bundled ExifTool 13.59: the
+  // Pentax.jpg (K10D) — the Pentax-MakerNote conformance backstop (#262, #173).
+  // The 141 ported `Pentax:*` tags emit byte-identically to bundled ExifTool
+  // 13.59: the
   // Phase-1 camera-indexing leaves + the `0x003f LensRec` → `LensType`
   // SubDirectory child (`LensType` = "Sigma or Tamron Lens (3 44)",
   // `PentaxModelID` = "K10D", `Quality` = "Better", `FNumber` = 13.0, the
@@ -8887,16 +8888,25 @@ fn makernotes_pentax_k10d_conformance() {
   // and `FlashInfo` 0x0208 (`$count == 27`: FlashStatus "Off", InternalFlashMode
   // "Did not fire, Wireless (Master)", the TTL_DA quad).
   //
-  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
-  // exifast does NOT emit — every exclusion is a still-deferred Phase-2b/2c port
-  // (the `%Pentax::Main` long-tail: LensInfo 0x0207 / CameraInfo 0x0215 /
-  // BatteryInfo 0x0216 / AFInfo 0x021f / SRInfo, the encrypted ShutterCount
-  // 0x005d, the model-/count-conditional FocusMode/AFPoint/ExposureCompensation/
-  // PictureMode/DriveMode/FlashMode Main leaves, the `IsOffset => 2`
-  // PreviewImageStart/PreviewImage pointers) — OR a documented engine-wide
-  // deferral (Composite:all — no EXIF Composite subsystem; IFD1:ThumbnailImage +
-  // PrintIM:PrintIMVersion — the same gaps the Nikon golden excludes). None masks
-  // a faithfulness gap in the ported subset. The JPEG SOF `File:*` dimension tags
+  // #173 adds the remaining `%Pentax::Main` long-tail: the model-/count-/format-
+  // conditional + array-PrintConv Main leaves (FlashMode 0x000c, FocusMode 0x000d,
+  // AFPointSelected 0x000e, ExposureCompensation 0x0016, AutoBracketing 0x0018,
+  // FocalLength 0x001d, EffectiveLV 0x002d, ImageEditing 0x0032, PictureMode
+  // 0x0033, DriveMode 0x0034, FlashExposureComp 0x004d, RawDevelopmentProcess
+  // 0x0062), the XOR-decrypted ShutterCount 0x005d (`CryptShutterCount` with the
+  // Date/Time DataMembers), the four binary SubDirectory tables ShakeReductionInfo
+  // 0x005c (SRInfo) / BatteryInfo 0x0216 / AFInfo 0x021f / ColorInfo 0x0222, and
+  // the four extra `%Pentax::LensData` leaves (AutoAperture, MinAperture,
+  // FocusRangeIndex, MaxAperture) inside the already-ported LensInfo2 0x0207.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping only the
+  // tags exifast does NOT emit: the `IsOffset => 2` PreviewImageStart 0x0004 +
+  // its DataTag PreviewImage (which need the maker-note original-base offset-
+  // rebase + binary-extraction subsystem, not yet ported) — OR a documented
+  // engine-wide deferral (Composite:all — no EXIF Composite subsystem;
+  // IFD1:ThumbnailImage + PrintIM:PrintIMVersion — the same gaps the Nikon golden
+  // excludes). None masks a faithfulness gap in the ported subset. The JPEG SOF
+  // `File:*` dimension tags
   // (#261/#263) ARE part of this golden. The APP0 JFIF tags (`JFIF:JFIFVersion`/
   // `ResolutionUnit`/`X`/`YResolution`) are NOW EMITTED (the #114 JFIF port,
   // `src/exif/jpeg_app.rs`) — no longer excluded; the golden carries them
@@ -8922,17 +8932,22 @@ fn pentax_avi_conformance() {
   // `$size > 20` `AEFlags` Hook shifts offsets 8+ by one) leaves emit too; the
   // K-x carries no `$count == 27` FlashInfo, so none is decoded (the scope-fence).
   //
-  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
-  // tags exifast does NOT emit — every exclusion is a still-deferred port (the
-  // `%Pentax::Main` long-tail the K10D `Pentax.jpg` golden also drops: LensInfo
-  // 0x0207 / CameraInfo 0x0215 / SRInfo, the size-24-only AEInfo leaves
-  // AEWhiteBalance/AEMeteringMode2/LevelIndicator, the model-/count-conditional
-  // DriveMode/PictureMode/ExposureCompensation/FocusMode Main leaves, the
-  // ExtenderStatus/Hue/SerialNumber/FirmwareVersion long-tail) OR the
-  // engine-wide Composite deferral (Composite:LensID/ImageSize/Megapixels/
-  // Duration — no EXIF Composite subsystem). None masks a faithfulness gap in
-  // the ported subset; the diff carries NO tag exifast emits that bundled does
-  // not.
+  // #173 adds the K-x-applicable long-tail leaves the K10D `Pentax.jpg` golden
+  // also gained: ExposureCompensation/PictureMode/DriveMode (Main), the SRInfo
+  // 0x005c quartet, the LensData AutoAperture/MinAperture/FocusRangeIndex/
+  // MaxAperture, and the ColorInfo WBShiftAB/WBShiftGM. (The K-x carries no
+  // BatteryInfo/AFInfo record, and no FlashMode/FocusMode/EffectiveLV/ShutterCount
+  // Main leaves, so none of those decode here.)
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping only the
+  // tags exifast does NOT emit — every remaining exclusion is a still-deferred
+  // port: the size-24-only AEInfo leaves AEWhiteBalance/AEMeteringMode2/
+  // LevelIndicator, the K-x-only ColorInfo leaves Hue/HighLowKeyAdj/
+  // MonochromeFilterEffect/MonochromeToning/CrossProcess, the ExtenderStatus/
+  // SerialNumber/Artist/Copyright/FirmwareVersion long-tail — OR the engine-wide
+  // Composite deferral (Composite:LensID/ImageSize/Megapixels/Duration — no EXIF
+  // Composite subsystem). None masks a faithfulness gap in the ported subset; the
+  // diff carries NO tag exifast emits that bundled does not.
   check("Pentax.avi", "Pentax.avi.json", true);
   check("Pentax.avi", "Pentax.avi.n.json", false);
 }
