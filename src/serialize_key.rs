@@ -26,6 +26,7 @@ pub(crate) enum GroupMode {
 pub(crate) fn group_key_into(
   buf: &mut String,
   doc: u32,
+  doc_sub: u32,
   family1: &str,
   name: &str,
   mode: GroupMode,
@@ -33,7 +34,14 @@ pub(crate) fn group_key_into(
   use core::fmt::Write;
   buf.clear();
   if matches!(mode, GroupMode::G3) && doc != 0 {
-    let _ = write!(buf, "Doc{doc}:");
+    // The GoPro GPMF `ProcessString` per-row split renders `Doc<N>-<M>`
+    // (GoPro.pm:759-774) for `doc_sub > 0`; every other source has `doc_sub ==
+    // 0` and renders the ordinary `Doc<N>`.
+    if doc_sub != 0 {
+      let _ = write!(buf, "Doc{doc}-{doc_sub}:");
+    } else {
+      let _ = write!(buf, "Doc{doc}:");
+    }
   }
   buf.reserve(family1.len() + 1 + name.len());
   buf.push_str(family1);
@@ -44,9 +52,15 @@ pub(crate) fn group_key_into(
 /// Owned-`String` convenience for callers that need to keep the token (e.g. a
 /// dedup `BTreeSet`). Allocates one `String`; prefer [`group_key_into`] in a loop.
 #[cfg(feature = "alloc")]
-pub(crate) fn group_key(doc: u32, family1: &str, name: &str, mode: GroupMode) -> String {
+pub(crate) fn group_key(
+  doc: u32,
+  doc_sub: u32,
+  family1: &str,
+  name: &str,
+  mode: GroupMode,
+) -> String {
   let mut key = String::new();
-  group_key_into(&mut key, doc, family1, name, mode);
+  group_key_into(&mut key, doc, doc_sub, family1, name, mode);
   key
 }
 
@@ -56,20 +70,41 @@ mod tests {
   #[test]
   fn g1_collapses_doc_g3_prefixes_doc() {
     assert_eq!(
-      group_key(0, "QuickTime", "GPSLatitude", GroupMode::G1),
+      group_key(0, 0, "QuickTime", "GPSLatitude", GroupMode::G1),
       "QuickTime:GPSLatitude"
     );
     assert_eq!(
-      group_key(2, "QuickTime", "GPSLatitude", GroupMode::G1),
+      group_key(2, 0, "QuickTime", "GPSLatitude", GroupMode::G1),
       "QuickTime:GPSLatitude"
     );
     assert_eq!(
-      group_key(0, "QuickTime", "TimeScale", GroupMode::G3),
+      group_key(0, 0, "QuickTime", "TimeScale", GroupMode::G3),
       "QuickTime:TimeScale"
     );
     assert_eq!(
-      group_key(1, "QuickTime", "GPSLatitude", GroupMode::G3),
+      group_key(1, 0, "QuickTime", "GPSLatitude", GroupMode::G3),
       "Doc1:QuickTime:GPSLatitude"
+    );
+  }
+
+  /// The GoPro GPMF `ProcessString` per-row split: `doc_sub > 0` renders the
+  /// two-level `Doc<N>-<M>` at `-G3`, and is collapsed away at `-G1` (the doc
+  /// axis is dropped entirely).
+  #[test]
+  fn g3_subdoc_renders_two_level() {
+    assert_eq!(
+      group_key(1, 2, "Track4", "GPSLatitude", GroupMode::G3),
+      "Doc1-2:Track4:GPSLatitude"
+    );
+    // `doc_sub == 0` is the ordinary parent `Doc<N>`.
+    assert_eq!(
+      group_key(1, 0, "Track4", "GPSLatitude", GroupMode::G3),
+      "Doc1:Track4:GPSLatitude"
+    );
+    // `-G1` collapses the whole doc axis, sub-doc included.
+    assert_eq!(
+      group_key(1, 2, "Track4", "GPSLatitude", GroupMode::G1),
+      "Track4:GPSLatitude"
     );
   }
 }

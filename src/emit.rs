@@ -238,7 +238,14 @@ pub(crate) fn run_emission<T: Taggable>(
     // rule (`ExifTool.pm:9544-9560`).
     let priority = e.priority();
     let (group, name, value) = e.into_tag().into_parts();
-    let _ = out.write_value_doc(group.doc(), group.family1(), name.as_str(), priority, value);
+    let _ = out.write_value_doc(
+      group.doc(),
+      group.doc_sub(),
+      group.family1(),
+      name.as_str(),
+      priority,
+      value,
+    );
   }
 }
 

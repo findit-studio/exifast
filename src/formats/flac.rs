@@ -2413,7 +2413,7 @@ mod tests {
     let names: Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(_, g, n, _, _)| (g == "FLAC").then_some(n.as_str()))
+      .filter_map(|(_, _, g, n, _, _)| (g == "FLAC").then_some(n.as_str()))
       .filter(|n| n.starts_with("Picture"))
       .collect();
     assert_eq!(
@@ -2822,7 +2822,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(_, g, n, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
+        .any(|(_, _, g, n, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 tags present in the engine output"
     );
   }

@@ -1718,8 +1718,8 @@ const _: () = {
       // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
       let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (doc, group, name, _priority, value) in entries {
-        crate::serialize_key::group_key_into(&mut key, *doc, group, name, group_mode);
+      for (doc, doc_sub, group, name, _priority, value) in entries {
+        crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, group_mode);
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {

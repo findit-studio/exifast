@@ -108,12 +108,12 @@ pub(crate) struct TagMap {
   /// never collides with the same `family1:name` in another document. The
   /// stored `priority` is the SURVIVING entry's priority, so a later same-key
   /// duplicate is compared against the value that currently occupies the slot.
-  entries: Vec<(u32, SmolStr, SmolStr, u8, TagValue)>,
+  entries: Vec<(u32, u32, SmolStr, SmolStr, u8, TagValue)>,
   /// `(doc, family1, name) → index into `entries`` for O(1) dedup. The key
   /// clones the two short `SmolStr`s (inline for ≤23 bytes — no heap), so the
   /// dedup probe never builds the `"g:n"` string the old design allocated per
   /// insert. The leading `doc` keeps per-sub-document tags distinct.
-  index: HashMap<(u32, SmolStr, SmolStr), usize>,
+  index: HashMap<(u32, u32, SmolStr, SmolStr), usize>,
   warnings: Vec<String>,
   errors: Vec<String>,
 }
@@ -165,7 +165,15 @@ impl TagMap {
   /// therefore both ride the in-stream `tags()` path so their FoundTag order is
   /// faithful (the survivor is whichever the walk reached FIRST). Pinned by the
   /// `Matroska_warning_collision*.mkv` goldens.
-  fn insert(&mut self, doc: u32, group: &str, name: &str, priority: u8, value: TagValue) {
+  fn insert(
+    &mut self,
+    doc: u32,
+    doc_sub: u32,
+    group: &str,
+    name: &str,
+    priority: u8,
+    value: TagValue,
+  ) {
     // O(1) dedup on the `(doc, family1, name)` TRIPLE — no `"g:n"` string is
     // built here (it is materialized once per surviving entry at serialization).
     // The probe key clones the two `SmolStr`s; tag groups + names are short
@@ -186,23 +194,24 @@ impl TagMap {
     } else {
       priority
     };
-    let key = (doc, SmolStr::new(group), SmolStr::new(name));
+    let key = (doc, doc_sub, SmolStr::new(group), SmolStr::new(name));
     if let Some(&idx) = self.index.get(&key) {
       // ExifTool's general rule: a NEW duplicate overrides the stored entry IFF
       // its effective priority is non-zero AND `>=` the stored (`>= 1`) priority
       // (`ExifTool.pm:9544-9560`). A `Priority => 0` duplicate never overrides.
-      let stored_priority = self.entries[idx].3;
+      let stored_priority = self.entries[idx].4;
       if effective_priority != 0 && effective_priority >= stored_priority {
-        self.entries[idx].3 = effective_priority;
-        self.entries[idx].4 = value;
+        self.entries[idx].4 = effective_priority;
+        self.entries[idx].5 = value;
       }
       return;
     }
     let idx = self.entries.len();
     self.entries.push((
       key.0,
-      key.1.clone(),
+      key.1,
       key.2.clone(),
+      key.3.clone(),
       effective_priority,
       value,
     ));
@@ -235,7 +244,7 @@ impl TagMap {
     name: &str,
     value: &str,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, 1, TagValue::Str(value.into()));
+    self.insert(0, 0, group, name, 1, TagValue::Str(value.into()));
     Ok(())
   }
 
@@ -247,7 +256,7 @@ impl TagMap {
     name: &str,
     value: u64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, 1, TagValue::U64(value));
+    self.insert(0, 0, group, name, 1, TagValue::U64(value));
     Ok(())
   }
 
@@ -259,7 +268,7 @@ impl TagMap {
     name: &str,
     value: i64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, 1, TagValue::I64(value));
+    self.insert(0, 0, group, name, 1, TagValue::I64(value));
     Ok(())
   }
 
@@ -271,7 +280,7 @@ impl TagMap {
     name: &str,
     value: f64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, 1, TagValue::F64(value));
+    self.insert(0, 0, group, name, 1, TagValue::F64(value));
     Ok(())
   }
 
@@ -287,7 +296,7 @@ impl TagMap {
   ) -> Result<(), Infallible> {
     let mut s = String::new();
     let _ = f(&mut s); // in-memory String write cannot fail
-    self.insert(0, group, name, 1, TagValue::Str(s.into()));
+    self.insert(0, 0, group, name, 1, TagValue::Str(s.into()));
     Ok(())
   }
 
@@ -306,7 +315,7 @@ impl TagMap {
   ) -> Result<(), Infallible> {
     // The non-`-ee` value path: Main document (`doc == 0`), ExifTool's default
     // duplicate `Priority => 1` (`ExifTool.pm:9553`).
-    self.insert(0, group, name, 1, value);
+    self.insert(0, 0, group, name, 1, value);
     Ok(())
   }
 
@@ -320,12 +329,13 @@ impl TagMap {
   pub(crate) fn write_value_doc(
     &mut self,
     doc: u32,
+    doc_sub: u32,
     group: &str,
     name: &str,
     priority: u8,
     value: TagValue,
   ) -> Result<(), Infallible> {
-    self.insert(doc, group, name, priority, value);
+    self.insert(doc, doc_sub, group, name, priority, value);
     Ok(())
   }
 
@@ -349,7 +359,7 @@ impl TagMap {
   /// is dedup bookkeeping the consumers ignore. Slice view of the backing `Vec`
   /// (§3: never expose `&Vec<T>`).
   #[inline(always)]
-  pub(crate) const fn entries(&self) -> &[(u32, SmolStr, SmolStr, u8, TagValue)] {
+  pub(crate) const fn entries(&self) -> &[(u32, u32, SmolStr, SmolStr, u8, TagValue)] {
     self.entries.as_slice()
   }
 
@@ -376,8 +386,8 @@ impl TagMap {
   /// emitted. Uses the O(1) dedup index.
   #[cfg(test)]
   pub(crate) fn get(&self, group: &str, name: &str) -> Option<&TagValue> {
-    let key = (0u32, SmolStr::new(group), SmolStr::new(name));
-    self.index.get(&key).map(|&idx| &self.entries[idx].4)
+    let key = (0u32, 0u32, SmolStr::new(group), SmolStr::new(name));
+    self.index.get(&key).map(|&idx| &self.entries[idx].5)
   }
 
   /// `true` if no tags / warnings / errors were emitted (test-only).
@@ -428,16 +438,20 @@ mod tests {
   #[test]
   fn tagmap_dedup_is_doc_aware() {
     let mut m = TagMap::new();
-    m.write_value_doc(1, "QuickTime", "GPSLatitude", 1, TagValue::F64(47.0))
+    m.write_value_doc(1, 0, "QuickTime", "GPSLatitude", 1, TagValue::F64(47.0))
       .unwrap();
-    m.write_value_doc(2, "QuickTime", "GPSLatitude", 1, TagValue::F64(-33.0))
+    m.write_value_doc(2, 0, "QuickTime", "GPSLatitude", 1, TagValue::F64(-33.0))
       .unwrap();
-    m.write_value_doc(0, "QuickTime", "TimeScale", 1, TagValue::U64(600))
+    m.write_value_doc(0, 0, "QuickTime", "TimeScale", 1, TagValue::U64(600))
       .unwrap();
-    m.write_value_doc(0, "QuickTime", "TimeScale", 1, TagValue::U64(1000))
+    m.write_value_doc(0, 0, "QuickTime", "TimeScale", 1, TagValue::U64(1000))
       .unwrap();
     assert_eq!(m.entries().len(), 3);
-    let doc2 = m.entries().iter().filter(|(d, _, _, _, _)| *d == 2).count();
+    let doc2 = m
+      .entries()
+      .iter()
+      .filter(|(d, _, _, _, _, _)| *d == 2)
+      .count();
     assert_eq!(doc2, 1);
   }
 
@@ -449,50 +463,50 @@ mod tests {
   fn tagmap_priority_dedup_general_rule() {
     // (a) Higher priority OVERRIDES the lower (2 >= 1, non-zero) ⇒ last wins.
     let mut m = TagMap::new();
-    m.insert(0, "G", "P", 1, TagValue::U64(1));
-    m.insert(0, "G", "P", 2, TagValue::U64(2));
+    m.insert(0, 0, "G", "P", 1, TagValue::U64(1));
+    m.insert(0, 0, "G", "P", 2, TagValue::U64(2));
     assert_eq!(m.get("G", "P"), Some(&TagValue::U64(2)));
 
     // (a') ...and the SURVIVING priority is the higher one, so a later
     // priority-1 duplicate can NOT override it (1 >= 2 is false).
-    m.insert(0, "G", "P", 1, TagValue::U64(3));
+    m.insert(0, 0, "G", "P", 1, TagValue::U64(3));
     assert_eq!(m.get("G", "P"), Some(&TagValue::U64(2)));
 
     // (b) A priority-0 duplicate NEVER overrides (0 != 0 is false) ⇒ first wins.
     let mut m = TagMap::new();
-    m.insert(0, "G", "Q", 1, TagValue::U64(10));
-    m.insert(0, "G", "Q", 0, TagValue::U64(99));
+    m.insert(0, 0, "G", "Q", 1, TagValue::U64(10));
+    m.insert(0, 0, "G", "Q", 0, TagValue::U64(99));
     assert_eq!(m.get("G", "Q"), Some(&TagValue::U64(10)));
 
     // (b') Two priority-0 entries: neither overrides (`0 != 0` is false), so the
     // first-extracted wins — the `Warning`/`Error` collision case.
     let mut m = TagMap::new();
-    m.insert(0, "G", "R", 0, TagValue::U64(1));
-    m.insert(0, "G", "R", 0, TagValue::U64(2));
+    m.insert(0, 0, "G", "R", 0, TagValue::U64(1));
+    m.insert(0, 0, "G", "R", 0, TagValue::U64(2));
     assert_eq!(m.get("G", "R"), Some(&TagValue::U64(1)));
 
     // (c) Two ordinary priority-1 entries ⇒ faithful last-wins (1 >= 1).
     let mut m = TagMap::new();
-    m.insert(0, "G", "S", 1, TagValue::U64(1));
-    m.insert(0, "G", "S", 1, TagValue::U64(2));
+    m.insert(0, 0, "G", "S", 1, TagValue::U64(1));
+    m.insert(0, 0, "G", "S", 1, TagValue::U64(2));
     assert_eq!(m.get("G", "S"), Some(&TagValue::U64(2)));
 
     // (d) The `Warning`/`Error` NAME fallback: a producer passing the default
     // priority `1` still gets effective-priority-0 first-wins.
     let mut m = TagMap::new();
-    m.insert(0, "G", "Warning", 1, TagValue::Str("first".into()));
-    m.insert(0, "G", "Warning", 1, TagValue::Str("second".into()));
+    m.insert(0, 0, "G", "Warning", 1, TagValue::Str("first".into()));
+    m.insert(0, 0, "G", "Warning", 1, TagValue::Str("second".into()));
     assert_eq!(m.get("G", "Warning"), Some(&TagValue::Str("first".into())));
 
     // First-occurrence POSITION is always preserved across overrides.
     let mut m = TagMap::new();
-    m.insert(0, "G", "A", 1, TagValue::U64(1));
-    m.insert(0, "G", "B", 1, TagValue::U64(1));
-    m.insert(0, "G", "A", 2, TagValue::U64(9)); // overrides A in place
+    m.insert(0, 0, "G", "A", 1, TagValue::U64(1));
+    m.insert(0, 0, "G", "B", 1, TagValue::U64(1));
+    m.insert(0, 0, "G", "A", 2, TagValue::U64(9)); // overrides A in place
     let names: std::vec::Vec<&str> = m
       .entries()
       .iter()
-      .map(|(_, _, n, _, _)| n.as_str())
+      .map(|(_, _, _, n, _, _)| n.as_str())
       .collect();
     assert_eq!(names, ["A", "B"]);
   }

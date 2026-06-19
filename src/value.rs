@@ -427,6 +427,14 @@ pub struct Group {
   /// ExifTool family-3 sub-document: `0` = Main, `N` = `Doc<N>` (the per-sample
   /// document index for `-ee` timed metadata). Almost every group is `0`.
   doc: u32,
+  /// The SECOND-level sub-document index for the GoPro GPMF `ProcessString`
+  /// shape only (`0` = none → render `Doc<N>`; `M > 0` → render `Doc<N>-<M>`,
+  /// GoPro.pm:759-774). ExifTool's `ProcessString` keeps the parent `DOC_NUM`
+  /// and splits each subsequent row of a multi-row `GPS5`/`GPS9` record into
+  /// `"$docNum-$subDoc"`; this is the only source in the port that emits the
+  /// two-level form. Every other group is `0` here (rendered as the ordinary
+  /// `Doc<N>`), so this is purely additive — no existing golden carries it.
+  doc_sub: u32,
 }
 
 impl Group {
@@ -438,6 +446,7 @@ impl Group {
       family0: family0.into(),
       family1: family1.into(),
       doc: 0,
+      doc_sub: 0,
     }
   }
 
@@ -449,6 +458,28 @@ impl Group {
       family0: family0.into(),
       family1: family1.into(),
       doc,
+      doc_sub: 0,
+    }
+  }
+
+  /// A two-level sub-document (`Doc<N>-<M>`) group — the GoPro GPMF
+  /// `ProcessString` per-row split (GoPro.pm:759-774). `sub == 0` is the parent
+  /// `Doc<N>` (identical to [`Self::with_doc`]); `sub > 0` renders `Doc<N>-<M>`.
+  /// Used ONLY by the GoPro `gpmd` timed-metadata emitter for the subsequent
+  /// rows of a multi-row `GPS5`/`GPS9` record.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_subdoc(
+    family0: impl Into<SmolStr>,
+    family1: impl Into<SmolStr>,
+    doc: u32,
+    sub: u32,
+  ) -> Self {
+    Self {
+      family0: family0.into(),
+      family1: family1.into(),
+      doc,
+      doc_sub: sub,
     }
   }
 
@@ -471,6 +502,15 @@ impl Group {
   #[inline(always)]
   pub const fn doc(&self) -> u32 {
     self.doc
+  }
+
+  /// The SECOND-level sub-document index (`0` = none → `Doc<N>`; `M > 0` →
+  /// `Doc<N>-<M>`). Non-zero only for the GoPro GPMF `ProcessString` per-row
+  /// split (GoPro.pm:759-774).
+  #[must_use]
+  #[inline(always)]
+  pub const fn doc_sub(&self) -> u32 {
+    self.doc_sub
   }
 }
 
