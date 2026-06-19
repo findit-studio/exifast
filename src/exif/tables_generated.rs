@@ -447,6 +447,16 @@ static EXIF_CAMERAELEVATIONANGLE: ExifTag = ExifTag {
   name: "CameraElevationAngle",
   conv: Conv::None,
 };
+static EXIF_XPCOMMENT: ExifTag = ExifTag {
+  id: 0x9c9c,
+  name: "XPComment",
+  conv: Conv::WindowsXp,
+};
+static EXIF_XPKEYWORDS: ExifTag = ExifTag {
+  id: 0x9c9e,
+  name: "XPKeywords",
+  conv: Conv::WindowsXp,
+};
 static EXIF_FLASHPIXVERSION: ExifTag = ExifTag {
   id: 0xa000,
   name: "FlashpixVersion",
@@ -587,6 +597,11 @@ static EXIF_SHARPNESS: ExifTag = ExifTag {
   id: 0xa40a,
   name: "Sharpness",
   conv: Conv::IntLabel(super::CONTRAST),
+};
+static EXIF_DEVICESETTINGDESCRIPTION: ExifTag = ExifTag {
+  id: 0xa40b,
+  name: "DeviceSettingDescription",
+  conv: Conv::BinaryData,
 };
 static EXIF_SUBJECTDISTANCERANGE: ExifTag = ExifTag {
   id: 0xa40c,
@@ -735,6 +750,8 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x9403 => Some(&EXIF_WATERDEPTH),
     0x9404 => Some(&EXIF_ACCELERATION),
     0x9405 => Some(&EXIF_CAMERAELEVATIONANGLE),
+    0x9c9c => Some(&EXIF_XPCOMMENT),
+    0x9c9e => Some(&EXIF_XPKEYWORDS),
     0xa000 => Some(&EXIF_FLASHPIXVERSION),
     0xa001 => Some(&EXIF_COLORSPACE),
     0xa002 => Some(&EXIF_EXIFIMAGEWIDTH),
@@ -759,6 +776,7 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0xa408 => Some(&EXIF_CONTRAST),
     0xa409 => Some(&EXIF_SATURATION),
     0xa40a => Some(&EXIF_SHARPNESS),
+    0xa40b => Some(&EXIF_DEVICESETTINGDESCRIPTION),
     0xa40c => Some(&EXIF_SUBJECTDISTANCERANGE),
     0xa420 => Some(&EXIF_IMAGEUNIQUEID),
     0xa430 => Some(&EXIF_OWNERNAME),

@@ -151,6 +151,16 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   // bespoke `RawConv`/`PrintConv` pair (Exif.pm:3068-3119) `-listx` cannot
   // express; pin the dedicated decode-and-PrintExposureTime conv.
   hp(0xa462, "Conv::CompositeImageExposureTimes"),
+  // `XPComment` (0x9c9c) / `XPKeywords` (0x9c9e) — Windows XP UCS-2(LE)
+  // strings, `ValueConv => '$self->Decode($val,"UCS2","II")'`
+  // (Exif.pm:2643-2650/:2661-2668). `-listx` carries no ValueConv, so pin the
+  // bespoke UCS-2-decode conv (the `format_override` reads the value as `undef`
+  // bytes so the conv sees the raw LE 2-byte units).
+  hp(0x9c9c, "Conv::WindowsXp"),
+  hp(0x9c9e, "Conv::WindowsXp"),
+  // `DeviceSettingDescription` (0xa40b) — `Binary => 1` (Exif.pm:2957-2961);
+  // pin the binary-placeholder conv (`(Binary data N bytes …)`).
+  hp(0xa40b, "Conv::BinaryData"),
   // ---- name-only overrides (conditional ids; conv auto-derives `None`) -----
   hp_name(0x0111, "StripOffsets"),
   hp_name(0x0117, "StripByteCounts"),

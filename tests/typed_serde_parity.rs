@@ -148,15 +148,15 @@ const NOT_ACTIVE: &[&str] = &[
   // container phases) plus the gpmd Doc<N> port. The conformance test is
   // `#[ignore]`d until then — accept-deferred here.
   "QuickTime_gopro_hero8_gpmf.mp4",
-  // The #285 round-2 real-device fixtures (#109/#114/#92/#100) — dropped with
+  // The #285 round-2 real-device fixtures (#109/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
-  // MPF/JFIF for Matrice+thermal, XMP-GPano for the Insta360 equirect; the Rove
-  // dashcam's `stsd` is now emitted, its residual no-ee gap is the NOVATEK
-  // `udta` + the `minf` data-handler, a later container phase). Their no-ee
-  // .json carries tags exifast does not yet emit, so accept-deferred here until
-  // each port lands (then they move to active).
+  // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect, the
+  // Rove dashcam GPS). Their no-ee .json carries tags exifast does not yet emit,
+  // so accept-deferred here until each port lands (then they move to active).
+  // `DJI_Matrice30T.jpg` (#114) is now ACTIVE — the JFIF/MPF/DJI-thermal port
+  // landed (`src/exif/jpeg_app.rs`), byte-exact at both `-j`/`-n` (see
+  // `tests/conformance.rs::dji_matrice30t_conformance`).
   "DJI_M3T_thermal.RJPEG",
-  "DJI_Matrice30T.jpg",
   "Insta360ONE_equirectangular.jpg",
   "QuickTime_rove_r2_4k.MP4",
   // The BlackVue DR770X (#213) + Pruveeo D90 (#138) dashcam fixtures — dropped
@@ -681,7 +681,10 @@ const NOT_ACTIVE: &[&str] = &[
 /// `QuickTime_gopro_gpmf.mp4` (#127/#278, +1). (The sequential squash-merges of
 /// these PRs landed a stale 528 — only the brand +3 — silently dropping
 /// Samsung's and GoPro's +1 each; corrected to 530 here.)
-const EXPECTED_ACTIVE_FIXTURES: usize = 530;
+/// 530 → 531 after `DJI_Matrice30T.jpg` (#114) activated — the JFIF/MPF/DJI
+/// thermal port (`src/exif/jpeg_app.rs`) made it byte-exact, so it moves out of
+/// [`NOT_ACTIVE`] into the active set.
+const EXPECTED_ACTIVE_FIXTURES: usize = 531;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -232,6 +232,20 @@ pub enum Conv {
   /// (0x0001, `Exif.pm:417-427` — `R98`/`R03`/`THM`); distinct from the
   /// integer-keyed [`Conv::IntLabel`].
   StrLabel(&'static [(&'static str, &'static str)]),
+  /// Windows XP `XP*` tags (`XPComment` 0x9c9c / `XPKeywords` 0x9c9e, also
+  /// `XPTitle`/`XPAuthor`/`XPSubject`) — `Format => 'undef'`, `ValueConv =>
+  /// '$self->Decode($val,"UCS2","II")'` (`Exif.pm:2643-2650`/`:2661-2668`).
+  /// The value is a little-endian UCS-2 (UTF-16LE) string, NUL-terminated;
+  /// `Decode` converts it to UTF-8. It is a ValueConv (no further PrintConv),
+  /// so the decoded UTF-8 is emitted in BOTH `-j` and `-n`. The on-disk format
+  /// is `int8u`, so the walker decodes a `U64` byte array; this conv
+  /// reconstructs the byte string before the UCS-2 decode.
+  WindowsXp,
+  /// A `Binary => 1` tag (`DeviceSettingDescription` 0xa40b, `Exif.pm:2957-2961`)
+  /// — the value is rendered as the universal `(Binary data N bytes, use -b
+  /// option to extract)` placeholder in default (`-b`-less) output, in BOTH
+  /// `-j` and `-n`. `N` is the on-disk value byte length.
+  BinaryData,
 }
 
 // ===========================================================================
@@ -770,6 +784,18 @@ pub const EXIF_TAGS: &[ExifTag] = &[
     name: "SubSecTimeDigitized",
     conv: Conv::TrimTrailingSpaces,
   },
+  // 0x9c9c `XPComment` — Windows XP UCS-2(LE) string (`Exif.pm:2643-2650`).
+  ExifTag {
+    id: 0x9c9c,
+    name: "XPComment",
+    conv: Conv::WindowsXp,
+  },
+  // 0x9c9e `XPKeywords` — Windows XP UCS-2(LE) string (`Exif.pm:2661-2668`).
+  ExifTag {
+    id: 0x9c9e,
+    name: "XPKeywords",
+    conv: Conv::WindowsXp,
+  },
   ExifTag {
     id: 0xa000,
     name: "FlashpixVersion",
@@ -885,6 +911,12 @@ pub const EXIF_TAGS: &[ExifTag] = &[
     id: 0xa40a,
     name: "Sharpness",
     conv: Conv::IntLabel(CONTRAST),
+  },
+  // 0xa40b `DeviceSettingDescription` — `Binary => 1` (`Exif.pm:2957-2961`).
+  ExifTag {
+    id: 0xa40b,
+    name: "DeviceSettingDescription",
+    conv: Conv::BinaryData,
   },
   ExifTag {
     id: 0xa40c,
@@ -1031,6 +1063,11 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
   match id {
     0x9286 => Some(crate::exif::ifd::Format::Undef),
+    // `XPComment` (0x9c9c) / `XPKeywords` (0x9c9e) carry `Format => 'undef'`
+    // (`Exif.pm:2645`/`:2663`): the on-disk `int8u[N]` value is re-read as raw
+    // `undef` bytes so the `WindowsXp` UCS-2(LE) `Decode` ValueConv sees the
+    // exact byte string (not a NUL-trimmed/space-joined re-encode).
+    0x9c9c | 0x9c9e => Some(crate::exif::ifd::Format::Undef),
     _ => None,
   }
 }

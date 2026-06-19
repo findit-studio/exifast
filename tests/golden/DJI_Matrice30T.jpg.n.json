@@ -57,7 +57,6 @@
   "IFD1:ResolutionUnit": 2,
   "IFD1:ThumbnailOffset": 976,
   "IFD1:ThumbnailLength": 19346,
-  "IFD1:ThumbnailImage": "(Binary data 19346 bytes, use -b option to extract)",
   "MPF0:MPFVersion": "0100",
   "MPF0:NumberOfImages": 2,
   "MPF0:ImageUIDList": "(Binary data 66 bytes, use -b option to extract)",

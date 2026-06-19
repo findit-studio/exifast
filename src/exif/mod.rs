@@ -94,6 +94,7 @@ pub(crate) mod render;
 // Gated on `feature = "exif"` (it produces an `ExifMeta`, reusing the IFD
 // walker); the GPS sub-IFD is decoded through the same block.
 pub mod jpeg;
+mod jpeg_app;
 
 use std::{string::String, vec::Vec};
 
@@ -1617,6 +1618,26 @@ pub struct ExifMeta<'a> {
   /// `File:` prefix (ahead of the IFD blocks), matching ExifTool reaching the
   /// SOF before the IFD walk (`ExifTool.pm:7419-7462`).
   sof: Option<SofInfo>,
+  /// Already-rendered tags from the JPEG auxiliary `APP` segments OTHER than the
+  /// EXIF block and the GoPro `APP6` — the JFIF (`APP0`), MPF (`APP2`) and DJI
+  /// thermal (`APP3`/`APP4`/`APP5`/`APP7`) arms decoded by
+  /// [`jpeg_app::process_app_markers`]. Populated by the JPEG marker walk
+  /// ([`crate::exif::jpeg`]) once IFD0 `Make` is known (the `$$self{Make} eq
+  /// 'DJI'` gate); `None`/empty for a standalone TIFF, an embedded eXIf block,
+  /// and any JPEG carrying none of these segments.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) appends them after the EXIF
+  /// block (the `-G1 -j` conformance is key-multiset, so they need no
+  /// marker-position interleave). Unlike [`sof`](Self::sof) these are
+  /// pre-rendered [`EmittedTag`](crate::emit::EmittedTag)s (the values were
+  /// converted at decode time, when the print-conv mode was known).
+  jpeg_app_tags_pc: Vec<crate::emit::EmittedTag>,
+  /// The `-n` (ValueConv / no-PrintConv) counterpart of
+  /// [`jpeg_app_tags_pc`](Self::jpeg_app_tags_pc) — the same JPEG `APP`
+  /// auxiliary tags rendered with PrintConv OFF. [`Taggable::tags`] selects this
+  /// vector when [`EmitOptions::mode`](crate::emit::EmitOptions) is
+  /// [`ConvMode::ValueConv`](crate::emit::ConvMode); the print-conv vector
+  /// otherwise.
+  jpeg_app_tags_n: Vec<crate::emit::EmittedTag>,
   /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — `Some("CRW")`
   /// for a CIFF/CRW raw, the standalone-TIFF candidate's `Parent`
   /// (`"TIFF"`/`"DNG"`/`"NEF"`/`"CR2"`/…) for a standalone TIFF, `None` for an
@@ -1629,6 +1650,20 @@ pub struct ExifMeta<'a> {
   /// reachable input is a CRW, so the pos-22 behaviour — hence all output —
   /// is unchanged; only the gate is now spelled faithfully.)
   file_type: Option<smol_str::SmolStr>,
+  /// IFD0's `Make` (`0x010f`) exactly as the MakerNotes dispatcher records it —
+  /// `$$self{Make}`, captured during the top-level Exif walk and TRIMMED of
+  /// trailing whitespace (the `Exif.pm:585` `RawConv` `s/\s+$//`, via
+  /// [`is_perl_space`]). This is the SAME value the walker stores into
+  /// [`Walker::captured_make`] — IFD0-only and last-wins on a duplicate `Make`
+  /// (the `RawConv` `$$self{Make} = $val` runs each time) — so it is the precise
+  /// `$$self{Make}` state ExifTool's `Marker:` loop would hold AFTER processing
+  /// this `APP1` Exif block. The JPEG front-end ([`jpeg::parse_jpeg_exif`]) reads
+  /// it to gate the DJI thermal `APP3`/`APP4`/`APP5` arms (`$$self{Make} eq
+  /// 'DJI'`, `JPEG.pm:113`/`:150`/`:174`) at each marker position, without
+  /// re-implementing a looser by-name IFD scan. `None` for a block with no IFD0
+  /// `Make`. WRITE-ONLY inside the engine except for that JPEG-front-end read
+  /// (exposed via [`ExifMeta::captured_make`]).
+  captured_make: Option<smol_str::SmolStr>,
   /// IFD0's `Model` (`0x0110`) as the MakerNotes dispatcher records it —
   /// `$$self{Model}`, captured during the top-level Exif walk and TRIMMED of
   /// trailing whitespace (the `Exif.pm:599` `RawConv` `s/\s+$//`). The Canon CTMD
@@ -1823,6 +1858,20 @@ impl<'a> ExifMeta<'a> {
   /// it from a `0x8769` `ExifIFD` block to hand off to the in-sample `0x927c`
   /// re-dispatch (Canon.pm:10739-10751). `None` for a TIFF with no IFD0 `Model`.
   /// (`pub(crate)`: an internal dispatch input, not API surface.)
+  /// IFD0's `Make` (`0x010f`) exactly as the MakerNotes dispatcher records it —
+  /// `$$self{Make}`, captured during this block's top-level Exif walk and TRIMMED
+  /// of trailing whitespace (the `Exif.pm:585` `RawConv` `s/\s+$//`). IFD0-only
+  /// and last-wins on a duplicate `Make`, so it is the exact `$$self{Make}` state
+  /// ExifTool would hold after processing this `APP1` Exif block — what the JPEG
+  /// front-end's DJI thermal-arm gate (`$$self{Make} eq 'DJI'`) keys on. `None`
+  /// for a block with no IFD0 `Make`. (`pub(crate)`: an internal dispatch input,
+  /// not API surface.)
+  #[must_use]
+  #[inline]
+  pub(crate) fn captured_make(&self) -> Option<&str> {
+    self.captured_make.as_deref()
+  }
+
   #[must_use]
   #[inline]
   pub(crate) fn dispatcher_model(&self) -> Option<&str> {
@@ -1868,11 +1917,17 @@ impl<'a> ExifMeta<'a> {
       // marker walk via [`set_jpeg_sof`](Self::set_jpeg_sof) once the first SOF
       // segment is parsed; a freshly merged JPEG `ExifMeta` starts with none.
       sof: None,
+      jpeg_app_tags_pc: Vec::new(),
+      jpeg_app_tags_n: Vec::new(),
       // A JPEG container's `APP1` Exif block is embedded — `$$self{FILE_TYPE}`
       // is the JPEG ("JPEG"), never "CRW", so the ShotInfo pos-22 CRW clause is
       // correctly off. We model that as `None` (no CRW), matching the embedded
       // `parse_exif_block` path.
       file_type: None,
+      // The merged JPEG-level `ExifMeta` is never itself inspected for
+      // `$$self{Make}` (the DJI thermal gate reads each PER-BLOCK `ExifMeta`'s
+      // `captured_make` BEFORE the merge); the merged carrier holds none.
+      captured_make: None,
       // The Canon CTMD `ProcessExifInfo` model hand-off reads `dispatcher_model`
       // only from a standalone `0x8769` TIFF (`parse_standalone_tiff_with_base`),
       // never from a JPEG `APP1` merge — so `None` here is correct.
@@ -1907,6 +1962,22 @@ impl<'a> ExifMeta<'a> {
   /// internal.)
   pub(crate) fn set_jpeg_sof(&mut self, sof: SofInfo) {
     self.sof = Some(sof);
+  }
+
+  /// Attach the JPEG auxiliary `APP`-segment tags (JFIF / MPF / DJI thermal)
+  /// decoded by [`jpeg_app::process_app_markers`]. Two pre-rendered vectors —
+  /// `pc` for the `-j` (PrintConv) path, `n` for the `-n` (ValueConv) path —
+  /// since the values are converted at decode time (the marker walk runs once
+  /// per print-conv mode). [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// appends the matching vector after the EXIF block. (`pub(crate)`: a
+  /// JPEG-front-end construction-time internal.)
+  pub(crate) fn set_jpeg_app_tags(
+    &mut self,
+    pc: Vec<crate::emit::EmittedTag>,
+    n: Vec<crate::emit::EmittedTag>,
+  ) {
+    self.jpeg_app_tags_pc = pc;
+    self.jpeg_app_tags_n = n;
   }
 
   /// Record the marker (file) position of the EXIF metadata block — the index
@@ -2515,7 +2586,10 @@ fn parse_tiff_with_base_no_raf<'a>(
     // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
     // has no JPEG SOF segment.
     sof: None,
+    jpeg_app_tags_pc: Vec::new(),
+    jpeg_app_tags_n: Vec::new(),
     file_type,
+    captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     dng_version: w.dng_version,
     cr2_magic,
@@ -2647,6 +2721,8 @@ fn parse_bigtiff<'a>(
     // The SOF dimension tags are a JPEG-container concern; a BigTIFF has no
     // JPEG SOF segment.
     sof: None,
+    jpeg_app_tags_pc: Vec::new(),
+    jpeg_app_tags_n: Vec::new(),
     // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) FORCES the file
     // type to `BTF` on the 0x2b magic, REGARDLESS of extension — so a BigTIFF
     // named `.tif` / dotless still finalizes `File:FileType = BTF`. Carry that
@@ -2656,6 +2732,7 @@ fn parse_bigtiff<'a>(
     // `image/x-tiff-big` MIME. (The WALKER above keeps the passed container
     // `file_type` for the Canon-CRW RawConv gate — `BTF` ≠ `CRW`, so unaffected.)
     file_type: Some(smol_str::SmolStr::new("BTF")),
+    captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     // `DNGVersion` (0xc612)'s RawConv still runs in `Walker::emit`, but a
     // BigTIFF is finalized as `BTF` (`ProcessBTF` `SetFileType('BTF')`), NOT
@@ -2820,8 +2897,11 @@ fn parse_tiff_with_base_shared<'a>(
     multi_page_count: None,
     // An embedded eXIf / CTMD block is not a JPEG marker walk — no SOF segment.
     sof: None,
+    jpeg_app_tags_pc: Vec::new(),
+    jpeg_app_tags_n: Vec::new(),
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
+    captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     // Embedded PNG `eXIf` / CTMD `0x8769` block: `$$self{FILE_TYPE}` is the
     // OUTER container ("PNG"/…), never "TIFF", so the DNG override is
@@ -6245,13 +6325,27 @@ impl Walker<'_, '_> {
       },
     };
 
-    // Capture `Make` (0x010f) and `Model` (0x0110) — both are IFD0 string
-    // tags (`Exif.pm:585`/`:599`) needed by the MakerNotes dispatcher
+    // Capture `Make` (0x010f) and `Model` (0x0110) — IFD0 tags
+    // (`Exif.pm:585`/`:599`) needed by the MakerNotes dispatcher
     // (`MakerNotes.pm`'s `$$self{Make}` / `$$self{Model}` conditions).
     // Bundled trims trailing whitespace via `RawConv => '$val =~ s/\s+$//'`
     // (Exif.pm:585/599 — `Conv::TrimTrailingWhitespace`); apply the same
     // trim here so the dispatcher sees the trimmed value, faithful to
     // bundled's view of `$$self{Make}` (which is the RawConv'd value).
+    //
+    // ALL READABLE SHAPES, not only `string`: the `RawConv` `… $$self{Make} =
+    // $val` runs whenever the `Make` TAG is SEEN, regardless of its on-disk
+    // format — `Make` is NORMALLY `ascii`, but a `Make` mis-encoded `int16u`/
+    // `undef`/`rational`/etc. still decodes through `ReadValue` and assigns
+    // `$$self{Make}` the STRINGIFIED `$val` ([`RawValue::raw_conv_val_string`] —
+    // `Text` keeps its FixUTF8 string, a numeric shape becomes the space-joined
+    // `join(' ', @vals)`, `undef` bytes become their lenient UTF-8 view). A
+    // present-but-non-string `Make` therefore UPDATES `$$self{Make}` (and so the
+    // JPEG DJI gate) to a value that does not stringify to `'DJI'`, flipping the
+    // gate OFF — it does NOT leave a prior `'DJI'` state intact. Only an
+    // ABSENT/unreadable `Make` (the tag never decoded, so this tap never runs)
+    // preserves the prior state. An ASCII `Make` is captured byte-for-byte as
+    // before (the `Text` arm of `raw_conv_val_string` is the old `text` path).
     //
     // LAST-WINS: bundled's `RawConv` ends `… $$self{Make} = $val` (Exif.pm:585)
     // / `… $$self{Model} = $val` (Exif.pm:599) — the assignment runs EACH time
@@ -6271,13 +6365,15 @@ impl Walker<'_, '_> {
     // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
     // Make alone.
     if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110) {
-      if let RawValue::Text { text: s, .. } = &raw {
-        let trimmed = s.trim_end_matches(is_perl_space);
-        if tag_id == 0x010f {
-          self.captured_make = Some(trimmed.to_string());
-        } else if tag_id == 0x0110 {
-          self.captured_model = Some(trimmed.to_string());
-        }
+      // The RawConv'd `$$self{Make}`/`$$self{Model}`: the stringified `$val`
+      // ([`RawValue::raw_conv_val_string`], faithful to any readable shape),
+      // with the `s/\s+$//` trailing-whitespace trim on top.
+      let trimmed = raw.raw_conv_val_string();
+      let trimmed = trimmed.trim_end_matches(is_perl_space);
+      if tag_id == 0x010f {
+        self.captured_make = Some(trimmed.to_string());
+      } else if tag_id == 0x0110 {
+        self.captured_model = Some(trimmed.to_string());
       }
     }
 
@@ -6470,6 +6566,27 @@ impl ExifMeta<'_> {
       push(out, mn.emissions_print_conv());
     } else {
       push(out, &mn.emissions_value_conv());
+    }
+    // `MakerNoteUnknownText` (`MakerNotes.pm:1101-1108`): the
+    // `@MakerNotes::Main` text-fallback arm. When the dispatcher classified the
+    // 0x927c blob as `Vendor::Unknown` AND its bytes match
+    // `/^[\x09\x0d\x0a\x20-\x7e]+\0*$/` (printable ASCII + optional trailing
+    // NULs), bundled emits the blob text as `MakerNoteUnknownText` rather than
+    // walking it as an IFD. ExifTool shows it as binary when `length($val) > 64`
+    // (`ValueConv => 'length($val) > 64 ? \$val : $val'`, `MakerNotes.pm:1106`),
+    // else the NUL-stripped text. The `-G1` family-1 group is the parent
+    // `ExifIFD` (the directory the 0x927c tag sits in); SAME under `-j`/`-n`
+    // (a ValueConv, no PrintConv). A short / empty / binary blob (no match) and
+    // any RECOGNIZED vendor emit nothing here.
+    if mn.vendor() == makernotes::Vendor::Unknown {
+      if let Some(value) = maker_note_unknown_text(mn.bytes()) {
+        out.push(crate::emit::EmittedTag::new(
+          crate::value::Group::new("MakerNotes", "ExifIFD"),
+          smol_str::SmolStr::new_static("MakerNoteUnknownText"),
+          value,
+          false,
+        ));
+      }
     }
   }
 
@@ -6682,6 +6799,19 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       self.push_exif_tags(print_conv, &mut tags);
       self.push_maker_note_tags(print_conv, &mut tags);
     }
+    // The JPEG auxiliary `APP`-segment tags (JFIF / MPF / DJI thermal) decoded
+    // by [`jpeg_app::process_app_markers`] — appended after the EXIF block. The
+    // `-G1 -j` conformance compares the key MULTISET (`src/jsondiff.rs`), so
+    // these need no marker-position interleave; ExifTool emits them at their
+    // own `Marker:`-loop positions but in the same family-1 groups
+    // (`JFIF`/`MPF0`/`MPImage<N>`/`DJI`). The PrintConv mode selects which
+    // pre-rendered vector to clone (the values were converted at decode time).
+    let app_tags = if print_conv {
+      &self.jpeg_app_tags_pc
+    } else {
+      &self.jpeg_app_tags_n
+    };
+    tags.extend(app_tags.iter().cloned());
     tags.into_iter()
   }
 }
@@ -10071,6 +10201,55 @@ pub(in crate::exif) fn canon_makernote_isolated(
   (emissions, typed)
 }
 
+/// `MakerNoteUnknownText` (`MakerNotes.pm:1101-1108`) — the
+/// `@MakerNotes::Main` text-fallback condition + ValueConv.
+///
+/// Returns `Some(value)` when `blob` matches the bundled `Condition`
+/// `/^[\x09\x0d\x0a\x20-\x7e]+\0*$/` — ONE OR MORE printable-ASCII bytes
+/// (tab `0x09`, CR `0x0d`, LF `0x0a`, or `0x20..=0x7e`) followed by ZERO OR
+/// MORE trailing NULs, with nothing else. The returned [`TagValue`] is the
+/// bundled `ValueConv => 'length($val) > 64 ? \$val : $val'`: a blob LONGER
+/// than 64 bytes is shown as the `(Binary data N bytes …)` placeholder (a
+/// scalar-ref ⇒ binary in default output), otherwise the printable text with
+/// trailing NULs stripped. `None` when the blob has no printable byte or
+/// carries a non-printable, non-trailing-NUL byte (not text — bundled then
+/// falls through to `MakerNoteUnknownBinary` / `MakerNoteUnknown`).
+#[cfg(feature = "alloc")]
+fn maker_note_unknown_text(blob: &[u8]) -> Option<crate::value::TagValue> {
+  if blob.is_empty() {
+    return None;
+  }
+  // Split into the leading printable run and the trailing NUL run; the whole
+  // blob must be exactly `printable+ NUL*`.
+  let nul_start = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+  let (text_bytes, trailing) = blob.split_at(nul_start);
+  // At least one printable byte (`+` quantifier).
+  if text_bytes.is_empty() {
+    return None;
+  }
+  // Every leading byte must be tab / CR / LF / `0x20..=0x7e`.
+  if !text_bytes
+    .iter()
+    .all(|&b| matches!(b, 0x09 | 0x0d | 0x0a | 0x20..=0x7e))
+  {
+    return None;
+  }
+  // The remainder (after the first NUL) must be ALL NULs (`\0*$`).
+  if !trailing.iter().all(|&b| b == 0) {
+    return None;
+  }
+  // `ValueConv => 'length($val) > 64 ? \$val : $val'` — `$val` is the full
+  // blob length (the on-disk `undef` value, NULs included).
+  if blob.len() > 64 {
+    return Some(crate::value::TagValue::Str(
+      crate::value::binary_placeholder(blob.len() as u64),
+    ));
+  }
+  // The printable text (trailing NULs already excluded by the split).
+  let text: String = text_bytes.iter().map(|&b| b as char).collect();
+  Some(crate::value::TagValue::Str(smol_str::SmolStr::from(text)))
+}
+
 // ====================================================================// Exif value emission — applies a `Conv` to a `RawValue`
 // ====================================================================
 /// Render a [`RawValue`] under a plain Exif [`Conv`] into the sink. This is
@@ -10262,6 +10441,52 @@ fn emit_exif_value<S: ExifSink>(
         return Ok(());
       }
       emit_raw(group, name, raw, out)
+    }
+    Conv::WindowsXp => {
+      // Windows `XP*` tags — `ValueConv => '$self->Decode($val,"UCS2","II")'`
+      // (`Exif.pm:2647`): the raw value is a little-endian UCS-2 (UTF-16LE)
+      // string, NUL-terminated. The `format_override` re-reads the on-disk
+      // `int8u[N]` as `undef` so `raw` is `RawValue::Bytes`; decode the LE
+      // 2-byte code units to UTF-8 (a ValueConv, so SAME in `-j` and `-n`; no
+      // further PrintConv). NUL terminator + trailing padding dropped.
+      if let RawValue::Bytes(b) = raw {
+        let mut s = String::new();
+        for chunk in b.chunks_exact(2) {
+          // `chunks_exact(2)` yields only full pairs; the slice pattern is
+          // total (a trailing odd byte is dropped, matching `unpack 'v*'`).
+          let unit = match *chunk {
+            [lo, hi] => u16::from_le_bytes([lo, hi]),
+            _ => 0,
+          };
+          // ExifTool's `Decode` truncates at the first NUL of the decoded
+          // string (the `ConvertExifText`/display path drops it); our XP
+          // payloads are NUL-terminated UCS-2 ASCII.
+          if unit == 0 {
+            break;
+          }
+          if let Some(c) = char::from_u32(u32::from(unit)) {
+            s.push(c);
+          } else {
+            s.push('\u{fffd}');
+          }
+        }
+        out.write_str(group, name, &s)?;
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::BinaryData => {
+      // `Binary => 1` (`DeviceSettingDescription` 0xa40b) — the universal
+      // `(Binary data N bytes …)` placeholder in default (`-b`-less) output,
+      // SAME under `-j` and `-n`. `N` = the on-disk value byte length: an
+      // `undef` value decodes to `RawValue::Bytes` whose length IS the byte
+      // count; a non-`Bytes` shape falls back to its element count.
+      let len = match raw {
+        RawValue::Bytes(b) => b.len(),
+        other => other.count(),
+      };
+      out.write_str(group, name, &crate::value::binary_placeholder(len as u64))?;
+      Ok(())
     }
     Conv::MetersSuffix => {
       // `$val =~ /^(inf|undef)$/ ? $val : "$val m"` (Exif.pm:2388).

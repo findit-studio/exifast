@@ -8886,10 +8886,13 @@ fn makernotes_pentax_k10d_conformance() {
   // 0x005d, the model-/count-conditional FocusMode/AFPoint/ExposureCompensation/
   // PictureMode/DriveMode/FlashMode Main leaves, the `IsOffset => 2`
   // PreviewImageStart/PreviewImage pointers) — OR a documented engine-wide
-  // deferral (Composite:all — no EXIF Composite subsystem; JFIF:all +
-  // IFD1:ThumbnailImage + PrintIM:PrintIMVersion — the same gaps the Nikon golden
-  // excludes). None masks a faithfulness gap in the ported subset. The JPEG SOF
-  // `File:*` dimension tags (#261/#263) ARE part of this golden.
+  // deferral (Composite:all — no EXIF Composite subsystem; IFD1:ThumbnailImage +
+  // PrintIM:PrintIMVersion — the same gaps the Nikon golden excludes). None masks
+  // a faithfulness gap in the ported subset. The JPEG SOF `File:*` dimension tags
+  // (#261/#263) ARE part of this golden. The APP0 JFIF tags (`JFIF:JFIFVersion`/
+  // `ResolutionUnit`/`X`/`YResolution`) are NOW EMITTED (the #114 JFIF port,
+  // `src/exif/jpeg_app.rs`) — no longer excluded; the golden carries them
+  // (regenerated to match).
   check("Pentax.jpg", "Pentax.jpg.json", true);
   check("Pentax.jpg", "Pentax.jpg.n.json", false);
 }
@@ -8948,19 +8951,18 @@ fn makernotes_dji_phantom4_conformance() {
   //                        Position}` synthesis; the RAW GPS IFD above is kept).
   //   -x XMP:all         — the XMP-drone-dji / XMP-crs / XMP-tiff / … packet is
   //                        not ported (no XMP subsystem).
-  //   -x MPF:all         — the MPF (Multi-Picture Format) APP2 block
-  //                        (MPF0/MPImage1/MPImage2, incl. the second-image
-  //                        PreviewImage) is not ported.
-  //   -x IFD0:XPComment -x IFD0:XPKeywords — the Windows XP* tags (0x9c9c/
-  //                        0x9c9e) are not in exifast's EXIF table (pre-existing
-  //                        standard-EXIF gap, unrelated to MakerNotes).
-  //   -x ExifIFD:DeviceSettingDescription — EXIF 0xa40b, likewise not in the
-  //                        table (standard-EXIF gap).
-  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder (the
+  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder is a
+  //                        `%Exif::Composite` tag (re-grouped to EXIF/IFD1), the
   //                        same documented engine-wide gap the Nikon/Pentax
-  //                        goldens drop; the `ThumbnailOffset`/`Length` ARE
+  //                        goldens drop (the `ThumbnailOffset`/`Length` ARE
   //                        kept). The JPEG SOF `File:*` dimension tags (#261)
   //                        are part of this golden.
+  // The MPF (APP2 Multi-Picture Format — `MPF0`/`MPImage1`/`MPImage2`, incl. the
+  // second-image `PreviewImage`), the Windows `XP*` tags (`IFD0:XPComment`/
+  // `XPKeywords`, 0x9c9c/0x9c9e UCS-2) and `ExifIFD:DeviceSettingDescription`
+  // (0xa40b binary) are NOW EMITTED (the #114 JFIF/MPF/EXIF port,
+  // `src/exif/jpeg_app.rs` + the EXIF-table additions), so they are NO LONGER
+  // excluded — the golden carries all three groups (regenerated to match).
   check("DJIPhantom4.jpg", "DJIPhantom4.jpg.json", true);
   check("DJIPhantom4.jpg", "DJIPhantom4.jpg.n.json", false);
 }
@@ -9588,10 +9590,45 @@ fn dji_thermal_rjpeg_conformance() {
 }
 
 #[test]
-#[ignore = "port gap: DJI MakerNote / MPF / JFIF / Composite; see #114"]
 fn dji_matrice30t_conformance() {
-  // DJI Matrice 30T (M30T) thermal JPEG from HuggingFace STRDrones/DJI
-  // dataset. Matrice-series enterprise drone with DJI MakerNote. Unblocks #114.
+  // DJI Matrice 30T (M30T) thermal JPEG from HuggingFace STRDrones/DJI dataset
+  // (#114). Matrice-series enterprise thermal drone. The JPEG carries metadata
+  // in NINE markers beyond the `APP1` Exif block, all now ported
+  // (`src/exif/jpeg_app.rs` + the 3 standard-EXIF tags below):
+  //   - APP0 JFIF (`%JFIF::Main`): `JFIFVersion`/`ResolutionUnit`/`X`/`YResolution`.
+  //   - APP2 MPF (`%MPF::Main` TIFF IFD + `%MPF::MPImage` binary sub-dir): the
+  //     `MPFVersion`/`NumberOfImages`/`ImageUIDList`/`TotalFrames` header + the
+  //     two `MPImage<N>` entries (`MPImageFlags` BITMASK / `MPImageFormat` /
+  //     `MPImageType` PrintHex / `MPImageLength` / the `IsOffset`-rebased
+  //     `MPImageStart` / `DependentImage1/2EntryNumber`), and the first Large
+  //     Thumbnail re-extracted as `MPImage2:PreviewImage` (`ExtractMPImages`).
+  //   - APP3 `DJI:ThermalData` (the multi-segment combined raw thermal frame,
+  //     `JPEG.pm:113`) + APP5 `DJI:ThermalCalibration` (`JPEG.pm:174`), binary.
+  //   - APP4 `%DJI::ThermalParams2` (`DJI.pm:123`): `AmbientTemperature`/
+  //     `ObjectDistance`/`Emissivity`/`RelativeHumidity`/`ReflectedTemperature`/
+  //     `IDString` (the M3T/M30T thermal floats).
+  //   - APP7 `DJI-DBG\0` → `%DJI::Info` `ProcessDJIInfo` → `DJI:SensorID`.
+  // Plus the standard-EXIF gaps the golden carries: `IFD0:XPComment`/
+  // `XPKeywords` (Windows XP UCS-2(LE), `Exif.pm:2643`/`:2661`),
+  // `ExifIFD:DeviceSettingDescription` (`Binary => 1`, 0xa40b) and
+  // `ExifIFD:MakerNoteUnknownText` (the `@MakerNotes::Main` printable-text
+  // fallback — the 0x927c blob is the literal `"DJI MakerNotes"` text, which
+  // starts `DJI` so the `MakerNoteDJI` arm's negative lookahead excludes it).
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="-x Composite:all -x
+  // IFD1:ThumbnailImage"`:
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (drops the
+  //                        9 `Composite:*` camera-synthesis tags: Aperture/DOF/
+  //                        FOV/FocalLength35efl/HyperfocalDistance/ImageSize/
+  //                        Megapixels/ScaleFactor35efl/CircleOfConfusion).
+  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder is a
+  //                        `%Exif::Composite` tag (re-grouped to EXIF/IFD1), the
+  //                        SAME documented engine-wide gap the DJIPhantom4 /
+  //                        Pentax / Nikon goldens drop (the `ThumbnailOffset`/
+  //                        `Length` ARE kept). `MPImage2:PreviewImage` (an MPF
+  //                        family-0 tag, not Composite) IS emitted.
+  // All 90 remaining tags match for BOTH the `-j` PrintConv and `-n` numeric
+  // snapshots (byte-exact, the token-exact `json_equivalent_strict` gate).
   check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.json", true);
   check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.n.json", false);
 }
