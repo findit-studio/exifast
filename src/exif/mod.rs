@@ -6176,11 +6176,14 @@ impl ExifMeta<'_> {
                 emissions: &[makernotes::VendorEmission]| {
       out.reserve(emissions.len());
       for e in emissions {
-        out.push(crate::emit::EmittedTag::new(
+        // Carry the emission's `Priority => N` into the `EmittedTag` so the sink
+        // applies the general duplicate-override rule (`ExifTool.pm:9544-9560`).
+        out.push(crate::emit::EmittedTag::new_with_priority(
           crate::value::Group::new("MakerNotes", group1),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
+          e.priority(),
         ));
       }
     };

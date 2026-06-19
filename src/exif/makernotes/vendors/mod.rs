@@ -78,19 +78,44 @@ pub struct VendorEmission {
   /// ExifTool's `Unknown => 1` flag — `true` ⇒ the engine suppresses this tag
   /// from default output.
   unknown: bool,
+  /// ExifTool's `Priority => N` for duplicate handling (default `1`,
+  /// `ExifTool.pm:9553`). Carried through to the [`EmittedTag`] the emission
+  /// becomes so the sink applies the general override rule: a duplicate
+  /// overrides only when `(priority != 0) && (priority >= stored_priority)`
+  /// (`ExifTool.pm:9544-9560`) — a `Priority => 0` vendor tag never overrides.
+  priority: u8,
 }
 
 #[cfg(feature = "alloc")]
 impl VendorEmission {
   /// Compose a vendor emission from its name, rendered value, and `Unknown`
-  /// flag. (`pub(crate)`: only the in-crate vendor body parsers build these.)
+  /// flag, with ExifTool's default duplicate `Priority => 1`
+  /// (`ExifTool.pm:9553`). (`pub(crate)`: only the in-crate vendor body parsers
+  /// build these.) Use [`new_with_priority`](Self::new_with_priority) to mark a
+  /// `Priority => 0` vendor tag (one that never overrides a duplicate).
   #[must_use]
   #[inline(always)]
   pub(crate) fn new(name: smol_str::SmolStr, value: crate::value::TagValue, unknown: bool) -> Self {
+    Self::new_with_priority(name, value, unknown, 1)
+  }
+
+  /// Compose a vendor emission carrying an explicit ExifTool `Priority => N`
+  /// for duplicate handling — `0` marks a vendor tag that NEVER overrides an
+  /// existing duplicate (`ExifTool.pm:9544-9560`); `1` is the default
+  /// [`new`](Self::new) uses.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn new_with_priority(
+    name: smol_str::SmolStr,
+    value: crate::value::TagValue,
+    unknown: bool,
+    priority: u8,
+  ) -> Self {
     Self {
       name,
       value,
       unknown,
+      priority,
     }
   }
 
@@ -115,6 +140,18 @@ impl VendorEmission {
   #[inline(always)]
   pub const fn unknown(&self) -> bool {
     self.unknown
+  }
+
+  /// This emission's ExifTool `Priority => N` for duplicate handling (default
+  /// `1`). Carried into the [`EmittedTag`](crate::emit::EmittedTag) the
+  /// emission becomes; the sink overrides a duplicate only when
+  /// `(priority != 0) && (priority >= stored_priority)`
+  /// (`ExifTool.pm:9544-9560`), so a `Priority => 0` vendor tag never
+  /// overrides.
+  #[must_use]
+  #[inline(always)]
+  pub const fn priority(&self) -> u8 {
+    self.priority
   }
 }
 

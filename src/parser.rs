@@ -1049,6 +1049,7 @@ struct DocObject<'a> {
     u32,
     smol_str::SmolStr,
     smol_str::SmolStr,
+    u8,
     crate::value::TagValue,
   )],
   /// The group-key form: `-G1` (collapse the doc axis — the conformance golden
@@ -1070,7 +1071,7 @@ impl serde::Serialize for DocObject<'_> {
     // `Doc<N>:`), skip any key already emitted by `obj` (first-wins), and
     // serialize the value straight through `TagValue::Serialize`.
     let mut key = String::new();
-    for (doc, group, name, value) in self.entries {
+    for (doc, group, name, _priority, value) in self.entries {
       crate::serialize_key::group_key_into(&mut key, *doc, group, name, self.group_mode);
       if self.obj.contains_key(key.as_str()) {
         continue;

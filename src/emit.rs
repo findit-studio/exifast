@@ -105,24 +105,57 @@ impl EmitOptions {
 /// the engine uses to suppress it from default output (`ExifTool.pm:9179`).
 ///
 /// Encapsulated per the crate accessor convention (no public fields): build
-/// with [`EmittedTag::new`], read via [`tag`](Self::tag) /
-/// [`unknown`](Self::unknown), or take ownership of the inner [`Tag`] with
-/// [`into_tag`](Self::into_tag).
+/// with [`EmittedTag::new`] (priority `1`, the ExifTool default) or
+/// [`EmittedTag::new_with_priority`], read via [`tag`](Self::tag) /
+/// [`unknown`](Self::unknown) / [`priority`](Self::priority), or take ownership
+/// of the inner [`Tag`] with [`into_tag`](Self::into_tag).
+///
+/// `priority` is the tag's ExifTool `Priority => N` for duplicate handling
+/// (`ExifTool.pm:9544-9560`): a NEW duplicate of an already-present
+/// `(doc, family1, name)` overrides the existing value IFF its priority is
+/// non-zero AND `>=` the stored one — a `Priority => 0` tag (e.g. `Warning` /
+/// `Error`) therefore NEVER overrides. The default `1` reproduces ExifTool's
+/// "no explicit Priority ⇒ forced to 1" rule (`ExifTool.pm:9553`), so an
+/// ordinary tag keeps the faithful last-wins behavior. See
+/// [`TagMap::insert`](crate::tagmap::TagMap).
 #[derive(Debug, Clone)]
 pub struct EmittedTag {
   tag: Tag,
   unknown: bool,
+  /// ExifTool `Priority => N` (default `1`): a duplicate overrides only when
+  /// `(priority != 0) && (priority >= stored_priority)`.
+  priority: u8,
 }
 
 impl EmittedTag {
   /// Compose an [`EmittedTag`] from its group, name, already-rendered value,
-  /// and the `Unknown=>1` flag (`true` ⇒ suppressed from default output).
+  /// and the `Unknown=>1` flag (`true` ⇒ suppressed from default output). The
+  /// tag takes ExifTool's default duplicate `Priority => 1`
+  /// (`ExifTool.pm:9553`) — use [`new_with_priority`](Self::new_with_priority)
+  /// to mark a `Priority => 0` tag (one that never overrides a duplicate).
   #[must_use]
   #[inline(always)]
   pub fn new(group: Group, name: SmolStr, value: TagValue, unknown: bool) -> Self {
+    Self::new_with_priority(group, name, value, unknown, 1)
+  }
+
+  /// Compose an [`EmittedTag`] carrying an explicit ExifTool `Priority => N`
+  /// for duplicate handling — `0` marks a tag that NEVER overrides an existing
+  /// duplicate (`ExifTool.pm:9544-9560`); `1` is the default
+  /// [`new`](Self::new) uses.
+  #[must_use]
+  #[inline(always)]
+  pub fn new_with_priority(
+    group: Group,
+    name: SmolStr,
+    value: TagValue,
+    unknown: bool,
+    priority: u8,
+  ) -> Self {
     Self {
       tag: Tag::new(group, name, value),
       unknown,
+      priority,
     }
   }
 
@@ -139,6 +172,16 @@ impl EmittedTag {
   #[inline(always)]
   pub const fn unknown(&self) -> bool {
     self.unknown
+  }
+
+  /// This tag's ExifTool `Priority => N` for duplicate handling (default `1`).
+  /// A duplicate of an already-present `(doc, family1, name)` overrides the
+  /// stored value only when `(priority != 0) && (priority >= stored_priority)`
+  /// (`ExifTool.pm:9544-9560`), so a `Priority => 0` tag never overrides.
+  #[must_use]
+  #[inline(always)]
+  pub const fn priority(&self) -> u8 {
+    self.priority
   }
 
   /// Consume `self`, yielding the inner [`Tag`] (the engine moves it into the
@@ -169,11 +212,13 @@ pub trait Taggable {
 /// 1. **Unknown-suppression** — a tag flagged `Unknown=>1` is skipped, because
 ///    ExifTool's default output omits unknown tags (`ExifTool.pm:9179`). Moving
 ///    this here lets every format drop its per-emitter `if unknown { continue }`.
-/// 2. **`write_value`** — the survivor's value is handed to the sink under its
-///    `family1:name` key; [`TagMap`](crate::tagmap::TagMap) owns the dedup
-///    (faithful `FoundTag` last-wins-in-place — a repeated key replaces the
-///    earlier value while keeping its first-occurrence position,
-///    `ExifTool.pm:9437-9519`).
+/// 2. **`write_value_doc`** — the survivor's value, its `Priority => N`, and
+///    its sub-document index are handed to the sink under the `family1:name`
+///    key; [`TagMap`](crate::tagmap::TagMap) owns the priority-aware dedup
+///    (ExifTool's general rule — a repeated key overrides the stored value IFF
+///    the duplicate's priority is non-zero AND `>=` the stored one, keeping
+///    first-occurrence position, `ExifTool.pm:9544-9560`; for an ordinary
+///    `Priority => 1` tag this is the faithful last-wins-in-place).
 pub(crate) fn run_emission<T: Taggable>(
   meta: &T,
   opts: EmitOptions,
@@ -188,8 +233,12 @@ pub(crate) fn run_emission<T: Taggable>(
     // call. `write_value` is infallible (`Result<(), Infallible>`); the sink
     // keys on the family-1 group (`exiftool:2948` — only family-1 reaches the
     // `-G1` key) and owns the dedup.
+    // Read the tag's `Priority => N` BEFORE moving the inner `Tag` out, then
+    // hand it to the sink so the dedup applies the general ExifTool override
+    // rule (`ExifTool.pm:9544-9560`).
+    let priority = e.priority();
     let (group, name, value) = e.into_tag().into_parts();
-    let _ = out.write_value_doc(group.doc(), group.family1(), name.as_str(), value);
+    let _ = out.write_value_doc(group.doc(), group.family1(), name.as_str(), priority, value);
   }
 }
 
