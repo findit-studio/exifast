@@ -61,6 +61,7 @@
   "Track1:BufferSize": 0,
   "Track1:MaxBitrate": 7617822,
   "Track1:AverageBitrate": 7617822,
+  "Track1:VideoFrameRate": 29.97002997003,
   "Track2:TrackHeaderVersion": 0,
   "Track2:TrackCreateDate": "0000:00:00 00:00:00",
   "Track2:TrackModifyDate": "0000:00:00 00:00:00",
@@ -100,5 +101,6 @@
   "Track3:MediaDuration": 0.1001,
   "Track3:HandlerType": "tmcd",
   "Track3:HandlerDescription": "GoPro AVC  ",
-  "Track3:OtherFormat": "tmcd"
+  "Track3:OtherFormat": "tmcd",
+  "Track3:PlaybackFrameRate": 29.97002997
 }]

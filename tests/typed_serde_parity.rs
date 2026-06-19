@@ -140,16 +140,6 @@ const NOT_ACTIVE: &[&str] = &[
   // conformance test excludes exactly those tails and is byte-exact on
   // everything else).
   "QuickTime_insta360_real.insv",
-  // `QuickTime_gopro_hero8_gpmf.mp4` (the real HERO8 Black, #211/#189) — the
-  // gpmd timed-GPS Doc<N> port landed (#211, the `-ee` path is byte-exact). The
-  // no-`ee` `.json` container tags are now emitted through container phase 1
-  // (`stsd`), phase 2 (`colr`/`pasp`/`btrt`), and phase 4 (`vmhd`
-  // GraphicsMode/OpColor, `tref` TimecodeTrack, `gmhd`/`gmin`/`tcmi` Gen*/Text*).
-  // The ONLY residual no-`ee` gap is the two `stts`-derived frame rates
-  // (`Track1:VideoFrameRate`, `Track3:PlaybackFrameRate`) — a later
-  // QuickTime-container phase — so `quicktime_gopro_hero8_gpmf_conformance` stays
-  // `#[ignore]`d and this fixture is accept-deferred here until then.
-  "QuickTime_gopro_hero8_gpmf.mp4",
   // The #285 round-2 real-device fixtures (#109/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
   // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect, the
@@ -686,7 +676,11 @@ const NOT_ACTIVE: &[&str] = &[
 /// 530 → 531 after `DJI_Matrice30T.jpg` (#114) activated — the JFIF/MPF/DJI
 /// thermal port (`src/exif/jpeg_app.rs`) made it byte-exact, so it moves out of
 /// [`NOT_ACTIVE`] into the active set.
-const EXPECTED_ACTIVE_FIXTURES: usize = 531;
+/// 531 → 532 after `QuickTime_gopro_hero8_gpmf.mp4` activated — QuickTime
+/// container phase 7 emits the last two no-`ee` residual `stts`-derived frame
+/// rates (`Track1:VideoFrameRate`, `Track3:PlaybackFrameRate`), making the
+/// no-`ee` `.json`/`.n.json` byte-exact, so it moves out of [`NOT_ACTIVE`].
+const EXPECTED_ACTIVE_FIXTURES: usize = 532;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

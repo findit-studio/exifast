@@ -1249,6 +1249,40 @@ pub struct MediaTrack {
   /// QuickTime.pm:8280-8294). Present for a timecode track whose `gmhd` carries
   /// a `tmcd` `TimeCode` SubDirectory. Drives the `Track<N>` text-styling tags.
   tc_media_info: Option<TcMediaInfo>,
+  /// `minf/stbl/stts`-derived VideoFrameRate (`%QuickTime::TimeToSampleTable`
+  /// `stts` ⇒ `Name => 'VideoFrameRate'`, QuickTime.pm:7408-7417). The RAW
+  /// `CalcSampleRate` quotient (`Σ sampleCount * MediaTimeScale / Σ
+  /// sampleCount*sampleDelta`, QuickTime.pm:8856-8868) BEFORE the
+  /// `int($val*1000+0.5)/1000` PrintConv — stored raw so the `-n` path emits the
+  /// full `%.15g` value and the `-j` path applies the PrintConv. Computed ONLY
+  /// for a `vide`-handler track (`Condition => '$$self{MediaType} eq "vide"'`)
+  /// with a non-degenerate `stts` and a non-zero MediaTimeScale (else `None`,
+  /// matching `CalcSampleRate`'s `return undef unless $num and $dur and
+  /// $$et{MediaTS}`). Drives `Track<N>:VideoFrameRate`.
+  video_frame_rate: Option<f64>,
+  /// `minf/stbl/stsd` (OtherSampleDesc) PlaybackFrameRate — the `rational64u` at
+  /// sample-entry offset 24 of a `tmcd` timecode descriptor (`%OtherSampleDesc`
+  /// `24 => { Condition => '$$self{MetaFormat} eq "tmcd"', Name =>
+  /// 'PlaybackFrameRate', Format => 'rational64u' }`, QuickTime.pm:7807-7811).
+  /// Stored as the raw `(numerator, denominator)` `int32u` pair; the emission
+  /// builds a `Rational::rational64` (no PrintConv, so both `-j`/`-n` render the
+  /// `%.10g` quotient). `None` for a non-`tmcd` descriptor or a too-short entry.
+  /// Drives `Track<N>:PlaybackFrameRate`.
+  playback_frame_rate: Option<(u32, u32)>,
+  /// Whether this track's `stsd` sample description was decoded through the
+  /// `%OtherSampleDesc` fallback at PARSE TIME (QuickTime.pm:7370-7405). Set
+  /// `true` by the `stsd` decode when the handler SEEN SO FAR (file order)
+  /// routes to `%OtherSampleDesc`, capturing ExifTool's parse-order routing:
+  /// `$$self{HandlerType}` inits to `''` and is filled by the `hdlr` atom, so a
+  /// track whose `stsd` precedes its `hdlr` (or has no `hdlr`) decodes under the
+  /// empty handler and falls through to `%OtherSampleDesc` (`OtherFormat` at
+  /// offset 4, `PlaybackFrameRate` at offset 24) REGARDLESS of the handler the
+  /// `hdlr` later assigns. The `soun`/`vide`/`hint`/`meta` arms leave this
+  /// `false` (their `stsd` routes to their own sample-desc table). Gates BOTH
+  /// the `OtherFormat` and `PlaybackFrameRate` emission so the two are
+  /// consistent and faithful to the decode-time routing (a `meta`/`hint` track
+  /// whose `stsd` came BEFORE its `hdlr` emits BOTH, matching ExifTool).
+  routes_other_sample_desc: bool,
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427 `1 =>
   /// 'Track#'`). ExifTool's `$track` counter is a `my` local of each
   /// `ProcessMOV` invocation (QuickTime.pm:9944) that increments per `trak`
@@ -1305,6 +1339,9 @@ impl MediaTrack {
       timecode_track: None,
       gen_media_info: None,
       tc_media_info: None,
+      video_frame_rate: None,
+      playback_frame_rate: None,
+      routes_other_sample_desc: false,
       track_group: None,
       warning: None,
     }
@@ -1531,6 +1568,33 @@ impl MediaTrack {
   #[must_use]
   pub const fn tc_media_info(&self) -> Option<&TcMediaInfo> {
     self.tc_media_info.as_ref()
+  }
+
+  /// The raw `stts`-derived VideoFrameRate quotient (BEFORE the
+  /// `int($val*1000+0.5)/1000` PrintConv). `None` for a non-video track or a
+  /// degenerate sample table.
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_frame_rate(&self) -> Option<f64> {
+    self.video_frame_rate
+  }
+
+  /// The `tmcd` PlaybackFrameRate as the raw `(numerator, denominator)`
+  /// `rational64u` pair (sample-entry offset 24). `None` when absent.
+  #[inline(always)]
+  #[must_use]
+  pub const fn playback_frame_rate(&self) -> Option<(u32, u32)> {
+    self.playback_frame_rate
+  }
+
+  /// Whether this track's `stsd` was decoded through the `%OtherSampleDesc`
+  /// fallback at parse time (the handler seen so far, file order, was not
+  /// `soun`/`vide`/`hint`/`meta`). Gates the `OtherFormat` + `PlaybackFrameRate`
+  /// emission.
+  #[inline(always)]
+  #[must_use]
+  pub const fn routes_other_sample_desc(&self) -> bool {
+    self.routes_other_sample_desc
   }
 
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427), reset
@@ -1773,6 +1837,29 @@ impl MediaTrack {
   #[inline(always)]
   pub fn set_tc_media_info(&mut self, v: Option<TcMediaInfo>) -> &mut Self {
     self.tc_media_info = v;
+    self
+  }
+
+  /// Set the raw `stts`-derived VideoFrameRate quotient.
+  #[inline(always)]
+  pub const fn set_video_frame_rate(&mut self, v: Option<f64>) -> &mut Self {
+    self.video_frame_rate = v;
+    self
+  }
+
+  /// Set the `tmcd` PlaybackFrameRate `(numerator, denominator)` pair.
+  #[inline(always)]
+  pub const fn set_playback_frame_rate(&mut self, v: Option<(u32, u32)>) -> &mut Self {
+    self.playback_frame_rate = v;
+    self
+  }
+
+  /// Mark this track's `stsd` as decoded through the `%OtherSampleDesc`
+  /// fallback (set by the parser at `stsd`-decode time when the handler seen so
+  /// far routes to `%OtherSampleDesc`).
+  #[inline(always)]
+  pub const fn set_routes_other_sample_desc(&mut self, v: bool) -> &mut Self {
+    self.routes_other_sample_desc = v;
     self
   }
 
