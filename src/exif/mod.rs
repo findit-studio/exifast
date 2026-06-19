@@ -623,6 +623,24 @@ enum ResolvedConv {
   /// dedicated capture loop emits (the parent pointer is never emitted, the
   /// Nikon/Pentax SubDirectory pattern).
   Samsung(&'static makernotes::vendors::samsung::tags::SamsungTag),
+  /// A Leica maker-note leaf (`%Panasonic::Leica2`..`Leica9` descriptor, #259).
+  /// Carries the resolved
+  /// [`LeicaTag`](makernotes::vendors::leica::tags::LeicaTag) PLUS the
+  /// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant) it
+  /// resolved under, so the emit ([`emit_leica_value`]) reapplies its
+  /// [`LeicaPrintConv`](makernotes::vendors::leica::printconv::LeicaPrintConv)
+  /// and evaluates its row `Condition` (the Leica5 0x0303 `$format eq "string"`
+  /// gate, the Leica6 Typ-006 rows). Leica is a SIMPLE vendor like
+  /// Pentax/Samsung: a plain LEAF table walked under
+  /// `active_table == TableRef::Leica(variant)`; the deferred SubDirectory /
+  /// binary rows are absent from the tables. The dispatcher fans the EIGHT
+  /// detected signatures (Leica2..Leica9) onto the SIX table-bearing variants
+  /// (Leica7→Leica6, Leica8→Leica5) and supplies the per-variant
+  /// `Start`/`Base`/`ByteOrder`, which the shared `Walker` applies.
+  Leica(
+    makernotes::vendors::leica::tags::LeicaVariant,
+    &'static makernotes::vendors::leica::tags::LeicaTag,
+  ),
 }
 
 impl ResolvedConv {
@@ -647,6 +665,9 @@ impl ResolvedConv {
       ResolvedConv::Nikon(_) => vendor_group1_of(TableRef::Nikon),
       ResolvedConv::Pentax(_) => vendor_group1_of(TableRef::Pentax),
       ResolvedConv::Samsung(_) => vendor_group1_of(TableRef::Samsung),
+      // Every Leica variant emits under the `Leica` family-1 group; the
+      // discriminant carries the variant, so `vendor_group1_of` resolves it.
+      ResolvedConv::Leica(variant, _) => vendor_group1_of(TableRef::Leica(variant)),
     }
   }
 }
@@ -709,6 +730,11 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // 'MakerNotes' }`, so family-1 follows family-0's `MakerNotes`→vendor
     // mapping — `exiftool -j -G1` emits `Samsung:LensType` on a Samsung body).
     TableRef::Samsung => Some("Samsung"),
+    // `%Panasonic::Leica2`..`Leica9` (#259). Every Leica variant table declares
+    // `GROUPS => { 1 => 'Leica' }` (`Panasonic.pm`), so `exiftool -j -G1` emits
+    // `Leica:LensType` on a Leica body — distinct from the Leica1/Leica10
+    // cross-vendor routes (which emit `Panasonic:*` via `%Panasonic::Main`).
+    TableRef::Leica(_) => Some("Leica"),
     TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
@@ -854,6 +880,32 @@ enum MakerNoteValueConvDecode<'a> {
     detected: makernotes::DetectedMakerNote,
     order: ByteOrder,
     make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Leica2..Leica9 — re-drive the SHARED `Walker`'s Leica variant walk +
+  /// emission capture ([`leica_makernote_isolated`]) with `print_conv = false`
+  /// (#259). The walk is deterministic across the PrintConv flag (same bytes,
+  /// same `detected` modes; only the per-leaf render differs), so the recomputed
+  /// `-n` emissions are byte-identical to the eager `-n` cache. The resolved
+  /// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant) selects the
+  /// table; the dispatched `detected` carries the body offset / `Base` rule /
+  /// `Unknown` byte order. `model` is the parent `$$self{Model}` the Leica6
+  /// Typ-006 `Condition` reads (retained so the `-n` recompute gates the same
+  /// rows as the `-j` decode). Distinct from [`Leica1`](Self::Leica1) /
+  /// [`Leica10`](Self::Leica10), which decode through `%Panasonic::Main`.
+  Leica {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    variant: makernotes::vendors::leica::tags::LeicaVariant,
+    detected: makernotes::DetectedMakerNote,
+    order: ByteOrder,
+    /// The parent TIFF base (the base of the IFD that contained the 0x927c
+    /// MakerNote entry). Leica7's `Base => '-$base'` ([`NegativeOfBase`]
+    /// (makernotes::BaseRule::NegativeOfBase)) rebases absolute value pointers
+    /// to the slice via `-parent_base`, so the `-n` recompute must replay the
+    /// SAME base the eager `-j` walk used (nonzero for an embedded JPEG `APP1`).
+    parent_base: u32,
     model: Option<smol_str::SmolStr>,
   },
 }
@@ -1062,6 +1114,38 @@ impl MakerNoteValueConvDecode<'_> {
           *detected,
           *order,
           make.as_deref(),
+          model.as_deref(),
+          false,
+        )
+        .map(|(e, _)| e)
+        .unwrap_or_default()
+      }
+      MakerNoteValueConvDecode::Leica {
+        data,
+        mn_offset,
+        mn_len,
+        variant,
+        detected,
+        order,
+        parent_base,
+        model,
+      } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and
+        // the typed slot discarded (the `-n` path needs only the ValueConv
+        // emissions), mirroring the other vendors (#259). A blob that walked in
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes +
+        // variant are PrintConv-independent), so `Some` always holds;
+        // `unwrap_or_default` is the defensive empty `Vec` for the impossible
+        // `None`. `parent_base` replays the eager walk's parent TIFF base so the
+        // Leica7 `-$base` rebase is identical across modes.
+        leica_makernote_isolated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *variant,
+          *detected,
+          *order,
+          *parent_base,
           model.as_deref(),
           false,
         )
@@ -3876,6 +3960,11 @@ impl Walker<'_, '_> {
       // Walker's verbose-only omit) — the deferred Crypt/SubDirectory rows are
       // simply absent from `SAMSUNG_TAGS`.
       TableRef::Samsung => makernotes::vendors::samsung::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Panasonic::Leica2`..`Leica9` (#259). The name resolves against the
+      // ACTIVE variant's own table (the variant rides in the `TableRef::Leica`
+      // payload). An unknown id yields `None` (the deferred SubDirectory /
+      // binary rows are absent from the tables), the verbose-only omit.
+      TableRef::Leica(v) => makernotes::vendors::leica::tags::lookup(v, tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -4384,6 +4473,12 @@ impl Walker<'_, '_> {
       // active Samsung table exactly as the Sony/Pentax walks do, recomputing
       // the count per `int(size/elemsize)` (`Exif.pm:6743`).
       TableRef::Samsung => makernotes::vendors::samsung::format_override(tag_id),
+      // `%Panasonic::Leica2`..`Leica9` (#259) carry their OWN `Format =>`
+      // directives — the `rational64s` `ExternalSensorBrightnessValue` /
+      // `MeasuredLV` rows (Leica2/6/9 0x311/0x312) + the Leica5 0x040d
+      // `ExposureMode` int8u[4] row. The Walker resolves them off the active
+      // Leica variant table exactly as Sony/Pentax/Samsung do.
+      TableRef::Leica(v) => makernotes::vendors::leica::format_override(v, tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -5543,6 +5638,50 @@ impl Walker<'_, '_> {
                   // tags ⇒ bundled emits them under the `Panasonic` family-1
                   // group.
                   emission_group1 = makernotes::Vendor::Panasonic.group1();
+                } else if let Some(variant) =
+                  makernotes::vendors::leica::discriminate_variant(bytes, make, model)
+                {
+                  // The Leica2..Leica9 variant tables (#259). Leica1/Leica10
+                  // (the cross-vendor `%Panasonic::Main` routes) did not match,
+                  // so re-discriminate WHICH variant the dispatcher matched and
+                  // walk its OWN table in a FRESH, ISOLATED `Walker`
+                  // ([`leica_makernote_isolated`]). The dispatched `detected`
+                  // carries the per-variant `Start`/`Base`/`ByteOrder` the helper
+                  // threads (Leica2 `$start`, Leica4/5/8 `$start - 8`,
+                  // Leica3/6/9 inherit, Leica7 `-$base` ⇒ `-parent_base`, which
+                  // is `self.base` below — 0 for a standalone TIFF, nonzero for
+                  // an embedded JPEG `APP1`).
+                  // `model` threads `$$self{Model}` for the Leica6 Typ-006
+                  // `Condition`. The walk DISCARDS its `warnings` / `warn_count` /
+                  // `active_ifd_offsets` / `chain_guard`. These tags emit under
+                  // the `Leica` family-1 group (they ARE `%Panasonic::Leica*`
+                  // tags, `GROUPS => { 1 => 'Leica' }`). `print_conv = true`
+                  // yields the cached `-j` emissions + the typed slot; the `-n`
+                  // emissions are recomputed on demand via the SAME helper.
+                  // `self.base` is the parent TIFF base of the IFD that holds
+                  // this 0x927c entry — 0 for a standalone TIFF, NONZERO for an
+                  // embedded JPEG `APP1` Exif block (sliced at its file offset
+                  // and walked with that base). Leica7's `Base => '-$base'`
+                  // rebases absolute value pointers to the slice via
+                  // `-self.base`; the other variants ignore it.
+                  if let Some((emi_pc, typed_pc)) = leica_makernote_isolated(
+                    self.data, mn_offset, mn_len, variant, detected, self.order, self.base, model,
+                    true,
+                  ) {
+                    meta.set_leica(typed_pc);
+                    cached_pc = emi_pc;
+                    value_conv_decode = MakerNoteValueConvDecode::Leica {
+                      data: self.data,
+                      mn_offset,
+                      mn_len,
+                      variant,
+                      detected,
+                      order: self.order,
+                      parent_base: self.base,
+                      model: model.map(smol_str::SmolStr::new),
+                    };
+                    emission_group1 = variant.group1();
+                  }
                 }
               }
               makernotes::Vendor::Dji => {
@@ -5958,6 +6097,15 @@ impl Walker<'_, '_> {
       // `next unless $tagInfo` skip.
       TableRef::Samsung => match makernotes::vendors::samsung::tags::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Samsung(t)),
+        None => return,
+      },
+      // `%Panasonic::Leica2`..`Leica9` (#259). The resolved [`LeicaTag`] rides in
+      // `ResolvedConv::Leica` WITH its variant so the emit ([`emit_leica_value`])
+      // reapplies its `LeicaPrintConv` + evaluates the row `Condition`. An unknown
+      // Leica tag is skipped here (the deferred SubDirectory/binary rows), matching
+      // `ProcessExif`'s `next unless $tagInfo` skip.
+      TableRef::Leica(v) => match makernotes::vendors::leica::tags::lookup(v, tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Leica(v, t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
@@ -7084,6 +7232,22 @@ fn emit_entry<S: ExifSink>(
       let group1 = entry.conv.vendor_group1().unwrap_or(group);
       emit_samsung_value(group1, entry, samsung_tag, print_conv, None, out)
     }
+    // `%Panasonic::Leica2`..`Leica9` (#259). Like Pentax/Samsung, the production
+    // Leica capture runs in the dedicated isolated walker
+    // ([`leica_makernote_isolated`]), and no core-IFD walk produces a
+    // `ResolvedConv::Leica` entry (Leica leaves exist only under
+    // `active_table == TableRef::Leica(_)`). This arm keeps the match exhaustive:
+    // a plain LEAF renders via `emit_leica_value` (which also evaluates the row
+    // `Condition`).
+    ResolvedConv::Leica(variant, leica_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      // The defensive `emit_entry` arm never carries the Leica Typ-006 model
+      // (the production Leica capture is the isolated walker, which threads it);
+      // pass `None` here (a core-IFD walk never produces a Leica entry anyway).
+      emit_leica_value(
+        group1, entry, variant, leica_tag, None, print_conv, None, out,
+      )
+    }
   }
 }
 
@@ -7228,6 +7392,67 @@ fn emit_samsung_value<S: ExifSink>(
     value,
     samsung_tag.is_unknown(),
   )
+}
+
+/// Render ONE Leica maker-note LEAF into the sink — the emit-time reproduction
+/// of `%Panasonic::Leica2`..`Leica9`'s per-tag emit through the shared `Walker`
+/// (#259).
+///
+/// Leica is a SIMPLE vendor like Pentax/Samsung, with ONE wrinkle: some rows
+/// carry a `Condition` that gates emission (the faithful port of ExifTool's
+/// `GetTagInfo` returning no tag when the `Condition` fails). This emit:
+///
+/// 1. Evaluates the row `Condition` against the entry — the Leica5 0x0303
+///    `LensType` `$format eq "string"` gate (read off [`ExifEntry::on_disk_format`])
+///    and the Leica6 Typ-006 rows (`$$self{Model} =~ /Typ 006/`, threaded as
+///    `model`). A failing `Condition` writes NOTHING (no emission, no typed
+///    populate) — the absent-tag behaviour.
+/// 2. Applies the resolved tag's
+///    [`LeicaPrintConv`](makernotes::vendors::leica::printconv::LeicaPrintConv)
+///    (taken BY VALUE — the conv is `Copy`) on the entry's RAW value.
+/// 3. Writes the already-rendered [`TagValue`] under `("MakerNotes", group1)`.
+///    No Leica leaf is `Unknown => 1`, so the flag is always `false`.
+///
+/// `typed` is the optional sink for the typed `MakerNotesLeica` populate (lens +
+/// serial) — `Some` only for the production capture; `populate_typed` runs only
+/// where the leaf emits (gate-passing), mirroring the other vendors.
+///
+/// `model` is the parent `$$self{Model}`, consumed only by the Leica6 Typ-006
+/// `Condition`; every other Leica row ignores it.
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+fn emit_leica_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  variant: makernotes::vendors::leica::tags::LeicaVariant,
+  leica_tag: &makernotes::vendors::leica::tags::LeicaTag,
+  model: Option<&str>,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::leica::MakerNotesLeica>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::leica::tags::LeicaCondition;
+  // Row `Condition` gate. A failing Condition ⇒ `GetTagInfo` returns no tag ⇒
+  // emit NOTHING and populate NO typed field (the absent-tag behaviour).
+  if let Some(cond) = leica_tag.condition() {
+    let holds = match cond {
+      // `$format eq "string"` — the entry's ON-DISK format is `string` (ASCII).
+      LeicaCondition::FormatIsString => entry.on_disk_format == crate::exif::ifd::Format::Ascii,
+      // `$$self{Model} =~ /Typ 006/` — the captured Model contains "Typ 006".
+      LeicaCondition::ModelTyp006 => model.is_some_and(|m| m.contains("Typ 006")),
+    };
+    if !holds {
+      return Ok(());
+    }
+  }
+  let raw = entry.value.raw();
+  let value = leica_tag.conv.apply(raw, print_conv);
+  // Populate the typed surface (gate-passing only, exactly where the leaf emits).
+  if let Some(typed) = typed {
+    makernotes::vendors::leica::populate_typed(typed, variant, entry.tag_id, &value, raw);
+  }
+  // No Leica leaf is `Unknown => 1`.
+  out.write_vendor_value("MakerNotes", group1, leica_tag.name(), value, false)
 }
 
 /// Render ONE Sony maker-note leaf into the sink — the emit-time reproduction of
@@ -9274,6 +9499,197 @@ pub(in crate::exif) fn samsung_makernote_isolated(
         g1,
         entry,
         samsung_tag,
+        print_conv,
+        Some(&mut typed),
+        &mut sink,
+      );
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk a Leica MakerNote variant IFD (`%Panasonic::Leica2`..`Leica9`) in a
+/// FRESH, ISOLATED [`Walker`] and capture its emissions + the typed
+/// [`MakerNotesLeica`](makernotes::vendors::leica::MakerNotesLeica) — the single
+/// entry point BOTH the `-j` production dispatch and the `-n` recompute drive
+/// (#259, structural isolation, mirroring [`samsung_makernote_isolated`]).
+///
+/// `variant` selects which of the SIX Leica tables the walk resolves against
+/// (the dispatcher fanned the EIGHT detected signatures onto the table-bearing
+/// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant), with
+/// Leica7→Leica6 and Leica8→Leica5). `detected` carries the dispatched
+/// `Start`/`Base`/`ByteOrder` the Walker applies.
+///
+/// ## Base-rule mapping (the Leica7 `NegativeOfBase` note)
+///
+/// The Leica variants use four base rules:
+/// - **Leica2** `Base => '$start'` ([`StartItself`](makernotes::BaseRule::StartItself))
+///   — out-of-line offsets are BLOB-body-relative ⇒ `value_offset_base =
+///   mn_offset + body_offset` (the file offset of the child IFD start).
+/// - **Leica4/Leica5/Leica8** `Base => '$start - 8'`
+///   ([`RelativeToStart(-8)`](makernotes::BaseRule::RelativeToStart)) — with
+///   `body_offset == 8` the child base is `mn_offset` ⇒ `value_offset_base =
+///   mn_offset` (blob-start-relative, the M9 fixup).
+/// - **Leica3/Leica6/Leica9** no `Base` ([`Inherit`](makernotes::BaseRule::Inherit))
+///   — offsets are parent-TIFF-relative against `data` ⇒ `value_offset_base = 0`.
+/// - **Leica7** `Base => '-$base'`
+///   ([`NegativeOfBase`](makernotes::BaseRule::NegativeOfBase)) — the child's
+///   out-of-line value pointers are ABSOLUTE FILE offsets, so they must be
+///   rebased to the slice `data` by SUBTRACTING the parent TIFF base ⇒
+///   `value_offset_base = -parent_base` (`parent_base` = the base of the IFD
+///   that contains this MakerNote entry). For a standalone / base-0 TIFF
+///   `parent_base == 0` ⇒ `-0`, identical to `Inherit` (an absolute pointer
+///   resolves directly against `data`). But a real JPEG `APP1` Exif block is
+///   SLICED at its NONZERO file offset and walked with that base retained, so an
+///   absolute Leica7 pointer `P` resolves at `data[P - parent_base]` — the
+///   slice-relative index. `value_offset_base` is SIGNED, so the negated base is
+///   expressible directly; the resolution site range-checks `off_signed >= 0`
+///   AND `off + size <= len`, so a pointer landing outside the slice is dropped
+///   (never wrapped). (The Leica7 *trailer* layout some JPEGs use — a
+///   `ProcessLeicaTrailer` blob with its own absolute base — is a separate,
+///   deferred case; the inline-IFD path here is byte-exact vs the `perl
+///   exiftool` oracle on the crafted standalone + nonzero-base Leica7 fixtures.)
+///
+/// A degenerate too-short blob (no room for the IFD count word) returns
+/// `Some(empty)` (vendor identified, nothing decoded), never `None`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+pub(in crate::exif) fn leica_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  variant: makernotes::vendors::leica::tags::LeicaVariant,
+  detected: makernotes::DetectedMakerNote,
+  parent_order: ByteOrder,
+  parent_base: u32,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::leica::MakerNotesLeica,
+)> {
+  use makernotes::vendors::leica::MakerNotesLeica;
+  // The captured MakerNote bytes the dispatcher classified
+  // (`data[mn_offset .. mn_offset + mn_len]`, saturating end clamped).
+  let mn_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let _blob = data.get(mn_offset..mn_end)?;
+  // The child IFD start: the MakerNote value offset + the dispatched body offset
+  // (8 for every Leica2..Leica9 variant). The IFD count word must sit inside the
+  // declared value, else a truncated `mn_len` lets the Walker read its count word
+  // from the UNRELATED following parent-TIFF bytes — spurious tags.
+  let body_offset = detected.body_offset() as usize;
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  match body_offset.checked_add(2) {
+    Some(min) if mn_len >= min => {}
+    _ => return Some((std::vec::Vec::new(), MakerNotesLeica::new())),
+  }
+  // Translate the dispatched `Base` rule into the `value_offset_base` shift (see
+  // the doc comment). `StartItself` ⇒ the child IFD start file offset; `$start -
+  // 8` (RelativeToStart, body_offset 8) ⇒ `mn_offset`; `Inherit` ⇒ 0; Leica7's
+  // `NegativeOfBase` ⇒ `-parent_base` (an absolute child pointer rebased to the
+  // slice; see below).
+  let value_offset_base: i64 = match detected.base_rule() {
+    makernotes::BaseRule::Inherit => 0,
+    // `Base => '$start'` — out-of-line offsets are relative to the child IFD
+    // start file offset (`mn_offset + body_offset`, ExifTool's `$start`).
+    makernotes::BaseRule::StartItself => i64::try_from(ifd_offset).unwrap_or(i64::MAX),
+    // `Base => '$start + delta'` — the child base is `$start + delta` =
+    // `mn_offset + body_offset + delta` (for Leica4/5/8 with delta -8 and
+    // body_offset 8 this is `mn_offset`, the blob start). Computed in i64;
+    // clamped non-negative (a degenerate negative result lands past EOF).
+    makernotes::BaseRule::RelativeToStart(delta) => {
+      (i64::try_from(ifd_offset).unwrap_or(i64::MAX) + i64::from(delta)).max(0)
+    }
+    // `Base => '-$base'` — Leica7. Out-of-line value pointers are ABSOLUTE FILE
+    // offsets, so they must be rebased to the slice `data` by subtracting the
+    // parent TIFF base: an absolute pointer `P` resolves at `data[P -
+    // parent_base] = data[P + value_offset_base]` with `value_offset_base =
+    // -parent_base` (`value_offset_base` is SIGNED; the resolution site
+    // range-checks `off_signed >= 0 && off + size <= len`, so a pointer landing
+    // before/after the slice is dropped, never wrapped). `parent_base` is the
+    // base of the IFD that CONTAINS this 0x927c entry — 0 for a standalone /
+    // base-0 TIFF (⇒ `-0`, identical to `Inherit`), but NONZERO for a real JPEG
+    // `APP1` Exif block (sliced at its file offset, walked with that base). The
+    // OLD code hardcoded 0 here and read embedded-APP1 Leica7 out-of-line values
+    // from the wrong offset / out of bounds.
+    makernotes::BaseRule::NegativeOfBase => -i64::from(parent_base),
+    makernotes::BaseRule::Literal(n) if n >= 0 => n,
+    _ => 0,
+  };
+  // `ByteOrder => Unknown` ⇒ probe the entry-count word; `Explicit(o)` ⇒ fixed.
+  let byte_order_rule = match detected.byte_order() {
+    makernotes::ChildByteOrder::Unknown => ByteOrderRule::Unknown,
+    makernotes::ChildByteOrder::Explicit(o) => ByteOrderRule::Fixed(o),
+  };
+  // No Leica2..Leica9 variant sets `FixBase` (`MakerNotes.pm:611-721`).
+  let fix_base_mode = if detected.fix_base() {
+    FixBaseMode::Heuristic
+  } else {
+    FixBaseMode::No
+  };
+  let mut w = Walker {
+    data,
+    order: parent_order,
+    base: 0,
+    value_offset_base,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Leica entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream.
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
+    // leaf reads Make.
+    captured_make: None,
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    file_type: None,
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Leica(variant))` swaps
+    // it to the Leica variant table for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Leica variant IFD walk — `ProcessProc::Exif` directly (the Leica2..Leica9
+  // tables carry no `PROCESS_PROC`; only their deferred binary sub-tables do). The
+  // probed order is resolved inside `process_subdir`. It appends the Leica leaves
+  // to `w.entries` from index 0, isolating every core side effect from the parent.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Leica(variant),
+    byte_order_rule,
+    fix_base_mode,
+    ProcessProc::Exif,
+  );
+  // Capture the walked `ResolvedConv::Leica` leaves into the vendor-emission
+  // `Vec`; build the typed `MakerNotesLeica` from the SAME gate-passing entries.
+  let g1 = vendor_group1_of(TableRef::Leica(variant)).unwrap_or("Leica");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = MakerNotesLeica::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // Only `ResolvedConv::Leica` entries live in this run; a defensive
+      // non-Leica conv (never produced under `TableRef::Leica`) is skipped.
+      let ResolvedConv::Leica(entry_variant, leica_tag) = entry.conv else {
+        continue;
+      };
+      let Ok(()) = emit_leica_value(
+        g1,
+        entry,
+        entry_variant,
+        leica_tag,
+        model,
         print_conv,
         Some(&mut typed),
         &mut sink,
