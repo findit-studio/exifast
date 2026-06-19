@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "M2TS_h264_mdpm.mts",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
+  "File:FileType": "M2TS",
+  "File:FileTypeExtension": "MTS",
+  "File:MIMEType": "video/m2ts",
+  "H264:ImageWidth": 1920,
+  "H264:ImageHeight": 1088,
+  "H264:DateTimeOriginal": "2020:06:15 12:30:00+00:00",
+  "H264:Make": 264,
+  "GPS:GPSLatitudeRef": "N",
+  "GPS:GPSLatitude": 48,
+  "GPS:GPSLongitudeRef": "E",
+  "GPS:GPSLongitude": 11,
+  "M2TS:Duration": 0.0333666666666667
+}]

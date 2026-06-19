@@ -3806,3 +3806,30 @@ fn pruveeo_d90_noee_no_ligogps_byte_exact() {
     NO_EXCL,
   );
 }
+
+// ── M2TS: AVCHD H.264 SEI/MDPM per-frame timed GPS (#304) ─────────────────────
+
+// A CRAFTED 192-byte (BDAV) M2TS whose H.264 (0x1b) PES carries TWO access
+// units, each an SEI/MDPM block (UUID 17ee8c60…MDPM) with DIFFERENT timed
+// values: frame 1 — SPS (1920x1088) + DateTimeOriginal 2020 + GPS 48N/11E;
+// frame 2 — DateTimeOriginal 2021 + GPS 49N/12E. ExifTool processes EVERY SEI
+// at `-ee` (H264.pm:1079-1082: past the first user-data SEI it sets `DOC_NUM =
+// $$et{GotNAL06}` and re-enters `ProcessSEI`), so each LATER frame's MDPM is
+// emitted under the per-frame `Doc<N>` sub-document axis.
+//
+//   * `-ee -G3:1` — frame 1's MDPM at `H264:`/`GPS:` (Main) and frame 2's at
+//     `Doc1:H264:DateTimeOriginal` / `Doc1:GPS:GPSLatitude` etc. (the AVCHD
+//     timed-GPS extraction this fixture exists to pin).
+//   * `-ee -G1` — the `Doc<N>` axis collapses to the FIRST fix (frame 1 only),
+//     the same first-fix-wins the LIGOGPS / mebx timed sources show; byte-
+//     identical to the no-`ee` `.json` (modulo the suppressed `[minor]
+//     ExtractEmbedded` warning, which `-ee` drops, M2TS.pm:347).
+//
+// Goldens are bundled `perl exiftool -ee` (`.ee.json`, family-1) / `-ee -G3:1`
+// (`.ee.g3.json`, the `Doc<N>:` axis), `System:*` + `Composite:*` stripped (the
+// M2TS precedent — the port has no Composite subsystem).
+#[test]
+fn m2ts_h264_mdpm_ee_byte_exact() {
+  check_ee("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.ee.json", false);
+  check_ee("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.ee.g3.json", true);
+}

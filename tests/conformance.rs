@@ -1014,6 +1014,28 @@ fn m2ts_conformance() {
 }
 
 #[test]
+fn m2ts_h264_mdpm_multiframe_noee_conformance() {
+  // #304 — a CRAFTED 192-byte (BDAV) M2TS carrying an H.264 (0x1b) PES with TWO
+  // access units, each an SEI/MDPM block with DIFFERENT timed values:
+  //   frame 1 — SPS (1920x1088) + MDPM DateTimeOriginal 2020 + GPS 48N/11E;
+  //   frame 2 — MDPM DateTimeOriginal 2021 + GPS 49N/12E.
+  //
+  // This NO-`ee` golden pins the bundled `ParseH264Video` first-frame behavior
+  // (H264.pm:1079-1082): without `-ee` the `GotNAL06` latch suppresses every
+  // SEI after the first, so ONLY frame 1's MDPM (DateTimeOriginal + GPS) is
+  // extracted, plus the `[minor] ExtractEmbedded` hint (M2TS.pm:349-351). The
+  // per-frame `-ee` `Doc<N>` extraction is pinned in
+  // `tests/timed_metadata_conformance.rs::m2ts_h264_mdpm_ee_byte_exact`.
+  //
+  // Goldens are bundled `perl exiftool -j -G1 -struct` with `System:*` +
+  // `Composite:*` stripped (the M2TS precedent — the Composite engine is a
+  // deferred Phase-2 forward item; the bundled output synthesizes
+  // `Composite:GPSLatitude`/`Longitude`/`Position` from the H.264/GPS values).
+  check("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.json", true);
+  check("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.n.json", false);
+}
+
+#[test]
 fn quicktime_nested_size0_conformance() {
   // PR #38 Codex R1/F5: a SYNTHETIC `.mov` whose `moov` contains a size-0
   // `free` atom (a CONTAINED zero-size = terminator, QuickTime.pm:10036-

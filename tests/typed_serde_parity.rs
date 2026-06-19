@@ -697,7 +697,12 @@ const NOT_ACTIVE: &[&str] = &[
 /// 536 → 537 after `MPEG2_TS_pruveeo_d90.ts` (#138/#129) activated — the M2TS
 /// LIGOGPSINFO dashcam timed-GPS port landed (`src/formats/m2ts.rs`), whose
 /// no-`ee` `.json`/`.n.json` (M2TS/H264, Composite-excluded) are byte-exact.
-const EXPECTED_ACTIVE_FIXTURES: usize = 537;
+/// 537 → 538 after `M2TS_h264_mdpm.mts` (#304) activated — the crafted 2-frame
+/// AVCHD H.264 SEI/MDPM fixture (mode-aware per-frame `-ee` MDPM, the AVCHD
+/// timed GPS / DateTimeOriginal). Its no-`ee` `.json`/`.n.json` carry only the
+/// FIRST frame's MDPM (the `GotNAL06` latch suppresses later SEI at no-`ee`),
+/// byte-exact (M2TS/H264/GPS, Composite-excluded).
+const EXPECTED_ACTIVE_FIXTURES: usize = 538;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

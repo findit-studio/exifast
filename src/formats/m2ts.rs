@@ -1671,9 +1671,12 @@ impl<'a> Walker<'a> {
         // The result is fully owned (the only `'a`-bearing field is a phantom —
         // see `H264Meta::into_rebound`); re-stamp the phantom to the M2TS Meta's
         // `'a` so it can live on the M2TS [`Meta<'a>`].
-        let new_h =
-          crate::formats::h264::parse_borrowed_stateful(payload, &mut self.h264_frame_state)
-            .map(crate::formats::h264::H264Meta::into_rebound);
+        let new_h = crate::formats::h264::parse_borrowed_stateful(
+          payload,
+          &mut self.h264_frame_state,
+          self.extract_embedded,
+        )
+        .map(crate::formats::h264::H264Meta::into_rebound);
         // H264.pm — any `$et->Warn` raised INSIDE `ParseH264Video`/`ProcessSEI`
         // (the MDPM out-of-sequence H264.pm:989 / forbidden-bit H264.pm:1058)
         // fires AT THIS WALK POSITION, before the M2TS minor warning below
@@ -1753,18 +1756,16 @@ impl<'a> Walker<'a> {
         // SCOPE — at `-ee` the full scan reaches EVERY PID (incl. the GPS 0x300
         // stream near EOF): the `-ee`-gated full scan is what makes the
         // LIGOGPSINFO PES extraction (the `type==6 $pid==0x0300` arm below)
-        // reachable. The full scan can also now REACH a FIRST user-data SEI that
-        // lay past the no-`ee` early-stop, and processing it at `-ee` is correct
-        // (ExifTool `-ee` processes H.264 SEI). What is STILL deferred is the
-        // per-frame LATER-SEI/MDPM `-ee` processing (the AVCHD timed-GPS domain:
-        // MDPM GPS + the exposure update from LATER frames — M2TS.pm:347 +
-        // H264.pm:1079-1082 `next unless ExtractEmbedded`): the stateful H.264
-        // decoder's `GotNAL06` latch (h264.rs:1419 — `got_nal06` ⇒ `continue`,
-        // UNCONDITIONAL of the render mode) still suppresses every SEI AFTER the
-        // first user-data SEI even at `-ee`. Threading `ExtractEmbedded` into the
-        // H.264 decoder so later SEI/MDPM records are processed at `-ee` is a
-        // substantial separate feature (AVCHD timed GPS), deferred to #304 (the
-        // AVCHD #132 domain).
+        // reachable, AND it hands every LATER H.264 frame's PES to
+        // `parse_borrowed_stateful`. The AVCHD per-frame timed MDPM (GPS +
+        // DateTimeOriginal + exposure of LATER frames, the #304 domain) is now
+        // processed there: `self.extract_embedded` is threaded into the H.264
+        // decoder (H264.pm:1081), so a user-data SEI past the first is decoded
+        // under the per-frame `Doc<N>` axis (`DOC_NUM = $$et{GotNAL06}`,
+        // H264.pm:1082) instead of being suppressed by the `GotNAL06` latch. At
+        // no-`ee` the latch still suppresses every later SEI (byte-identical
+        // no-`ee` output), and `-ee -G1` collapses the per-frame `Doc<N>` to the
+        // FIRST fix (the same first-fix-wins the LIGOGPS / mebx sources show).
         //
         // `ParseH264Video`'s own `$more` (H264.pm:1100-1104): want one more frame
         // ONLY when this frame carried no user data and we have not already
