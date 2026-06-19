@@ -9564,11 +9564,7 @@ fn dji_thermal_rjpeg_conformance() {
   // dataset. Contains DJI MakerNote with thermal data (ThermalData, Emissivity,
   // AmbientTemperature, ObjectDistance, RelativeHumidity, ReflectedTemperature,
   // ThermalCalibration, SensorID). Unblocks #109.
-  check(
-    "DJI_M3T_thermal.RJPEG",
-    "DJI_M3T_thermal.RJPEG.json",
-    true,
-  );
+  check("DJI_M3T_thermal.RJPEG", "DJI_M3T_thermal.RJPEG.json", true);
   check(
     "DJI_M3T_thermal.RJPEG",
     "DJI_M3T_thermal.RJPEG.n.json",
@@ -9581,16 +9577,8 @@ fn dji_thermal_rjpeg_conformance() {
 fn dji_matrice30t_conformance() {
   // DJI Matrice 30T (M30T) thermal JPEG from HuggingFace STRDrones/DJI
   // dataset. Matrice-series enterprise drone with DJI MakerNote. Unblocks #114.
-  check(
-    "DJI_Matrice30T.jpg",
-    "DJI_Matrice30T.jpg.json",
-    true,
-  );
-  check(
-    "DJI_Matrice30T.jpg",
-    "DJI_Matrice30T.jpg.n.json",
-    false,
-  );
+  check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.json", true);
+  check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.n.json", false);
 }
 
 #[test]

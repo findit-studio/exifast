@@ -1,6 +1,6 @@
 [{
   "SourceFile": "Insta360ONE_equirectangular.jpg",
-  "ExifTool:ExifToolVersion": 13.55,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "JPEG",
   "File:FileTypeExtension": "JPG",
   "File:MIMEType": "image/jpeg",
@@ -28,7 +28,5 @@
   "XMP-GPano:FullPanoHeightPixels": 3456,
   "XMP-GPano:CroppedAreaLeftPixels": 0,
   "XMP-GPano:CroppedAreaTopPixels": 0,
-  "XMP-GPano:InitialViewVerticalFOVDegrees": 95,
-  "Composite:ImageSize": "6912 3456",
-  "Composite:Megapixels": 23.887872
+  "XMP-GPano:InitialViewVerticalFOVDegrees": 95
 }]
