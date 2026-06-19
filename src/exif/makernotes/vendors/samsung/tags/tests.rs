@@ -84,3 +84,19 @@ fn focal_length_35_carries_int32u_format_override() {
   // A plain leaf has no override.
   assert_eq!(format_override(0x0002), None);
 }
+
+/// The two walked `%Samsung::Main` `Priority => 0` rows (`0xa019 FNumber`
+/// `Samsung.pm:465`, `0xa01a FocalLengthIn35mmFormat` `Samsung.pm:475`) report
+/// priority 0; a non-marked sibling reports the default 1 (#284).
+#[test]
+fn tag_priority_marks_priority0_rows() {
+  assert_eq!(lookup(0xa019).unwrap().tag_priority(), 0, "FNumber");
+  assert_eq!(
+    lookup(0xa01a).unwrap().tag_priority(),
+    0,
+    "FocalLengthIn35mmFormat"
+  );
+  // A non-`Priority => 0` Main leaf keeps the default priority 1.
+  assert_eq!(lookup(0xa018).unwrap().tag_priority(), 1, "ExposureTime");
+  assert_eq!(lookup(0x0002).unwrap().tag_priority(), 1, "DeviceType");
+}

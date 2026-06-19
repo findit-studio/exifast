@@ -55,3 +55,16 @@ fn quality_hash_k10d_better() {
     Some("Better")
   );
 }
+
+/// The two walked `%Pentax::Main` `Priority => 0` rows (`0x0012 ExposureTime`
+/// `Pentax.pm:1474`, `0x0013 FNumber` `Pentax.pm:1484`) report priority 0; a
+/// non-marked sibling reports the default 1 (#284). The walked sub-table
+/// `Priority => 0` rows (`LensRec` LensType, `LensData` LensFocalLength) are
+/// pinned at their own emit sites, not on `PentaxTag`.
+#[test]
+fn tag_priority_marks_priority0_main_rows() {
+  assert_eq!(lookup(0x0012).unwrap().tag_priority(), 0, "ExposureTime");
+  assert_eq!(lookup(0x0013).unwrap().tag_priority(), 0, "FNumber");
+  // A non-`Priority => 0` Main leaf keeps the default priority 1.
+  assert_eq!(lookup(0x0005).unwrap().tag_priority(), 1, "PentaxModelID");
+}

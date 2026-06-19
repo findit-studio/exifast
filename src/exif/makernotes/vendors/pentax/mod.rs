@@ -235,7 +235,15 @@ pub(crate) fn emit_lens_rec(
     // ValueConv: the default space-joined int8u[2] pair, e.g. `"3 44"`.
     crate::value::TagValue::Str(SmolStr::from(std::format!("{series} {model}")))
   };
-  emissions.push(super::VendorEmission::new("LensType".into(), value, false));
+  // `%Pentax::LensRec` `LensType` (pos 0) is `Priority => 0` (`Pentax.pm:4202`):
+  // a duplicate never overrides an earlier same-`(doc, family1, name)` tag
+  // (`ExifTool.pm:9544-9560`).
+  emissions.push(super::VendorEmission::new_with_priority(
+    "LensType".into(),
+    value,
+    false,
+    0,
+  ));
 }
 
 /// Populate the typed lens identity from the LensRec byte pair — the typed-slot

@@ -617,6 +617,7 @@ pub(crate) fn emit_flash_info(
     "FlashOutput",
     "FlashCompensation",
     NikonConv::FlashCompensation,
+    0,
     emissions,
   );
 
@@ -678,6 +679,7 @@ pub(crate) fn emit_flash_info(
     "FlashGroupAOutput",
     "FlashGroupACompensation",
     NikonConv::FlashGroupCompensation,
+    1,
     emissions,
   );
   // offset 18 CONDITIONAL on FlashGroupBControlMode (same as 17, group B).
@@ -690,6 +692,7 @@ pub(crate) fn emit_flash_info(
     "FlashGroupBOutput",
     "FlashGroupBCompensation",
     NikonConv::FlashGroupCompensation,
+    1,
     emissions,
   );
 }
@@ -863,10 +866,15 @@ pub(crate) fn emit_shot_info(
       && let Some(record) = body.get(0x157..0x157 + 2)
     {
       let n = u16::from_be_bytes([*record.first().unwrap_or(&0), *record.get(1).unwrap_or(&0)]);
-      emissions.push(VendorEmission::new(
+      // `%Nikon::ShotInfo` 0205 `0x157 ShutterCount` is `Priority => 0`
+      // (`Nikon.pm:6058`) — mark it so a duplicate never overrides a
+      // higher-priority same-name tag (`ExifTool.pm:9544-9560`); the
+      // `any(name == "ShutterCount")` guard above pre-applies the same rule.
+      emissions.push(VendorEmission::new_with_priority(
         "ShutterCount".into(),
         TagValue::I64(i64::from(n)),
         false,
+        0,
       ));
     }
     // 0x1ae `VibrationReduction` (int8u, PrintHex, `{0x00=>'n/a',0x0c=>'Off',
@@ -961,10 +969,20 @@ fn emit_shot_info_int(
   let Some(raw) = read_value(body, offset, format, 1, avail, order) else {
     return;
   };
-  // No PrintConv (Priority 0 raw integer) ⇒ the default `ReadValue` render.
+  // No PrintConv (Priority 0 raw integer) ⇒ the default `ReadValue` render. The
+  // base `%Nikon::ShotInfo` counts are `Priority => 0`
+  // (`Nikon.pm:6019/6026/6081`) — mark the emission so a duplicate never
+  // overrides a higher-priority same-`(doc, family1, name)` tag
+  // (`ExifTool.pm:9544-9560`); the early-return guard above is the same rule
+  // pre-applied on the walk path.
   let parsed = ParsedValue::new(raw);
   if let Some(value) = NikonConv::Raw.apply(&parsed, false, None, order) {
-    emissions.push(VendorEmission::new(name.into(), value, false));
+    emissions.push(VendorEmission::new_with_priority(
+      name.into(),
+      value,
+      false,
+      0,
+    ));
   }
 }
 
@@ -1031,6 +1049,11 @@ fn emit_flash_output_or_comp(
   output_name: &'static str,
   comp_name: &'static str,
   comp_conv: NikonConv,
+  // The COMP-arm member's ExifTool `Priority => N` (`0` for the offset-10
+  // `FlashCompensation`, `%Nikon::FlashInfo0100`, `Nikon.pm:10875`; `1` for the
+  // offset-17/18 `FlashGroup{A,B}Compensation`). The `FlashOutput` arm is never
+  // `Priority => 0`.
+  comp_priority: u8,
   emissions: &mut Vec<VendorEmission>,
 ) {
   let Some(&byte) = sub.get(offset) else {
@@ -1046,7 +1069,12 @@ fn emit_flash_output_or_comp(
     // The `Compensation`-arm (int8s `Format` override — the byte is signed).
     let parsed = ParsedValue::new(RawValue::I64(std::vec![i64::from(byte as i8)]));
     if let Some(value) = comp_conv.apply(&parsed, print_conv, None, order) {
-      emissions.push(VendorEmission::new(comp_name.into(), value, false));
+      emissions.push(VendorEmission::new_with_priority(
+        comp_name.into(),
+        value,
+        false,
+        comp_priority,
+      ));
     }
   }
 }
@@ -1392,7 +1420,18 @@ pub(crate) fn emit_lens_data(
           let Some(value) = pos.conv.apply(&parsed, print_conv, None, order) else {
             continue;
           };
-          emissions.push(VendorEmission::new(pos.name.into(), value, false));
+          // The legacy `FocalLength` row (`%Nikon::LensData01`/`0204`/`0800`,
+          // `Nikon.pm:5544/5630/5764`) is `Priority => 0` — a duplicate never
+          // overrides a higher-priority same-name tag (`ExifTool.pm:9544-9560`).
+          // The sibling `MinFocalLength`/`MaxFocalLength` rows are NOT, so key on
+          // the exact name (the ONLY `Priority => 0` legacy LensData byte member).
+          let priority = u8::from(pos.name != "FocalLength");
+          emissions.push(VendorEmission::new_with_priority(
+            pos.name.into(),
+            value,
+            false,
+            priority,
+          ));
         }
         // `LensModel`, `Format => 'string[len]'`: `len` ASCII bytes, NUL-truncated
         // (`ReadValue`'s `s/\0.*//s`). An entirely-empty (all-NUL) field yields the
@@ -1502,6 +1541,7 @@ fn emit_lens_data_0800_new(
       NikonConv::LensFirmwareZ,
       false,
       "LensFirmwareVersion",
+      1,
       emissions,
     );
   }
@@ -1516,6 +1556,7 @@ fn emit_lens_data_0800_new(
       NikonConv::LensApertureZ,
       false,
       "MaxAperture",
+      0,
       emissions,
     );
     emit_z_int16u(
@@ -1526,6 +1567,7 @@ fn emit_lens_data_0800_new(
       NikonConv::LensApertureZ,
       false,
       "FNumber",
+      0,
       emissions,
     );
     emit_z_int16u(
@@ -1536,6 +1578,7 @@ fn emit_lens_data_0800_new(
       NikonConv::FocalLengthZ,
       false,
       "FocalLength",
+      0,
       emissions,
     );
   }
@@ -1567,6 +1610,7 @@ fn emit_lens_data_0800_new(
       NikonConv::FocusDistanceZ,
       false,
       "FocusDistance",
+      1,
       emissions,
     );
   }
@@ -1666,6 +1710,10 @@ fn emit_z_int16u(
   conv: NikonConv,
   unknown: bool,
   name: &'static str,
+  // The member's ExifTool `Priority => N` (`0` for the `%Nikon::LensData0800`
+  // NEW-block `MaxAperture`/`FNumber`/`FocalLength` rows,
+  // `Nikon.pm:5891/5901/5911`; `1` for the firmware/focus members).
+  priority: u8,
   emissions: &mut Vec<VendorEmission>,
 ) {
   let Some(n) = read_z_int16u(body, offset, order) else {
@@ -1674,7 +1722,12 @@ fn emit_z_int16u(
   let raw = RawValue::U64(std::vec![u64::from(n)]);
   let parsed = ParsedValue::new(raw);
   if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
-    emissions.push(VendorEmission::new(name.into(), value, unknown));
+    emissions.push(VendorEmission::new_with_priority(
+      name.into(),
+      value,
+      unknown,
+      priority,
+    ));
   }
 }
 
@@ -2674,6 +2727,17 @@ mod tests {
     assert_eq!(lens_get(&em, "MaxApertureAtMaxFocal"), Some(str_val("4.0")));
     assert_eq!(lens_get(&em, "MCUVersion"), Some(TagValue::I64(7)));
     assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+    // #284: the legacy `FocalLength` row is `Priority => 0` (`Nikon.pm:5630`);
+    // the sibling `MinFocalLength`/`MaxFocalLength` keep the default priority 1.
+    let prio = |name: &str| em.iter().find(|e| e.name() == name).map(|e| e.priority());
+    assert_eq!(
+      prio("FocalLength"),
+      Some(0),
+      "legacy FocalLength Priority=>0"
+    );
+    assert_eq!(prio("MinFocalLength"), Some(1));
+    assert_eq!(prio("MaxFocalLength"), Some(1));
+    assert_eq!(prio("LensIDNumber"), Some(1));
   }
 
   #[test]
@@ -2969,6 +3033,15 @@ mod tests {
     // — here 0x4c FocusDistanceRangeWidth=0x05 (non-zero) and 0x56=0x02
     // (non-zero) ⇒ "CFD" (still unknown-flagged, so output-suppressed).
     assert_eq!(lens_get(&em, "LensDriveEnd"), Some(str_val("CFD")));
+    // #284: the NEW Z-block `MaxAperture`/`FNumber`/`FocalLength` rows are
+    // `Priority => 0` (`Nikon.pm:5891/5901/5911`); the `LensFirmwareVersion`/
+    // `FocusDistance` members keep the default priority 1.
+    let prio = |name: &str| em.iter().find(|e| e.name() == name).map(|e| e.priority());
+    assert_eq!(prio("MaxAperture"), Some(0), "Z MaxAperture Priority=>0");
+    assert_eq!(prio("FNumber"), Some(0), "Z FNumber Priority=>0");
+    assert_eq!(prio("FocalLength"), Some(0), "Z FocalLength Priority=>0");
+    assert_eq!(prio("LensFirmwareVersion"), Some(1));
+    assert_eq!(prio("FocusDistance"), Some(1));
   }
 
   /// The `0x56` `LensDriveEnd` stateful RawConv (`Nikon.pm:5933-5939`): `Inf`
@@ -3530,6 +3603,15 @@ mod tests {
     // contract), which the JSON layer serializes as the BARE number 0 — matching
     // the oracle `"Nikon:FlashCompensation": 0`.
     assert_eq!(get("FlashCompensation"), Some(str_val("0")));
+    // #284: the offset-10 `FlashCompensation` row is `Priority => 0`
+    // (`Nikon.pm:10875`); the offset-14 `FlashGNDistance` is the default 1.
+    let prio = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.priority());
+    assert_eq!(
+      prio("FlashCompensation"),
+      Some(0),
+      "FlashCompensation Priority=>0"
+    );
+    assert_eq!(prio("FlashGNDistance"), Some(1));
     assert!(get("FlashOutput").is_none());
     assert_eq!(get("FlashGNDistance"), Some(str_val("0")));
     assert_eq!(get("FlashGroupAControlMode"), Some(str_val("Off")));
@@ -3886,6 +3968,20 @@ mod tests {
     assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0204")));
     assert_eq!(lens_get(&em, "ShutterCount"), Some(TagValue::I64(12345)));
     assert_eq!(lens_get(&em, "DeletedImageCount"), Some(TagValue::I64(7)));
+    // #284: 0x6a ShutterCount / 0x6e DeletedImageCount are `Priority => 0`
+    // (`Nikon.pm:6019/6026`); 0x82 VibrationReduction keeps the default 1.
+    let prio = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.priority());
+    assert_eq!(
+      prio("ShutterCount"),
+      Some(0),
+      "0204 ShutterCount Priority=>0"
+    );
+    assert_eq!(
+      prio("DeletedImageCount"),
+      Some(0),
+      "0204 DeletedImageCount Priority=>0"
+    );
+    assert_eq!(prio("VibrationReduction"), Some(1));
     assert_eq!(lens_get(&em, "VibrationReduction"), Some(str_val("On")));
     // VR_0x66 (0x66, `Unknown => 1`) is never implemented/emitted.
     assert!(
@@ -3963,6 +4059,14 @@ mod tests {
     );
     assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0211")));
     assert_eq!(lens_get(&em, "ShutterCount"), Some(TagValue::I64(999)));
+    // #284: 0x24d ShutterCount is `Priority => 0` (`Nikon.pm:6081`).
+    assert_eq!(
+      em.iter()
+        .find(|e| e.name() == "ShutterCount")
+        .map(|e| e.priority()),
+      Some(0),
+      "0211 ShutterCount Priority=>0"
+    );
   }
 
   /// An ENCRYPTED `0206` ShotInfo with VALID keys (serial/count present)

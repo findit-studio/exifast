@@ -82,6 +82,20 @@ impl SamsungTag {
     self.name
   }
 
+  /// The ExifTool `Priority => N` of this `%Samsung::Main` leaf — `0` for a
+  /// `Priority => 0` row (never overrides an earlier same-`(doc, family1, name)`
+  /// tag, `ExifTool.pm:9544-9560`), `1` (the default) otherwise. The two walked
+  /// `Priority => 0` rows are `0xa019 FNumber` (`Samsung.pm:465`) and `0xa01a
+  /// FocalLengthIn35mmFormat` (`Samsung.pm:475`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_priority(&self) -> u8 {
+    match self.id {
+      0xa019 | 0xa01a => 0,
+      _ => 1,
+    }
+  }
+
   /// The tag's optional `Format =>` directive (`Exif.pm:6728-6745`).
   #[must_use]
   #[inline(always)]

@@ -754,15 +754,19 @@ pub(crate) fn emit_lens_info(
     if model.is_none_or(|m| !m.contains("645Z")) {
       let raw = i64::from(v);
       let f = 10.0 * ((raw >> 2) as f64) * 4.0_f64.powi(((raw & 0x03) - 2) as i32);
-      push(
-        out,
-        "LensFocalLength",
+      // `%Pentax::LensData` `LensFocalLength` (pos 9) is `Priority => 0`
+      // (`Pentax.pm:4506`): a duplicate never overrides an earlier same-`(doc,
+      // family1, name)` tag (`ExifTool.pm:9544-9560`).
+      out.push(VendorEmission::new_with_priority(
+        SmolStr::new_static("LensFocalLength"),
         if print_conv {
           TagValue::Str(SmolStr::from(std::format!("{f:.1} mm")))
         } else {
           TagValue::F64(f)
         },
-      );
+        false,
+        0,
+      ));
     }
   }
   // 10: NominalMaxAperture — `Mask => 0xf0` (>>4); `ValueConv => '2**($val/4)'`;
