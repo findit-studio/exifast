@@ -90,7 +90,11 @@ const MALFORMED_APP1_WARNING: &str = "Malformed APP1 EXIF segment";
 /// One length-bearing JPEG segment captured during the marker walk: its
 /// marker code and the file-offset range of its payload (the bytes after the
 /// 2-byte length word). Standalone (length-less) markers are not captured.
-struct Segment {
+///
+/// `pub(super)` so the auxiliary `APP`-segment decoder
+/// ([`super::jpeg_app::process_app_markers`]) can re-read the same marker walk
+/// (JFIF/MPF/DJI thermal arms) the Exif arm uses.
+pub(super) struct Segment {
   /// The JPEG marker code (e.g. `0xe1` for `APP1`).
   marker: u8,
   /// File offset of the segment payload's first byte (bundled `$segPos`,
@@ -98,6 +102,24 @@ struct Segment {
   payload_start: usize,
   /// File offset one past the segment payload's last byte.
   payload_end: usize,
+}
+
+impl Segment {
+  /// The JPEG marker code (e.g. `0xe1` for `APP1`).
+  #[inline]
+  pub(super) const fn marker(&self) -> u8 {
+    self.marker
+  }
+  /// File offset of the segment payload's first byte.
+  #[inline]
+  pub(super) const fn payload_start(&self) -> usize {
+    self.payload_start
+  }
+  /// File offset one past the segment payload's last byte.
+  #[inline]
+  pub(super) const fn payload_end(&self) -> usize {
+    self.payload_end
+  }
 }
 
 /// Walk a JPEG file's markers and decode every independent `APP1` Exif block
@@ -232,116 +254,170 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
         .is_some_and(|p| p.starts_with(b"GoPro\0"))
   });
 
+  // The MUTABLE `$$self{Make} eq 'DJI'` state, captured per-segment in marker
+  // order — the gate ExifTool's `Marker:` loop evaluates IN-LOOP for the JPEG
+  // auxiliary DJI thermal `APP3`/`APP4`/`APP5` arms (`JPEG.pm:113`/`:150`/`:174`).
+  // ExifTool sets `$$self{Make}` from each `APP1` Exif block's IFD0 `Make`
+  // (`Exif.pm:585` `RawConv` `$$self{Make} = $val`, after trimming trailing
+  // whitespace) as it processes that segment, so the state is LAST-WINS across
+  // `APP1`s, not first-wins: a file ordered `APP1 Make=DJI`, then `APP1
+  // Make=Canon`, then `APP4` leaves `$$self{Make}` == `Canon` at the `APP4` — the
+  // thermal arm is SKIPPED. `make_is_dji_at[i]` is that running state AS OF
+  // segment `i` (after processing every `APP1` at index `<= i`): `true` iff the
+  // most-recent `APP1` whose `ProcessTIFF` succeeded had IFD0 `Make` trimming to
+  // exactly `DJI`. An IFD1-only `Make` does NOT set it (the capture is IFD0-only,
+  // reusing the main walker's [`ExifMeta::captured_make`]); `'DJI '` with
+  // trailing space DOES (the `RawConv` trim normalizes it to `DJI`). The vector
+  // is index-aligned with `segments`; `false` everywhere until the first DJI
+  // `APP1`, then it follows the current IFD0 `Make` forward. A `ThermalParams2`
+  // `APP4` is emitted by [`super::jpeg_app::process_app_markers`] only where this
+  // is `true` at its own marker position. `APP7` (`DJI-DBG\0`) is NOT
+  // `Make`-gated (it keys on its payload prefix) so it is unaffected.
+  let mut make_is_dji_at: Vec<bool> = std::vec::Vec::with_capacity(segments.len());
+  let mut current_make_is_dji = false;
   for (i, seg) in segments.iter().enumerate() {
-    // `ExifTool.pm:7736`: APP1 (EXIF / XMP / QVCI / PARROT). Only APP1.
-    if seg.marker != 0xe1 {
-      continue;
-    }
-    let payload = match data.get(seg.payload_start..seg.payload_end) {
-      Some(p) => p,
-      None => continue,
-    };
-    // Is this an `APP1` segment matching the Exif arm `^(.{0,4})Exif\0.`?
-    let Some(garbage) = exif_arm_garbage(payload) else {
-      // A non-Exif APP1 (XMP / extended-XMP / QVCI / PARROT) — its arms are a
-      // deferred JPEG-container follow-up. Keep walking (`ExifTool.pm:7821`
-      // `next`).
-      continue;
-    };
+    // The running `$$self{Make} eq 'DJI'` state is recorded ONCE per segment by
+    // the `make_is_dji_at.push(current_make_is_dji)` after this labeled block:
+    // every early exit from the `APP1` work below is a `break 'app1`, so the push
+    // runs for EVERY marker position (an `APP1` that fails to parse, a non-`APP1`
+    // segment, or a parsed `APP1` — which first updates `current_make_is_dji`).
+    'app1: {
+      // `ExifTool.pm:7736`: APP1 (EXIF / XMP / QVCI / PARROT). Only APP1.
+      if seg.marker != 0xe1 {
+        // Not an `APP1` — `$$self{Make}` is unchanged at this marker position.
+        break 'app1;
+      }
+      let payload = match data.get(seg.payload_start..seg.payload_end) {
+        Some(p) => p,
+        None => break 'app1,
+      };
+      // Is this an `APP1` segment matching the Exif arm `^(.{0,4})Exif\0.`?
+      let Some(garbage) = exif_arm_garbage(payload) else {
+        // A non-Exif APP1 (XMP / extended-XMP / QVCI / PARROT) — its arms are a
+        // deferred JPEG-container follow-up. Keep walking (`ExifTool.pm:7821`
+        // `next`). `$$self{Make}` is unchanged here (no IFD0 was parsed).
+        break 'app1;
+      };
 
-    // Bundled's extended-EXIF discriminator (`ExifTool.pm:7764-7765`): this
-    // `APP1` Exif segment is a multi-segment EXIF chain link when EITHER it is
-    // the chain START (the immediately-following `APP1` payload is `^Exif\0\0`
-    // NOT followed by a TIFF magic) OR a prior segment already entered the
-    // chain (`in_multisegment`). The combined-data ASSEMBLY is a deferred
-    // follow-up; a chain link is skipped SILENTLY (no merge, no malformed
-    // warning). `in_multisegment` stays set while more fragments follow and
-    // clears on the LAST fragment (its `is_multisegment_chain` is `false`).
-    if in_multisegment || is_multisegment_chain(data, &segments, i) {
-      in_multisegment = is_multisegment_chain(data, &segments, i);
-      continue;
-    }
+      // Bundled's extended-EXIF discriminator (`ExifTool.pm:7764-7765`): this
+      // `APP1` Exif segment is a multi-segment EXIF chain link when EITHER it is
+      // the chain START (the immediately-following `APP1` payload is `^Exif\0\0`
+      // NOT followed by a TIFF magic) OR a prior segment already entered the
+      // chain (`in_multisegment`). The combined-data ASSEMBLY is a deferred
+      // follow-up; a chain link is skipped SILENTLY (no merge, no malformed
+      // warning). `in_multisegment` stays set while more fragments follow and
+      // clears on the LAST fragment (its `is_multisegment_chain` is `false`).
+      if in_multisegment || is_multisegment_chain(data, &segments, i) {
+        in_multisegment = is_multisegment_chain(data, &segments, i);
+        break 'app1;
+      }
 
-    // `$hdrLen = length($exifAPP1hdr) + length($1)` = 6 + garbage. Strip it
-    // (`DirStart(\%dirInfo, $hdrLen, $hdrLen)`, `ExifTool.pm:7780`) and hand
-    // the remainder to ProcessTIFF (`ExifTool.pm:7783`).
-    let hdr_len = garbage + EXIF_APP1_HDR.len();
-    let Some(block) = payload.get(hdr_len..) else {
-      continue;
-    };
-    // The TIFF block's file offset (`$$dirInfo{Base}`): `$segPos + $hdrLen`
-    // (`DirStart` sets `$$dirInfo{Base} = $$dirInfo{DataPos} + $base`,
-    // `ExifTool.pm:7780`). `$segPos` is `$raf->Tell()` — an ABSOLUTE file
-    // position — so when an unknown header was skipped past, `base_offset`
-    // (Perl `$pos + $skip`) shifts every segment's TIFF block to its true
-    // file offset; `base_offset == 0` for a JPEG that starts at offset 0.
-    // `u32` matches ExifTool's 32-bit offset arithmetic; a JPEG cannot place
-    // an `APP1` past 4 GiB, so the cast is lossless in practice (saturation
-    // guards a pathological input rather than wrapping). `checked_add` across
-    // all three terms BEFORE the cast: a huge caller-supplied `base_offset`
-    // (direct-API caller, or a future container that rebases past `usize::MAX`)
-    // would otherwise overflow `usize` and panic in debug / wrap in release
-    // BEFORE the intended `u32::MAX` saturation. On any overflow, fall through
-    // to the same `u32::MAX` fallback (preserving the saturation intent).
-    let base = base_offset
-      .checked_add(seg.payload_start)
-      .and_then(|s| s.checked_add(hdr_len))
-      .and_then(|s| u32::try_from(s).ok())
-      .unwrap_or(u32::MAX);
+      // `$hdrLen = length($exifAPP1hdr) + length($1)` = 6 + garbage. Strip it
+      // (`DirStart(\%dirInfo, $hdrLen, $hdrLen)`, `ExifTool.pm:7780`) and hand
+      // the remainder to ProcessTIFF (`ExifTool.pm:7783`).
+      let hdr_len = garbage + EXIF_APP1_HDR.len();
+      let Some(block) = payload.get(hdr_len..) else {
+        break 'app1;
+      };
+      // The TIFF block's file offset (`$$dirInfo{Base}`): `$segPos + $hdrLen`
+      // (`DirStart` sets `$$dirInfo{Base} = $$dirInfo{DataPos} + $base`,
+      // `ExifTool.pm:7780`). `$segPos` is `$raf->Tell()` — an ABSOLUTE file
+      // position — so when an unknown header was skipped past, `base_offset`
+      // (Perl `$pos + $skip`) shifts every segment's TIFF block to its true
+      // file offset; `base_offset == 0` for a JPEG that starts at offset 0.
+      // `u32` matches ExifTool's 32-bit offset arithmetic; a JPEG cannot place
+      // an `APP1` past 4 GiB, so the cast is lossless in practice (saturation
+      // guards a pathological input rather than wrapping). `checked_add` across
+      // all three terms BEFORE the cast: a huge caller-supplied `base_offset`
+      // (direct-API caller, or a future container that rebases past `usize::MAX`)
+      // would otherwise overflow `usize` and panic in debug / wrap in release
+      // BEFORE the intended `u32::MAX` saturation. On any overflow, fall through
+      // to the same `u32::MAX` fallback (preserving the saturation intent).
+      let base = base_offset
+        .checked_add(seg.payload_start)
+        .and_then(|s| s.checked_add(hdr_len))
+        .and_then(|s| u32::try_from(s).ok())
+        .unwrap_or(u32::MAX);
 
-    // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')`
-    // (`ExifTool.pm:7783`). A bad TIFF block is a non-fatal `Warn` — the JPEG
-    // container is still accepted and the walk continues.
-    match parse_exif_block_with_base(block, base) {
-      Some(exif) => {
-        // Record the FIRST `APP1` that emits a MOVABLE EXIF tag — the EFFECTIVE
-        // EXIF block a GoPro `APP6` is ordered against (first-wins, the primary
-        // block, like `byte_order`/`maker_note`). A "movable" tag is any
-        // default-visible tag in a family-0 group OTHER than `File`: the
-        // `File:ExifByteOrder`/`File:PageCount` prefix is the unconditional
-        // `File`-group prefix `Taggable::tags` emits FIRST regardless, so it
-        // never participates in the GoPro-vs-EXIF ordering. The predicate is
-        // computed by INSPECTING the block's REAL `Taggable::tags` output
-        // ([`ExifMeta::emits_movable_tag`]) — `any(non-`File`, non-Unknown tag)`
-        // — NOT by guessing which channels are movable: a valid-but-EMPTY TIFF
-        // (byte-order marker + 0-entry IFD0) emits ONLY `File:ExifByteOrder` and
-        // is NOT effective (`false`); an `APP1` with IFD entries emits `EXIF:*`
-        // (`true`); an `APP1` carrying ONLY a decoded MakerNote (an `ExifIFD`
-        // pointer + an `Apple`/`Canon`/… MakerNote, no other IFD0 entry, so
-        // `entries` is EMPTY) emits `MakerNotes:*` (`true`) even though the old
-        // `!entries.is_empty()` guess missed it. So a GoPro `APP6` ahead of such
-        // a MakerNote-only `APP1` correctly emits BEFORE it. This mirrors the
-        // GoPro-side anchor (the empty-to-non-empty `GoProMeta` accumulator
-        // transition in [`attach_app6_gopro`]): both anchors are "first segment
-        // producing a default-visible non-`File` tag". Inspecting the real
-        // emission ends the channel-by-channel drift (this guess missed
-        // `entries` at R8, then MakerNote at R9) and covers any future
-        // non-`File` channel for free.
-        #[cfg(feature = "quicktime")]
-        if has_gopro_app6 && effective_exif_idx.is_none() && exif.emits_movable_tag() {
-          effective_exif_idx = Some(i);
+      // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')`
+      // (`ExifTool.pm:7783`). A bad TIFF block is a non-fatal `Warn` — the JPEG
+      // container is still accepted and the walk continues.
+      match parse_exif_block_with_base(block, base) {
+        Some(exif) => {
+          // Record the FIRST `APP1` that emits a MOVABLE EXIF tag — the EFFECTIVE
+          // EXIF block a GoPro `APP6` is ordered against (first-wins, the primary
+          // block, like `byte_order`/`maker_note`). A "movable" tag is any
+          // default-visible tag in a family-0 group OTHER than `File`: the
+          // `File:ExifByteOrder`/`File:PageCount` prefix is the unconditional
+          // `File`-group prefix `Taggable::tags` emits FIRST regardless, so it
+          // never participates in the GoPro-vs-EXIF ordering. The predicate is
+          // computed by INSPECTING the block's REAL `Taggable::tags` output
+          // ([`ExifMeta::emits_movable_tag`]) — `any(non-`File`, non-Unknown tag)`
+          // — NOT by guessing which channels are movable: a valid-but-EMPTY TIFF
+          // (byte-order marker + 0-entry IFD0) emits ONLY `File:ExifByteOrder` and
+          // is NOT effective (`false`); an `APP1` with IFD entries emits `EXIF:*`
+          // (`true`); an `APP1` carrying ONLY a decoded MakerNote (an `ExifIFD`
+          // pointer + an `Apple`/`Canon`/… MakerNote, no other IFD0 entry, so
+          // `entries` is EMPTY) emits `MakerNotes:*` (`true`) even though the old
+          // `!entries.is_empty()` guess missed it. So a GoPro `APP6` ahead of such
+          // a MakerNote-only `APP1` correctly emits BEFORE it. This mirrors the
+          // GoPro-side anchor (the empty-to-non-empty `GoProMeta` accumulator
+          // transition in [`attach_app6_gopro`]): both anchors are "first segment
+          // producing a default-visible non-`File` tag". Inspecting the real
+          // emission ends the channel-by-channel drift (this guess missed
+          // `entries` at R8, then MakerNote at R9) and covers any future
+          // non-`File` channel for free.
+          #[cfg(feature = "quicktime")]
+          if has_gopro_app6 && effective_exif_idx.is_none() && exif.emits_movable_tag() {
+            effective_exif_idx = Some(i);
+          }
+          // Update the MUTABLE `$$self{Make} eq 'DJI'` state at THIS `APP1`'s
+          // marker position (`Exif.pm:585` `$$self{Make} = $val`, last-wins): the
+          // block's [`ExifMeta::captured_make`] is the IFD0-only, trailing-
+          // whitespace-trimmed `Make` exactly as the main Exif walker captured it
+          // (the SAME `is_perl_space` RawConv path — `'DJI '` trims to `DJI`; an
+          // IFD1-only `Make` is excluded). ExifTool assigns `$$self{Make} = $val`
+          // ONLY when an IFD0 `Make` tag is actually seen — an `APP1` with NO IFD0
+          // `Make` (or only an IFD1 `Make`, or an unreadable one) never runs that
+          // assignment, so it LEAVES the prior state intact rather than clearing
+          // it. `captured_make()` is therefore `Some` only when an IFD0 `Make` was
+          // captured; update the gate ONLY then. A later DJI `APP1` arms it; a
+          // later non-DJI `APP1` flips it back OFF (its `captured_make` is a
+          // non-DJI `Some`); a no-`Make` `APP1` carries the previous state forward
+          // unchanged — faithful to ExifTool reaching a subsequent `APP4`
+          // ThermalParams2 with `$$self{Make}` == the last Make actually assigned,
+          // never cleared by an absent one. Read on the parsed block BEFORE
+          // `merge_exif_block` consumes it.
+          if let Some(make) = exif.captured_make() {
+            current_make_is_dji = make == "DJI";
+          }
+          merge_exif_block(
+            &mut entries,
+            &mut warnings,
+            &mut warnings_ignorable,
+            &mut byte_order,
+            &mut maker_note,
+            exif,
+          );
         }
-        merge_exif_block(
-          &mut entries,
-          &mut warnings,
-          &mut warnings_ignorable,
-          &mut byte_order,
-          &mut maker_note,
-          exif,
-        );
+        // `parse_exif_block_with_base` also returns `None` for a BigTIFF (0x2b)
+        // header — a clean, deliberate no-Exif skip (bundled SUPPORTS BigTIFF, so
+        // emitting a "Malformed APP1" warning would diverge). A genuinely
+        // malformed CLASSIC (0x2a) header is what bundled warns on. So map only
+        // a non-BigTIFF `None` to the warning; a BigTIFF block is skipped
+        // silently (no warning, no Exif), matching the standalone-TIFF path.
+        // `$$self{Make}` is unchanged on a parse failure (no IFD0 was walked).
+        None if !is_bigtiff_block(block) => {
+          warnings.push(String::from(MALFORMED_APP1_WARNING));
+          warnings_ignorable.push(0); // normal warning (ExifTool.pm:7783)
+        }
+        None => {}
       }
-      // `parse_exif_block_with_base` also returns `None` for a BigTIFF (0x2b)
-      // header — a clean, deliberate no-Exif skip (bundled SUPPORTS BigTIFF, so
-      // emitting a "Malformed APP1" warning would diverge). A genuinely
-      // malformed CLASSIC (0x2a) header is what bundled warns on. So map only
-      // a non-BigTIFF `None` to the warning; a BigTIFF block is skipped
-      // silently (no warning, no Exif), matching the standalone-TIFF path.
-      None if !is_bigtiff_block(block) => {
-        warnings.push(String::from(MALFORMED_APP1_WARNING));
-        warnings_ignorable.push(0); // normal warning (ExifTool.pm:7783)
-      }
-      None => {}
     }
+    // Record the running `$$self{Make} eq 'DJI'` state AS OF this segment — after
+    // this `APP1`'s own update (if it parsed), else carried forward unchanged.
+    // One push per segment keeps `make_is_dji_at` index-aligned with `segments`.
+    make_is_dji_at.push(current_make_is_dji);
   }
 
   // A valid JPEG ALWAYS yields an `ExifMeta` (the container is accepted);
@@ -354,6 +430,20 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     byte_order,
     maker_note,
   );
+  // The JPEG auxiliary `APP`-segment tags: JFIF (`APP0`), MPF (`APP2`) and the
+  // DJI thermal arms (`APP3`/`APP4`/`APP5`/`APP7`). Decoded for BOTH print-conv
+  // modes (the values are converted at decode time) and attached for
+  // [`Taggable::tags`] to append after the EXIF block. Empty for a JPEG
+  // carrying none of these segments.
+  {
+    let app_pc =
+      super::jpeg_app::process_app_markers(data, &segments, &make_is_dji_at, base_offset, true);
+    let app_n =
+      super::jpeg_app::process_app_markers(data, &segments, &make_is_dji_at, base_offset, false);
+    if !app_pc.is_empty() || !app_n.is_empty() {
+      meta.set_jpeg_app_tags(app_pc, app_n);
+    }
+  }
   // The `File:*` Start-Of-Frame dimension tags (`ExifTool.pm:7419-7462`): the
   // FIRST SOF segment yields `ImageWidth`/`ImageHeight`/`EncodingProcess`/
   // `BitsPerSample`/`ColorComponents`/`YCbCrSubSampling`. ExifTool `HandleTag`s
@@ -536,7 +626,7 @@ fn attach_app6_gopro(
 /// (`%markerLenBytes`, `ExifTool.pm:7358`), and reads the 2-byte big-endian
 /// length word of every other marker (`ExifTool.pm:7360-7366`). A truncated
 /// or malformed segment header simply ends the scan (bundled `last Marker`).
-fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
+pub(super) fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
   let mut segments: Vec<Segment> = Vec::new();
   // Cursor sits just past the SOI marker. The `Marker:` loop reads ahead.
   let mut pos = 2usize;
@@ -1680,6 +1770,481 @@ mod tests {
     assert!(
       !pj.contains_key("YCbCrSubSampling"),
       "a 1-component frame has no YCbCrSubSampling"
+    );
+  }
+
+  // ====================================================================
+  // DJI auxiliary APP segments (#114 — Codex R1 findings 1/2/3)
+  // ====================================================================
+
+  /// A minimal big-endian TIFF block with a single IFD0 entry `Make = "DJI"`
+  /// (NUL-padded to 4 bytes so it is INLINE in the value field — no out-of-line
+  /// offset). The decoder NUL-trims it to `"DJI"`, matching the
+  /// `$$self{Make} eq 'DJI'` gate.
+  fn dji_make_tiff() -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    t.extend_from_slice(&[0x01, 0x0f]); // tag 0x010f Make
+    t.extend_from_slice(&[0x00, 0x02]); // ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4 (fits inline)
+    t.extend_from_slice(b"DJI\0"); // inline value "DJI\0"
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    t
+  }
+
+  /// A `DJI::ThermalParams2` `APP4` payload: the `\x2c\x01\x20\0` magic at
+  /// payload offset 32 (so the decoder's `dir_start` is 0), and the
+  /// little-endian `float` RelativeHumidity at directory offset 0x0c. The
+  /// preceding 12 bytes (0x00..0x0c — AmbientTemperature/ObjectDistance/
+  /// Emissivity) are left zero; the magic word lands at 32 regardless.
+  fn dji_thermal_params2_app4(humidity_le: [u8; 4]) -> Vec<u8> {
+    let mut p = std::vec![0u8; 36];
+    // RelativeHumidity float @ dir_start(0) + 0x0c.
+    p[0x0c..0x10].copy_from_slice(&humidity_le);
+    // The ThermalParams2 magic `\x2c\x01\x20\0` at offset 32 (dir_start => 0).
+    p[32..36].copy_from_slice(&[0x2c, 0x01, 0x20, 0x00]);
+    p
+  }
+
+  /// Build a JPEG `APP` segment (`0xff`, `marker`, 2-byte BE length, payload).
+  fn app_segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+    let mut seg: Vec<u8> = std::vec![0xff, marker];
+    let len = (payload.len() + 2) as u16;
+    seg.extend_from_slice(&len.to_be_bytes());
+    seg.extend_from_slice(payload);
+    seg
+  }
+
+  /// One `APP1` `Exif\0\0` segment wrapping `tiff`.
+  fn app1_exif_segment(tiff: &[u8]) -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(b"Exif\0\0");
+    payload.extend_from_slice(tiff);
+    app_segment(0xe1, &payload)
+  }
+
+  /// Collect every emitted tag's rendered value keyed by `(family1, name)` —
+  /// the JPEG `APP` (JFIF/MPF/DJI) tags appear here alongside EXIF.
+  fn emitted_by_group(
+    meta: &ExifMeta<'_>,
+    mode: crate::emit::ConvMode,
+  ) -> std::collections::BTreeMap<(String, String), String> {
+    use crate::emit::Taggable as _;
+    use crate::value::TagValue;
+    let mut out = std::collections::BTreeMap::new();
+    for et in meta.tags(crate::emit::EmitOptions::g1(mode, false)) {
+      let tag = et.tag();
+      let key = (
+        tag.group_ref().family1().to_string(),
+        tag.name().to_string(),
+      );
+      let rendered = match tag.value_ref() {
+        TagValue::U64(n) => n.to_string(),
+        TagValue::I64(n) => n.to_string(),
+        TagValue::F64(n) => crate::value::format_g(*n, 15),
+        TagValue::Str(s) => s.to_string(),
+        other => std::format!("{other:?}"),
+      };
+      out.insert(key, rendered);
+    }
+    out
+  }
+
+  #[test]
+  fn dji_thermal_params2_emitted_for_normal_marker_order() {
+    // The NORMAL DJI layout — `APP1` Exif `Make=DJI` THEN `APP4`
+    // ThermalParams2 — passes the marker-order `$$self{Make} eq 'DJI'` gate, so
+    // the DJI:* thermal tags ARE emitted.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff()));
+    // humidity raw 0.5 -> 50.0% -> "50 %" (the real-fixture value).
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      pj.get(&("DJI".to_string(), "RelativeHumidity".to_string()))
+        .map(String::as_str),
+      Some("50 %"),
+      "APP4 ThermalParams2 after APP1 Make=DJI must emit DJI:RelativeHumidity"
+    );
+  }
+
+  #[test]
+  fn dji_thermal_params2_skipped_when_app4_precedes_make_dji() {
+    // Reordered (recovered / partially-repaired) JPEG: `APP4` ThermalParams2
+    // BEFORE the `APP1` Exif `Make=DJI` segment. ExifTool evaluates
+    // `$$self{Make} eq 'DJI'` INSIDE its Marker: loop, so `$$self{Make}` is not
+    // yet `'DJI'` when the APP4 is reached — the DJI thermal arm is SKIPPED. No
+    // DJI:* tag may be emitted.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    // APP4 ThermalParams2 FIRST (before any Make).
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    // THEN the APP1 Exif block establishing Make=DJI.
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff()));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert!(
+      !pj.keys().any(|(family1, _)| family1 == "DJI"),
+      "an APP4 ThermalParams2 ahead of the APP1 Make=DJI must emit NO DJI tags \
+       (marker-order $$self{{Make}} gate), got: {pj:?}"
+    );
+    // The IFD0:Make IS still extracted (the EXIF block is merged regardless).
+    assert_eq!(meta.entry("Make").map(|e| e.name()), Some("Make"));
+  }
+
+  /// A big-endian TIFF whose IFD0 carries an inline `Make` of exactly the 4
+  /// ASCII bytes `make` (e.g. `b"DJI "` — `DJI` + a trailing SPACE), no IFD1.
+  /// The `Exif.pm:585` `Make` `RawConv` (`s/\s+$//`) trims the trailing
+  /// whitespace, so the captured `$$self{Make}` is the trimmed string.
+  fn ifd0_make4_tiff(make: [u8; 4]) -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    t.extend_from_slice(&[0x01, 0x0f]); // tag 0x010f Make
+    t.extend_from_slice(&[0x00, 0x02]); // ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4 (fits inline)
+    t.extend_from_slice(&make); // inline 4-byte value
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    t
+  }
+
+  /// A big-endian TIFF whose IFD0 carries a READABLE NON-STRING `Make` — tag
+  /// `0x010f` encoded as `SHORT[2]` (`int16u`), value `1 2`. ExifTool's `Make`
+  /// `RawConv` (`$val =~ s/\s+$//; $$self{Make} = $val`, `Exif.pm:585`) runs
+  /// whenever the `Make` TAG is seen, NOT only for an `ascii` format, so this
+  /// decodes through `ReadValue` to the space-joined `$val` `"1 2"` and
+  /// assigns `$$self{Make} = "1 2"` — a readable Make that does NOT stringify
+  /// to `'DJI'`. It must therefore CLEAR a prior DJI gate state (the
+  /// non-string-Make edge), not preserve it like an absent Make does.
+  fn ifd0_make_short_tiff() -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    t.extend_from_slice(&[0x01, 0x0f]); // tag 0x010f Make
+    t.extend_from_slice(&[0x00, 0x03]); // SHORT (int16u) — a NON-string format
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // count 2 (4 bytes, fits inline)
+    t.extend_from_slice(&[0x00, 0x01, 0x00, 0x02]); // inline BE SHORT[2] = 1, 2
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    t
+  }
+
+  /// A big-endian TIFF whose IFD0 has NO `Make` (one benign `Orientation`
+  /// entry) but whose IFD1 (reached via the next-IFD pointer) carries
+  /// `Make='DJI'`. ExifTool stores `$$self{Make}` ONLY from the top-level IFD0
+  /// walk (`Exif.pm:585`), so an IFD1 `Make` must NOT set it — the captured
+  /// `Make` stays `None`, and the DJI thermal gate stays off.
+  fn ifd1_only_make_dji_tiff() -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0 @8: one Orientation (0x0112, SHORT, value 1) — no Make.
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    t.extend_from_slice(&[0x01, 0x12]); // tag 0x0112 Orientation
+    t.extend_from_slice(&[0x00, 0x03]); // SHORT
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
+    t.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // value 1 (BE SHORT, left-justified)
+    // Next-IFD pointer -> IFD1 at offset 26.
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]);
+    // IFD1 @26: one Make=DJI inline.
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    t.extend_from_slice(&[0x01, 0x0f]); // tag 0x010f Make
+    t.extend_from_slice(&[0x00, 0x02]); // ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4
+    t.extend_from_slice(b"DJI\0"); // inline "DJI\0"
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    t
+  }
+
+  #[test]
+  fn dji_thermal_params2_skipped_when_later_app1_make_is_non_dji() {
+    // The MUTABLE `$$self{Make}` state: `APP1` Make=DJI, THEN a later `APP1`
+    // Make=Canon, THEN `APP4` ThermalParams2. ExifTool updates `$$self{Make}`
+    // from each `APP1`'s IFD0 `Make` as it walks the Marker: loop (last-wins),
+    // so its CURRENT Make at the `APP4` is `Canon` — the DJI thermal arm is
+    // SKIPPED. A gate that merely latched "the first APP1 was DJI" would WRONGLY
+    // emit the thermal tags here; the per-segment current-Make state must not.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff())); // APP1 Make=DJI
+    j.extend_from_slice(&app1_exif_segment(&minimal_tiff())); // APP1 Make=Canon
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert!(
+      !pj.keys().any(|(family1, _)| family1 == "DJI"),
+      "a later non-DJI APP1 (Make=Canon) flips $$self{{Make}} off, so an APP4 \
+       ThermalParams2 after it must emit NO DJI tags, got: {pj:?}"
+    );
+  }
+
+  #[test]
+  fn dji_thermal_params2_skipped_when_make_is_ifd1_only() {
+    // `Make='DJI'` lives ONLY in IFD1; IFD0 has no Make. ExifTool's
+    // `$$self{Make}` is set from the IFD0 walk alone (`Exif.pm:585`), so it is
+    // never `'DJI'` here — the `APP4` ThermalParams2 DJI arm is SKIPPED. A gate
+    // that scanned ALL entries by name (the pre-fix `exif_ifd0_make_is_dji`)
+    // would WRONGLY accept the IFD1 `Make`; the IFD0-only capture must not.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&ifd1_only_make_dji_tiff()));
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert!(
+      !pj.keys().any(|(family1, _)| family1 == "DJI"),
+      "an IFD1-only Make=DJI must NOT arm the DJI thermal gate (IFD0 $$self{{Make}} \
+       is what gates), got: {pj:?}"
+    );
+  }
+
+  #[test]
+  fn dji_thermal_params2_emitted_when_no_make_app1_preserves_prior_dji() {
+    // The MUTABLE `$$self{Make}` is NEVER cleared by an absent `Make`: `APP1`
+    // Make=DJI (arms the state), THEN an independent `APP1` with NO IFD0 `Make`
+    // (here an IFD1-only `Make`, so its `captured_make` is `None`), THEN `APP4`
+    // ThermalParams2. ExifTool runs `$$self{Make} = $val` ONLY when an IFD0
+    // `Make` tag is seen (`Exif.pm:585`), so the no-IFD0-Make `APP1` LEAVES the
+    // prior `'DJI'` state intact — the gate must stay armed and the DJI:* thermal
+    // tags MUST still be emitted at the `APP4`. A gate that overwrote the state
+    // for EVERY parsed `APP1` (treating `captured_make == None` as an explicit
+    // non-DJI Make) would WRONGLY clear the DJI state here and suppress the tags.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff())); // APP1 Make=DJI (arms)
+    // An APP1 with NO IFD0 Make (IFD1-only Make) -> captured_make None -> the
+    // marker-state Make is carried forward unchanged (still DJI), not cleared.
+    j.extend_from_slice(&app1_exif_segment(&ifd1_only_make_dji_tiff()));
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      pj.get(&("DJI".to_string(), "RelativeHumidity".to_string()))
+        .map(String::as_str),
+      Some("50 %"),
+      "an APP1 with no IFD0 Make must NOT clear the prior DJI $$self{{Make}} state, \
+       so an APP4 ThermalParams2 after it still emits the DJI thermal tags, got: {pj:?}"
+    );
+  }
+
+  #[test]
+  fn dji_thermal_params2_skipped_when_later_app1_make_is_non_string() {
+    // The marker-state Make edge where the LATER `Make` is READABLE but NOT a
+    // string: `APP1` Make=DJI (arms the gate), THEN an `APP1` whose IFD0 `Make`
+    // (`0x010f`) is encoded as a NUMERIC `SHORT[2]` (`int16u`, value `1 2`),
+    // THEN `APP4` ThermalParams2. ExifTool's `Make` `RawConv`
+    // (`$val =~ s/\s+$//; $$self{Make} = $val`, `Exif.pm:585`) runs whenever the
+    // `Make` TAG is seen — NOT only when the format is `ascii` — so the SHORT
+    // `Make` decodes through `ReadValue` and assigns `$$self{Make}` its
+    // space-joined `$val` `"1 2"`. That is a readable, non-`'DJI'` Make: it must
+    // CLEAR the prior DJI state, so the `APP4` ThermalParams2 emits NO DJI tags.
+    // Contrast `*_when_no_make_app1_preserves_prior_dji` (an ABSENT Make leaves
+    // the state intact); a readable non-string Make is a SEEN Make and clears.
+    // The pre-fix capture taps only `RawValue::Text`, so the SHORT `Make` left
+    // `captured_make == None`, the prior DJI state survived, and the thermal
+    // tags were WRONGLY emitted.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff())); // APP1 Make=DJI (arms)
+    // APP1 with a READABLE NON-STRING IFD0 Make (SHORT[2] = 1 2) -> $$self{Make}
+    // becomes "1 2" (a seen, non-DJI Make) -> the DJI gate flips OFF.
+    j.extend_from_slice(&app1_exif_segment(&ifd0_make_short_tiff()));
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert!(
+      !pj.keys().any(|(family1, _)| family1 == "DJI"),
+      "a later APP1 whose IFD0 Make is a readable non-string value (SHORT[2]) \
+       still assigns $$self{{Make}} (its stringified $val), so it CLEARS the \
+       prior DJI state — an APP4 ThermalParams2 after it must emit NO DJI tags, \
+       got: {pj:?}"
+    );
+    // The IFD0:Make IS still extracted from the second APP1 (the EXIF block is
+    // merged regardless of the gate); it is rendered as the numeric $val.
+    assert_eq!(meta.entry("Make").map(|e| e.name()), Some("Make"));
+  }
+
+  #[test]
+  fn dji_thermal_params2_emitted_for_ifd0_make_dji_trailing_space() {
+    // IFD0 `Make='DJI '` (a trailing SPACE). The `Exif.pm:585` `Make` `RawConv`
+    // (`s/\s+$//`) trims it to `'DJI'`, so `$$self{Make} eq 'DJI'` is TRUE and the
+    // `APP4` ThermalParams2 DJI arm fires. Reusing the main walker's trimmed
+    // `captured_make` (not a raw byte compare) is what makes this match.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&ifd0_make4_tiff(*b"DJI ")));
+    j.extend_from_slice(&app_segment(
+      0xe4,
+      &dji_thermal_params2_app4(0.5f32.to_le_bytes()),
+    ));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      pj.get(&("DJI".to_string(), "RelativeHumidity".to_string()))
+        .map(String::as_str),
+      Some("50 %"),
+      "IFD0 Make='DJI ' (trailing space) must trim to 'DJI' and emit the DJI \
+       thermal tags"
+    );
+  }
+
+  #[test]
+  fn dji_relative_humidity_uses_g6_not_g15() {
+    // ExifTool's RelativeHumidity PrintConv is `sprintf("%g %%", $val*100)`;
+    // Perl `%g` defaults to SIX significant digits. The crafted raw float
+    // 0.123456 (LE 0x80 0xd6 0xfc 0x3d) decodes to f32 ~0.1234560013, so
+    // `$val*100` ~= 12.34560013:
+    //   %g  (6 sig) => "12.3456"   (what ExifTool emits, verified against the
+    //                               bundled `exiftool`),
+    //   %.15g       => "12.3456001281738" (the pre-fix output — WRONG).
+    // The fix must produce the 6-sig-digit form.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff()));
+    let humidity = [0x80u8, 0xd6, 0xfc, 0x3d]; // f32 0.123456 little-endian
+    j.extend_from_slice(&app_segment(0xe4, &dji_thermal_params2_app4(humidity)));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      pj.get(&("DJI".to_string(), "RelativeHumidity".to_string()))
+        .map(String::as_str),
+      Some("12.3456 %"),
+      "RelativeHumidity must render with %g's 6 significant digits (matching \
+       `exiftool`), not %.15g"
+    );
+  }
+
+  #[test]
+  fn malformed_short_app_segments_no_panic() {
+    // Truncated / short APP2 (MPF), APP3, APP4 and APP5 segments must be handled
+    // gracefully (no panic, no out-of-bounds): the DJI gate is active (Make=DJI)
+    // and every auxiliary decoder bails on a too-short payload via its
+    // `payload.get(..)` guards.
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&dji_make_tiff()));
+    // APP2 "MPF\0" header only — no TIFF body (process_mpf's `payload.get(4..)`
+    // yields an empty slice; the byte-order marker probe fails -> bail).
+    j.extend_from_slice(&app_segment(0xe2, b"MPF\0"));
+    // APP2 with a 1-byte truncated TIFF (no full byte-order marker).
+    j.extend_from_slice(&app_segment(0xe2, b"MPF\0I"));
+    // APP3 raw thermal: a 1-byte payload (consecutive-run sum stays tiny).
+    j.extend_from_slice(&app_segment(0xe3, &[0x00]));
+    // APP4 ThermalParams2 too short for the offset-32/64 magic probe -> bail
+    // (the `payload.get(32..36)` / `get(64..68)` both yield None).
+    j.extend_from_slice(&app_segment(0xe4, &[0x01, 0x02, 0x03]));
+    // APP5 ThermalCalibration: empty payload.
+    j.extend_from_slice(&app_segment(0xe5, &[]));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    // Must not panic in either conv mode.
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted despite short APP segments");
+    let pj = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    let nj = emitted_by_group(&meta, crate::emit::ConvMode::ValueConv);
+    // The short APP4 produced no ThermalParams2 tags; the empty/short APP3/APP5
+    // still emit their combined-blob binary placeholders (0-/1-byte length is a
+    // valid combined-run sum), so we only assert no thermal-PARAM tag leaked and
+    // that the call returned without panicking.
+    assert!(
+      !pj.contains_key(&("DJI".to_string(), "RelativeHumidity".to_string())),
+      "a too-short APP4 must not emit RelativeHumidity"
+    );
+    let _ = nj; // exercised the -n path for panics too
+  }
+
+  #[test]
+  fn mpf_image_start_rebased_by_base_offset() {
+    // `MPImageStart` (`IsOffset => '$val'`) is rebased to an ABSOLUTE file
+    // offset by the MPF TIFF Base = base_offset + payload_start + 4. A JPEG
+    // recovered after a leading header (base_offset > 0) must therefore report
+    // the skipped bytes in a non-zero MPImageStart; base_offset == 0 leaves it
+    // at payload_start + 4 (the offset-0 case the goldens pin).
+    //
+    // Build a little-endian MPF APP2 with one MP entry whose MPImageStart raw
+    // value is 0x1000, then parse the SAME JPEG body at base_offset 0 and at a
+    // non-zero base_offset and confirm the emitted MPImageStart shifts by
+    // exactly the base_offset delta.
+    fn mpf_app2_payload() -> Vec<u8> {
+      // "MPF\0" + little-endian classic TIFF.
+      let mut p: Vec<u8> = Vec::new();
+      p.extend_from_slice(b"MPF\0");
+      let tiff_start = p.len();
+      p.extend_from_slice(&[b'I', b'I', 0x2a, 0x00]); // II, 0x2a
+      // IFD0 offset = 8 (relative to tiff start).
+      p.extend_from_slice(&8u32.to_le_bytes());
+      // IFD0 @ tiff_start + 8: 1 entry.
+      p.extend_from_slice(&1u16.to_le_bytes());
+      // Entry: tag 0xb002 MPImageList, format undef(7), count 16, value-offset.
+      p.extend_from_slice(&0xb002u16.to_le_bytes());
+      p.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+      p.extend_from_slice(&16u32.to_le_bytes()); // 16 bytes => out-of-line
+      // The 16-byte MP-entry list goes right after the IFD (count + 1 entry +
+      // next-IFD long): offset = 8 + 2 + 12 + 4 = 26 (relative to tiff start).
+      let list_off = 26u32;
+      p.extend_from_slice(&list_off.to_le_bytes());
+      // next-IFD = 0.
+      p.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(
+        p.len() - tiff_start,
+        list_off as usize,
+        "list offset layout"
+      );
+      // The 16-byte MP entry: packed flags/format/type @0, length @4,
+      // MPImageStart @8 = 0x1000, dep1/dep2 @12/14.
+      p.extend_from_slice(&0u32.to_le_bytes()); // packed (type=0 => no preview)
+      p.extend_from_slice(&100u32.to_le_bytes()); // MPImageLength
+      p.extend_from_slice(&0x1000u32.to_le_bytes()); // MPImageStart raw
+      p.extend_from_slice(&0u16.to_le_bytes()); // dep1
+      p.extend_from_slice(&0u16.to_le_bytes()); // dep2
+      p
+    }
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app_segment(0xe2, &mpf_app2_payload()));
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+
+    // The APP2 payload begins after SOI(2) + marker(2) + length(2) = byte 6, so
+    // payload_start == 6; the MPF TIFF base at offset 0 is 6 + 4 = 10, and the
+    // rebased MPImageStart is 0x1000 + 10 = 4106.
+    let meta0 = parse_jpeg_exif_with_base(&j, 0).expect("base 0 JPEG accepted");
+    let g0 = emitted_by_group(&meta0, crate::emit::ConvMode::ValueConv);
+    let start0: u64 = g0
+      .get(&("MPImage1".to_string(), "MPImageStart".to_string()))
+      .expect("MPImage1:MPImageStart present")
+      .parse()
+      .expect("numeric MPImageStart");
+    assert_eq!(
+      start0,
+      0x1000 + 6 + 4,
+      "base 0 rebases by payload_start+4 only"
+    );
+
+    // The same body recovered after a 0x40 = 64-byte leading header: every
+    // absolute offset shifts by exactly 64.
+    let base = 0x40usize;
+    let meta1 = parse_jpeg_exif_with_base(&j, base).expect("base>0 JPEG accepted");
+    let g1 = emitted_by_group(&meta1, crate::emit::ConvMode::ValueConv);
+    let start1: u64 = g1
+      .get(&("MPImage1".to_string(), "MPImageStart".to_string()))
+      .expect("MPImage1:MPImageStart present")
+      .parse()
+      .expect("numeric MPImageStart");
+    assert_eq!(
+      start1,
+      start0 + base as u64,
+      "base_offset must be threaded into the MPF Base so MPImageStart is absolute"
     );
   }
 }

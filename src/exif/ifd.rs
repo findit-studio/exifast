@@ -598,6 +598,41 @@ impl RawValue {
     }
     s
   }
+
+  /// ExifTool's post-`ReadValue` `$val` AS A DISPLAY STRING — the value a
+  /// `RawConv` that stores `$$self{X} = $val` keeps in object state for ANY
+  /// readable shape, the way that scalar later stringifies in an `eq`
+  /// comparison. This is the string form of the IFD0 `Make`/`Model` the
+  /// MakerNotes dispatcher and the JPEG DJI gate read (`$$self{Make} eq 'DJI'`,
+  /// `Exif.pm:585`): the `RawConv` `$$self{Make} = $val` runs whenever the
+  /// `Make` TAG is seen, NOT only when its on-disk format is ASCII — so a
+  /// `Make` encoded `int16u`/`undef`/etc. still assigns `$$self{Make}` its
+  /// stringified `$val` and must be captured.
+  ///
+  /// Per shape, mirroring how Perl stringifies the post-`ReadValue` `$val`:
+  /// - `Text` → the FixUTF8 display string (`text`) — the SAME string the
+  ///   EMITTED `Make`/`Model` tag renders (so an ASCII `Make` is captured
+  ///   exactly as before this method existed: byte-for-byte the prior
+  ///   `RawValue::Text`-only path);
+  /// - numeric (`U64`/`I64`/`F64`/`Rational`) → the space-joined `$val`
+  ///   ([`Self::numeric_val_string`] — `ReadValue`'s `join(' ', @vals)`), e.g.
+  ///   an `int16u[2]` `Make` stringifies to `"1 2"`;
+  /// - `Bytes` (`undef`/`binary`) → the lenient UTF-8 view of the bytes
+  ///   (`from_utf8_lossy`) — the binary `$val`'s string form.
+  ///
+  /// The caller applies the `Make`/`Model` `RawConv`'s trailing-`\s+` trim on
+  /// top (`s/\s+$//`); this method returns the untrimmed `$val` string.
+  /// Borrows for `Text` (zero-copy); allocates only the numeric/`Bytes` forms,
+  /// which have no stored display string.
+  #[must_use]
+  pub fn raw_conv_val_string(&self) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match self {
+      RawValue::Text { text, .. } => Cow::Borrowed(text.as_str()),
+      RawValue::Bytes(b) => std::string::String::from_utf8_lossy(b),
+      _ => Cow::Owned(self.numeric_val_string()),
+    }
+  }
 }
 
 /// Space-join `Display` elements into `s` (the `ReadValue` integer-array join).
