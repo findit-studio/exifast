@@ -569,7 +569,11 @@ pub fn redispatch_ctmd_makernote_value_offset_diagnostics(
         num_entries,
         dir_end,
       } => (num_entries, dir_end),
-      CanonDirShape::AbortBadDirectory => return out,
+      // The CTMD re-dispatch is the `$inMakerNotes = 0` framing (the diagnostic
+      // walk has no `DirLen` window): a clean-count overrun ABORTS exactly like
+      // `AbortBadDirectory`, NOT salvaged (the maker-note salvage is applied only
+      // at the two emission sites via [`body::salvage_makernote_overrun`]).
+      CanonDirShape::Overrun { .. } | CanonDirShape::AbortBadDirectory => return out,
       CanonDirShape::AbortIllegalSize { num_entries } => {
         out.push(Diagnostic::warn(std::format!(
           "Illegal IFD0 directory size ({num_entries} entries)"

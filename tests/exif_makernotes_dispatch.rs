@@ -4787,3 +4787,882 @@ fn leica7_embedded_app1_nonzero_base_matches_bundled_exiftool() {
   }
   let _ = std::fs::remove_file(&path);
 }
+
+// ===========================================================================
+// MakerNote directory-size SALVAGE clamp (Exif.pm:6384-6388, #248)
+// ===========================================================================
+
+/// Craft a big-endian JPEG (`Exif` APP1) whose Canon MakerNote (`0x927c`) IFD
+/// count word CLAIMS `claimed_count` entries (so `2 + 12*claimed_count` overruns
+/// the buffer) while the BLOB physically holds only two real Canon leaves —
+/// `OwnerName` (0x0009) and `CanonImageType` (0x0006), both ASCII out-of-line.
+/// `mn_len` is the declared `0x927c` value length: defaults to `2 + 12*N` (exactly
+/// covering the `N=2` real entries, so the salvage clamp `(mn_len-2)/12 == 2`); a
+/// `mn_len_override` lets a caller force the sub-14 / out-of-range gate-fail cases.
+/// The two string values sit AFTER the (salvaged) directory end, so the salvaged
+/// entries decode WITHOUT a Suspicious-offset skip.
+#[cfg(all(feature = "exif", feature = "std"))]
+fn craft_canon_overrun_jpeg(claimed_count: u16, mn_len_override: Option<u32>) -> Vec<u8> {
+  let be16 = |v: u16| v.to_be_bytes();
+  let be32 = |v: u32| v.to_be_bytes();
+  let make = b"Canon\x00";
+  let model = b"Canon EOS 5D\x00";
+  let hdr = 8usize;
+  let ifd0_start = hdr;
+  let ifd0_size = 2 + 12 * 3 + 4;
+  let make_off = ifd0_start + ifd0_size;
+  let model_off = make_off + make.len();
+  let exif_start = model_off + model.len();
+  let exif_size = 2 + 12 + 4;
+  let canon_start = exif_start + exif_size;
+  let n_real = 2usize;
+  // The next-IFD pointer sits exactly at the SALVAGED directory end
+  // (canon_start + 2 + 12*N), so the two string values that follow are at an
+  // offset >= dir_end (no Suspicious-offset skip).
+  let nextptr_off = canon_start + 2 + 12 * n_real;
+  let owner = b"OwnerX\x00";
+  let imgtype = b"CanonImg\x00";
+  let owner_off = nextptr_off + 4;
+  let imgtype_off = owner_off + owner.len();
+  let mn_len = mn_len_override.unwrap_or((2 + 12 * n_real) as u32);
+
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&be16(0x2a));
+  t.extend_from_slice(&be32(ifd0_start as u32));
+  // IFD0: Make, Model, ExifIFD.
+  t.extend_from_slice(&be16(3));
+  t.extend_from_slice(&be16(0x010f));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(make.len() as u32));
+  t.extend_from_slice(&be32(make_off as u32));
+  t.extend_from_slice(&be16(0x0110));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(model.len() as u32));
+  t.extend_from_slice(&be32(model_off as u32));
+  t.extend_from_slice(&be16(0x8769));
+  t.extend_from_slice(&be16(4));
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be32(exif_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(make);
+  t.extend_from_slice(model);
+  // ExifIFD: MakerNote.
+  t.extend_from_slice(&be16(1));
+  t.extend_from_slice(&be16(0x927c));
+  t.extend_from_slice(&be16(7)); // UNDEF
+  t.extend_from_slice(&be32(mn_len));
+  t.extend_from_slice(&be32(canon_start as u32));
+  t.extend_from_slice(&be32(0));
+  // Canon Main IFD: the count word CLAIMS an overrun, then two real entries.
+  t.extend_from_slice(&be16(claimed_count));
+  t.extend_from_slice(&be16(0x0009)); // OwnerName
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(owner.len() as u32));
+  t.extend_from_slice(&be32(owner_off as u32));
+  t.extend_from_slice(&be16(0x0006)); // CanonImageType
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(imgtype.len() as u32));
+  t.extend_from_slice(&be32(imgtype_off as u32));
+  t.extend_from_slice(&be32(0)); // next-IFD ptr at the salvaged dir_end
+  t.extend_from_slice(owner);
+  t.extend_from_slice(imgtype);
+
+  // Wrap in a JPEG: SOI + APP1(Exif\0\0 + tiff) + EOI.
+  let mut app1: Vec<u8> = Vec::new();
+  app1.extend_from_slice(b"Exif\x00\x00");
+  app1.extend_from_slice(&t);
+  let mut jpeg: Vec<u8> = Vec::new();
+  jpeg.extend_from_slice(&[0xff, 0xd8]);
+  jpeg.extend_from_slice(&[0xff, 0xe1]);
+  jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+  jpeg.extend_from_slice(&app1);
+  jpeg.extend_from_slice(&[0xff, 0xd9]);
+  jpeg
+}
+
+/// SALVAGE (`Exif.pm:6384-6388`, #248): a crafted Canon MakerNote whose IFD count
+/// word claims 1000 entries (`2 + 12*1000` overruns the buffer) but whose declared
+/// `mn_len` (26 ≥ 14) is a valid in-range region ⇒ exifast CLAMPS to
+/// `(26-2)/12 == 2` entries and emits BOTH salvaged Canon leaves, instead of
+/// aborting the whole directory (which would emit zero Canon tags).
+///
+/// Oracle (`perl exiftool -G1 -j` on the SAME crafted bytes):
+///
+/// ```text
+/// "ExifTool:Warning": "[minor] Bad MakerNotes directory",
+/// "IFD0:Make": "Canon",
+/// "IFD0:Model": "Canon EOS 5D",
+/// "Canon:OwnerName": "OwnerX",
+/// "Canon:CanonImageType": "CanonImg"
+/// ```
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_makernote_dirsize_overrun_salvages_clamped_entries() {
+  let data = craft_canon_overrun_jpeg(1000, None);
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted Canon JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_canon(), "vendor = Canon");
+  let emissions = mn.emissions_print_conv();
+  // BOTH salvaged Canon leaves emit (the clamp walked the 2 real entries).
+  let owner = emissions
+    .iter()
+    .find(|e| e.name() == "OwnerName")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    owner,
+    Some(exifast::TagValue::Str("OwnerX".into())),
+    "the salvage must walk the clamped entries and emit OwnerName (NOT abort)"
+  );
+  let imgtype = emissions
+    .iter()
+    .find(|e| e.name() == "CanonImageType")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    imgtype,
+    Some(exifast::TagValue::Str("CanonImg".into())),
+    "the second salvaged entry (CanonImageType) must emit too"
+  );
+}
+
+/// NEGATIVE (the `$dirLen >= 14` gate, `Exif.pm:6383`): the SAME overrun Canon
+/// MakerNote but with a declared `mn_len` of 8 (< 14) ⇒ the salvage condition
+/// FAILS, so exifast aborts the whole directory and emits ZERO Canon leaves
+/// (Make/Model still resolve). Bundled `perl exiftool -G1 -j` likewise emits the
+/// `[minor] Bad MakerNotes directory` warning and NO `Canon:*` tags.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_makernote_dirsize_overrun_short_dirlen_aborts() {
+  let data = craft_canon_overrun_jpeg(1000, Some(8));
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted Canon JPEG parsed");
+  // Make/Model from IFD0 still resolve.
+  assert_eq!(
+    meta.entry("Model").map(|e| match e.value_ref().raw() {
+      exifast::exif::ifd::RawValue::Text { text: s, .. } => s.as_str(),
+      _ => "<not-text>",
+    }),
+    Some("Canon EOS 5D")
+  );
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_canon(), "vendor = Canon");
+  // `dirLen < 14` ⇒ NO salvage ⇒ the directory aborts ⇒ zero Canon leaves.
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "a sub-14 declared MakerNote length must NOT salvage — abort, emit no Canon tags"
+  );
+}
+
+/// NEGATIVE (the `$inMakerNotes` gate, `Exif.pm:6382`): a CORE IFD (ExifIFD) whose
+/// count word overruns the buffer is NOT salvaged — ExifTool warns `Bad ExifIFD
+/// directory` (NON-minor, `$inMakerNotes == 0`) and `return 0`s the directory. The
+/// salvage clamp must fire for maker notes ONLY (`!active_table.is_core_ifd()`); a
+/// core IFD overrun still aborts. Assert the overrunning ExifIFD yields NO Exif
+/// tags from it (its single real entry is NOT read).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn core_ifd_dirsize_overrun_aborts_no_salvage() {
+  let be16 = |v: u16| v.to_be_bytes();
+  let be32 = |v: u32| v.to_be_bytes();
+  let hdr = 8usize;
+  let ifd0_start = hdr;
+  let ifd0_size = 2 + 12 + 4;
+  let exif_start = ifd0_start + ifd0_size;
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&be16(0x2a));
+  t.extend_from_slice(&be32(ifd0_start as u32));
+  // IFD0: ExifIFD pointer only.
+  t.extend_from_slice(&be16(1));
+  t.extend_from_slice(&be16(0x8769));
+  t.extend_from_slice(&be16(4));
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be32(exif_start as u32));
+  t.extend_from_slice(&be32(0));
+  // ExifIFD: count word CLAIMS 1000 (overrun), then one real ExposureProgram
+  // (0x8822, SHORT, inline) the walk would emit IF it did not abort.
+  t.extend_from_slice(&be16(1000));
+  t.extend_from_slice(&be16(0x8822)); // ExposureProgram
+  t.extend_from_slice(&be16(3)); // int16u
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be16(2)); // value 2 (= "Program AE")
+  t.extend_from_slice(&be16(0)); // inline padding
+  t.extend_from_slice(&be32(0)); // next-IFD ptr
+
+  let meta = exifast::parse_exif_block(&t).expect("valid TIFF");
+  // A core ExifIFD overrun aborts (no salvage): ExposureProgram is NOT emitted.
+  assert!(
+    meta.entry("ExposureProgram").is_none(),
+    "a CORE IFD overrun must abort (no maker-note salvage): ExposureProgram dropped"
+  );
+}
+
+/// Cross-check the SALVAGE against the bundled ExifTool binary (when `$EXIFTOOL`
+/// is set / on PATH): `perl exiftool -G1 -j` on the crafted overrun Canon JPEG
+/// must emit BOTH salvaged Canon leaves + the `[minor] Bad MakerNotes directory`
+/// warning, proving the clamp is byte-faithful. Skipped (not failed) when the
+/// binary is unavailable.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn canon_dirsize_salvage_matches_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Canon salvage cross-check skipped");
+    return;
+  }
+  let data = craft_canon_overrun_jpeg(1000, None);
+  let dir = std::env::temp_dir();
+  let path = dir.join("exifast_canon_dirsize_salvage.jpg");
+  std::fs::write(&path, &data).expect("write temp salvage jpg");
+  let out = Command::new(&tool)
+    .args([
+      "-G1",
+      "-j",
+      "-Make",
+      "-Model",
+      "-OwnerName",
+      "-CanonImageType",
+      "-Warning",
+    ])
+    .arg(&path)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&path);
+  assert!(out.status.success(), "exiftool failed");
+  let json = String::from_utf8(out.stdout).expect("utf8");
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  // The bundled binary salvages the SAME two Canon leaves.
+  assert_eq!(
+    obj.get("Canon:OwnerName").and_then(|v| v.as_str()),
+    Some("OwnerX"),
+    "bundled exiftool must salvage Canon:OwnerName"
+  );
+  assert_eq!(
+    obj.get("Canon:CanonImageType").and_then(|v| v.as_str()),
+    Some("CanonImg"),
+    "bundled exiftool must salvage Canon:CanonImageType"
+  );
+  // And raises the minor Bad-MakerNotes-directory warning.
+  assert_eq!(
+    obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+    Some("[minor] Bad MakerNotes directory"),
+    "bundled exiftool must warn [minor] Bad MakerNotes directory"
+  );
+}
+
+// ===========================================================================
+// #248 R1 finding 1 — the Canon `%CameraSettings` DataMember pre-scan must
+// apply the SAME maker-note salvage clamp as the emission walk, so a SALVAGED
+// Canon directory's dependent sub-tables (FocalLength / FileInfo) read the
+// pre-scanned `FocalUnits` / `LensType` instead of defaulting.
+// ===========================================================================
+
+/// Craft a big-endian JPEG (`Exif` APP1) whose Canon MakerNote (`0x927c`) IFD
+/// count word CLAIMS an OVERRUN (`claimed_count`, so `2 + 12*claimed_count`
+/// exceeds the buffer) while the declared `0x927c` value length is exactly
+/// `2 + 12*2 == 26` (>= 14) ⇒ the salvage clamps to TWO real entries:
+///
+///   - `0x0001` `CanonCameraSettings` — `int16u[26]`, out-of-line, carrying
+///     `LensType` (position 22) and `FocalUnits` (position 25 = 2); the
+///     DataMembers the pre-scan must extract from the SALVAGED entry set.
+///   - `0x0002` `CanonFocalLength` — `int16u[2]`, out-of-line: `FocalType` = 2
+///     (Zoom), raw `FocalLength` = 100. The sub-table renders
+///     `FocalLength = 100 / FocalUnits` mm — `"50 mm"` WITH the pre-scanned
+///     `FocalUnits = 2`, but the default `"100 mm"` if the pre-scan aborts the
+///     salvaged directory (the bug this finding fixes).
+///
+/// Both out-of-line values sit AFTER the salvaged directory end (`canon_start +
+/// 26`), so neither is dropped by the Suspicious-offset rule. `lens_type` and
+/// `focal_units` are caller-chosen so the test can vary the lens word.
+#[cfg(all(feature = "exif", feature = "std"))]
+fn craft_canon_focal_salvage_jpeg(claimed_count: u16, lens_type: u16, focal_units: u16) -> Vec<u8> {
+  let be16 = |v: u16| v.to_be_bytes();
+  let be32 = |v: u32| v.to_be_bytes();
+  let make = b"Canon\x00";
+  // A non-EOS PowerShot model: keeps the typed focal RANGE off the EOS path and
+  // does not perturb the FocalLength sub-table (its FocalPlane words are absent).
+  let model = b"Canon PowerShot S100\x00";
+  let hdr = 8usize;
+  let ifd0_start = hdr;
+  let ifd0_size = 2 + 12 * 3 + 4;
+  let make_off = ifd0_start + ifd0_size;
+  let model_off = make_off + make.len();
+  let exif_start = model_off + model.len();
+  let exif_size = 2 + 12 + 4;
+  let canon_start = exif_start + exif_size;
+  let n_real = 2usize;
+  // The next-IFD pointer sits at the SALVAGED directory end; the CameraSettings
+  // out-of-line value (52 bytes > 4) follows it (offset >= dir_end ⇒ no
+  // Suspicious-offset skip). The FocalLength value (4 bytes == size <= 4) is
+  // INLINE in its 12-byte entry's value field (`Exif.pm:6517` — Canon reads a
+  // `<= 4`-byte value from `$entry + 8`), so it needs no out-of-line slot.
+  let nextptr_off = canon_start + 2 + 12 * n_real;
+  let cs_off = nextptr_off + 4; // CanonCameraSettings value (52 bytes, out-of-line)
+  // The declared `0x927c` length: exactly the salvaged-directory extent (26),
+  // which is >= 14 ⇒ the salvage clamps to `(26 - 2) / 12 == 2` entries.
+  let mn_len = (2 + 12 * n_real) as u32;
+
+  // CanonCameraSettings: int16u[26]. word0 = blob byte-length (52); word22 =
+  // LensType; word25 = FocalUnits. All other words 0 (RawConv-dropped / benign).
+  let mut cs = vec![0u8; 52];
+  let put = |buf: &mut [u8], word_idx: usize, v: u16| {
+    let off = 2 * word_idx;
+    buf[off..off + 2].copy_from_slice(&v.to_be_bytes());
+  };
+  put(&mut cs, 0, 52);
+  put(&mut cs, 22, lens_type);
+  put(&mut cs, 25, focal_units);
+
+  // CanonFocalLength: int16u[2]. word0 = FocalType (2 = Zoom); word1 = raw
+  // FocalLength (100 ⇒ 100/FocalUnits mm).
+  let mut fl = vec![0u8; 4];
+  put(&mut fl, 0, 2);
+  put(&mut fl, 1, 100);
+
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&be16(0x2a));
+  t.extend_from_slice(&be32(ifd0_start as u32));
+  // IFD0: Make, Model, ExifIFD.
+  t.extend_from_slice(&be16(3));
+  t.extend_from_slice(&be16(0x010f));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(make.len() as u32));
+  t.extend_from_slice(&be32(make_off as u32));
+  t.extend_from_slice(&be16(0x0110));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(model.len() as u32));
+  t.extend_from_slice(&be32(model_off as u32));
+  t.extend_from_slice(&be16(0x8769));
+  t.extend_from_slice(&be16(4));
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be32(exif_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(make);
+  t.extend_from_slice(model);
+  // ExifIFD: MakerNote.
+  t.extend_from_slice(&be16(1));
+  t.extend_from_slice(&be16(0x927c));
+  t.extend_from_slice(&be16(7)); // UNDEF
+  t.extend_from_slice(&be32(mn_len));
+  t.extend_from_slice(&be32(canon_start as u32));
+  t.extend_from_slice(&be32(0));
+  // Canon Main IFD: the count word CLAIMS an overrun, then two real entries.
+  t.extend_from_slice(&be16(claimed_count));
+  t.extend_from_slice(&be16(0x0001)); // CanonCameraSettings
+  t.extend_from_slice(&be16(3)); // int16u
+  t.extend_from_slice(&be32(26)); // count = 26 words
+  t.extend_from_slice(&be32(cs_off as u32));
+  t.extend_from_slice(&be16(0x0002)); // CanonFocalLength
+  t.extend_from_slice(&be16(3)); // int16u
+  t.extend_from_slice(&be32(2)); // count = 2 words (size 4 ⇒ INLINE value)
+  t.extend_from_slice(&fl); // inline FocalType + raw FocalLength (4 bytes)
+  t.extend_from_slice(&be32(0)); // next-IFD ptr at the salvaged dir_end
+  t.extend_from_slice(&cs);
+
+  // Wrap in a JPEG: SOI + APP1(Exif\0\0 + tiff) + EOI.
+  let mut app1: Vec<u8> = Vec::new();
+  app1.extend_from_slice(b"Exif\x00\x00");
+  app1.extend_from_slice(&t);
+  let mut jpeg: Vec<u8> = Vec::new();
+  jpeg.extend_from_slice(&[0xff, 0xd8]);
+  jpeg.extend_from_slice(&[0xff, 0xe1]);
+  jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+  jpeg.extend_from_slice(&app1);
+  jpeg.extend_from_slice(&[0xff, 0xd9]);
+  jpeg
+}
+
+/// #248 R1 finding 1 — a SALVAGED Canon directory must be PRE-SCANNED over the
+/// SAME clamped entry set, so the `0x02` FocalLength sub-table reads the
+/// pre-scanned `FocalUnits` (`= 2`) and renders `100 / 2 == "50 mm"`, NOT the
+/// default-unit `"100 mm"`. WITHOUT the finding-1 fix the pre-scan aborts the
+/// overclaimed directory, leaving `FocalUnits` unset ⇒ the FocalLength would
+/// render `"100 mm"` (the regression). The `LensType` DataMember (position 22)
+/// likewise emits only because the pre-scan walked the salvaged CameraSettings.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_salvaged_dir_prescan_drives_focallength_and_lenstype() {
+  // LensType 1 = "Canon EF 50mm f/1.8" (`%canonLensTypes`); FocalUnits 2.
+  let data = craft_canon_focal_salvage_jpeg(1000, 1, 2);
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted Canon JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_canon(), "vendor = Canon");
+  let emissions = mn.emissions_print_conv();
+  let find = |name: &str| {
+    emissions
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  };
+  // The dependent FocalLength sub-table emission scaled by the pre-scanned
+  // FocalUnits = 2 ⇒ 100/2 = "50 mm" (the salvage drove the pre-scan).
+  assert_eq!(
+    find("FocalLength"),
+    Some(exifast::TagValue::Str("50 mm".into())),
+    "the salvaged dir's FocalLength must use the pre-scanned FocalUnits=2 (50 mm), \
+     NOT the default unit (100 mm) — the finding-1 fix"
+  );
+  assert_eq!(
+    find("FocalType"),
+    Some(exifast::TagValue::Str("Zoom".into())),
+    "FocalType from the salvaged 0x02 entry"
+  );
+  // LensType emits ONLY because the pre-scan walked the salvaged CameraSettings.
+  assert_eq!(
+    find("LensType"),
+    Some(exifast::TagValue::Str("Canon EF 50mm f/1.8".into())),
+    "LensType resolved from the salvaged CameraSettings position 22"
+  );
+}
+
+/// Cross-check the SALVAGED-directory sub-table output against the bundled
+/// ExifTool binary (`perl exiftool -G1 -j`): the SAME crafted bytes must emit
+/// `Canon:FocalLength = "50 mm"` and `Canon:LensType = "Canon EF 50mm f/1.8"`
+/// — proving the pre-scan salvage is byte-faithful. Skipped (not failed) when
+/// the binary is unavailable.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn canon_salvaged_dir_prescan_matches_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Canon salvage pre-scan cross-check skipped");
+    return;
+  }
+  let data = craft_canon_focal_salvage_jpeg(1000, 1, 2);
+  let dir = std::env::temp_dir();
+  let path = dir.join("exifast_canon_salvage_prescan.jpg");
+  std::fs::write(&path, &data).expect("write temp salvage-prescan jpg");
+  let out = Command::new(&tool)
+    .args(["-G1", "-j", "-FocalLength", "-FocalType", "-LensType"])
+    .arg(&path)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&path);
+  assert!(out.status.success(), "exiftool failed");
+  let json = String::from_utf8(out.stdout).expect("utf8");
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  // Bundled renders the FocalLength scaled by the salvaged FocalUnits = 2.
+  assert_eq!(
+    obj.get("Canon:FocalLength").and_then(|v| v.as_str()),
+    Some("50 mm"),
+    "bundled exiftool must render the salvaged FocalLength as 50 mm (FocalUnits=2)"
+  );
+  assert_eq!(
+    obj.get("Canon:LensType").and_then(|v| v.as_str()),
+    Some("Canon EF 50mm f/1.8"),
+    "bundled exiftool must render the salvaged LensType"
+  );
+}
+
+// ===========================================================================
+// #248 R1 finding 2 — `ProcessUnknown`'s `LocateIFD` must bound its
+// relocation-candidate scan by the threaded `DirLen` (`MakerNotes.pm:1501`),
+// NOT by `data.len() - dir_start`. A truncated MakerNote whose declared `0x927c`
+// length stops BEFORE an IFD-shaped run that physically follows in the buffer
+// must NOT relocate onto it and emit spurious vendor tags.
+// ===========================================================================
+
+/// Craft a big-endian JPEG (`Exif` APP1) carrying a Pentax `AOC\0` MakerNote
+/// (`MakerNotePentax`, `ProcessUnknown` + `FixBase => 1`) whose value region is
+/// `"AOC\0"` + 4 zero bytes + a little-endian 1-entry IFD (`Quality` 0x0008 =
+/// 1) at value-offset 8 — i.e. `LocateIFD` would relocate `+8` and the walk
+/// would emit `Pentax:Quality`. The DECLARED `0x927c` length is `mn_len`; the
+/// IFD bytes [8, 26) physically EXTEND PAST a truncated `mn_len` but stay inside
+/// the captured TIFF buffer (the "truncated MakerNote" case). `mn_len` < 22
+/// (`8 + 14`) ⇒ a DirLen-bounded `LocateIFD` rejects the `+8` candidate; a
+/// `mn_len` >= 22 lets it through.
+#[cfg(all(feature = "exif", feature = "std"))]
+fn craft_pentax_aoc_truncated_jpeg(mn_len: u32) -> Vec<u8> {
+  let be16 = |v: u16| v.to_be_bytes();
+  let be32 = |v: u32| v.to_be_bytes();
+  let make = b"PENTAX\x00";
+  let model = b"PENTAX K10D\x00";
+  let hdr = 8usize;
+  let ifd0_start = hdr;
+  let ifd0_size = 2 + 12 * 3 + 4;
+  let make_off = ifd0_start + ifd0_size;
+  let model_off = make_off + make.len();
+  let exif_start = model_off + model.len();
+  let exif_size = 2 + 12 + 4;
+  let mn_start = exif_start + exif_size;
+
+  // The MakerNote value: "AOC\0" + 4 zero bytes + a LE 1-entry IFD at offset 8.
+  let mut mn: Vec<u8> = Vec::new();
+  mn.extend_from_slice(b"AOC\x00"); // offset 0..4 — Pentax primary signature
+  mn.extend_from_slice(&[0u8; 4]); // offset 4..8 — zero count words ⇒ LocateIFD skips 4/6
+  // IFD at offset 8 (little-endian): count=1, Quality(0x0008) int16u=1, next=0.
+  mn.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+  mn.extend_from_slice(&0x0008u16.to_le_bytes()); // tag 0x0008 = Quality
+  mn.extend_from_slice(&3u16.to_le_bytes()); // format = int16u
+  mn.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+  mn.extend_from_slice(&1u16.to_le_bytes()); // value 1 inline
+  mn.extend_from_slice(&0u16.to_le_bytes()); // value padding
+  mn.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+  mn.extend_from_slice(&[0u8; 8]); // trailing slack so LocateIFD's size checks pass
+  // The IFD reaches offset 26; the value region is 34 bytes — but the 0x927c tag
+  // DECLARES only `mn_len` of it.
+
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&be16(0x2a));
+  t.extend_from_slice(&be32(ifd0_start as u32));
+  // IFD0: Make, Model, ExifIFD.
+  t.extend_from_slice(&be16(3));
+  t.extend_from_slice(&be16(0x010f));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(make.len() as u32));
+  t.extend_from_slice(&be32(make_off as u32));
+  t.extend_from_slice(&be16(0x0110));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(model.len() as u32));
+  t.extend_from_slice(&be32(model_off as u32));
+  t.extend_from_slice(&be16(0x8769));
+  t.extend_from_slice(&be16(4));
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be32(exif_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(make);
+  t.extend_from_slice(model);
+  // ExifIFD: MakerNote — DECLARES `mn_len` (possibly < the IFD's physical reach).
+  t.extend_from_slice(&be16(1));
+  t.extend_from_slice(&be16(0x927c));
+  t.extend_from_slice(&be16(7)); // UNDEF
+  t.extend_from_slice(&be32(mn_len));
+  t.extend_from_slice(&be32(mn_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(&mn); // the full 34-byte region (IFD bytes stay in the buffer)
+
+  // Wrap in a JPEG: SOI + APP1(Exif\0\0 + tiff) + EOI.
+  let mut app1: Vec<u8> = Vec::new();
+  app1.extend_from_slice(b"Exif\x00\x00");
+  app1.extend_from_slice(&t);
+  let mut jpeg: Vec<u8> = Vec::new();
+  jpeg.extend_from_slice(&[0xff, 0xd8]);
+  jpeg.extend_from_slice(&[0xff, 0xe1]);
+  jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+  jpeg.extend_from_slice(&app1);
+  jpeg.extend_from_slice(&[0xff, 0xd9]);
+  jpeg
+}
+
+/// #248 R1 finding 2 — `LocateIFD` bounds its relocation scan by `DirLen`: a
+/// Pentax `AOC\0` MakerNote whose IFD is at value-offset 8 but whose DECLARED
+/// `0x927c` length is 20 (< `8 + 14`) must emit NO Pentax tags, even though the
+/// IFD-shaped bytes physically follow in the buffer. The CONTROL (declared
+/// length 30 >= 22) proves the SAME bytes DO emit `Pentax:Quality` when the
+/// window admits the relocation — so the suppression is the DirLen bound, not a
+/// parse failure.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn pentax_locate_ifd_respects_dirlen_window() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::fixbase;
+
+  // NON-VACUOUS: the value region IS IFD-shaped — `LocateIFD` with NO DirLen
+  // (the pre-fix behaviour, scanning the whole buffer) locks onto the IFD at
+  // value-offset 8, so WITHOUT the DirLen bound `ProcessUnknown` would walk it.
+  let region = {
+    let mut r: Vec<u8> = Vec::new();
+    r.extend_from_slice(b"AOC\x00");
+    r.extend_from_slice(&[0u8; 4]);
+    r.extend_from_slice(&1u16.to_le_bytes());
+    r.extend_from_slice(&0x0008u16.to_le_bytes());
+    r.extend_from_slice(&3u16.to_le_bytes());
+    r.extend_from_slice(&1u32.to_le_bytes());
+    r.extend_from_slice(&1u16.to_le_bytes());
+    r.extend_from_slice(&0u16.to_le_bytes());
+    r.extend_from_slice(&0u32.to_le_bytes());
+    r.extend_from_slice(&[0u8; 8]);
+    r
+  };
+  assert_eq!(
+    fixbase::locate_ifd(&region, 0, None, ByteOrder::Big, Some("PENTAX"), None).map(|(off, _)| off),
+    Some(8),
+    "the crafted Pentax AOC region IS IFD-shaped at offset 8 (LocateIFD locks \
+     there with NO DirLen) — so the DirLen bound, not a parse failure, suppresses \
+     the tags"
+  );
+  // And with the DECLARED window (20 < 8 + 14) the SAME scan finds NOTHING — the
+  // finding-2 fix, asserted directly on `locate_ifd`.
+  assert_eq!(
+    fixbase::locate_ifd(&region, 0, Some(20), ByteOrder::Big, Some("PENTAX"), None),
+    None,
+    "a DirLen of 20 must bound the scan SHORT of the offset-8 IFD"
+  );
+
+  // End-to-end: declared `mn_len` 20 ⇒ NO Pentax tags (the relocation is bounded).
+  let truncated = craft_pentax_aoc_truncated_jpeg(20);
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&truncated).expect("crafted Pentax JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(
+    mn.vendor().is_pentax(),
+    "vendor = Pentax (AOC primary dispatched)"
+  );
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "a truncated DirLen must bound LocateIFD: NO Pentax tags from the out-of-window IFD"
+  );
+  assert_eq!(
+    mn.meta().pentax().and_then(|p| p.quality()),
+    None,
+    "no bogus Quality from an IFD that lies past the declared MakerNote window"
+  );
+
+  // CONTROL: declared `mn_len` 30 (>= 22) ⇒ the SAME bytes DO emit Pentax:Quality
+  // — proving the difference is the DirLen bound, not the byte content.
+  let admitted = craft_pentax_aoc_truncated_jpeg(30);
+  let meta2 = exifast::exif::jpeg::parse_jpeg_exif(&admitted).expect("crafted Pentax JPEG parsed");
+  let mn2 = meta2.maker_note().expect("MakerNote captured");
+  assert_eq!(
+    mn2.meta().pentax().and_then(|p| p.quality()),
+    Some(1),
+    "a DirLen wide enough to admit the offset-8 IFD DOES emit Quality (control)"
+  );
+}
+
+/// Craft a big-endian JPEG (`Exif` APP1) whose Pentax `AOC\0` MakerNote (`0x927c`)
+/// is shaped so that — for the DECLARED `mn_len` window — `LocateIFD` finds NO
+/// plausible IFD (`return undef` ⇒ `ProcessUnknown` processes nothing), YET the
+/// count word AT the unrelocated `ifd_start` (the `AOC` bytes, `0x414F` big-endian
+/// = 16719) is an OVERCLAIM whose `walk_one_ifd_body` salvage clamp
+/// (`(mn_len - 2) / 12` entries) would walk a VALID `Pentax:Quality` (`0x0008`)
+/// entry. With `mn_len == 26` the clamp keeps TWO entries:
+///
+///   - entry 0 @ blob offset 2 — tag id `0x4300` (the `"C\0"` of `AOC\0`, an
+///     UNKNOWN Pentax tag), `int16u[1]` (a VALID format so it is a normal-but-
+///     skipped entry, NOT a first-entry `Bad format` abort);
+///   - entry 1 @ blob offset 14 — `Quality` (`0x0008`), `int16u[1]`, inline value
+///     `1` ⇒ `Pentax:Quality` would emit on the salvage walk.
+///
+/// Every `LocateIFD` scan offset within the 26-byte window (0,2,4,6,8,10,12)
+/// rejects (see the per-offset reasoning in the test) so `locate_ifd` is `None`;
+/// the Quality entry sits at offset 14, BEYOND the `$offset + 14 > $dirLen` scan
+/// cutoff, so it is reachable ONLY by the count-word salvage. The DECLARED `0x927c`
+/// length is `mn_len`; the physical blob is longer (the IFD bytes stay inside the
+/// captured TIFF buffer) — the "truncated MakerNote" shape.
+#[cfg(all(feature = "exif", feature = "std"))]
+fn craft_pentax_aoc_overrun_jpeg(mn_len: u32) -> Vec<u8> {
+  let be16 = |v: u16| v.to_be_bytes();
+  let be32 = |v: u32| v.to_be_bytes();
+  let make = b"PENTAX\x00";
+  let model = b"PENTAX K10D\x00";
+  let hdr = 8usize;
+  let ifd0_start = hdr;
+  let ifd0_size = 2 + 12 * 3 + 4;
+  let make_off = ifd0_start + ifd0_size;
+  let model_off = make_off + make.len();
+  let exif_start = model_off + model.len();
+  let exif_size = 2 + 12 + 4;
+  let mn_start = exif_start + exif_size;
+
+  // The MakerNote value (big-endian throughout — the salvage walk's resolved
+  // order). Offset 0..4 is the forced `AOC\0` signature; its first two bytes ARE
+  // the IFD count word (`0x414F` = an overclaim ⇒ the salvage clamp fires).
+  let mut mn: Vec<u8> = Vec::new();
+  mn.extend_from_slice(b"AOC\x00"); // 0..4 — signature; count word = 0x414F (overrun)
+  // entry 0 @ offset 2 (tag id = the "C\0" of the signature = 0x4300, UNKNOWN):
+  // its format/count/value live at offsets 4.. (ours to control).
+  mn.extend_from_slice(&be16(0x0003)); // 4..6  — entry0 format = int16u (VALID ⇒ no entry-0 abort)
+  mn.extend_from_slice(&be32(1)); // 6..10 — entry0 count = 1
+  mn.extend_from_slice(&be16(1)); // 10..12 — entry0 inline value = 1
+  mn.extend_from_slice(&be16(0)); // 12..14 — entry0 inline value padding (= 0)
+  // entry 1 @ offset 14 — Pentax Quality (0x0008), int16u[1], inline value 1.
+  mn.extend_from_slice(&be16(0x0008)); // 14..16 — entry1 tag id = Quality
+  mn.extend_from_slice(&be16(0x0003)); // 16..18 — entry1 format = int16u
+  mn.extend_from_slice(&be32(1)); // 18..22 — entry1 count = 1
+  mn.extend_from_slice(&be16(1)); // 22..24 — entry1 inline value = 1 (Quality = "Better")
+  mn.extend_from_slice(&be16(0)); // 24..26 — entry1 inline value padding
+  mn.extend_from_slice(&be32(0)); // 26..30 — next-IFD pointer = 0 (bytes_from_end = 4)
+  // The blob physically reaches offset 30; the 0x927c tag DECLARES only `mn_len`.
+
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&be16(0x2a));
+  t.extend_from_slice(&be32(ifd0_start as u32));
+  // IFD0: Make, Model, ExifIFD.
+  t.extend_from_slice(&be16(3));
+  t.extend_from_slice(&be16(0x010f));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(make.len() as u32));
+  t.extend_from_slice(&be32(make_off as u32));
+  t.extend_from_slice(&be16(0x0110));
+  t.extend_from_slice(&be16(2));
+  t.extend_from_slice(&be32(model.len() as u32));
+  t.extend_from_slice(&be32(model_off as u32));
+  t.extend_from_slice(&be16(0x8769));
+  t.extend_from_slice(&be16(4));
+  t.extend_from_slice(&be32(1));
+  t.extend_from_slice(&be32(exif_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(make);
+  t.extend_from_slice(model);
+  // ExifIFD: MakerNote — DECLARES `mn_len` (< the IFD's physical reach).
+  t.extend_from_slice(&be16(1));
+  t.extend_from_slice(&be16(0x927c));
+  t.extend_from_slice(&be16(7)); // UNDEF
+  t.extend_from_slice(&be32(mn_len));
+  t.extend_from_slice(&be32(mn_start as u32));
+  t.extend_from_slice(&be32(0));
+  t.extend_from_slice(&mn); // the full 30-byte region (IFD bytes stay in the buffer)
+
+  // Wrap in a JPEG: SOI + APP1(Exif\0\0 + tiff) + EOI.
+  let mut app1: Vec<u8> = Vec::new();
+  app1.extend_from_slice(b"Exif\x00\x00");
+  app1.extend_from_slice(&t);
+  let mut jpeg: Vec<u8> = Vec::new();
+  jpeg.extend_from_slice(&[0xff, 0xd8]);
+  jpeg.extend_from_slice(&[0xff, 0xe1]);
+  jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+  jpeg.extend_from_slice(&app1);
+  jpeg.extend_from_slice(&[0xff, 0xd9]);
+  jpeg
+}
+
+/// #248 R3 finding — `ProcessUnknown`'s `LocateIFD`-returns-`undef` arm
+/// (`MakerNotes.pm:1834`) must ABORT the sub-directory (ExifTool `return 0`s
+/// WITHOUT processing it), NOT fall back to the unrelocated `ifd_start`. This is
+/// load-bearing now that `walk_one_ifd_body` SALVAGES a non-core count-word
+/// overrun: a Pentax `AOC\0` MakerNote whose declared `0x927c` window holds NO
+/// plausible IFD (`locate_ifd == None`) but whose `AOC`-byte count word is an
+/// overclaim WOULD, on the pre-fix fallback, salvage-clamp to entries that include
+/// a valid `Pentax:Quality` (`0x0008`). The abort suppresses it.
+///
+/// This is the case the existing `pentax_locate_ifd_respects_dirlen_window` does
+/// NOT cover: there the clamped first entry has a zero format code ⇒ a first-entry
+/// abort ⇒ no tags regardless of the R3 fix. HERE the salvage WOULD emit a tag, so
+/// the test fails WITHOUT the abort (verified by reverting the fix) and passes WITH
+/// it. Cross-checked against bundled `perl exiftool -G1 -j`: ExifTool's `LocateIFD`
+/// finds no in-window IFD ⇒ `ProcessUnknown` processes nothing ⇒ no `Pentax:Quality`.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn pentax_locate_ifd_none_aborts_before_overrun_salvage() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::fixbase;
+
+  // The bare MakerNote value (the `0x927c` payload) — the same bytes the dispatch
+  // hands the Pentax walk at `ifd_start`.
+  let region = {
+    let be16 = |v: u16| v.to_be_bytes();
+    let be32 = |v: u32| v.to_be_bytes();
+    let mut r: Vec<u8> = Vec::new();
+    r.extend_from_slice(b"AOC\x00");
+    r.extend_from_slice(&be16(0x0003));
+    r.extend_from_slice(&be32(1));
+    r.extend_from_slice(&be16(1));
+    r.extend_from_slice(&be16(0));
+    r.extend_from_slice(&be16(0x0008));
+    r.extend_from_slice(&be16(0x0003));
+    r.extend_from_slice(&be32(1));
+    r.extend_from_slice(&be16(1));
+    r.extend_from_slice(&be16(0));
+    r.extend_from_slice(&be32(0));
+    r
+  };
+  // PRECONDITION 1 — `LocateIFD` finds NO IFD within the DECLARED 26-byte window.
+  // The scan tries offsets 0,2,4,6,8,10,12 (offset 14 ⇒ `14 + 14 > 26` breaks):
+  //   @0  count 0x414F — upper byte nonzero ⇒ "not an IFD", skip;
+  //   @2  count 0x4300 — low byte 0 ⇒ toggle, num 0x43 = 67 entries overrun, skip;
+  //   @4  count 0x0003 = 3 — 3 entries overrun the 30-byte blob, skip;
+  //   @6  count 0x0000 = 0 — `next unless $num`, skip;
+  //   @8  count 0x0001 = 1 — the sole entry's format word (@12) is 0 ⇒ reject;
+  //   @10 count 0x0001 = 1 — the sole entry's value-size (format @14 = 8, count
+  //       @16 huge) exceeds the blob ⇒ reject;
+  //   @12 count 0x0000 = 0 — skip.
+  // ⇒ `None`, the R3 precondition (the same `$dirLen`-bounded scan ExifTool runs).
+  assert_eq!(
+    fixbase::locate_ifd(&region, 0, Some(26), ByteOrder::Big, Some("PENTAX"), None),
+    None,
+    "LocateIFD must find NO plausible IFD within the declared 26-byte Pentax window"
+  );
+
+  // PRECONDITION 2 — the count word AT ifd_start (the `AOC` bytes, 0x414F = 16719)
+  // is an overclaim that overruns the buffer ⇒ `walk_one_ifd_body` reaches its
+  // maker-note salvage clamp on the pre-fix `None`-fallback. `(26 - 2) / 12 == 2`
+  // entries are kept; entry 1 (offset 14) is the VALID `Pentax:Quality`.
+  assert_eq!(
+    (26 - 2) / 12,
+    2,
+    "the declared window clamps the overrun to 2 entries"
+  );
+
+  // END-TO-END — declared `mn_len` 26 ⇒ the abort fires: NO Pentax tags. WITHOUT
+  // the R3 abort the salvage would clamp + walk entry 1 and emit `Pentax:Quality`.
+  let data = craft_pentax_aoc_overrun_jpeg(26);
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted Pentax JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(
+    mn.vendor().is_pentax(),
+    "vendor = Pentax (AOC primary dispatched)"
+  );
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "R3: a None LocateIFD must ABORT the sub-directory — the count-word overrun \
+     salvage must NOT run, so NO Pentax tags emit"
+  );
+  assert_eq!(
+    mn.meta().pentax().and_then(|p| p.quality()),
+    None,
+    "R3: the salvageable Quality entry must be suppressed by the LocateIFD abort"
+  );
+
+  // CROSS-CHECK against bundled ExifTool (when available): `LocateIFD` finds no
+  // in-window IFD ⇒ `ProcessUnknown` processes nothing ⇒ no `Pentax:Quality`.
+  // Skipped (not failed) when the binary is unavailable.
+  #[cfg(feature = "json")]
+  {
+    use std::process::Command;
+    let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+    if Command::new(&tool).arg("-ver").output().is_ok() {
+      let dir = std::env::temp_dir();
+      let path = dir.join("exifast_pentax_locate_none_abort.jpg");
+      std::fs::write(&path, &data).expect("write temp jpg");
+      let out = Command::new(&tool)
+        .args([
+          "-G1",
+          "-j",
+          "-Make",
+          "-Model",
+          "-Pentax:Quality",
+          "-Quality",
+        ])
+        .arg(&path)
+        .output()
+        .expect("run exiftool");
+      let _ = std::fs::remove_file(&path);
+      assert!(out.status.success(), "exiftool failed");
+      let json = String::from_utf8(out.stdout).expect("utf8");
+      let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+      let obj = doc
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|o| o.as_object())
+        .expect("doc is [{…}]");
+      // The AOC primary dispatch is confirmed by Make; ExifTool emits NO Pentax
+      // Quality (LocateIFD found no in-window IFD ⇒ the directory is not processed).
+      assert_eq!(
+        obj.get("IFD0:Make").and_then(|v| v.as_str()),
+        Some("PENTAX"),
+        "bundled exiftool reads the PENTAX make (AOC primary dispatch)"
+      );
+      assert!(
+        !obj.contains_key("Pentax:Quality"),
+        "bundled exiftool emits NO Pentax:Quality (LocateIFD found no in-window IFD \
+         ⇒ ProcessUnknown processes nothing) — parity with the R3 abort"
+      );
+    } else {
+      eprintln!("SKIP: exiftool binary not available; Pentax LocateIFD-None cross-check skipped");
+    }
+  }
+}

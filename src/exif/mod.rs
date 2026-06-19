@@ -2470,6 +2470,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
+    dir_len: None,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
@@ -2608,6 +2610,8 @@ fn parse_bigtiff<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // BigTIFF top-level walk — no maker-note `DirLen` (salvage gated to maker notes).
+    dir_len: None,
   };
   w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
   debug_assert!(
@@ -2799,6 +2803,8 @@ fn parse_tiff_with_base_shared<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
+    dir_len: None,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -3115,6 +3121,20 @@ struct Walker<'a, 'g> {
   /// by [`emit_canon_subtable`]'s FocalLength arm. `None` when no readable 0x02
   /// exists ⇒ that arm (and the oracle) emit nothing for FocalLength.
   canon_focal_length_blob: Option<std::vec::Vec<u8>>,
+  /// `$$dirInfo{DirLen}` — the DECLARED byte length of the (sub-)directory being
+  /// walked (`Exif.pm:6285` `$dirLen = $$dirInfo{DirLen} || $dataLen - $dirStart`).
+  /// For a MakerNote SubDirectory this is the `0x927c` value size (`DirLen => $size`,
+  /// `Exif.pm:7126`); it gates the maker-note directory-size SALVAGE clamp in
+  /// [`walk_one_ifd_body`] (`Exif.pm:6384-6388`): when the IFD count word claims a
+  /// directory bigger than the buffer, an in-maker-note walk with `dir_len >= 14`
+  /// (and `[ifd_start, ifd_start+dir_len]` in range) reads `(dir_len-2)/12` entries
+  /// instead of aborting. `Some(mn_len)` only on the isolated vendor walkers; `None`
+  /// for every core IFD / top-level walk — where the salvage never fires (it is also
+  /// gated on `!active_table.is_core_ifd()`, i.e. ExifTool's `$inMakerNotes`), so the
+  /// field's value there is irrelevant. [`process_subdir`] reduces it by the
+  /// `ProcessUnknown` `LocateIFD` relocation delta (`DirLen -= offset`,
+  /// `MakerNotes.pm:1589`/`:1658`) for the duration of that sub-walk.
+  dir_len: Option<usize>,
 }
 
 impl Walker<'_, '_> {
@@ -3351,11 +3371,12 @@ impl Walker<'_, '_> {
       self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
-    let num_entries = get_u16(data, ifd_start, self.order)? as usize;
+    let mut num_entries = get_u16(data, ifd_start, self.order)? as usize;
     // `$dirSize = 2 + 12 * $numEntries; $dirEnd = $dirStart + $dirSize`,
     // each step checked (see the overflow note above) — overflow ⇒ the
-    // Bad-directory abort.
-    let Some(dir_end) = num_entries
+    // Bad-directory abort. (`mut`: the maker-note salvage below re-clamps both
+    // `num_entries` and `dir_end` to the declared `dir_len`.)
+    let Some(mut dir_end) = num_entries
       .checked_mul(12)
       .and_then(|body| body.checked_add(2))
       .and_then(|dir_size| ifd_start.checked_add(dir_size))
@@ -3368,20 +3389,62 @@ impl Walker<'_, '_> {
     // (Exif.pm:6389-6395). If the IFD overruns the buffer entirely we
     // cannot read its entries — abort.
     if dir_end > data.len() {
-      // The IFD's declared extent runs past the EXIF block. ExifTool's
-      // "read what we can" salvage (`$numEntries = int(($dirSize-2)/12)`,
-      // Exif.pm:6386-6388) is GATED to MakerNotes: `return 0 unless
-      // $inMakerNotes and $dirLen >= 14 …` (Exif.pm:6381-6385). For a
-      // normal IFD0/IFD1/ExifIFD/GPS/InteropIFD the count cannot be read
-      // reliably (the file-seek fallback at Exif.pm:6362-6374 fails its
-      // `Read` and yields `$success = 0`), so ExifTool warns
-      // "Bad $dir directory" and aborts the WHOLE directory — no partial
-      // tags. The exifast walker never recurses into a MakerNote IFD
-      // (vendor parsing is deferred — see [`SubDirKind::MakerNote`]), so
-      // every directory kind it handles takes the abort branch.
-      // `$et->Warn("Bad $dir directory")` — Exif.pm:6381.
+      // The IFD's declared extent runs past the buffer (`$dirEnd > $dataLen` ⇒
+      // `undef $dirSize`, Exif.pm:6356). With no RAF to re-read the IFD from the
+      // file (`$success = 0`), ExifTool warns `Bad $dir directory` — MINOR while
+      // `$inMakerNotes` (`$et->Warn("Bad $dir directory", $inMakerNotes)`,
+      // Exif.pm:6381) — and then SALVAGES for maker notes (`Exif.pm:6382-6388`):
+      //
+      //   return 0 unless $inMakerNotes and $dirLen >= 14 and $dirStart >= 0 and
+      //                   $dirStart + $dirLen <= length($$dataPt);
+      //   $dirSize = $dirLen;
+      //   $numEntries = int(($dirSize - 2) / 12);  # read what we can
+      //
+      // i.e. when the count word claims more entries than fit the buffer BUT the
+      // walk is in a maker note (`$$tagTablePtr{GROUPS}{0} eq 'MakerNotes'` —
+      // exactly `!active_table.is_core_ifd()`) AND the declared maker-note length
+      // `$dirLen` is a valid minimal IFD (`>= 14` = 2 count + one 12-byte entry)
+      // whose `[dirStart, dirStart+dirLen]` window fits the buffer, CLAMP
+      // `numEntries` to `(dirLen - 2) / 12` and walk that many entries (from the
+      // declared maker-note region) instead of aborting. A core IFD
+      // (IFD0/IFD1/ExifIFD/GPS/InteropIFD — `is_core_ifd()`, `$inMakerNotes == 0`)
+      // or a maker note whose `$dirLen < 14` / out-of-range window still `return
+      // 0`s the WHOLE directory.
+      //
+      // The warning is recorded on THIS walk's channel via `warn` (NOT
+      // `warn_counted` — ExifTool's `Warn` here is not followed by `++$warnCount`);
+      // for a maker-note sub-walk the isolated `Walker` discards its `warnings`
+      // (every other maker-note `$et->Warn` is dropped the same way), so the
+      // observable salvage effect is the EMITTED tags from the clamped entries.
       self.warn(std::format!("Bad {} directory", kind.as_str()));
-      return None;
+      // The salvage decision is the SHARED [`salvage_makernote_overrun`]
+      // (`body.rs`) — the SAME helper [`canon_prescan_datamembers`] drives, so a
+      // salvaged Canon directory is pre-scanned over the IDENTICAL clamped entry
+      // set this emission walk renders (the DataMembers it extracts therefore feed
+      // the dependent FocalLength / FileInfo sub-tables). `$inMakerNotes` is
+      // `!self.active_table.is_core_ifd()`; `self.dir_len` is `$$dirInfo{DirLen}`
+      // (already reduced by any `ProcessUnknown` `LocateIFD` delta in
+      // [`process_subdir`]). `None` ⇒ abort the whole directory (`return 0`,
+      // Exif.pm:6382): a core IFD, a missing/`< 14` `dir_len`, or an out-of-range
+      // window. (ExifTool also `Set16u`s the clamped count back into the buffer;
+      // the port reads the count once into `num_entries`, so the clamped value
+      // drives `walk_entries` directly — re-storing it is unnecessary.) The warning
+      // is recorded on THIS walk's channel via `warn` (not `warn_counted` —
+      // ExifTool's `Warn` here is not followed by `++$warnCount`); a maker-note
+      // sub-walk's isolated `Walker` discards its `warnings`, so the observable
+      // salvage effect is the EMITTED tags from the clamped entries.
+      let Some((salvaged_entries, salvaged_end)) =
+        makernotes::vendors::canon::body::salvage_makernote_overrun(
+          ifd_start,
+          data.len(),
+          !self.active_table.is_core_ifd(),
+          self.dir_len,
+        )
+      else {
+        return None;
+      };
+      num_entries = salvaged_entries;
+      dir_end = salvaged_end;
     }
 
     // `my $bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) {
@@ -4835,29 +4898,67 @@ impl Walker<'_, '_> {
 
     // ---- Pre-walk hook 2: ProcessUnknown's `LocateIFD` (`MakerNotes.pm:1816-
     // 1837`). Only `ProcessProc::Unknown` relocates the IFD start + order; the
-    // other processors keep `ifd_start`/`resolved_order` as derived. A failed
-    // locate leaves them unchanged (the walk then bounds-rejects, mirroring
-    // `ProcessUnknown`'s `Unrecognized` warn arm). Inert for `Exif`/`Canon`.
+    // other processors keep `ifd_start`/`resolved_order` as derived. Inert for
+    // `Exif`/`Canon`/`BinaryData`.
     //
     // `locate_ifd` returns the located IFD offset RELATIVE to the `ifd_start` it
     // was handed (its scan runs `0..=32` from `dir_start`), so the ABSOLUTE
     // position in `self.data` is `ifd_start + located`. Adding it back is
-    // essential for any maker note whose blob begins at a non-zero TIFF offset;
-    // a `checked_add` overflow (degenerate input) falls back to the unrelocated
-    // start, which the walk then bounds-rejects.
-    let (ifd_start, resolved_order) = match process {
-      ProcessProc::Unknown => makernotes::fixbase::locate_ifd(
-        self.data,
-        ifd_start,
-        None,
-        resolved_order,
-        self.captured_make.as_deref(),
-        self.captured_model.as_deref(),
-      )
-      .and_then(|(located, order)| ifd_start.checked_add(located).map(|abs| (abs, order)))
-      .unwrap_or((ifd_start, resolved_order)),
+    // essential for any maker note whose blob begins at a non-zero TIFF offset.
+    //
+    // ABORT on no candidate (`MakerNotes.pm:1834`). `LocateIFD` returning `undef`
+    // is ExifTool's `Unrecognized MakerNotes` arm — `ProcessUnknown` then `return
+    // 0` WITHOUT walking the directory (it processes NOTHING). So a `None` here
+    // (no plausible IFD within the declared window) ABORTS the whole sub-directory
+    // — `return` BEFORE FixBase, the Canon pre-scan, and `walk_one_ifd`, emitting no
+    // tags. This is load-bearing now that `walk_one_ifd_body` SALVAGES a non-core
+    // count-word overrun (clamping `num_entries` by the same `dir_len`): without
+    // the abort, the `None` would fall back to `ifd_start` and the salvage could
+    // emit spurious vendor tags from a count word at the UNRELOCATED start whose
+    // first clamped entry happens to be a valid vendor tag — even though `LocateIFD`
+    // legitimately found no in-window IFD. A post-`Some` `checked_add` overflow
+    // (degenerate input that can't yield an absolute start) aborts for the same
+    // reason: there is no walkable relocated IFD.
+    //
+    // `self.dir_len` is threaded as `LocateIFD`'s `$$dirInfo{DirLen}`
+    // (`MakerNotes.pm:1501` `my $dirLen = defined $$dirInfo{DirLen} ? … : $size`):
+    // it BOUNDS the relocation-candidate scan — the `$offset + 14 > $dirLen` IFD_TRY
+    // cutoff (`:1573`) and the TIFF-header `$ptr + $offset + 14 <= $dirLen` window
+    // (`:1586`) — so a relocated IFD candidate must fit the DECLARED maker-note
+    // window, not the whole trailing buffer. Without it (`None` ⇒ `$dirLen = $size`)
+    // a TRUNCATED MakerNote could relocate onto IFD-shaped bytes that lie AFTER the
+    // declared `0x927c` value and emit spurious vendor tags. `None` for a `dir_len`-
+    // less caller keeps the prior full-buffer scan. (The standard-IFD arm's
+    // `$bytesFromEnd` still uses `$size`, `:1613` — unchanged.)
+    let (ifd_start, resolved_order, locate_delta) = match process {
+      ProcessProc::Unknown => {
+        let Some(relocated) = makernotes::fixbase::locate_ifd(
+          self.data,
+          ifd_start,
+          self.dir_len,
+          resolved_order,
+          self.captured_make.as_deref(),
+          self.captured_model.as_deref(),
+        )
+        .and_then(|(located, order)| {
+          // `LocateIFD` returns the IFD start RELATIVE to the handed `ifd_start`, so
+          // the relocation delta is exactly `located` — ExifTool advances
+          // `$$dirInfo{DirStart} += $offset` and shrinks `$$dirInfo{DirLen} -= $offset`
+          // by the SAME amount (`MakerNotes.pm:1657-1658`), keeping `DirStart+DirLen`
+          // invariant. Carry `located` so the `dir_len` (the salvage gate) tracks it.
+          ifd_start
+            .checked_add(located)
+            .map(|abs| (abs, order, located))
+        }) else {
+          // `Unrecognized MakerNotes` ⇒ `ProcessUnknown` processes nothing
+          // (`MakerNotes.pm:1834`). Abort the sub-directory: emit no tags, leaving
+          // every saved field untouched (none were mutated yet).
+          return;
+        };
+        relocated
+      }
       ProcessProc::Exif | ProcessProc::Canon | ProcessProc::BinaryData => {
-        (ifd_start, resolved_order)
+        (ifd_start, resolved_order, 0)
       }
     };
 
@@ -4955,9 +5056,18 @@ impl Walker<'_, '_> {
     let saved_table = self.active_table;
     let saved_order = self.order;
     let saved_warn_count = self.warn_count;
+    // `$$dirInfo{DirLen}` is per-`ProcessExif`-call (`Exif.pm:6285`); scope it like
+    // the table/order/warn-count fields. `ProcessUnknown`'s `LocateIFD` advanced
+    // `ifd_start` by `locate_delta`, so the remaining declared length shrinks by the
+    // same amount (`$$dirInfo{DirLen} -= $offset`, `MakerNotes.pm:1658`) — keeping
+    // the salvage window `[ifd_start, ifd_start+dir_len]` correct for the relocated
+    // IFD. `None` (a core sub-IFD / a `dir_len`-less caller) stays `None`.
+    let saved_dir_len = self.dir_len;
+    self.dir_len = self.dir_len.map(|d| d.saturating_sub(locate_delta));
     self.active_table = table;
     self.order = resolved_order;
     let _ = self.walk_one_ifd(ifd_start, kind);
+    self.dir_len = saved_dir_len;
     self.warn_count = saved_warn_count;
     self.order = saved_order;
     self.active_table = saved_table;
@@ -5005,6 +5115,7 @@ impl Walker<'_, '_> {
   fn canon_prescan_datamembers(&mut self, ifd_start: usize, order: ByteOrder) {
     use makernotes::vendors::canon::body::{
       CanonDirShape, CanonEntryClass, classify_canon_directory, classify_canon_entry,
+      salvage_makernote_overrun,
     };
     use makernotes::vendors::canon::{camera_settings, read_focal_units};
     // Reset first: the members are only meaningful for THIS Canon walk.
@@ -5013,14 +5124,34 @@ impl Walker<'_, '_> {
     self.canon_focal_length_blob = None;
     let data = self.data;
     // Directory shape — the SHARED `ProcessExif` gate (`Exif.pm:6343-6400`) the
-    // emission walk uses. A degenerate/overrunning/`1`/`3`-byte-tail directory
-    // walks no entries (so both members stay `None`); only the `Walk` arm walks.
-    let CanonDirShape::Walk {
-      num_entries,
-      dir_end,
-    } = classify_canon_directory(data, ifd_start, data.len(), order)
-    else {
-      return;
+    // emission walk uses. A degenerate/`1`/`3`-byte-tail directory walks no
+    // entries (so both members stay `None`); only the `Walk` arm — or a SALVAGED
+    // `Overrun` — walks.
+    let (num_entries, dir_end) = match classify_canon_directory(data, ifd_start, data.len(), order)
+    {
+      CanonDirShape::Walk {
+        num_entries,
+        dir_end,
+      } => (num_entries, dir_end),
+      // A clean-count buffer overrun: apply the SAME maker-note salvage clamp
+      // the emission walk does (`walk_one_ifd_body` → [`salvage_makernote_overrun`]),
+      // so the pre-scan extracts `FocalUnits`/`LensType` from the IDENTICAL
+      // clamped entry set the emission walk renders — otherwise a salvaged
+      // Canon directory's dependent FocalLength / FileInfo sub-tables would emit
+      // defaults. The Canon Main IFD is always a maker note (this pre-scan runs
+      // ONLY under `TableRef::Canon`, `!is_core_ifd`), so `$inMakerNotes` is
+      // unconditionally `true`; `self.dir_len` is `$$dirInfo{DirLen}` (Canon uses
+      // `ProcessProc::Canon`, so no `LocateIFD` delta — it is unadjusted here).
+      // `None` (a missing/`< 14`/out-of-range `dir_len`) ⇒ walk no entries, like
+      // the emission walk's abort.
+      CanonDirShape::Overrun { .. } => {
+        let Some(salvaged) = salvage_makernote_overrun(ifd_start, data.len(), true, self.dir_len)
+        else {
+          return;
+        };
+        salvaged
+      }
+      CanonDirShape::AbortBadDirectory | CanonDirShape::AbortIllegalSize { .. } => return,
     };
     let entries_start = ifd_start + 2;
     // `$warnCount` — the SAME per-entry abort cap the emission walk honors
@@ -8185,6 +8316,8 @@ pub(in crate::exif) fn apple_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Apple IFD's declared length: the captured value (`blob`) end minus the `14 + header` body offset (`Exif.pm:6385` salvage gate).
+    dir_len: Some(blob.len().saturating_sub(ifd_offset)),
   };
   // The Apple Main IFD walk — the SAME `process_subdir` entry the Canon walk uses,
   // but with `ProcessProc::Exif` (Apple needs NO Canon DataMember pre-scan; the
@@ -8378,6 +8511,8 @@ pub(in crate::exif) fn sony_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Sony IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Sony Main IFD walk — `ProcessProc::Exif` (Sony needs NO Canon DataMember
   // pre-scan; the `if table == TableRef::Canon` hook is inert). `Fixed(order)` is
@@ -8662,6 +8797,8 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Panasonic IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Panasonic Main IFD walk — `ProcessProc::Exif` (Panasonic needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -8925,6 +9062,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Nikon IFD's declared length: the `0x927c` value size minus the layout's body offset (equal in both the blob and parent-TIFF layouts; the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(layout.ifd_offset())),
   };
   // The Nikon Main/Type2 IFD walk — `ProcessProc::Exif` (Nikon needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -9209,6 +9348,8 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Pentax IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Pentax Main IFD walk — `ProcessProc::Unknown` runs `LocateIFD` (Pentax's
   // offsets are inconsistent, `MakerNotes.pm:1816` / `subdir.rs`) then
@@ -9473,6 +9614,8 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Samsung IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Samsung Type2 IFD walk — `ProcessProc::Unknown` runs `LocateIFD`
   // (Samsung's offsets are inconsistent, `MakerNotes.pm:976`) then `ProcessExif`.
@@ -9713,6 +9856,8 @@ pub(in crate::exif) fn leica_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Leica IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Leica variant IFD walk — `ProcessProc::Exif` directly (the Leica2..Leica9
   // tables carry no `PROCESS_PROC`; only their deferred binary sub-tables do). The
@@ -9893,6 +10038,8 @@ pub(in crate::exif) fn canon_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Canon MakerNote's declared length (`DirLen => $size`, the `0x927c` value size; Canon's body offset is 0). Gates the directory-size salvage clamp (`Exif.pm:6383-6388`, #248).
+    dir_len: Some(mn_len),
   };
   // The Canon Main IFD walk — the SAME `process_subdir` entry the recompute used
   // (`IfdKind::ExifIfd` directory kind, fixed parent order, no FixBase, the Canon
@@ -12662,6 +12809,8 @@ mod tests {
       canon_focal_units: None,
       canon_lens_type: None,
       canon_focal_length_blob: None,
+      // Test walk — no maker-note `DirLen`.
+      dir_len: None,
     }
   }
 
