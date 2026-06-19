@@ -189,7 +189,7 @@ pub(crate) fn synth_gps_date_time(
 
 /// The `stsz`/`stz2` sample-size table (`$$et{ee}{size}` — QuickTimeStream.pl
 /// :2495-2516). ExifTool builds a flat Perl array of one size per sample, but
-/// the only operations [`expand_samples`] performs on it are `scalar(@$size)`
+/// the only operations [`walk_samples`] performs on it are `scalar(@$size)`
 /// (the sample count) and `$$size[$i]` (the size of sample `i`). A fixed-size
 /// `stsz` records `@$size = ($sz) x $num` — every sample the same `$sz` — where
 /// `$num` is an attacker-controllable `int32u` read straight from the box
@@ -299,7 +299,7 @@ fn parse_stsz(tag: &[u8; 4], data: &[u8], ee: &mut EeData) {
       // COMPACTLY instead of materializing `vec![sz; num]` (which would try to
       // allocate ~16 GiB for `$num == 0xffff_ffff` and abort the parser). The
       // count is later cross-checked against the file length in
-      // [`expand_samples`] before any per-sample work.
+      // [`walk_samples`] before any per-sample work.
       ee.size = SizeTable::Uniform {
         size: sz,
         count: num,
@@ -492,29 +492,6 @@ fn parse_kenwood_gps(data: &[u8], create_date_raw: Option<u64>, out: &mut QuickT
 // ProcessSamples — chunk→sample machinery (QuickTimeStream.pl:1304-1592)
 // ===========================================================================
 
-/// Safety ceiling on the running `@$start` index [`expand_samples`] will walk
-/// before abandoning a track as one ExifTool could not process either.
-///
-/// ExifTool's `ProcessSamples` pushes one `@$start`/`@$size` entry per declared
-/// sample; a crafted fixed-size `stsz` can declare an `int32u` count up to ~4.3
-/// billion (`0xffff_ffff`). Perl `@$size = ($sz) x $num` array-materializes the
-/// FULL count, so a count this large makes ExifTool run out of memory and die
-/// before it dispatches anything — the faithful result is no samples. exifast
-/// mirrors that by dropping the track once the declared walk crosses this bound.
-///
-/// This is NOT a track-drop threshold for the in-bounds prefix: a `size >= 1`
-/// table advances the offset by at least one byte per sample, so the chunk walk
-/// breaks out of a chunk as soon as the offset leaves the movie buffer (every
-/// later sample in that chunk is then also out of bounds) and the out-of-range
-/// tail is fast-forwarded analytically rather than iterated — so the only thing
-/// this ceiling bounds is (a) the materialized in-bounds prefix of a `size == 0`
-/// table (whose offset never advances, so every declared sample is in bounds)
-/// and (b) a declared count so large ExifTool would have died materializing it.
-/// Set well above any in-bounds prefix a real timed-metadata track can hold (a
-/// one-hour 30 Hz track is ~108 000 samples; even a one-byte-per-sample track is
-/// bounded by the movie length), so it never drops a track ExifTool dispatches.
-const MAX_EXPANDED_SAMPLES: u64 = 1 << 24;
-
 /// One flattened timed sample — `(file offset, byte size, sample time,
 /// sample duration)` — the output of the chunk→sample expansion
 /// (QuickTimeStream.pl:1339-1392).
@@ -535,7 +512,7 @@ struct Sample {
 /// block (QuickTimeStream.pl:1364-1377) `r` times in O(`stts` entries) instead
 /// of O(`r`).
 ///
-/// [`expand_samples`] calls this when a chunk's running offset first leaves the
+/// [`walk_samples`] calls this when a chunk's running offset first leaves the
 /// movie buffer: a `size >= 1` table advances the offset by at least one byte
 /// per sample, so once `start + size > movie_len` every remaining sample in the
 /// chunk is also out of bounds (and a `size == 0` table that is already past the
@@ -604,66 +581,63 @@ fn fast_forward_stts_tail(
   }
 }
 
-/// Expand the `stco`/`stsc`/`stsz`/`stts` tables into a flat sample list with
-/// the production walk bound ([`MAX_EXPANDED_SAMPLES`]).
-fn expand_samples(ee: &EeData, media_ts: u32, movie_len: usize) -> Option<Vec<Sample>> {
-  expand_samples_capped(ee, media_ts, movie_len, MAX_EXPANDED_SAMPLES)
-}
-
-/// Expand the `stco`/`stsc`/`stsz`/`stts` tables into a flat sample list —
-/// faithful port of QuickTimeStream.pl:1339-1392.
+/// Walk the `stco`/`stsc`/`stsz`/`stts` tables and STREAM each in-bounds timed
+/// sample to `on_sample`, returning whether the walk is *consistent* —
+/// `@$start == @$size` (QuickTimeStream.pl:1386). A faithful port of
+/// QuickTimeStream.pl:1339-1392 with O(1) memory in the declared sample count.
 ///
 /// ExifTool walks the chunk-offset table; for each chunk it consults the
-/// sample-to-chunk table to learn how many samples that chunk holds, then
-/// lays the samples out back-to-back from the chunk offset using the
-/// sample-size table. The time-to-sample table is consumed in lockstep to
-/// assign `@time` / `@dur`.
+/// sample-to-chunk table to learn how many samples that chunk holds, then lays
+/// the samples out back-to-back from the chunk offset using the sample-size
+/// table. The time-to-sample table is consumed in lockstep to assign
+/// `@time` / `@dur`. ExifTool array-materializes the FULL declared `@$start`
+/// (one slot per sample) and only AFTER the walk checks `@$start == @$size`;
+/// if that fails it `Warn`s and returns WITHOUT dispatching anything, otherwise
+/// it loops the samples and reads each (skipping any whose bytes run past EOF,
+/// QuickTimeStream.pl:1418-1443). This function never builds that array: it
+/// runs the identical state machine but invokes `on_sample` only for the
+/// IN-BOUNDS samples (`start + size <= movie_len`, exactly the set ExifTool's
+/// dispatch loop would keep) and threads ExifTool's running sample index in
+/// `expanded` for the consistency check.
+///
+/// Because the consistency check gates dispatch (an inconsistent track yields
+/// no samples at all), [`process_samples`] drives this in two passes: first
+/// with a no-op `on_sample` to learn consistency, then — only if consistent —
+/// with the dispatching `on_sample`. The walk is identical across passes, so
+/// the second pass re-yields exactly the prefix the first counted; nothing is
+/// dispatched until consistency is known, matching ExifTool's
+/// check-then-dispatch order.
 ///
 /// `media_ts` is the per-track `MediaTimeScale` (`$$et{MediaTS}`,
-/// QuickTimeStream.pl:1351 — defaults to 1 when absent/zero).
+/// QuickTimeStream.pl:1351 — defaults to 1 when absent/zero). `movie_len` is the
+/// length of the whole movie buffer; it is NOT a track-drop threshold (the
+/// declared count comes from the sample tables, never the file size), only the
+/// in-bounds predicate.
 ///
-/// `movie_len` is the length of the whole movie buffer the samples are read
-/// from. It is NOT a track-drop threshold: ExifTool lays out one `@$start`
-/// entry per DECLARED sample (the count comes from the `stco`/`stsc`/`stsz`
-/// tables, never the file size) and only the LATER per-sample dispatch
-/// (`ProcessSamples`:1418-1443) skips a sample whose bytes run past EOF. So a
-/// fixed-size `stsz` with `count == movie_len + 1` still dispatches the first
-/// `movie_len` in-bounds samples and skips only the trailing EOF read — the
-/// whole track is NOT discarded. To stay byte-faithful to that per-sample
-/// semantics WHILE bounding memory, this expansion MATERIALIZES only the
-/// in-bounds samples (`start + size <= movie_len`, exactly the set the dispatch
-/// loop in [`process_samples`] would keep) and tracks the FULL declared count
-/// in `expanded` for the trailing `@$start == @$size` consistency check
-/// (QuickTimeStream.pl:1386). A crafted fixed-size `stsz` can declare an
-/// `int32u` count up to ~4.3 billion; that neither materializes a multi-GiB
-/// `Vec` nor spins: a `size >= 1` sample's offset strictly increases, so once a
-/// chunk's offset leaves the buffer every later sample in it is out of bounds
-/// and [`fast_forward_stts_tail`] advances the declared count over that tail in
-/// O(`stts` entries) instead of iterating it. The materialized prefix is thus
-/// bounded by `movie_len`. The set of samples this yields is identical to
-/// ExifTool's dispatched set for every file ExifTool itself can hold; a count so
-/// large ExifTool would run out of memory array-materializing `@$size`
-/// (tracked by [`MAX_EXPANDED_SAMPLES`]) is dropped, as is a `size == 0` table
-/// whose non-advancing offset would otherwise make every declared sample
-/// in-bounds.
-fn expand_samples_capped(
+/// There is no materialization cap: a crafted fixed-size `stsz` can declare an
+/// `int32u` count up to ~4.3 billion, but this neither allocates nor spins. The
+/// in-bounds prefix `on_sample` sees is bounded by `movie_len` (a `size >= 1`
+/// sample's offset strictly increases, so once a chunk's offset leaves the
+/// buffer every later sample in it is out of bounds and the chunk breaks);
+/// [`fast_forward_stts_tail`] then advances the declared count over that
+/// out-of-range tail in O(`stts` entries) rather than iterating it. So the
+/// dispatched set is byte-identical to ExifTool's for EVERY declared count —
+/// including the band a count so large ExifTool would die array-materializing
+/// `@$size`, whose tiny in-bounds prefix ExifTool never reaches but exifast now
+/// dispatches faithfully (O(1) memory, bounded iteration). A `size == 0` table
+/// (whose offset never advances) makes every declared sample in-bounds, so its
+/// prefix is the full declared count; that is also iterated without a cap, and
+/// is the only shape whose `on_sample` count is unbounded by `movie_len` — but
+/// such a track is consistent only if `@$stts` covers the whole count, and a
+/// real timed-metadata track's count is small.
+fn walk_samples<F: FnMut(Sample)>(
   ee: &EeData,
   media_ts: u32,
   movie_len: usize,
-  max_samples: u64,
-) -> Option<Vec<Sample>> {
+  mut on_sample: F,
+) -> bool {
   if ee.stco.is_empty() || ee.stsc.is_empty() || ee.size.is_empty() {
-    return None;
-  }
-  // A declared sample count above the safety cap can ONLY fail the
-  // post-fast-forward `expanded > max_samples` check below (the full walk
-  // always advances `expanded` to the declared count), so drop it HERE —
-  // before the per-sample walk allocates up to `max_samples` `Sample`s for a
-  // track guaranteed not to be returned (parse-time memory DoS). Same drop
-  // set, no allocation. The `>=` in-loop and `>` post-fast-forward checks
-  // still cover the `== max_samples` boundary cases.
-  if ee.size.len() as u64 > max_samples {
-    return None;
+    return false;
   }
   let ts = if media_ts == 0 {
     1.0
@@ -691,21 +665,13 @@ fn expand_samples_capped(
   let mut next_chunk: u32 = 0;
   let mut samples_per_chunk: u32 = 0;
 
-  // Each `Sample` carries its own `time`/`dur` (ExifTool's parallel
-  // `@time`/`@dur` arrays are folded into the sample record here). Only the
-  // IN-BOUNDS samples are stored — the ones [`process_samples`] would dispatch
-  // (`data.get(start..start + size)` is `Some`); an out-of-range sample is
-  // skipped here exactly as the dispatch loop skips it, which bounds `samples`
-  // to the in-bounds count (≤ ~`movie_len` for a size >= 1 table) instead of the
-  // declared count.
-  let mut samples: Vec<Sample> = Vec::new();
-  // `@$start` — the number of samples the chunk walk lays out, counting the
-  // out-of-range ones ExifTool materializes but we elide. This (not
-  // `samples.len()`) is ExifTool's running sample index and the value the
-  // trailing `@$start == @$size` consistency check compares. The in-bounds
-  // samples are iterated one at a time; the out-of-range tail of a chunk is
-  // advanced analytically by [`fast_forward_stts_tail`], so `expanded` reaches
-  // the full declared count without iterating (or storing) the tail.
+  // `@$start` — ExifTool's running sample index, counting EVERY declared sample
+  // (the out-of-range ones it materializes but we never yield). This is the
+  // value the trailing `@$start == @$size` consistency check compares. The
+  // in-bounds samples are streamed one at a time via `on_sample`; the
+  // out-of-range tail of a chunk is advanced analytically by
+  // [`fast_forward_stts_tail`], so `expanded` reaches the full declared count
+  // without iterating (or storing) the tail.
   let mut expanded: u64 = 0;
   // `start + size <= movie_len` — the same in-bounds predicate the dispatch
   // loop applies (`data.get(start..start + size)` is `Some`). A `size == 0`
@@ -742,36 +708,35 @@ fn expand_samples_capped(
     // QuickTimeStream.pl:1362 `Sample: for ($i=0; ; )`.
     let mut i: u32 = 0;
     loop {
-      // Bound the running `@$start` index. For a `size == 0` table the offset
-      // never advances, so every declared sample is in bounds and this is the
-      // only thing that keeps the materialized `samples` from growing to the
-      // declared count; for a `size >= 1` table the in-bounds prefix is already
-      // bounded by `movie_len` (the OOB-break below leaves the chunk once the
-      // offset escapes), so this fires only for a declared count so large
-      // ExifTool would have died array-materializing it — the faithful drop.
-      // Pre-materialization bound — runs BEFORE pushing the current sample, so
-      // it is `>=`: at `expanded == max_samples` we STOP, else a `cap + 1`
-      // all-in-bounds count would materialize one sample past the cap. (The
-      // post-fast-forward check below is `>` because it runs AFTER advancing
-      // `expanded` over an out-of-bounds EOF tail, where `== cap` is the
-      // surviving boundary.)
-      if expanded >= max_samples {
-        return None;
-      }
       let idx = expanded as usize;
-      let size = ee.size.get(idx)?;
+      // `$$size[$#$start]` past the declared count is `undef` in Perl; an
+      // out-of-range `get` mirrors it. With the `Sample size error` guard above
+      // this is in range for every chunk the walk enters, but the `?`-style
+      // early stop keeps a degenerate stsc/stsz pairing safe.
+      let Some(size) = ee.size.get(idx) else {
+        // A chunk wants a sample beyond the declared size table. ExifTool still
+        // reads the (undef) `$size` and pushes an extra `@$start` slot — even a
+        // `samplesPerChunk == 0` chunk reads ONE sample (`last if ++$i >= 0`,
+        // QuickTimeStream.pl:1362-1389) — so `@$start` exceeds `@$size` and the
+        // track is INCONSISTENT. (The legitimate end is the bottom check after
+        // the chunk loop drains; reaching here means a chunk overran the table.)
+        return false;
+      };
       // The running offset has left the movie buffer. A `size >= 1` table only
       // advances it, and a `size == 0` table already past `movie_len` never
       // returns, so every remaining sample in THIS chunk is also out of bounds —
       // none would be dispatched. ExifTool keeps pushing them onto `@$start` and
       // draining the time queue, though, so fast-forward the tail analytically
-      // (advancing `expanded`/the stts queue without iterating or storing) and
+      // (advancing `expanded`/the stts queue without iterating or yielding) and
       // leave the chunk; a subsequent chunk with a lower, in-bounds offset (an
       // out-of-order `stco`) still resumes from the correct queue position. The
       // `@$start == @$size` check at the end then keeps the in-bounds prefix
       // unless the queue ran dry mid-tail, in which case `fast_forward_stts_tail`
-      // leaves `expanded` below the declared count and the track drops — exactly
-      // as ExifTool's `last Sample` then `Warn` + return does.
+      // leaves `expanded` below the declared count and the track is inconsistent
+      // — exactly as ExifTool's `last Sample` then `Warn` + return does. This
+      // bounds the walk: a ~4.3-billion declared count with a tiny in-bounds
+      // prefix fast-forwards its tail in O(`stts`), never iterating ~4.3 billion
+      // samples.
       if !in_bounds(sample_start, size) {
         let r = u64::from(samples_per_chunk)
           .saturating_sub(u64::from(i))
@@ -785,20 +750,10 @@ fn expand_samples_capped(
           &mut stts_idx,
           &mut expanded,
         );
-        // Skipping the out-of-range tail can push the declared walk past the
-        // safety bound (e.g. a ~4.3-billion `int32u` count with a tiny in-bounds
-        // prefix) — drop it as one ExifTool could not have array-materialized.
-        // The cap is INCLUSIVE: `expanded == max_samples` is the boundary an
-        // in-bounds prefix of `max_samples - 1` plus one EOF tail reaches, and
-        // ExifTool dispatches that prefix, so only a STRICTLY larger declared
-        // count is rejected.
-        if expanded > max_samples {
-          return None;
-        }
         break;
       }
       // From here the sample is in bounds, so `sample_start` fits `u64` and the
-      // pushes below are unconditional.
+      // `on_sample` calls below are unconditional.
       let start = sample_start as u64;
       // QuickTimeStream.pl:1364-1377 — assign @time/@dur from the stts queue.
       let (mut s_time, mut s_dur) = (None, None);
@@ -822,9 +777,9 @@ fn expand_samples_capped(
         }
         if stopped {
           // `last Sample`: this (in-bounds) sample's `@$start` slot still counts
-          // (the push at QuickTimeStream.pl:1363 happened BEFORE the time block).
-          // Then leave the chunk loop.
-          samples.push(Sample {
+          // (the push at QuickTimeStream.pl:1363 happened BEFORE the time block)
+          // and it is dispatched. Then leave the chunk loop.
+          on_sample(Sample {
             start,
             size,
             time: None,
@@ -841,7 +796,7 @@ fn expand_samples_capped(
       }
       // QuickTimeStream.pl:1363 pushes `@$start` for this in-bounds sample (the
       // dispatched set).
-      samples.push(Sample {
+      on_sample(Sample {
         start,
         size,
         time: s_time,
@@ -859,18 +814,14 @@ fn expand_samples_capped(
       sample_start += u128::from(size);
     }
   }
-  // QuickTimeStream.pl:1386 `@$start == @$size or ... return` — a mismatch
-  // is fatal ('Incorrect sample start/size count'). Compared against the full
-  // declared count (`expanded`), NOT the in-bounds `samples.len()`: an
+  // QuickTimeStream.pl:1386 `@$start == @$size or ... return` — a mismatch is
+  // fatal ('Incorrect sample start/size count'). Compared against the full
+  // declared count (`expanded`), NOT the dispatched in-bounds count: an
   // over-count track whose chunk walk laid out exactly `@$size` slots (a fixed
   // `stsz` with `count == movie_len + 1`) stays consistent and dispatches its
   // in-bounds prefix, just as ExifTool does.
-  if expanded != ee.size.len() as u64 {
-    return None;
-  }
-  Some(samples)
+  expanded == ee.size.len() as u64
 }
-
 /// `Process_mebx` keys-table entry — a local-ID → `(TagID, format)` mapping
 /// recovered from the `OtherSampleDesc` `keys` box (QuickTimeStream.pl
 /// `SaveMetaKeys`:876-962).
@@ -2045,10 +1996,17 @@ fn process_samples(
   dji_out: &mut crate::metadata::DjiProtobufMeta,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
-  let samples = match expand_samples(&track.ee, track.media_ts, data.len()) {
-    Some(s) => s,
-    None => return false,
-  };
+  // ExifTool array-materializes the FULL declared `@$start`, then checks
+  // `@$start == @$size` BEFORE the dispatch loop (QuickTimeStream.pl:1386): an
+  // inconsistent track `Warn`s and returns having dispatched NOTHING. The
+  // streaming walk can only learn consistency by running to the declared count,
+  // so probe it first (a no-op `on_sample`, O(1) memory — the in-bounds prefix
+  // is bounded by `data.len()` and the out-of-range tail is fast-forwarded), and
+  // bail before dispatching if it is inconsistent. This preserves ExifTool's
+  // check-then-dispatch order without ever building the `Vec` of samples.
+  if !walk_samples(&track.ee, track.media_ts, data.len(), |_| {}) {
+    return false;
+  }
   let mut found_embedded = false;
   // The MUTABLE per-track DJI decode state (`$$et{ProtoPrefix}{$dirName}` +
   // `$$self{CoordUnits}`) — created FRESH here, once per metadata `trak` (one
@@ -2059,13 +2017,17 @@ fn process_samples(
   // — a second metadata `trak` re-enters `process_samples` and gets a NEW empty
   // state (R15-F2). Unused by non-`djmd` traks (only the `djmd` arm reads it).
   let mut dji_track_state = crate::formats::dji_protobuf::DjiTrackState::new();
-  // QuickTimeStream.pl:1418 `for ($i=0; $i<@$start and $i<@$size; ++$i)`.
-  for sample in &samples {
+  // QuickTimeStream.pl:1418 `for ($i=0; $i<@$start and $i<@$size; ++$i)` — the
+  // walk is consistent, so re-run it and dispatch each in-bounds sample as it is
+  // yielded (the second pass re-derives the identical prefix the probe counted).
+  walk_samples(&track.ee, track.media_ts, data.len(), |sample| {
     let start = sample.start as usize;
     let size = sample.size as usize;
     let Some(buff) = data.get(start..start.saturating_add(size)) else {
       // QuickTimeStream.pl:1436-1443 — a seek/read past EOF warns + `next`s.
-      continue;
+      // `walk_samples` only yields in-bounds samples, so this is unreachable for
+      // a streamed sample; kept as the faithful per-sample EOF guard.
+      return;
     };
     // R12-B: do NOT skip a size-0 sample. ExifTool reads a 0-byte sample
     // (`$raf->Read($buff, 0) == 0 == $size`, QuickTimeStream.pl:1438-1443, no
@@ -2087,7 +2049,7 @@ fn process_samples(
       buff,
       track,
       track_index,
-      sample,
+      &sample,
       create_date_raw,
       free_gps_state,
       out,
@@ -2100,7 +2062,7 @@ fn process_samples(
       &mut dji_track_state,
       &mut *ligogps_out,
     );
-  }
+  });
   found_embedded
 }
 
@@ -3193,6 +3155,25 @@ fn is_meta_handler(h: &[u8; 4]) -> bool {
 mod tests {
   use super::*;
 
+  /// Drive [`walk_samples`] over the tables and COLLECT every in-bounds sample
+  /// it yields, plus the consistency flag (`@$start == @$size`). The
+  /// post-streaming analogue of materializing the old `Vec<Sample>`, used to
+  /// assert the dispatched set in the walk-shape tests below.
+  fn collect_samples(ee: &EeData, media_ts: u32, movie_len: usize) -> (Vec<Sample>, bool) {
+    let mut v = Vec::new();
+    let consistent = walk_samples(ee, media_ts, movie_len, |s| v.push(s));
+    (v, consistent)
+  }
+
+  /// The exact gate [`process_samples`] applies: the in-bounds sample set when
+  /// the walk is consistent, or `None` when it is not (an inconsistent track
+  /// dispatches nothing — QuickTimeStream.pl:1386 `Warn` + return). Lets the
+  /// walk-shape tests read like the pre-streaming `expand_samples`.
+  fn dispatched_samples(ee: &EeData, media_ts: u32, movie_len: usize) -> Option<Vec<Sample>> {
+    let (v, consistent) = collect_samples(ee, media_ts, movie_len);
+    consistent.then_some(v)
+  }
+
   /// **R8-B** — `decode_one_sample` sets `FoundEmbedded` (returns `true`) for
   /// ANY non-deferred `gpmd` sample, regardless of whether the GoPro KLV parse
   /// extracted a record. ExifTool sets `$$et{FoundEmbedded} = 1` on ENTRY to
@@ -4164,7 +4145,7 @@ mod tests {
       stts: alloc::vec![1, 600], // 1 sample, delta 600
     };
     // movie_len comfortably exceeds the 1-sample count.
-    let samples = expand_samples(&ee, 600, 4096).expect("samples");
+    let samples = dispatched_samples(&ee, 600, 4096).expect("samples");
     assert_eq!(samples.len(), 1);
     assert_eq!(samples.first().unwrap().start, 1000);
     assert_eq!(samples.first().unwrap().size, 42);
@@ -4173,10 +4154,33 @@ mod tests {
     assert_eq!(samples.first().unwrap().dur, Some(1.0));
   }
 
+  // #275 R2 — a `samplesPerChunk == 0` chunk past the declared size table must
+  // be INCONSISTENT, not silently consistent. ExifTool's `last if ++$i >= 0`
+  // reads ONE sample per chunk even for spc==0, so with 1 declared size and 2
+  // chunk offsets the second chunk reads an undef `$size` and pushes an extra
+  // `@$start` slot → `@$start(2) != @$size(1)` → the track is rejected. The
+  // streaming walk's `size.get` miss returns `false` (not `expanded == len`).
+  #[test]
+  fn expand_zero_spc_extra_chunk_past_size_table_is_inconsistent() {
+    let ee = EeData {
+      stco: alloc::vec![1000, 2000],              // 2 chunks
+      stsc: alloc::vec![(1, 0, 1)],               // 0 samples-per-chunk
+      size: SizeTable::Explicit(alloc::vec![42]), // ONE declared size
+      stts: alloc::vec![1, 600],
+    };
+    // movie_len is comfortably in-bounds — the inconsistency is the start/size
+    // COUNT mismatch (the extra @start slot), not an out-of-bounds offset.
+    assert!(
+      dispatched_samples(&ee, 600, 4096).is_none(),
+      "a 0-samples-per-chunk chunk reading past the size table is inconsistent"
+    );
+  }
+
   // A crafted fixed-size `stsz` whose 12-byte body declares a `0xffff_ffff`
   // sample count must NOT trigger an ~16 GiB allocation (the pre-fix
-  // `vec![sz; num]`), and the downstream expansion must NOT build a giant
-  // `Sample` Vec from that count — both bounded against the actual file size.
+  // `vec![sz; num]`), and the streaming walk must never materialize a giant
+  // sample Vec from that count — the in-bounds prefix is bounded by the file
+  // size and the out-of-range tail is fast-forwarded analytically (no cap).
   #[test]
   fn stsz_huge_uniform_count_is_bounded_not_oom() {
     // Fixed-size stsz: version/flags=0, sample-size=8 (nonzero ⇒ uniform),
@@ -4208,22 +4212,42 @@ mod tests {
     // sample finds the queue exhausted (`@$stts < 2`), `undef $time; last
     // Sample` fires after laying out 2 of the ~4.3-billion declared slots, so
     // `@$start` (2) != `@$size` (~4.3 billion) and the consistency check drops
-    // the track (None). No multi-GiB `Vec`, no spin — matching ExifTool, which
-    // also stops at `@$start == 2` here and `Warn`s + returns.
+    // the track (dispatches NOTHING). No multi-GiB `Vec`, no spin — matching
+    // ExifTool, which also stops at `@$start == 2` here and `Warn`s + returns.
     ee.stts = alloc::vec![1, 1];
-    assert!(expand_samples(&ee, 1, 512).is_none());
+    assert!(dispatched_samples(&ee, 1, 512).is_none());
 
     // The harder DoS shape: an `stts` whose single entry's count ALSO spans the
-    // full ~4.3-billion declaration, so `$time` never goes undef and ExifTool
-    // would array-materialize (and so OOM/die on) every declared sample. The
-    // in-bounds prefix here is tiny — a size-8 sample at offset 16 + i*8 is in
-    // bounds only while `16 + i*8 + 8 <= 512` (~62 samples). The walk iterates
-    // just those ~62, then the out-of-range tail is fast-forwarded in O(1):
-    // `expanded` lands at ~4.3 billion, which crosses `MAX_EXPANDED_SAMPLES`, so
-    // the track drops as one ExifTool could not have materialized — no spin and
-    // no multi-GiB `Vec`.
+    // full ~4.3-billion declaration, so `$time` never goes undef. ExifTool would
+    // array-materialize (and so OOM/die on) every declared `@$start` slot before
+    // dispatching anything; the streaming walk does NOT — it yields only the tiny
+    // in-bounds prefix (a size-8 sample at offset `16 + i*8` is in bounds while
+    // `16 + i*8 + 8 <= 512`, i.e. `i <= 61` ⇒ 62 samples), then fast-forwards the
+    // ~4.3-billion out-of-range tail in O(`stts`). `expanded` lands at exactly the
+    // declared `0xffff_ffff`, so the walk is CONSISTENT and the 62-sample prefix
+    // is dispatched — the now-faithful (cap, OOM] band (ExifTool can't reach this
+    // prefix at all, having died materializing `@$size`). No spin, no multi-GiB
+    // `Vec`: bounded by the OOB-break plus the analytic tail.
     ee.stts = alloc::vec![0xffff_ffff, 1];
-    assert!(expand_samples(&ee, 1, 512).is_none());
+    let (prefix, consistent) = collect_samples(&ee, 1, 512);
+    assert!(
+      consistent,
+      "the full ~4.3-billion count is consistent (one stts run)"
+    );
+    assert_eq!(
+      prefix.len(),
+      62,
+      "only the in-bounds size-8 prefix is dispatched"
+    );
+    assert_eq!(prefix.first().unwrap().start, 16);
+    assert_eq!(prefix.last().unwrap().start, 16 + 61 * 8);
+    for s in &prefix {
+      assert_eq!(s.size, 8);
+      assert!(
+        (s.start as usize) + 8 <= 512,
+        "every dispatched sample is in bounds"
+      );
+    }
 
     // An explicit (sz==0) stsz with a huge count is ALREADY bounded by the box
     // length: only the bytes actually present decode (here zero entries).
@@ -4240,8 +4264,8 @@ mod tests {
   // lays out all `movie_len + 1` `@$start` slots (the count is table-driven, not
   // file-size-driven) and the dispatch loop reads each, skipping ONLY the final
   // out-of-range sample whose offset is at EOF; the first `movie_len` in-bounds
-  // one-byte samples still dispatch. `expand_samples` must therefore return the
-  // `movie_len` in-bounds samples (not `None`).
+  // one-byte samples still dispatch. The streaming walk must therefore yield the
+  // `movie_len` in-bounds samples and report the track consistent (not dropped).
   #[test]
   fn expand_overcount_keeps_inbounds_samples_skips_eof_tail() {
     const MOVIE_LEN: usize = 10;
@@ -4258,11 +4282,11 @@ mod tests {
       stts: alloc::vec![(MOVIE_LEN as u32) + 1, 100],
     };
     // The pre-fix R1 guard rejected this (`size.len() (11) > movie_len (10)`),
-    // dropping the track. The faithful result keeps the in-bounds prefix.
-    let samples = expand_samples(&ee, 1, MOVIE_LEN).expect("in-bounds samples must survive");
+    // dropping the track. The faithful streaming result yields the in-bounds prefix.
+    let samples = dispatched_samples(&ee, 1, MOVIE_LEN).expect("in-bounds samples must survive");
     // Exactly MOVIE_LEN in-bounds one-byte samples at offsets 0..MOVIE_LEN; the
     // (MOVIE_LEN+1)-th sample sits at offset MOVIE_LEN (start + size = 11 > 10)
-    // and is the EOF tail the dispatch loop skips — so it is NOT materialized.
+    // and is the EOF tail the walk never yields (fast-forwarded for consistency).
     assert_eq!(samples.len(), MOVIE_LEN);
     for (i, s) in samples.iter().enumerate() {
       assert_eq!(s.start, i as u64);
@@ -4291,7 +4315,7 @@ mod tests {
       size: SizeTable::Uniform { size: 8, count: 5 },
       stts: alloc::vec![5, 1],
     };
-    let samples = expand_samples(&ee, 1, MOVIE_LEN).expect("consistent over-count survives");
+    let samples = dispatched_samples(&ee, 1, MOVIE_LEN).expect("consistent over-count survives");
     assert_eq!(samples.len(), 4);
     assert_eq!(
       samples.iter().map(|s| s.start).collect::<Vec<_>>(),
@@ -4358,18 +4382,16 @@ mod tests {
     );
   }
 
-  // R3 #1 — the walk bound must NOT drop an in-bounds prefix just because the
-  // DECLARED walk crosses it. The pre-fix per-iteration `expanded >= cap` guard
-  // fired in the middle of the in-bounds prefix (e.g. for the production
-  // `movie_len = 8_388_609`, `size = 1`, `count = movie_len + 1` track: ExifTool
-  // dispatches offsets `0..8_388_608` and skips only the EOF tail, but the guard
-  // returned `None` once the running index reached `1 << 23`). The fix lets the
-  // in-bounds prefix complete and fast-forwards the out-of-range tail, so the
-  // bound only drops a track whose declared count is one ExifTool could not have
-  // array-materialized. Proven here at a tiny synthetic cap (the production scale
-  // would need a ~400 MiB allocation) via `expand_samples_capped`.
+  // The streaming walk dispatches the in-bounds prefix for ANY declared count —
+  // there is no longer a materialization cap that could truncate it mid-prefix.
+  // (The pre-streaming code bounded the running index by a materialization cap
+  // of `1 << 24`, which for the production `movie_len = 8_388_609`, `size = 1`,
+  // `count = movie_len + 1` track sat BELOW `movie_len` and so wrongly dropped a
+  // prefix ExifTool dispatches; the cap is gone.) Here the in-bounds prefix
+  // (`MOVIE_LEN`) plus a 3-sample EOF tail is yielded as exactly `MOVIE_LEN`
+  // samples, with the tail fast-forwarded so the `@$start == @$size` check holds.
   #[test]
-  fn expand_keeps_inbounds_prefix_that_crosses_the_walk_bound() {
+  fn expand_streams_full_inbounds_prefix_with_no_cap() {
     const MOVIE_LEN: usize = 10;
     // Fixed-size stsz: size 1, count 13 (an in-bounds prefix of MOVIE_LEN = 10
     // plus a 3-sample EOF tail). One chunk at offset 0 holding all 13 samples; a
@@ -4381,12 +4403,7 @@ mod tests {
       size: SizeTable::Uniform { size: 1, count: 13 },
       stts: alloc::vec![13, 100],
     };
-
-    // With a cap of 16, the in-bounds prefix (10) and the declared count (13)
-    // both stay under it: the prefix is dispatched and the 3-sample tail is
-    // fast-forwarded for consistency. Crucially the prefix (10) EXCEEDS the
-    // legacy-style cap asserted just below — the bound no longer truncates it.
-    let samples = expand_samples_capped(&ee, 1, MOVIE_LEN, 16).expect("in-bounds prefix survives");
+    let samples = dispatched_samples(&ee, 1, MOVIE_LEN).expect("in-bounds prefix dispatches");
     assert_eq!(samples.len(), MOVIE_LEN);
     for (i, sample) in samples.iter().enumerate() {
       assert_eq!(sample.start, i as u64);
@@ -4395,68 +4412,58 @@ mod tests {
     // Time queue tracked the elided tail: first sample is time 0 / dur 100.
     assert_eq!(samples.first().unwrap().time, Some(0.0));
     assert_eq!(samples.first().unwrap().dur, Some(100.0));
-
-    // A cap BELOW the in-bounds prefix is the only thing that drops it (modelling
-    // the pre-fix bug, where the production cap sat below `movie_len`): the walk
-    // abandons the track once the running index reaches the bound. This is the
-    // residual `size == 1` crafted-magnitude edge — a prefix larger than the
-    // production `MAX_EXPANDED_SAMPLES` (now `1 << 24`) — and is bounded, not a
-    // spin or an over-allocation.
-    assert!(expand_samples_capped(&ee, 1, MOVIE_LEN, 8).is_none());
   }
 
-  // R4 — the inclusive-cap boundary: an in-bounds prefix of exactly
-  // `max_samples - 1` (plus a single EOF tail that pushes the declared count to
-  // `max_samples`) must SURVIVE. The pre-fix `expanded >= max_samples` dropped it
-  // (off-by-one), making cap behavior depend on whether the last slot was
-  // in-bounds or an EOF tail.
-  // R5 — the in-loop (pre-materialization) cap must drop a `cap + 1` declared
-  // count even when EVERY sample is in bounds. The pre-increment guard is `>=`
-  // (not `>`): at `expanded == cap` it stops, so at most `cap` samples are ever
-  // materialized. (The post-fast-forward check is `>`, for the EOF-tail boundary.)
+  // The streaming walk dispatches EVERY in-bounds sample of an all-in-bounds
+  // track, with no materialization cap. The pre-streaming code dropped a count
+  // above the old `1 << 24` materialization cap even when every sample was in
+  // bounds (the crafted-magnitude (cap, OOM] gap #275 closes); now all dispatch,
+  // matching ExifTool — and the in-bounds count is itself bounded by `movie_len`
+  // for a `size >= 1` table, so this stays O(in-bounds) memory.
   #[test]
-  fn expand_cap_plus_one_all_inbounds_drops() {
-    const CAP: usize = 16;
-    // One chunk of 17 one-byte samples, all in bounds (movie_len 20 > 17); no
-    // EOF tail. count (17) > cap (16), so the pre-walk early-out drops it WITHOUT
-    // materializing — ExifTool would dispatch 17, but that is past exifast's
-    // crafted-magnitude safety cap (the (cap, OOM] faithfulness band is a
-    // documented streaming-redesign follow-up).
+  fn expand_all_inbounds_count_dispatches_fully_no_cap() {
+    // One chunk of 17 one-byte samples, all in bounds (movie_len 20 > 17); no EOF
+    // tail. A single stts run covers all 17 so the walk is consistent.
+    const N: usize = 17;
     let ee = EeData {
       stco: alloc::vec![0],
-      stsc: alloc::vec![(1, (CAP + 1) as u32, 1)],
+      stsc: alloc::vec![(1, N as u32, 1)],
       size: SizeTable::Uniform {
         size: 1,
-        count: (CAP + 1) as u32,
+        count: N as u32,
       },
-      stts: alloc::vec![(CAP + 1) as u32, 100],
+      stts: alloc::vec![N as u32, 100],
     };
-    assert!(
-      expand_samples_capped(&ee, 1, 20, CAP as u64).is_none(),
-      "a cap+1 all-in-bounds count drops via the pre-materialization bound"
-    );
+    let samples =
+      dispatched_samples(&ee, 1, 20).expect("an all-in-bounds count dispatches with no cap");
+    assert_eq!(samples.len(), N);
+    for (i, sample) in samples.iter().enumerate() {
+      assert_eq!(sample.start, i as u64);
+      assert_eq!(sample.size, 1);
+    }
   }
 
+  // A partial-prefix shape: an in-bounds prefix followed by exactly one EOF tail
+  // sample. The walk yields the prefix and fast-forwards the single tail so
+  // `@$start == @$size` holds — matching ExifTool (offsets 0..MOVIE_LEN-1
+  // dispatched, the EOF-tail sample skipped). No cap is involved.
   #[test]
-  fn expand_cap_boundary_inbounds_prefix_survives() {
-    const CAP: usize = 16;
-    const MOVIE_LEN: usize = CAP - 1; // 15 in-bounds one-byte samples (offsets 0..14)
-    // size 1, count = CAP (15 in-bounds + 1 EOF tail at offset 15); one chunk;
-    // a single stts entry covering all CAP samples.
+  fn expand_partial_prefix_with_one_eof_tail_dispatches() {
+    const N: usize = 16;
+    const MOVIE_LEN: usize = N - 1; // 15 in-bounds one-byte samples (offsets 0..14)
+    // size 1, count = N (15 in-bounds + 1 EOF tail at offset 15); one chunk;
+    // a single stts entry covering all N samples.
     let ee = EeData {
       stco: alloc::vec![0],
-      stsc: alloc::vec![(1, CAP as u32, 1)],
+      stsc: alloc::vec![(1, N as u32, 1)],
       size: SizeTable::Uniform {
         size: 1,
-        count: CAP as u32,
+        count: N as u32,
       },
-      stts: alloc::vec![CAP as u32, 100],
+      stts: alloc::vec![N as u32, 100],
     };
-    // `expanded` reaches CAP (== cap) after fast-forwarding the 1 EOF tail; the
-    // inclusive cap (`> max_samples`) lets it through and the MOVIE_LEN prefix
-    // dispatches — matching ExifTool (offsets 0..14 dispatched, EOF tail skipped).
-    let samples = expand_samples_capped(&ee, 1, MOVIE_LEN, CAP as u64)
-      .expect("an in-bounds prefix of cap-1 survives the inclusive cap");
+    let samples = dispatched_samples(&ee, 1, MOVIE_LEN)
+      .expect("an in-bounds prefix plus one EOF tail dispatches");
     assert_eq!(samples.len(), MOVIE_LEN);
     for (i, sample) in samples.iter().enumerate() {
       assert_eq!(sample.start, i as u64);
@@ -4487,7 +4494,7 @@ mod tests {
     // both samples are out of bounds, so the expansion is consistent (@$start ==
     // @$size == 2) but materializes nothing — in particular NOT a wrapped sample
     // at offset 0.
-    let samples = expand_samples(&ee, 1, MOVIE_LEN).expect("consistent, zero in-bounds");
+    let samples = dispatched_samples(&ee, 1, MOVIE_LEN).expect("consistent, zero in-bounds");
     assert!(
       samples.is_empty(),
       "a u64::MAX offset must not wrap to an in-bounds sample"
