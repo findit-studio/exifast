@@ -159,6 +159,12 @@ const NOT_ACTIVE: &[&str] = &[
   "DJI_Matrice30T.jpg",
   "Insta360ONE_equirectangular.jpg",
   "QuickTime_rove_r2_4k.MP4",
+  // The BlackVue DR770X (#213) + Pruveeo D90 (#138) dashcam fixtures — dropped
+  // with goldens + #[ignore]d conformance tests pending their ports (BlackVue
+  // GPS/accelerometer/embedded-JSON; Pruveeo LIGOGPSINFO in MPEG-TS). Their
+  // no-ee .json carries tags exifast does not yet emit, so accept-deferred here.
+  "MP4_blackvue_dr770x.mp4",
+  "MPEG2_TS_pruveeo_d90.ts",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
