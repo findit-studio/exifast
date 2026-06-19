@@ -594,7 +594,13 @@ fn get_string(buf: &[u8], pos: &mut usize) -> Option<SmolStr> {
 /// Mirroring / ColorSpec) and `iref` deep relationships are DEFERRED;
 /// only `cdsc` (ContentDescribes) item-id refs are noted as a warning
 /// when present.
-pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out: &mut HeifMeta) {
+pub fn walk_heif_meta(
+  body: &[u8],
+  meta_abs_offset: u64,
+  child_start: usize,
+  out: &mut HeifMeta,
+  iloc_extents_remaining: &mut u64,
+) {
   let Some(children) = body.get(child_start..) else {
     out.set_warning_at(Some(String::from("Truncated meta box")), meta_abs_offset);
     return;
@@ -626,6 +632,15 @@ pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out
   // cannot overflow a narrower counter and alias one property index onto another.
   let mut ispe_props: Vec<(u32, u32, u32)> = Vec::new();
   let mut ipma_assoc: Vec<(u32, Vec<u16>)> = Vec::new();
+  // #218 — the iloc extent budget is CUMULATIVE across every `iloc` child of
+  // this `meta` AND across every OTHER `meta` box in the file: `walk_heif_meta`
+  // does NOT own it. The caller ([`scan_quicktime_brands`]) holds ONE
+  // remaining-budget (init [`MAX_ILOC_EXTENTS`]) at file scope and threads the
+  // SAME `&mut` through every `walk_heif_meta` call that writes into the SAME
+  // `HeifMeta`, so a crafted file cannot defeat the ceiling by splitting its
+  // zero-width-extent flood across many tiny iloc boxes OR many top-level meta
+  // boxes. Each materialized extent decrements it; once the GLOBAL count
+  // reaches the ceiling, all further iloc extent parsing stops file-wide.
   walk_boxes(children, children_abs, Size0Behavior::Stop, |h| {
     match h.tag {
       // pitm — PrimaryItemReference (QuickTime.pm:2883-2892).
@@ -728,9 +743,12 @@ pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out
           }
         });
       }
-      // iloc — ItemLocation (QuickTime.pm:9131-9195).
+      // iloc — ItemLocation (QuickTime.pm:9131-9195). The extent budget is
+      // SHARED across every iloc box of every meta in the file (#218 cumulative
+      // DoS floor), so pass the caller-owned `iloc_extents_remaining` rather
+      // than letting each box (or each meta) restart at the full ceiling.
       b"iloc" => {
-        if let Err(w) = parse_iloc(h.body, out, &mut id_index) {
+        if let Err(w) = parse_iloc_remaining(h.body, out, &mut id_index, iloc_extents_remaining) {
           out.set_warning_at(Some(w), meta_abs_offset);
         }
       }
@@ -1192,13 +1210,97 @@ fn emit_ispe_dimensions(
   }
 }
 
+/// Crafted-magnitude safety bound on the TOTAL extents materialized by ALL
+/// the `iloc` boxes across EVERY `meta` box in the file — a DoS floor, NOT a
+/// faithful ExifTool count (ExifTool's `ParseItemLocation` has no such cap).
+///
+/// `ParseItemLocation` (QuickTime.pm:9155-9192) is an UNBOUNDED `num`
+/// (Get16u for ver<2, a full Get32u — up to ~4.3 billion — for ver≥2) ×
+/// `ext_num` (Get16u, up to 65535) double loop that `push`es one Perl
+/// hash per extent. A crafted ~400 KB `iloc` whose `siz` nibbles are all
+/// zero (zero-width extents consume NO bytes, so `GetVarInt` with `$n==0`
+/// advances 0) can declare ~65535 items × ~65535 extents ⇒ ~4.3 billion
+/// pushes — ExifTool itself runs out of memory and `die`s before it emits
+/// anything.
+///
+/// The ceiling is CUMULATIVE across every `iloc` child of EVERY `meta` box in
+/// the file, NOT reset per `iloc` box and NOT reset per `meta`. Either
+/// granularity is defeatable by the SAME amplification one container level
+/// apart: a crafted file can repeat MANY tiny `iloc` boxes (one `meta`), OR
+/// MANY tiny top-level `meta` boxes (each with one just-under-cap `iloc`),
+/// each declaring just under the cap so no single box trips it, yet the
+/// summed retained extents are O(num_boxes × cap) — still OOM from a small
+/// input. [`scan_quicktime_brands`] (the file-scope caller that loops the
+/// `meta` boxes) therefore owns ONE shared remaining-budget (init to this
+/// constant) and threads a `&mut` to it through every recursive call and into
+/// every [`walk_heif_meta`] → [`parse_iloc_remaining`] call; once the GLOBAL
+/// count of materialized extents reaches the ceiling, further extent parsing
+/// stops regardless of which box (or which meta) it occurs in.
+///
+/// This bounds the work WITHOUT diverging on any real input: a real HEIF
+/// has a handful of items each with a few extents (even an 8K image tiled
+/// into 64×64 blocks is ~20K extents), and a real file has ONE `meta` with
+/// ONE `iloc`, so the cumulative total is orders of magnitude below
+/// `1 << 20` — this NEVER fires on a conforming file and the
+/// byte-identical-conformance guarantee holds. Mirrors the
+/// [`MAX_EXPANDED_SAMPLES`](crate::formats::quicktime_stream) timed-sample
+/// magnitude bound.
+pub(crate) const MAX_ILOC_EXTENTS: u64 = 1 << 20;
+
 /// Parse the `iloc` body. Faithful port of `ParseItemLocation`
 /// (QuickTime.pm:9131-9195). Returns `Err(warning)` on a structurally
-/// malformed iloc (truncated header / count overflow).
+/// malformed iloc (truncated header / count overflow). Bounds the total
+/// extent work at [`MAX_ILOC_EXTENTS`] (a crafted-magnitude DoS floor;
+/// see [`parse_iloc_remaining`]).
+///
+/// Test-only convenience: this 3-arg form allocates a FRESH per-call budget,
+/// so each standalone `iloc` parses fully up to the cap on its own. The
+/// production walk does NOT use it — [`scan_quicktime_brands`] threads one
+/// shared budget through [`walk_heif_meta`] into [`parse_iloc_remaining`] so
+/// the ceiling is CUMULATIVE across every `iloc` child of every `meta` box in
+/// the file (see [`MAX_ILOC_EXTENTS`]).
+#[cfg(test)]
 fn parse_iloc(
   buf: &[u8],
   out: &mut HeifMeta,
   id_index: &mut BTreeMap<u32, usize>,
+) -> Result<(), String> {
+  parse_iloc_capped(buf, out, id_index, MAX_ILOC_EXTENTS)
+}
+
+/// [`parse_iloc`] with an explicit total-extent ceiling, so a test can
+/// prove the bound with a small synthetic budget instead of crafting the
+/// full billions-magnitude input. The budget is local to this call.
+#[cfg(test)]
+fn parse_iloc_capped(
+  buf: &[u8],
+  out: &mut HeifMeta,
+  id_index: &mut BTreeMap<u32, usize>,
+  max_extents: u64,
+) -> Result<(), String> {
+  let mut remaining = max_extents;
+  parse_iloc_remaining(buf, out, id_index, &mut remaining)
+}
+
+/// Parse one `iloc` body (the worker behind [`parse_iloc`]), threading a
+/// SHARED, decrement-to-zero extent budget owned by the caller. This is the
+/// production entry the `meta` walk uses. [`scan_quicktime_brands`] holds one
+/// `remaining` (init [`MAX_ILOC_EXTENTS`]) at FILE scope and passes the SAME
+/// `&mut` — through every recursive call and every [`walk_heif_meta`] — to
+/// EVERY `iloc` child of EVERY `meta` box, so the cap is CUMULATIVE file-wide
+/// rather than resetting per `iloc` box or per `meta`. A crafted file cannot
+/// defeat the bound by splitting its flood into many tiny boxes (or many
+/// meta boxes) each just under a per-box cap. Each materialized extent
+/// decrements `*remaining`; when it hits 0 the walk stops (returning the
+/// in-budget prefix) — and a subsequent item row is refused at the top of the
+/// `num` loop so a post-cap zero-extent row cannot overwrite a retained item
+/// — bounding the cumulative retained extents regardless of how many `iloc`
+/// boxes precede or follow.
+fn parse_iloc_remaining(
+  buf: &[u8],
+  out: &mut HeifMeta,
+  id_index: &mut BTreeMap<u32, usize>,
+  remaining: &mut u64,
 ) -> Result<(), String> {
   let ver = *buf.first().ok_or_else(|| String::from("Truncated iloc"))?;
   if buf.len() < 8 {
@@ -1221,14 +1323,34 @@ fn parse_iloc(
     let n = be_u32(buf, 6).ok_or_else(|| String::from("Truncated iloc num32"))?;
     (n, 10)
   };
-  // NOTE: the `num` × `ext_num` nesting (QuickTime.pm:9155 `for $i<$num`
-  // / 9178 `for $j<$ext_num`) is left UNBOUNDED on purpose — faithful to
-  // ExifTool. `num` is a u16 (ver<2) or a full Get32u (ver≥2), `ext_num`
-  // a u16; zero-width extents (every `siz` nibble 0) consume no bytes, so
-  // a crafted iloc CAN drive billions of empty extents. ExifTool has the
-  // same behaviour; a count budget / DoS guard would DIVERGE and is a
-  // separately-tracked robustness-budget follow-up — do NOT add one here.
+  // The `num` × `ext_num` nesting (QuickTime.pm:9155 `for $i<$num` / 9178
+  // `for $j<$ext_num`) is faithfully UNbounded in COUNT — `num` is a u16
+  // (ver<2) or a full Get32u (ver≥2), `ext_num` a u16 — but the cumulative
+  // extents materialized are capped by the caller-owned `*remaining` budget
+  // ([`MAX_ILOC_EXTENTS`] in production, threaded across ALL iloc boxes of
+  // EVERY meta box in the file). Zero-width extents (every `siz` nibble 0)
+  // consume NO bytes,
+  // so a crafted iloc CAN declare billions of empty extents that ExifTool
+  // would OOM on; once `*remaining` reaches 0 we stop the walk (returning
+  // the in-budget prefix), bounding the pushes WITHOUT diverging on any real
+  // input (a real iloc is orders of magnitude under the ceiling). See
+  // [`MAX_ILOC_EXTENTS`] for why this can never fire on a conforming HEIF.
   for _ in 0..num {
+    // #218 — STOP before COMMITTING any item row once the shared, caller-owned
+    // extent budget is exhausted. The per-extent guard below stops the EXTENT
+    // loop, but an item with `ext_num == 0` never enters that loop, so without
+    // this row-level check a post-cap zero-extent iloc row for an id reused
+    // from an already-retained item would still reach the unconditional slot
+    // writeback and OVERWRITE that item's BaseOffset + Extents with an empty
+    // vector — making the post-ceiling tail observable. Checking `*remaining`
+    // here makes EVERY post-cap row (including `ext_num == 0`) a complete
+    // no-op: parsing stops, no slot is mutated, and the in-budget prefix
+    // already merged survives intact. (ExifTool would have OOM'd materializing
+    // the declared billions of extents, so this tail is unobservable anyway;
+    // unreachable on any real HEIF — see [`MAX_ILOC_EXTENTS`].)
+    if *remaining == 0 {
+      return Ok(());
+    }
     // Item id (u16 for ver<2, u32 for ver>=2).
     let id = if ver < 2 {
       let id = u32::from(be_u16(buf, pos).ok_or_else(|| String::from("Truncated iloc id"))?);
@@ -1291,6 +1413,24 @@ fn parse_iloc(
         Some(v) => v,
         None => return Err(String::from("Truncated iloc extent length")),
       };
+      // Crafted-magnitude DoS floor (extent granularity): once the shared,
+      // caller-owned extent budget is exhausted MID-item, STOP the walk. The
+      // budget is CUMULATIVE across every iloc box of every meta in the file
+      // (`*remaining` is owned by `scan_quicktime_brands` and threaded through
+      // `walk_heif_meta`), so a flood split over many tiny boxes — or many
+      // meta boxes — is bounded in total. This per-extent guard handles a
+      // budget that drains BETWEEN extents of one item; the row-level guard at
+      // the top of `for _ in 0..num` handles a budget already drained when a
+      // (possibly `ext_num == 0`) item row BEGINS, so the post-cap slot
+      // writeback below can never run. ExifTool would have OOM'd materializing
+      // the declared billions of extents, so the post-ceiling tail is
+      // unobservable; exifast keeps the fully-merged prior items and drops the
+      // in-progress one — bounded, no OOM, no spin. Unreachable on any real
+      // HEIF (see [`MAX_ILOC_EXTENTS`]).
+      if *remaining == 0 {
+        return Ok(());
+      }
+      *remaining -= 1;
       let mut e = HeifExtent::new();
       // Fold BaseOffset in (faithful to QuickTime.pm:9397 `my $base =
       // ($$item{BaseOffset} || 0) + (...)`).
@@ -1349,7 +1489,7 @@ fn parse_iloc(
 /// Because the sets are disjoint, a normal item (in BOTH iinf and iloc)
 /// cross-merges — `infe`'s Name/Type and `iloc`'s Extents coexist — while
 /// a repeat of ONE source overwrites only that source's fields. The two
-/// call sites below ([`parse_iloc`] and the `iinf` arm of
+/// call sites below ([`parse_iloc_remaining`] and the `iinf` arm of
 /// [`walk_heif_meta`]) each write EXACTLY their owned subset into the
 /// returned slot; `DataReferenceIndex`/`ProtectionIndex`/
 /// `ContentEncoding`/`URI` are not surfaced by [`HeifItem`] and so are
@@ -1761,6 +1901,19 @@ impl QtTable {
 /// CMT1 `Model` even across multiple Canon `uuid` atoms (or recursion edges).
 /// The top-level caller seeds it with `None`.
 ///
+/// `iloc_extents_remaining` is the FILE-SCOPED HEIF `iloc` extent budget
+/// (#218): a single remaining-count the top-level caller seeds with
+/// [`MAX_ILOC_EXTENTS`] and that is threaded — by the SAME `&mut` — through
+/// every recursive call AND into every [`walk_heif_meta`] invocation. So ONE
+/// ceiling bounds the total materialized extents across ALL `meta` boxes
+/// anywhere in the file, not per-meta and not per-`iloc`-box. This closes the
+/// container-level amplification a crafted file otherwise gets from many small
+/// `meta` boxes, each carrying a just-under-cap zero-width `iloc` (the same
+/// flood one level up from the multi-`iloc` case `walk_heif_meta` already
+/// bounds). A conforming file has one `meta` with one `iloc` of a few extents,
+/// so the budget never fires and the byte-identical-conformance guarantee
+/// holds (see [`MAX_ILOC_EXTENTS`]).
+///
 /// `boxes` is the atom's payload, `abs_offset` its absolute file offset
 /// (folded into per-extent / per-block offsets), `depth` the recursion
 /// budget (Golden-v2 Contract 3a: capped at [`MAX_ATOM_DEPTH`] — the SAME
@@ -1778,6 +1931,7 @@ pub fn scan_quicktime_brands(
   heif: &mut HeifMeta,
   cr3: &mut Cr3Meta,
   current_model: &mut Option<SmolStr>,
+  iloc_extents_remaining: &mut u64,
 ) {
   if depth >= MAX_ATOM_DEPTH {
     return;
@@ -1789,7 +1943,13 @@ pub fn scan_quicktime_brands(
       // offset (`Start => 4` for the FullBox positions Main/UserData, else
       // 0). A `moov/meta` that is iTunes-style (hdlr/keys/ilst, no
       // iinf/iloc) simply yields no HEIF items — correct.
-      walk_heif_meta(h.body, h.body_abs_start, table.meta_child_start(), heif);
+      walk_heif_meta(
+        h.body,
+        h.body_abs_start,
+        table.meta_child_start(),
+        heif,
+        iloc_extents_remaining,
+      );
     } else if h.tag == b"uuid"
       && h.body.get(..16) == Some(&CANON_UUID[..])
       && let Some(rest) = h.body.get(16..)
@@ -1810,6 +1970,7 @@ pub fn scan_quicktime_brands(
         heif,
         cr3,
         current_model,
+        iloc_extents_remaining,
       );
     }
   });
@@ -2981,7 +3142,17 @@ mod tests {
   fn scan_heif_meta(data: &[u8], out: &mut HeifMeta) {
     let mut cr3 = Cr3Meta::new();
     let mut model = None;
-    scan_quicktime_brands(data, 0, QtTable::Main, 0, out, &mut cr3, &mut model);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    scan_quicktime_brands(
+      data,
+      0,
+      QtTable::Main,
+      0,
+      out,
+      &mut cr3,
+      &mut model,
+      &mut iloc_budget,
+    );
   }
 
   /// Test shim: run the unified [`scan_quicktime_brands`] from `%Main` over
@@ -2993,7 +3164,17 @@ mod tests {
   fn scan_canon_uuid(data: &[u8], out: &mut Cr3Meta) -> bool {
     let mut heif = HeifMeta::new();
     let mut model = None;
-    scan_quicktime_brands(data, 0, QtTable::Main, 0, &mut heif, out, &mut model);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    scan_quicktime_brands(
+      data,
+      0,
+      QtTable::Main,
+      0,
+      &mut heif,
+      out,
+      &mut model,
+      &mut iloc_budget,
+    );
     !out.is_empty()
   }
 
@@ -3542,7 +3723,8 @@ mod tests {
     pitm_body.extend_from_slice(&42u16.to_be_bytes());
     body.extend(box_bytes(b"pitm", &pitm_body));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.primary_item(), Some(42));
   }
 
@@ -3556,7 +3738,8 @@ mod tests {
     pitm_body.extend_from_slice(&100_000u32.to_be_bytes());
     body.extend(box_bytes(b"pitm", &pitm_body));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.primary_item(), Some(100_000));
   }
 
@@ -3652,7 +3835,8 @@ mod tests {
     // NO order warning. Wrap the 6-byte body in an `infe` box inside iinf v0.
     let body = meta_inner(&iinf_v0(&[six]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert!(
       m.items().is_empty(),
       "a truncated infe produces no phantom item"
@@ -3698,7 +3882,8 @@ mod tests {
     body.extend(box_bytes(b"iloc", &iloc_body));
 
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.primary_item(), Some(1));
     assert_eq!(m.items().len(), 1);
     let it = &m.items()[0];
@@ -3806,8 +3991,372 @@ mod tests {
     // iloc with only 4 bytes — too short.
     body.extend(box_bytes(b"iloc", &[0, 0, 0, 0]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert!(m.warning().is_some());
+  }
+
+  /// #218 — a crafted `iloc` whose `num` × `ext_num` product is enormous but
+  /// whose `siz` nibbles are all zero (zero-width extents consume NO input
+  /// bytes) must NOT materialize billions of extents. ExifTool's
+  /// `ParseItemLocation` would `push` one Perl hash per declared extent and run
+  /// out of memory; exifast's [`MAX_ILOC_EXTENTS`] ceiling bounds the TOTAL
+  /// extent work across all items. Proven cheaply with a tiny synthetic budget
+  /// via [`parse_iloc_capped`]: the walk stops the instant the cumulative
+  /// extent count reaches the budget, so only `budget` extents are ever
+  /// materialized regardless of the declared magnitude.
+  ///
+  /// The body is ~393 KB (matching the issue's ~400 KB crafted-input figure):
+  /// 65535 items × 4 declared extents each = 262 140 declared extents. A
+  /// 64-extent budget caps the materialized total at 64 (16 fully-merged items)
+  /// and halts the walk — bounded, no OOM, no hang.
+  #[test]
+  fn parse_iloc_zero_width_extent_flood_is_bounded() {
+    // ver 0, siz = 0x0000 → noff=nlen=nbas=nind=0. Per-item header is
+    // id(2) + dataRefIdx(2) + ext_num(2) = 6 bytes; each declared extent then
+    // reads 0 offset + 0 length bytes (the GetVarInt `$n==0` default path
+    // advances the cursor by 0), so the inner loop is pure CPU + the push.
+    // EXT_PER_ITEM is kept BELOW the budget so whole items merge and the
+    // cumulative cap is observed crossing an item boundary.
+    const ITEMS: u32 = u16::MAX as u32; // 65535 (max count for a ver<2 iloc)
+    const EXT_PER_ITEM: u16 = 4;
+    let mut iloc_body = Vec::new();
+    iloc_body.extend_from_slice(&[0, 0, 0, 0]); // ver=0, flags=0
+    iloc_body.extend_from_slice(&0x0000u16.to_be_bytes()); // siz: all nibbles 0
+    iloc_body.extend_from_slice(&(ITEMS as u16).to_be_bytes()); // count (u16, ver<2)
+    for id in 0..ITEMS {
+      iloc_body.extend_from_slice(&(id as u16).to_be_bytes()); // id
+      iloc_body.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+      iloc_body.extend_from_slice(&EXT_PER_ITEM.to_be_bytes()); // ext_num
+      // zero extent bytes (noff=nlen=0)
+    }
+    // Sanity: ~393 KB body declaring 262K extents — far past the budget.
+    assert!(
+      (390_000..400_000).contains(&iloc_body.len()),
+      "the crafted iloc body is ~393 KB, got {}",
+      iloc_body.len()
+    );
+    let declared = u64::from(ITEMS) * u64::from(EXT_PER_ITEM);
+    assert_eq!(declared, 262_140, "262K declared extents");
+
+    const BUDGET: u64 = 64;
+    let mut out = HeifMeta::new();
+    let mut id_index = BTreeMap::new();
+    // Returns Ok promptly (the budget stops the walk) — no OOM, no hang.
+    assert!(parse_iloc_capped(&iloc_body, &mut out, &mut id_index, BUDGET).is_ok());
+    // The TOTAL extents materialized across every merged item is bounded by the
+    // budget — proof the `num` × `ext_num` flood cannot allocate the declared
+    // 262K (let alone the ~4.3 billion a full Get32u-count iloc could declare).
+    let total_extents: u64 = out.items().iter().map(|it| it.extents().len() as u64).sum();
+    assert!(
+      total_extents <= BUDGET,
+      "materialized {total_extents} extents, budget was {BUDGET}"
+    );
+    // EXT_PER_ITEM (4) divides BUDGET (64) exactly, so the walk stops on an
+    // item boundary after 16 fully-merged items (16 × 4 == 64), proving the
+    // cap accumulates ACROSS items rather than per-item.
+    assert_eq!(
+      total_extents, BUDGET,
+      "the cap halts after exactly 64 extents"
+    );
+    assert_eq!(
+      out.items().len(),
+      (BUDGET / u64::from(EXT_PER_ITEM)) as usize,
+      "16 items merged before the cumulative cap stopped the walk"
+    );
+  }
+
+  /// #218 (R1 follow-up) — the extent budget must be CUMULATIVE across MANY
+  /// `iloc` boxes, not reset per box. A per-box cap is defeatable: repeat
+  /// several small zero-width `iloc` boxes whose DECLARED extents each sit
+  /// just under the cap, so no single box trips it, yet the SUMMED retained
+  /// extents would be O(num_boxes × cap) and still OOM. This proves the
+  /// budget threaded through [`parse_iloc_remaining`] is shared: three boxes
+  /// declaring 40 extents each (120 total) against a 64-extent budget retain
+  /// EXACTLY 64 — the cap accumulates across the box boundary rather than
+  /// granting each box a fresh 40.
+  #[test]
+  fn parse_iloc_cumulative_budget_spans_multiple_boxes() {
+    // Build one ver-0 iloc body: `count` items, each with a single
+    // zero-width extent (siz nibbles all 0 ⇒ noff=nlen=nbas=nind=0). Per
+    // item: id(2) + dataRefIdx(2) + ext_num(2), then 0 extent bytes. Using
+    // EXT_PER_ITEM == 1 makes any budget land on an item boundary, so a
+    // partial (dropped) item never muddies the retained count.
+    fn iloc_box(first_id: u32, count: u16) -> Vec<u8> {
+      let mut b = Vec::new();
+      b.extend_from_slice(&[0, 0, 0, 0]); // ver=0, flags=0
+      b.extend_from_slice(&0x0000u16.to_be_bytes()); // siz: all nibbles 0
+      b.extend_from_slice(&count.to_be_bytes()); // item count (u16, ver<2)
+      for i in 0..count {
+        let id = first_id + u32::from(i);
+        b.extend_from_slice(&(id as u16).to_be_bytes()); // id
+        b.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+        b.extend_from_slice(&1u16.to_be_bytes()); // ext_num = 1
+        // zero extent bytes (noff=nlen=0)
+      }
+      b
+    }
+
+    const PER_BOX: u16 = 40;
+    const BUDGET: u64 = 64;
+    // DISJOINT id ranges per box so each box creates its own slots (no
+    // last-wins merge collapsing the retained count).
+    let box1 = iloc_box(100, PER_BOX);
+    let box2 = iloc_box(1_000, PER_BOX);
+    let box3 = iloc_box(10_000, PER_BOX);
+
+    let mut out = HeifMeta::new();
+    let mut id_index = BTreeMap::new();
+    // The SAME `remaining` is threaded through all three calls — exactly what
+    // `walk_heif_meta` does for the meta's iloc children.
+    let mut remaining: u64 = BUDGET;
+    assert!(parse_iloc_remaining(&box1, &mut out, &mut id_index, &mut remaining).is_ok());
+    assert!(parse_iloc_remaining(&box2, &mut out, &mut id_index, &mut remaining).is_ok());
+    assert!(parse_iloc_remaining(&box3, &mut out, &mut id_index, &mut remaining).is_ok());
+
+    // 3 boxes × 40 = 120 declared, but the cumulative cap retains only 64.
+    let total_extents: u64 = out.items().iter().map(|it| it.extents().len() as u64).sum();
+    assert_eq!(
+      total_extents, BUDGET,
+      "the cumulative cap bounds the TOTAL across all 3 iloc boxes (got \
+       {total_extents}, declared 120), proving the budget is not reset per box"
+    );
+    assert_eq!(remaining, 0, "the shared budget is fully consumed");
+    // 64 items kept (40 from box1 + 24 from box2 before the cap halted the
+    // walk on an item boundary); box3 contributed none.
+    assert_eq!(
+      out.items().len(),
+      BUDGET as usize,
+      "64 single-extent items retained across the box boundary, not 3×40"
+    );
+
+    // Integration: the SAME cumulative bound holds when `walk_heif_meta`
+    // loops the meta's iloc children at the PRODUCTION ceiling. Many tiny
+    // v2 iloc boxes, each declaring just under `MAX_ILOC_EXTENTS` worth of
+    // zero-width extents across disjoint ids, declare FAR more than the cap
+    // in total — but the retained extents stay bounded by the single shared
+    // budget (no OOM, no hang).
+    fn iloc_v2_box(first_id: u32, items: u32, ext_each: u16) -> Vec<u8> {
+      let mut b = Vec::new();
+      b.extend_from_slice(&[2, 0, 0, 0]); // ver=2, flags=0
+      b.extend_from_slice(&0x0000u16.to_be_bytes()); // siz: all nibbles 0
+      b.extend_from_slice(&items.to_be_bytes()); // count (u32, ver==2)
+      for i in 0..items {
+        b.extend_from_slice(&(first_id + i).to_be_bytes()); // id (u32, ver==2)
+        b.extend_from_slice(&0u16.to_be_bytes()); // constMeth (ver 2)
+        b.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+        b.extend_from_slice(&ext_each.to_be_bytes()); // ext_num
+        // each declared extent: ext_index(nind=0) + offset(noff=0) +
+        // length(nlen=0) → ZERO bytes consumed.
+      }
+      b
+    }
+
+    // 16 items × 65535 extents = 1_048_560 declared per box (just under the
+    // 1<<20 == 1_048_576 cap), matching the finding's per-box magnitude.
+    const ITEMS_PER_BOX: u32 = 16;
+    const EXT_EACH: u16 = u16::MAX; // 65535
+    const NUM_BOXES: u32 = 4;
+    let declared_per_box = u64::from(ITEMS_PER_BOX) * u64::from(EXT_EACH);
+    assert!(
+      declared_per_box < MAX_ILOC_EXTENTS,
+      "each box stays just under the per-box magnitude ({declared_per_box} < {MAX_ILOC_EXTENTS})"
+    );
+    let declared_total = declared_per_box * u64::from(NUM_BOXES);
+    assert!(
+      declared_total > MAX_ILOC_EXTENTS,
+      "the summed declaration far exceeds the cap ({declared_total} > {MAX_ILOC_EXTENTS})"
+    );
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0, 0, 0, 0]); // meta version+flags
+    for b in 0..NUM_BOXES {
+      // Disjoint id windows so boxes never share slots.
+      meta_body.extend(box_bytes(
+        b"iloc",
+        &iloc_v2_box(1 + b * 1_000_000, ITEMS_PER_BOX, EXT_EACH),
+      ));
+    }
+    let mut m = HeifMeta::new();
+    // Returns promptly (the shared budget halts the walk) — no OOM, no hang.
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&meta_body, 0, 4, &mut m, &mut iloc_budget);
+    let walked_total: u64 = m.items().iter().map(|it| it.extents().len() as u64).sum();
+    assert!(
+      walked_total <= MAX_ILOC_EXTENTS,
+      "walk_heif_meta retained {walked_total} extents across {NUM_BOXES} iloc boxes \
+       (declared {declared_total}); the cumulative cap is {MAX_ILOC_EXTENTS}"
+    );
+    // The cap genuinely fired (one box alone nearly fills it; the rest push it
+    // over), so the bound is the cumulative ceiling, not the trivially-small
+    // declaration.
+    assert!(
+      walked_total > declared_per_box / 2,
+      "the cap was exercised (retained {walked_total}), not a degenerate empty walk"
+    );
+  }
+
+  /// #218 (R2 finding 1) — the extent budget must be CUMULATIVE across EVERY
+  /// top-level `meta` box in the file, not reset per `meta`. The R1/R2 work
+  /// hoisted the budget to be cumulative across the `iloc` children of ONE
+  /// `meta`; this proves the SAME bound holds one container level up. A
+  /// crafted file with MANY tiny `meta` boxes, each carrying a single
+  /// just-under-cap zero-width `iloc` over disjoint ids, declares FAR more
+  /// than `MAX_ILOC_EXTENTS` in total — but the file-scope budget owned by
+  /// `scan_quicktime_brands` (threaded into every `walk_heif_meta`) bounds the
+  /// TOTAL retained extents to ONE ceiling, not N times it.
+  #[test]
+  fn iloc_budget_cumulative_across_meta_boxes() {
+    // One ver-2 zero-width iloc body (siz nibbles all 0 → no extent bytes),
+    // `items` ids each declaring `ext_each` empty extents. The same shape the
+    // cumulative-across-iloc test uses, here split one-per-`meta`.
+    fn iloc_v2_zero_width(first_id: u32, items: u32, ext_each: u16) -> Vec<u8> {
+      let mut b = Vec::new();
+      b.extend_from_slice(&[2, 0, 0, 0]); // ver=2, flags=0
+      b.extend_from_slice(&0x0000u16.to_be_bytes()); // siz: all nibbles 0
+      b.extend_from_slice(&items.to_be_bytes()); // count (u32, ver==2)
+      for i in 0..items {
+        b.extend_from_slice(&(first_id + i).to_be_bytes()); // id (u32)
+        b.extend_from_slice(&0u16.to_be_bytes()); // constMeth (ver 2)
+        b.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+        b.extend_from_slice(&ext_each.to_be_bytes()); // ext_num
+        // ext_index(nind=0)+offset(noff=0)+length(nlen=0) → ZERO bytes each.
+      }
+      b
+    }
+
+    // One top-level `meta` box body: [version+flags][iloc box].
+    fn meta_box(iloc_body: &[u8]) -> Vec<u8> {
+      let mut meta = Vec::new();
+      meta.extend_from_slice(&[0, 0, 0, 0]); // meta version+flags
+      meta.extend(box_bytes(b"iloc", iloc_body));
+      box_bytes(b"meta", &meta)
+    }
+
+    // 16 items × 65535 extents = 1_048_560 declared per meta box (just under
+    // the 1<<20 == 1_048_576 cap), so NO single meta trips the ceiling.
+    const ITEMS_PER_META: u32 = 16;
+    const EXT_EACH: u16 = u16::MAX; // 65535
+    const NUM_META: u32 = 4;
+    let declared_per_meta = u64::from(ITEMS_PER_META) * u64::from(EXT_EACH);
+    assert!(
+      declared_per_meta < MAX_ILOC_EXTENTS,
+      "each meta's lone iloc stays just under the per-box cap \
+       ({declared_per_meta} < {MAX_ILOC_EXTENTS})"
+    );
+    let declared_total = declared_per_meta * u64::from(NUM_META);
+    assert!(
+      declared_total > MAX_ILOC_EXTENTS,
+      "the SUMMED declaration across all meta boxes far exceeds one ceiling \
+       ({declared_total} > {MAX_ILOC_EXTENTS})"
+    );
+
+    // A file = several top-level `meta` boxes, each over a DISJOINT id window
+    // so no last-wins merge collapses the retained count.
+    let mut file = Vec::new();
+    for m in 0..NUM_META {
+      file.extend(meta_box(&iloc_v2_zero_width(
+        1 + m * 1_000_000,
+        ITEMS_PER_META,
+        EXT_EACH,
+      )));
+    }
+
+    let mut heif = HeifMeta::new();
+    // `scan_heif_meta` is the file-scope entry (`scan_quicktime_brands` over
+    // `%Main`): it seeds ONE budget and threads it through every `meta`'s
+    // `walk_heif_meta`. Returns promptly (the shared budget halts the walk) —
+    // no OOM, no hang — even though the declaration is multi-meta.
+    scan_heif_meta(&file, &mut heif);
+
+    let walked_total: u64 = heif
+      .items()
+      .iter()
+      .map(|it| it.extents().len() as u64)
+      .sum();
+    assert!(
+      walked_total <= MAX_ILOC_EXTENTS,
+      "the file-scope budget bounds the TOTAL retained extents across all \
+       {NUM_META} meta boxes to ONE ceiling (retained {walked_total}, declared \
+       {declared_total}, cap {MAX_ILOC_EXTENTS}) — NOT {NUM_META}× the cap"
+    );
+    // The cap genuinely fired (one meta nearly fills it; the rest push it over
+    // a SINGLE ceiling), so the bound is the cumulative file-scope ceiling, not
+    // a trivially-small declaration nor a per-meta reset.
+    assert!(
+      walked_total > declared_per_meta / 2,
+      "the cap was exercised across meta boxes (retained {walked_total}), not a \
+       degenerate empty walk"
+    );
+  }
+
+  /// #218 (R2 finding 2) — a post-cap iloc ROW must be a COMPLETE no-op, even
+  /// when it declares ZERO extents. The per-extent guard lives INSIDE the
+  /// extent loop, so an `ext_num == 0` row skips it and would otherwise reach
+  /// the unconditional slot writeback, OVERWRITING an already-retained item's
+  /// base offset + extents with an empty vector once the budget has drained.
+  /// The row-level guard at the top of the `num` loop refuses every post-cap
+  /// row, so a later zero-extent iloc reusing a retained id leaves it intact.
+  #[test]
+  fn parse_iloc_post_cap_zero_extent_row_does_not_overwrite() {
+    // Box A (ver 0): id 7 with a non-zero BaseOffset (nbas=4) and 2 zero-width
+    // extents (noff=nlen=0). siz nibbles: noff=0, nlen=0, nbas=4, nind=0 ⇒
+    // 0x0040. Per item: id(2) + dataRefIdx(2) + base(4) + ext_num(2), then 0
+    // extent bytes. The 2 extents EXACTLY drain a budget of 2.
+    // `HeifItem::base_offset` is a u64; a 4-byte (nbas=4) BaseOffset reads as
+    // its low 32 bits.
+    const BASE: u64 = 0xDEAD_BEEF;
+    let mut box_a = Vec::new();
+    box_a.extend_from_slice(&[0, 0, 0, 0]); // ver=0, flags=0
+    box_a.extend_from_slice(&0x0040u16.to_be_bytes()); // siz: nbas=4 nibble
+    box_a.extend_from_slice(&1u16.to_be_bytes()); // count = 1 item
+    box_a.extend_from_slice(&7u16.to_be_bytes()); // id = 7
+    box_a.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+    box_a.extend_from_slice(&(BASE as u32).to_be_bytes()); // BaseOffset (nbas=4)
+    box_a.extend_from_slice(&2u16.to_be_bytes()); // ext_num = 2
+    // 2 zero-width extents → ZERO bytes consumed.
+
+    // Box B (ver 0): id 7 again with ext_num == 0 and a DIFFERENT declared
+    // BaseOffset. This is the post-cap row that must NOT touch the slot.
+    let mut box_b = Vec::new();
+    box_b.extend_from_slice(&[0, 0, 0, 0]); // ver=0, flags=0
+    box_b.extend_from_slice(&0x0040u16.to_be_bytes()); // siz: nbas=4 nibble
+    box_b.extend_from_slice(&1u16.to_be_bytes()); // count = 1 item
+    box_b.extend_from_slice(&7u16.to_be_bytes()); // id = 7 (SAME id)
+    box_b.extend_from_slice(&0u16.to_be_bytes()); // dataRefIdx
+    box_b.extend_from_slice(&0x1111_1111u32.to_be_bytes()); // would-be base
+    box_b.extend_from_slice(&0u16.to_be_bytes()); // ext_num = 0
+
+    let mut out = HeifMeta::new();
+    let mut id_index = BTreeMap::new();
+    // Shared budget of exactly 2 — box A consumes it fully.
+    let mut remaining: u64 = 2;
+    assert!(parse_iloc_remaining(&box_a, &mut out, &mut id_index, &mut remaining).is_ok());
+    assert_eq!(remaining, 0, "box A drained the shared budget to 0");
+    assert_eq!(out.items().len(), 1, "id 7 was retained by box A");
+    assert_eq!(out.items()[0].extents().len(), 2, "id 7 kept its 2 extents");
+    assert_eq!(out.items()[0].base_offset(), BASE, "id 7 kept box A's base");
+
+    // Box B's zero-extent row arrives with the budget already at 0. The
+    // row-level guard fires BEFORE the slot writeback, so id 7 is untouched —
+    // its base and extents survive (the post-ceiling tail stays unobservable).
+    assert!(parse_iloc_remaining(&box_b, &mut out, &mut id_index, &mut remaining).is_ok());
+    assert_eq!(remaining, 0, "the budget stays exhausted");
+    assert_eq!(
+      out.items().len(),
+      1,
+      "no new slot was created by the no-op row"
+    );
+    assert_eq!(
+      out.items()[0].extents().len(),
+      2,
+      "the post-cap zero-extent row did NOT erase id 7's retained extents"
+    );
+    assert_eq!(
+      out.items()[0].base_offset(),
+      BASE,
+      "the post-cap zero-extent row did NOT overwrite id 7's base offset"
+    );
   }
 
   #[test]
@@ -3816,7 +4365,8 @@ mod tests {
     body.extend_from_slice(&[0, 0, 0, 0]);
     body.extend(box_bytes(b"idat", &[0xAA, 0xBB, 0xCC]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     // Normal (8-byte header) box: idat starts at body[4], its 8-byte
     // header ends at body[12], so the payload offset is 12 and the length
     // is exactly the 3 payload bytes (REGRESSION guard for the
@@ -3847,7 +4397,8 @@ mod tests {
     body.extend_from_slice(&[0, 0, 0, 0]); // meta version+flags
     body.extend(largesize_box_bytes(b"idat", &[0xAA, 0xBB, 0xCC, 0xDD]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     // idat box starts at body[4]; its 16-byte largesize header ends at
     // body[20], so the payload begins at absolute offset 20 (a plain
     // `abs_start + 8` would WRONGLY report 12 and read 8 header bytes as
@@ -4009,7 +4560,8 @@ mod tests {
     // prefix is for; here there is none, so a top-level (offset-4) parse of
     // this same body would NOT find the item — proving the offset matters.
     let mut top = HeifMeta::new();
-    walk_heif_meta(&meta_body, 0, 4, &mut top);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&meta_body, 0, 4, &mut top, &mut iloc_budget);
     assert!(
       top.items().is_empty(),
       "the same body parsed at offset 4 (top-level) finds nothing — offset 0 is required for moov/meta"
@@ -4325,7 +4877,8 @@ mod tests {
     // descending into the iprp container.
     let body = meta_with_iprp_ipma(&ipma_v0(false, &[(2, 0), (1, 0)]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(
       m.warning(),
       Some("Item property association entries are out of order")
@@ -4337,7 +4890,8 @@ mod tests {
     // Ascending ids (1 then 2) → no out-of-order warning.
     let body = meta_with_iprp_ipma(&ipma_v0(false, &[(1, 0), (2, 0)]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.warning(), None);
   }
 
@@ -4349,7 +4903,8 @@ mod tests {
     // warning, and the second entry's id is reached (ascending → none).
     let body = meta_with_iprp_ipma(&ipma_v0(true, &[(1, 1), (2, 1)]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(
       m.warning(),
       None,
@@ -4359,7 +4914,8 @@ mod tests {
     // the cursor landed on the real second id, not mid-association.
     let body2 = meta_with_iprp_ipma(&ipma_v0(true, &[(5, 1), (3, 1)]));
     let mut m2 = HeifMeta::new();
-    walk_heif_meta(&body2, 0, 4, &mut m2);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body2, 0, 4, &mut m2, &mut iloc_budget);
     assert_eq!(
       m2.warning(),
       Some("Item property association entries are out of order")
@@ -4373,11 +4929,13 @@ mod tests {
     // `out.items()` so a `meta` body reusing an id already present
     // overwrites that slot rather than appending a duplicate.
     let mut m = HeifMeta::new();
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
     walk_heif_meta(
       &meta_inner(&iinf_v0(&[infe_v0(2, b"orig", b"image/heic")])),
       0,
       4,
       &mut m,
+      &mut iloc_budget,
     );
     assert_eq!(m.items().len(), 1);
     // Second standalone call into the SAME HeifMeta, same id 2.
@@ -4386,6 +4944,7 @@ mod tests {
       0,
       4,
       &mut m,
+      &mut iloc_budget,
     );
     assert_eq!(m.items().len(), 1, "reused id overwrites the seeded slot");
     assert_eq!(m.items()[0].name(), Some("updated"));
@@ -4412,7 +4971,8 @@ mod tests {
       infe_v0(1, b"", b""), // empty Name → clears
     ]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1);
     assert_eq!(
       m.items()[0].name(),
@@ -4437,7 +4997,8 @@ mod tests {
     mime.extend_from_slice(b"application/rdf+xml\0"); // ContentType
     let body = meta_inner(&iinf_v0(&[mime, infe_v2(5, b"Exif", b"exif")]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1);
     let it = &m.items()[0];
     assert_eq!(it.item_type(), Some("Exif"), "later Exif Type wins");
@@ -4469,7 +5030,8 @@ mod tests {
     second.extend_from_slice(b"\0"); // EMPTY ContentType → clears
     let body = meta_inner(&iinf_v0(&[first, second]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1);
     assert_eq!(
       m.items()[0].content_type(),
@@ -4489,7 +5051,8 @@ mod tests {
       infe_v0(3, b"renamed", b""),
     ]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1);
     let it = &m.items()[0];
     assert_eq!(
@@ -4541,7 +5104,8 @@ mod tests {
       infe_v4(b"av01", b"b"),
     ]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(
       m.warning(),
       Some("Item info entries are out of order"),
@@ -4565,7 +5129,8 @@ mod tests {
       infe_v2(5, b"\xff\xfe\xfd\xfc", b"b"),
     ]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1, "same id = one slot");
     assert_eq!(
       m.items()[0].item_type(),
@@ -4590,7 +5155,8 @@ mod tests {
       infe_v2(5, b"hvc1", b"\xff\xfe"),
     ]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1, "same id = one slot");
     assert_eq!(
       m.items()[0].name(),
@@ -4721,7 +5287,8 @@ mod tests {
     second.extend_from_slice(b"image/heic"); // ContentType, NO NUL → EOF
     let body = meta_inner(&iinf_v0(&[first, second]));
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1, "same id = one slot");
     assert_eq!(
       m.items()[0].content_type(),
@@ -4862,7 +5429,8 @@ mod tests {
     body.extend(box_bytes(b"iinf", &iinf_body));
 
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1, "same id collapses to one slot");
     let it = &m.items()[0];
     assert_eq!(it.id(), 1);
@@ -4955,7 +5523,8 @@ mod tests {
     body.extend(box_bytes(b"iloc", &iloc_body));
 
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1, "one merged slot");
     let it = &m.items()[0];
     assert_eq!(it.id(), 3);
@@ -4999,7 +5568,8 @@ mod tests {
     body.extend(box_bytes(b"iinf", &iinf_body));
 
     let mut m = HeifMeta::new();
-    walk_heif_meta(&body, 0, 4, &mut m);
+    let mut iloc_budget = MAX_ILOC_EXTENTS;
+    walk_heif_meta(&body, 0, 4, &mut m, &mut iloc_budget);
     assert_eq!(m.items().len(), 1);
     let it = &m.items()[0];
     assert_eq!(it.id(), 4);

@@ -1317,7 +1317,8 @@ fn heif_primary_change_across_meta_boxes_keeps_main_doc_dims() {
   body1.extend(box_bytes(b"iprp", &iprp1));
 
   let mut m = HeifMeta::new();
-  walk_heif_meta(&body1, 0, 4, &mut m);
+  let mut iloc_budget = u64::MAX;
+  walk_heif_meta(&body1, 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(m.primary_item(), Some(2));
   assert_eq!(m.image_width(), Some(640));
   assert_eq!(m.image_height(), Some(480));
@@ -1345,7 +1346,7 @@ fn heif_primary_change_across_meta_boxes_keeps_main_doc_dims() {
   body2.extend(box_bytes(b"pitm", &pitm2));
   body2.extend(box_bytes(b"iprp", &iprp2));
 
-  walk_heif_meta(&body2, 0, 4, &mut m);
+  walk_heif_meta(&body2, 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(m.primary_item(), Some(9), "pitm overwrote the primary");
   assert_eq!(
     m.image_width(),
@@ -1399,10 +1400,11 @@ fn heif_two_meta_primary_ispe_overrides() {
   };
 
   let mut m = HeifMeta::new();
-  walk_heif_meta(&meta_body(2, 640, 480, 2), 0, 4, &mut m);
+  let mut iloc_budget = u64::MAX;
+  walk_heif_meta(&meta_body(2, 640, 480, 2), 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(m.image_width(), Some(640));
   // Pass 2: ispe(11x22) associated with the NEW primary 9 ⇒ overrides.
-  walk_heif_meta(&meta_body(9, 11, 22, 9), 0, 4, &mut m);
+  walk_heif_meta(&meta_body(9, 11, 22, 9), 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(m.primary_item(), Some(9));
   assert_eq!(
     m.image_width(),
@@ -1660,7 +1662,8 @@ fn heif_unrelated_later_meta_does_not_erase_dims() {
   body1.extend(box_bytes(b"iprp", &iprp1));
 
   let mut m = HeifMeta::new();
-  walk_heif_meta(&body1, 0, 4, &mut m);
+  let mut iloc_budget = u64::MAX;
+  walk_heif_meta(&body1, 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(m.image_width(), Some(640));
   assert_eq!(m.image_height(), Some(480));
 
@@ -1671,7 +1674,7 @@ fn heif_unrelated_later_meta_does_not_erase_dims() {
   body2.extend_from_slice(&[0, 0, 0, 0]);
   body2.extend(box_bytes(b"hdlr", &[0u8; 24]));
 
-  walk_heif_meta(&body2, 0, 4, &mut m);
+  walk_heif_meta(&body2, 0, 4, &mut m, &mut iloc_budget);
   assert_eq!(
     m.image_width(),
     Some(640),
