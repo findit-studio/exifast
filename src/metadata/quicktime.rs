@@ -124,6 +124,227 @@ impl HandlerKind {
   }
 }
 
+/// A `colr` `ColorRepresentation` sub-atom decoded via the
+/// `%QuickTime::ColorRep` ProcessBinaryData table (QuickTime.pm:3106). The
+/// `colr` box body begins with a 4-byte color-type 4cc (`ColorProfiles`); for
+/// the `nclx`/`nclc` types the CICP coding-independent code points follow. The
+/// `prof`/`rICC` types carry an ICC profile instead, so only `ColorProfiles`
+/// is populated for them (the int16u fields stay `None` — their bytes are an
+/// ICC blob, not CICP enums). `VideoFullRangeFlag` exists for `nclx` only (it
+/// is the trailing range byte the `nclc` layout lacks); a short box leaves it
+/// `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorRepresentation {
+  /// `ColorProfiles` (offset 0, `undef[4]`): the color-type 4cc — `nclx`,
+  /// `nclc`, `prof`, or `rICC` (QuickTime.pm:3110). Emitted verbatim in both
+  /// modes (no PrintConv). Drives `Track<N>:ColorProfiles`.
+  color_profiles: Option<String>,
+  /// `ColorPrimaries` (offset 4, `int16u`): the CICP colour-primaries index
+  /// (QuickTime.pm:3111). `Some` only for `nclx`/`nclc`. The `%QuickTime::ColorRep`
+  /// PrintConv maps the value at `-j`; the raw int rides at `-n`.
+  color_primaries: Option<u16>,
+  /// `TransferCharacteristics` (offset 6, `int16u`): the CICP transfer-function
+  /// index (QuickTime.pm:3130). `Some` only for `nclx`/`nclc`.
+  transfer_characteristics: Option<u16>,
+  /// `MatrixCoefficients` (offset 8, `int16u`): the CICP matrix-coefficients
+  /// index (QuickTime.pm:3153). `Some` only for `nclx`/`nclc`.
+  matrix_coefficients: Option<u16>,
+  /// `VideoFullRangeFlag` (offset 10, `Mask => 0x80`): the `nclx` full-range
+  /// bit — `(byte >> 7) & 1` (QuickTime.pm:3175). PrintConv `0 => Limited`,
+  /// `1 => Full`. `None` for `nclc` (no range byte) or a short box.
+  video_full_range_flag: Option<u8>,
+}
+
+impl ColorRepresentation {
+  /// An empty color representation (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      color_profiles: None,
+      color_primaries: None,
+      transfer_characteristics: None,
+      matrix_coefficients: None,
+      video_full_range_flag: None,
+    }
+  }
+
+  /// `ColorProfiles` — the color-type 4cc.
+  #[inline(always)]
+  #[must_use]
+  pub fn color_profiles(&self) -> Option<&str> {
+    self.color_profiles.as_deref()
+  }
+
+  /// `ColorPrimaries` (CICP index, `nclx`/`nclc` only).
+  #[inline(always)]
+  #[must_use]
+  pub const fn color_primaries(&self) -> Option<u16> {
+    self.color_primaries
+  }
+
+  /// `TransferCharacteristics` (CICP index, `nclx`/`nclc` only).
+  #[inline(always)]
+  #[must_use]
+  pub const fn transfer_characteristics(&self) -> Option<u16> {
+    self.transfer_characteristics
+  }
+
+  /// `MatrixCoefficients` (CICP index, `nclx`/`nclc` only).
+  #[inline(always)]
+  #[must_use]
+  pub const fn matrix_coefficients(&self) -> Option<u16> {
+    self.matrix_coefficients
+  }
+
+  /// `VideoFullRangeFlag` (`nclx` only): the post-`Mask` `0` / `1` bit.
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_full_range_flag(&self) -> Option<u8> {
+    self.video_full_range_flag
+  }
+
+  /// Set `ColorProfiles`.
+  #[inline(always)]
+  pub fn set_color_profiles(&mut self, v: Option<String>) -> &mut Self {
+    self.color_profiles = v;
+    self
+  }
+
+  /// Set `ColorPrimaries`.
+  #[inline(always)]
+  pub const fn set_color_primaries(&mut self, v: Option<u16>) -> &mut Self {
+    self.color_primaries = v;
+    self
+  }
+
+  /// Set `TransferCharacteristics`.
+  #[inline(always)]
+  pub const fn set_transfer_characteristics(&mut self, v: Option<u16>) -> &mut Self {
+    self.transfer_characteristics = v;
+    self
+  }
+
+  /// Set `MatrixCoefficients`.
+  #[inline(always)]
+  pub const fn set_matrix_coefficients(&mut self, v: Option<u16>) -> &mut Self {
+    self.matrix_coefficients = v;
+    self
+  }
+
+  /// Set `VideoFullRangeFlag`.
+  #[inline(always)]
+  pub const fn set_video_full_range_flag(&mut self, v: Option<u8>) -> &mut Self {
+    self.video_full_range_flag = v;
+    self
+  }
+}
+
+impl Default for ColorRepresentation {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// A `btrt` `BitrateInfo` sub-atom decoded via the `%QuickTime::Bitrate`
+/// ProcessBinaryData table (QuickTime.pm:1158). Three big-endian `int32u`
+/// fields. The table carries `PRIORITY => 0` ("often filled with zeros"), so
+/// the emitter marks these tags `Priority => 0` — a duplicate never overrides
+/// (the first-extracted wins). Found as a child atom of BOTH the `vide` and the
+/// `soun` sample description (`avc1`/`mp4a` both nest a `btrt`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bitrate {
+  /// `BufferSize` (offset 0, `int32u`, QuickTime.pm:1163).
+  buffer_size: Option<u32>,
+  /// `MaxBitrate` (offset 4, `int32u`, QuickTime.pm:1164).
+  max_bitrate: Option<u32>,
+  /// `AverageBitrate` (offset 8, `int32u`, QuickTime.pm:1165).
+  average_bitrate: Option<u32>,
+}
+
+impl Bitrate {
+  /// An empty bitrate record (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      buffer_size: None,
+      max_bitrate: None,
+      average_bitrate: None,
+    }
+  }
+
+  /// `BufferSize`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn buffer_size(&self) -> Option<u32> {
+    self.buffer_size
+  }
+
+  /// `MaxBitrate`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn max_bitrate(&self) -> Option<u32> {
+    self.max_bitrate
+  }
+
+  /// `AverageBitrate`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn average_bitrate(&self) -> Option<u32> {
+    self.average_bitrate
+  }
+
+  /// Set `BufferSize`.
+  #[inline(always)]
+  pub const fn set_buffer_size(&mut self, v: Option<u32>) -> &mut Self {
+    self.buffer_size = v;
+    self
+  }
+
+  /// Set `MaxBitrate`.
+  #[inline(always)]
+  pub const fn set_max_bitrate(&mut self, v: Option<u32>) -> &mut Self {
+    self.max_bitrate = v;
+    self
+  }
+
+  /// Set `AverageBitrate`.
+  #[inline(always)]
+  pub const fn set_average_bitrate(&mut self, v: Option<u32>) -> &mut Self {
+    self.average_bitrate = v;
+    self
+  }
+
+  /// Fold a later `btrt`'s fields into `self` with ExifTool `%QuickTime::Bitrate`
+  /// `PRIORITY => 0` per-FIELD first-wins semantics (QuickTime.pm:1162): an
+  /// already-present `BufferSize`/`MaxBitrate`/`AverageBitrate` is NEVER replaced
+  /// (the existing slot is promoted to priority 1 at ExifTool.pm:9547, so the new
+  /// priority-0 value's `>=` test fails), and a `None` field is filled from
+  /// `other`. A present value of `0` still counts as present and wins — so a
+  /// later zero-filled `btrt` does not overwrite an earlier non-zero field.
+  #[inline]
+  pub const fn merge_priority0(&mut self, other: &Self) {
+    if self.buffer_size.is_none() {
+      self.buffer_size = other.buffer_size;
+    }
+    if self.max_bitrate.is_none() {
+      self.max_bitrate = other.max_bitrate;
+    }
+    if self.average_bitrate.is_none() {
+      self.average_bitrate = other.average_bitrate;
+    }
+  }
+}
+
+impl Default for Bitrate {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// A `vide`-track `stsd` Visual Sample Description (ExifTool
 /// `%QuickTime::VisualSampleDesc`, QuickTime.pm:7585). The codec-identity
 /// fields decoded by [`crate::formats::quicktime`] via the `ProcessHybrid`
@@ -158,6 +379,18 @@ pub struct VisualSampleDesc {
   compressor_name: Option<String>,
   /// `BitDepth` (key 41 ⇒ byte 82, `int16u`).
   bit_depth: Option<u16>,
+  /// The `colr` `ColorRepresentation` child atom (QuickTime.pm:7670), decoded
+  /// after the fixed visual fields at the `ProcessHybrid` child-atom offset.
+  /// `None` when the entry carries no `colr`.
+  color_rep: Option<ColorRepresentation>,
+  /// The `pasp` `PixelAspectRatio` child atom (QuickTime.pm:7675): the
+  /// `join(":", unpack("N*", $val))` ValueConv result — two big-endian `int32u`
+  /// joined by a colon (e.g. `"1:1"`), stored verbatim (mode-invariant).
+  /// `None` when the entry carries no `pasp`.
+  pixel_aspect_ratio: Option<String>,
+  /// The `btrt` `BitrateInfo` child atom (QuickTime.pm:7574), a `PRIORITY => 0`
+  /// table. `None` when the entry carries no `btrt`.
+  bitrate: Option<Bitrate>,
 }
 
 impl VisualSampleDesc {
@@ -174,6 +407,9 @@ impl VisualSampleDesc {
       y_resolution: None,
       compressor_name: None,
       bit_depth: None,
+      color_rep: None,
+      pixel_aspect_ratio: None,
+      bitrate: None,
     }
   }
 
@@ -233,6 +469,27 @@ impl VisualSampleDesc {
     self.bit_depth
   }
 
+  /// The `colr` `ColorRepresentation` child atom.
+  #[inline(always)]
+  #[must_use]
+  pub const fn color_rep(&self) -> Option<&ColorRepresentation> {
+    self.color_rep.as_ref()
+  }
+
+  /// The `pasp` `PixelAspectRatio` (the colon-joined `int32u` pair).
+  #[inline(always)]
+  #[must_use]
+  pub fn pixel_aspect_ratio(&self) -> Option<&str> {
+    self.pixel_aspect_ratio.as_deref()
+  }
+
+  /// The `btrt` `BitrateInfo` child atom.
+  #[inline(always)]
+  #[must_use]
+  pub const fn bitrate(&self) -> Option<&Bitrate> {
+    self.bitrate.as_ref()
+  }
+
   /// Set `CompressorID`.
   #[inline(always)]
   pub fn set_compressor_id(&mut self, v: Option<String>) -> &mut Self {
@@ -289,12 +546,52 @@ impl VisualSampleDesc {
     self
   }
 
+  /// Set the `colr` `ColorRepresentation`.
+  #[inline(always)]
+  pub fn set_color_rep(&mut self, v: Option<ColorRepresentation>) -> &mut Self {
+    self.color_rep = v;
+    self
+  }
+
+  /// Set the `pasp` `PixelAspectRatio` (the colon-joined `int32u` pair).
+  #[inline(always)]
+  pub fn set_pixel_aspect_ratio(&mut self, v: Option<String>) -> &mut Self {
+    self.pixel_aspect_ratio = v;
+    self
+  }
+
+  /// Set the `btrt` `BitrateInfo`.
+  #[inline(always)]
+  pub fn set_bitrate(&mut self, v: Option<Bitrate>) -> &mut Self {
+    self.bitrate = v;
+    self
+  }
+
+  /// Fold a decoded `btrt` [`Bitrate`] into this descriptor's bitrate slot with
+  /// `%QuickTime::Bitrate` `PRIORITY => 0` per-field first-wins semantics: the
+  /// FIRST `btrt` seen establishes each field and a later (or zero-filled)
+  /// `btrt` fills ONLY a still-`None` field, never overwriting a present one
+  /// (see [`Bitrate::merge_priority0`]). Used for a REPEATED `btrt` inside one
+  /// `stsd` entry.
+  #[inline]
+  pub fn fold_bitrate_priority0(&mut self, incoming: Bitrate) {
+    match &mut self.bitrate {
+      Some(existing) => existing.merge_priority0(&incoming),
+      None => self.bitrate = Some(incoming),
+    }
+  }
+
   /// Fold a later `stsd` entry's Visual Sample Description into `self` with
   /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics: each field set
   /// (`Some`) in `other` overrides the prior value, while a field absent
   /// (`None`) in `other` leaves the earlier value intact. ExifTool re-runs
   /// `ProcessBinaryData` per entry, so a later entry's present tag overwrites
   /// the FoundTag and an absent one never erases it (QuickTime.pm:9640-9648).
+  ///
+  /// **`bitrate` is the exception** — `%QuickTime::Bitrate` is `PRIORITY => 0`,
+  /// so its `BufferSize`/`MaxBitrate`/`AverageBitrate` are first-extracted-wins
+  /// PER FIELD (QuickTime.pm:1162): a later entry's `btrt` fills only fields the
+  /// earlier entries left `None`, and never replaces a present one (even `0`).
   #[inline]
   pub fn merge_from(&mut self, other: Self) {
     if other.compressor_id.is_some() {
@@ -320,6 +617,17 @@ impl VisualSampleDesc {
     }
     if other.bit_depth.is_some() {
       self.bit_depth = other.bit_depth;
+    }
+    if other.color_rep.is_some() {
+      self.color_rep = other.color_rep;
+    }
+    if other.pixel_aspect_ratio.is_some() {
+      self.pixel_aspect_ratio = other.pixel_aspect_ratio;
+    }
+    // `btrt` is PRIORITY 0 (per-field first-wins), NOT last-wins like the
+    // fields above: fill only fields earlier entries left `None`.
+    if let Some(other_bitrate) = other.bitrate {
+      self.fold_bitrate_priority0(other_bitrate);
     }
   }
 }
@@ -360,6 +668,12 @@ pub struct AudioSampleDesc {
   /// `AudioSampleRate` (key 32 ⇒ byte 32, `fixed32u`): the rounded 16.16
   /// fixed-point sample rate (`GetFixed32u`).
   sample_rate: Option<f64>,
+  /// The `btrt` `BitrateInfo` child atom (QuickTime.pm:7574), decoded after the
+  /// fixed audio fields at the `ProcessHybrid` child-atom offset. The
+  /// `%QuickTime::AudioSampleDesc` table lists `btrt` (but NOT `colr`/`pasp`),
+  /// so an `mp4a` descriptor's `btrt` surfaces here. `PRIORITY => 0`. `None`
+  /// when the entry carries no `btrt`.
+  bitrate: Option<Bitrate>,
 }
 
 impl AudioSampleDesc {
@@ -373,6 +687,7 @@ impl AudioSampleDesc {
       channels: None,
       bits_per_sample: None,
       sample_rate: None,
+      bitrate: None,
     }
   }
 
@@ -412,6 +727,13 @@ impl AudioSampleDesc {
     self.sample_rate
   }
 
+  /// The `btrt` `BitrateInfo` child atom.
+  #[inline(always)]
+  #[must_use]
+  pub const fn bitrate(&self) -> Option<&Bitrate> {
+    self.bitrate.as_ref()
+  }
+
   /// Set `AudioFormat`.
   #[inline(always)]
   pub fn set_audio_format(&mut self, v: Option<String>) -> &mut Self {
@@ -447,10 +769,31 @@ impl AudioSampleDesc {
     self
   }
 
+  /// Set the `btrt` `BitrateInfo`.
+  #[inline(always)]
+  pub fn set_bitrate(&mut self, v: Option<Bitrate>) -> &mut Self {
+    self.bitrate = v;
+    self
+  }
+
+  /// Fold a decoded `btrt` [`Bitrate`] into this descriptor's bitrate slot with
+  /// `%QuickTime::Bitrate` `PRIORITY => 0` per-field first-wins semantics (see
+  /// [`VisualSampleDesc::fold_bitrate_priority0`]). Used for a REPEATED `btrt`
+  /// inside one `stsd` entry.
+  #[inline]
+  pub fn fold_bitrate_priority0(&mut self, incoming: Bitrate) {
+    match &mut self.bitrate {
+      Some(existing) => existing.merge_priority0(&incoming),
+      None => self.bitrate = Some(incoming),
+    }
+  }
+
   /// Fold a later `stsd` entry's Audio Sample Description into `self` with
   /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics (see
   /// [`VisualSampleDesc::merge_from`]): a `Some` field in `other` overrides,
-  /// a `None` field leaves the earlier value (QuickTime.pm:9640-9648).
+  /// a `None` field leaves the earlier value (QuickTime.pm:9640-9648). The
+  /// `bitrate` field is the PRIORITY-0 exception — per-field first-wins, never
+  /// overwriting a present field (QuickTime.pm:1162).
   #[inline]
   pub fn merge_from(&mut self, other: Self) {
     if other.audio_format.is_some() {
@@ -467,6 +810,10 @@ impl AudioSampleDesc {
     }
     if other.sample_rate.is_some() {
       self.sample_rate = other.sample_rate;
+    }
+    // `btrt` is PRIORITY 0 (per-field first-wins), NOT last-wins.
+    if let Some(other_bitrate) = other.bitrate {
+      self.fold_bitrate_priority0(other_bitrate);
     }
   }
 }

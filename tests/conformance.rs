@@ -1330,14 +1330,19 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   // (cf. #211), and only the two standard goldens are needed.
   //
   // exifast emits a clean SUBSET of the bundled tags (zero extra). The QuickTime
-  // container phase-1 port (#100) now decodes the `hdlr` HandlerDescription and
-  // the `vide`/`soun`/other `stsd` sample-description, so the retained set
-  // includes per-track `HandlerDescription`, the `vide` `CompressorID`/
-  // `SourceImageWidth`/`SourceImageHeight`/`XResolution`/`YResolution`/
-  // `CompressorName`/`BitDepth`, the `soun` `Balance`/`AudioFormat`/
-  // `AudioChannels`/`AudioBitsPerSample`/`AudioSampleRate`, and the `tmcd`
-  // `OtherFormat`. The still-deferred tags, excluded via `tools/gen_golden.sh
-  // EXCLUDE` (`-x` is ExifTool TRUTH; we defer the unported, never edit a value):
+  // container phase-1 port (#100) decodes the `hdlr` HandlerDescription and the
+  // `vide`/`soun`/other `stsd` sample-description fixed fields; the phase-2 port
+  // adds the `stsd`-entry `colr`/`pasp`/`btrt` CHILD atoms (the `ProcessHybrid`
+  // child-atom walk). So the retained set includes per-track `HandlerDescription`,
+  // the `vide` `CompressorID`/`SourceImageWidth`/`SourceImageHeight`/
+  // `XResolution`/`YResolution`/`CompressorName`/`BitDepth`, the `colr`
+  // `ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/`MatrixCoefficients`/
+  // `VideoFullRangeFlag` (the CICP enums), the `pasp` `PixelAspectRatio`, the
+  // `btrt` `BufferSize`/`MaxBitrate`/`AverageBitrate` (`PRIORITY => 0`), the `soun`
+  // `Balance`/`AudioFormat`/`AudioChannels`/`AudioBitsPerSample`/`AudioSampleRate`
+  // (plus the `soun` `btrt`), and the `tmcd` `OtherFormat`. The still-deferred
+  // tags, excluded via `tools/gen_golden.sh EXCLUDE` (`-x` is ExifTool TRUTH; we
+  // defer the unported, never edit a value):
   //   - `System:all`/`Composite:all` — filesystem + the deferred QuickTime
   //     Composite subsystem (incl. the `LocationInformation`-derived
   //     `GPSLatitude`/`Longitude`/`Position`), matching the `.mov` goldens;
@@ -1347,13 +1352,9 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   //     `udta/hdlr` `mdir`/`appl`), family-1-scoped so the per-track
   //     `Track<N>:HandlerType`/`HandlerDescription` the port DOES emit is
   //     retained;
-  //   - the deferred per-track minf/stbl detail the phase-1 port does NOT walk:
-  //     the `vmhd` `GraphicsMode`/`OpColor`, the `colr` color tags
-  //     (`ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/
-  //     `MatrixCoefficients`/`VideoFullRangeFlag`), `pasp` `PixelAspectRatio`,
-  //     the `btrt` `BufferSize`/`MaxBitrate`/`AverageBitrate`, the `stts`
-  //     `VideoFrameRate`, the `tref` `TimecodeTrack`, and the `tmcd`
-  //     `PlaybackFrameRate`.
+  //   - the deferred per-track minf/stbl detail the port does NOT yet walk:
+  //     the `vmhd` `GraphicsMode`/`OpColor`, the `stts` `VideoFrameRate`, the
+  //     `tref` `TimecodeTrack`, and the `tmcd` `PlaybackFrameRate`.
   // The retained set is byte-exact vs the bundled `perl exiftool 13.59 -j -G1
   // -struct -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
   check(

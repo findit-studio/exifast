@@ -59,9 +59,9 @@ use crate::{
     insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
   },
   metadata::{
-    AudioSampleDesc, CammMeta, CanonCtmdMeta, DjiProtobufMeta, GoProConv, GoProMeta, GoProTag,
-    GoProTagValue, Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
-    QuickTimeStreamMeta, SonyRtmdMeta, VisualSampleDesc,
+    AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
+    GoProConv, GoProMeta, GoProTag, GoProTagValue, Insta360Meta, LigoGpsMeta, MediaTrack,
+    ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -1221,6 +1221,150 @@ fn vendor_id_print(code: &str) -> &'static str {
   }
 }
 
+/// The `%QuickTime::ColorRep` `ColorPrimaries` PrintConv (QuickTime.pm:3111-
+/// 3124): the CICP colour-primaries enum. A hash miss returns `None` (the
+/// caller renders ExifTool's `Unknown ($val)`).
+fn color_primaries_print(v: u16) -> Option<&'static str> {
+  Some(match v {
+    1 => "BT.709",
+    2 => "Unspecified",
+    4 => "BT.470 System M (historical)",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240",
+    8 => "Generic film (color filters using illuminant C)",
+    9 => "BT.2020, BT.2100",
+    10 => "SMPTE 428 (CIE 1931 XYZ)",
+    11 => "SMPTE RP 431-2",
+    12 => "SMPTE EG 432-1",
+    22 => "EBU Tech. 3213-E",
+    _ => return None,
+  })
+}
+
+/// The `%QuickTime::ColorRep` `TransferCharacteristics` PrintConv
+/// (QuickTime.pm:3130-3150): the CICP transfer-function enum.
+fn transfer_characteristics_print(v: u16) -> Option<&'static str> {
+  Some(match v {
+    0 => "For future use (0)",
+    1 => "BT.709",
+    2 => "Unspecified",
+    3 => "For future use (3)",
+    4 => "BT.470 System M (historical)",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240 M",
+    8 => "Linear",
+    9 => "Logarithmic (100 : 1 range)",
+    10 => "Logarithmic (100 * Sqrt(10) : 1 range)",
+    11 => "IEC 61966-2-4",
+    12 => "BT.1361",
+    13 => "sRGB or sYCC",
+    14 => "BT.2020 10-bit systems",
+    15 => "BT.2020 12-bit systems",
+    16 => "SMPTE ST 2084, ITU BT.2100 PQ",
+    17 => "SMPTE ST 428",
+    18 => "BT.2100 HLG, ARIB STD-B67",
+    _ => return None,
+  })
+}
+
+/// The `%QuickTime::ColorRep` `MatrixCoefficients` PrintConv
+/// (QuickTime.pm:3153-3170): the CICP matrix-coefficients enum.
+fn matrix_coefficients_print(v: u16) -> Option<&'static str> {
+  Some(match v {
+    0 => "Identity matrix",
+    1 => "BT.709",
+    2 => "Unspecified",
+    3 => "For future use (3)",
+    4 => "US FCC 73.628",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240 M",
+    8 => "YCgCo",
+    9 => "BT.2020 non-constant luminance, BT.2100 YCbCr",
+    10 => "BT.2020 constant luminance",
+    11 => "SMPTE ST 2085 YDzDx",
+    12 => "Chromaticity-derived non-constant luminance",
+    13 => "Chromaticity-derived constant luminance",
+    14 => "BT.2100 ICtCp",
+    _ => return None,
+  })
+}
+
+/// Render a `%QuickTime::ColorRep` CICP `int16u` field for `print_conv`: the
+/// PrintConv label (via `lookup`) at `-j`, the ExifTool `Unknown ($val)`
+/// fallback on a hash miss, and the bare raw int at `-n`. Mirrors the
+/// `vendor_id_print` rendering convention used elsewhere in this emitter.
+fn cicp_value(
+  v: u16,
+  print_conv: bool,
+  lookup: fn(u16) -> Option<&'static str>,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    match lookup(v) {
+      Some(s) => TagValue::Str(s.into()),
+      None => TagValue::Str(std::format!("Unknown ({v})").into()),
+    }
+  } else {
+    TagValue::U64(u64::from(v))
+  }
+}
+
+/// Emit a `btrt` [`Bitrate`]'s three `int32u` fields (`BufferSize`/`MaxBitrate`/
+/// `AverageBitrate`) into `tags` under the track's family-1 group, in the
+/// `%QuickTime::Bitrate` field order. The table is `PRIORITY => 0` ("often
+/// filled with zeros"), so each tag is pushed with
+/// [`EmittedTag::new_with_priority`](crate::emit::EmittedTag::new_with_priority)
+/// at priority `0`: a duplicate never overrides at the `TagMap` sink, keeping
+/// the first-extracted value (`ExifTool.pm:9544-9560`). `first_seen` gives the
+/// same first-wins within this per-track walk. Shared by the `vide` and `soun`
+/// sample-description emission (both nest a `btrt`).
+fn emit_bitrate(
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+  track_group: &impl Fn() -> crate::value::Group,
+  first_seen: &mut impl FnMut(&str, &str) -> bool,
+  grp: &str,
+  bt: &Bitrate,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  if let Some(bs) = bt.buffer_size()
+    && first_seen(grp, "BufferSize")
+  {
+    tags.push(EmittedTag::new_with_priority(
+      track_group(),
+      "BufferSize".into(),
+      TagValue::U64(u64::from(bs)),
+      false,
+      0,
+    ));
+  }
+  if let Some(mb) = bt.max_bitrate()
+    && first_seen(grp, "MaxBitrate")
+  {
+    tags.push(EmittedTag::new_with_priority(
+      track_group(),
+      "MaxBitrate".into(),
+      TagValue::U64(u64::from(mb)),
+      false,
+      0,
+    ));
+  }
+  if let Some(ab) = bt.average_bitrate()
+    && first_seen(grp, "AverageBitrate")
+  {
+    tags.push(EmittedTag::new_with_priority(
+      track_group(),
+      "AverageBitrate".into(),
+      TagValue::U64(u64::from(ab)),
+      false,
+      0,
+    ));
+  }
+}
+
 /// `MediaLanguageCode` ValueConv (QuickTime.pm:7280): a 16-bit code that is
 /// either a Macintosh language id (`< 0x400` or `0x7fff`) or a packed ISO
 /// 639-2 three-letter code (three 5-bit groups, each offset by `0x60`).
@@ -1749,8 +1893,12 @@ fn decode_hdlr_class(payload: &[u8]) -> Option<String> {
 /// to ExifTool `ProcessSampleDesc`'s per-entry loop (QuickTime.pm:9640-9648).
 /// The `stsd` body is `[version+flags:4][entry-count:4]` then each entry
 /// `[size:4][format:4][reserved:6][data-ref-index:2]` + child atoms. `f`
-/// receives the FULL entry slice (`[size:4]`-relative, so the format 4cc is at
-/// entry offset 4); the per-handler decoders index entry-relative offsets.
+/// receives the entry's `dir_start` (its byte offset within the `stsd` box body,
+/// 8 for the first entry — the `$$dirInfo{DirStart}` ExifTool's ProcessSampleDesc
+/// sets at QuickTime.pm:9645) and the FULL entry slice (`[size:4]`-relative, so
+/// the format 4cc is at entry offset 4); the per-handler decoders index
+/// entry-relative offsets and use `dir_start` for the absolute ProcessHybrid
+/// fixed-field cutoff.
 ///
 /// Bounds (the SINGLE source of truth shared by [`decode_stsd_meta_format`] and
 /// the visual/audio sample-description decoders): stop on a missing `size`
@@ -1758,7 +1906,7 @@ fn decode_hdlr_class(payload: &[u8]) -> Option<String> {
 /// giant size breaks rather than wrapping/panicking), on `size < 8` (an entry
 /// needs at least its `[size:4][format:4]` header), or on an entry that
 /// overruns the box (QuickTime.pm:9641-9643 `$pos + $size > $dirLen`).
-fn for_each_stsd_entry(payload: &[u8], mut f: impl FnMut(&[u8])) {
+fn for_each_stsd_entry(payload: &[u8], mut f: impl FnMut(usize, &[u8])) {
   let Some(count) = be_u32(payload, 4).map(|c| c as usize) else {
     return;
   };
@@ -1774,7 +1922,7 @@ fn for_each_stsd_entry(payload: &[u8], mut f: impl FnMut(&[u8])) {
       break;
     }
     if let Some(entry) = payload.get(pos..entry_end) {
-      f(entry);
+      f(pos, entry);
     }
     pos = entry_end;
   }
@@ -1790,7 +1938,7 @@ fn for_each_stsd_entry(payload: &[u8], mut f: impl FnMut(&[u8])) {
 /// malformed.
 fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
   let mut last: Option<String> = None;
-  for_each_stsd_entry(payload, |entry| {
+  for_each_stsd_entry(payload, |_dir_start, entry| {
     if let Some(raw) = entry.get(4..8) {
       last = Some(String::from_utf8_lossy(raw).into_owned());
     }
@@ -1883,41 +2031,89 @@ fn decode_hdlr_description(payload: &[u8]) -> Option<String> {
 /// relative to the sample entry start (the `[size:4]` field), so CompressorID
 /// (key 2 ⇒ byte 4) IS the format 4cc. A field whose offset overruns the entry
 /// is left `None` (ExifTool stops at `$entry >= $size`). The caller folds every
-/// entry with [`VisualSampleDesc::merge_from`] (per-tag last-wins). Child atoms
-/// (`btrt`/`colr`/`pasp`/`avcC`/…) are NOT walked (Phase 2/3).
-fn decode_visual_sample_desc(entry: &[u8]) -> VisualSampleDesc {
+/// entry with [`VisualSampleDesc::merge_from`] (per-tag last-wins). The
+/// `colr`/`pasp`/`btrt` child atoms are then walked via
+/// [`decode_visual_child_atoms`] (the other children — `avcC`/`clap`/`fiel`/… —
+/// are still deferred).
+fn decode_visual_sample_desc(entry: &[u8], dir_start: usize) -> VisualSampleDesc {
   let mut v = VisualSampleDesc::new();
+  // The ProcessHybrid child boundary, located ONCE and reused for the child-atom
+  // walk (no double scan).
+  let child_pos = find_hybrid_child_pos(entry);
+  // ExifTool's ProcessHybrid sets `$$dirInfo{DirLen} = $pos` (QuickTime.pm:9680)
+  // when a child boundary is found, where `$pos` is the child atom's ABSOLUTE
+  // position within the `stsd` box (`dir_start + childPos`, the entry's offset in
+  // the box plus the entry-relative boundary). ProcessBinaryData then reads a
+  // fixed field at entry-relative offset `entry` only while `entry < DirLen`
+  // (ExifTool.pm:9935-9966 `next if $entry >= $size` / `last if $more <= 0`). So
+  // the read limit applied to the per-field entry-relative offset is the absolute
+  // `dir_start + childPos`, NOT the entry-relative `childPos` alone. A field whose
+  // offset is at/beyond that cutoff is NOT decoded.
+  //
+  // FAITHFUL for the FIRST entry (`dir_start == 8`): the boundary chain ends at
+  // the entry end, so the minimal 8-byte child forces `childPos <= entry.len() -
+  // 8`, hence `cutoff = 8 + childPos <= entry.len()` and every read at offset
+  // `< cutoff` stays inside this entry slice (no byte-bleed). A crafted entry with
+  // an EARLY child boundary therefore omits the fixed fields past the cutoff
+  // (verified against bundled ExifTool 13.59 — see
+  // `walk_trak_vide_early_child_boundary_cuts_fixed_fields`). DEFERRED (#302): a
+  // 2nd+ entry has `dir_start > 8`, so a field whose offset is `< cutoff` but
+  // `>= entry.len()` would, in ExifTool, read into the NEXT entry's bytes
+  // (`substr($$dataPt, $entry + $dirStart, ...)` over the WHOLE box) — that
+  // cross-entry byte-bleed needs the whole `stsd` payload threaded, not this
+  // per-entry slice, and is left as a documented follow-up.
+  let within = |off: usize| child_pos.is_none_or(|cp| off < dir_start + cp);
   // CompressorID (key 2 ⇒ byte 4, string[4]): the codec 4cc, verbatim. The
   // `string[4]` would NUL-truncate, but a real 4cc has no NUL; keep the lossy
   // 4 chars to mirror ExifTool's `Get*`-then-string read.
-  if let Some(raw) = entry.get(4..8) {
+  if within(4)
+    && let Some(raw) = entry.get(4..8)
+  {
     v.set_compressor_id(Some(String::from_utf8_lossy(raw).into_owned()));
   }
   // VendorID (key 10 ⇒ byte 20, string[4], RawConv `length $val ? $val :
   // undef`): NUL-truncate then drop an empty (all-zero) value.
-  if let Some(raw) = entry.get(20..24) {
+  if within(20)
+    && let Some(raw) = entry.get(20..24)
+  {
     let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     if let Some(trimmed) = raw.get(..nul).filter(|t| !t.is_empty()) {
       v.set_vendor_id(Some(String::from_utf8_lossy(trimmed).into_owned()));
     }
   }
   // SourceImageWidth/Height (keys 16/17 ⇒ bytes 32/34, int16u).
-  v.set_source_image_width(be_u16(entry, 32));
-  v.set_source_image_height(be_u16(entry, 34));
+  if within(32) {
+    v.set_source_image_width(be_u16(entry, 32));
+  }
+  if within(34) {
+    v.set_source_image_height(be_u16(entry, 34));
+  }
   // XResolution/YResolution (keys 18/20 ⇒ bytes 36/40, fixed32u).
-  v.set_x_resolution(be_u32(entry, 36).map(get_fixed32u));
-  v.set_y_resolution(be_u32(entry, 40).map(get_fixed32u));
+  if within(36) {
+    v.set_x_resolution(be_u32(entry, 36).map(get_fixed32u));
+  }
+  if within(40) {
+    v.set_y_resolution(be_u32(entry, 40).map(get_fixed32u));
+  }
   // CompressorName (key 25 ⇒ byte 50, string[32]) through the Pascal/C-string
   // RawConv (ExifTool reads 32 bytes then NUL-truncates; the helper takes the
   // shorter of the slice and the NUL position).
-  if let Some(raw) = entry.get(50..) {
+  if within(50)
+    && let Some(raw) = entry.get(50..)
+  {
     // `string[32]` reads at most 32 bytes; the shared decoder truncates at the
     // first NUL within that window.
     let field = raw.get(..32).unwrap_or(raw);
     v.set_compressor_name(decode_qt_handler_string(field));
   }
   // BitDepth (key 41 ⇒ byte 82, int16u).
-  v.set_bit_depth(be_u16(entry, 82));
+  if within(82) {
+    v.set_bit_depth(be_u16(entry, 82));
+  }
+  // Child atoms (colr/pasp/btrt) after the fixed visual fields, at the
+  // `ProcessHybrid` boundary (QuickTime.pm:7585 PROCESS_PROC + 9660). Phase 2.
+  // The boundary located above is reused (not recomputed).
+  decode_visual_child_atoms(entry, child_pos, &mut v);
   v
 }
 
@@ -1926,14 +2122,28 @@ fn decode_visual_sample_desc(entry: &[u8]) -> VisualSampleDesc {
 /// `ProcessHybrid`; the table has no explicit `FORMAT`, so the default `int8u`
 /// ⇒ key `N` is byte `N`). `AudioFormat` (key 4 ⇒ byte 4) is the codec 4cc.
 /// The caller folds every entry with [`AudioSampleDesc::merge_from`] (per-tag
-/// last-wins). Child atoms (`wave`/`chan`/`esds`/`btrt`/…) are NOT walked
-/// (Phase 2/3).
-fn decode_audio_sample_desc(entry: &[u8]) -> AudioSampleDesc {
+/// last-wins). The `btrt` child atom is then walked via
+/// [`decode_audio_child_atoms`] (the other children — `wave`/`chan`/`esds`/… —
+/// are still deferred).
+fn decode_audio_sample_desc(entry: &[u8], dir_start: usize) -> AudioSampleDesc {
   let mut a = AudioSampleDesc::new();
+  // The ProcessHybrid child boundary, located ONCE and reused for the child walk
+  // (no double scan).
+  let child_pos = find_hybrid_child_pos(entry);
+  // Same absolute fixed-field cutoff as the visual decoder: ExifTool sets
+  // `$$dirInfo{DirLen} = $pos` = the child atom's ABSOLUTE box position
+  // (`dir_start + childPos`, QuickTime.pm:9680) and ProcessBinaryData reads a
+  // field at entry-relative offset `off` only while `off < DirLen`. FAITHFUL for
+  // the FIRST entry (`dir_start == 8`, `cutoff <= entry.len()`, no bleed);
+  // the 2nd+ entry cross-entry byte-bleed is DEFERRED (#302) — see the
+  // `decode_visual_sample_desc` note.
+  let within = |off: usize| child_pos.is_none_or(|cp| off < dir_start + cp);
   // AudioFormat (key 4 ⇒ byte 4, undef[4]): RawConv stashes `$$self{AudioFormat}`
   // and returns `undef` unless the 4cc matches `/^[\w ]{4}$/i`.
   let mut fmt: Option<String> = None;
-  if let Some(raw) = entry.get(4..8) {
+  if within(4)
+    && let Some(raw) = entry.get(4..8)
+  {
     let is_word_space = raw
       .iter()
       .all(|&b| b == b' ' || b == b'_' || b.is_ascii_alphanumeric());
@@ -1945,7 +2155,8 @@ fn decode_audio_sample_desc(entry: &[u8]) -> AudioSampleDesc {
   }
   // AudioVendorID (key 20 ⇒ byte 20, undef[4], Condition `AudioFormat ne
   // "mp4s"`, RawConv all-zero ⇒ undef): the shared `%vendorID` PrintConv.
-  if fmt.as_deref() != Some("mp4s")
+  if within(20)
+    && fmt.as_deref() != Some("mp4s")
     && let Some(raw) = entry.get(20..24)
     && raw != [0, 0, 0, 0]
   {
@@ -1953,11 +2164,257 @@ fn decode_audio_sample_desc(entry: &[u8]) -> AudioSampleDesc {
   }
   // AudioChannels (key 24 ⇒ byte 24, int16u), AudioBitsPerSample (key 26 ⇒ byte
   // 26, int16u) — emitted even when zero (no RawConv).
-  a.set_channels(be_u16(entry, 24));
-  a.set_bits_per_sample(be_u16(entry, 26));
+  if within(24) {
+    a.set_channels(be_u16(entry, 24));
+  }
+  if within(26) {
+    a.set_bits_per_sample(be_u16(entry, 26));
+  }
   // AudioSampleRate (key 32 ⇒ byte 32, fixed32u).
-  a.set_sample_rate(be_u32(entry, 32).map(get_fixed32u));
+  if within(32) {
+    a.set_sample_rate(be_u32(entry, 32).map(get_fixed32u));
+  }
+  // Child atoms after the fixed audio fields, at the `ProcessHybrid` boundary
+  // (QuickTime.pm:7498 PROCESS_PROC + 9660). The audio table lists `btrt` but
+  // NOT `colr`/`pasp`, so only `btrt` is decoded here. Phase 2. The boundary
+  // located above is reused (not recomputed).
+  decode_audio_child_atoms(entry, child_pos, &mut a);
   a
+}
+
+/// Locate the FIRST child-atom byte offset inside an `stsd` sample-description
+/// entry, faithful to ExifTool `ProcessHybrid` (QuickTime.pm:9660-9698). A
+/// hybrid atom carries fixed binary fields followed by nested child atoms at a
+/// per-codec offset (`avc1` → 86, `mp4a` → 36/52, …), so ExifTool brute-forces
+/// the boundary rather than hard-coding it: starting at entry-relative offset 8
+/// (`$dirStart + 8`, past the `[size:4][format:4]` header) it slides a candidate
+/// position one byte at a time, and at each position reads the `[size:4][tag:4]`
+/// of a would-be atom. A candidate `tag` containing any byte outside `[\w ]`
+/// (word char or space) is rejected (advance one byte); otherwise it follows the
+/// declared-size chain (`try += size`), and the FIRST chain whose atom ends
+/// EXACTLY at the entry end (`size + try == end`) fixes the child-region start
+/// (`childPos`). The fixed binary data is then `[8 .. childPos]` and the child
+/// atoms `[childPos .. end]`. Returns `None` when no such boundary exists (the
+/// entry is pure binary data with no child atoms — e.g. a bare `tmcd`).
+///
+/// `entry` is the full sample-entry slice (offset 0 = the `[size:4]` word), so
+/// `end` is `entry.len()` and the returned offset is entry-relative.
+fn find_hybrid_child_pos(entry: &[u8]) -> Option<usize> {
+  let end = entry.len();
+  // The Perl loop guard is `$pos <= $end - 8`; with `$pos`/`$end` as usizes
+  // this needs `end >= 8` first (a sub-8-byte entry has no room for a child).
+  if end < 8 {
+    return None;
+  }
+  let limit = end - 8;
+  let mut pos = 8usize;
+  let mut tryp = pos;
+  while pos <= limit {
+    // `substr($$dataPt, $try+4, 4)`: the candidate atom's 4cc. A short read at
+    // the tail means no well-formed atom starts here — treat as a non-match and
+    // advance one byte (the Perl `substr` would yield a short/empty string that
+    // the `/[^\w ]/` test below would not "fail" on, but a real child atom needs
+    // all 4 tag + 4 size bytes in range; the size read guards the rest).
+    let tag = entry.get(tryp + 4..tryp + 8);
+    let well_behaved = tag.is_some_and(|t| {
+      t.iter()
+        .all(|&b| b == b' ' || b == b'_' || b.is_ascii_alphanumeric())
+    });
+    if !well_behaved {
+      pos += 1;
+      tryp = pos;
+      continue;
+    }
+    // `Get32u($dataPt, $try)`: the candidate atom's declared size (big-endian).
+    let Some(size) = be_u32(entry, tryp).map(|s| s as usize) else {
+      pos += 1;
+      tryp = pos;
+      continue;
+    };
+    // `$size + $try` — guard the add so a hostile giant size cannot wrap.
+    let Some(reach) = size.checked_add(tryp) else {
+      pos += 1;
+      tryp = pos;
+      continue;
+    };
+    if reach == end {
+      // The atom ends exactly at the entry end — this chain's start is the
+      // child-region boundary.
+      return Some(pos);
+    }
+    if size < 8 || reach > limit {
+      // Invalid/overrunning candidate: try the next byte position.
+      pos += 1;
+      tryp = pos;
+    } else {
+      // A well-formed inner atom that does not (yet) reach the end — follow the
+      // chain to the next atom without moving `pos`.
+      tryp = reach;
+    }
+  }
+  None
+}
+
+/// Decode a `colr` `ColorRepresentation` sub-atom via `%QuickTime::ColorRep`
+/// (QuickTime.pm:3106, ProcessBinaryData, `FIRST_ENTRY => 0`). `body` is the
+/// `colr` atom payload (offset 0 = the color-type 4cc). The table has NO
+/// Condition on the color-type, so ProcessBinaryData reads every offset
+/// UNCONDITIONALLY, gated only by the available length — this mirrors that:
+///
+///  - `ColorProfiles` (offset 0, `undef[4]`): the color-type 4cc — `nclx` /
+///    `nclc` / `prof` / `rICC`, verbatim.
+///  - `ColorPrimaries` (offset 4), `TransferCharacteristics` (offset 6),
+///    `MatrixCoefficients` (offset 8): `int16u` CICP code points.
+///  - `VideoFullRangeFlag` (offset 10, `Mask => 0x80` ⇒ `(byte >> 7) & 1`).
+///
+/// The on-disk layout makes the type distinction fall out of the LENGTH: an
+/// `nclx` box is 11 bytes (all five fields), an `nclc` box is 10 (no range
+/// byte ⇒ `VideoFullRangeFlag` reads out of bounds and stays `None`). A
+/// `prof`/`rICC` ICC box would read its ICC bytes through the same offsets
+/// (what ProcessBinaryData does), so only `ColorProfiles` is meaningful — but
+/// the int16u reads are NOT suppressed, to stay byte-faithful to ExifTool.
+/// `None` only when the box is too short for the 4-byte color-type.
+fn decode_colr(body: &[u8]) -> Option<ColorRepresentation> {
+  let kind = body.get(0..4)?;
+  let mut c = ColorRepresentation::new();
+  c.set_color_profiles(Some(String::from_utf8_lossy(kind).into_owned()));
+  c.set_color_primaries(be_u16(body, 4));
+  c.set_transfer_characteristics(be_u16(body, 6));
+  c.set_matrix_coefficients(be_u16(body, 8));
+  // `Mask => 0x80` on the `int8u` at offset 10 ⇒ the high bit shifted down to
+  // a `0`/`1` flag. Absent (`nclc` / a short box) ⇒ `None`.
+  if let Some(&byte) = body.get(10) {
+    c.set_video_full_range_flag(Some((byte >> 7) & 1));
+  }
+  Some(c)
+}
+
+/// Decode a `pasp` `PixelAspectRatio` sub-atom (QuickTime.pm:7675): the
+/// `ValueConv => 'join(":", unpack("N*", $val))'` — every big-endian `int32u`
+/// in the payload joined by a colon. `unpack("N*")` consumes 4-byte groups and
+/// IGNORES a trailing remainder of < 4 bytes (Perl's `unpack` stops when fewer
+/// than a full template item remains). A real `pasp` is exactly 8 bytes
+/// (`hSpacing`:`vSpacing`, e.g. `"1:1"`). Returns `None` for an empty payload
+/// (the `join` of zero items is the empty string ⇒ ExifTool emits no value).
+fn decode_pasp(body: &[u8]) -> Option<String> {
+  let mut parts: std::vec::Vec<u32> = std::vec::Vec::new();
+  let mut off = 0usize;
+  while let Some(v) = be_u32(body, off) {
+    parts.push(v);
+    off += 4;
+  }
+  if parts.is_empty() {
+    return None;
+  }
+  // `join(":", ...)`: the decimal `int32u`s separated by colons. Use the
+  // standard `Display` for `u32` (a plain decimal, matching Perl's stringify).
+  let out = parts
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect::<std::vec::Vec<_>>()
+    .join(":");
+  Some(out)
+}
+
+/// Decode a `btrt` `BitrateInfo` sub-atom via `%QuickTime::Bitrate`
+/// (QuickTime.pm:1158, ProcessBinaryData, `FORMAT => 'int32u'`,
+/// `PRIORITY => 0`). Three big-endian `int32u`: `BufferSize` (offset 0),
+/// `MaxBitrate` (offset 4), `AverageBitrate` (offset 8). Each is read
+/// independently — a short box leaves the missing tail fields `None`. Returns
+/// `None` only when no field could be read (an empty payload).
+fn decode_btrt(body: &[u8]) -> Option<Bitrate> {
+  let buffer_size = be_u32(body, 0);
+  let max_bitrate = be_u32(body, 4);
+  let average_bitrate = be_u32(body, 8);
+  if buffer_size.is_none() && max_bitrate.is_none() && average_bitrate.is_none() {
+    return None;
+  }
+  let mut b = Bitrate::new();
+  b.set_buffer_size(buffer_size);
+  b.set_max_bitrate(max_bitrate);
+  b.set_average_bitrate(average_bitrate);
+  Some(b)
+}
+
+/// Walk the `colr`/`pasp`/`btrt` child atoms of ONE `vide`-track `stsd` sample
+/// entry, folding them onto `v` (the [`VisualSampleDesc`] for this entry).
+/// `child_pos` is the `ProcessHybrid` boundary already located by the caller
+/// ([`find_hybrid_child_pos`], computed once and shared so the boundary scan is
+/// not repeated); `None` ⇒ no child atoms. The
+/// children are a normal `[size:4][type:4][payload]` box sequence walked via
+/// [`walk_atoms`] (the `ProcessMOV` re-entry ExifTool performs from `childPos`).
+/// Atoms other than `colr`/`pasp`/`btrt` (`avcC`, `clap`, `fiel`, …) are not
+/// decoded this phase.
+///
+/// **A REPEATED `btrt` is folded first-wins per field.** `%QuickTime::Bitrate`
+/// is `PRIORITY => 0` (QuickTime.pm:1162), so when ExifTool re-extracts an
+/// already-present `BufferSize`/`MaxBitrate`/`AverageBitrate` the existing slot
+/// (promoted to priority 1 at ExifTool.pm:9547) is NOT overridden — the FIRST
+/// `btrt`'s fields win, even a zero value. We merge each later `btrt` into the
+/// running [`Bitrate`] filling only `None` fields
+/// ([`VisualSampleDesc::fold_bitrate_priority0`] →
+/// [`Bitrate::merge_priority0`]).
+fn decode_visual_child_atoms(entry: &[u8], child_pos: Option<usize>, v: &mut VisualSampleDesc) {
+  let Some(child_pos) = child_pos else {
+    return;
+  };
+  // Warnings from this scan are discarded: a `trak`'s `Warning` slot is the one
+  // `walk_trak` threads, and a malformed child atom inside a sample entry does
+  // not surface a `ProcessMOV` directory warning the way `moov`/`trak` do (the
+  // hybrid binary boundary already bounded the region).
+  let mut sink: Option<String> = None;
+  walk_atoms(
+    0,
+    entry,
+    child_pos,
+    entry.len(),
+    &mut sink,
+    |atom, body, _w| match &atom.atom_type {
+      b"colr" => {
+        if let Some(c) = decode_colr(body) {
+          v.set_color_rep(Some(c));
+        }
+      }
+      b"pasp" => {
+        if let Some(s) = decode_pasp(body) {
+          v.set_pixel_aspect_ratio(Some(s));
+        }
+      }
+      b"btrt" => {
+        if let Some(b) = decode_btrt(body) {
+          v.fold_bitrate_priority0(b);
+        }
+      }
+      _ => {}
+    },
+  );
+}
+
+/// Walk the `btrt` child atom of ONE `soun`-track `stsd` sample entry, folding
+/// it onto `a`. The `%QuickTime::AudioSampleDesc` table lists `btrt` but NOT
+/// `colr`/`pasp`, so only `btrt` is recognized here (an `mp4a` descriptor nests
+/// `esds`/`btrt`/…). `child_pos` is the caller's already-located `ProcessHybrid`
+/// boundary (`None` ⇒ no child atoms); walk + the first-wins repeated-`btrt`
+/// fold are as in [`decode_visual_child_atoms`].
+fn decode_audio_child_atoms(entry: &[u8], child_pos: Option<usize>, a: &mut AudioSampleDesc) {
+  let Some(child_pos) = child_pos else {
+    return;
+  };
+  let mut sink: Option<String> = None;
+  walk_atoms(
+    0,
+    entry,
+    child_pos,
+    entry.len(),
+    &mut sink,
+    |atom, body, _w| {
+      if &atom.atom_type == b"btrt"
+        && let Some(b) = decode_btrt(body)
+      {
+        a.fold_bitrate_priority0(b);
+      }
+    },
+  );
 }
 
 /// Decode every `mvhd` inside one `moov` atom into `qt` (QuickTime.pm:660-
@@ -2193,8 +2650,8 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                           match track.handler_code() {
                             Some("vide") => {
                               let mut acc = track.visual_sample_desc().cloned();
-                              for_each_stsd_entry(sbody, |entry| {
-                                let v = decode_visual_sample_desc(entry);
+                              for_each_stsd_entry(sbody, |dir_start, entry| {
+                                let v = decode_visual_sample_desc(entry, dir_start);
                                 match &mut acc {
                                   Some(a) => a.merge_from(v),
                                   None => acc = Some(v),
@@ -2206,8 +2663,8 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                             }
                             Some("soun") => {
                               let mut acc = track.audio_sample_desc().cloned();
-                              for_each_stsd_entry(sbody, |entry| {
-                                let a = decode_audio_sample_desc(entry);
+                              for_each_stsd_entry(sbody, |dir_start, entry| {
+                                let a = decode_audio_sample_desc(entry, dir_start);
                                 match &mut acc {
                                   Some(prev) => prev.merge_from(a),
                                   None => acc = Some(a),
@@ -5949,6 +6406,91 @@ impl crate::emit::Taggable for Meta<'_> {
             false,
           ));
         }
+        // colr ColorRepresentation (`%QuickTime::ColorRep`, QuickTime.pm:3106):
+        // ColorProfiles (the color-type 4cc, verbatim), then the CICP enums
+        // ColorPrimaries/TransferCharacteristics/MatrixCoefficients (PrintConv
+        // label at `-j`, raw int at `-n`) and the `nclx`-only VideoFullRangeFlag
+        // (`Mask => 0x80` → `0`/`1`; PrintConv `Limited`/`Full`). Emitted in the
+        // table field order, right after BitDepth (the oracle order).
+        if let Some(c) = v.color_rep() {
+          if let Some(profiles) = c.color_profiles()
+            && first_seen(grp, "ColorProfiles")
+          {
+            tags.push(EmittedTag::new(
+              track_group(),
+              "ColorProfiles".into(),
+              TagValue::Str(profiles.into()),
+              false,
+            ));
+          }
+          if let Some(cp) = c.color_primaries()
+            && first_seen(grp, "ColorPrimaries")
+          {
+            tags.push(EmittedTag::new(
+              track_group(),
+              "ColorPrimaries".into(),
+              cicp_value(cp, print_conv, color_primaries_print),
+              false,
+            ));
+          }
+          if let Some(tc) = c.transfer_characteristics()
+            && first_seen(grp, "TransferCharacteristics")
+          {
+            tags.push(EmittedTag::new(
+              track_group(),
+              "TransferCharacteristics".into(),
+              cicp_value(tc, print_conv, transfer_characteristics_print),
+              false,
+            ));
+          }
+          if let Some(mc) = c.matrix_coefficients()
+            && first_seen(grp, "MatrixCoefficients")
+          {
+            tags.push(EmittedTag::new(
+              track_group(),
+              "MatrixCoefficients".into(),
+              cicp_value(mc, print_conv, matrix_coefficients_print),
+              false,
+            ));
+          }
+          if let Some(flag) = c.video_full_range_flag()
+            && first_seen(grp, "VideoFullRangeFlag")
+          {
+            // PrintConv `{ 0 => Limited, 1 => Full }` at `-j`; the raw bit at
+            // `-n`. The Mask guarantees a `0`/`1` value, so no `Unknown` case.
+            let value = if print_conv {
+              TagValue::Str(if flag == 0 { "Limited" } else { "Full" }.into())
+            } else {
+              TagValue::U64(u64::from(flag))
+            };
+            tags.push(EmittedTag::new(
+              track_group(),
+              "VideoFullRangeFlag".into(),
+              value,
+              false,
+            ));
+          }
+        }
+        // pasp PixelAspectRatio (QuickTime.pm:7675): the colon-joined `int32u`
+        // pair (the `join(":", unpack N*)` ValueConv), mode-invariant.
+        if let Some(par) = v.pixel_aspect_ratio()
+          && first_seen(grp, "PixelAspectRatio")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "PixelAspectRatio".into(),
+            TagValue::Str(par.into()),
+            false,
+          ));
+        }
+        // btrt BitrateInfo (`%QuickTime::Bitrate`, QuickTime.pm:1158, PRIORITY
+        // => 0): BufferSize/MaxBitrate/AverageBitrate (`int32u`). The
+        // `Priority => 0` ("often filled with zeros") means a duplicate never
+        // overrides — emitted via `new_with_priority(.., 0)` so the
+        // first-extracted wins at the TagMap sink.
+        if let Some(bt) = v.bitrate() {
+          emit_bitrate(&mut tags, &track_group, &mut first_seen, grp, bt);
+        }
       }
       // AudioSampleDesc (`soun` handler, QuickTime.pm:7498-7530): AudioFormat,
       // AudioVendorID, AudioChannels, AudioBitsPerSample, AudioSampleRate. The
@@ -6014,6 +6556,12 @@ impl crate::emit::Taggable for Meta<'_> {
             TagValue::F64(r),
             false,
           ));
+        }
+        // btrt BitrateInfo (`%QuickTime::Bitrate`, QuickTime.pm:1158, PRIORITY
+        // => 0): the `mp4a` descriptor's bitrate child. Same Priority-0
+        // first-wins handling as the visual btrt.
+        if let Some(bt) = a.bitrate() {
+          emit_bitrate(&mut tags, &track_group, &mut first_seen, grp, bt);
         }
       }
       // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
@@ -19646,6 +20194,543 @@ mod tests {
     );
   }
 
+  // ── stsd-entry child atoms: colr / pasp / btrt (ProcessHybrid, Phase 2) ──
+
+  /// Append child atoms to a fixed `vide`/`soun` entry of `fixed_len` bytes,
+  /// returning a complete sample entry whose declared `size` is updated and
+  /// whose LAST child ends exactly at the entry end (the `ProcessHybrid`
+  /// boundary condition `find_hybrid_child_pos` keys on). Each `child` is an
+  /// already-built `[size:4][type:4][payload]` box.
+  fn entry_with_children(fixed: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+    let mut e = fixed.to_vec();
+    for c in children {
+      e.extend_from_slice(c);
+    }
+    let total = e.len() as u32;
+    wr(&mut e, 0, &total.to_be_bytes());
+    e
+  }
+
+  /// Build a `colr` box: the `[size][colr]` header then the payload bytes.
+  fn colr_box(payload: &[u8]) -> Vec<u8> {
+    atom(b"colr", payload)
+  }
+
+  /// `find_hybrid_child_pos` locates the child-atom region of an `avc1`-shaped
+  /// entry: 86 fixed bytes (the documented avc1 child offset, QuickTime.pm:7647)
+  /// then `colr`+`pasp`+`btrt`, the last ending exactly at entry end. The
+  /// boundary is byte 86; a pure-binary entry (no trailing child reaching the
+  /// end) returns None.
+  #[test]
+  fn find_hybrid_child_pos_locates_avc1_child_region() {
+    let fixed = vide_entry(b"avc1", 848, 480, b"GoPro AVC encoder", 24, 86);
+    let colr = colr_box(b"nclx\x00\x01\x00\x01\x00\x01\x00");
+    let pasp = atom(b"pasp", &[0, 0, 0, 1, 0, 0, 0, 1]);
+    let btrt = atom(
+      b"btrt",
+      &[0, 0, 0, 0, 0, 0x74, 0x3d, 0x1e, 0, 0x74, 0x3d, 0x1e],
+    );
+    let entry = entry_with_children(&fixed, &[colr, pasp, btrt]);
+    assert_eq!(
+      find_hybrid_child_pos(&entry),
+      Some(86),
+      "the child region begins right after the 86-byte avc1 fixed fields"
+    );
+    // A bare entry whose only content is the fixed binary data (no child atom
+    // chain reaching the end) has no boundary.
+    let bare = vide_entry(b"avc1", 848, 480, b"", 24, 86);
+    assert_eq!(find_hybrid_child_pos(&bare), None);
+  }
+
+  /// `decode_colr` for an `nclx` box: ColorProfiles=`nclx`, the three CICP
+  /// int16u fields, and the `Mask => 0x80` VideoFullRangeFlag (`0` here). Bytes
+  /// match the bundled `QuickTime_gopro_gpmf.mp4` `colr` (`6e636c78 0001 0001
+  /// 0001 00`).
+  #[test]
+  fn decode_colr_nclx_full_cicp() {
+    let c = decode_colr(b"nclx\x00\x01\x00\x01\x00\x01\x00").expect("nclx colr");
+    assert_eq!(c.color_profiles(), Some("nclx"));
+    assert_eq!(c.color_primaries(), Some(1));
+    assert_eq!(c.transfer_characteristics(), Some(1));
+    assert_eq!(c.matrix_coefficients(), Some(1));
+    assert_eq!(c.video_full_range_flag(), Some(0));
+    // The high bit of the range byte ⇒ flag 1 (Full).
+    let full = decode_colr(b"nclx\x00\x09\x00\x10\x00\x09\x80").expect("nclx colr");
+    assert_eq!(full.color_primaries(), Some(9));
+    assert_eq!(full.transfer_characteristics(), Some(16));
+    assert_eq!(full.video_full_range_flag(), Some(1));
+  }
+
+  /// `decode_colr` for an `nclc` box (10 bytes, no trailing range byte): the
+  /// three int16u CICP fields are read but VideoFullRangeFlag (offset 10) is out
+  /// of bounds ⇒ `None`. A too-short box (only the 4cc) yields only
+  /// ColorProfiles. Faithful to ProcessBinaryData (length-gated, no color-type
+  /// Condition).
+  #[test]
+  fn decode_colr_nclc_no_range_and_short_box() {
+    let c = decode_colr(b"nclc\x00\x06\x00\x01\x00\x06").expect("nclc colr");
+    assert_eq!(c.color_profiles(), Some("nclc"));
+    assert_eq!(c.color_primaries(), Some(6));
+    assert_eq!(c.transfer_characteristics(), Some(1));
+    assert_eq!(c.matrix_coefficients(), Some(6));
+    assert_eq!(
+      c.video_full_range_flag(),
+      None,
+      "nclc (10 bytes) has no offset-10 range byte"
+    );
+    // A box with only the 4-byte color-type: the int16u reads are all out of
+    // bounds (None), only ColorProfiles is set.
+    let short = decode_colr(b"prof").expect("4cc-only colr");
+    assert_eq!(short.color_profiles(), Some("prof"));
+    assert_eq!(short.color_primaries(), None);
+    assert_eq!(short.transfer_characteristics(), None);
+    assert_eq!(short.matrix_coefficients(), None);
+    assert_eq!(short.video_full_range_flag(), None);
+  }
+
+  /// `decode_pasp` = `join(":", unpack("N*"))`: the colon-joined big-endian
+  /// `int32u`s. `00000001 00000001` ⇒ "1:1"; a non-square ratio joins both
+  /// numbers; a sub-4-byte remainder is ignored (`unpack N*` stops); an empty
+  /// payload is None.
+  #[test]
+  fn decode_pasp_colon_joins_int32u() {
+    assert_eq!(
+      decode_pasp(&[0, 0, 0, 1, 0, 0, 0, 1]).as_deref(),
+      Some("1:1")
+    );
+    assert_eq!(
+      decode_pasp(&[0, 0, 0, 16, 0, 0, 0, 9]).as_deref(),
+      Some("16:9")
+    );
+    // A trailing 2-byte remainder after one full int32u is dropped by `N*`.
+    assert_eq!(decode_pasp(&[0, 0, 0, 4, 0xab]).as_deref(), Some("4"));
+    assert_eq!(decode_pasp(&[]), None);
+  }
+
+  /// `decode_btrt` reads three big-endian `int32u` (BufferSize/MaxBitrate/
+  /// AverageBitrate). Bytes match the bundled `gopro_gpmf.mp4` vide `btrt`
+  /// (`00000000 00743d1e 00743d1e` ⇒ 0 / 7617822 / 7617822). A short box leaves
+  /// the missing tail None; an empty payload is None.
+  #[test]
+  fn decode_btrt_three_int32u() {
+    let b = decode_btrt(&[0, 0, 0, 0, 0, 0x74, 0x3d, 0x1e, 0, 0x74, 0x3d, 0x1e]).expect("btrt");
+    assert_eq!(b.buffer_size(), Some(0));
+    assert_eq!(b.max_bitrate(), Some(7_617_822));
+    assert_eq!(b.average_bitrate(), Some(7_617_822));
+    // Short box: only BufferSize+MaxBitrate present.
+    let short = decode_btrt(&[0, 0, 0, 5, 0, 0, 0, 9]).expect("short btrt");
+    assert_eq!(short.buffer_size(), Some(5));
+    assert_eq!(short.max_bitrate(), Some(9));
+    assert_eq!(short.average_bitrate(), None);
+    assert_eq!(decode_btrt(&[]), None);
+  }
+
+  /// End-to-end: a `vide` `stsd` entry carrying `colr`+`pasp`+`btrt` children
+  /// (the `gopro_gpmf.mp4` Track1 shape) decodes all three onto the
+  /// `VisualSampleDesc` through `walk_trak`.
+  #[test]
+  fn walk_trak_vide_decodes_colr_pasp_btrt_children() {
+    let fixed = vide_entry(b"avc1", 848, 480, b"GoPro AVC encoder", 24, 86);
+    let colr = colr_box(b"nclx\x00\x01\x00\x01\x00\x01\x00");
+    let pasp = atom(b"pasp", &[0, 0, 0, 1, 0, 0, 0, 1]);
+    let btrt = atom(
+      b"btrt",
+      &[0, 0, 0, 0, 0, 0x74, 0x3d, 0x1e, 0, 0x74, 0x3d, 0x1e],
+    );
+    let entry = entry_with_children(&fixed, &[colr, pasp, btrt]);
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    // The fixed fields still decode (the child walk does not disturb them).
+    assert_eq!(v.compressor_id(), Some("avc1"));
+    assert_eq!(v.bit_depth(), Some(24));
+    let c = v.color_rep().expect("colr");
+    assert_eq!(c.color_profiles(), Some("nclx"));
+    assert_eq!(c.color_primaries(), Some(1));
+    assert_eq!(c.video_full_range_flag(), Some(0));
+    assert_eq!(v.pixel_aspect_ratio(), Some("1:1"));
+    let bt = v.bitrate().expect("btrt");
+    assert_eq!(bt.max_bitrate(), Some(7_617_822));
+    assert_eq!(bt.average_bitrate(), Some(7_617_822));
+  }
+
+  /// End-to-end: a `soun` `stsd` entry's `btrt` child decodes onto the
+  /// `AudioSampleDesc` (the audio table lists `btrt` but not `colr`/`pasp`).
+  /// Bytes match the bundled `gopro_gpmf.mp4` Track2 `btrt` (`00000000 0002e220
+  /// 0001b7bf` ⇒ 0 / 188960 / 112575).
+  #[test]
+  fn walk_trak_soun_decodes_btrt_child() {
+    // `mp4a` child atoms sit at offset 36 (the documented short-form offset).
+    let fixed = soun_entry(b"mp4a", 2, 16, 48000, 36);
+    let btrt = atom(
+      b"btrt",
+      &[0, 0, 0, 0, 0, 0x02, 0xe2, 0x20, 0, 0x01, 0xb7, 0xbf],
+    );
+    let entry = entry_with_children(&fixed, &[btrt]);
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(a.audio_format(), Some("mp4a"));
+    let bt = a.bitrate().expect("audio btrt");
+    assert_eq!(bt.buffer_size(), Some(0));
+    assert_eq!(bt.max_bitrate(), Some(188_960));
+    assert_eq!(bt.average_bitrate(), Some(112_575));
+  }
+
+  /// **Codex R2 — ProcessHybrid fixed-field cutoff (first entry).** ExifTool
+  /// sets `$$dirInfo{DirLen} = $pos` = the child atom's ABSOLUTE box position
+  /// when a `vide` sample entry has an EARLY child boundary (QuickTime.pm:9680),
+  /// and ProcessBinaryData reads a fixed field at entry-relative offset `off`
+  /// only while `off < DirLen`. The first entry's `dir_start` is 8, so a child
+  /// boundary at entry-relative offset 16 ⇒ cutoff 24: CompressorID (4) and
+  /// VendorID (20) are decoded (and VendorID reads the child `btrt` 4cc, the
+  /// faithful byte-bleed ExifTool itself exhibits), but SourceImageWidth/Height
+  /// (32/34), X/YResolution (36/40), CompressorName (50) and BitDepth (82) are
+  /// all at/beyond the cutoff and are OMITTED. The child `btrt` still decodes.
+  ///
+  /// Ground-truth from bundled ExifTool 13.59 on these exact bytes (`/tmp`
+  /// crafted MP4): `CompressorID avc1`, `VendorID "Unknown (btrt)"` (raw `btrt`),
+  /// `BufferSize 0`, `MaxBitrate 1111`, `AverageBitrate 2222`, and NO
+  /// SourceImageWidth / SourceImageHeight / XResolution / YResolution /
+  /// CompressorName / BitDepth.
+  #[test]
+  fn walk_trak_vide_early_child_boundary_cuts_fixed_fields() {
+    // 16-byte fixed prefix (offset 4 = `avc1`, bytes 8..16 = reserved/dataRefIdx)
+    // then a single `btrt` child (20 bytes) ending exactly at the entry end ⇒ the
+    // ProcessHybrid boundary is entry-relative offset 16. The btrt header lands at
+    // entry-relative 16..24 (`[size:4][btrt]`), so VendorID at 20..24 reads `btrt`.
+    let mut fixed = vec![0u8; 16];
+    wr(&mut fixed, 0, &16u32.to_be_bytes());
+    wr(&mut fixed, 4, b"avc1");
+    let entry = entry_with_children(&fixed, &[btrt_box(0, 1111, 2222)]);
+    assert_eq!(
+      find_hybrid_child_pos(&entry),
+      Some(16),
+      "single btrt child ⇒ boundary at entry-relative offset 16"
+    );
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    // Below the cutoff (offset < 24): decoded.
+    assert_eq!(
+      v.compressor_id(),
+      Some("avc1"),
+      "CompressorID (4) < cutoff 24"
+    );
+    assert_eq!(
+      v.vendor_id(),
+      Some("btrt"),
+      "VendorID (20) < cutoff 24 reads the child btrt 4cc (faithful bleed)"
+    );
+    // At/beyond the cutoff (offset >= 24): OMITTED.
+    assert_eq!(
+      v.source_image_width(),
+      None,
+      "SourceImageWidth (32) >= cutoff"
+    );
+    assert_eq!(
+      v.source_image_height(),
+      None,
+      "SourceImageHeight (34) >= cutoff"
+    );
+    assert_eq!(v.x_resolution(), None, "XResolution (36) >= cutoff");
+    assert_eq!(v.y_resolution(), None, "YResolution (40) >= cutoff");
+    assert_eq!(v.compressor_name(), None, "CompressorName (50) >= cutoff");
+    assert_eq!(v.bit_depth(), None, "BitDepth (82) >= cutoff");
+    // The child btrt is still walked from the boundary.
+    let bt = v.bitrate().expect("btrt decoded from the child region");
+    assert_eq!(bt.buffer_size(), Some(0));
+    assert_eq!(bt.max_bitrate(), Some(1111));
+    assert_eq!(bt.average_bitrate(), Some(2222));
+  }
+
+  /// **Codex R2 — ProcessHybrid fixed-field cutoff (first `soun` entry).** Same
+  /// absolute `dir_start + childPos` cutoff on the audio sample description. A
+  /// `mp4a` entry with the child boundary at entry-relative offset 16 ⇒ cutoff
+  /// 24: AudioFormat (4) and AudioVendorID (20, reading the child `btrt` 4cc) are
+  /// decoded, but AudioChannels (24), AudioBitsPerSample (26) and AudioSampleRate
+  /// (32) are at/beyond the cutoff and OMITTED. Ground-truth from bundled
+  /// ExifTool 13.59 on these exact bytes: `AudioFormat mp4a`,
+  /// `AudioVendorID "Unknown (btrt)"`, `BufferSize 0`, `MaxBitrate 600`,
+  /// `AverageBitrate 700`, and NO AudioChannels / AudioBitsPerSample /
+  /// AudioSampleRate.
+  #[test]
+  fn walk_trak_soun_early_child_boundary_cuts_fixed_fields() {
+    let mut fixed = vec![0u8; 16];
+    wr(&mut fixed, 0, &16u32.to_be_bytes());
+    wr(&mut fixed, 4, b"mp4a");
+    let entry = entry_with_children(&fixed, &[btrt_box(0, 600, 700)]);
+    assert_eq!(find_hybrid_child_pos(&entry), Some(16));
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(
+      a.audio_format(),
+      Some("mp4a"),
+      "AudioFormat (4) < cutoff 24"
+    );
+    assert_eq!(
+      a.vendor_id(),
+      Some("btrt"),
+      "AudioVendorID (20) < cutoff 24 reads the child btrt 4cc (faithful bleed)"
+    );
+    assert_eq!(a.channels(), None, "AudioChannels (24) >= cutoff");
+    assert_eq!(
+      a.bits_per_sample(),
+      None,
+      "AudioBitsPerSample (26) >= cutoff"
+    );
+    assert_eq!(a.sample_rate(), None, "AudioSampleRate (32) >= cutoff");
+    let bt = a
+      .bitrate()
+      .expect("audio btrt decoded from the child region");
+    assert_eq!(bt.buffer_size(), Some(0));
+    assert_eq!(bt.max_bitrate(), Some(600));
+    assert_eq!(bt.average_bitrate(), Some(700));
+  }
+
+  /// The `btrt` tags carry ExifTool `PRIORITY => 0` (QuickTime.pm:1162) so a
+  /// duplicate never overrides — [`emit_bitrate`] must mark every field
+  /// priority 0 (the first-extracted wins at the `TagMap` sink). Verified
+  /// directly on the helper's pushed [`EmittedTag`]s.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_bitrate_marks_priority_zero() {
+    use crate::emit::EmittedTag;
+    use crate::value::Group;
+    let mut bt = Bitrate::new();
+    bt.set_buffer_size(Some(0));
+    bt.set_max_bitrate(Some(7_617_822));
+    bt.set_average_bitrate(Some(7_617_822));
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+    let track_group = || Group::new("QuickTime", "Track1");
+    let mut seen: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+    let mut first_seen = |grp: &str, name: &str| -> bool {
+      let key = smol_str::SmolStr::new(std::format!("{grp}:{name}"));
+      if seen.contains(&key) {
+        return false;
+      }
+      seen.push(key);
+      true
+    };
+    emit_bitrate(&mut tags, &track_group, &mut first_seen, "Track1", &bt);
+    assert_eq!(tags.len(), 3, "BufferSize + MaxBitrate + AverageBitrate");
+    for t in &tags {
+      assert_eq!(t.priority(), 0, "{} must be Priority 0", t.tag().name());
+    }
+    // The names + values are the %QuickTime::Bitrate field order.
+    let names: std::vec::Vec<&str> = tags.iter().map(|t| t.tag().name()).collect();
+    assert_eq!(names, ["BufferSize", "MaxBitrate", "AverageBitrate"]);
+    // A SECOND emit under the same group/keys is fully suppressed by the
+    // first-wins gate (the priority-0 first-extracted survives).
+    let n0 = tags.len();
+    emit_bitrate(&mut tags, &track_group, &mut first_seen, "Track1", &bt);
+    assert_eq!(tags.len(), n0, "duplicate btrt suppressed (first-wins)");
+  }
+
+  // ── btrt PRIORITY-0 per-field first-wins (Codex R1/F2) ──
+
+  /// Build a `btrt` box from explicit `BufferSize`/`MaxBitrate`/`AverageBitrate`.
+  fn btrt_box(buffer_size: u32, max_bitrate: u32, average_bitrate: u32) -> Vec<u8> {
+    let mut payload = std::vec::Vec::with_capacity(12);
+    payload.extend_from_slice(&buffer_size.to_be_bytes());
+    payload.extend_from_slice(&max_bitrate.to_be_bytes());
+    payload.extend_from_slice(&average_bitrate.to_be_bytes());
+    atom(b"btrt", &payload)
+  }
+
+  /// [`Bitrate::merge_priority0`] keeps an already-present field and fills only a
+  /// `None` one — `%QuickTime::Bitrate` is `PRIORITY => 0`, so each field is
+  /// first-extracted-wins (QuickTime.pm:1162). A present value of `0` still
+  /// counts as present (it must not be treated as "missing").
+  #[test]
+  fn bitrate_merge_priority0_keeps_present_fills_none() {
+    let mut first = Bitrate::new();
+    first.set_buffer_size(Some(0)); // present-but-zero ⇒ wins
+    first.set_max_bitrate(Some(1111));
+    // average_bitrate left None ⇒ fillable
+    let mut later = Bitrate::new();
+    later.set_buffer_size(Some(99));
+    later.set_max_bitrate(Some(9999));
+    later.set_average_bitrate(Some(2222));
+    first.merge_priority0(&later);
+    assert_eq!(first.buffer_size(), Some(0), "present 0 not overwritten");
+    assert_eq!(
+      first.max_bitrate(),
+      Some(1111),
+      "present non-zero not overwritten"
+    );
+    assert_eq!(
+      first.average_bitrate(),
+      Some(2222),
+      "None filled from later"
+    );
+  }
+
+  /// [`VisualSampleDesc::fold_bitrate_priority0`] establishes the slot from the
+  /// FIRST `btrt` and a later one fills only still-`None` fields (never
+  /// overwrites). `AudioSampleDesc` shares the rule.
+  #[test]
+  fn fold_bitrate_priority0_first_btrt_wins_per_field() {
+    let mut v = VisualSampleDesc::new();
+    let mut b1 = Bitrate::new();
+    b1.set_buffer_size(Some(10));
+    b1.set_max_bitrate(Some(1111));
+    v.fold_bitrate_priority0(b1); // first btrt establishes the slot
+    let mut b2 = Bitrate::new();
+    b2.set_buffer_size(Some(99));
+    b2.set_max_bitrate(Some(9999));
+    b2.set_average_bitrate(Some(2222));
+    v.fold_bitrate_priority0(b2); // later fills only AverageBitrate
+    let bt = v.bitrate().expect("bitrate");
+    assert_eq!(bt.buffer_size(), Some(10));
+    assert_eq!(bt.max_bitrate(), Some(1111));
+    assert_eq!(
+      bt.average_bitrate(),
+      Some(2222),
+      "None field filled by later"
+    );
+
+    let mut a = AudioSampleDesc::new();
+    let mut a1 = Bitrate::new();
+    a1.set_buffer_size(Some(7));
+    a.fold_bitrate_priority0(a1);
+    let mut a2 = Bitrate::new();
+    a2.set_buffer_size(Some(8));
+    a.fold_bitrate_priority0(a2);
+    assert_eq!(a.bitrate().expect("audio bitrate").buffer_size(), Some(7));
+  }
+
+  /// **Codex R1/F2 — REPEATED `btrt` in ONE entry, first wins per field.** A
+  /// `vide` sample entry carrying TWO `btrt` children decodes the FIRST `btrt`'s
+  /// fields (PRIORITY 0 ⇒ a later duplicate never overrides). Ground-truth from
+  /// bundled ExifTool 13.59 on the same bytes (entry btrt1 = 10/1111/2222,
+  /// btrt2 = 99/9999/8888) → BufferSize 10, MaxBitrate 1111, AverageBitrate 2222.
+  #[test]
+  fn walk_trak_vide_repeated_btrt_first_wins() {
+    let fixed = vide_entry(b"avc1", 320, 240, b"", 24, 86);
+    let entry = entry_with_children(
+      &fixed,
+      &[btrt_box(10, 1111, 2222), btrt_box(99, 9999, 8888)],
+    );
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let bt = track
+      .visual_sample_desc()
+      .expect("vide sample desc")
+      .bitrate()
+      .expect("btrt");
+    assert_eq!(bt.buffer_size(), Some(10), "first btrt BufferSize wins");
+    assert_eq!(bt.max_bitrate(), Some(1111), "first btrt MaxBitrate wins");
+    assert_eq!(
+      bt.average_bitrate(),
+      Some(2222),
+      "first btrt AverageBitrate wins"
+    );
+  }
+
+  /// **Codex R1/F2 — REPEATED `btrt` in ONE `soun` entry, first wins.** Same
+  /// PRIORITY-0 rule on the audio sample description. ExifTool 13.59 on the same
+  /// bytes (btrt1 = 5/600/700, btrt2 = 50/6000/7000) → 5 / 600 / 700.
+  #[test]
+  fn walk_trak_soun_repeated_btrt_first_wins() {
+    let fixed = soun_entry(b"mp4a", 2, 16, 48000, 36);
+    let entry = entry_with_children(&fixed, &[btrt_box(5, 600, 700), btrt_box(50, 6000, 7000)]);
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[entry]));
+    let track = walk_trak(1, &payload, Some(600));
+    let bt = track
+      .audio_sample_desc()
+      .expect("soun sample desc")
+      .bitrate()
+      .expect("btrt");
+    assert_eq!(bt.buffer_size(), Some(5));
+    assert_eq!(bt.max_bitrate(), Some(600));
+    assert_eq!(bt.average_bitrate(), Some(700));
+  }
+
+  /// **Codex R1/F2 — two `stsd` entries with DIFFERING `btrt`, btrt first-wins
+  /// while the ordinary fields last-win.** Across entries, `%QuickTime::Bitrate`
+  /// is PRIORITY 0 so the FIRST entry's `btrt` survives, whereas CompressorID
+  /// (no Avoid/Priority) is last-wins. Ground-truth from bundled ExifTool 13.59
+  /// (entry1 `avc1` btrt 10/1111/2222, entry2 `hvc1` btrt 99/9999/8888) →
+  /// CompressorID `hvc1`, BufferSize 10, MaxBitrate 1111, AverageBitrate 2222.
+  #[test]
+  fn walk_trak_vide_two_entries_btrt_first_wins_id_last_wins() {
+    let e1 = entry_with_children(
+      &vide_entry(b"avc1", 100, 100, b"", 24, 86),
+      &[btrt_box(10, 1111, 2222)],
+    );
+    let e2 = entry_with_children(
+      &vide_entry(b"hvc1", 200, 200, b"", 32, 86),
+      &[btrt_box(99, 9999, 8888)],
+    );
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    assert_eq!(v.compressor_id(), Some("hvc1"), "ordinary field last-wins");
+    let bt = v.bitrate().expect("btrt");
+    assert_eq!(
+      bt.buffer_size(),
+      Some(10),
+      "btrt PRIORITY 0 ⇒ first entry wins"
+    );
+    assert_eq!(bt.max_bitrate(), Some(1111));
+    assert_eq!(bt.average_bitrate(), Some(2222));
+  }
+
+  /// **Codex R1/F2 — a later ALL-ZERO `btrt` must NOT overwrite earlier non-zero
+  /// fields.** The motivating case from the `%QuickTime::Bitrate` comment
+  /// ("often filled with zeros"). Ground-truth from bundled ExifTool 13.59
+  /// (entry1 btrt 10/1111/2222, entry2 btrt 0/0/0) → still 10 / 1111 / 2222.
+  #[test]
+  fn walk_trak_vide_later_zero_btrt_does_not_overwrite() {
+    let e1 = entry_with_children(
+      &vide_entry(b"avc1", 100, 100, b"", 24, 86),
+      &[btrt_box(10, 1111, 2222)],
+    );
+    let e2 = entry_with_children(
+      &vide_entry(b"hvc1", 200, 200, b"", 32, 86),
+      &[btrt_box(0, 0, 0)],
+    );
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let bt = track
+      .visual_sample_desc()
+      .expect("vide sample desc")
+      .bitrate()
+      .expect("btrt");
+    assert_eq!(
+      bt.buffer_size(),
+      Some(10),
+      "later all-zero btrt does not overwrite"
+    );
+    assert_eq!(bt.max_bitrate(), Some(1111));
+    assert_eq!(bt.average_bitrate(), Some(2222));
+  }
+
+  /// The audio merge mirrors the visual one: a later all-zero `btrt` keeps the
+  /// earlier non-zero audio bitrate fields (PRIORITY 0 first-wins).
+  #[test]
+  fn walk_trak_soun_later_zero_btrt_does_not_overwrite() {
+    let e1 = entry_with_children(
+      &soun_entry(b"mp4a", 2, 16, 48000, 36),
+      &[btrt_box(7, 800, 900)],
+    );
+    let e2 = entry_with_children(&soun_entry(b"lpcm", 6, 24, 32000, 36), &[btrt_box(0, 0, 0)]);
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(a.audio_format(), Some("lpcm"), "ordinary field last-wins");
+    let bt = a.bitrate().expect("btrt");
+    assert_eq!(
+      bt.buffer_size(),
+      Some(7),
+      "later all-zero btrt does not overwrite"
+    );
+    assert_eq!(bt.max_bitrate(), Some(800));
+    assert_eq!(bt.average_bitrate(), Some(900));
+  }
+
   // ── Pascal/C-string RawConv (HandlerDescription + CompressorName) ──
 
   /// **Codex R1/F2.** The `%QuickTime::Handler` `HandlerDescription` /
@@ -19720,13 +20805,13 @@ mod tests {
     // CompressorName field = `\x05abc` (5 > 3 follow) ⇒ C string `\x05abc`.
     let mut e = vide_entry(b"avc1", 320, 240, b"", 24, 86);
     wr(&mut e, 50, b"\x05abc");
-    let v = decode_visual_sample_desc(&e);
+    let v = decode_visual_sample_desc(&e, 8);
     assert_eq!(v.compressor_name(), Some("\u{5}abc"));
 
     // CompressorName field = `\x03abc` (3 < 4) ⇒ counted ⇒ "abc".
     let mut e2 = vide_entry(b"avc1", 320, 240, b"", 24, 86);
     wr(&mut e2, 50, b"\x03abc");
-    let v2 = decode_visual_sample_desc(&e2);
+    let v2 = decode_visual_sample_desc(&e2, 8);
     assert_eq!(v2.compressor_name(), Some("abc"));
   }
 
