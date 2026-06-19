@@ -6176,11 +6176,14 @@ impl ExifMeta<'_> {
                 emissions: &[makernotes::VendorEmission]| {
       out.reserve(emissions.len());
       for e in emissions {
-        out.push(crate::emit::EmittedTag::new(
+        // Carry the emission's `Priority => N` into the `EmittedTag` so the sink
+        // applies the general duplicate-override rule (`ExifTool.pm:9544-9560`).
+        out.push(crate::emit::EmittedTag::new_with_priority(
           crate::value::Group::new("MakerNotes", group1),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
+          e.priority(),
         ));
       }
     };
@@ -6499,7 +6502,9 @@ trait ExifSink {
     value: &[u8],
   ) -> Result<(), core::convert::Infallible>;
   /// Write an ALREADY-RENDERED vendor maker-note value under a FULL group
-  /// (`family0`, `family1`) with its `Unknown=>1` flag.
+  /// (`family0`, `family1`) with its `Unknown=>1` flag, taking ExifTool's
+  /// default duplicate `Priority => 1` (`ExifTool.pm:9553`). A provided method
+  /// delegating to [`write_vendor_value_with_priority`](Self::write_vendor_value_with_priority).
   ///
   /// Unlike the scalar `write_*` writers (which fix `family0 = "EXIF"` and route
   /// a scalar through the terminal number gate), a vendor leaf's value is built
@@ -6512,6 +6517,7 @@ trait ExifSink {
   /// rides into the [`EmittedTag`](crate::emit::EmittedTag) so the shared engine
   /// ([`run_emission`](crate::emit::run_emission)) drops it centrally — exactly
   /// as a Canon `VendorEmission`'s flag flows today.
+  #[inline(always)]
   fn write_vendor_value(
     &mut self,
     family0: &str,
@@ -6519,6 +6525,28 @@ trait ExifSink {
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+  ) -> Result<(), core::convert::Infallible> {
+    self.write_vendor_value_with_priority(family0, family1, name, value, unknown, 1)
+  }
+
+  /// Like [`write_vendor_value`](Self::write_vendor_value) but carrying an
+  /// explicit ExifTool `Priority => N` for duplicate handling. `0` marks a
+  /// vendor leaf that NEVER overrides an existing duplicate of the same
+  /// `(doc, family1, name)` (`ExifTool.pm:9544-9560`) — e.g. the Canon
+  /// `Priority => 0` sub-table rows (`Canon::ShotInfo` `FNumber`/`ExposureTime`/
+  /// `BaseISO`, `Canon::FocalLength` `FocalLength`), whose EXIF/CTMD counterpart
+  /// must win the collapsed `Track<N>:<name>` row. The priority rides into the
+  /// [`VendorEmission`](makernotes::VendorEmission) (and thence the
+  /// [`EmittedTag`](crate::emit::EmittedTag)), so the sink's priority-aware
+  /// dedup applies the general override rule centrally.
+  fn write_vendor_value_with_priority(
+    &mut self,
+    family0: &str,
+    family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible>;
 }
 
@@ -6586,18 +6614,20 @@ impl ExifSink for crate::tagmap::TagMap {
     )
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     _family0: &str,
     family1: &str,
     name: &str,
     value: crate::value::TagValue,
     _unknown: bool,
+    _priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The `TagMap` keys on family-1 only (`-G1`), so this test sink stores the
     // value under `family1:name` (the `Unknown=>1` suppression is the engine's
     // job and is not modelled by this raw test sink — a caller that wants the
-    // gate tests it before writing).
+    // gate tests it before writing). The `priority` is the engine's concern and
+    // not modelled by this raw test sink either.
     crate::tagmap::TagMap::write_value(self, family1, name, value)
   }
 }
@@ -6705,23 +6735,26 @@ impl ExifSink for EmittedTagSink<'_> {
     Ok(())
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     family0: &str,
     family1: &str,
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The vendor value is already a complete `TagValue` (built by the vendor
     // `PrintConv`), so it bypasses `Self::push`'s `EXIF`/`unknown:false` shape:
-    // push the FULL group + flag, matching `push_maker_note_tags`'s
-    // `EmittedTag::new(Group::new("MakerNotes", group1), …, e.unknown())`.
-    self.tags.push(crate::emit::EmittedTag::new(
+    // push the FULL group + flag + `Priority => N`, matching
+    // `push_maker_note_tags`'s `EmittedTag::new_with_priority(Group::new(
+    // "MakerNotes", group1), …, e.unknown(), e.priority())`.
+    self.tags.push(crate::emit::EmittedTag::new_with_priority(
       crate::value::Group::new(family0, family1),
       smol_str::SmolStr::new(name),
       value,
       unknown,
+      priority,
     ));
     Ok(())
   }
@@ -6811,24 +6844,32 @@ impl ExifSink for VendorEmissionSink<'_> {
     Ok(())
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     _family0: &str,
     _family1: &str,
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The family-0/1 group is fixed (`("MakerNotes", "Canon")`) for every Canon
     // emission and re-applied by [`ExifMeta::push_maker_note_tags`] from
     // [`MakerNote::emission_group1`], so it is NOT stored on the
-    // `VendorEmission` (which carries only `name` / `value` / `unknown`, exactly
-    // as the vendor body parsers build it).
-    self.emissions.push(makernotes::VendorEmission::new(
-      smol_str::SmolStr::new(name),
-      value,
-      unknown,
-    ));
+    // `VendorEmission` (which carries only `name` / `value` / `unknown` /
+    // `priority`, exactly as the vendor body parsers build it). The `priority`
+    // is the Canon row's `Priority => N` (`0` for the `Canon::ShotInfo`
+    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength`
+    // rows), so a CTMD re-dispatch's `Track<N>:FNumber` never overrides the
+    // earlier ExposureInfo value of the same row.
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_priority(
+        smol_str::SmolStr::new(name),
+        value,
+        unknown,
+        priority,
+      ));
     Ok(())
   }
 }
@@ -7688,7 +7729,15 @@ fn emit_canon_subtable<S: ExifSink>(
   };
 
   for (name, value) in positions {
-    out.write_vendor_value("MakerNotes", group1, &name, value, false)?;
+    // Thread the row's ExifTool `Priority => N` (`0` for the `Canon::ShotInfo`
+    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength`
+    // rows, `1` otherwise) onto the emission so the sink's priority-aware dedup
+    // keeps an EARLIER same-`(doc, family1, name)` value when this leaf is
+    // `Priority => 0` (`ExifTool.pm:9544-9560`) — the CTMD `Track<N>:FNumber`
+    // fix. Every walked sub-table position is an explicit `BinaryData` entry,
+    // never `Unknown`.
+    let priority = sub.tag_priority(&name);
+    out.write_vendor_value_with_priority("MakerNotes", group1, &name, value, false, priority)?;
   }
   Ok(())
 }

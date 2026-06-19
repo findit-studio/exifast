@@ -3507,7 +3507,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(_, _, n, _)| n.contains("WhiteBalance"))
+      .filter(|(_, _, n, _, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the priority winner is emitted");
   }

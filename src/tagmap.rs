@@ -60,6 +60,13 @@ use std::{
 /// new value is shunted to a numbered `Warning (n)` key) and the default
 /// (`%noDups`) output keeps the FIRST-extracted one by file order
 /// (ExifTool.pm:5404-5417). See [`TagMap::insert`].
+///
+/// This is the NAME fallback for the general per-tag priority threaded through
+/// [`TagMap::insert`]: even when a `Warning`/`Error` reaches the sink with the
+/// default `priority == 1` (its producers do not yet thread a `Priority => 0`),
+/// the insert forces its EFFECTIVE priority to `0` so the faithful first-wins is
+/// preserved. A producer MAY also pass `priority == 0` explicitly; both routes
+/// agree.
 #[inline]
 fn is_priority_zero_pseudo_tag(name: &str) -> bool {
   name == "Warning" || name == "Error"
@@ -89,13 +96,19 @@ fn is_priority_zero_pseudo_tag(name: &str) -> bool {
 /// emission. Net per-insert: one `HashMap` probe + (on a new key) two inline
 /// `SmolStr` clones, vs the old heap `format!` + a growing linear scan.
 pub(crate) struct TagMap {
-  /// `(doc, family1, name, value)` in first-occurrence order; the latest value
-  /// for a repeated `(doc, family1, name)` replaces in place (faithful
-  /// `FoundTag` last-wins, keeping first-occurrence POSITION —
-  /// `ExifTool.pm:9437-9519`). The leading `doc` is the family-3 sub-document
-  /// index (`0` = Main); it widens the dedup identity so a sub-document tag
-  /// (`Doc<N>`) never collides with the same `family1:name` in another document.
-  entries: Vec<(u32, SmolStr, SmolStr, TagValue)>,
+  /// `(doc, family1, name, priority, value)` in first-occurrence order. A
+  /// repeated `(doc, family1, name)` overrides the stored `(priority, value)`
+  /// in place IFF the NEW duplicate's effective priority is non-zero AND `>=`
+  /// the stored priority (ExifTool's general duplicate rule,
+  /// `ExifTool.pm:9544-9560`); first-occurrence POSITION is always kept
+  /// (`ExifTool.pm:9437-9519`). For an ordinary tag (priority `1`) this is the
+  /// faithful last-wins; a `Priority => 0` duplicate (e.g. `Warning`/`Error`)
+  /// never overrides. The leading `doc` is the family-3 sub-document index (`0`
+  /// = Main); it widens the dedup identity so a sub-document tag (`Doc<N>`)
+  /// never collides with the same `family1:name` in another document. The
+  /// stored `priority` is the SURVIVING entry's priority, so a later same-key
+  /// duplicate is compared against the value that currently occupies the slot.
+  entries: Vec<(u32, SmolStr, SmolStr, u8, TagValue)>,
   /// `(doc, family1, name) → index into `entries`` for O(1) dedup. The key
   /// clones the two short `SmolStr`s (inline for ≤23 bytes — no heap), so the
   /// dedup probe never builds the `"g:n"` string the old design allocated per
@@ -128,24 +141,31 @@ impl TagMap {
   /// `AIFF:Name` keeps the LAST value, `AIFF_dup_name.aif`; multi-COMM →
   /// last COMM).
   ///
-  /// **`Warning`/`Error` exception — FIRST-wins (faithful priority-0).** The
-  /// only documented case where two DIFFERENT family-0 tags collide on one
-  /// `family1:name` token is the pseudo-tags `Warning` / `Error`: a group-scoped
-  /// `$et->Warn`/`$et->Error` (family-0 `ExifTool`, ExifTool.pm:1290/1299
-  /// `Priority => 0`) and a real same-family-1 `Warning`/`Error` TAG (e.g. a
-  /// Matroska SimpleTag `TagName=Warning`, whose `StdTag` table is
-  /// `PRIORITY => 0`, Matroska.pm:752). BOTH are priority-0, and ExifTool's
-  /// duplicate handler NEVER lets a priority-0 duplicate override an existing
-  /// tag (`$priority(0) >= $oldPriority(forced 1)` is false → the new value is
-  /// shunted to `Warning (1)`, ExifTool.pm:9544-9560), and the render `%noDups`
-  /// then keeps the FIRST-extracted by file order (ExifTool.pm:5404-5417). The
-  /// comment at ExifTool.pm:9542 spells it out: "never override a Warning tag".
-  /// So for these two names a HIT is a NO-OP (the first-extracted value stays) —
-  /// the group-scoped diagnostic and the real same-group `Warning`/`Error` must
+  /// **General `Priority => N` duplicate rule (`ExifTool.pm:9544-9560`).** Each
+  /// tag carries a `priority` (default `1`); a producer marks a `Priority => 0`
+  /// tag by passing `0`. The effective priority is forced to `0` for the
+  /// `Warning`/`Error` pseudo-tags (the [`is_priority_zero_pseudo_tag`] name
+  /// fallback) so they stay first-wins even when their producer still passes the
+  /// default `1`. On a key HIT the NEW duplicate REPLACES the stored
+  /// `(priority, value)` IFF `(effective_priority != 0) && (effective_priority
+  /// >= stored_priority)` — ExifTool forces a stored tag's priority to at least
+  /// `1` (`ExifTool.pm:9553`), so a `Priority => 0` duplicate can never override
+  /// (`0 >= 1` is false → the new value is shunted to a numbered key) and the
+  /// render `%noDups` then keeps the FIRST-extracted by file order
+  /// (`ExifTool.pm:5404-5417`). First-occurrence POSITION is always preserved.
+  ///
+  /// For an ordinary tag (priority `1` vs stored `1`) this reduces to the
+  /// faithful last-wins (`1 >= 1` ⇒ replace), unchanged from before per-tag
+  /// priority existed. The documented colliding case is the pseudo-tags
+  /// `Warning` / `Error` (`Priority => 0`, ExifTool.pm:1290/1299; a Matroska
+  /// SimpleTag `StdTag` table is `PRIORITY => 0`, Matroska.pm:752): both are
+  /// effective-priority-0, so a HIT is a NO-OP (the first-extracted value
+  /// stays), and ExifTool.pm:9542 spells it out: "never override a Warning tag".
+  /// The group-scoped diagnostic and the real same-group `Warning`/`Error`
   /// therefore both ride the in-stream `tags()` path so their FoundTag order is
   /// faithful (the survivor is whichever the walk reached FIRST). Pinned by the
   /// `Matroska_warning_collision*.mkv` goldens.
-  fn insert(&mut self, doc: u32, group: &str, name: &str, value: TagValue) {
+  fn insert(&mut self, doc: u32, group: &str, name: &str, priority: u8, value: TagValue) {
     // O(1) dedup on the `(doc, family1, name)` TRIPLE — no `"g:n"` string is
     // built here (it is materialized once per surviving entry at serialization).
     // The probe key clones the two `SmolStr`s; tag groups + names are short
@@ -159,18 +179,33 @@ impl TagMap {
     // sub-document tag (`Doc<N>`) distinct from the same `family1:name` in
     // another document; the `Warning`/`Error` first-wins exception stays keyed
     // on `name` only (doc-agnostic — correct, it never overrides regardless).
+    // The `Warning`/`Error` name fallback forces effective priority to `0` even
+    // when the producer passed the default `1`, preserving their first-wins.
+    let effective_priority = if is_priority_zero_pseudo_tag(name) {
+      0
+    } else {
+      priority
+    };
     let key = (doc, SmolStr::new(group), SmolStr::new(name));
     if let Some(&idx) = self.index.get(&key) {
-      // `Warning`/`Error` are priority-0 ⇒ first-extracted wins (no override).
-      if !is_priority_zero_pseudo_tag(name) {
-        self.entries[idx].3 = value;
+      // ExifTool's general rule: a NEW duplicate overrides the stored entry IFF
+      // its effective priority is non-zero AND `>=` the stored (`>= 1`) priority
+      // (`ExifTool.pm:9544-9560`). A `Priority => 0` duplicate never overrides.
+      let stored_priority = self.entries[idx].3;
+      if effective_priority != 0 && effective_priority >= stored_priority {
+        self.entries[idx].3 = effective_priority;
+        self.entries[idx].4 = value;
       }
       return;
     }
     let idx = self.entries.len();
-    self
-      .entries
-      .push((key.0, key.1.clone(), key.2.clone(), value));
+    self.entries.push((
+      key.0,
+      key.1.clone(),
+      key.2.clone(),
+      effective_priority,
+      value,
+    ));
     self.index.insert(key, idx);
   }
 
@@ -200,7 +235,7 @@ impl TagMap {
     name: &str,
     value: &str,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, TagValue::Str(value.into()));
+    self.insert(0, group, name, 1, TagValue::Str(value.into()));
     Ok(())
   }
 
@@ -212,7 +247,7 @@ impl TagMap {
     name: &str,
     value: u64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, TagValue::U64(value));
+    self.insert(0, group, name, 1, TagValue::U64(value));
     Ok(())
   }
 
@@ -224,7 +259,7 @@ impl TagMap {
     name: &str,
     value: i64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, TagValue::I64(value));
+    self.insert(0, group, name, 1, TagValue::I64(value));
     Ok(())
   }
 
@@ -236,7 +271,7 @@ impl TagMap {
     name: &str,
     value: f64,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, TagValue::F64(value));
+    self.insert(0, group, name, 1, TagValue::F64(value));
     Ok(())
   }
 
@@ -252,7 +287,7 @@ impl TagMap {
   ) -> Result<(), Infallible> {
     let mut s = String::new();
     let _ = f(&mut s); // in-memory String write cannot fail
-    self.insert(0, group, name, TagValue::Str(s.into()));
+    self.insert(0, group, name, 1, TagValue::Str(s.into()));
     Ok(())
   }
 
@@ -269,23 +304,28 @@ impl TagMap {
     name: &str,
     value: TagValue,
   ) -> Result<(), Infallible> {
-    self.insert(0, group, name, value);
+    // The non-`-ee` value path: Main document (`doc == 0`), ExifTool's default
+    // duplicate `Priority => 1` (`ExifTool.pm:9553`).
+    self.insert(0, group, name, 1, value);
     Ok(())
   }
 
   /// Emit a pre-built [`TagValue`] under a specific family-3 sub-document
-  /// (`doc==0` is Main, identical to [`write_value`](Self::write_value)). The
-  /// doc widens the dedup identity so a per-sample (`Doc<N>`) tag never collides
+  /// (`doc==0` is Main) with an explicit ExifTool `Priority => N`. The doc
+  /// widens the dedup identity so a per-sample (`Doc<N>`) tag never collides
   /// with the same `family1:name` in another document — the doc-aware entry
-  /// point for the timed-metadata (`-ee`) walkers.
+  /// point for the emission engine + the timed-metadata (`-ee`) walkers. The
+  /// `priority` threads the tag's `Priority => N` into the general
+  /// duplicate-override rule (`ExifTool.pm:9544-9560`); ordinary tags pass `1`.
   pub(crate) fn write_value_doc(
     &mut self,
     doc: u32,
     group: &str,
     name: &str,
+    priority: u8,
     value: TagValue,
   ) -> Result<(), Infallible> {
-    self.insert(doc, group, name, value);
+    self.insert(doc, group, name, priority, value);
     Ok(())
   }
 
@@ -301,14 +341,15 @@ impl TagMap {
     Ok(())
   }
 
-  /// The collected format-tag entries `(doc, family1, name, value)` in
-  /// first-occurrence order (last-wins dedup already applied). The consumer
-  /// builds the JSON key ONCE per entry here via
+  /// The collected format-tag entries `(doc, family1, name, priority, value)`
+  /// in first-occurrence order (the priority-aware dedup already applied). The
+  /// consumer builds the JSON key ONCE per entry here via
   /// [`crate::serialize_key::group_key`] (not per emission) — `-G1` collapses
-  /// the leading `doc`, `-G3` renders it as a `Doc<N>:` prefix. Slice view of
-  /// the backing `Vec` (§3: never expose `&Vec<T>`).
+  /// the leading `doc`, `-G3` renders it as a `Doc<N>:` prefix; the `priority`
+  /// is dedup bookkeeping the consumers ignore. Slice view of the backing `Vec`
+  /// (§3: never expose `&Vec<T>`).
   #[inline(always)]
-  pub(crate) const fn entries(&self) -> &[(u32, SmolStr, SmolStr, TagValue)] {
+  pub(crate) const fn entries(&self) -> &[(u32, SmolStr, SmolStr, u8, TagValue)] {
     self.entries.as_slice()
   }
 
@@ -336,7 +377,7 @@ impl TagMap {
   #[cfg(test)]
   pub(crate) fn get(&self, group: &str, name: &str) -> Option<&TagValue> {
     let key = (0u32, SmolStr::new(group), SmolStr::new(name));
-    self.index.get(&key).map(|&idx| &self.entries[idx].3)
+    self.index.get(&key).map(|&idx| &self.entries[idx].4)
   }
 
   /// `true` if no tags / warnings / errors were emitted (test-only).
@@ -387,16 +428,72 @@ mod tests {
   #[test]
   fn tagmap_dedup_is_doc_aware() {
     let mut m = TagMap::new();
-    m.write_value_doc(1, "QuickTime", "GPSLatitude", TagValue::F64(47.0))
+    m.write_value_doc(1, "QuickTime", "GPSLatitude", 1, TagValue::F64(47.0))
       .unwrap();
-    m.write_value_doc(2, "QuickTime", "GPSLatitude", TagValue::F64(-33.0))
+    m.write_value_doc(2, "QuickTime", "GPSLatitude", 1, TagValue::F64(-33.0))
       .unwrap();
-    m.write_value_doc(0, "QuickTime", "TimeScale", TagValue::U64(600))
+    m.write_value_doc(0, "QuickTime", "TimeScale", 1, TagValue::U64(600))
       .unwrap();
-    m.write_value_doc(0, "QuickTime", "TimeScale", TagValue::U64(1000))
+    m.write_value_doc(0, "QuickTime", "TimeScale", 1, TagValue::U64(1000))
       .unwrap();
     assert_eq!(m.entries().len(), 3);
-    let doc2 = m.entries().iter().filter(|(d, _, _, _)| *d == 2).count();
+    let doc2 = m.entries().iter().filter(|(d, _, _, _, _)| *d == 2).count();
     assert_eq!(doc2, 1);
+  }
+
+  /// The general ExifTool `Priority => N` duplicate rule
+  /// (`ExifTool.pm:9544-9560`): a NEW duplicate of an already-present
+  /// `(doc, family1, name)` overrides the stored value IFF its priority is
+  /// non-zero AND `>=` the stored one.
+  #[test]
+  fn tagmap_priority_dedup_general_rule() {
+    // (a) Higher priority OVERRIDES the lower (2 >= 1, non-zero) ⇒ last wins.
+    let mut m = TagMap::new();
+    m.insert(0, "G", "P", 1, TagValue::U64(1));
+    m.insert(0, "G", "P", 2, TagValue::U64(2));
+    assert_eq!(m.get("G", "P"), Some(&TagValue::U64(2)));
+
+    // (a') ...and the SURVIVING priority is the higher one, so a later
+    // priority-1 duplicate can NOT override it (1 >= 2 is false).
+    m.insert(0, "G", "P", 1, TagValue::U64(3));
+    assert_eq!(m.get("G", "P"), Some(&TagValue::U64(2)));
+
+    // (b) A priority-0 duplicate NEVER overrides (0 != 0 is false) ⇒ first wins.
+    let mut m = TagMap::new();
+    m.insert(0, "G", "Q", 1, TagValue::U64(10));
+    m.insert(0, "G", "Q", 0, TagValue::U64(99));
+    assert_eq!(m.get("G", "Q"), Some(&TagValue::U64(10)));
+
+    // (b') Two priority-0 entries: neither overrides (`0 != 0` is false), so the
+    // first-extracted wins — the `Warning`/`Error` collision case.
+    let mut m = TagMap::new();
+    m.insert(0, "G", "R", 0, TagValue::U64(1));
+    m.insert(0, "G", "R", 0, TagValue::U64(2));
+    assert_eq!(m.get("G", "R"), Some(&TagValue::U64(1)));
+
+    // (c) Two ordinary priority-1 entries ⇒ faithful last-wins (1 >= 1).
+    let mut m = TagMap::new();
+    m.insert(0, "G", "S", 1, TagValue::U64(1));
+    m.insert(0, "G", "S", 1, TagValue::U64(2));
+    assert_eq!(m.get("G", "S"), Some(&TagValue::U64(2)));
+
+    // (d) The `Warning`/`Error` NAME fallback: a producer passing the default
+    // priority `1` still gets effective-priority-0 first-wins.
+    let mut m = TagMap::new();
+    m.insert(0, "G", "Warning", 1, TagValue::Str("first".into()));
+    m.insert(0, "G", "Warning", 1, TagValue::Str("second".into()));
+    assert_eq!(m.get("G", "Warning"), Some(&TagValue::Str("first".into())));
+
+    // First-occurrence POSITION is always preserved across overrides.
+    let mut m = TagMap::new();
+    m.insert(0, "G", "A", 1, TagValue::U64(1));
+    m.insert(0, "G", "B", 1, TagValue::U64(1));
+    m.insert(0, "G", "A", 2, TagValue::U64(9)); // overrides A in place
+    let names: std::vec::Vec<&str> = m
+      .entries()
+      .iter()
+      .map(|(_, _, n, _, _)| n.as_str())
+      .collect();
+    assert_eq!(names, ["A", "B"]);
   }
 }
