@@ -9280,6 +9280,61 @@ fn jpeg_unknown_header_conformance() {
 }
 
 #[test]
+#[ignore = "port gap: DJI MakerNote / MPF / JFIF / Composite; see #109"]
+fn dji_thermal_rjpeg_conformance() {
+  // DJI Mavic 3 Thermal (M3T) radiometric JPEG from HuggingFace STRDrones/DJI
+  // dataset. Contains DJI MakerNote with thermal data (ThermalData, Emissivity,
+  // AmbientTemperature, ObjectDistance, RelativeHumidity, ReflectedTemperature,
+  // ThermalCalibration, SensorID). Unblocks #109.
+  check(
+    "DJI_M3T_thermal.RJPEG",
+    "DJI_M3T_thermal.RJPEG.json",
+    true,
+  );
+  check(
+    "DJI_M3T_thermal.RJPEG",
+    "DJI_M3T_thermal.RJPEG.n.json",
+    false,
+  );
+}
+
+#[test]
+#[ignore = "port gap: DJI MakerNote / MPF / JFIF / Composite; see #114"]
+fn dji_matrice30t_conformance() {
+  // DJI Matrice 30T (M30T) thermal JPEG from HuggingFace STRDrones/DJI
+  // dataset. Matrice-series enterprise drone with DJI MakerNote. Unblocks #114.
+  check(
+    "DJI_Matrice30T.jpg",
+    "DJI_Matrice30T.jpg.json",
+    true,
+  );
+  check(
+    "DJI_Matrice30T.jpg",
+    "DJI_Matrice30T.jpg.n.json",
+    false,
+  );
+}
+
+#[test]
+#[ignore = "port gap: XMP-GPano / Composite; see #92"]
+fn insta360_equirectangular_conformance() {
+  // Insta360 ONE stitched equirectangular 360° photo from GitHub
+  // hakanson/Insta360-images-20180318. Contains XMP-GPano metadata
+  // (ProjectionType=equirectangular, CaptureSoftware, StitchingSoftware).
+  // Unblocks #92 (spherical projection metadata).
+  check(
+    "Insta360ONE_equirectangular.jpg",
+    "Insta360ONE_equirectangular.jpg.json",
+    true,
+  );
+  check(
+    "Insta360ONE_equirectangular.jpg",
+    "Insta360ONE_equirectangular.jpg.n.json",
+    false,
+  );
+}
+
+#[test]
 fn xmp_base64_control_byte_split_conformance() {
   // Codex R3 F1 regression: `rdf:datatype="base64"` decoded payloads keep
   // ExifTool's binary/text split (XMP.pm:3646-3647 —
