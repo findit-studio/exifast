@@ -139,6 +139,14 @@ const NOT_ACTIVE: &[&str] = &[
   // emit, so it is accept-deferred here (the conformance test excludes exactly
   // those tails and is byte-exact on everything else).
   "QuickTime_insta360_real.insv",
+  // `QuickTime_gopro_hero8_gpmf.mp4` (the real HERO8 Black, #211/#189) — the
+  // gpmd timed-GPS Doc<N> port is SCHEDULED: `process_gopro` flat-merges every
+  // gpmd sample into one `GoProMeta`, so a per-sample Doc<N> timed-source
+  // retrofit (like camm/sony_rtmd/insta360) is needed before the gpmd GPS emits
+  // byte-exact. Until then the conformance test is `#[ignore]`d and the no-`ee`
+  // `.json` carries the `stsd` codec container tags exifast does not emit —
+  // accept-deferred here (same precedent as the two QuickTime fixtures above).
+  "QuickTime_gopro_hero8_gpmf.mp4",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
