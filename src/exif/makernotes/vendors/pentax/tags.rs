@@ -66,6 +66,22 @@ impl PentaxTag {
     self.name
   }
 
+  /// The ExifTool `Priority => N` of this `%Pentax::Main` leaf — `0` for a
+  /// `Priority => 0` row (never overrides an earlier same-`(doc, family1, name)`
+  /// tag, `ExifTool.pm:9544-9560`), `1` (the default) otherwise. The two walked
+  /// `%Pentax::Main` `Priority => 0` rows are `0x0012 ExposureTime`
+  /// (`Pentax.pm:1474`) and `0x0013 FNumber` (`Pentax.pm:1484`). The
+  /// `Priority => 0` rows in walked SUB-tables (`LensRec` `LensType`,
+  /// `LensData` `LensFocalLength`) are marked at their own emit sites.
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_priority(&self) -> u8 {
+    match self.id {
+      0x0012 | 0x0013 => 0,
+      _ => 1,
+    }
+  }
+
   /// `true` when bundled marks the tag `Unknown => 1`.
   #[must_use]
   #[inline(always)]

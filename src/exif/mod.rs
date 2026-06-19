@@ -7331,7 +7331,18 @@ fn emit_pentax_value<S: ExifSink>(
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   let value = pentax_tag.conv.apply(raw, print_conv);
-  out.write_vendor_value("MakerNotes", group1, name, value, pentax_tag.is_unknown())
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x0012
+  // ExposureTime` / `0x0013 FNumber` rows, `1` otherwise) so a `Priority => 0`
+  // leaf never overrides an earlier same-`(doc, family1, name)` value
+  // (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
+    "MakerNotes",
+    group1,
+    name,
+    value,
+    pentax_tag.is_unknown(),
+    pentax_tag.tag_priority(),
+  )
 }
 
 /// Render ONE Samsung Type2 maker-note LEAF into the sink — the emit-time
@@ -7385,12 +7396,17 @@ fn emit_samsung_value<S: ExifSink>(
   if let Some(typed) = typed {
     populate_typed(typed, entry.tag_id, raw);
   }
-  out.write_vendor_value(
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0xa019
+  // FNumber` / `0xa01a FocalLengthIn35mmFormat` rows, `1` otherwise) so a
+  // `Priority => 0` leaf never overrides an earlier same-`(doc, family1, name)`
+  // value (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
     samsung_tag.name(),
     value,
     samsung_tag.is_unknown(),
+    samsung_tag.tag_priority(),
   )
 }
 
@@ -7550,12 +7566,17 @@ fn emit_sony_value<S: ExifSink>(
   if let Some(typed) = typed {
     populate_typed(typed, tag_id, raw, &value);
   }
-  out.write_vendor_value(
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x201b
+  // FocusMode` / `0xb04f DynamicRangeOptimizer` rows, `1` otherwise) so the
+  // sink's priority-aware dedup keeps an EARLIER same-`(doc, family1, name)`
+  // value over a `Priority => 0` leaf (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
     sony_tag.name(),
     value,
     sony_tag.is_unknown(),
+    sony_tag.tag_priority(),
   )
 }
 
@@ -7614,12 +7635,17 @@ fn emit_nikon_value<S: ExifSink>(
   if let Some(typed) = typed {
     populate_typed(typed, entry.tag_id, &value, nikon_tag.name());
   }
-  out.write_vendor_value(
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `%Nikon::Main`
+  // `0x0002 ISO` row, `1` otherwise) so a `Priority => 0` leaf never overrides an
+  // earlier same-`(doc, family1, name)` value (`ExifTool.pm:9544-9560`) — the EXIF
+  // ISO is the more reliable duplicate (`Nikon.pm:1803`).
+  out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
     nikon_tag.name(),
     value,
     nikon_tag.is_unknown(),
+    nikon_tag.tag_priority(),
   )
 }
 

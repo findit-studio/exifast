@@ -748,3 +748,24 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   emit_camera_info(&[], true, &mut em0);
   assert!(em0.is_empty());
 }
+
+/// #284: `%Pentax::LensData` `LensFocalLength` (offset 9) is `Priority => 0`
+/// (`Pentax.pm:4506`) — the marking is carried on the emission so a duplicate
+/// never overrides a higher-priority same-name tag. A sibling LensData leaf
+/// (`LensFStops`) keeps the default priority 1.
+#[test]
+fn lens_data_focal_length_is_priority_zero() {
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), true, &mut em);
+  let prio = |n: &str| {
+    em.iter()
+      .find(|e| e.name() == n)
+      .map(VendorEmission::priority)
+  };
+  assert_eq!(
+    prio("LensFocalLength"),
+    Some(0),
+    "LensData LensFocalLength Priority=>0"
+  );
+  assert_eq!(prio("LensFStops"), Some(1));
+}

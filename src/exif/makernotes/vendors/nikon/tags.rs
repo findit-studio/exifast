@@ -99,6 +99,23 @@ impl NikonTag {
     self.id
   }
 
+  /// The ExifTool `Priority => N` of this `%Nikon::Main` leaf — `0` for a
+  /// `Priority => 0` row (never overrides an earlier same-`(doc, family1, name)`
+  /// tag, `ExifTool.pm:9544-9560`), `1` (the default) otherwise. The sole walked
+  /// `%Nikon::Main` `Priority => 0` leaf is `0x0002 ISO` (`Nikon.pm:1803` — "the
+  /// EXIF ISO is more reliable"). The `Priority => 0` rows in walked SUB-tables
+  /// (`LensData` FocalLength/FNumber/MaxAperture, `ShotInfo` ShutterCount/
+  /// DeletedImageCount, `FlashInfo0100` FlashCompensation) are marked at their
+  /// own emit sites, not here.
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_priority(&self) -> u8 {
+    match self.id {
+      0x0002 => 0,
+      _ => 1,
+    }
+  }
+
   /// Tag `Name`.
   #[must_use]
   #[inline(always)]
@@ -1008,5 +1025,21 @@ mod tests {
     for p in LENS_DATA_0204.iter().chain(LENS_DATA_0800_OLD) {
       assert_eq!(p.read, LensRead::Byte, "{} must be int8u", p.name);
     }
+  }
+
+  /// The sole walked `%Nikon::Main` `Priority => 0` leaf (`0x0002 ISO`,
+  /// `Nikon.pm:1803`) reports priority 0; a non-marked sibling reports the
+  /// default 1 (#284). The walked sub-table `Priority => 0` rows (LensData/
+  /// ShotInfo/FlashInfo) are pinned at their own emit sites, not on `NikonTag`.
+  #[test]
+  fn tag_priority_marks_main_iso() {
+    assert_eq!(lookup(0x0002).unwrap().tag_priority(), 0, "ISO");
+    // A non-`Priority => 0` Main leaf keeps the default priority 1.
+    assert_eq!(
+      lookup(0x0001).unwrap().tag_priority(),
+      1,
+      "MakerNoteVersion"
+    );
+    assert_eq!(lookup(0x0004).unwrap().tag_priority(), 1, "Quality");
   }
 }

@@ -98,6 +98,23 @@ impl SonyTag {
   pub const fn is_unknown(&self) -> bool {
     self.unknown
   }
+
+  /// The ExifTool `Priority => N` of this `%Sony::Main` leaf — `0` for a
+  /// `Priority => 0` row (a duplicate that never overrides an earlier same-`(doc,
+  /// family1, name)` tag, `ExifTool.pm:9544-9560`), `1` (the default,
+  /// `:9553`) otherwise. The two `Priority => 0` rows the port WALKS+emits are
+  /// `0x201b FocusMode` (`Sony.pm:1246`) and `0xb04f DynamicRangeOptimizer`
+  /// (`Sony.pm:2652`); every other `Priority => 0` Sony row lives in a deferred
+  /// sub-table (CameraInfo*/Tag2010*/Tag90xx/AFInfo/SR2DataIFD) that emits no
+  /// leaf, so it never reaches here.
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_priority(&self) -> u8 {
+    match self.id {
+      0x201b | 0xb04f => 0,
+      _ => 1,
+    }
+  }
 }
 
 /// The `Format =>` directive's FORMAT for tag `id` under `%Sony::Main`, if any —
@@ -1352,5 +1369,21 @@ mod tests {
   #[test]
   fn unknown_count_is_17() {
     assert_eq!(SONY_TAGS.iter().filter(|t| t.unknown).count(), 17);
+  }
+
+  /// The two walked `%Sony::Main` `Priority => 0` rows (`0x201b FocusMode`
+  /// `Sony.pm:1246`, `0xb04f DynamicRangeOptimizer` `Sony.pm:2652`) report
+  /// priority 0; a non-marked sibling reports the default 1 (#284).
+  #[test]
+  fn tag_priority_marks_priority0_rows() {
+    assert_eq!(lookup(0x201b).unwrap().tag_priority(), 0, "FocusMode");
+    assert_eq!(
+      lookup(0xb04f).unwrap().tag_priority(),
+      0,
+      "DynamicRangeOptimizer"
+    );
+    // A non-`Priority => 0` Main leaf keeps the default priority 1.
+    assert_eq!(lookup(0x0102).unwrap().tag_priority(), 1, "Quality");
+    assert_eq!(lookup(0xb027).unwrap().tag_priority(), 1, "LensType");
   }
 }

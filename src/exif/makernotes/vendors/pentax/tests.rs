@@ -22,6 +22,8 @@ fn emit_lens_rec_pentax_jpg_pair() {
   emit_lens_rec(&block, true, &mut em);
   assert_eq!(em.len(), 1);
   assert_eq!(em[0].name(), "LensType");
+  // #284: `%Pentax::LensRec` `LensType` is `Priority => 0` (`Pentax.pm:4202`).
+  assert_eq!(em[0].priority(), 0, "LensRec LensType Priority=>0");
   assert_eq!(
     em[0].value(),
     &crate::value::TagValue::Str("Sigma or Tamron Lens (3 44)".into())
