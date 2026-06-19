@@ -1533,7 +1533,34 @@ impl AnyMeta<'_> {
       // PAC / WV, with the matching MIME.
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => {
-        FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
+        // WEBP variants: bundled's `OverrideFileType(..., 'webp')` (the
+        // `Extended WEBP` promotion RIFF.pm:2106, the VP8L ` (lossless)` append
+        // RIFF.pm:1332) passes `'webp'` as the EXPLICIT 3rd `SetFileType`
+        // `$normExt` arg, so `File:FileTypeExtension` is `webp` even though
+        // `Extended WEBP` / `WAV (lossless)` are NOT `%fileTypeExt` keys (the
+        // generic fallback `$normExt = $fileType` would otherwise yield
+        // `extended webp`). The explicit `webp` extension applies to:
+        //  - a plain `WEBP` (its `%fileTypeExt` default is already `webp`), and
+        //    the VP8X-promoted `Extended WEBP` (starts-with check), AND
+        //  - ANY base type whose `VP8X`/`VP8L` chunk actually fired
+        //    `OverrideFileType(..., 'webp')` ([`RiffMeta::webp_ext_override`]) —
+        //    e.g. a non-WEBP WAVE carrying a `VP8L` finalizes as `WAV (lossless)`
+        //    with extension `webp` (verified vs bundled 13.59). A non-WEBP RIFF
+        //    that did NOT fire an override (AVI / WAV / LA / OFR / PAC / WV, or a
+        //    WAVE carrying only a `VP8X` — gated out by `$type ne 'WEBP'`) keeps
+        //    its `%fileTypeExt`-derived extension via `ExplicitWithMime`.
+        if m.file_type().starts_with("WEBP")
+          || m.file_type().starts_with("Extended WEBP")
+          || m.webp_ext_override()
+        {
+          FileTypeFinalize::ExplicitWithMimeAndExt(ExplicitWithMimeAndExt::new(
+            m.file_type(),
+            m.mime(),
+            "webp",
+          ))
+        } else {
+          FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
+        }
       }
       // XMP: `SetFileType()` finalizes to the detected `XMP` candidate.
       // `ProcessXMP` also `SetFileType`s SVG/PLIST/XML for those XML flavours
