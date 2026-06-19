@@ -96,7 +96,7 @@ fn media_metadata_projection_from_riff() {
   let mut riff_meta = None;
   for cand in candidates {
     if let Some(p) = any_parser_for(cand.file_type())
-      && let Some(meta) = p.parse_any(&data, &mut shared, Some("avi"), 0, None)
+      && let Some(meta) = p.parse_any(&data, &mut shared, Some("avi"), 0, None, false)
     {
       if let AnyMeta::Riff(rm) = meta {
         riff_meta = Some(rm);

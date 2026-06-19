@@ -116,12 +116,14 @@ pub mod formats;
 // `QuickTimeMeta`). Unconditional — pure typed data with no serde/json
 // dependency; the QuickTime port's `from_quicktime` projection lives here.
 pub mod metadata;
-// Render-time options (`ParseOptions`) mirroring ExifTool flags that gate the
-// EMITTED tag stream, not the always-on typed domain extraction (the parse
-// walkers extract per-sample data unconditionally). Threaded along the SAME
-// path as the `-j`/`-n` `print_conv` toggle: `extract_info_with_options` /
-// `Rendered::new_with_options` → `serialize_tags` → `EmitOptions`. Unconditional
-// — a tiny `Copy` value-type with no heap or feature dependency.
+// Parse + render options (`ParseOptions`) mirroring ExifTool flags. For most
+// formats these gate only the EMITTED tag stream (the parse walkers extract
+// per-sample data unconditionally), threaded along the `-j`/`-n` `print_conv`
+// path: `extract_info_with_options` / `Rendered::new_with_options` →
+// `serialize_tags` → `EmitOptions`. M2TS's `-ee` LIGOGPS walk is the one
+// PARSE-time consumer (`parse_bytes_with_options` / `media_metadata_with_options`
+// thread it into `parse_any`). Unconditional — a tiny `Copy` value-type with no
+// heap or feature dependency.
 pub mod options;
 // `jsondiff` (value-semantic golden-diff oracle) and `serialize` (the
 // `serde_json` document renderer) depend on `serde_json` + `serde`, gated on
@@ -306,24 +308,60 @@ pub use formats::xmp::ProcessXmp;
 #[cfg(feature = "std")]
 #[must_use]
 pub fn parse_bytes(bytes: &[u8]) -> Option<AnyMeta<'_>> {
+  // The faithful no-`ee` baseline: the default `ParseOptions` keeps
+  // `extract_embedded` off, so the M2TS walk early-stops as bundled does
+  // without `ExtractEmbedded` (no near-EOF LIGOGPS/late-SEI scan), byte-exact
+  // to the prior hard-coded behavior. Use [`parse_bytes_with_options`] for `-ee`.
+  parse_bytes_with_options(bytes, &ParseOptions::default())
+}
+
+/// Like [`parse_bytes`] but driven by an explicit [`ParseOptions`] — the
+/// parse-time companion of [`parse_bytes`].
+///
+/// [`ParseOptions::extract_embedded`] mirrors ExifTool `-ee`. For most formats
+/// the parse is mode-agnostic (the typed per-sample data is always extracted;
+/// only the rendered tag stream is gated, via [`Rendered::new_with_options`]),
+/// so `parse_bytes_with_options(bytes, &ParseOptions::default())` is identical to
+/// [`parse_bytes`]. For **M2TS**, though, `-ee` extends the parse-time walk to
+/// the near-EOF LIGOGPSINFO dashcam-GPS PES (M2TS.pm:347): only an `-ee`
+/// options value here makes the walk reach + decode that GPS, so the returned
+/// [`AnyMeta::M2ts`] (and its [`AnyMeta::project`] →
+/// [`MediaMetadata::gps`](crate::MediaMetadata::gps)) carries the LIGOGPS fix.
+/// A default (no-`ee`) options value keeps the faithful baseline (no LIGOGPS).
+///
+/// See [`parse_bytes`] for the return-value + zero-allocation semantics
+/// (unchanged) and [`media_metadata_with_options`] for the one-call domain
+/// projection of this entry.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn parse_bytes_with_options<'a>(
+  bytes: &'a [u8],
+  options: &ParseOptions,
+) -> Option<AnyMeta<'a>> {
   // Golden-v2 Contract 3d — a `catch_unwind` BACKSTOP at the public boundary.
   // The primary no-panic guarantee is 3a (the recursion budgets) + 3b (the
   // `tests/no_panic.rs` proptest gate); this only converts an UNANTICIPATED
   // panic (a future bug, a slice-index regression, an arithmetic overflow in a
   // debug build) into the same empty result a clean rejection yields, so an
   // untrusted byte stream can never crash the host process. `AssertUnwindSafe`
-  // is sound here: the closure only READS `bytes` (a shared `&[u8]`) and
-  // returns an owned/borrowed result — no `&mut` state is left half-updated
-  // across the boundary.
-  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_bytes_inner(bytes)))
-    .unwrap_or(None)
+  // is sound here: the closure only READS `bytes` (a shared `&[u8]`) +
+  // `extract_embedded` (a `Copy` `bool`) and returns an owned/borrowed result —
+  // no `&mut` state is left half-updated across the boundary.
+  let extract_embedded = options.extract_embedded();
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    parse_bytes_inner(bytes, extract_embedded)
+  }))
+  .unwrap_or(None)
 }
 
-/// Inner body of [`parse_bytes`] (see that fn's doc + Golden-v2 3d note). The
-/// public wrapper adds the `catch_unwind` backstop. `parse_bytes` is itself
-/// `std`-only, so its inner shares that gate.
+/// Inner body of [`parse_bytes`] / [`parse_bytes_with_options`] (see those fns'
+/// docs + Golden-v2 3d note). The public wrappers add the `catch_unwind`
+/// backstop. `extract_embedded` mirrors ExifTool `-ee`: it is threaded into
+/// [`AnyParser::parse_any`](crate::format_parser::AnyParser::parse_any), where
+/// only the M2TS arm consumes it (the parse-time walk-extent gate). Itself
+/// `std`-only, so it shares that gate.
 #[cfg(feature = "std")]
-fn parse_bytes_inner(bytes: &[u8]) -> Option<AnyMeta<'_>> {
+fn parse_bytes_inner(bytes: &[u8], extract_embedded: bool) -> Option<AnyMeta<'_>> {
   // Empty filename ⇒ magic-only detection (ExifTool.pm:2965-3045 with
   // `$ext = undef`). Each candidate is tried in turn; the first parser to
   // return `Some(meta)` wins. Faithful to the legacy
@@ -375,6 +413,12 @@ fn parse_bytes_inner(bytes: &[u8]) -> Option<AnyMeta<'_>> {
       None,
       cand.header_skip(),
       Some(cand.parent_type()),
+      // ExifTool `-ee`, threaded from the caller's [`ParseOptions`]. Only the
+      // M2TS arm consumes it (the parse-time walk-extent gate that reaches the
+      // near-EOF LIGOGPSINFO dashcam-GPS PES, M2TS.pm:347); every other format
+      // parses mode-agnostically. Default ([`parse_bytes`]) is `false` — the
+      // faithful no-`ee` baseline (M2TS early-stops, no LIGOGPS/late-SEI scan).
+      extract_embedded,
     ) {
       return Some(m);
     }
@@ -426,19 +470,44 @@ fn parse_bytes_inner(bytes: &[u8]) -> Option<AnyMeta<'_>> {
 #[cfg(feature = "std")]
 #[must_use]
 pub fn media_metadata(bytes: &[u8]) -> Option<MediaMetadata> {
-  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
-  // Backstop only; 3a (recursion budgets) + 3b (proptest) are the primary
-  // guarantee. `AssertUnwindSafe` is sound: the closure only reads `bytes`.
-  // A caught panic ⇒ `None` (the `Option` default), same as a clean miss.
-  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| media_metadata_inner(bytes)))
-    .unwrap_or_default()
+  // The faithful no-`ee` baseline (default `ParseOptions`). For the M2TS LIGOGPS
+  // dashcam GPS, use [`media_metadata_with_options`] with `-ee` (the walk reaches
+  // the near-EOF LIGOGPSINFO PES only then).
+  media_metadata_with_options(bytes, &ParseOptions::default())
 }
 
-/// Inner body of [`media_metadata`] (see that fn's doc + Golden-v2 3d note).
+/// Like [`media_metadata`] but driven by an explicit [`ParseOptions`] — the
+/// one-call domain projection of [`parse_bytes_with_options`].
+///
+/// This is the product entry for "give me the camera / GPS / capture facts,
+/// honoring `-ee`". In particular, on an **M2TS** dashcam file an `-ee` options
+/// value makes the parse-time walk reach the near-EOF LIGOGPSINFO PES, so the
+/// returned [`MediaMetadata::gps`](crate::MediaMetadata::gps) carries the
+/// LIGOGPS fix (M2TS.pm:347 / [`parse_bytes_with_options`]); a default (no-`ee`)
+/// value keeps the faithful baseline with `gps()` `None` for that LIGOGPS source.
+///
+/// Returns the same `Some`/`None` as [`media_metadata`] (an unknown/empty input
+/// ⇒ `None`).
 #[cfg(feature = "std")]
-fn media_metadata_inner(bytes: &[u8]) -> Option<MediaMetadata> {
-  // `None` from `parse_bytes` (no format matched) maps straight through.
-  parse_bytes(bytes).map(|any| any.project())
+#[must_use]
+pub fn media_metadata_with_options(bytes: &[u8], options: &ParseOptions) -> Option<MediaMetadata> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a (recursion budgets) + 3b (proptest) are the primary
+  // guarantee. `AssertUnwindSafe` is sound: the closure only reads `bytes` +
+  // a `Copy` `bool`. A caught panic ⇒ `None`, same as a clean miss.
+  let extract_embedded = options.extract_embedded();
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    media_metadata_inner(bytes, extract_embedded)
+  }))
+  .unwrap_or_default()
+}
+
+/// Inner body of [`media_metadata`] / [`media_metadata_with_options`] (see those
+/// fns' docs + Golden-v2 3d note). `extract_embedded` mirrors ExifTool `-ee`.
+#[cfg(feature = "std")]
+fn media_metadata_inner(bytes: &[u8], extract_embedded: bool) -> Option<MediaMetadata> {
+  // `None` from the parse (no format matched) maps straight through.
+  parse_bytes_inner(bytes, extract_embedded).map(|any| any.project())
 }
 
 // ===========================================================================
@@ -815,6 +884,44 @@ mod tests {
   fn parse_bytes_empty_input_returns_none() {
     let result = parse_bytes(b"");
     assert!(result.is_none());
+  }
+
+  /// `parse_bytes_with_options` with the default [`ParseOptions`] is identical to
+  /// [`parse_bytes`] (the no-`ee` faithful baseline) — both reject an empty input.
+  #[test]
+  #[cfg(feature = "std")]
+  fn parse_bytes_with_default_options_matches_parse_bytes() {
+    assert!(parse_bytes_with_options(b"", &ParseOptions::default()).is_none());
+    // A non-format buffer is `None` regardless of `-ee`.
+    assert!(
+      parse_bytes_with_options(
+        b"\x00\x00\x00\x00not-a-format",
+        &ParseOptions::default().with_extract_embedded(true),
+      )
+      .is_none()
+    );
+  }
+
+  /// `media_metadata_with_options` over a real Canon JPEG projects the same
+  /// camera domain as [`media_metadata`] — `-ee` is a no-op for a JPEG (no
+  /// `-ee`-gated parse-time walk), so the typed-options entry equals the default.
+  #[test]
+  #[cfg(all(feature = "exif", feature = "std"))]
+  fn media_metadata_with_options_matches_default_for_non_ee_format() {
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/MakerNotes_Canon.jpg"
+    ))
+    .expect("read MakerNotes_Canon.jpg fixture");
+    let base = media_metadata(&bytes).expect("Canon JPEG projects");
+    let ee =
+      media_metadata_with_options(&bytes, &ParseOptions::default().with_extract_embedded(true))
+        .expect("Canon JPEG projects with -ee options too");
+    assert_eq!(
+      base.camera().and_then(|c| c.make().map(str::to_owned)),
+      ee.camera().and_then(|c| c.make().map(str::to_owned)),
+      "-ee is a no-op for a JPEG: the camera make must match the default path"
+    );
   }
 
   /// `media_metadata` over a real Canon JPEG projects the camera domain

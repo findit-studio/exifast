@@ -151,12 +151,16 @@ const NOT_ACTIVE: &[&str] = &[
   "DJI_M3T_thermal.RJPEG",
   "Insta360ONE_equirectangular.jpg",
   "QuickTime_rove_r2_4k.MP4",
-  // The BlackVue DR770X (#213) + Pruveeo D90 (#138) dashcam fixtures — dropped
-  // with goldens + #[ignore]d conformance tests pending their ports (BlackVue
-  // GPS/accelerometer/embedded-JSON; Pruveeo LIGOGPSINFO in MPEG-TS). Their
-  // no-ee .json carries tags exifast does not yet emit, so accept-deferred here.
+  // The BlackVue DR770X (#213) dashcam fixture — dropped with goldens +
+  // #[ignore]d conformance test pending its port (BlackVue GPS/accelerometer/
+  // embedded-JSON). Its no-ee .json carries tags exifast does not yet emit, so
+  // accept-deferred here.
+  // (`MPEG2_TS_pruveeo_d90.ts` (#138/#129) is now ACTIVE — the M2TS LIGOGPSINFO
+  // dashcam timed-GPS port landed: its no-`ee` `.json`/`.n.json` are byte-exact
+  // (M2TS/H264 only; Composite-excluded per the QuickTime/MPEG precedent) and
+  // the `-ee` LIGO GPS is pinned in
+  // `tests/timed_metadata_conformance.rs::pruveeo_d90_ligogps_ee_byte_exact`.)
   "MP4_blackvue_dr770x.mp4",
-  "MPEG2_TS_pruveeo_d90.ts",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
@@ -690,7 +694,10 @@ const NOT_ACTIVE: &[&str] = &[
 /// `RIFF_webp_multi_meta.webp`, #153 Codex R1) activated — they pin the
 /// byte-exact `[minor]` `Improper EXIF header` / `Incorrect XMP tag ID`
 /// warnings and the repeated-chunk ordered-replay tag retention.
-const EXPECTED_ACTIVE_FIXTURES: usize = 536;
+/// 536 → 537 after `MPEG2_TS_pruveeo_d90.ts` (#138/#129) activated — the M2TS
+/// LIGOGPSINFO dashcam timed-GPS port landed (`src/formats/m2ts.rs`), whose
+/// no-`ee` `.json`/`.n.json` (M2TS/H264, Composite-excluded) are byte-exact.
+const EXPECTED_ACTIVE_FIXTURES: usize = 537;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -755,6 +762,8 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
       ext_ref,
       cand.header_skip(),
       Some(cand.parent_type()),
+      // No-`ee` parity oracle (mirrors `extract_info`'s default render mode).
+      false,
     ) {
       Some(meta) => return Some(meta),
       None => shared = SharedFlags::new(),

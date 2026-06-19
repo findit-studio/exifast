@@ -36,7 +36,7 @@ fn synthetic_null_stream_yields_m2ts_meta() {
   let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
   let mut shared = SharedFlags::new();
   let meta = parser
-    .parse_any(&buf, &mut shared, Some("mts"), 0, None)
+    .parse_any(&buf, &mut shared, Some("mts"), 0, None, false)
     .expect("parser accepts the synthetic stream");
   match meta {
     exifast::AnyMeta::M2ts(m) => {
@@ -70,7 +70,7 @@ fn synthetic_188_byte_stream_yields_m2t_file_type() {
   let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
   let mut shared = SharedFlags::new();
   let meta = parser
-    .parse_any(&buf, &mut shared, Some("ts"), 0, None)
+    .parse_any(&buf, &mut shared, Some("ts"), 0, None, false)
     .expect("parser accepts the synthetic stream");
   let m = match meta {
     exifast::AnyMeta::M2ts(m) => m,
@@ -86,7 +86,7 @@ fn truncated_input_is_rejected() {
   let buf = synth_null_192(1); // 192 bytes — well under 383
   let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
   let mut shared = SharedFlags::new();
-  let result = parser.parse_any(&buf, &mut shared, Some("mts"), 0, None);
+  let result = parser.parse_any(&buf, &mut shared, Some("mts"), 0, None, false);
   assert!(result.is_none(), "truncated input must be rejected");
 }
 
@@ -95,7 +95,7 @@ fn random_garbage_is_rejected() {
   let buf = vec![0xa5u8; 2048]; // no sync byte
   let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
   let mut shared = SharedFlags::new();
-  let result = parser.parse_any(&buf, &mut shared, Some("mts"), 0, None);
+  let result = parser.parse_any(&buf, &mut shared, Some("mts"), 0, None, false);
   assert!(result.is_none(), "garbage must be rejected");
 }
 
@@ -284,7 +284,24 @@ fn parse_m2ts(buf: &[u8]) -> exifast::formats::m2ts::Meta<'_> {
   let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
   let mut shared = SharedFlags::new();
   let meta = parser
-    .parse_any(buf, &mut shared, Some("mts"), 0, None)
+    .parse_any(buf, &mut shared, Some("mts"), 0, None, false)
+    .expect("parser accepts the synthetic stream");
+  match meta {
+    exifast::AnyMeta::M2ts(m) => m,
+    other => panic!("expected AnyMeta::M2ts, got {other:?}"),
+  }
+}
+
+/// Like [`parse_m2ts`] but with `extract_embedded = true` (`-ee`). The
+/// LIGOGPSINFO PID-0x0300 decode arm is `-ee`-gated (M2TS.pm:308-318 is an
+/// ExtractEmbedded feature), so any test that needs the LIGOGPS decode to run —
+/// or its `LIGOGPSINFO format error` walker warning to fire — must parse at
+/// `-ee`.
+fn parse_m2ts_ee(buf: &[u8]) -> exifast::formats::m2ts::Meta<'_> {
+  let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
+  let mut shared = SharedFlags::new();
+  let meta = parser
+    .parse_any(buf, &mut shared, Some("mts"), 0, None, true)
     .expect("parser accepts the synthetic stream");
   match meta {
     exifast::AnyMeta::M2ts(m) => m,
@@ -463,6 +480,97 @@ fn h264_extra_frame_accumulates_sps_and_mdpm() {
   );
 }
 
+/// The H.264 full scan to EOF (M2TS.pm:347 `$more = 1`) is `-ee`-GATED.
+///
+/// M2TS.pm:347 forces the forward pass to run to EOF (`$more = 1`) ONLY inside
+/// `if ($$et{OPTIONS}{ExtractEmbedded})`; without `-ee` the H.264 arm returns
+/// `ParseH264Video`'s own `$more`, so the forward pass early-stops the moment
+/// every needed PID is satisfied and a PCR has been seen (M2TS.pm:653). The
+/// per-sample H.264 data is decoded into the same `Meta` either way, but the
+/// WALK EXTENT differs — so a file whose FIRST user-data H.264 SEI lies PAST
+/// that early-stop must NOT have its `H264:*` MDPM tags surface at no-`ee`
+/// (ExifTool early-stops there too) yet MUST surface at `-ee` (the full scan
+/// reaches it).
+///
+/// Stream layout: PAT, PMT (H.264 video + a PCR PID), a first PCR (so the
+/// early-stop's `start_time.is_some()` guard is armed), then THREE SPS-only
+/// (no-user-data) H.264 frames — frame 2's flush leaves `ParsedH264` set so
+/// frame 3's flush returns `Done` at no-`ee`, draining `%needPID` to 0 and
+/// stopping the forward pass — then a long filler run, and FINALLY a frame
+/// carrying the MDPM MakeModel (Canon). At no-`ee` the forward pass has already
+/// stopped before that last frame's packets are read; at `-ee` the forced full
+/// scan reaches them.
+#[test]
+fn h264_full_scan_is_ee_gated_late_first_sei_suppressed_at_no_ee() {
+  let mut buf = Vec::new();
+  buf.extend_from_slice(&ts_packet(0, true, None, &pat(PMT_PID)));
+  let streams = [(0x1bu8, VIDEO_PID, &[][..])];
+  buf.extend_from_slice(&ts_packet(PMT_PID, true, None, &pmt(&streams, PCR_PID)));
+  // A first PCR arms the early-stop guard (`need_count == 0 && start_time`).
+  buf.extend_from_slice(&ts_packet(PCR_PID, false, Some(&pcr_af(10)), &[]));
+  // Three SPS-only frames: frame-2 flush sets `ParsedH264`; frame-3 flush then
+  // returns `Done` at no-`ee` (no user data + already parsed) ⇒ video PID done
+  // ⇒ forward pass stops here (a PCR was seen).
+  for _ in 0..3 {
+    buf.extend_from_slice(&ts_packet(
+      VIDEO_PID,
+      true,
+      None,
+      &pes(0xe0, &h264_no_user_data()),
+    ));
+  }
+  // Long filler PAST the no-`ee` early-stop budget.
+  for _ in 0..32 {
+    buf.extend_from_slice(&ts_packet(0x1fff, false, None, &[0xff; 10]));
+  }
+  // The FIRST user-data H.264 SEI (MDPM MakeModel ⇒ Canon) — reachable only by
+  // the `-ee` full scan. Two frame-starts so the MDPM frame is flushed + parsed
+  // (the second start flushes the MDPM-bearing first; the EOF flush is a no-op
+  // for it). At no-`ee` the forward pass never reaches these packets.
+  buf.extend_from_slice(&ts_packet(
+    VIDEO_PID,
+    true,
+    None,
+    &pes(0xe0, &h264_with_mdpm()),
+  ));
+  buf.extend_from_slice(&ts_packet(
+    VIDEO_PID,
+    true,
+    None,
+    &pes(0xe0, &h264_no_user_data()),
+  ));
+
+  // NO-`ee` (the engine default, mirrored by `parse_m2ts` / `extract_info`):
+  // the forward pass early-stops before the late MDPM ⇒ NO `H264:Make`.
+  let m_no_ee = parse_m2ts(&buf);
+  assert_eq!(
+    m_no_ee.h264().and_then(|h| h.make()),
+    None,
+    "at no-`ee` the `-ee`-gated full scan must NOT run, so a late first \
+     user-data H.264 SEI past the early-stop is never parsed (byte-identical \
+     to the pre-LIGOGPS early-stop behavior)"
+  );
+
+  // `-ee`: the forced full scan (M2TS.pm:347) reaches the late MDPM frame ⇒
+  // `H264:Make` surfaces (this is also the path that reaches the LIGOGPSINFO
+  // PES near EOF — the #129 feature).
+  let parser = any_parser_for("M2TS").expect("M2TS feature enabled");
+  let mut shared = SharedFlags::new();
+  let meta_ee = parser
+    .parse_any(&buf, &mut shared, Some("mts"), 0, None, true)
+    .expect("parser accepts the synthetic stream");
+  let m_ee = match meta_ee {
+    exifast::AnyMeta::M2ts(m) => m,
+    other => panic!("expected AnyMeta::M2ts, got {other:?}"),
+  };
+  assert_eq!(
+    m_ee.h264().and_then(|h| h.make()),
+    Some("Canon"),
+    "at `-ee` the full scan to EOF must reach the late first user-data H.264 \
+     SEI (the same scan that reaches the LIGOGPSINFO PES)"
+  );
+}
+
 /// FINDING 3 — a PES seen BEFORE the PMT must not permanently kill the stream.
 ///
 /// The video elementary PES (PID 0x0011) begins BEFORE the PAT/PMT have
@@ -547,6 +655,117 @@ fn canon_avchd_fixture_extracts_h264_make_canon() {
   assert!(
     got.contains("\"File:FileType\":\"M2TS\""),
     "expected File:FileType=M2TS in:\n{got}"
+  );
+}
+
+// ===========================================================================
+// #307 — the parse-time `-ee` (`ParseOptions`) typed-path wiring + the M2TS
+// LIGOGPS domain-GPS regression. The M2TS walk extent is `-ee`-gated
+// (M2TS.pm:347): the LIGOGPSINFO dashcam-GPS PES sits near EOF, so the typed
+// `parse_bytes` / `media_metadata` path surfaces the LIGOGPS `GpsLocation`
+// ONLY when `-ee` reaches the parse — which the default (no-`ee`) options do
+// NOT. The expected first-fix coords are the Pruveeo D90 `.ee.json` golden's
+// `Doc1` row (`30 deg 24' 9.10" N` / `89 deg 1' 33.12" W`).
+// ===========================================================================
+
+/// First decoded LIGOGPS fix, decimal degrees (the `.ee.json` `Doc1` row).
+const PRUVEEO_FIRST_LAT: f64 = 30.0 + 24.0 / 60.0 + 9.10 / 3600.0; // +30.40252...
+const PRUVEEO_FIRST_LON: f64 = -(89.0 + 1.0 / 60.0 + 33.12 / 3600.0); // -89.02586...
+
+/// `parse_bytes_with_options(.., -ee on)` on the Pruveeo D90 `.ts` extends the
+/// parse-time walk to the near-EOF LIGOGPSINFO PES, decodes it, and projects
+/// the first fix into `media_metadata().gps()` — the product path. The default
+/// (no-`ee`) options early-stop the walk before that PES, so `gps()` is `None`
+/// (the faithful no-`ee` baseline). This is the #307 repro.
+#[cfg(feature = "std")]
+#[test]
+fn pruveeo_ligogps_surfaces_in_media_metadata_only_at_ee() {
+  use exifast::ParseOptions;
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data =
+    std::fs::read(format!("{root}/tests/fixtures/MPEG2_TS_pruveeo_d90.ts")).expect("read fixture");
+
+  // ── -ee ON: the walk reaches the LIGOGPS PES ⇒ domain GPS surfaces. ──
+  let any =
+    exifast::parse_bytes_with_options(&data, &ParseOptions::default().with_extract_embedded(true))
+      .expect("Pruveeo D90 .ts is a recognized M2TS file");
+  let md = any.project();
+  let gps = md
+    .gps()
+    .expect("at -ee the M2TS LIGOGPS first fix must populate MediaMetadata::gps");
+  let lat = gps.latitude().expect("LIGOGPS latitude");
+  let lon = gps.longitude().expect("LIGOGPS longitude");
+  assert!(
+    (lat - PRUVEEO_FIRST_LAT).abs() < 1e-4,
+    "LIGOGPS latitude: got {lat}, expected ~{PRUVEEO_FIRST_LAT}"
+  );
+  assert!(
+    (lon - PRUVEEO_FIRST_LON).abs() < 1e-4,
+    "LIGOGPS longitude: got {lon}, expected ~{PRUVEEO_FIRST_LON}"
+  );
+
+  // The one-call domain entry yields the SAME GPS.
+  let md2 = exifast::media_metadata_with_options(
+    &data,
+    &ParseOptions::default().with_extract_embedded(true),
+  )
+  .expect("media_metadata_with_options recognizes the M2TS file");
+  assert_eq!(
+    md2.gps().and_then(|g| g.latitude()),
+    Some(lat),
+    "media_metadata_with_options must surface the same LIGOGPS latitude"
+  );
+
+  // ── no-`ee` (default): the walk early-stops before the LIGOGPS PES. ──
+  let any_base = exifast::parse_bytes(&data).expect("Pruveeo D90 .ts is recognized at no-ee too");
+  let md_base = any_base.project();
+  assert!(
+    md_base.gps().is_none(),
+    "at no-`ee` the M2TS walk early-stops before the LIGOGPS PES, so the \
+     domain GPS is None (the faithful baseline)"
+  );
+  // The top-level `media_metadata` (default options) agrees.
+  assert!(
+    exifast::media_metadata(&data)
+      .expect("media_metadata recognizes the M2TS file")
+      .gps()
+      .is_none(),
+    "default media_metadata must keep the no-`ee` baseline (gps None)"
+  );
+}
+
+/// The `Rendered::new_with_options` refactor: it now takes the SAME
+/// [`ParseOptions`] the parse entry points take. Rendering an `-ee`-parsed
+/// `AnyMeta` (from `parse_bytes_with_options`) with an `-ee` `ParseOptions`
+/// emits the per-sample `LIGO:*` GPS tags the no-`ee` baseline suppresses. This
+/// pins the unified parse-time + render-time `-ee` shape end-to-end for M2TS.
+#[cfg(all(feature = "json", feature = "serde"))]
+#[test]
+fn pruveeo_rendered_with_ee_options_emits_ligogps_tags() {
+  use exifast::{ParseOptions, Rendered};
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data =
+    std::fs::read(format!("{root}/tests/fixtures/MPEG2_TS_pruveeo_d90.ts")).expect("read fixture");
+
+  let opts = ParseOptions::default().with_extract_embedded(true);
+  // Parse-time `-ee` is required for M2TS so the walk reaches the LIGOGPS PES;
+  // the SAME options drive the render-time emission.
+  let any = exifast::parse_bytes_with_options(&data, &opts).expect("recognized M2TS");
+  let on_json =
+    serde_json::to_string(&Rendered::new_with_options(&any, true, &opts)).expect("serialize -ee");
+  assert!(
+    on_json.contains("LIGO:GPSLatitude"),
+    "-ee render of an -ee-parsed M2TS must emit the LIGOGPS per-sample tags:\n{on_json}"
+  );
+
+  // The default (no-`ee`) render of a no-`ee` parse suppresses them.
+  let base = exifast::parse_bytes(&data).expect("recognized M2TS at no-ee");
+  let off_json = serde_json::to_string(&Rendered::new(&base, true)).expect("serialize no-ee");
+  assert!(
+    !off_json.contains("LIGO:GPSLatitude"),
+    "no-`ee` render must suppress the LIGOGPS per-sample tags:\n{off_json}"
   );
 }
 
@@ -963,6 +1182,241 @@ fn h264_minor_warning_precedes_later_sync_error() {
       "\"ExifTool:Warning\":\"[minor] The ExtractEmbedded option may find more tags in the video data\""
     ),
     "the H.264 minor warning (earlier in walk order) must be the surviving ExifTool:Warning in:\n{json}"
+  );
+}
+
+/// A PES private-stream (`stream_id` 0xbf, `%noSyntax` — no 3-byte PES syntax
+/// header skip, M2TS.pm:925 / `is_no_syntax`) wrapper carrying `payload`
+/// directly after the 6-byte PES prefix. The LIGOGPSINFO dashcam stream
+/// (`type == 6 and $pid == 0x0300`, M2TS.pm:308) rides this private stream, so
+/// the ordinary [`pes`] helper (which injects a `[80 00 00]` syntax header) must
+/// NOT be used — those 3 bytes would be read as the start of the LIGOGPSINFO
+/// block. `pes_packet_length` 0 ⇒ no `packLen`.
+fn pes_no_syntax(payload: &[u8]) -> Vec<u8> {
+  let mut out = vec![0x00, 0x00, 0x01, 0xbf, 0x00, 0x00];
+  out.extend_from_slice(payload);
+  out
+}
+
+/// A MALFORMED `LIGOGPSINFO\0` block that decodes to a `LIGOGPSINFO format
+/// error` (`ParseLigoGPS` rejects it, LigoGPS.pm:235). Layout per
+/// `process_ligogps`: the records start at offset `0x14`, each `0x84` bytes.
+/// The single record is a plain-ASCII-date record (passes `m(^.{4}\d{4}/\d{2}/
+/// \d{2} )s`, LigoGPS.pm:304) whose body `2024/01/01 ` is followed by a
+/// non-whitespace token, so the lead-field regex (date + time + `N/S:lat`
+/// E/W:lon + speed`) fails on the missing time/coordinate fields ⇒ the walker
+/// raises `$et->Warn('LIGOGPSINFO format error')`.
+fn malformed_ligogps_block() -> Vec<u8> {
+  let mut blk = Vec::new();
+  blk.extend_from_slice(b"LIGOGPSINFO\0"); // 12-byte header prefix
+  // Pad to the 0x14 (20) records offset; 0xff keeps the `pos-8` no-fuzz probe
+  // (`\0\0\0[\x01\x14]`, LigoGPS.pm:299) from matching (irrelevant to the
+  // format-error path, but avoids any incidental behavior change).
+  while blk.len() < 0x14 {
+    blk.push(0xff);
+  }
+  // TWO 0x84-byte records (so the PES — 6-byte prefix + 0x14 offset + 2*0x84 =
+  // 290 bytes — spans two TS packets, letting the type-6 accumulator cross the
+  // 256-byte `SAVE_LEN_SMALL` in-loop dispatch threshold). Each record: [0..4]
+  // counter, [4..15] = "2024/01/01 " (the ASCII date LigoGPS.pm:304 accepts),
+  // then a single non-whitespace token so the LigoGPS.pm:235 lead-field regex
+  // fails (no time / coordinate fields) ⇒ `LIGOGPSINFO format error`.
+  let mut rec = Vec::new();
+  rec.extend_from_slice(&[0u8; 4]); // counter (NOT "####" ⇒ the plain-ASCII arm)
+  rec.extend_from_slice(b"2024/01/01 "); // YYYY/MM/DD + space (11 bytes)
+  rec.extend_from_slice(&[b'X'; 0x84 - 4 - 11]); // garbage, no whitespace/NUL
+  assert_eq!(rec.len(), 0x84);
+  blk.extend_from_slice(&rec);
+  blk.extend_from_slice(&rec);
+  blk
+}
+
+/// Codex R3 FINDING (ordering) — a malformed LIGOGPSINFO PES that decodes
+/// (raising `LIGOGPSINFO format error`, LigoGPS.pm:235) BEFORE a later `M2TS
+/// synchronization error` (M2TS.pm:708) must be the document `ExifTool:Warning`
+/// survivor — the LIGOGPS warning is a DOCUMENT-level `$et->Warn` pushed AT ITS
+/// PID-0x0300 PES walk position (not appended after the structural corpus), so
+/// the priority-0 FIRST-wins resolution (ExifTool.pm `%noDups`; Extra.pm
+/// Warning `Priority => 0`) keeps the EARLIER LIGOGPS warning, NOT the later
+/// sync error. Mirrors `h264_minor_warning_precedes_later_sync_error`.
+///
+/// The PMT declares PID 0x0300 as stream-type 6 (`ISO 13818-1 PES private
+/// data`); it is NOT auto-needed, but the elementary-stream path accumulates
+/// it and (no PCR ⇒ the walk never early-stops) dispatches it IN-LOOP once the
+/// accumulator reaches `SAVE_LEN_SMALL` (256 bytes) across two TS packets, i.e.
+/// at the LIGOGPS PES walk position, BEFORE the trailing bad-sync packet.
+#[cfg(feature = "json")]
+#[test]
+fn ligogps_format_error_precedes_later_sync_error() {
+  const LIGO_PID: u16 = 0x0300;
+  let block = malformed_ligogps_block();
+  let pes = pes_no_syntax(&block);
+  // Split the PES across a START packet + one continuation so the type-6
+  // accumulator crosses the 256-byte `SAVE_LEN_SMALL` in-loop dispatch
+  // threshold AT the LIGOGPS walk position (a single TS packet's ~178-byte
+  // payload is below it ⇒ would otherwise dispatch only at the EOF flush).
+  // 184 = one TS packet's full payload (4-byte TS header + 184 = 188); the
+  // continuation then carries the remaining bytes so the type-6 accumulator
+  // reaches >= 256 IN-LOOP, at the LIGOGPS PES walk position.
+  let split = 184usize.min(pes.len());
+  let (head, tail) = pes.split_at(split);
+  assert!(
+    !tail.is_empty(),
+    "the PES must span two TS packets for in-loop dispatch"
+  );
+
+  let mut buf = Vec::new();
+  buf.extend_from_slice(&ts_packet(0, true, None, &pat(PMT_PID)));
+  let streams = [(6u8, LIGO_PID, &[][..])];
+  buf.extend_from_slice(&ts_packet(PMT_PID, true, None, &pmt(&streams, PCR_PID)));
+  // LIGOGPSINFO PES: start packet (PES prefix + header), then a continuation
+  // that pushes the accumulator past the in-loop dispatch threshold.
+  buf.extend_from_slice(&ts_packet(LIGO_PID, true, None, head));
+  buf.extend_from_slice(&ts_packet(LIGO_PID, false, None, tail));
+  // A bad-sync packet AFTER the LIGOGPS PES decoded -> sync error (later walk).
+  buf.extend_from_slice(&ts_packet_bad_sync(0x1fff));
+  for _ in 0..4 {
+    buf.extend_from_slice(&ts_packet(0x1fff, false, None, &[0xff; 10]));
+  }
+
+  // The typed corpus must carry the LIGOGPS warning BEFORE the sync error in
+  // WALK order (the in-walk push), so the FIRST-wins document survivor is it.
+  // Parsed at `-ee`: the LIGOGPSINFO decode arm (and its walker warning) is now
+  // `-ee`-gated (#307), so the malformed PES is only decoded under `-ee`.
+  use exifast::diagnostics::Diagnose;
+  let m = parse_m2ts_ee(&buf);
+  let msgs: Vec<_> = Diagnose::diagnostics(&m)
+    .iter()
+    .map(|d| d.message().to_string())
+    .collect();
+  let ligo_idx = msgs.iter().position(|x| x == "LIGOGPSINFO format error");
+  let sync_idx = msgs.iter().position(|x| x == "M2TS synchronization error");
+  assert!(
+    ligo_idx.is_some(),
+    "expected a 'LIGOGPSINFO format error' diagnostic, got {msgs:?}"
+  );
+  assert!(
+    sync_idx.is_some(),
+    "expected a later 'M2TS synchronization error' diagnostic, got {msgs:?}"
+  );
+  assert!(
+    ligo_idx < sync_idx,
+    "the LIGOGPS warning must precede the sync error in walk order, got {msgs:?}"
+  );
+  // Single-emit guarantee: the latch keeps the LIGOGPS warning to ONE entry.
+  assert_eq!(
+    msgs
+      .iter()
+      .filter(|x| **x == "LIGOGPSINFO format error")
+      .count(),
+    1,
+    "the LIGOGPS warning must be emitted exactly once (latched), got {msgs:?}"
+  );
+
+  // End-to-end: the surviving document `ExifTool:Warning` is the LIGOGPS one.
+  // The `-ee` options reach the LIGOGPSINFO decode arm (the warning is a decode
+  // product, so the no-`ee` document would NOT carry it — #307).
+  let json = exifast::parser::extract_info_with_options(
+    "ligo_sync.mts",
+    &buf,
+    true,
+    exifast::ParseOptions::default().with_extract_embedded(true),
+  );
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"LIGOGPSINFO format error\""),
+    "the earlier LIGOGPS warning must be the surviving ExifTool:Warning in:\n{json}"
+  );
+}
+
+/// A VALID `LIGOGPSINFO\0` block carrying ONE plain-ASCII GPS record (the
+/// Redtiger/F9 4K format `process_ligogps` accepts, LigoGPS.pm:304): `[counter]
+/// YYYY/MM/DD HH:MM:SS [NS]:lat [EW]:lon spd km/h …`. The PES is 12 (header) + 8
+/// (preamble, records-offset 0x14) + 0x84 (one record) = 152 bytes ⇒ `noFuzz ==
+/// (len != 200) == true`, so the record decodes WITHOUT defuzzing — straight to
+/// the lat/lon the text spells. With `N:45.500 W:120.500` the first fix is
+/// +45.500 / -120.500.
+fn valid_ligogps_block() -> Vec<u8> {
+  let mut blk = Vec::new();
+  blk.extend_from_slice(b"LIGOGPSINFO\0"); // 12-byte header prefix
+  // 8-byte preamble: bytes [0x0c..0x10] = [0,0,0,0x14] put the records offset at
+  // 0x14 (the `process_ligogps` auto-detect, LigoGPS.pm:299), then 4 zero bytes.
+  blk.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]);
+  // One 0x84-byte record: 4-byte counter + the plain-ASCII GPS line, NUL-padded.
+  let mut rec = Vec::with_capacity(0x84);
+  rec.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // counter (NOT "####")
+  rec.extend_from_slice(b"2024/06/15 14:30:00 N:45.500 W:120.500 50.0 km/h H:100.0");
+  while rec.len() < 0x84 {
+    rec.push(0);
+  }
+  assert_eq!(rec.len(), 0x84);
+  blk.extend_from_slice(&rec);
+  blk
+}
+
+/// #307 — the LIGOGPSINFO decode is gated EXPLICITLY on parse-time
+/// `extract_embedded`, NOT on the incidental walk extent. Build an M2TS whose
+/// PID-0x0300 LIGOGPSINFO PES appears EARLY and that has NO PCR — so the forward
+/// pass NEVER early-stops (the `need_count == 0 && start_time` guard never arms)
+/// and the PES is reached on EVERY parse, no-`ee` or `-ee`. The `Project`
+/// projection copies any decoded first fix into `MediaMetadata::gps`
+/// MODE-INDEPENDENTLY, so were the decode tied only to the walk position this
+/// stream WOULD surface GPS at the default no-`ee` `media_metadata` — violating
+/// the #307 contract (this LIGOGPS GPS only at parse-time `-ee`). With the decode
+/// `-ee`-gated, no-`ee` decodes NOTHING (gps `None`), `-ee` decodes the fix.
+#[cfg(feature = "std")]
+#[test]
+fn ligogps_early_pid_decode_is_extract_embedded_gated_not_walk_position() {
+  use exifast::ParseOptions;
+  const LIGO_PID: u16 = 0x0300;
+
+  // PMT declares PID 0x0300 as stream-type 6 (`PES private data`); NO PCR PID is
+  // signalled (PCR_PID == 0x1fff, the reserved null PID — never carries a PCR),
+  // so the walk has no last-PCR to early-stop toward: it runs to EOF regardless
+  // of mode, reaching the LIGOGPS PES on BOTH parses.
+  let block = valid_ligogps_block();
+  let pes = pes_no_syntax(&block);
+  let mut buf = Vec::new();
+  buf.extend_from_slice(&ts_packet(0, true, None, &pat(PMT_PID)));
+  let streams = [(6u8, LIGO_PID, &[][..])];
+  buf.extend_from_slice(&ts_packet(PMT_PID, true, None, &pmt(&streams, 0x1fff)));
+  // The LIGOGPS PES rides one START packet near the FRONT of the stream — long
+  // before any (here, nonexistent) early-stop. The 152-byte block fits one TS
+  // packet; the EOF flush dispatches it through `parse_pid` (the `-ee`-gated arm).
+  buf.extend_from_slice(&ts_packet(LIGO_PID, true, None, &pes));
+  // A little trailing inert null filler so the PES is plainly NOT the last thing
+  // in the stream (the "appears early" intent), without adding a PCR.
+  for _ in 0..4 {
+    buf.extend_from_slice(&ts_packet(0x1fff, false, None, &[0xff; 10]));
+  }
+
+  // ── default (no-`ee`): the decode is suppressed ⇒ NO domain GPS, even though
+  //    the walk reaches the PID (no PCR ⇒ no early-stop). ──
+  let md_base = exifast::media_metadata(&buf).expect("recognized M2TS at no-ee");
+  assert!(
+    md_base.gps().is_none(),
+    "no-`ee` must NOT surface LIGOGPS GPS even when the PID-0x0300 PES is reached \
+     (the decode is `extract_embedded`-gated, not walk-position-gated): got {:?}",
+    md_base.gps()
+  );
+
+  // ── `-ee`: the decode runs ⇒ the first fix flows to `MediaMetadata::gps`. ──
+  let md_ee = exifast::media_metadata_with_options(
+    &buf,
+    &ParseOptions::default().with_extract_embedded(true),
+  )
+  .expect("recognized M2TS at -ee");
+  let gps = md_ee
+    .gps()
+    .expect("at -ee the early LIGOGPS PES decodes and projects MediaMetadata::gps");
+  let lat = gps.latitude().expect("LIGOGPS latitude");
+  let lon = gps.longitude().expect("LIGOGPS longitude");
+  assert!(
+    (lat - 45.500).abs() < 1e-3,
+    "LIGOGPS latitude: got {lat}, expected ~45.500"
+  );
+  assert!(
+    (lon - -120.500).abs() < 1e-3,
+    "LIGOGPS longitude: got {lon}, expected ~-120.500"
   );
 }
 

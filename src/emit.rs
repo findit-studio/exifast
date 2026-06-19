@@ -326,8 +326,8 @@ mod tests {
 
   /// [`EmitOptions::g1`] carries the requested conv mode + `-ee` flag and the
   /// `-G1` (doc-collapsed) group rendering — the documented default the typed
-  /// `serialize_tags` path builds until the `ParseOptions` task threads the real
-  /// `-ee`.
+  /// `serialize_tags` path builds; the public `-ee`/`-G3` toggle that feeds this
+  /// is [`crate::ParseOptions`] (via `Rendered::new_with_options`).
   #[test]
   fn emit_options_g1_defaults() {
     let opts = EmitOptions::g1(ConvMode::ValueConv, false);

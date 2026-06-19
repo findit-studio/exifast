@@ -1,19 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
-//! Render-time options mirroring the ExifTool flags that change EMISSION, not
-//! the always-on typed domain extraction.
+//! Parse- and render-time options mirroring the ExifTool flags that change what
+//! is extracted / emitted, not the always-on typed domain extraction.
 //!
-//! The parse walkers ALWAYS extract the full typed per-sample data (the domain
-//! layer needs it regardless); only the rendered tag STREAM is gated. So these
-//! options ride the same render path as the `-j`/`-n` `print_conv` toggle, not
-//! the parse signature — see [`crate::parser::extract_info_with_options`] /
+//! For MOST formats the parse walkers ALWAYS extract the full typed per-sample
+//! data (the domain layer needs it regardless) and only the rendered tag STREAM
+//! is gated, so [`extract_embedded`](ParseOptions::extract_embedded) rides the
+//! render path beside the `-j`/`-n` `print_conv` toggle — see
+//! [`crate::parser::extract_info_with_options`] /
 //! [`crate::format_parser::Rendered::new_with_options`].
+//!
+//! ONE format (M2TS, M2TS.pm:347) makes the `-ee` full-scan-to-EOF part of the
+//! PARSE itself: the LIGOGPSINFO dashcam-GPS PES sits near EOF and is reached
+//! only when the walk extent is `-ee`-driven, so `extract_embedded` is ALSO
+//! threaded into the parse signature there (the same `ParseOptions` value drives
+//! both). [`crate::parse_bytes_with_options`] /
+//! [`crate::media_metadata_with_options`] take `&ParseOptions` so a typed caller
+//! gets the parse-time `-ee` walk (and thus the M2TS LIGOGPS
+//! [`GpsLocation`](crate::metadata::GpsLocation) in
+//! [`MediaMetadata::gps`](crate::metadata::MediaMetadata::gps)); the default
+//! [`ParseOptions`] keeps the faithful no-`ee` baseline.
 
-/// Render/emit options. [`extract_embedded`](Self::extract_embedded) mirrors
-/// ExifTool `-ee`: it gates whether the per-sample timed-metadata tags are
-/// emitted, NOT whether they are parsed (the typed per-sample data — and thus
-/// the domain `GpsLocation` — is parsed unconditionally).
+/// Parse + render options. [`extract_embedded`](Self::extract_embedded) mirrors
+/// ExifTool `-ee`: for most formats it gates only whether the per-sample
+/// timed-metadata tags are EMITTED (the typed per-sample data is parsed
+/// unconditionally), but for M2TS it ALSO drives the parse-time walk extent that
+/// reaches the LIGOGPSINFO dashcam-GPS PES near EOF (M2TS.pm:347), so an `-ee`
+/// [`crate::parse_bytes_with_options`] / [`crate::media_metadata_with_options`]
+/// is what surfaces the M2TS LIGOGPS GPS into the domain layer.
 /// [`group3`](Self::group3) mirrors `-G3:1`: it switches the JSON key from the
 /// default `-G1` (`<family1>:<name>`, the family-3 sub-document axis collapsed)
 /// to `Doc<N>:<family1>:<name>` (one row per timed sample).
@@ -33,9 +48,12 @@ pub struct ParseOptions {
 impl ParseOptions {
   /// Enable ExifTool `-ee` (extract embedded): emit the per-sample timed
   /// metadata. Default off ⇒ the document carries the `[minor] ExtractEmbedded`
-  /// warning instead and the per-sample tags are suppressed; the typed
-  /// per-sample data is ALWAYS parsed regardless, so the domain `GpsLocation`
-  /// is unaffected by this flag.
+  /// warning instead and the per-sample tags are suppressed. For most formats
+  /// the typed per-sample data is parsed regardless (only the rendered stream is
+  /// gated); for M2TS this flag ALSO extends the parse-time walk to the
+  /// near-EOF LIGOGPSINFO dashcam-GPS PES, so an M2TS LIGOGPS
+  /// [`GpsLocation`](crate::metadata::GpsLocation) surfaces only when this is set
+  /// on a parse-time options value ([`crate::parse_bytes_with_options`]).
   #[must_use]
   #[inline(always)]
   pub const fn with_extract_embedded(mut self, on: bool) -> Self {
