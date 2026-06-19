@@ -139,6 +139,17 @@ const NOT_ACTIVE: &[&str] = &[
   // emit, so it is accept-deferred here (the conformance test excludes exactly
   // those tails and is byte-exact on everything else).
   "QuickTime_insta360_real.insv",
+  // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
+  // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
+  // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
+  // byte-exact at `-ee` (see
+  // `tests/timed_metadata_conformance.rs::canon_ctmd_real_cr3_priority_dedup_byte_exact`).
+  // Its no-`ee` `.json`/`.n.json` are accept-deferred: bundled extracts the FULL
+  // CTMD metadata WITHOUT `-ee` for a still-image RAW (145 keys), but exifast
+  // gates CTMD behind `-ee` (a separate QuickTime-container item) and at no-`ee`
+  // emits only the structural moov/track scalars + the `Track1:Warning`
+  // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
+  "CanonRaw_ctmd.cr3",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`

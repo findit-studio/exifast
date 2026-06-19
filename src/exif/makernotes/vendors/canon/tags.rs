@@ -300,6 +300,38 @@ impl SubTable {
         | SubTable::ColorBalance
     )
   }
+
+  /// The ExifTool `Priority => N` for an emitted leaf `name` of this WALKED
+  /// sub-table — `0` for a `Priority => 0` row, `1` (the default,
+  /// `ExifTool.pm:9553`) otherwise.
+  ///
+  /// Faithful to the `Priority => 0` rows of the sub-tables this port WALKS
+  /// (`is_walked`): `Canon::ShotInfo` `BaseISO` (`Canon.pm:2789`), `FNumber`
+  /// (`:2959`), `ExposureTime` (`:2973`/`:2986` — both conditional-list
+  /// branches); `Canon::FocalLength` `FocalLength` (`:2710`). The other walked
+  /// tables (`CameraSettings`/`FileInfo`/`AFInfo`/`AFInfo2`/`AFInfo3`/
+  /// `SensorInfo`/`ColorBalance`) carry NO `Priority => 0` row. The NON-walked
+  /// tables that DO (`CameraInfo*` `OwnerName`/`LensSerialNumber`, `Processing`
+  /// `Sharpness`, `LensInfo` `LensSerialNumber`, `Composite` `ISO`) never reach
+  /// here — their parent pointer is suppressed (`is_walked() == false`) so no
+  /// leaf is emitted.
+  ///
+  /// A `Priority => 0` Canon leaf NEVER overrides an earlier same-`(doc,
+  /// family1, name)` duplicate (`ExifTool.pm:9544-9560`): this matters for the
+  /// CTMD timed-metadata re-dispatch (`MakerNotes:Track<N>:FNumber` from
+  /// `ShotInfo` must NOT clobber the `ExposureInfo` `FNumber` of the same
+  /// sample), and is INERT on the static-file path (the `ShotInfo` leaf lands
+  /// in the `Canon` family-1 group, not colliding with EXIF `ExifIFD:FNumber`).
+  #[must_use]
+  #[inline(always)]
+  pub fn tag_priority(self, name: &str) -> u8 {
+    let priority_zero = matches!(
+      (self, name),
+      (SubTable::ShotInfo, "BaseISO" | "FNumber" | "ExposureTime")
+        | (SubTable::FocalLength, "FocalLength")
+    );
+    u8::from(!priority_zero)
+  }
 }
 
 /// `%Canon::Main` (`Canon.pm:1221-2209`). Sorted by tag ID.

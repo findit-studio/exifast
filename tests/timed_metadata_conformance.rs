@@ -2091,6 +2091,73 @@ fn canon_ctmd_exifinfo_n_match_bundled() {
   }
 }
 
+/// The deferred Canon `MakerNote` sub-tables the REAL `CanonRaw_ctmd.cr3` CTMD
+/// re-dispatch reaches but exifast does NOT walk — their parent SubDirectory
+/// pointer is suppressed (`SubTable::is_walked() == false`, issues #84/#85), so
+/// no leaf is emitted: `Canon::Processing` (ToneCurve / Sharpness /
+/// SharpnessFrequency / WhiteBalanceRed/Blue / ColorTemperature / PictureStyle /
+/// DigitalGain / WBShift / UnsharpMask… / SensorRed/BlueLevel) and
+/// `Canon::VignettingCorr2` (VignettingCorrVersion + the four lens-correction
+/// `*Setting` flags). NONE collide with a tag exifast DOES emit; they are the
+/// only structural absences in the otherwise byte-identical `-ee` stream.
+const CR3_CTMD_EXCL: &[&str] = &[
+  // Canon::Processing (`Canon.pm:7203-7290`).
+  "ToneCurve",
+  "Sharpness",
+  "SharpnessFrequency",
+  "WhiteBalanceRed",
+  "WhiteBalanceBlue",
+  "ColorTemperature",
+  "PictureStyle",
+  "DigitalGain",
+  "WBShiftAB",
+  "WBShiftGM",
+  "UnsharpMaskFineness",
+  "UnsharpMaskThreshold",
+  "SensorRedLevel",
+  "SensorBlueLevel",
+  // Canon::VignettingCorr2 (`Canon.pm`) — version + lens-correction flags.
+  "VignettingCorrVersion",
+  "PeripheralLightingSetting",
+  "ChromaticAberrationSetting",
+  "DistortionCorrectionSetting",
+  "DigitalLensOptimizerSetting",
+];
+
+// REAL Canon CR3 (`CanonRaw_ctmd.cr3`, a minimal CRX still-RAW), the #81 phase-2
+// proof: ExifTool keeps the CTMD `ExposureInfo` `FNumber 3.5` / `ExposureTime
+// 1/80` (`Canon::CTMD/ExposureInfo` `Priority => 1`) over the Canon `ShotInfo`
+// `FNumber 3.6` / `ExposureTime 1/70` (`Canon::ShotInfo` `Priority => 0`) that
+// the type-7 `0x927c` MakerNote re-dispatch ALSO produces under the same
+// collapsed `Track1:` row. Pre-fix, the `ShotInfo` values (emitted later in walk
+// order) clobbered the `ExposureInfo` ones; marking the Canon `Priority => 0`
+// rows priority-0 + honoring that in the CTMD `Doc<N>` dedup keeps the
+// ExposureInfo value, matching bundled. The 5 proof tags
+// (`TimeStamp`/`FocalLength`/`FNumber 3.5`/`ExposureTime 1/80`/`RecordMode
+// CR3+JPEG`) + every other emitted tag are byte-exact at BOTH `-G1` and `-G3`;
+// the only absences are the deferred [`CR3_CTMD_EXCL`] sub-tables. Oracle:
+// bundled ExifTool 13.59 (`-ee` / `-ee -G3:1`, `-x System:all -x Composite:all`).
+//
+// The fixture is accept-deferred from the no-`ee` byte-exact set
+// (`tests/typed_serde_parity.rs::NOT_ACTIVE`): bundled extracts the WHOLE CTMD
+// metadata WITHOUT `-ee` for a still-image RAW, which exifast gates behind `-ee`
+// (a separate QuickTime-container item) — so the proof is pinned here at `-ee`.
+#[test]
+fn canon_ctmd_real_cr3_priority_dedup_byte_exact() {
+  check_ee_excluding(
+    "CanonRaw_ctmd.cr3",
+    "CanonRaw_ctmd.cr3.ee.json",
+    false,
+    CR3_CTMD_EXCL,
+  );
+  check_ee_excluding(
+    "CanonRaw_ctmd.cr3",
+    "CanonRaw_ctmd.cr3.ee.g3.json",
+    true,
+    CR3_CTMD_EXCL,
+  );
+}
+
 // Canon CTMD `ExifInfo` 0x8769 re-dispatch with a NESTED EXIF sub-IFD.
 // The 0x8769 ProcessExifInfo TIFF's IFD0 carries ExposureTime + ISO AND a 0xa005
 // InteropOffset → a nested InteropIFD with InteropIndex (0x0001 "R98"). When

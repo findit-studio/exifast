@@ -6295,7 +6295,32 @@ impl crate::emit::Taggable for Meta<'_> {
           );
         }
         if g3 {
-          tags.append(&mut ctmd_scratch);
+          // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
+          // `ctmd_scratch` carry one doc. Collapse the within-sample `(family1,
+          // name)` duplicates HONORING `Priority => N` BEFORE appending: a later
+          // same-key row overrides the earlier ONLY when its priority is
+          // non-zero AND `>=` the stored one (`ExifTool.pm:9544-9560`), keeping
+          // the priority-winner at the EARLIER row's position. This is what
+          // makes the re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority =>
+          // 0`, emitted after the type-5 payload) NOT clobber this sample's
+          // `ExposureInfo` `FNumber` (`Priority => 1`) — matching bundled
+          // (`Doc<N>:Track<N>:FNumber` = the ExposureInfo value).
+          let mut g3_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+            std::vec::Vec::new();
+          for tag in ctmd_scratch.drain(..) {
+            let key = (
+              smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+              smol_str::SmolStr::new(tag.tag().name()),
+            );
+            if let Some(slot) = g3_vals.iter_mut().find(|(k, _)| *k == key) {
+              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+                slot.1 = tag;
+              }
+            } else {
+              g3_vals.push((key, tag));
+            }
+          }
+          tags.extend(g3_vals.into_iter().map(|(_, tag)| tag));
         } else {
           if cur_doc != Some(doc_n) {
             flush_doc(&mut doc_vals, &mut ctmd_committed, &mut tags);
@@ -6307,7 +6332,15 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              // Within-sample last-wins, HONORING `Priority => N`: a later
+              // same-`(family1, name)` row overrides the stored value ONLY when
+              // its priority is non-zero AND `>=` the stored one
+              // (`ExifTool.pm:9544-9560`). So the `ShotInfo` `Track<N>:FNumber`
+              // (`Priority => 0`) leaves the earlier `ExposureInfo` `FNumber`
+              // (`Priority => 1`) in place — the `-G1` half of the CTMD fix.
+              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -10223,11 +10256,16 @@ fn emit_ctmd_exif_info(
       for e in emissions {
         // The engine's Unknown-suppression runs centrally; the caller's CTMD
         // scratch is appended into the engine sink, so carry the flag through.
-        out.push(EmittedTag::new(
+        // Carry the emission's `Priority => N` too (`0` for the `Canon::ShotInfo`
+        // `FNumber`/`ExposureTime`/`BaseISO` rows): a `Track<N>:FNumber` from the
+        // re-dispatched ShotInfo must NOT override this sample's earlier
+        // `ExposureInfo` `FNumber` (`ExifTool.pm:9544-9560`).
+        out.push(EmittedTag::new_with_priority(
           group.clone(),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
+          e.priority(),
         ));
       }
     }
