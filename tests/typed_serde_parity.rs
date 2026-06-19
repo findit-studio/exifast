@@ -147,6 +147,15 @@ const NOT_ACTIVE: &[&str] = &[
   // `.json` carries the `stsd` codec container tags exifast does not emit —
   // accept-deferred here (same precedent as the two QuickTime fixtures above).
   "QuickTime_gopro_hero8_gpmf.mp4",
+  // The #285 round-2 real-device fixtures (#109/#114/#92/#100) — dropped with
+  // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
+  // MPF/JFIF for Matrice+thermal, XMP-GPano for the Insta360 equirect, the Rove
+  // dashcam GPS). Their no-ee .json carries tags exifast does not yet emit, so
+  // accept-deferred here until each port lands (then they move to active).
+  "DJI_M3T_thermal.RJPEG",
+  "DJI_Matrice30T.jpg",
+  "Insta360ONE_equirectangular.jpg",
+  "QuickTime_rove_r2_4k.MP4",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is

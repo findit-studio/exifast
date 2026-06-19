@@ -1,6 +1,6 @@
 [{
   "SourceFile": "QuickTime_rove_r2_4k.MP4",
-  "ExifTool:ExifToolVersion": 13.55,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "MP4",
   "File:FileTypeExtension": "mp4",
   "File:MIMEType": "video/mp4",
@@ -82,10 +82,5 @@
   "Track2:AudioBitsPerSample": 16,
   "Track2:AudioSampleRate": 32000,
   "UserData:Format": "NOVATEK",
-  "UserData:Information": "DEMO1",
-  "Composite:ImageSize": "1920x1080",
-  "Composite:Megapixels": 2.1,
-  "Composite:AvgBitrate": "20.6 Mbps",
-  "Composite:Rotation": 0,
-  "Composite:GPSPosition": "40 deg 26' 13.87\" N, 79 deg 57' 46.93\" W"
+  "UserData:Information": "DEMO1"
 }]
