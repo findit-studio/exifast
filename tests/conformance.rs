@@ -8,8 +8,7 @@
 //! insensitivity is still kept: `1 == 1.0`, `3.4e+38 == 3.4e38`). The
 //! serializer reproduces ExifTool's exact `EscapeJSON` bare-number-vs-quoted-
 //! string typing, so the goldens pin that typing. One case per ported format —
-//! add a `#[test]
-#[ignore]` per format as it lands (FORMATS.md order).
+//! add a `#[test]` per format as it lands (FORMATS.md order).
 //!
 //! Gated on `feature = "json"`: the suite imports the `json`-gated `jsondiff`,
 //! and `std` does NOT imply `json`, so a `--features std,id3` test build must
@@ -10811,12 +10810,13 @@ fn png_rawprofile_xmp_conformance() {
   );
 }
 
-// Add one `#[test]
-#[ignore]` per ported format here, in FORMATS.md order, each
+// Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
 
 // #213 — BlackVue DR770X dashcam (PittaSoft) with GPS, accelerometer, embedded JSON metadata
+
+
 
 // #213 — BlackVue DR770X dashcam (PittaSoft) with GPS, accelerometer, embedded JSON metadata
 #[test]
@@ -10824,4 +10824,12 @@ fn png_rawprofile_xmp_conformance() {
 fn mp4_blackvue_dr770x_conformance() {
     check("MP4_blackvue_dr770x.mp4", "MP4_blackvue_dr770x.mp4.json", true);
     check("MP4_blackvue_dr770x.mp4", "MP4_blackvue_dr770x.mp4.n.json", false);
+}
+
+// #138 — Pruveeo D90 dashcam with LIGOGPSINFO data in MPEG-TS container
+#[test]
+#[ignore]
+fn mpeg2_ts_pruveeo_d90_conformance() {
+    check("MPEG2_TS_pruveeo_d90.ts", "MPEG2_TS_pruveeo_d90.ts.json", true);
+    check("MPEG2_TS_pruveeo_d90.ts", "MPEG2_TS_pruveeo_d90.ts.n.json", false);
 }
