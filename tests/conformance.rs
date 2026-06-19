@@ -1400,7 +1400,6 @@ fn quicktime_gopro_scen_conformance() {
 }
 
 #[test]
-#[ignore = "port gap: track-level + -ee gating; see #211"]
 fn quicktime_gopro_hero8_gpmf_conformance() {
   // Real GoPro HERO8 Black MP4 (from GoPro's official gpmf-parser repo,
   // `samples/hero8.mp4`, 4.2 MB, 12.6 s, 848×480, firmware HD8.01.01.20.00).
@@ -1408,6 +1407,12 @@ fn quicktime_gopro_hero8_gpmf_conformance() {
   // (Track1–Track5, GoPro:*, Composite:*). The gpmd track (Track4, GoPro MET)
   // carries GPMF GPS/accel data but that requires `-ee` to decode — tracked
   // separately via timed_metadata_conformance.
+  //
+  // ACTIVE (QuickTime container phase 7): the two `stts`-derived frame rates
+  // (`Track1:VideoFrameRate` = the `CalcSampleRate` average; `Track3:
+  // PlaybackFrameRate` = the `tmcd` `OtherSampleDesc` `rational64u`) were the
+  // last no-`ee` residual; with those emitted the no-`ee` `.json`/`.n.json` are
+  // byte-exact and this conformance is no longer `#[ignore]`d.
   // Goldens: bundled ExifTool 13.59 (`tools/gen_golden.sh`), TZ=UTC.
   check(
     "QuickTime_gopro_hero8_gpmf.mp4",

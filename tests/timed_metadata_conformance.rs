@@ -219,46 +219,31 @@ fn gsen_ee_byte_exact() {
 /// axis collapses first-wins to the first sample's block; at `-ee -G3:1` every
 /// `Doc<N>` / `Doc<N>-<M>` is its own row. Byte-exact vs bundled ExifTool 13.59.
 ///
-/// NOTE: the DEFAULT (no-`ee`) `.json` is NOT byte-exact yet — its residual gap
-/// is now down to the two `stts`-derived frame rates `VideoFrameRate` /
-/// `PlaybackFrameRate` (a LATER QuickTime-container phase), so
-/// `quicktime_gopro_hero8_gpmf_conformance` (the no-`ee` path) stays
+/// The DEFAULT (no-`ee`) `.json` is ALSO byte-exact now: QuickTime container
+/// phase 7 emits the last two residual `stts`-derived frame rates
+/// (`Track1:VideoFrameRate` = the `CalcSampleRate` average; `Track3:
+/// PlaybackFrameRate` = the `tmcd` `OtherSampleDesc` `rational64u`), so
+/// `quicktime_gopro_hero8_gpmf_conformance` (the no-`ee` path) is no longer
 /// `#[ignore]`d. This `-ee` test exercises the gpmd `Doc<N>` port that #211
 /// adds: with `-ee` the per-sample GPMF timed block is what changes, and it IS
-/// byte-exact.
-/// The QuickTime *container* tags the hero8 goldens carry that exifast does not
-/// yet emit — the SAME residual gap as the no-`ee` `.json` conformance, and
-/// ENTIRELY outside the #211 `gpmd` timed-`Doc<N>` scope. After QuickTime
-/// container phase 4 (the `vmhd` GraphicsMode/OpColor, the `tref`
-/// `TimecodeTrack`, and the `gmhd`/`gmin`/`tmcd`/`tcmi` GenMediaHeader
-/// `Gen*`/`Text*`/`FontName` — now emitted byte-exact) and phase 2 (the `colr`
-/// `ColorProfiles`/CICP fields), the ONLY residual is the two `stts`-derived
-/// frame rates, a LATER container phase (P5+): `VideoFrameRate` (Track1) and
-/// `PlaybackFrameRate` (Track3). Dropping just those two from BOTH sides
-/// isolates the `gpmd`/`fdsc` timed `Doc<N>` stream this test pins, which IS
-/// byte-exact. (NOT `SampleTime`/`SampleDuration` — those are emitted correctly
-/// for the gpmd/fdsc tracks here.)
-const HERO8_CONTAINER_EXCL: &[&str] = &["VideoFrameRate", "PlaybackFrameRate"];
-
+/// byte-exact. With those two frame rates now emitted, the FULL hero8 document
+/// (container + gpmd/fdsc `Doc<N>`) is byte-exact at `-ee` with NO exclusions.
 #[test]
 fn gopro_hero8_gpmd_ee_byte_exact() {
   // `-ee -G1`: the doc axis collapsed first-wins — Track4's first `DEVC` block
   // (DeviceName, the sensor streams, the GPS scalars, the first `GPS5` row's
-  // lat/lon/alt/speed) + Track5's `fdsc` identity — byte-exact once the
-  // out-of-scope QuickTime container tails are dropped from both sides.
-  check_ee_excluding(
+  // lat/lon/alt/speed) + Track5's `fdsc` identity — byte-exact.
+  check_ee(
     "QuickTime_gopro_hero8_gpmf.mp4",
     "QuickTime_gopro_hero8_gpmf.mp4.ee.json",
     false,
-    HERO8_CONTAINER_EXCL,
   );
   // `-ee -G3:1`: every gpmd sample as its own `Doc<N>` (the `GPS5` rows split
   // into `Doc<N>-<M>`), Track5's `fdsc` as the final `Doc<N>`, byte-exact.
-  check_ee_excluding(
+  check_ee(
     "QuickTime_gopro_hero8_gpmf.mp4",
     "QuickTime_gopro_hero8_gpmf.mp4.ee.g3.json",
     true,
-    HERO8_CONTAINER_EXCL,
   );
 }
 

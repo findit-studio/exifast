@@ -1149,6 +1149,25 @@ fn is_ee_handler(code: &str) -> bool {
   matches!(code, "text" | "meta" | "sbtl" | "data" | "camm" | "ctbx")
 }
 
+/// `true` iff a `trak` whose HandlerType-SO-FAR is `handler` routes its `stsd`
+/// sample description to `%OtherSampleDesc` — the UNCONDITIONAL fallback in
+/// the `%SampleTable` `stsd` Condition chain (QuickTime.pm:7370-7405): a
+/// `soun`/`vide`/`hint`/`meta` handler matches its own table
+/// (Audio/Visual/Hint/Meta`SampleDesc`) FIRST, and every OTHER handler (a
+/// `tmcd` timecode, a `text` track, …) falls through to `OtherSampleDesc`.
+/// A handler-less track (`None`) ALSO routes to `OtherSampleDesc`: ExifTool's
+/// `$$self{HandlerType}` inits to `''` and the `soun`/`vide`/`hint`/`meta`
+/// Conditions test a NON-empty match, so an empty handler (no `hdlr` yet, or
+/// no `hdlr` at all) falls through to the fallback — hence `None` ⇒ `true`.
+/// This is evaluated at `stsd`-DECODE time (the handler seen so far in file
+/// order); the result is stashed on the track as
+/// [`MediaTrack::routes_other_sample_desc`], which then gates BOTH the
+/// `OtherFormat` and `PlaybackFrameRate` emission, so the two cannot drift and
+/// both stay faithful to ExifTool's parse-order routing decision.
+fn routes_to_other_sample_desc(handler: Option<&str>) -> bool {
+  !matches!(handler, Some("vide" | "soun" | "hint" | "meta"))
+}
+
 /// `hdlr` HandlerType PrintConv table (QuickTime.pm:8418-8444).
 fn handler_type_print(code: &str) -> &'static str {
   match code {
@@ -2048,6 +2067,87 @@ fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
     }
   });
   last
+}
+
+/// Faithful `Image::ExifTool::QuickTime::CalcSampleRate` (QuickTime.pm:8856-8868)
+/// for the `stts` (time-to-sample) box: the average sample rate of a video
+/// track. The `stts` body is `unpack('N*', ...)` (big-endian `int32u`s):
+/// `dat[0]` = version+flags, `dat[1]` = entry count, then `(sampleCount,
+/// sampleDelta)` pairs. The loop (`for $i=2; $i<@dat-1; $i+=2`) sums
+/// `num = Σ sampleCount` and `dur = Σ sampleCount * sampleDelta`, returning
+/// `num * MediaTimeScale / dur`. Returns `None` (ExifTool `return undef`) when
+/// `num`, `dur`, or `media_ts` is zero — exactly the cases where bundled emits
+/// no `VideoFrameRate`. This is the RAW quotient; the
+/// `int($val*1000+0.5)/1000` PrintConv is applied at emission.
+///
+/// `payload` is the `stts` box body AFTER the `[size:4][type:4]` header (the
+/// `$$valPt` ExifTool's `stts` table receives). ExifTool uses Perl
+/// arbitrary-precision numbers, so the running `num = Σ sampleCount` and
+/// `dur = Σ sampleCount * sampleDelta` never overflow; the faithful
+/// no-overflow equivalent accumulates both in `u128` (a malformed `stts`
+/// of two `(0xffffffff, 0xffffffff)` entries would overflow a `u64` sum and
+/// PANIC a debug build). The final quotient is converted to `f64`, matching
+/// Perl's numeric context.
+fn calc_sample_rate(payload: &[u8], media_ts: u32) -> Option<f64> {
+  if media_ts == 0 {
+    return None;
+  }
+  // `unpack('N*')` drops a trailing partial word; iterate whole `int32u`s only.
+  let word_count = payload.len() / 4;
+  if word_count < 4 {
+    // Need at least version+count + one (sampleCount, sampleDelta) pair for the
+    // `$i < @dat-1` loop body to run once.
+    return None;
+  }
+  // Read the `i`-th big-endian `int32u` via the bounds-checked [`be_u32`] (the
+  // `#![deny(clippy::indexing_slicing)]` checked path); `0` for an out-of-range
+  // word, which the `i < word_count - 1` bound below never reaches.
+  let word = |i: usize| -> u64 { u64::from(be_u32(payload, i * 4).unwrap_or(0)) };
+  let mut num: u128 = 0;
+  let mut dur: u128 = 0;
+  // `for ($i=2; $i<@dat-1; $i+=2)` — a pair needs `dat[i]` AND `dat[i+1]`, so
+  // the last valid `i` is `word_count - 2` (the `@dat-1` bound).
+  let mut i = 2usize;
+  while i < word_count - 1 {
+    let sample_count = word(i);
+    let sample_delta = word(i + 1);
+    // `u128` so the running sums cannot overflow (the faithful
+    // arbitrary-precision equivalent); a `u32*u32` product fits `u128`
+    // exactly, so the multiply needs no saturation.
+    num += u128::from(sample_count);
+    dur += u128::from(sample_count) * u128::from(sample_delta);
+    i += 2;
+  }
+  if num == 0 || dur == 0 {
+    return None;
+  }
+  Some(num as f64 * f64::from(media_ts) / dur as f64)
+}
+
+/// Read the `tmcd` PlaybackFrameRate from the FIRST `stsd` sample-description
+/// entry (`%OtherSampleDesc` `24 => { Condition => '$$self{MetaFormat} eq
+/// "tmcd"', Name => 'PlaybackFrameRate', Format => 'rational64u' }`,
+/// QuickTime.pm:7807-7811). The entry slice (from [`for_each_stsd_entry`]) is
+/// `[size:4]`-relative, so ExifTool's offset-4 `OtherFormat` 4cc is at
+/// `entry[4..8]` and the offset-24 `rational64u` is at `entry[24..32]` (two
+/// big-endian `int32u`s = numerator, denominator). Returns the raw
+/// `(numerator, denominator)` pair ONLY when the first entry's format 4cc is
+/// `tmcd` and the entry reaches offset 32 (`None` otherwise — a non-`tmcd`
+/// descriptor or a too-short entry). ExifTool's per-entry `RawConv` sets
+/// `MetaFormat` from each entry's 4cc, so the Condition matches the entry's OWN
+/// format; the universal real-world `tmcd` shape is a single entry.
+fn decode_other_sample_desc_playback_rate(payload: &[u8]) -> Option<(u32, u32)> {
+  let mut found: Option<(u32, u32)> = None;
+  for_each_stsd_entry(payload, |_dir_start, entry| {
+    // `$$self{MetaFormat} eq "tmcd"` — the entry's own OtherFormat 4cc.
+    if entry.get(4..8) == Some(b"tmcd")
+      && let Some(num) = be_u32(entry, 24)
+      && let Some(den) = be_u32(entry, 28)
+    {
+      found = Some((num, den));
+    }
+  });
+  found
 }
 
 /// Faithful `Image::ExifTool::GetFixed32u` (ExifTool.pm:6139-6143): read a
@@ -3019,8 +3119,56 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                                 track.set_audio_sample_desc(acc);
                               }
                             }
+                            // Every handler that is NOT `soun`/`vide` falls
+                            // through to `%OtherSampleDesc` HERE iff the handler
+                            // SEEN SO FAR (file order) routes to it — captured by
+                            // `routes_to_other_sample_desc(track.handler_code())`.
+                            // ExifTool's `$$self{HandlerType}` inits to `''` and is
+                            // filled by the `hdlr` atom, so a `meta`/`hint` track
+                            // whose `stsd` precedes its `hdlr` (or a no-`hdlr`
+                            // track) DECODES under the empty handler and routes to
+                            // `%OtherSampleDesc` even though its FINAL handler is
+                            // `meta`/`hint` (QuickTime.pm:7370-7405). We stash that
+                            // parse-order decision on the track (`routes_other_sample_desc`)
+                            // and gate BOTH the `OtherFormat` and `PlaybackFrameRate`
+                            // emission on it — so the two cannot drift AND both stay
+                            // faithful to the decode-time routing (the `soun`/`vide`/
+                            // `hint`/`meta` arms below leave the flag `false`: their
+                            // `stsd`, seen AFTER their `hdlr`, routes to their own
+                            // sample-desc table). For an `%OtherSampleDesc` route a
+                            // `tmcd` timecode descriptor carries the offset-24
+                            // `rational64u` PlaybackFrameRate (`Condition =>
+                            // '$$self{MetaFormat} eq "tmcd"'`); the helper gates on
+                            // the entry's own `tmcd` 4cc, so a non-`tmcd`
+                            // `OtherSampleDesc` (e.g. a `text` track) yields `None`
+                            // and leaves the slot untouched. Last-wins across `stsd`
+                            // entries/atoms (Some-only), mirroring the folds above.
+                            _ if routes_to_other_sample_desc(track.handler_code()) => {
+                              track.set_routes_other_sample_desc(true);
+                              if let Some(rat) = decode_other_sample_desc_playback_rate(sbody) {
+                                track.set_playback_frame_rate(Some(rat));
+                              }
+                            }
+                            // `meta`/`hint` SEEN BEFORE this `stsd` (the normal
+                            // hdlr-first order): route to Meta/Hint`SampleDesc`, no
+                            // `%OtherSampleDesc` decode (flag stays `false`).
                             _ => {}
                           }
+                        }
+                        // `stts` time-to-sample table (QuickTime.pm:7408-7417):
+                        // for a `vide` track ONLY (`Condition => '$$self{MediaType}
+                        // eq "vide"'`), the `CalcSampleRate` average is the
+                        // VideoFrameRate. `MediaTimeScale` is set by the preceding
+                        // `mdhd` (file order: `mdhd` precedes `minf/stbl`), so it is
+                        // available here. A degenerate sample table or a zero
+                        // MediaTimeScale yields `None` (no tag, matching bundled).
+                        // Last-wins across duplicate `stts` atoms (Some-only).
+                        else if &s.atom_type == b"stts"
+                          && track.handler_code() == Some("vide")
+                          && let Some(media_ts) = track.media_time_scale()
+                          && let Some(rate) = calc_sample_rate(sbody, media_ts)
+                        {
+                          track.set_video_frame_rate(Some(rate));
                         }
                       });
                     }
@@ -7035,6 +7183,29 @@ impl crate::emit::Taggable for Meta<'_> {
           emit_bitrate(&mut tags, &track_group, &mut first_seen, grp, bt);
         }
       }
+      // `stts`-derived VideoFrameRate (QuickTime.pm:7410-7417): the
+      // `CalcSampleRate` average for a `vide` track, emitted AFTER the `stsd`
+      // sample-description tags because the `stts` box follows `stsd` in the
+      // `stbl` (ExifTool's parse-order emission). At `-j` the PrintConv
+      // `int($val*1000+0.5)/1000` rounds to 3 decimals (`29.97`); at `-n` the
+      // raw `CalcSampleRate` quotient renders via `%.15g` (`29.97002997003`).
+      if let Some(raw) = track.video_frame_rate()
+        && first_seen(grp, "VideoFrameRate")
+      {
+        let value = if print_conv {
+          // `int(... + 0.5)` — Perl `int()` truncates toward zero; the rate is
+          // non-negative, so `+0.5` is round-half-up. `29.97` renders bare.
+          TagValue::F64(((raw * 1000.0) + 0.5).trunc() / 1000.0)
+        } else {
+          TagValue::F64(raw)
+        };
+        tags.push(EmittedTag::new(
+          track_group(),
+          "VideoFrameRate".into(),
+          value,
+          false,
+        ));
+      }
       // AudioSampleDesc (`soun` handler, QuickTime.pm:7498-7530): AudioFormat,
       // AudioVendorID, AudioChannels, AudioBitsPerSample, AudioSampleRate. The
       // 4cc/vendor are mode-invariant strings; channels/bits are bare ints
@@ -7108,21 +7279,46 @@ impl crate::emit::Taggable for Meta<'_> {
         }
       }
       // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
-      // a handler that is NOT `vide`/`soun`/`meta`/`hint` (those route to their
-      // own sample-desc table). Shares the `meta_format` slot (ExifTool stores
-      // both in `$$self{MetaFormat}`); the raw 4-char code verbatim in both modes.
-      // E.g. a `tmcd` time-code track or a `text` track.
+      // a track whose `stsd` was DECODED through the `%OtherSampleDesc` fallback
+      // (the `routes_other_sample_desc` flag, set at parse time on the handler
+      // SEEN SO FAR — so a `meta`/`hint` track whose `stsd` preceded its `hdlr`,
+      // or a no-`hdlr` track, emits this; the normal `vide`/`soun`/`meta`/`hint`
+      // hdlr-first order routes to its own sample-desc table and does not).
+      // Shares the `meta_format` slot (ExifTool stores both in
+      // `$$self{MetaFormat}`); the raw 4-char code verbatim in both modes. E.g. a
+      // `tmcd` time-code track or a `text` track.
       if let Some(fmt) = track.meta_format()
-        && !matches!(
-          track.handler_code(),
-          Some("vide" | "soun" | "meta" | "hint")
-        )
+        && track.routes_other_sample_desc()
         && first_seen(grp, "OtherFormat")
       {
         tags.push(EmittedTag::new(
           track_group(),
           "OtherFormat".into(),
           TagValue::Str(fmt.into()),
+          false,
+        ));
+      }
+      // `tmcd` PlaybackFrameRate (`%OtherSampleDesc` offset 24, `rational64u`,
+      // QuickTime.pm:7807-7811): emitted immediately after `OtherFormat` (the
+      // same `OtherSampleDesc` entry), gated on the SAME parse-time
+      // `routes_other_sample_desc` flag so it stays consistent with `OtherFormat`
+      // — `playback_frame_rate` is only ever set on a track that took the
+      // `%OtherSampleDesc` decode arm, so the flag is redundant-but-explicit here
+      // and makes the two emissions provably consistent. No PrintConv, so both
+      // `-j`/`-n` render the `Rational`'s `%.10g` quotient (`29.97002997`). A zero
+      // denominator renders the `Rational` serializer's `inf`/`undef` word —
+      // faithful to ExifTool's `GetRational64u`.
+      if let Some((num, den)) = track.playback_frame_rate()
+        && track.routes_other_sample_desc()
+        && first_seen(grp, "PlaybackFrameRate")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "PlaybackFrameRate".into(),
+          TagValue::Rational(crate::value::Rational::rational64(
+            i64::from(num),
+            i64::from(den),
+          )),
           false,
         ));
       }
@@ -22255,6 +22451,457 @@ mod tests {
     assert_eq!(acc.audio_format(), Some("lpcm"));
     assert_eq!(acc.channels(), Some(2));
     assert_eq!(acc.sample_rate(), Some(44100.0));
+  }
+
+  /// Build an `stts` box BODY (`[version+flags:4][entry-count:4]` + each
+  /// `(sampleCount:4, sampleDelta:4)` pair, all big-endian) for the
+  /// `calc_sample_rate` unit tests — the `$$valPt` ExifTool's `stts` table sees.
+  fn stts_body(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut b = vec![0u8; 8];
+    wr(&mut b, 4, &(entries.len() as u32).to_be_bytes());
+    for &(count, delta) in entries {
+      b.extend_from_slice(&count.to_be_bytes());
+      b.extend_from_slice(&delta.to_be_bytes());
+    }
+    b
+  }
+
+  /// `CalcSampleRate` on the real hero8 Track1 `stts` (one entry: 379 samples,
+  /// delta 3003) with MediaTimeScale 90000 ⇒ `379 * 90000 / (379*3003)` =
+  /// `90000/3003` = `29.97002997002997`. Ground-truth = bundled ExifTool 13.59
+  /// (`Track1:VideoFrameRate 29.97` at `-j`, `29.97002997003` at `-n`).
+  #[test]
+  fn calc_sample_rate_hero8_track1() {
+    let body = stts_body(&[(379, 3003)]);
+    let r = calc_sample_rate(&body, 90000).expect("defined rate");
+    assert!(
+      (r - 29.970_029_970_029_97).abs() < 1e-9,
+      "raw CalcSampleRate quotient = {r}"
+    );
+    // The `-j` PrintConv `int($val*1000+0.5)/1000` rounds to `29.97`.
+    let pc = ((r * 1000.0) + 0.5).trunc() / 1000.0;
+    assert_eq!(pc, 29.97);
+    // The `-n` value renders via `%.15g` = `29.97002997003`.
+    assert_eq!(crate::value::format_g(r, 15), "29.97002997003");
+  }
+
+  /// `CalcSampleRate` sums ALL entries (`num = Σ count`, `dur = Σ count*delta`),
+  /// matching the Perl loop. A two-entry table (100@2 + 100@4) over MediaTimeScale
+  /// 1000 ⇒ `200 * 1000 / (100*2 + 100*4)` = `200000/600` = `333.33...`.
+  #[test]
+  fn calc_sample_rate_multi_entry_sums_all() {
+    let body = stts_body(&[(100, 2), (100, 4)]);
+    let r = calc_sample_rate(&body, 1000).expect("defined rate");
+    assert!((r - (200_000.0 / 600.0)).abs() < 1e-9, "rate = {r}");
+  }
+
+  /// `CalcSampleRate` returns `None` (ExifTool `return undef`) for a degenerate
+  /// table or a zero MediaTimeScale — the cases where bundled emits NO
+  /// VideoFrameRate. A zero-duration table (delta 0), a zero-sample table
+  /// (count 0), a zero MediaTimeScale, and an entry-count-only stub all yield
+  /// `None`.
+  #[test]
+  fn calc_sample_rate_degenerate_is_none() {
+    // dur = Σ count*delta = 0 (all deltas zero) ⇒ None.
+    assert_eq!(calc_sample_rate(&stts_body(&[(10, 0)]), 1000), None);
+    // num = Σ count = 0 ⇒ None.
+    assert_eq!(calc_sample_rate(&stts_body(&[(0, 33)]), 1000), None);
+    // MediaTimeScale 0 ⇒ None (the `$$et{MediaTS}` falsy guard).
+    assert_eq!(calc_sample_rate(&stts_body(&[(379, 3003)]), 0), None);
+    // No pairs (just version+count) ⇒ None (the `$i < @dat-1` loop never runs).
+    assert_eq!(calc_sample_rate(&stts_body(&[]), 1000), None);
+  }
+
+  /// Finding 1 — a malformed `stts` of two `(0xffffffff, 0xffffffff)` entries
+  /// overflows a `u64` running sum (`Σ count*delta = 2 * 0xffffffff^2` is just
+  /// under `u64::MAX`, but `Σ count = 2 * 0xffffffff` plus the second product
+  /// would wrap in debug); the `u128` accumulators make it impossible. The
+  /// quotient must be a DEFINED finite value (not `inf`/`nan`) and not panic —
+  /// faithful to ExifTool computing it in Perl arbitrary-precision arithmetic.
+  #[test]
+  fn calc_sample_rate_max_value_entries_no_overflow() {
+    let body = stts_body(&[(0xffff_ffff, 0xffff_ffff), (0xffff_ffff, 0xffff_ffff)]);
+    let r = calc_sample_rate(&body, 1).expect("defined finite rate");
+    assert!(r.is_finite(), "rate must be finite, got {r}");
+    assert!(r > 0.0, "rate must be positive, got {r}");
+    // num = 2*0xffffffff = 8589934590; dur = 2*0xffffffff^2 = 36893488138829168642;
+    // media_ts = 1 ⇒ ~2.328e-10 (the exact u128/f64 quotient).
+    let num = 2.0 * f64::from(0xffff_ffffu32);
+    let dur = 2.0 * f64::from(0xffff_ffffu32) * f64::from(0xffff_ffffu32);
+    assert!((r - num / dur).abs() < 1e-20, "rate = {r}");
+  }
+
+  /// Finding 1, end-to-end through the PUBLIC parse: a minimal MOV whose single
+  /// `vide` track carries the same malformed two-`(0xffffffff, 0xffffffff)`
+  /// `stts` must parse with NO panic (the parser's no-panic-on-untrusted-media
+  /// contract) and yield a DEFINED finite VideoFrameRate.
+  #[test]
+  fn parse_minimal_mov_malformed_stts_no_overflow_panic() {
+    let e = vide_entry(b"avc1", 100, 100, b"Comp", 24, 86);
+    let mut stbl_body = stsd_box(&[e]);
+    stbl_body.extend_from_slice(&atom(
+      b"stts",
+      &stts_body(&[(0xffff_ffff, 0xffff_ffff), (0xffff_ffff, 0xffff_ffff)]),
+    ));
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"vide");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    // mdhd v0: MediaTimeScale=90000 (offset 12).
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &90000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    // mvhd v0: movie TimeScale=1000 (offset 12) so parse_inner accepts the moov.
+    let mut mvhd_payload = vec![0u8; 100];
+    wr(&mut mvhd_payload, 12, &1000u32.to_be_bytes());
+    let mut moov_body = atom(b"mvhd", &mvhd_payload);
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend_from_slice(&moov);
+    // The whole point: this must NOT panic in a debug/test build.
+    let meta = parse_inner(&data, None).expect("minimal MOV accepted");
+    let rate = meta
+      .qt
+      .tracks()
+      .iter()
+      .find_map(|t| t.video_frame_rate())
+      .expect("a defined VideoFrameRate");
+    assert!(rate.is_finite() && rate > 0.0, "VideoFrameRate = {rate}");
+  }
+
+  /// Build one `tmcd` `OtherSampleDesc` entry: `[size:4][format=tmcd:4]` then the
+  /// `rational64u` PlaybackFrameRate `(num, den)` at entry-relative offset 24.
+  fn tmcd_entry(num: u32, den: u32) -> Vec<u8> {
+    const LEN: usize = 34;
+    let mut e = vec![0u8; LEN];
+    wr(&mut e, 0, &(LEN as u32).to_be_bytes());
+    wr(&mut e, 4, b"tmcd");
+    wr(&mut e, 24, &num.to_be_bytes());
+    wr(&mut e, 28, &den.to_be_bytes());
+    e
+  }
+
+  /// `decode_other_sample_desc_playback_rate` reads the `rational64u` at offset 24
+  /// of a `tmcd` entry. The real hero8 Track3 `tmcd` carries `90000/3003`; bundled
+  /// ExifTool 13.59 renders `Track3:PlaybackFrameRate 29.97002997` (the
+  /// `rational64u` `%.10g`, NOT the 15-digit f64).
+  #[test]
+  fn decode_playback_frame_rate_hero8_track3() {
+    let body = stsd_box(&[tmcd_entry(90000, 3003)]);
+    // `stsd_box` returns a full atom; the decoder takes the BODY (after the
+    // 8-byte `[size:4][type:4]` header).
+    let body_after_header = body.get(8..).expect("stsd body");
+    let rat = decode_other_sample_desc_playback_rate(body_after_header).expect("tmcd rate");
+    assert_eq!(rat, (90000, 3003));
+    // The emission builds a `rational64`; its `%.10g` value is `29.97002997`.
+    let r = crate::value::Rational::rational64(i64::from(rat.0), i64::from(rat.1));
+    assert_eq!(r.exiftool_val_str(), "29.97002997");
+  }
+
+  /// PlaybackFrameRate is read ONLY when the entry's own format 4cc is `tmcd`
+  /// (`Condition => '$$self{MetaFormat} eq "tmcd"'`): a non-`tmcd` descriptor
+  /// (e.g. a `text` track) yields `None`, and a `tmcd` entry too short to reach
+  /// offset 32 yields `None`.
+  #[test]
+  fn decode_playback_frame_rate_gated_and_bounds() {
+    // Non-`tmcd` format ⇒ None.
+    let mut text = vec![0u8; 34];
+    wr(&mut text, 0, &34u32.to_be_bytes());
+    wr(&mut text, 4, b"text");
+    wr(&mut text, 24, &90000u32.to_be_bytes());
+    wr(&mut text, 28, &3003u32.to_be_bytes());
+    let body = stsd_box(&[text]);
+    assert_eq!(
+      decode_other_sample_desc_playback_rate(body.get(8..).expect("stsd body")),
+      None
+    );
+    // A `tmcd` entry only 28 bytes long (cannot reach offset 32) ⇒ None.
+    let mut short = vec![0u8; 28];
+    wr(&mut short, 0, &28u32.to_be_bytes());
+    wr(&mut short, 4, b"tmcd");
+    let body2 = stsd_box(&[short]);
+    assert_eq!(
+      decode_other_sample_desc_playback_rate(body2.get(8..).expect("stsd body")),
+      None
+    );
+  }
+
+  /// End-to-end through [`walk_trak`]: a `vide` track whose `stbl` carries an
+  /// `stts` (after the `stsd`) sets `video_frame_rate`; a `tmcd`-format
+  /// `OtherSampleDesc` sets `playback_frame_rate`. The `trak_payload_*` helpers
+  /// hardcode MediaTimeScale 600, so a `(60, 10)` stts ⇒ `60*600/(60*10)` = `60`.
+  #[test]
+  fn walk_trak_stts_sets_video_frame_rate() {
+    let e = vide_entry(b"avc1", 100, 100, b"Comp", 24, 86);
+    // Build a `stbl` containing BOTH the `stsd` and the `stts` (file order).
+    let mut stbl_body = stsd_box(&[e]);
+    stbl_body.extend_from_slice(&atom(b"stts", &stts_body(&[(60, 10)])));
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"vide");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &600u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let payload = atom(b"mdia", &mdia_body);
+    let track = walk_trak(1, &payload, Some(600));
+    assert_eq!(track.video_frame_rate(), Some(60.0));
+    assert_eq!(track.playback_frame_rate(), None);
+  }
+
+  /// A `tmcd`-handler track's `stsd` sets `playback_frame_rate`, and a non-`vide`
+  /// handler does NOT compute VideoFrameRate even with an `stts` present
+  /// (`Condition => '$$self{MediaType} eq "vide"'`).
+  #[test]
+  fn walk_trak_tmcd_sets_playback_not_video() {
+    let mut stbl_body = stsd_box(&[tmcd_entry(90000, 3003)]);
+    stbl_body.extend_from_slice(&atom(b"stts", &stts_body(&[(60, 10)])));
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"tmcd");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &90000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let payload = atom(b"mdia", &mdia_body);
+    let track = walk_trak(1, &payload, Some(90000));
+    assert_eq!(track.playback_frame_rate(), Some((90000, 3003)));
+    // `tmcd` is not `vide`, so no VideoFrameRate even though an `stts` is present.
+    assert_eq!(track.video_frame_rate(), None);
+  }
+
+  /// Finding 2 — a `meta`-handler track routes its `stsd` to `MetaSampleDesc`,
+  /// NOT `%OtherSampleDesc`, so even a `tmcd`-format `stsd` entry must NOT set
+  /// `playback_frame_rate` (`%OtherSampleDesc` is only the FALLBACK for
+  /// unmatched handlers, QuickTime.pm:7370-7405). Gated by the shared
+  /// `routes_to_other_sample_desc` predicate.
+  #[test]
+  fn walk_trak_meta_handler_tmcd_stsd_emits_no_playback_rate() {
+    let stbl = atom(b"stbl", &stsd_box(&[tmcd_entry(90000, 3003)]));
+    let minf = atom(b"minf", &stbl);
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"meta");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &90000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let payload = atom(b"mdia", &mdia_body);
+    let track = walk_trak(1, &payload, Some(90000));
+    assert_eq!(
+      track.playback_frame_rate(),
+      None,
+      "a meta track uses MetaSampleDesc, not OtherSampleDesc PlaybackFrameRate"
+    );
+  }
+
+  /// Finding 2 — a `hint`-handler track routes its `stsd` to `HintSampleDesc`,
+  /// NOT `%OtherSampleDesc`; a `tmcd`-format `stsd` entry must NOT set
+  /// `playback_frame_rate`.
+  #[test]
+  fn walk_trak_hint_handler_tmcd_stsd_emits_no_playback_rate() {
+    let stbl = atom(b"stbl", &stsd_box(&[tmcd_entry(90000, 3003)]));
+    let minf = atom(b"minf", &stbl);
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"hint");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &90000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let payload = atom(b"mdia", &mdia_body);
+    let track = walk_trak(1, &payload, Some(90000));
+    assert_eq!(
+      track.playback_frame_rate(),
+      None,
+      "a hint track uses HintSampleDesc, not OtherSampleDesc PlaybackFrameRate"
+    );
+  }
+
+  /// Wrap a custom `mdia` body in a full single-track MOV: `ftyp` + `moov(mvhd,
+  /// trak(mdia))`, with an `mvhd` carrying a non-zero movie TimeScale so the
+  /// full `parse_inner` → `Meta::tags()` path runs exactly as for a real file
+  /// (NOT the `walk_trak` unit shortcut). Drives the `OtherFormat` /
+  /// `PlaybackFrameRate` DECODE-TIME routing (the `hdlr`/`minf` order inside
+  /// `mdia` is what the caller controls).
+  fn single_track_mov(mdia: &[u8]) -> Vec<u8> {
+    let trak = atom(b"trak", mdia);
+    // mvhd v0: TimeScale=600 (offset 12) — a realistic movie timescale.
+    let mut mvhd_payload = vec![0u8; 100];
+    wr(&mut mvhd_payload, 12, &600u32.to_be_bytes());
+    let mut moov_body = atom(b"mvhd", &mvhd_payload);
+    moov_body.extend_from_slice(&trak);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend_from_slice(&atom(b"moov", &moov_body));
+    data
+  }
+
+  /// An `mdhd` atom with MediaTimeScale 600 (offset 12).
+  fn mdhd_600() -> Vec<u8> {
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &600u32.to_be_bytes());
+    atom(b"mdhd", &mdhd_body)
+  }
+
+  /// An `hdlr` atom whose HandlerType (offset 8) is `handler`.
+  fn hdlr_atom(handler: &[u8; 4]) -> Vec<u8> {
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, handler);
+    atom(b"hdlr", &hdlr_body)
+  }
+
+  /// A `minf(stbl(stsd))` wrapping the given `stsd` box.
+  fn minf_with_stsd(stsd: &[u8]) -> Vec<u8> {
+    atom(b"minf", &atom(b"stbl", stsd))
+  }
+
+  /// Collect the `(name, value)` pairs emitted under the family-1 `Track1` group
+  /// for `data` (default no-`-ee` PrintConv mode — `OtherFormat` /
+  /// `PlaybackFrameRate` are always-on SP1 tags, not `-ee`-gated).
+  fn track1_emitted(data: &[u8]) -> std::vec::Vec<(String, crate::value::TagValue)> {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let meta = parse_inner(data, None).expect("MOV accepted");
+    let opts = EmitOptions::g1(ConvMode::PrintConv, false);
+    meta
+      .tags(opts)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect()
+  }
+
+  /// Assert the emitted `Track1` tag list carries BOTH `OtherFormat == "tmcd"`
+  /// and `PlaybackFrameRate == 29.97002997` (the hero8 `90000/3003` rate). These
+  /// are the two `%OtherSampleDesc` tags whose DECODE-TIME routing this fix
+  /// gates.
+  fn assert_emits_both(data: &[u8], case: &str) {
+    let emitted = track1_emitted(data);
+    let of = emitted
+      .iter()
+      .find(|(n, _)| n == "OtherFormat")
+      .map(|(_, v)| v);
+    assert_eq!(
+      of,
+      Some(&crate::value::TagValue::Str("tmcd".into())),
+      "[{case}] OtherFormat must be emitted (== tmcd)"
+    );
+    let pfr = emitted
+      .iter()
+      .find(|(n, _)| n == "PlaybackFrameRate")
+      .map(|(_, v)| v);
+    match pfr {
+      Some(crate::value::TagValue::Rational(r)) => assert_eq!(
+        r.exiftool_val_str(),
+        "29.97002997",
+        "[{case}] PlaybackFrameRate value"
+      ),
+      other => panic!("[{case}] PlaybackFrameRate must be an emitted Rational, got {other:?}"),
+    }
+  }
+
+  /// Assert the emitted `Track1` tag list carries NEITHER `OtherFormat` nor
+  /// `PlaybackFrameRate` (the track routed to its OWN sample-desc table).
+  fn assert_emits_neither(data: &[u8], case: &str) {
+    let emitted = track1_emitted(data);
+    assert!(
+      !emitted.iter().any(|(n, _)| n == "OtherFormat"),
+      "[{case}] OtherFormat must NOT be emitted"
+    );
+    assert!(
+      !emitted.iter().any(|(n, _)| n == "PlaybackFrameRate"),
+      "[{case}] PlaybackFrameRate must NOT be emitted"
+    );
+  }
+
+  /// **Option X / case A** — a handler-LESS track with a `tmcd` `stsd`
+  /// (`mdia(mdhd, minf(stbl(stsd)))`, no `hdlr`). ExifTool's `$$self{HandlerType}`
+  /// is `''`, so the `stsd` decodes under the empty handler and falls through to
+  /// `%OtherSampleDesc` ⇒ BOTH `OtherFormat=tmcd` and `PlaybackFrameRate` are
+  /// emitted (verified vs bundled ExifTool 13.59:
+  /// `OtherFormat=tmcd`, `PlaybackFrameRate=29.97002997`).
+  #[test]
+  fn option_x_case_a_no_hdlr_tmcd_emits_both() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_emits_both(&data, "A no-hdlr tmcd");
+  }
+
+  /// **Option X / case B** — a `meta`-handler track whose `stsd` comes BEFORE its
+  /// `hdlr` (`mdia(mdhd, minf(stbl(stsd<tmcd>)), hdlr<meta>)`). At `stsd`-decode
+  /// time the handler-so-far is empty, so the descriptor routes to
+  /// `%OtherSampleDesc` ⇒ BOTH tags emit — EVEN THOUGH the FINAL handler is
+  /// `meta` (verified vs bundled ExifTool 13.59). This is the pre-existing
+  /// divergence the fix corrects: the prior final-handler gate WRONGLY suppressed
+  /// `OtherFormat` here.
+  #[test]
+  fn option_x_case_b_meta_stsd_before_hdlr_emits_both() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"meta"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_emits_both(&data, "B meta stsd-before-hdlr");
+  }
+
+  /// **Option X / case C** — a `hint`-handler track whose `stsd` comes BEFORE its
+  /// `hdlr`. Same parse-order routing as case B (empty handler at decode time ⇒
+  /// `%OtherSampleDesc`) ⇒ BOTH tags emit despite the FINAL `hint` handler
+  /// (verified vs bundled ExifTool 13.59).
+  #[test]
+  fn option_x_case_c_hint_stsd_before_hdlr_emits_both() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"hint"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_emits_both(&data, "C hint stsd-before-hdlr");
+  }
+
+  /// **Option X / case D** — a `tmcd`-handler track in NORMAL (hdlr-first) order
+  /// (`mdia(mdhd, hdlr<tmcd>, minf(stbl(stsd<tmcd>)))`). The `tmcd` handler is
+  /// not `soun`/`vide`/`hint`/`meta`, so its `stsd` routes to `%OtherSampleDesc`
+  /// ⇒ BOTH tags emit. This mirrors the real hero8 Track3 shape (verified vs
+  /// bundled ExifTool 13.59).
+  #[test]
+  fn option_x_case_d_tmcd_normal_emits_both() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"tmcd"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_emits_both(&data, "D tmcd normal");
+  }
+
+  /// **Option X / case E** — a `meta`-handler track in NORMAL (hdlr-first) order
+  /// (`mdia(mdhd, hdlr<meta>, minf(stbl(stsd<tmcd>)))`). The `stsd` decodes under
+  /// the `meta` handler, routing to `MetaSampleDesc` (its OWN table), NOT
+  /// `%OtherSampleDesc` ⇒ NEITHER `OtherFormat` nor `PlaybackFrameRate` is
+  /// emitted (verified vs bundled ExifTool 13.59: no `OtherFormat`, no
+  /// `PlaybackFrameRate`). The `tmcd`-format `stsd` still sets `MetaFormat`
+  /// via the `meta`-handler path, but that is a different tag.
+  #[test]
+  fn option_x_case_e_meta_normal_emits_neither() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"meta"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_emits_neither(&data, "E meta normal");
   }
 
   /// #211 finding 2 — GoPro `%noDups` is PER `(family1, name)`, decided by which
