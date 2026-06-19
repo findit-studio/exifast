@@ -38,11 +38,22 @@ pub(crate) enum CanonDirShape {
   /// `Exif.pm:6391`). Reached for a readable directory whose
   /// `$bytesFromEnd` is `0`, `2`, or `>= 4` (`Exif.pm:6395-6399`).
   Walk { num_entries: usize, dir_end: usize },
+  /// The count word READ cleanly but the directory's declared extent
+  /// (`$dirEnd = $dirStart + 2 + 12*$numEntries`) runs PAST the buffer
+  /// (`$dirEnd > $dataLen` ⇒ `undef $dirSize`, `Exif.pm:6356`). With no RAF to
+  /// re-read the IFD from the file, ExifTool warns `Bad <dir> directory`
+  /// (`Exif.pm:6381`) and then either SALVAGES (maker notes — see
+  /// [`salvage_makernote_overrun`]) or `return 0`s (a core IFD). Split out from
+  /// [`CanonDirShape::AbortBadDirectory`] so a maker-note caller can apply the
+  /// salvage clamp while the CTMD / `$inMakerNotes = 0` caller still aborts.
+  /// `num_entries` is the (over-claimed) READ count, retained only to keep the
+  /// abort path's `Illegal … (<n> entries)`-style diagnostics faithful.
+  Overrun { num_entries: usize },
   /// Abort with NO warning here — the structural path already raised
-  /// `Bad <dir> directory` (`Exif.pm:6383`): the IFD0 count is unreadable, or
-  /// the directory overruns the block (`$dirEnd > $dataLen`,
-  /// `Exif.pm:6356`; for the `$inMakerNotes = 0` framing the generic walker
-  /// reuses, an overrun aborts rather than salvages).
+  /// `Bad <dir> directory` (`Exif.pm:6383`): the IFD0 count is unreadable
+  /// (`$dirStart > $dataLen-2`), or the extent arithmetic overflows `usize`
+  /// (the 32-bit/wasm class — an overflow can never describe an in-range
+  /// directory). A clean-count BUFFER OVERRUN is [`CanonDirShape::Overrun`].
   AbortBadDirectory,
   /// Abort AND raise `Illegal <dir> directory size (<n> entries)`
   /// (`Exif.pm:6397`) — a `$bytesFromEnd` of `1` or `3`. NON-minor (the Perl
@@ -95,10 +106,12 @@ pub(crate) fn classify_canon_directory(
     return CanonDirShape::AbortBadDirectory;
   };
   // `undef $dirSize if $dirEnd > $dataLen` (Exif.pm:6356) ⇒ the no-RAF
-  // `$success = 0` path ⇒ `Bad <dir> directory` + abort (the `$inMakerNotes`
-  // salvage only changes the VERBOSE entry walk, which is not modelled).
+  // `$success = 0` path ⇒ `Bad <dir> directory` (`Exif.pm:6381`). For a maker
+  // note this is the salvage gate (`Exif.pm:6382-6388`, [`salvage_makernote_overrun`]);
+  // for the `$inMakerNotes = 0` / CTMD framing it is a plain abort. Surface it
+  // as the distinct [`CanonDirShape::Overrun`] so the caller decides.
   if dir_end > data_len {
-    return CanonDirShape::AbortBadDirectory;
+    return CanonDirShape::Overrun { num_entries };
   }
   // `my $bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) { unless
   // ($bytesFromEnd==2 or $bytesFromEnd==0) { Warn("Illegal …"); return 0 } }`
@@ -111,6 +124,63 @@ pub(crate) fn classify_canon_directory(
     num_entries,
     dir_end,
   }
+}
+
+/// The MakerNote directory-size SALVAGE clamp (`Exif.pm:6382-6393`) — the ONE
+/// shared decision driving BOTH the shared `Walker`'s emission walk
+/// (`exif/mod.rs` `walk_one_ifd_body`) AND the Canon `%CameraSettings`
+/// DataMember pre-scan (`exif/mod.rs` `canon_prescan_datamembers`), so a
+/// salvaged directory is walked IDENTICALLY by both passes (the pre-scan must
+/// extract `FocalUnits`/`LensType` from the SAME clamped entry set the emission
+/// walk renders, or the dependent sub-tables — FocalLength / FileInfo — would
+/// emit defaults).
+///
+/// Applies ONLY when [`classify_canon_directory`] returned
+/// [`CanonDirShape::Overrun`] (a clean-count buffer overrun). Ports:
+///
+/// ```text
+/// return 0 unless $inMakerNotes and $dirLen >= 14 and $dirStart >= 0 and
+///                 $dirStart + $dirLen <= length($$dataPt);
+/// $dirSize = $dirLen;
+/// $numEntries = int(($dirSize - 2) / 12);  # read what we can
+/// $dirSize = 2 + 12 * $numEntries;
+/// $dirEnd = $dirStart + $dirSize;
+/// ```
+///
+/// `in_maker_notes` is ExifTool's `$inMakerNotes` (`$$tagTablePtr{GROUPS}{0} eq
+/// 'MakerNotes'` — exactly `!active_table.is_core_ifd()` at the call site).
+/// `dir_len` is `$$dirInfo{DirLen}` — the declared `0x927c` value window, already
+/// reduced by any `ProcessUnknown` `LocateIFD` relocation delta by the caller.
+///
+/// Returns the CLAMPED `(num_entries, dir_end)` to walk, or `None` to abort the
+/// whole directory (`return 0`) — for a core IFD, a missing/`< 14` `dir_len`, or
+/// a window that does not fit `[dir_start, dir_start + dir_len] <= data_len`.
+///
+/// `dir_len >= 14` guarantees `(dir_len - 2) / 12 >= 1`, and the recomputed
+/// `dir_end = dir_start + 2 + 12*int((dir_len-2)/12) <= dir_start + dir_len <=
+/// data_len` — so the caller's subsequent `bytes_from_end` subtraction cannot
+/// underflow and the entry walk stays in bounds. Every `+` is `checked_*` for the
+/// 32-bit/wasm overflow class (an overflow can never fit the buffer).
+pub(crate) fn salvage_makernote_overrun(
+  dir_start: usize,
+  data_len: usize,
+  in_maker_notes: bool,
+  dir_len: Option<usize>,
+) -> Option<(usize, usize)> {
+  // `return 0 unless $inMakerNotes and $dirLen >= 14 and
+  //                  $dirStart + $dirLen <= length($$dataPt)` (Exif.pm:6382-6385).
+  // `$dirStart >= 0` is implicit (`dir_start: usize`).
+  let dir_len = dir_len.filter(|_| in_maker_notes).filter(|&dir_len| {
+    dir_len >= 14
+      && dir_start
+        .checked_add(dir_len)
+        .is_some_and(|end| end <= data_len)
+  })?;
+  // `$numEntries = int(($dirSize - 2) / 12); $dirEnd = $dirStart + 2 + 12*$numEntries`
+  // (Exif.pm:6386-6393) — "read what we can".
+  let num_entries = (dir_len - 2) / 12;
+  let dir_end = dir_start.checked_add(2 + 12 * num_entries)?;
+  Some((num_entries, dir_end))
 }
 
 /// The per-entry classification shared by the Canon `0x927c` emission walk and

@@ -2091,6 +2091,73 @@ fn canon_ctmd_exifinfo_n_match_bundled() {
   }
 }
 
+/// The deferred Canon `MakerNote` sub-tables the REAL `CanonRaw_ctmd.cr3` CTMD
+/// re-dispatch reaches but exifast does NOT walk — their parent SubDirectory
+/// pointer is suppressed (`SubTable::is_walked() == false`, issues #84/#85), so
+/// no leaf is emitted: `Canon::Processing` (ToneCurve / Sharpness /
+/// SharpnessFrequency / WhiteBalanceRed/Blue / ColorTemperature / PictureStyle /
+/// DigitalGain / WBShift / UnsharpMask… / SensorRed/BlueLevel) and
+/// `Canon::VignettingCorr2` (VignettingCorrVersion + the four lens-correction
+/// `*Setting` flags). NONE collide with a tag exifast DOES emit; they are the
+/// only structural absences in the otherwise byte-identical `-ee` stream.
+const CR3_CTMD_EXCL: &[&str] = &[
+  // Canon::Processing (`Canon.pm:7203-7290`).
+  "ToneCurve",
+  "Sharpness",
+  "SharpnessFrequency",
+  "WhiteBalanceRed",
+  "WhiteBalanceBlue",
+  "ColorTemperature",
+  "PictureStyle",
+  "DigitalGain",
+  "WBShiftAB",
+  "WBShiftGM",
+  "UnsharpMaskFineness",
+  "UnsharpMaskThreshold",
+  "SensorRedLevel",
+  "SensorBlueLevel",
+  // Canon::VignettingCorr2 (`Canon.pm`) — version + lens-correction flags.
+  "VignettingCorrVersion",
+  "PeripheralLightingSetting",
+  "ChromaticAberrationSetting",
+  "DistortionCorrectionSetting",
+  "DigitalLensOptimizerSetting",
+];
+
+// REAL Canon CR3 (`CanonRaw_ctmd.cr3`, a minimal CRX still-RAW), the #81 phase-2
+// proof: ExifTool keeps the CTMD `ExposureInfo` `FNumber 3.5` / `ExposureTime
+// 1/80` (`Canon::CTMD/ExposureInfo` `Priority => 1`) over the Canon `ShotInfo`
+// `FNumber 3.6` / `ExposureTime 1/70` (`Canon::ShotInfo` `Priority => 0`) that
+// the type-7 `0x927c` MakerNote re-dispatch ALSO produces under the same
+// collapsed `Track1:` row. Pre-fix, the `ShotInfo` values (emitted later in walk
+// order) clobbered the `ExposureInfo` ones; marking the Canon `Priority => 0`
+// rows priority-0 + honoring that in the CTMD `Doc<N>` dedup keeps the
+// ExposureInfo value, matching bundled. The 5 proof tags
+// (`TimeStamp`/`FocalLength`/`FNumber 3.5`/`ExposureTime 1/80`/`RecordMode
+// CR3+JPEG`) + every other emitted tag are byte-exact at BOTH `-G1` and `-G3`;
+// the only absences are the deferred [`CR3_CTMD_EXCL`] sub-tables. Oracle:
+// bundled ExifTool 13.59 (`-ee` / `-ee -G3:1`, `-x System:all -x Composite:all`).
+//
+// The fixture is accept-deferred from the no-`ee` byte-exact set
+// (`tests/typed_serde_parity.rs::NOT_ACTIVE`): bundled extracts the WHOLE CTMD
+// metadata WITHOUT `-ee` for a still-image RAW, which exifast gates behind `-ee`
+// (a separate QuickTime-container item) — so the proof is pinned here at `-ee`.
+#[test]
+fn canon_ctmd_real_cr3_priority_dedup_byte_exact() {
+  check_ee_excluding(
+    "CanonRaw_ctmd.cr3",
+    "CanonRaw_ctmd.cr3.ee.json",
+    false,
+    CR3_CTMD_EXCL,
+  );
+  check_ee_excluding(
+    "CanonRaw_ctmd.cr3",
+    "CanonRaw_ctmd.cr3.ee.g3.json",
+    true,
+    CR3_CTMD_EXCL,
+  );
+}
+
 // Canon CTMD `ExifInfo` 0x8769 re-dispatch with a NESTED EXIF sub-IFD.
 // The 0x8769 ProcessExifInfo TIFF's IFD0 carries ExposureTime + ISO AND a 0xa005
 // InteropOffset → a nested InteropIFD with InteropIndex (0x0001 "R98"). When
@@ -3177,5 +3244,492 @@ fn insta360_atomspan_trailer_byte_exact() {
     "QuickTime_insta360_atomspan.mp4",
     "QuickTime_insta360_atomspan.mp4.ee.g3.json",
     true,
+  );
+}
+
+// The REAL Sony FX3 `.mp4` rtmd metadata track (#76). Unlike the synthetic
+// `.mov` fixtures (a hand-built minimal `moov`), this is a genuine `ILME-FX3`
+// clip: a full `moov` — video (Track1) + audio (Track2) + `rtmd` timed-metadata
+// (Track3) — whose `mdat` precedes the `moov` and whose rtmd `stsz` is a
+// FIXED-size table (`sample-size = 11264`, `count = 24`, body exactly 12 bytes).
+// The rtmd track is a `meta`-handler `trak` (`stsd` 4cc `rtmd`); sample 1
+// carries the FX3 camera scalars (FNumber/FrameRate/ExposureTime/
+// MasterGainAdjustment/ISO/ElectricalExtenderMagnification/SerialNumber/
+// WhiteBalance/DateTime) plus the `PitchRollYaw`/`Accelerometer` IMU arrays. No
+// GPS on this clip. ExifTool collapses the duplicate samples to ONE record at
+// `-ee -G1`.
+//
+// Every Sony `rtmd` payload tag — FNumber … Accelerometer, plus the structural
+// `Track3:MetaFormat` (the stsd rtmd 4cc) and the sample-table `Track3:
+// SampleTime`/`SampleDuration` — is compared BYTE-EXACT. The decode is enabled
+// by the `parse_stsz` precedence fix (the Perl `length > 12` guard gates
+// `stz2`, NOT `stsz`; the 12-byte fixed-size rtmd `stsz` must still expand to
+// `($sz) x $num`).
+//
+// EXCLUDED ([`FX3_STRUCT_EXCL`]) are the GENERAL-QuickTime container tags this
+// Sony-rtmd port does not target — the `vide`/`soun` `stsd` sample-description
+// fields (BitDepth/Compressor*/GraphicsMode/OpColor/SourceImage*/XResolution/
+// YResolution/VideoFrameRate, Audio*/Balance), the per-`trak`
+// HandlerDescription/TrackProperty, the `tref` `ContentDescribes`, and the
+// `mvhd`-region `TimeZone`. They are absent from the synthetic `.mov` goldens
+// (minimal `moov`) and are a deferred structural-decode item, NOT an rtmd gap.
+// The `-ee` run ALSO excludes `Track3:Warning` "Error reading meta data [x22]":
+// that is `ProcessSamples`' GENERIC short-read diagnostic
+// (QuickTimeStream.pl:1438 `$et->Warn("Error reading $type data")`) for the 22
+// rtmd samples whose fixed-size offsets run past EOF — a per-track read-error
+// channel exifast does not yet model (it skips a past-EOF sample). The no-`ee`
+// `Track3:Warning` "[minor] The ExtractEmbedded option may find more tags…"
+// already matches byte-exact, so the no-`ee` test does NOT exclude it.
+const FX3_STRUCT_EXCL: &[&str] = &[
+  "TimeZone",
+  // `vmhd` VideoHeader + `stts` frame-rate — still deferred (Phase 2/3); the
+  // `stsd` sample-description fields (Compressor*/SourceImage*/X/YResolution/
+  // BitDepth/Audio*/Balance) and the per-`trak` HandlerDescription are now
+  // emitted by the #100 container phase-1 port and compared byte-exact.
+  "GraphicsMode",
+  "OpColor",
+  "VideoFrameRate",
+  // `tapt`/`prop` track property + `tref` ContentDescribes — not yet ported.
+  "TrackProperty",
+  "ContentDescribes",
+];
+
+/// `FX3_STRUCT_EXCL` plus `Track3:Warning` — the `-ee` short-read diagnostic
+/// (`Error reading meta data [x22]`) for the past-EOF rtmd samples, a per-track
+/// read-error channel exifast does not yet model.
+const FX3_EE_EXCL: &[&str] = &[
+  "TimeZone",
+  "GraphicsMode",
+  "OpColor",
+  "VideoFrameRate",
+  "TrackProperty",
+  "ContentDescribes",
+  "Warning",
+];
+
+#[test]
+fn sony_fx3_rtmd_mp4_ee_byte_exact() {
+  // `-ee -G1`: the duplicate full samples (the rtmd chunk offset `0x24` is read
+  // by BOTH chunk-1 sample 1 AND chunk-2 sample 13 — `stsc` = 12 samples/chunk,
+  // 2 chunks) collapse to ONE record. Every rtmd payload tag is byte-exact.
+  check_ee_excluding(
+    "QuickTime_sony_fx3_rtmd.mp4",
+    "QuickTime_sony_fx3_rtmd.mp4.ee.json",
+    false,
+    FX3_EE_EXCL,
+  );
+  // The `-ee -G3:1` Doc-axis golden is NOT asserted: it depends on the same
+  // unmodeled partial/past-EOF sample handling as `Track3:Warning`. The fixed-
+  // size rtmd `stsz` (24 samples × 11264 B all from offset `0x24`) lays samples
+  // back-to-back, so samples 2 and 14 PARTIAL-read the file tail (2239 B of the
+  // trailing `moov`) and samples 3-12 / 15-24 read 0 B past EOF. ExifTool opens
+  // a `Doc<N>` for every sample that read ≥1 byte and emits its timing-only
+  // `SampleTime`/`SampleDuration` (golden Docs: 1 full, 2 timing-only, 3 full,
+  // 4 timing-only). exifast SKIPS a past-EOF/partial sample wholesale
+  // (`data.get(start..start+size)` → `None` → `continue` in `process_samples`),
+  // so it opens only the 2 FULL-read docs and numbers them 1/2 — a different
+  // Doc multiset the name-tail exclusion cannot reconcile. Modeling the
+  // ExifTool clamp-and-parse (partial read → warn `Error reading meta data`,
+  // open a timing-only doc, parse the clamped bytes) is the deferred per-track
+  // read-error feature noted on `FX3_EE_EXCL`'s `Warning`; the `-G1` record
+  // above is the byte-exact rtmd proof.
+}
+
+#[test]
+fn sony_fx3_rtmd_mp4_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_fx3_rtmd.mp4",
+    "QuickTime_sony_fx3_rtmd.mp4.json",
+    FX3_STRUCT_EXCL,
+  );
+}
+
+// ── Insta360 OneRS REAL `.insv` (real-fixture trailer + capped accel) ────────
+// The REAL Insta360 OneRS capture (#91): a 1.26 MB `.insv` with a 1 200 577-byte
+// Insta360 trailer at file offset 0xfab3. This pins `ProcessInsta360` against
+// genuine OneRS bytes, not a crafted minimal trailer — in particular the
+// `%insvLimit` 0x300 accelerometer cap (QuickTimeStream.pl:103-105 + :3347-3349):
+// the trailer's accelerometer record holds far more than 20 000 rows, so bundled
+// truncates to the first 20 000 and raises the `[Minor]` ignorable-2 warning
+// `Insta360 accelerometer data is huge. Processing only the first 20000 records`.
+// exifast mirrors BOTH the cap (exactly 20 000 surfaced accel rows) and the
+// `[Minor]`-prefixed group-scoped `Insta360:Warning` — the prefix being the sole
+// real-input divergence this fixture surfaced (`$et->Warn(..., 2)` renders
+// `[Minor] ` per ExifTool.pm:5630; the crafted fixtures never reach the cap, so
+// it was previously unpinned). The identity (`Model = Insta360 OneRS`,
+// `SerialNumber = IRBEN2204U3FRW`, `Firmware = v1.6.29_build1`, `Parameters`) and
+// the always-on positional `[minor] Insta360 trailer at offset 0xfab3 (1200577
+// bytes)` `ExifTool:Warning` are byte-exact.
+//
+// EXCLUDED tails (`INSV_REAL_EXCL`): the OneRS file carries full QuickTime `stsd`
+// sample-description boxes + a 470-sample timed-`text` track that this port's
+// structural trak parse does not surface — a pre-existing QuickTime *container*
+// gap (NOT Insta360): the `stsd` codec sub-tags (`CompressorID`/`AudioFormat`/
+// `HandlerDescription`/`Gen*`/`BitDepth`/…) and the per-sample
+// `SampleTime`/`SampleDuration` of the `text` handler track. (Contrast `camm`,
+// whose metadata-handler track DOES surface `SampleTime`/`SampleDuration` — see
+// `camm_ee_byte_exact_gps_columns`.) Everything exifast emits is byte-IDENTICAL
+// to the bundled oracle; the excluded tails are the only structural absences and
+// none collide with a tag exifast does emit.
+//
+// The full `-ee -G3` Insta360 record stream IS pinned, doc-number-normalized —
+// see [`insta360_real_oners_insv_g3_full_stream_byte_exact`]. The raw `-ee -G3:1`
+// document is NOT directly comparable: the 469 un-extracted `text`-track timed
+// samples occupy `Doc1..Doc469` in the bundled oracle, shifting EVERY Insta360
+// trailer record's `Doc<N>` index up by 469 (the OneRS oracle runs
+// `Doc470..Doc21616`; exifast emits the same records at `Doc1..Doc21147`). The
+// Insta360 RECORD SEQUENCE — tag names + values, in doc order — is byte-identical
+// once that constant offset is removed; only the absolute `Doc<N>` numbering
+// differs, which a key-drop exclusion cannot realign. The full-stream test
+// VERIFIES that offset from the raw doc numbers (oracle `Doc470..Doc21616`,
+// exifast `Doc1..Doc21147`, both contiguous, constant +469) and THEN compares
+// the two docless ordered sequences byte-identical, without porting the
+// timed-`text` subsystem (a large QuickTime-container item, out of scope for the
+// Insta360 trailer proof).
+const INSV_REAL_EXCL: &[&str] = &[
+  // Still-deferred `stsd`/`vmhd`/`stts` detail (Phase 2/3): the `vmhd`
+  // VideoHeader, the `pasp` PixelAspectRatio, the `stts` frame-rate, and the
+  // `gmhd`/`gmin` GenMediaHeader. The `vide`/`soun` `stsd` sample-description
+  // fields, the per-`trak` HandlerDescription, and the `text`-handler
+  // `OtherFormat` are now emitted by the #100 container phase-1 port and
+  // compared byte-exact.
+  "GraphicsMode",
+  "OpColor",
+  "PixelAspectRatio",
+  "VideoFrameRate",
+  "GenBalance",
+  "GenFlags",
+  "GenGraphicsMode",
+  "GenMediaVersion",
+  "GenOpColor",
+  // Per-sample timed-`text`-track table tags (the 470-sample text track).
+  "SampleDuration",
+  "SampleTime",
+];
+
+#[test]
+fn insta360_real_oners_insv_byte_exact() {
+  // no-`ee` (`-G1`): the identity + Parameters + the always-on positional
+  // `ExifTool:Warning` + the `Track3:Warning` ExtractEmbedded hint, byte-exact.
+  check_noee_excluding(
+    "QuickTime_insta360_real.insv",
+    "QuickTime_insta360_real.insv.json",
+    INSV_REAL_EXCL,
+  );
+  // `-ee` (`-G1`): the `%noDups`-collapsed timed records + the capped-accel
+  // `[Minor]` warning + the identity, byte-exact. This SMOKE-tests only the
+  // FIRST visible TimeCode/Accelerometer/AngularVelocity/ExposureTime (the doc
+  // axis is collapsed first-wins); the full 21 147-record stream is pinned by
+  // `insta360_real_oners_insv_g3_full_stream_byte_exact` below.
+  check_ee_excluding(
+    "QuickTime_insta360_real.insv",
+    "QuickTime_insta360_real.insv.ee.json",
+    false,
+    INSV_REAL_EXCL,
+  );
+}
+
+/// Ordered `(full-key, value)` entries of the SINGLE top-level object of a
+/// `-ee -G3:1 -j` document, **preserving duplicate keys** — the same
+/// duplicate-key-faithful parse [`json_equivalent_strict`] uses internally (its
+/// private `OrderedObject`: a serde `MapAccess` visitor that pushes EVERY entry
+/// in source order). Routing this comparison through a `serde_json::Map`/`Value`
+/// instead would SILENTLY COLLAPSE a repeated `Doc<N>:Insta360:*` key (this
+/// crate builds `serde_json` WITHOUT `preserve_order`), masking the ExifTool
+/// `%noDups` regression class on the raw `-ee -G3` stream before any value
+/// comparison runs.
+struct OrderedEntries<'de>(Vec<(String, &'de serde_json::value::RawValue)>);
+
+impl<'de> serde::Deserialize<'de> for OrderedEntries<'de> {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::de::Deserializer<'de>,
+  {
+    struct V<'de>(std::marker::PhantomData<&'de ()>);
+    impl<'de> serde::de::Visitor<'de> for V<'de> {
+      type Value = OrderedEntries<'de>;
+      fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON object")
+      }
+      fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+      where
+        M: serde::de::MapAccess<'de>,
+      {
+        let mut pairs: Vec<(String, &'de serde_json::value::RawValue)> = Vec::new();
+        while let Some((k, v)) = map.next_entry::<String, &'de serde_json::value::RawValue>()? {
+          pairs.push((k, v));
+        }
+        Ok(OrderedEntries(pairs))
+      }
+    }
+    deserializer.deserialize_map(V(std::marker::PhantomData))
+  }
+}
+
+/// Filter a `-ee -G3:1 -j` document to its `Doc<N>:Insta360:<tag>` timed records,
+/// preserving DUPLICATE keys and source order, and RENUMBER each record's `<N>`
+/// by `+doc_offset`. The `Insta360:Model`/`SerialNumber`/`Firmware`/`Parameters`/
+/// `Warning` identity + cap-warning ride the family-1 level with NO `Doc<N>`
+/// prefix and are dropped here (pinned by the `-ee -G1` smoke test, not this
+/// per-record stream); any non-`Insta360` `Doc<N>` group (e.g. the `Track3`
+/// text-track samples that ride `Doc1..Doc469` in the raw oracle) is dropped too.
+///
+/// Used for BOTH sides: the raw-doc oracle golden parses with `doc_offset = 0`
+/// (it already carries ExifTool's `Doc470..` numbering), and exifast's output
+/// parses with `doc_offset = INSTA360_DOC_OFFSET` so its `Doc1..` records are
+/// renumbered up to the oracle's `Doc470..` range — STAGE 2 then compares the two
+/// RAW filtered objects with the standard [`json_equivalent_strict`] (key
+/// multiset, duplicates-significant, values token-exact), so the offset is the
+/// ONLY transform and the duplicate-key protection is inherited, not reimplemented.
+///
+/// Returns the ordered `(renumbered-full-key, raw-value-text)` pairs (duplicates
+/// kept) AND the per-entry doc numbers in source order (duplicates kept) for the
+/// STAGE-1 span/contiguity assertion.
+fn insta360_doc_entries(
+  doc: &str,
+  side: &str,
+  doc_offset: u64,
+) -> (Vec<(String, String)>, Vec<u64>) {
+  let arr: Vec<&serde_json::value::RawValue> =
+    serde_json::from_str(doc).expect("valid -ee -G3 JSON document (single-object array)");
+  let first = arr
+    .first()
+    .expect("-ee -G3 document is a single-object array");
+  let OrderedEntries(pairs) =
+    serde_json::from_str(first.get()).expect("-ee -G3 first element is a JSON object");
+
+  let mut entries: Vec<(String, String)> = Vec::new();
+  let mut docs: Vec<u64> = Vec::new();
+  for (k, v) in pairs {
+    let Some(rest) = k.strip_prefix("Doc") else {
+      continue;
+    };
+    let Some((num, name)) = rest.split_once(':') else {
+      continue;
+    };
+    let Some(tag) = name.strip_prefix("Insta360:") else {
+      continue;
+    };
+    let Ok(n) = num.parse::<u64>() else {
+      continue;
+    };
+    let renumbered = n
+      .checked_add(doc_offset)
+      .unwrap_or_else(|| panic!("{side}: Doc{n}+{doc_offset} overflows u64"));
+    docs.push(renumbered);
+    entries.push((
+      format!("Doc{renumbered}:Insta360:{tag}"),
+      v.get().trim().to_string(),
+    ));
+  }
+  (entries, docs)
+}
+
+/// The `(first, last, distinct)` doc span of an Insta360 record stream's per-entry
+/// doc numbers (`insta360_doc_entries`'s second return, duplicates kept),
+/// asserting CONTIGUITY (an unbroken `Doc{first}..Doc{last}` run over the DISTINCT
+/// doc numbers — a gap would mean a dropped or duplicated record and must fail
+/// loudly, never silently realign) and non-emptiness. A repeated full key does
+/// NOT break doc-number contiguity (the doc still appears in the distinct set);
+/// that class is owned by STAGE 2's raw-object multiset compare.
+fn insta360_doc_span(docs: &[u64], side: &str) -> (u64, u64, u64) {
+  assert!(
+    !docs.is_empty(),
+    "{side}: no `Doc<N>:Insta360:*` timed records found in the -ee -G3 document"
+  );
+  let mut distinct: Vec<u64> = docs.to_vec();
+  distinct.sort_unstable();
+  distinct.dedup();
+  let first = *distinct.first().expect("non-empty");
+  let last = *distinct.last().expect("non-empty");
+  let count = distinct.len() as u64;
+  assert_eq!(
+    last - first + 1,
+    count,
+    "{side}: Insta360 -ee -G3 doc numbers are not contiguous (Doc{first}..Doc{last}, \
+     {count} distinct) — a dropped or duplicated record"
+  );
+  (first, last, count)
+}
+
+/// Re-serialize the ordered `(full-key, raw-value-text)` entries (duplicates kept)
+/// of an Insta360 record stream into a SINGLE-OBJECT-ARRAY JSON text whose object
+/// keys are written verbatim in source order — duplicates and all. Feeding this
+/// to [`json_equivalent_strict`] lets the comparator's `OrderedObject` see the
+/// FULL key multiset (so an exifast-side duplicate `Doc<N>:Insta360:*` key fails
+/// the cardinality check) instead of a `serde_json::Map` that would collapse it.
+fn insta360_entries_to_document(entries: &[(String, String)]) -> String {
+  let mut s = String::from("[{");
+  for (i, (k, v)) in entries.iter().enumerate() {
+    if i > 0 {
+      s.push(',');
+    }
+    // `{k:?}` JSON-escapes the (renumbered) key; the value text is the verbatim
+    // source lexeme captured by `RawValue::get` (already trimmed), so the value
+    // stays token-exact for the strict compare.
+    s.push_str(&format!("{k:?}:{v}"));
+  }
+  s.push_str("}]");
+  s
+}
+
+/// The constant Insta360 `Doc<N>` offset: ExifTool numbers the trailer records
+/// `Doc470..` because the un-extracted 469-sample timed-`text` track occupies
+/// `Doc1..Doc469`; exifast (not extracting that track) emits the SAME records at
+/// `Doc1..`. STAGE 1 re-derives and asserts this offset from the raw doc numbers;
+/// STAGE 2 renumbers the exifast side UP by it so both sides share `Doc470..`.
+const INSTA360_DOC_OFFSET: u64 = 469;
+
+// ── Insta360 OneRS REAL `.insv` — FULL `-ee -G3` timed-record stream ─────────
+// Pins the ENTIRE Insta360 timed-record stream the `-ee -G1` view collapses:
+// 21 147 records (one per `Doc<N>`) — 20 000 carrying TimeCode + Accelerometer +
+// AngularVelocity (the `%insvLimit` 0x300 accelerometer cap, QuickTimeStream.pl:
+// 103-105 / :3347-3349, truncates the >20 000-row accel stream to the first
+// 20 000) and 1 147 carrying TimeCode + ExposureTime (the 0x700/0x900-class
+// records). The bundled `-ee -G3:1` oracle numbers these `Doc470..Doc21616` (the
+// un-extracted 469-sample timed-`text` track occupies `Doc1..Doc469`); exifast,
+// not extracting that track, emits the SAME records at `Doc1..Doc21147` — a
+// CONSTANT +469 offset that this test VERIFIES (it does not remove it: porting
+// the timed-`text` subsystem is a large QuickTime-container item, out of scope
+// for the Insta360 trailer proof).
+//
+// The proof is two-staged, and BOTH stages parse with a DUPLICATE-PRESERVING
+// `RawValue` ordered-object scan (the same parse `json_equivalent_strict` uses),
+// never a `serde_json::Map` (which — this crate builds `serde_json` WITHOUT
+// `preserve_order` — would silently collapse a repeated `Doc<N>:Insta360:*` key
+// and mask the ExifTool `%noDups` regression on the raw stream):
+//   (1) parse exifast's `-ee -G3` output AND the raw-doc oracle golden into
+//       per-entry doc-number lists (RAW `Doc<N>` preserved; exifast renumbered
+//       +469), and ASSERT the absolute numbering — oracle docs run exactly
+//       `Doc470..Doc21616` (first 470, last 21616, 21 147 distinct), exifast docs
+//       run `Doc1..Doc21147` → renumbered `Doc470..Doc21616`, both CONTIGUOUS,
+//       and the constant offset is exactly 469. A manually-regenerated golden
+//       with a gap / wrong start, or an exifast run shifted to a different
+//       contiguous `Doc` range, FAILS here.
+//   (2) THEN re-serialize both filtered + renumbered streams back to raw
+//       single-object-array JSON (keys verbatim, DUPLICATES KEPT) and compare
+//       with the STANDARD [`json_equivalent_strict`] the other goldens use. Both
+//       sides now carry `Doc470..Doc21616`, so the comparator's object-key
+//       MULTISET check (duplicates significant) + token-exact value check pin the
+//       record count, the full key set, the 20 000-cap behaviour, and every row's
+//       TimeCode/Accelerometer/AngularVelocity/ExposureTime value, byte-exact vs
+//       ExifTool — and a duplicate `Doc<N>:Insta360:*` key on EITHER side now
+//       fails the cardinality check (it is no longer collapsed pre-compare).
+//
+// The committed golden (`…ee.g3.insta360.json`) carries ExifTool's RAW
+// `Doc<N>:Insta360:*` keys (`Doc470..Doc21616`), so both sides go through the
+// identical filter + renumber (the golden with offset 0). It is NOT produced by
+// `gen_golden.sh` (whose raw `.ee.g3.json` also carries the un-extracted `Track3`
+// text-track samples at `Doc1..Doc469`); regenerate it by filtering that oracle
+// to the Insta360 records, preserving the raw doc numbers:
+//   ( cd tests/fixtures && LC_ALL=C TZ=UTC perl "$EXIFTOOL" -j -G3:1 -struct \
+//       -api QuickTimeUTC=1 --FileName --Directory --FileSize --FileModifyDate \
+//       --FileAccessDate --FileInodeChangeDate --FilePermissions -ee \
+//       QuickTime_insta360_real.insv ) \
+//     | jq -c '[ .[0] | with_entries(select(.key | test("^Doc[0-9]+:Insta360:"))) ]' \
+//     > tests/golden/QuickTime_insta360_real.insv.ee.g3.insta360.json
+#[test]
+fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
+  let data = fixture("QuickTime_insta360_real.insv");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got_raw = extract_info_with_options("QuickTime_insta360_real.insv", &data, true, opts);
+  let want_raw = golden("QuickTime_insta360_real.insv.ee.g3.insta360.json");
+
+  // Filter to `Doc<N>:Insta360:*` records via the DUPLICATE-PRESERVING ordered
+  // parse; renumber the exifast side UP by the offset so both carry `Doc470..`.
+  let (got_entries, got_docs) = insta360_doc_entries(&got_raw, "got", INSTA360_DOC_OFFSET);
+  let (want_entries, want_docs) = insta360_doc_entries(&want_raw, "oracle", 0);
+
+  // STAGE 1 — verify the doc-offset normalization from the RAW doc numbers
+  // (before the renumber/compare): the oracle's absolute range, exifast's
+  // PRE-renumber range, contiguity on both sides, and the constant offset.
+  // (Re-derive exifast's pre-renumber numbers by subtracting the offset back.)
+  let got_pre: Vec<u64> = got_docs.iter().map(|n| n - INSTA360_DOC_OFFSET).collect();
+  let (oracle_first, oracle_last, oracle_count) = insta360_doc_span(&want_docs, "oracle");
+  let (got_first, got_last, got_count) = insta360_doc_span(&got_pre, "got");
+  assert_eq!(
+    (oracle_first, oracle_last, oracle_count),
+    (470, 21616, 21147),
+    "raw-doc oracle golden must run exactly Doc470..Doc21616 (21 147 records); \
+     a manually-regenerated golden with a gap / wrong start fails here"
+  );
+  assert_eq!(
+    (got_first, got_last, got_count),
+    (1, 21147, 21147),
+    "exifast -ee -G3 Insta360 records must run exactly Doc1..Doc21147 (21 147 \
+     records); a doc-shifted run (e.g. Doc2..Doc21148) fails here"
+  );
+  assert_eq!(
+    oracle_first - got_first,
+    INSTA360_DOC_OFFSET,
+    "the constant Insta360 doc offset (un-extracted 469-sample text track) must \
+     be exactly 469: oracle_first {oracle_first} - got_first {got_first}"
+  );
+
+  // STAGE 2 — re-serialize both renumbered streams to RAW single-object-array
+  // JSON (keys verbatim, DUPLICATES KEPT) and compare with the STANDARD strict
+  // comparator: its object-key MULTISET check pins the record count + full key
+  // set (a duplicate `Doc<N>:Insta360:*` key on either side now FAILS the
+  // cardinality check), and the token-exact value check pins every row's value.
+  let got = insta360_entries_to_document(&got_entries);
+  let want = insta360_entries_to_document(&want_entries);
+  if let Err(e) = json_equivalent_strict(&got, &want) {
+    panic!(
+      "QuickTime_insta360_real.insv (-ee -G3, Insta360 record stream, \
+       renumbered) vs QuickTime_insta360_real.insv.ee.g3.insta360.json: {}",
+      e.message()
+    );
+  }
+}
+
+// A SYNTHETIC exifast-side document carrying a DUPLICATE `Doc470:Insta360:TimeCode`
+// key must FAIL the comparison — proving the structural duplicate-key protection
+// (inherited from `json_equivalent_strict`'s object-key MULTISET check) actually
+// fires, instead of the old `serde_json::Map` path that SILENTLY COLLAPSED the
+// repeat before any value compare. This is the negative half of the R3 fix: the
+// real-stream test above proves byte-exact equality; this proves a duplicated
+// record is REJECTED (not masked). Both go through the same
+// `insta360_doc_entries` (duplicate-preserving) → `insta360_entries_to_document`
+// → `json_equivalent_strict` machinery as the real test.
+#[test]
+fn insta360_full_stream_rejects_duplicate_doc_key() {
+  // Golden side: one clean record (offset 0 ⇒ stays Doc470).
+  let want_raw = r#"[{"Doc470:Insta360:TimeCode":534773.966}]"#;
+  // exifast side: the SAME record emitted TWICE (a duplicated record). With
+  // offset 0 it also stays Doc470, so the only difference is the cardinality of
+  // the `Doc470:Insta360:TimeCode` key — exactly the `%noDups` class the old
+  // `Map::insert` collapsed.
+  let got_raw =
+    r#"[{"Doc470:Insta360:TimeCode":534773.966,"Doc470:Insta360:TimeCode":534773.966}]"#;
+
+  let (got_entries, got_docs) = insta360_doc_entries(got_raw, "got", 0);
+  let (want_entries, _want_docs) = insta360_doc_entries(want_raw, "oracle", 0);
+
+  // The duplicate-preserving parse must KEEP both copies (a `serde_json::Map`
+  // would have already collapsed them to one here — the original bug site).
+  assert_eq!(
+    got_docs.len(),
+    2,
+    "duplicate-preserving parse must keep BOTH Doc470 entries (a collapsing \
+     serde_json::Map would report 1)"
+  );
+
+  let got = insta360_entries_to_document(&got_entries);
+  let want = insta360_entries_to_document(&want_entries);
+  let res = json_equivalent_strict(&got, &want);
+  assert!(
+    res.is_err(),
+    "a duplicate Doc470:Insta360:TimeCode on the exifast side MUST fail the \
+     strict comparison (the object-key multiset cardinality differs), not be \
+     silently collapsed"
+  );
+  let msg = res.unwrap_err();
+  assert!(
+    msg.message().contains("multiset differs"),
+    "the failure must be the object-key MULTISET check (the structural \
+     duplicate-key guard), got: {}",
+    msg.message()
   );
 }

@@ -1366,7 +1366,60 @@ fn quicktime_gopro_gpmf_conformance() {
 }
 
 #[test]
-#[ignore]
+fn quicktime_gopro_gpmf_mp4_conformance() {
+  // GoPro Hero8 `.mp4` variant of `QuickTime_gopro_gpmf` (#127). UNLIKE the
+  // synthetic `.mov` sibling (whose `moov/udta/GPMF` blob carries the typed
+  // `%GoPro::GPMF` device tags), this is a real transcoded `.mp4` (98 kB,
+  // muxed by `Lavf62.12.101`): THREE tracks (`vide`/`soun`/`tmcd`, all with a
+  // `GoPro AVC/AAC` `HandlerDescription`) and a `moov/udta/LocationInformation`
+  // atom (`Lat=33.12650 Lon=-117.32719`) — but NO `gpmd` GPMF timed track and
+  // NO `GoPro:*` device record at all. Because there is no embedded/timed
+  // metadata, the bundled oracle's default (`-j`) and `-ee` outputs are
+  // byte-identical (124 tags each): the Composite `GPSLatitude`/`Longitude`
+  // come from the always-extracted `LocationInformation` udta atom, NOT from a
+  // `-ee`-gated gpmd stream — so there is no `-ee`-gating divergence to pin
+  // (cf. #211), and only the two standard goldens are needed.
+  //
+  // exifast emits a clean SUBSET of the bundled tags (zero extra). The QuickTime
+  // container phase-1 port (#100) now decodes the `hdlr` HandlerDescription and
+  // the `vide`/`soun`/other `stsd` sample-description, so the retained set
+  // includes per-track `HandlerDescription`, the `vide` `CompressorID`/
+  // `SourceImageWidth`/`SourceImageHeight`/`XResolution`/`YResolution`/
+  // `CompressorName`/`BitDepth`, the `soun` `Balance`/`AudioFormat`/
+  // `AudioChannels`/`AudioBitsPerSample`/`AudioSampleRate`, and the `tmcd`
+  // `OtherFormat`. The still-deferred tags, excluded via `tools/gen_golden.sh
+  // EXCLUDE` (`-x` is ExifTool TRUTH; we defer the unported, never edit a value):
+  //   - `System:all`/`Composite:all` — filesystem + the deferred QuickTime
+  //     Composite subsystem (incl. the `LocationInformation`-derived
+  //     `GPSLatitude`/`Longitude`/`Position`), matching the `.mov` goldens;
+  //   - `ItemList:all` (`©too` Encoder) + `UserData:all`
+  //     (`LocationInformation`) — udta atoms this port does not decode;
+  //   - the movie-level `1QuickTime:HandlerType`/`HandlerVendorID` (the
+  //     `udta/hdlr` `mdir`/`appl`), family-1-scoped so the per-track
+  //     `Track<N>:HandlerType`/`HandlerDescription` the port DOES emit is
+  //     retained;
+  //   - the deferred per-track minf/stbl detail the phase-1 port does NOT walk:
+  //     the `vmhd` `GraphicsMode`/`OpColor`, the `colr` color tags
+  //     (`ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/
+  //     `MatrixCoefficients`/`VideoFullRangeFlag`), `pasp` `PixelAspectRatio`,
+  //     the `btrt` `BufferSize`/`MaxBitrate`/`AverageBitrate`, the `stts`
+  //     `VideoFrameRate`, the `tref` `TimecodeTrack`, and the `tmcd`
+  //     `PlaybackFrameRate`.
+  // The retained set is byte-exact vs the bundled `perl exiftool 13.59 -j -G1
+  // -struct -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
+  check(
+    "QuickTime_gopro_gpmf.mp4",
+    "QuickTime_gopro_gpmf.mp4.json",
+    true,
+  );
+  check(
+    "QuickTime_gopro_gpmf.mp4",
+    "QuickTime_gopro_gpmf.mp4.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_gopro_scen_conformance() {
   // GoPro Codex R13: a complex `?` record (`SCEN` SceneClassification,
   // GoPro.pm:482) whose preceding `TYPE` is `Ff` — a 4-char FourCC scene code
@@ -1411,12 +1464,28 @@ fn quicktime_rove_r2_4k_conformance() {
   check(
     "QuickTime_rove_r2_4k.MP4",
     "QuickTime_rove_r2_4k.MP4.n.json",
+#[ignore = "port gap: track-level + -ee gating; see #211"]
+fn quicktime_gopro_hero8_gpmf_conformance() {
+  // Real GoPro HERO8 Black MP4 (from GoPro's official gpmf-parser repo,
+  // `samples/hero8.mp4`, 4.2 MB, 12.6 s, 848×480, firmware HD8.01.01.20.00).
+  // This is the default (non-`-ee`) conformance: container-level metadata only
+  // (Track1–Track5, GoPro:*, Composite:*). The gpmd track (Track4, GoPro MET)
+  // carries GPMF GPS/accel data but that requires `-ee` to decode — tracked
+  // separately via timed_metadata_conformance.
+  // Goldens: bundled ExifTool 13.59 (`tools/gen_golden.sh`), TZ=UTC.
+  check(
+    "QuickTime_gopro_hero8_gpmf.mp4",
+    "QuickTime_gopro_hero8_gpmf.mp4.json",
+    true,
+  );
+  check(
+    "QuickTime_gopro_hero8_gpmf.mp4",
+    "QuickTime_gopro_hero8_gpmf.mp4.n.json",
     false,
   );
 }
 
 #[test]
-#[ignore]
 fn quicktime_trunc_ftyp_conformance() {
   // PR #38 Codex R6/F2: a 12-byte file whose first atom is `ftyp` with a
   // DECLARED size of 100 — the header is intact but the brand payload
@@ -1755,6 +1824,114 @@ fn quicktime_nested_invalid_tkhd_conformance() {
   check(
     "QuickTime_nested_invalid_tkhd.mov",
     "QuickTime_nested_invalid_tkhd.mov.n.json",
+    false,
+  );
+}
+
+// ============================================================================
+// QuickTime SP4 brand-variant real-fixture conformance (#151)
+// ============================================================================
+//
+// Three REAL bundled brand-variant containers prove the already-merged SP4
+// `ftyp`-driven brand-detection dispatch (HEIC/AVIF/iso5/msf1) end-to-end: the
+// brand routes to the correct `File:FileType`/`File:MIMEType` and the
+// `ProcessMOV` walk emits the `ftyp` brand tags (`QuickTime:MajorBrand`/
+// `MinorVersion`/`CompatibleBrands`) plus whatever structural atoms the port
+// supports, BYTE-EXACT against the bundled ExifTool oracle.
+//
+// The goldens (`tools/gen_golden.sh` with the per-fixture `EXCLUDE` below) drop
+// `System:all` + `Composite:all` (the QuickTime Composite subsystem is the
+// Phase-2 forward item) AND the container/codec-config atoms this port does not
+// decode — the HEVC/AV1 `*Configuration*` sample-description fields, the HEIF
+// `ispe` `ImageSpatialExtent`, the `vmhd` `GraphicsMode`/`OpColor`, the
+// `mvex/mehd` `MovieFragmentSequence`, and the file-`meta` `hdlr`
+// `HandlerType`/`HandlerDescription`. Since the QuickTime container phase-1 port
+// (#100) the per-track `stsd` `OtherFormat` (the `pict`/`text` 4cc) and the
+// `trak` `hdlr` `HandlerDescription` ARE now decoded and retained byte-exact.
+// exifast emits a strict SUBSET of the oracle (verified: it produces NO tag the
+// oracle lacks); every excluded key is an unsupported container-structure tag,
+// deferred via `-x`, never a value the port gets wrong.
+
+#[test]
+fn avif_brand_conformance() {
+  // `tests/fixtures/AVIF_sample.avif` — a real AV1 Image File. Oracle (bundled
+  // `exiftool -G1 -j`): File:FileType AVIF, File:MIMEType image/avif,
+  // QuickTime:MajorBrand "AV1 Image File Format (.AVIF)" (brand `avif`),
+  // CompatibleBrands [avif, mif1, miaf, MA1B], File:ImageWidth 1204,
+  // File:ImageHeight 800, Meta:PrimaryItemReference 1.
+  //
+  // EXCLUDE (gen_golden.sh): `-x System:all -x Composite:all -x HandlerType
+  // -x HandlerDescription -x PixelAspectRatio -x ImageSpatialExtent
+  // -x ImagePixelDepth -x AV1ConfigurationVersion -x ChromaFormat
+  // -x ChromaSamplePosition`. The AVIF has only a file-`meta` `pict` handler
+  // (no `trak`), so the bare `-x HandlerType`/`HandlerDescription` are
+  // collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
+  // unsupported codec-config / spatial-extent fields. The brand routing +
+  // `pitm` + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  check("AVIF_sample.avif", "AVIF_sample.avif.json", true);
+  check("AVIF_sample.avif", "AVIF_sample.avif.n.json", false);
+}
+
+#[test]
+fn heic_msf1_brand_conformance() {
+  // `tests/fixtures/HEIF_C001_msf1.heic` — a real HEVC still image whose `msf1`
+  // compatible brand sits ahead of `heic`. Oracle: File:FileType HEIC,
+  // File:MIMEType image/heic, QuickTime:MajorBrand "High Efficiency Image Format
+  // HEVC still image (.HEIC)" (brand `heic`), CompatibleBrands
+  // [msf1, mif1, heic, hevc, iso8], Meta:PrimaryItemReference 20001. The file
+  // ALSO carries a `moov`/`trak` (the HEVC image track) whose `mvhd`/`tkhd`/
+  // `mdhd`/`hdlr` core atoms the port decodes byte-exact (CreateDate,
+  // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
+  // -x ImageSpatialExtent -x GraphicsMode -x OpColor` + the `hvcC` HEVC
+  // sample-description config block (`HEVCConfigurationVersion`,
+  // `GeneralProfileSpace`/`GeneralTierFlag`/`GeneralProfileIDC`,
+  // `GenProfileCompatibilityFlags`, `ConstraintIndicatorFlags`,
+  // `GeneralLevelIDC`, `MinSpatialSegmentationIDC`, `ParallelismType`,
+  // `ChromaFormat`, `BitDepthLuma`/`BitDepthChroma`, `AverageFrameRate`/
+  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`). The `pict`
+  // track is a non-`vide`/`soun`/`meta` handler, so the phase-1 port (#100)
+  // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1" — now RETAINED (the
+  // `vmhd` `GraphicsMode`/`OpColor` stay deferred).
+  //
+  // `-x Copy1:HandlerType` is the ONE non-obvious exclusion: the file carries
+  // TWO `hdlr` boxes with the SAME tag NAME — the file-`meta` `hdlr` (which the
+  // port's `walk_heif_meta` reads only for `pitm`, NOT `hdlr` — a deliberate
+  // unsupported container tag) and the `trak` `hdlr` (which the port DOES emit
+  // as `Track1:HandlerType`). They are distinguished only by ExifTool's
+  // family-4 copy-number group (`Copy1` = the file-`meta` duplicate, `Main` =
+  // the track), so excluding `Copy1:HandlerType` drops EXACTLY the unsupported
+  // file-`meta` `QuickTime:HandlerType` while keeping the port-emitted
+  // `Track1:HandlerType` — no value is altered.
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.json", true);
+  check("HEIF_C001_msf1.heic", "HEIF_C001_msf1.heic.n.json", false);
+}
+
+#[test]
+fn iso5_brand_conformance() {
+  // `tests/fixtures/ISOBMFF_iso5_brand.mp4` — a real fragmented MP4 whose major
+  // brand `iso5` ("MP4 Base Media v5") has no `(.EXT)` substring, so the brand
+  // dispatch falls through to MP4 (no `mp41`/`mp42`/`f4v`/`qt` compatible
+  // brand). Oracle: File:FileType MP4, File:MIMEType video/mp4,
+  // QuickTime:MajorBrand "MP4 Base Media v5", MinorVersion "0.0.1",
+  // CompatibleBrands [iso5, dsms, msix, dash]. The `moov`/`trak` (a GPAC text
+  // track) decodes byte-exact incl. Track1:MediaLanguageCode "und",
+  // Track1:HandlerType "Text", and the no-`-ee` Track1:Warning.
+  //
+  // EXCLUDE: `-x System:all -x Composite:all -x MovieFragmentSequence` — only
+  // the `mvex/mehd` `MovieFragmentSequence` is an unsupported container tag now.
+  // The phase-1 port (#100) decodes the `trak` `hdlr` `HandlerDescription`
+  // ("nhml@GPAC0.5.1-DEV-rev5339") and the `text`-handler `stsd` `OtherFormat`
+  // ("depi"), both RETAINED byte-exact.
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.json",
+    true,
+  );
+  check(
+    "ISOBMFF_iso5_brand.mp4",
+    "ISOBMFF_iso5_brand.mp4.n.json",
     false,
   );
 }
@@ -9057,25 +9234,32 @@ fn makernotes_nikon_d2hs_conformance() {
 #[test]
 #[ignore]
 fn makernotes_pentax_k10d_conformance() {
-  // Pentax.jpg (K10D) — the first Pentax-MakerNote conformance backstop (#262).
-  // The 47 ported `Pentax:*` tags (the camera-indexing leaves + the `0x003f
-  // LensRec` → `LensType` SubDirectory child) are emitted byte-identically to
-  // bundled ExifTool 13.59: `LensType` = "Sigma or Tamron Lens (3 44)",
+  // Pentax.jpg (K10D) — the Pentax-MakerNote conformance backstop (#262). The 99
+  // ported `Pentax:*` tags emit byte-identically to bundled ExifTool 13.59: the
+  // Phase-1 camera-indexing leaves + the `0x003f LensRec` → `LensType`
+  // SubDirectory child (`LensType` = "Sigma or Tamron Lens (3 44)",
   // `PentaxModelID` = "K10D", `Quality` = "Better", `FNumber` = 13.0, the
-  // %pentaxCities world-time pair (Toronto/New York), the dotted PentaxVersion
-  // ("3.0.0.0"), the LV-converted metering segments, and the WB_RGGBLevels run.
+  // %pentaxCities world-time pair, the dotted PentaxVersion "3.0.0.0", the
+  // LV-converted metering segments, the WB_RGGBLevels run), PLUS the Phase-2a
+  // binary SubDirectory tables — `CameraSettings` 0x0205 (`$count < 25` K10D
+  // variant: PictureMode2 "Aperture Priority", the bitfields, the K10D-only
+  // offset-13+ leaves RawAndJpgRecording/SRActive/Rotation/TvExposureTimeSetting/
+  // AvApertureSetting/BaseExposureCompensation, …), `AEInfo` 0x0206 (`$count <= 25
+  // and != 21`: AEExposureTime "1/101", AEAperture 12.9, the exp/log apertures),
+  // and `FlashInfo` 0x0208 (`$count == 27`: FlashStatus "Off", InternalFlashMode
+  // "Did not fire, Wireless (Master)", the TTL_DA quad).
   //
   // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
-  // exifast intentionally does NOT emit — every exclusion is a Phase-1 deferral
-  // (the `%Pentax::Main` long-tail: the binary SubDirectory tables CameraSettings
-  // 0x0205 / AEInfo 0x0206 / LensInfo 0x0207 / FlashInfo 0x0208 / CameraInfo
-  // 0x0215 / BatteryInfo 0x0216 / AFInfo 0x021f, the encrypted ShutterCount
-  // 0x005d, the model-/count-conditional FocusMode/AFPoint/ExposureCompensation
-  // leaves, the `IsOffset => 2` PreviewImageStart/PreviewImage pointers) — OR a
-  // documented engine-wide deferral (Composite:all — no EXIF Composite subsystem;
-  // JFIF:all + IFD1:ThumbnailImage + PrintIM:PrintIMVersion — the same gaps the
-  // Nikon golden excludes). None masks a faithfulness gap in the ported subset.
-  // The JPEG SOF `File:*` dimension tags (#261/#263) ARE part of this golden.
+  // exifast does NOT emit — every exclusion is a still-deferred Phase-2b/2c port
+  // (the `%Pentax::Main` long-tail: LensInfo 0x0207 / CameraInfo 0x0215 /
+  // BatteryInfo 0x0216 / AFInfo 0x021f / SRInfo, the encrypted ShutterCount
+  // 0x005d, the model-/count-conditional FocusMode/AFPoint/ExposureCompensation/
+  // PictureMode/DriveMode/FlashMode Main leaves, the `IsOffset => 2`
+  // PreviewImageStart/PreviewImage pointers) — OR a documented engine-wide
+  // deferral (Composite:all — no EXIF Composite subsystem; JFIF:all +
+  // IFD1:ThumbnailImage + PrintIM:PrintIMVersion — the same gaps the Nikon golden
+  // excludes). None masks a faithfulness gap in the ported subset. The JPEG SOF
+  // `File:*` dimension tags (#261/#263) ARE part of this golden.
   check("Pentax.jpg", "Pentax.jpg.json", true);
   check("Pentax.jpg", "Pentax.jpg.n.json", false);
 }
@@ -9085,21 +9269,25 @@ fn pentax_avi_conformance() {
   // Pentax.avi (K-x) — the Pentax AVI MakerNote bridge (#157). The RIFF parser
   // routes the `LIST_hydt` → `hymn` chunk through the shared `%Pentax::Main`
   // walker (`%Pentax::AVI` SubDirectory: `Start => 10`, `Base => '$start'`,
-  // `ByteOrder => 'Unknown'`, `Pentax.pm:6373-6395`), so the 15 Phase-1 Pentax
+  // `ByteOrder => 'Unknown'`, `Pentax.pm:6373-6395`), so the Phase-1 Pentax
   // camera-indexing leaves emit byte-identically to bundled ExifTool 13.59
   // under family-1 `Pentax`: the K-x lens `LensType` = "smc PENTAX-DA L 18-55mm
   // F3.5-5.6" (the `0x003f LensRec` child), `PentaxModelID` = "K-x", `Quality`
   // = "Best", `WhiteBalance` = "Flash", the dotted `PentaxVersion` ("5.1.0.0"),
   // Contrast/Saturation/Sharpness, ImageTone "Natural", and the DSP/CPU
   // firmware versions — alongside the AVI `RIFF:`/`File:` stream (incl.
-  // `RIFF:Software` "PENTAX K-x …").
+  // `RIFF:Software` "PENTAX K-x …"). The Phase-2a (#262) `CameraSettings`
+  // (`$count < 25`, BASE leaves only — the K-x is not a K10D/GX10 body so the
+  // offset-13+ leaves are model-gated out) and `AEInfo` (`$count == 24` ⇒ the
+  // `$size > 20` `AEFlags` Hook shifts offsets 8+ by one) leaves emit too; the
+  // K-x carries no `$count == 27` FlashInfo, so none is decoded (the scope-fence).
   //
   // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
-  // tags exifast does NOT emit — every exclusion is a Phase-1 deferral (the
-  // `%Pentax::Main` long-tail the K10D `Pentax.jpg` golden also drops: the
-  // binary SubDirectory tables AEInfo 0x0206 / LensInfo 0x0207 / CameraInfo
-  // 0x0215 / SRInfo / FlashInfo, the model-/count-conditional DriveMode /
-  // PictureMode / ExposureCompensation / FocusMode leaves, the
+  // tags exifast does NOT emit — every exclusion is a still-deferred port (the
+  // `%Pentax::Main` long-tail the K10D `Pentax.jpg` golden also drops: LensInfo
+  // 0x0207 / CameraInfo 0x0215 / SRInfo, the size-24-only AEInfo leaves
+  // AEWhiteBalance/AEMeteringMode2/LevelIndicator, the model-/count-conditional
+  // DriveMode/PictureMode/ExposureCompensation/FocusMode Main leaves, the
   // ExtenderStatus/Hue/SerialNumber/FirmwareVersion long-tail) OR the
   // engine-wide Composite deferral (Composite:LensID/ImageSize/Megapixels/
   // Duration — no EXIF Composite subsystem). None masks a faithfulness gap in
@@ -9109,7 +9297,104 @@ fn pentax_avi_conformance() {
   check("Pentax.avi", "Pentax.avi.n.json", false);
 }
 #[test]
-#[ignore]
+fn makernotes_dji_phantom4_conformance() {
+  // DJIPhantom4.jpg (FC330) — the DJI-MakerNote conformance backstop on a REAL
+  // drone JPEG (#121, MakerNote #163). The `0x927c` MakerNote is the verbatim
+  // `%DJI::Main` text-record block (DJI.pm) — exifast emits all 10 `DJI:*`
+  // leaves byte-identically to bundled ExifTool 13.59: `Make` = "DJI", the
+  // three `SpeedX/Y/Z` (`+0.00`, the signed `%+.2f` PrintConv), the flight
+  // `Pitch`/`Yaw`/`Roll` (-7.40 / -7.90 / -2.30) and `CameraPitch`/`CameraYaw`/
+  // `CameraRoll` (-29.80 / -7.80 / +0.00) gimbal angles. The standard EXIF GPS
+  // IFD is ALSO byte-exact (exifast emits the GPS IFD directly): `GPSLatitude`
+  // = 32 deg 28' 42.95" N, `GPSLongitude` = 90 deg 15' 36.01" W, `GPSAltitude`
+  // = 109.786 m — these are the raw GPS IFD tags, NOT the `Composite:GPS*`
+  // synthesis (which exifast cannot emit). All 83 shared tags match for BOTH
+  // the `-j` PrintConv and `-n` numeric snapshots.
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
+  // tags exifast does NOT emit — every exclusion is a documented, NON-DJI-
+  // MakerNote-path deferral (none masks a DJI faithfulness gap):
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (this drops
+  //                        the `Composite:GPS{Latitude,Longitude,Altitude,
+  //                        Position}` synthesis; the RAW GPS IFD above is kept).
+  //   -x XMP:all         — the XMP-drone-dji / XMP-crs / XMP-tiff / … packet is
+  //                        not ported (no XMP subsystem).
+  //   -x MPF:all         — the MPF (Multi-Picture Format) APP2 block
+  //                        (MPF0/MPImage1/MPImage2, incl. the second-image
+  //                        PreviewImage) is not ported.
+  //   -x IFD0:XPComment -x IFD0:XPKeywords — the Windows XP* tags (0x9c9c/
+  //                        0x9c9e) are not in exifast's EXIF table (pre-existing
+  //                        standard-EXIF gap, unrelated to MakerNotes).
+  //   -x ExifIFD:DeviceSettingDescription — EXIF 0xa40b, likewise not in the
+  //                        table (standard-EXIF gap).
+  //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder (the
+  //                        same documented engine-wide gap the Nikon/Pentax
+  //                        goldens drop; the `ThumbnailOffset`/`Length` ARE
+  //                        kept). The JPEG SOF `File:*` dimension tags (#261)
+  //                        are part of this golden.
+  check("DJIPhantom4.jpg", "DJIPhantom4.jpg.json", true);
+  check("DJIPhantom4.jpg", "DJIPhantom4.jpg.n.json", false);
+}
+#[test]
+fn makernotes_samsung_nx500_conformance() {
+  // SamsungNX500.srw (NX500) — the Samsung Type2 MakerNote conformance backstop
+  // on a REAL .srw raw (#210). The `0x927c` MakerNote dispatches to
+  // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`, EXIF-format magic) and walks
+  // `%Samsung::Type2` through the shared `Walker` (body offset 0, inherit base,
+  // `ByteOrder => Unknown` probed to big-endian, `FixBase => 1`, `ProcessProc =>
+  // ProcessUnknown`). exifast emits all 45 `Samsung:*` leaves (29 plain + the
+  // 16 decrypted Crypt leaves, #242) byte-identically to bundled ExifTool 13.59
+  // — the camera-indexing identity
+  // (`DeviceType` = "High-end NX Camera", `SamsungModelID` = "Various Models
+  // (0x5001038)", `LensType` = "Samsung NX 45mm F1.8" via %samsungLensTypes,
+  // `FirmwareName` = "1.10", `LensFirmware` = "01.00_01.10",
+  // `InternalLensSerialNumber`), the exposure leaves (`ExposureTime` = "1/160"
+  // via PrintExposureTime, `FNumber` = 8.9, `FocalLengthIn35mmFormat` = "69 mm"
+  // with the /10 ValueConv, `ISO` = 20000, `ExposureCompensation`), the enum
+  // leaves (`WhiteBalanceSetup`/`RawDataByteOrder`/`ColorSpace`/`SmartRange`/
+  // `FaceDetect`/`FaceRecognition`), `MakerNoteVersion` = "0100" (the undef
+  // ASCII-string render), the `CameraTemperature` undef rational, `SensorAreas`,
+  // `SmartAlbumColor` = "n/a" (the `\0{4}` branch), and the five
+  // `%Samsung::PictureWizard` ProcessBinaryData members (PictureWizardMode =
+  // "Standard", Color = 65535, the -4-shifted Saturation/Sharpness/Contrast),
+  // and the 16 decrypted Crypt leaves (#242, e.g. ColorMatrix =
+  // "436 -120 -60 -42 312 -14 2 -94 348", WB_RGGBLevelsBlack = "128 128 128 128").
+  // The "[minor] Unrecognized MakerNotes" warning bundled emitted while Samsung
+  // was undecoded is GONE (the vendor now decodes). All 45 match for BOTH the
+  // `-j` PrintConv and `-n` numeric snapshots (a Crypt row has no PrintConv, so
+  // its plaintext is identical in both).
+  //
+  // #242: the 16 `RawConv => Samsung::Crypt(...)` encrypted leaves are now
+  // DECRYPTED and emitted — WB_RGGBLevels{Uncorrected,Auto,Illuminator1,
+  // Illuminator2,Black}, ColorMatrix{,SRGB,AdobeRGB}, CbCr{MatrixDefault,Matrix,
+  // GainDefault,Gain}, ToneCurve{SRGBDefault,AdobeRGBDefault,SRGB,AdobeRGB}. The
+  // cipher (`Samsung::Crypt`, Samsung.pm:1579-1605) decrypts each with the
+  // `0xa020 EncryptionKey` int32u[11] captured DURING the Type2 walk; exifast's
+  // plaintext space-joined integers match bundled ExifTool 13.59 BYTE-EXACT (the
+  // real-input proof the cipher port is correct).
+  //
+  // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
+  // exifast does NOT emit — every exclusion is a documented deferral (none masks
+  // a Samsung-Type2 faithfulness gap; the diff carries NO tag exifast emits that
+  // bundled does not):
+  //   -x PreviewIFD:all  — the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD
+  //                        (PreviewImage + its IFD tags), deferred.
+  //   -x SubIFD:all -x SubIFD1:all — the SRW raw/JpgFromRaw sub-IFDs (the raw
+  //                        image strips + the embedded JPEG), not walked.
+  //   -x Composite:all   — exifast has no EXIF Composite subsystem (drops the
+  //                        Composite:LensID/ImageSize/WB_RGGBLevels/… synthesis).
+  // (The deferred `Unknown => 1` Crypt rows 0xa048/0xa05x are NOT excluded here:
+  // ExifTool suppresses them from default `-j` output, so bundled never emits
+  // them either — no `-x` is needed.)
+  // (The `0x0011 OrientationInfo` row is absent from this body. The
+  // `0xa002 SerialNumber` row IS present, but its value is `"0"` + NULs, which
+  // fails the `Condition => '$$valPt =~ /^\w{5}/'` gate (`Samsung.pm:404-409`)
+  // — bundled emits no `Samsung:SerialNumber` and exifast's emit-time
+  // `condition_holds` gate drops it identically, so no exclusion is needed.)
+  check("SamsungNX500.srw", "SamsungNX500.srw.json", true);
+  check("SamsungNX500.srw", "SamsungNX500.srw.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`
@@ -9675,7 +9960,49 @@ fn jpeg_unknown_header_conformance() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "port gap: DJI MakerNote / MPF / JFIF / Composite; see #109"]
+fn dji_thermal_rjpeg_conformance() {
+  // DJI Mavic 3 Thermal (M3T) radiometric JPEG from HuggingFace STRDrones/DJI
+  // dataset. Contains DJI MakerNote with thermal data (ThermalData, Emissivity,
+  // AmbientTemperature, ObjectDistance, RelativeHumidity, ReflectedTemperature,
+  // ThermalCalibration, SensorID). Unblocks #109.
+  check("DJI_M3T_thermal.RJPEG", "DJI_M3T_thermal.RJPEG.json", true);
+  check(
+    "DJI_M3T_thermal.RJPEG",
+    "DJI_M3T_thermal.RJPEG.n.json",
+    false,
+  );
+}
+
+#[test]
+#[ignore = "port gap: DJI MakerNote / MPF / JFIF / Composite; see #114"]
+fn dji_matrice30t_conformance() {
+  // DJI Matrice 30T (M30T) thermal JPEG from HuggingFace STRDrones/DJI
+  // dataset. Matrice-series enterprise drone with DJI MakerNote. Unblocks #114.
+  check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.json", true);
+  check("DJI_Matrice30T.jpg", "DJI_Matrice30T.jpg.n.json", false);
+}
+
+#[test]
+#[ignore = "port gap: XMP-GPano / Composite; see #92"]
+fn insta360_equirectangular_conformance() {
+  // Insta360 ONE stitched equirectangular 360° photo from GitHub
+  // hakanson/Insta360-images-20180318. Contains XMP-GPano metadata
+  // (ProjectionType=equirectangular, CaptureSoftware, StitchingSoftware).
+  // Unblocks #92 (spherical projection metadata).
+  check(
+    "Insta360ONE_equirectangular.jpg",
+    "Insta360ONE_equirectangular.jpg.json",
+    true,
+  );
+  check(
+    "Insta360ONE_equirectangular.jpg",
+    "Insta360ONE_equirectangular.jpg.n.json",
+    false,
+  );
+}
+
+#[test]
 fn xmp_base64_control_byte_split_conformance() {
   // Codex R3 F1 regression: `rdf:datatype="base64"` decoded payloads keep
   // ExifTool's binary/text split (XMP.pm:3646-3647 —

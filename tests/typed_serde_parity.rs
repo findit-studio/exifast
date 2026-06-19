@@ -116,6 +116,60 @@ const NOT_ACTIVE: &[&str] = &[
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
+  // The REAL Sony FX3 `.mp4` (#76) carries paired `.json` / `.n.json` goldens
+  // but is accept-deferred from the active byte-exact set. The QuickTime
+  // container phase-1 port now emits its `vide`/`soun` `stsd` sample-description
+  // + `hdlr` HandlerDescription; the residual no-`ee` divergence is the `tapt`
+  // `TrackProperty`, the `tref` `ContentDescribes`, the `vmhd`
+  // GraphicsMode/OpColor, the `stts`-derived `VideoFrameRate`, and the
+  // `TimeZone` (later container phases). The rtmd PAYLOAD proof
+  // (FNumber/ExposureTime/ISO/… byte-exact, the `parse_stsz` fixed-size-`stsz`
+  // fix) is pinned at `-ee` in `tests/timed_metadata_conformance.rs`
+  // (`sony_fx3_rtmd_mp4_*`), with the residual tags + the past-EOF
+  // `Track3:Warning` excluded there.
+  "QuickTime_sony_fx3_rtmd.mp4",
+  // `QuickTime_insta360_real.insv` (the real OneRS capture, #91) — the
+  // Insta360 trailer decode is byte-exact (see
+  // `tests/timed_metadata_conformance.rs::insta360_real_oners_insv_byte_exact`).
+  // The QuickTime container phase-1 port now emits its `vide`/`soun` `stsd`
+  // sample-description + HandlerDescription; the residual QuickTime *container*
+  // gap (NOT Insta360) is the `gmhd` `Gen*` fields, `pasp` PixelAspectRatio,
+  // `vmhd` GraphicsMode/OpColor, the `stts`-derived `VideoFrameRate`, and the
+  // 470-sample timed-`text` track's per-sample `SampleTime`/`SampleDuration`. So
+  // it is accept-deferred here (the conformance test excludes exactly those
+  // tails and is byte-exact on everything else).
+  "QuickTime_insta360_real.insv",
+  // `QuickTime_gopro_hero8_gpmf.mp4` (the real HERO8 Black, #211/#189) — the
+  // gpmd timed-GPS Doc<N> port is SCHEDULED: `process_gopro` flat-merges every
+  // gpmd sample into one `GoProMeta`, so a per-sample Doc<N> timed-source
+  // retrofit (like camm/sony_rtmd/insta360) is needed before the gpmd GPS emits
+  // byte-exact. Phase-1 emitted its `stsd` codec container tags; the residual
+  // no-`ee` gap is the `colr`/`btrt`/`tmcd`/`gmhd`/`tref` classes (later
+  // container phases) plus the gpmd Doc<N> port. The conformance test is
+  // `#[ignore]`d until then — accept-deferred here.
+  "QuickTime_gopro_hero8_gpmf.mp4",
+  // The #285 round-2 real-device fixtures (#109/#114/#92/#100) — dropped with
+  // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
+  // MPF/JFIF for Matrice+thermal, XMP-GPano for the Insta360 equirect; the Rove
+  // dashcam's `stsd` is now emitted, its residual no-ee gap is the NOVATEK
+  // `udta` + the `minf` data-handler, a later container phase). Their no-ee
+  // .json carries tags exifast does not yet emit, so accept-deferred here until
+  // each port lands (then they move to active).
+  "DJI_M3T_thermal.RJPEG",
+  "DJI_Matrice30T.jpg",
+  "Insta360ONE_equirectangular.jpg",
+  "QuickTime_rove_r2_4k.MP4",
+  // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
+  // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
+  // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
+  // byte-exact at `-ee` (see
+  // `tests/timed_metadata_conformance.rs::canon_ctmd_real_cr3_priority_dedup_byte_exact`).
+  // Its no-`ee` `.json`/`.n.json` are accept-deferred: bundled extracts the FULL
+  // CTMD metadata WITHOUT `-ee` for a still-image RAW (145 keys), but exifast
+  // gates CTMD behind `-ee` (a separate QuickTime-container item) and at no-`ee`
+  // emits only the structural moov/track scalars + the `Track1:Warning`
+  // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
+  "CanonRaw_ctmd.cr3",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
@@ -608,7 +662,20 @@ const NOT_ACTIVE: &[&str] = &[
 /// the positional `[minor] Insta360 trailer …` warning + the mvhd-derived
 /// QuickTime tags; the `-ee` `.ee.*` goldens (the GPS fix + identity + that
 /// warning) are pinned by `tests/timed_metadata_conformance.rs`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 521;
+/// 521 → 525 after the recent real-fixture conformance merges added paired
+/// `.json`+`.n.json` goldens without bumping this count: `Pentax.jpg` (#264),
+/// `Pentax.avi` (#265), `DJIPhantom4.jpg` (#272) + one prior. Each new active
+/// fixture must bump this constant (the per-PR convention above).
+/// 525 → 530 after the #266 real-device-fixture batch merged four conformance
+/// PRs, each adding paired `.json`+`.n.json` goldens for ALL-ACTIVE fixtures
+/// (each routes through the golden-migrated `Taggable` engine, so the
+/// typed-serde path equals the writer path byte-for-byte): `SamsungNX500.srw`
+/// (#276, +1); the three SP4 brand-detection fixtures `AVIF_sample.avif`,
+/// `HEIF_C001_msf1.heic`, `ISOBMFF_iso5_brand.mp4` (#151/#277, +3); and
+/// `QuickTime_gopro_gpmf.mp4` (#127/#278, +1). (The sequential squash-merges of
+/// these PRs landed a stale 528 — only the brand +3 — silently dropping
+/// Samsung's and GoPro's +1 each; corrected to 530 here.)
+const EXPECTED_ACTIVE_FIXTURES: usize = 530;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

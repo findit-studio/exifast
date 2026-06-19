@@ -305,7 +305,11 @@ fn metering_segments(raw: &RawValue, print_conv: bool) -> TagValue {
 }
 
 /// `Image::ExifTool::Exif::PrintExposureTime` (`Exif.pm:5701-5711`).
-fn print_exposure_time(secs: f64) -> std::string::String {
+///
+/// `pub(crate)` so the Phase-2a binary SubDirectory decoders ([`super::subtables`])
+/// can reuse the exact `PrintExposureTime` PrintConv for the AEInfo /
+/// CameraSettings exposure-time leaves.
+pub(crate) fn print_exposure_time(secs: f64) -> std::string::String {
   if !secs.is_finite() {
     return crate::value::format_g(secs, 15);
   }
@@ -407,6 +411,335 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
     )),
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phase-2a binary SubDirectory PrintConv tables (`%Pentax::CameraSettings`,
+// `%Pentax::AEInfo`, `%Pentax::FlashInfo`). Each hash is sorted by key for
+// binary search; each `*_BITS` table is the `DecodeBits` BITMASK label set.
+// ---------------------------------------------------------------------------
+
+/// `CameraSettings` `0 PictureMode2` (`Pentax.pm:3366-3386`).
+pub(crate) const PICTURE_MODE2: &[(i64, &str)] = &[
+  (0, "Scene Mode"),
+  (1, "Auto PICT"),
+  (2, "Program AE"),
+  (3, "Green Mode"),
+  (4, "Shutter Speed Priority"),
+  (5, "Aperture Priority"),
+  (6, "Program Tv Shift"),
+  (7, "Program Av Shift"),
+  (8, "Manual"),
+  (9, "Bulb"),
+  (10, "Aperture Priority, Off-Auto-Aperture"),
+  (11, "Manual, Off-Auto-Aperture"),
+  (12, "Bulb, Off-Auto-Aperture"),
+  (13, "Shutter & Aperture Priority AE"),
+  (15, "Sensitivity Priority AE"),
+  (16, "Flash X-Sync Speed AE"),
+];
+
+/// `CameraSettings` `1.1 ProgramLine` (mask 0x03, `Pentax.pm:3391-3396`).
+pub(crate) const PROGRAM_LINE: &[(i64, &str)] =
+  &[(0, "Normal"), (1, "Hi Speed"), (2, "Depth"), (3, "MTF")];
+
+/// `CameraSettings` `1.2 EVSteps` (mask 0x20, `Pentax.pm:3401-3404`).
+pub(crate) const EV_STEPS: &[(i64, &str)] = &[(0, "1/2 EV Steps"), (1, "1/3 EV Steps")];
+
+/// `CameraSettings` `1.3 E-DialInProgram` (mask 0x40, `Pentax.pm:3410-3413`).
+pub(crate) const E_DIAL_IN_PROGRAM: &[(i64, &str)] = &[(0, "Tv or Av"), (1, "P Shift")];
+
+/// `CameraSettings` `1.4 ApertureRingUse` (mask 0x80, `Pentax.pm:3419-3422`).
+pub(crate) const APERTURE_RING_USE: &[(i64, &str)] = &[(0, "Prohibited"), (1, "Permitted")];
+
+/// `CameraSettings` `2 FlashOptions` / `16 FlashOptions2` (mask 0xf0,
+/// `Pentax.pm:3430-3440` / `:3657-3667` — identical label sets).
+pub(crate) const FLASH_OPTIONS: &[(i64, &str)] = &[
+  (0, "Normal"),
+  (1, "Red-eye reduction"),
+  (2, "Auto"),
+  (3, "Auto, Red-eye reduction"),
+  (5, "Wireless (Master)"),
+  (6, "Wireless (Control)"),
+  (8, "Slow-sync"),
+  (9, "Slow-sync, Red-eye reduction"),
+  (10, "Trailing-curtain Sync"),
+];
+
+/// `CameraSettings` `2.1 MeteringMode2` / `16.1 MeteringMode3` (mask 0x0f) and
+/// `AEInfo` `13.1 AEMeteringMode2` — the shared `{ 0 => 'Multi-segment',
+/// BITMASK => { 0 => 'Center-weighted average', 1 => 'Spot' } }` BITMASK
+/// (`Pentax.pm:3446-3452`). The `0 => 'Multi-segment'` zero label is passed
+/// separately to `bitmask0`.
+pub(crate) const METERING_MODE_BITS: &[(u8, &str)] = &[(0, "Center-weighted average"), (1, "Spot")];
+
+/// `CameraSettings` `3 AFPointMode` (mask 0xf0) — `{ 0 => 'Auto', BITMASK =>
+/// { 0 => 'Select', 1 => 'Fixed Center' } }` (`Pentax.pm:3457-3464`).
+pub(crate) const AF_POINT_MODE_BITS: &[(u8, &str)] = &[(0, "Select"), (1, "Fixed Center")];
+
+/// `CameraSettings` `3.1 FocusMode2` (mask 0x0f, `Pentax.pm:3469-3474`).
+pub(crate) const FOCUS_MODE2: &[(i64, &str)] =
+  &[(0, "Manual"), (1, "AF-S"), (2, "AF-C"), (3, "AF-A")];
+
+/// `CameraSettings` `4 AFPointSelected2` (int16u) — `{ 0 => 'Auto', BITMASK =>
+/// { … } }` (`Pentax.pm:3479-3494`).
+pub(crate) const AF_POINT_SELECTED2_BITS: &[(u8, &str)] = &[
+  (0, "Upper-left"),
+  (1, "Top"),
+  (2, "Upper-right"),
+  (3, "Left"),
+  (4, "Mid-left"),
+  (5, "Center"),
+  (6, "Mid-right"),
+  (7, "Right"),
+  (8, "Lower-left"),
+  (9, "Bottom"),
+  (10, "Lower-right"),
+];
+
+/// `CameraSettings` `7 DriveMode2` — `{ 0 => 'Single-frame', BITMASK =>
+/// { … } }` (`Pentax.pm:3504-3516`).
+pub(crate) const DRIVE_MODE2_BITS: &[(u8, &str)] = &[
+  (0, "Continuous"),
+  (1, "Continuous (Lo)"),
+  (2, "Self-timer (12 s)"),
+  (3, "Self-timer (2 s)"),
+  (4, "Remote Control (3 s delay)"),
+  (5, "Remote Control"),
+  (6, "Exposure Bracket"),
+  (7, "Multiple Exposure"),
+];
+
+/// `CameraSettings` `8 ExposureBracketStepSize` (`Pentax.pm:3524-3533`). The
+/// numeric-looking string labels (`"0.3"`) render as JSON numbers.
+pub(crate) const EXPOSURE_BRACKET_STEP_SIZE: &[(i64, &str)] = &[
+  (3, "0.3"),
+  (4, "0.5"),
+  (5, "0.7"),
+  (8, "1.0"),
+  (11, "1.3"),
+  (12, "1.5"),
+  (13, "1.7"),
+  (16, "2.0"),
+];
+
+/// `CameraSettings` `9 BracketShotNumber` (PrintHex, `Pentax.pm:3538-3550`).
+pub(crate) const BRACKET_SHOT_NUMBER: &[(i64, &str)] = &[
+  (0x00, "n/a"),
+  (0x02, "1 of 2"),
+  (0x03, "1 of 3"),
+  (0x05, "1 of 5"),
+  (0x12, "2 of 2"),
+  (0x13, "2 of 3"),
+  (0x15, "2 of 5"),
+  (0x23, "3 of 3"),
+  (0x25, "3 of 5"),
+  (0x35, "4 of 5"),
+  (0x45, "5 of 5"),
+];
+
+/// `CameraSettings` `10 WhiteBalanceSet` (mask 0xf0, `Pentax.pm:3558-3574`).
+pub(crate) const WHITE_BALANCE_SET: &[(i64, &str)] = &[
+  (0, "Auto"),
+  (1, "Daylight"),
+  (2, "Shade"),
+  (3, "Cloudy"),
+  (4, "Daylight Fluorescent"),
+  (5, "Day White Fluorescent"),
+  (6, "White Fluorescent"),
+  (7, "Tungsten"),
+  (8, "Flash"),
+  (9, "Manual"),
+  (12, "Set Color Temperature 1"),
+  (13, "Set Color Temperature 2"),
+  (14, "Set Color Temperature 3"),
+];
+
+/// `{ 0 => 'Off', 1 => 'On' }` — `CameraSettings` `10.1 MultipleExposureSet`
+/// (mask 0x0f, `Pentax.pm:3579-3582`).
+pub(crate) const OFF_ON: &[(i64, &str)] = &[(0, "Off"), (1, "On")];
+
+/// `CameraSettings` `13 RawAndJpgRecording` (K10D, PrintHex,
+/// `Pentax.pm:3591-3608`).
+pub(crate) const RAW_AND_JPG_RECORDING: &[(i64, &str)] = &[
+  (0x01, "JPEG (Best)"),
+  (0x04, "RAW (PEF, Best)"),
+  (0x05, "RAW+JPEG (PEF, Best)"),
+  (0x08, "RAW (DNG, Best)"),
+  (0x09, "RAW+JPEG (DNG, Best)"),
+  (0x21, "JPEG (Better)"),
+  (0x24, "RAW (PEF, Better)"),
+  (0x25, "RAW+JPEG (PEF, Better)"),
+  (0x28, "RAW (DNG, Better)"),
+  (0x29, "RAW+JPEG (DNG, Better)"),
+  (0x41, "JPEG (Good)"),
+  (0x44, "RAW (PEF, Good)"),
+  (0x45, "RAW+JPEG (PEF, Good)"),
+  (0x48, "RAW (DNG, Good)"),
+  (0x49, "RAW+JPEG (DNG, Good)"),
+];
+
+/// `CameraSettings` `14.1 JpgRecordedPixels` (K10D, mask 0x03,
+/// `Pentax.pm:3615-3619`).
+pub(crate) const JPG_RECORDED_PIXELS: &[(i64, &str)] = &[(0, "10 MP"), (1, "6 MP"), (2, "2 MP")];
+
+/// `{ 0 => 'No', 1 => 'Yes' }` (`%noYes`, `Pentax.pm:847`) — `CameraSettings`
+/// `17.1 SRActive` (K10D, mask 0x80).
+pub(crate) const NO_YES: &[(i64, &str)] = &[(0, "No"), (1, "Yes")];
+
+/// `CameraSettings` `17.2 Rotation` (K10D, mask 0x60, `Pentax.pm:3698-3703`).
+pub(crate) const ROTATION: &[(i64, &str)] = &[
+  (0, "Horizontal (normal)"),
+  (1, "Rotate 180"),
+  (2, "Rotate 90 CW"),
+  (3, "Rotate 270 CW"),
+];
+
+/// `CameraSettings` `17.3 ISOSetting` (K10D, mask 0x04, `Pentax.pm:3712-3715`).
+pub(crate) const ISO_SETTING: &[(i64, &str)] = &[(0, "Manual"), (1, "Auto")];
+
+/// `CameraSettings` `17.4 SensitivitySteps` (K10D, mask 0x02,
+/// `Pentax.pm:3722-3725`).
+pub(crate) const SENSITIVITY_STEPS: &[(i64, &str)] = &[(0, "1 EV Steps"), (1, "As EV Steps")];
+
+/// `AEInfo` `6 AEProgramMode` (`Pentax.pm:3832-3866`).
+pub(crate) const AE_PROGRAM_MODE: &[(i64, &str)] = &[
+  (0, "M, P or TAv"),
+  (1, "Av, B or X"),
+  (2, "Tv"),
+  (3, "Sv or Green Mode"),
+  (8, "Hi-speed Program"),
+  (11, "Hi-speed Program (P-Shift)"),
+  (16, "DOF Program"),
+  (19, "DOF Program (P-Shift)"),
+  (24, "MTF Program"),
+  (27, "MTF Program (P-Shift)"),
+  (35, "Standard"),
+  (43, "Portrait"),
+  (51, "Landscape"),
+  (59, "Macro"),
+  (67, "Sport"),
+  (75, "Night Scene Portrait"),
+  (83, "No Flash"),
+  (91, "Night Scene"),
+  (99, "Surf & Snow"),
+  (104, "Night Snap"),
+  (107, "Text"),
+  (115, "Sunset"),
+  (123, "Kids"),
+  (131, "Pet"),
+  (139, "Candlelight"),
+  (144, "SCN"),
+  (147, "Museum"),
+  (160, "Program"),
+  (184, "Shallow DOF Program"),
+  (216, "HDR"),
+];
+
+/// `AEInfo` `12 AEMeteringMode` — `{ 0 => 'Multi-segment', BITMASK =>
+/// { 4 => 'Center-weighted average', 5 => 'Spot' } }` (`Pentax.pm:3932-3938`).
+pub(crate) const AE_METERING_MODE_BITS: &[(u8, &str)] =
+  &[(4, "Center-weighted average"), (5, "Spot")];
+
+/// `FlashInfo` `0 FlashStatus` (PrintHex, `Pentax.pm:4587-4595`).
+pub(crate) const FLASH_STATUS: &[(i64, &str)] = &[
+  (0x00, "Off"),
+  (0x01, "Off (1)"),
+  (0x02, "External, Did not fire"),
+  (0x06, "External, Fired"),
+  (0x08, "Internal, Did not fire (0x08)"),
+  (0x09, "Internal, Did not fire"),
+  (0x0d, "Internal, Fired"),
+];
+
+/// `FlashInfo` `1 InternalFlashMode` (PrintHex, `Pentax.pm:4600-4622`).
+pub(crate) const INTERNAL_FLASH_MODE: &[(i64, &str)] = &[
+  (0x00, "n/a - Off-Auto-Aperture"),
+  (0x86, "Fired, Wireless (Control)"),
+  (0x95, "Fired, Wireless (Master)"),
+  (0xc0, "Fired"),
+  (0xc1, "Fired, Red-eye reduction"),
+  (0xc2, "Fired, Auto"),
+  (0xc3, "Fired, Auto, Red-eye reduction"),
+  (
+    0xc6,
+    "Fired, Wireless (Control), Fired normally not as control",
+  ),
+  (0xc8, "Fired, Slow-sync"),
+  (0xc9, "Fired, Slow-sync, Red-eye reduction"),
+  (0xca, "Fired, Trailing-curtain Sync"),
+  (0xf0, "Did not fire, Normal"),
+  (0xf1, "Did not fire, Red-eye reduction"),
+  (0xf2, "Did not fire, Auto"),
+  (0xf3, "Did not fire, Auto, Red-eye reduction"),
+  (0xf4, "Did not fire, (Unknown 0xf4)"),
+  (0xf5, "Did not fire, Wireless (Master)"),
+  (0xf6, "Did not fire, Wireless (Control)"),
+  (0xf8, "Did not fire, Slow-sync"),
+  (0xf9, "Did not fire, Slow-sync, Red-eye reduction"),
+  (0xfa, "Did not fire, Trailing-curtain Sync"),
+];
+
+/// `FlashInfo` `2 ExternalFlashMode` (PrintHex, `Pentax.pm:4627-4639`).
+pub(crate) const EXTERNAL_FLASH_MODE: &[(i64, &str)] = &[
+  (0x00, "n/a - Off-Auto-Aperture"),
+  (0x3f, "Off"),
+  (0x40, "On, Auto"),
+  (0xbf, "On, Flash Problem"),
+  (0xc0, "On, Manual"),
+  (0xc4, "On, P-TTL Auto"),
+  (0xc5, "On, Contrast-control Sync"),
+  (0xc6, "On, High-speed Sync"),
+  (0xcc, "On, Wireless"),
+  (0xcd, "On, Wireless, High-speed Sync"),
+  (0xf0, "Not Connected"),
+];
+
+/// `FlashInfo` `25 ExternalFlashExposureComp` (`Pentax.pm:4683-4695`).
+pub(crate) const EXTERNAL_FLASH_EXPOSURE_COMP: &[(i64, &str)] = &[
+  (0, "n/a"),
+  (144, "n/a (Manual Mode)"),
+  (164, "-3.0"),
+  (167, "-2.5"),
+  (168, "-2.0"),
+  (171, "-1.5"),
+  (172, "-1.0"),
+  (175, "-0.5"),
+  (176, "0.0"),
+  (179, "0.5"),
+  (180, "1.0"),
+];
+
+/// `FlashInfo` `26 ExternalFlashBounce` (`Pentax.pm:4700-4704`).
+pub(crate) const EXTERNAL_FLASH_BOUNCE: &[(i64, &str)] =
+  &[(0, "n/a"), (16, "Direct"), (48, "Bounce")];
+
+/// `%Pentax::LensData` `3 MinFocusDistance` (`Pentax.pm:4434-4467`) — the masked
+/// (`Mask => 0xf8`) lens minimum-focus-distance code. The keys are the raw
+/// masked value (`($val & 0xf8) >> 3`, 0-20); the labels are the verbatim range
+/// strings. Sorted by key for binary search.
+pub(crate) const MIN_FOCUS_DISTANCE: &[(i64, &str)] = &[
+  (0, "0.13-0.19 m"),
+  (1, "0.20-0.24 m"),
+  (2, "0.25-0.28 m"),
+  (3, "0.28-0.30 m"),
+  (4, "0.35-0.38 m"),
+  (5, "0.40-0.45 m"),
+  (6, "0.49-0.50 m"),
+  (7, "0.6 m"),
+  (8, "0.7 m"),
+  (9, "0.8-0.9 m"),
+  (10, "1.0 m"),
+  (11, "1.1-1.2 m"),
+  (12, "1.4-1.5 m"),
+  (13, "1.5 m"),
+  (14, "2.0 m"),
+  (15, "2.0-2.1 m"),
+  (16, "2.1 m"),
+  (17, "2.2-2.9 m"),
+  (18, "3.0 m"),
+  (19, "4-5 m"),
+  (20, "5.6 m"),
+];
 
 #[cfg(test)]
 mod tests;

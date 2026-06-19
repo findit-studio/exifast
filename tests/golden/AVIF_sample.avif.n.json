@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "AVIF_sample.avif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "AVIF",
+  "File:FileTypeExtension": "AVIF",
+  "File:MIMEType": "image/avif",
+  "File:ImageWidth": 1204,
+  "File:ImageHeight": 800,
+  "QuickTime:MajorBrand": "avif",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["avif","mif1","miaf","MA1B"],
+  "QuickTime:MediaDataSize": 82715,
+  "QuickTime:MediaDataOffset": 325,
+  "Meta:PrimaryItemReference": 1
+}]

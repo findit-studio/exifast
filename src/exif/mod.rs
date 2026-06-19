@@ -613,6 +613,34 @@ enum ResolvedConv {
   /// LensRec` SubDirectory whose `LensType` child the dedicated capture loop
   /// emits (the parent pointer is never emitted, the Nikon SubDirectory pattern).
   Pentax(&'static makernotes::vendors::pentax::tags::PentaxTag),
+  /// A Samsung maker-note leaf (`%Samsung::Type2` descriptor). Carries the
+  /// resolved [`SamsungTag`](makernotes::vendors::samsung::tags::SamsungTag) so
+  /// the emit ([`emit_samsung_value`]) reapplies its
+  /// [`SamsungPrintConv`](makernotes::vendors::samsung::printconv::SamsungPrintConv)
+  /// and reads its `Unknown=>1` flag. Samsung is a SIMPLE vendor (#210): a plain
+  /// LEAF table walked under `active_table == Samsung`, plus the ONE `0x0021
+  /// PictureWizard` `ProcessBinaryData` SubDirectory whose five members the
+  /// dedicated capture loop emits (the parent pointer is never emitted, the
+  /// Nikon/Pentax SubDirectory pattern).
+  Samsung(&'static makernotes::vendors::samsung::tags::SamsungTag),
+  /// A Leica maker-note leaf (`%Panasonic::Leica2`..`Leica9` descriptor, #259).
+  /// Carries the resolved
+  /// [`LeicaTag`](makernotes::vendors::leica::tags::LeicaTag) PLUS the
+  /// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant) it
+  /// resolved under, so the emit ([`emit_leica_value`]) reapplies its
+  /// [`LeicaPrintConv`](makernotes::vendors::leica::printconv::LeicaPrintConv)
+  /// and evaluates its row `Condition` (the Leica5 0x0303 `$format eq "string"`
+  /// gate, the Leica6 Typ-006 rows). Leica is a SIMPLE vendor like
+  /// Pentax/Samsung: a plain LEAF table walked under
+  /// `active_table == TableRef::Leica(variant)`; the deferred SubDirectory /
+  /// binary rows are absent from the tables. The dispatcher fans the EIGHT
+  /// detected signatures (Leica2..Leica9) onto the SIX table-bearing variants
+  /// (Leica7→Leica6, Leica8→Leica5) and supplies the per-variant
+  /// `Start`/`Base`/`ByteOrder`, which the shared `Walker` applies.
+  Leica(
+    makernotes::vendors::leica::tags::LeicaVariant,
+    &'static makernotes::vendors::leica::tags::LeicaTag,
+  ),
 }
 
 impl ResolvedConv {
@@ -636,6 +664,10 @@ impl ResolvedConv {
       // `Nikon` arm covers it (the Type2 walk emits under the same vendor group).
       ResolvedConv::Nikon(_) => vendor_group1_of(TableRef::Nikon),
       ResolvedConv::Pentax(_) => vendor_group1_of(TableRef::Pentax),
+      ResolvedConv::Samsung(_) => vendor_group1_of(TableRef::Samsung),
+      // Every Leica variant emits under the `Leica` family-1 group; the
+      // discriminant carries the variant, so `vendor_group1_of` resolves it.
+      ResolvedConv::Leica(variant, _) => vendor_group1_of(TableRef::Leica(variant)),
     }
   }
 }
@@ -693,7 +725,17 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     TableRef::Pentax => Some("Pentax"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
     // tables never reach the emit through this walker.
-    TableRef::Exif | TableRef::Gps | TableRef::Interop | TableRef::Samsung => None,
+    // `%Samsung::Type2` (#210). A Samsung maker-note leaf emits under the
+    // `Samsung` family-1 group (`Samsung.pm:133` declares `GROUPS => { 0 =>
+    // 'MakerNotes' }`, so family-1 follows family-0's `MakerNotes`→vendor
+    // mapping — `exiftool -j -G1` emits `Samsung:LensType` on a Samsung body).
+    TableRef::Samsung => Some("Samsung"),
+    // `%Panasonic::Leica2`..`Leica9` (#259). Every Leica variant table declares
+    // `GROUPS => { 1 => 'Leica' }` (`Panasonic.pm`), so `exiftool -j -G1` emits
+    // `Leica:LensType` on a Leica body — distinct from the Leica1/Leica10
+    // cross-vendor routes (which emit `Panasonic:*` via `%Panasonic::Main`).
+    TableRef::Leica(_) => Some("Leica"),
+    TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
 
@@ -821,6 +863,49 @@ enum MakerNoteValueConvDecode<'a> {
     detected: makernotes::DetectedMakerNote,
     order: ByteOrder,
     make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Samsung — re-drive the SHARED `Walker`'s Samsung Type2 walk + emission
+  /// capture ([`samsung_makernote_isolated`]) with `print_conv = false` (#210).
+  /// The walk is deterministic across the PrintConv flag (same bytes, same
+  /// `detected` modes; only the per-leaf render differs), so the recomputed `-n`
+  /// emissions are byte-identical to the eager `-n` cache. The dispatched
+  /// `detected` carries the body offset / `Unknown` byte order / `FixBase` the
+  /// walk threads; `make`/`model` are retained for symmetry with the other
+  /// vendors (the Samsung walk reads no model-conditional structure).
+  Samsung {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    detected: makernotes::DetectedMakerNote,
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Leica2..Leica9 — re-drive the SHARED `Walker`'s Leica variant walk +
+  /// emission capture ([`leica_makernote_isolated`]) with `print_conv = false`
+  /// (#259). The walk is deterministic across the PrintConv flag (same bytes,
+  /// same `detected` modes; only the per-leaf render differs), so the recomputed
+  /// `-n` emissions are byte-identical to the eager `-n` cache. The resolved
+  /// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant) selects the
+  /// table; the dispatched `detected` carries the body offset / `Base` rule /
+  /// `Unknown` byte order. `model` is the parent `$$self{Model}` the Leica6
+  /// Typ-006 `Condition` reads (retained so the `-n` recompute gates the same
+  /// rows as the `-j` decode). Distinct from [`Leica1`](Self::Leica1) /
+  /// [`Leica10`](Self::Leica10), which decode through `%Panasonic::Main`.
+  Leica {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    variant: makernotes::vendors::leica::tags::LeicaVariant,
+    detected: makernotes::DetectedMakerNote,
+    order: ByteOrder,
+    /// The parent TIFF base (the base of the IFD that contained the 0x927c
+    /// MakerNote entry). Leica7's `Base => '-$base'` ([`NegativeOfBase`]
+    /// (makernotes::BaseRule::NegativeOfBase)) rebases absolute value pointers
+    /// to the slice via `-parent_base`, so the `-n` recompute must replay the
+    /// SAME base the eager `-j` walk used (nonzero for an embedded JPEG `APP1`).
+    parent_base: u32,
     model: Option<smol_str::SmolStr>,
   },
 }
@@ -1001,6 +1086,66 @@ impl MakerNoteValueConvDecode<'_> {
           *detected,
           *order,
           make.as_deref(),
+          model.as_deref(),
+          false,
+        )
+        .map(|(e, _)| e)
+        .unwrap_or_default()
+      }
+      MakerNoteValueConvDecode::Samsung {
+        data,
+        mn_offset,
+        mn_len,
+        detected,
+        order,
+        make,
+        model,
+      } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and
+        // the typed slot discarded (the `-n` path needs only the ValueConv
+        // emissions), mirroring the other vendors (#210). A blob that walked in
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes are
+        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
+        // the defensive empty `Vec` for the impossible `None`.
+        samsung_makernote_isolated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *detected,
+          *order,
+          make.as_deref(),
+          model.as_deref(),
+          false,
+        )
+        .map(|(e, _)| e)
+        .unwrap_or_default()
+      }
+      MakerNoteValueConvDecode::Leica {
+        data,
+        mn_offset,
+        mn_len,
+        variant,
+        detected,
+        order,
+        parent_base,
+        model,
+      } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and
+        // the typed slot discarded (the `-n` path needs only the ValueConv
+        // emissions), mirroring the other vendors (#259). A blob that walked in
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes +
+        // variant are PrintConv-independent), so `Some` always holds;
+        // `unwrap_or_default` is the defensive empty `Vec` for the impossible
+        // `None`. `parent_base` replays the eager walk's parent TIFF base so the
+        // Leica7 `-$base` rebase is identical across modes.
+        leica_makernote_isolated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *variant,
+          *detected,
+          *order,
+          *parent_base,
           model.as_deref(),
           false,
         )
@@ -2325,6 +2470,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
+    dir_len: None,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
@@ -2463,6 +2610,8 @@ fn parse_bigtiff<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // BigTIFF top-level walk — no maker-note `DirLen` (salvage gated to maker notes).
+    dir_len: None,
   };
   w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
   debug_assert!(
@@ -2654,6 +2803,8 @@ fn parse_tiff_with_base_shared<'a>(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
+    dir_len: None,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -2970,6 +3121,20 @@ struct Walker<'a, 'g> {
   /// by [`emit_canon_subtable`]'s FocalLength arm. `None` when no readable 0x02
   /// exists ⇒ that arm (and the oracle) emit nothing for FocalLength.
   canon_focal_length_blob: Option<std::vec::Vec<u8>>,
+  /// `$$dirInfo{DirLen}` — the DECLARED byte length of the (sub-)directory being
+  /// walked (`Exif.pm:6285` `$dirLen = $$dirInfo{DirLen} || $dataLen - $dirStart`).
+  /// For a MakerNote SubDirectory this is the `0x927c` value size (`DirLen => $size`,
+  /// `Exif.pm:7126`); it gates the maker-note directory-size SALVAGE clamp in
+  /// [`walk_one_ifd_body`] (`Exif.pm:6384-6388`): when the IFD count word claims a
+  /// directory bigger than the buffer, an in-maker-note walk with `dir_len >= 14`
+  /// (and `[ifd_start, ifd_start+dir_len]` in range) reads `(dir_len-2)/12` entries
+  /// instead of aborting. `Some(mn_len)` only on the isolated vendor walkers; `None`
+  /// for every core IFD / top-level walk — where the salvage never fires (it is also
+  /// gated on `!active_table.is_core_ifd()`, i.e. ExifTool's `$inMakerNotes`), so the
+  /// field's value there is irrelevant. [`process_subdir`] reduces it by the
+  /// `ProcessUnknown` `LocateIFD` relocation delta (`DirLen -= offset`,
+  /// `MakerNotes.pm:1589`/`:1658`) for the duration of that sub-walk.
+  dir_len: Option<usize>,
 }
 
 impl Walker<'_, '_> {
@@ -3206,11 +3371,12 @@ impl Walker<'_, '_> {
       self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
-    let num_entries = get_u16(data, ifd_start, self.order)? as usize;
+    let mut num_entries = get_u16(data, ifd_start, self.order)? as usize;
     // `$dirSize = 2 + 12 * $numEntries; $dirEnd = $dirStart + $dirSize`,
     // each step checked (see the overflow note above) — overflow ⇒ the
-    // Bad-directory abort.
-    let Some(dir_end) = num_entries
+    // Bad-directory abort. (`mut`: the maker-note salvage below re-clamps both
+    // `num_entries` and `dir_end` to the declared `dir_len`.)
+    let Some(mut dir_end) = num_entries
       .checked_mul(12)
       .and_then(|body| body.checked_add(2))
       .and_then(|dir_size| ifd_start.checked_add(dir_size))
@@ -3223,20 +3389,62 @@ impl Walker<'_, '_> {
     // (Exif.pm:6389-6395). If the IFD overruns the buffer entirely we
     // cannot read its entries — abort.
     if dir_end > data.len() {
-      // The IFD's declared extent runs past the EXIF block. ExifTool's
-      // "read what we can" salvage (`$numEntries = int(($dirSize-2)/12)`,
-      // Exif.pm:6386-6388) is GATED to MakerNotes: `return 0 unless
-      // $inMakerNotes and $dirLen >= 14 …` (Exif.pm:6381-6385). For a
-      // normal IFD0/IFD1/ExifIFD/GPS/InteropIFD the count cannot be read
-      // reliably (the file-seek fallback at Exif.pm:6362-6374 fails its
-      // `Read` and yields `$success = 0`), so ExifTool warns
-      // "Bad $dir directory" and aborts the WHOLE directory — no partial
-      // tags. The exifast walker never recurses into a MakerNote IFD
-      // (vendor parsing is deferred — see [`SubDirKind::MakerNote`]), so
-      // every directory kind it handles takes the abort branch.
-      // `$et->Warn("Bad $dir directory")` — Exif.pm:6381.
+      // The IFD's declared extent runs past the buffer (`$dirEnd > $dataLen` ⇒
+      // `undef $dirSize`, Exif.pm:6356). With no RAF to re-read the IFD from the
+      // file (`$success = 0`), ExifTool warns `Bad $dir directory` — MINOR while
+      // `$inMakerNotes` (`$et->Warn("Bad $dir directory", $inMakerNotes)`,
+      // Exif.pm:6381) — and then SALVAGES for maker notes (`Exif.pm:6382-6388`):
+      //
+      //   return 0 unless $inMakerNotes and $dirLen >= 14 and $dirStart >= 0 and
+      //                   $dirStart + $dirLen <= length($$dataPt);
+      //   $dirSize = $dirLen;
+      //   $numEntries = int(($dirSize - 2) / 12);  # read what we can
+      //
+      // i.e. when the count word claims more entries than fit the buffer BUT the
+      // walk is in a maker note (`$$tagTablePtr{GROUPS}{0} eq 'MakerNotes'` —
+      // exactly `!active_table.is_core_ifd()`) AND the declared maker-note length
+      // `$dirLen` is a valid minimal IFD (`>= 14` = 2 count + one 12-byte entry)
+      // whose `[dirStart, dirStart+dirLen]` window fits the buffer, CLAMP
+      // `numEntries` to `(dirLen - 2) / 12` and walk that many entries (from the
+      // declared maker-note region) instead of aborting. A core IFD
+      // (IFD0/IFD1/ExifIFD/GPS/InteropIFD — `is_core_ifd()`, `$inMakerNotes == 0`)
+      // or a maker note whose `$dirLen < 14` / out-of-range window still `return
+      // 0`s the WHOLE directory.
+      //
+      // The warning is recorded on THIS walk's channel via `warn` (NOT
+      // `warn_counted` — ExifTool's `Warn` here is not followed by `++$warnCount`);
+      // for a maker-note sub-walk the isolated `Walker` discards its `warnings`
+      // (every other maker-note `$et->Warn` is dropped the same way), so the
+      // observable salvage effect is the EMITTED tags from the clamped entries.
       self.warn(std::format!("Bad {} directory", kind.as_str()));
-      return None;
+      // The salvage decision is the SHARED [`salvage_makernote_overrun`]
+      // (`body.rs`) — the SAME helper [`canon_prescan_datamembers`] drives, so a
+      // salvaged Canon directory is pre-scanned over the IDENTICAL clamped entry
+      // set this emission walk renders (the DataMembers it extracts therefore feed
+      // the dependent FocalLength / FileInfo sub-tables). `$inMakerNotes` is
+      // `!self.active_table.is_core_ifd()`; `self.dir_len` is `$$dirInfo{DirLen}`
+      // (already reduced by any `ProcessUnknown` `LocateIFD` delta in
+      // [`process_subdir`]). `None` ⇒ abort the whole directory (`return 0`,
+      // Exif.pm:6382): a core IFD, a missing/`< 14` `dir_len`, or an out-of-range
+      // window. (ExifTool also `Set16u`s the clamped count back into the buffer;
+      // the port reads the count once into `num_entries`, so the clamped value
+      // drives `walk_entries` directly — re-storing it is unnecessary.) The warning
+      // is recorded on THIS walk's channel via `warn` (not `warn_counted` —
+      // ExifTool's `Warn` here is not followed by `++$warnCount`); a maker-note
+      // sub-walk's isolated `Walker` discards its `warnings`, so the observable
+      // salvage effect is the EMITTED tags from the clamped entries.
+      let Some((salvaged_entries, salvaged_end)) =
+        makernotes::vendors::canon::body::salvage_makernote_overrun(
+          ifd_start,
+          data.len(),
+          !self.active_table.is_core_ifd(),
+          self.dir_len,
+        )
+      else {
+        return None;
+      };
+      num_entries = salvaged_entries;
+      dir_end = salvaged_end;
     }
 
     // `my $bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) {
@@ -3811,6 +4019,15 @@ impl Walker<'_, '_> {
       // unknown-tag warning form), matching `ProcessExif`'s `next unless
       // $tagInfo` skip for an unported id.
       TableRef::Pentax => makernotes::vendors::pentax::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Samsung::Type2` (#210). An unknown Samsung tag returns `None` (the
+      // Walker's verbose-only omit) — the deferred Crypt/SubDirectory rows are
+      // simply absent from `SAMSUNG_TAGS`.
+      TableRef::Samsung => makernotes::vendors::samsung::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Panasonic::Leica2`..`Leica9` (#259). The name resolves against the
+      // ACTIVE variant's own table (the variant rides in the `TableRef::Leica`
+      // payload). An unknown id yields `None` (the deferred SubDirectory /
+      // binary rows are absent from the tables), the verbose-only omit.
+      TableRef::Leica(v) => makernotes::vendors::leica::tags::lookup(v, tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -4313,6 +4530,18 @@ impl Walker<'_, '_> {
       // is exempt from the excessive-count guard. Without this the LensRec value
       // span never materializes and `LensType` cannot emit.
       TableRef::Pentax => makernotes::vendors::pentax::format_override(tag_id),
+      // `%Samsung::Type2` (#210) carries its OWN `Format =>` directives
+      // (`0xa01a FocalLengthIn35mmFormat` reads `int32u`; `0x0030
+      // LocalLocationName` reads `undef`); the Walker resolves them off the
+      // active Samsung table exactly as the Sony/Pentax walks do, recomputing
+      // the count per `int(size/elemsize)` (`Exif.pm:6743`).
+      TableRef::Samsung => makernotes::vendors::samsung::format_override(tag_id),
+      // `%Panasonic::Leica2`..`Leica9` (#259) carry their OWN `Format =>`
+      // directives — the `rational64s` `ExternalSensorBrightnessValue` /
+      // `MeasuredLV` rows (Leica2/6/9 0x311/0x312) + the Leica5 0x040d
+      // `ExposureMode` int8u[4] row. The Walker resolves them off the active
+      // Leica variant table exactly as Sony/Pentax/Samsung do.
+      TableRef::Leica(v) => makernotes::vendors::leica::format_override(v, tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -4669,29 +4898,67 @@ impl Walker<'_, '_> {
 
     // ---- Pre-walk hook 2: ProcessUnknown's `LocateIFD` (`MakerNotes.pm:1816-
     // 1837`). Only `ProcessProc::Unknown` relocates the IFD start + order; the
-    // other processors keep `ifd_start`/`resolved_order` as derived. A failed
-    // locate leaves them unchanged (the walk then bounds-rejects, mirroring
-    // `ProcessUnknown`'s `Unrecognized` warn arm). Inert for `Exif`/`Canon`.
+    // other processors keep `ifd_start`/`resolved_order` as derived. Inert for
+    // `Exif`/`Canon`/`BinaryData`.
     //
     // `locate_ifd` returns the located IFD offset RELATIVE to the `ifd_start` it
     // was handed (its scan runs `0..=32` from `dir_start`), so the ABSOLUTE
     // position in `self.data` is `ifd_start + located`. Adding it back is
-    // essential for any maker note whose blob begins at a non-zero TIFF offset;
-    // a `checked_add` overflow (degenerate input) falls back to the unrelocated
-    // start, which the walk then bounds-rejects.
-    let (ifd_start, resolved_order) = match process {
-      ProcessProc::Unknown => makernotes::fixbase::locate_ifd(
-        self.data,
-        ifd_start,
-        None,
-        resolved_order,
-        self.captured_make.as_deref(),
-        self.captured_model.as_deref(),
-      )
-      .and_then(|(located, order)| ifd_start.checked_add(located).map(|abs| (abs, order)))
-      .unwrap_or((ifd_start, resolved_order)),
+    // essential for any maker note whose blob begins at a non-zero TIFF offset.
+    //
+    // ABORT on no candidate (`MakerNotes.pm:1834`). `LocateIFD` returning `undef`
+    // is ExifTool's `Unrecognized MakerNotes` arm — `ProcessUnknown` then `return
+    // 0` WITHOUT walking the directory (it processes NOTHING). So a `None` here
+    // (no plausible IFD within the declared window) ABORTS the whole sub-directory
+    // — `return` BEFORE FixBase, the Canon pre-scan, and `walk_one_ifd`, emitting no
+    // tags. This is load-bearing now that `walk_one_ifd_body` SALVAGES a non-core
+    // count-word overrun (clamping `num_entries` by the same `dir_len`): without
+    // the abort, the `None` would fall back to `ifd_start` and the salvage could
+    // emit spurious vendor tags from a count word at the UNRELOCATED start whose
+    // first clamped entry happens to be a valid vendor tag — even though `LocateIFD`
+    // legitimately found no in-window IFD. A post-`Some` `checked_add` overflow
+    // (degenerate input that can't yield an absolute start) aborts for the same
+    // reason: there is no walkable relocated IFD.
+    //
+    // `self.dir_len` is threaded as `LocateIFD`'s `$$dirInfo{DirLen}`
+    // (`MakerNotes.pm:1501` `my $dirLen = defined $$dirInfo{DirLen} ? … : $size`):
+    // it BOUNDS the relocation-candidate scan — the `$offset + 14 > $dirLen` IFD_TRY
+    // cutoff (`:1573`) and the TIFF-header `$ptr + $offset + 14 <= $dirLen` window
+    // (`:1586`) — so a relocated IFD candidate must fit the DECLARED maker-note
+    // window, not the whole trailing buffer. Without it (`None` ⇒ `$dirLen = $size`)
+    // a TRUNCATED MakerNote could relocate onto IFD-shaped bytes that lie AFTER the
+    // declared `0x927c` value and emit spurious vendor tags. `None` for a `dir_len`-
+    // less caller keeps the prior full-buffer scan. (The standard-IFD arm's
+    // `$bytesFromEnd` still uses `$size`, `:1613` — unchanged.)
+    let (ifd_start, resolved_order, locate_delta) = match process {
+      ProcessProc::Unknown => {
+        let Some(relocated) = makernotes::fixbase::locate_ifd(
+          self.data,
+          ifd_start,
+          self.dir_len,
+          resolved_order,
+          self.captured_make.as_deref(),
+          self.captured_model.as_deref(),
+        )
+        .and_then(|(located, order)| {
+          // `LocateIFD` returns the IFD start RELATIVE to the handed `ifd_start`, so
+          // the relocation delta is exactly `located` — ExifTool advances
+          // `$$dirInfo{DirStart} += $offset` and shrinks `$$dirInfo{DirLen} -= $offset`
+          // by the SAME amount (`MakerNotes.pm:1657-1658`), keeping `DirStart+DirLen`
+          // invariant. Carry `located` so the `dir_len` (the salvage gate) tracks it.
+          ifd_start
+            .checked_add(located)
+            .map(|abs| (abs, order, located))
+        }) else {
+          // `Unrecognized MakerNotes` ⇒ `ProcessUnknown` processes nothing
+          // (`MakerNotes.pm:1834`). Abort the sub-directory: emit no tags, leaving
+          // every saved field untouched (none were mutated yet).
+          return;
+        };
+        relocated
+      }
       ProcessProc::Exif | ProcessProc::Canon | ProcessProc::BinaryData => {
-        (ifd_start, resolved_order)
+        (ifd_start, resolved_order, 0)
       }
     };
 
@@ -4789,9 +5056,18 @@ impl Walker<'_, '_> {
     let saved_table = self.active_table;
     let saved_order = self.order;
     let saved_warn_count = self.warn_count;
+    // `$$dirInfo{DirLen}` is per-`ProcessExif`-call (`Exif.pm:6285`); scope it like
+    // the table/order/warn-count fields. `ProcessUnknown`'s `LocateIFD` advanced
+    // `ifd_start` by `locate_delta`, so the remaining declared length shrinks by the
+    // same amount (`$$dirInfo{DirLen} -= $offset`, `MakerNotes.pm:1658`) — keeping
+    // the salvage window `[ifd_start, ifd_start+dir_len]` correct for the relocated
+    // IFD. `None` (a core sub-IFD / a `dir_len`-less caller) stays `None`.
+    let saved_dir_len = self.dir_len;
+    self.dir_len = self.dir_len.map(|d| d.saturating_sub(locate_delta));
     self.active_table = table;
     self.order = resolved_order;
     let _ = self.walk_one_ifd(ifd_start, kind);
+    self.dir_len = saved_dir_len;
     self.warn_count = saved_warn_count;
     self.order = saved_order;
     self.active_table = saved_table;
@@ -4839,6 +5115,7 @@ impl Walker<'_, '_> {
   fn canon_prescan_datamembers(&mut self, ifd_start: usize, order: ByteOrder) {
     use makernotes::vendors::canon::body::{
       CanonDirShape, CanonEntryClass, classify_canon_directory, classify_canon_entry,
+      salvage_makernote_overrun,
     };
     use makernotes::vendors::canon::{camera_settings, read_focal_units};
     // Reset first: the members are only meaningful for THIS Canon walk.
@@ -4847,14 +5124,34 @@ impl Walker<'_, '_> {
     self.canon_focal_length_blob = None;
     let data = self.data;
     // Directory shape — the SHARED `ProcessExif` gate (`Exif.pm:6343-6400`) the
-    // emission walk uses. A degenerate/overrunning/`1`/`3`-byte-tail directory
-    // walks no entries (so both members stay `None`); only the `Walk` arm walks.
-    let CanonDirShape::Walk {
-      num_entries,
-      dir_end,
-    } = classify_canon_directory(data, ifd_start, data.len(), order)
-    else {
-      return;
+    // emission walk uses. A degenerate/`1`/`3`-byte-tail directory walks no
+    // entries (so both members stay `None`); only the `Walk` arm — or a SALVAGED
+    // `Overrun` — walks.
+    let (num_entries, dir_end) = match classify_canon_directory(data, ifd_start, data.len(), order)
+    {
+      CanonDirShape::Walk {
+        num_entries,
+        dir_end,
+      } => (num_entries, dir_end),
+      // A clean-count buffer overrun: apply the SAME maker-note salvage clamp
+      // the emission walk does (`walk_one_ifd_body` → [`salvage_makernote_overrun`]),
+      // so the pre-scan extracts `FocalUnits`/`LensType` from the IDENTICAL
+      // clamped entry set the emission walk renders — otherwise a salvaged
+      // Canon directory's dependent FocalLength / FileInfo sub-tables would emit
+      // defaults. The Canon Main IFD is always a maker note (this pre-scan runs
+      // ONLY under `TableRef::Canon`, `!is_core_ifd`), so `$inMakerNotes` is
+      // unconditionally `true`; `self.dir_len` is `$$dirInfo{DirLen}` (Canon uses
+      // `ProcessProc::Canon`, so no `LocateIFD` delta — it is unadjusted here).
+      // `None` (a missing/`< 14`/out-of-range `dir_len`) ⇒ walk no entries, like
+      // the emission walk's abort.
+      CanonDirShape::Overrun { .. } => {
+        let Some(salvaged) = salvage_makernote_overrun(ifd_start, data.len(), true, self.dir_len)
+        else {
+          return;
+        };
+        salvaged
+      }
+      CanonDirShape::AbortBadDirectory | CanonDirShape::AbortIllegalSize { .. } => return,
     };
     let entries_start = ifd_start + 2;
     // `$warnCount` — the SAME per-entry abort cap the emission walk honors
@@ -5472,6 +5769,50 @@ impl Walker<'_, '_> {
                   // tags ⇒ bundled emits them under the `Panasonic` family-1
                   // group.
                   emission_group1 = makernotes::Vendor::Panasonic.group1();
+                } else if let Some(variant) =
+                  makernotes::vendors::leica::discriminate_variant(bytes, make, model)
+                {
+                  // The Leica2..Leica9 variant tables (#259). Leica1/Leica10
+                  // (the cross-vendor `%Panasonic::Main` routes) did not match,
+                  // so re-discriminate WHICH variant the dispatcher matched and
+                  // walk its OWN table in a FRESH, ISOLATED `Walker`
+                  // ([`leica_makernote_isolated`]). The dispatched `detected`
+                  // carries the per-variant `Start`/`Base`/`ByteOrder` the helper
+                  // threads (Leica2 `$start`, Leica4/5/8 `$start - 8`,
+                  // Leica3/6/9 inherit, Leica7 `-$base` ⇒ `-parent_base`, which
+                  // is `self.base` below — 0 for a standalone TIFF, nonzero for
+                  // an embedded JPEG `APP1`).
+                  // `model` threads `$$self{Model}` for the Leica6 Typ-006
+                  // `Condition`. The walk DISCARDS its `warnings` / `warn_count` /
+                  // `active_ifd_offsets` / `chain_guard`. These tags emit under
+                  // the `Leica` family-1 group (they ARE `%Panasonic::Leica*`
+                  // tags, `GROUPS => { 1 => 'Leica' }`). `print_conv = true`
+                  // yields the cached `-j` emissions + the typed slot; the `-n`
+                  // emissions are recomputed on demand via the SAME helper.
+                  // `self.base` is the parent TIFF base of the IFD that holds
+                  // this 0x927c entry — 0 for a standalone TIFF, NONZERO for an
+                  // embedded JPEG `APP1` Exif block (sliced at its file offset
+                  // and walked with that base). Leica7's `Base => '-$base'`
+                  // rebases absolute value pointers to the slice via
+                  // `-self.base`; the other variants ignore it.
+                  if let Some((emi_pc, typed_pc)) = leica_makernote_isolated(
+                    self.data, mn_offset, mn_len, variant, detected, self.order, self.base, model,
+                    true,
+                  ) {
+                    meta.set_leica(typed_pc);
+                    cached_pc = emi_pc;
+                    value_conv_decode = MakerNoteValueConvDecode::Leica {
+                      data: self.data,
+                      mn_offset,
+                      mn_len,
+                      variant,
+                      detected,
+                      order: self.order,
+                      parent_base: self.base,
+                      model: model.map(smol_str::SmolStr::new),
+                    };
+                    emission_group1 = variant.group1();
+                  }
                 }
               }
               makernotes::Vendor::Dji => {
@@ -5577,6 +5918,47 @@ impl Walker<'_, '_> {
                   meta.set_pentax(typed_pc);
                   cached_pc = emi_pc;
                   value_conv_decode = MakerNoteValueConvDecode::Pentax {
+                    data: self.data,
+                    mn_offset,
+                    mn_len,
+                    detected,
+                    order: self.order,
+                    make: make.map(smol_str::SmolStr::new),
+                    model: model.map(smol_str::SmolStr::new),
+                  };
+                }
+              }
+              // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`) — the EXIF-format
+              // Samsung Type2 maker note (#210). The dispatcher gives body offset
+              // 0, `Base => Inherit`, `ByteOrder => Unknown` (probed) and
+              // `FixBase => 1`, carried on `detected`. Walk the Samsung Type2 IFD
+              // in a FRESH, ISOLATED `Walker` ([`samsung_makernote_isolated`]) —
+              // NOT on `self` — then capture its emissions into the cached buffer
+              // (structural isolation, mirroring Sony/Pentax). The isolated walk
+              // builds its own `Walker` over `self.data` (the IFD at `mn_offset`),
+              // walks under `TableRef::Samsung`, descends the `0x0021 PictureWizard`
+              // SubDirectory to its five binary members, and DISCARDS its
+              // `warnings` / `warn_count` / `active_ifd_offsets` / `chain_guard` —
+              // so a malformed Samsung entry cannot leak a core `ExifTool:Warning`
+              // or abort the parent walk. `print_conv = true` yields the cached
+              // `-j` emissions + the typed `MakerNotesSamsung`; the `-n` emissions
+              // are recomputed on demand via the SAME helper with `print_conv =
+              // false`. A degenerate too-short blob returns `None` and leaves the
+              // Samsung slot absent.
+              makernotes::Vendor::Samsung => {
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                // Threaded for symmetry with the other vendors; the Samsung walk
+                // reads no model-conditional structure (the FixBase heuristic is
+                // the generic offset-correction one, not the PENTAX make arm).
+                let make = self.captured_make.as_deref();
+                let model = self.captured_model.as_deref();
+                if let Some((emi_pc, typed_pc)) = samsung_makernote_isolated(
+                  self.data, mn_offset, mn_len, detected, self.order, make, model, true,
+                ) {
+                  meta.set_samsung(typed_pc);
+                  cached_pc = emi_pc;
+                  value_conv_decode = MakerNoteValueConvDecode::Samsung {
                     data: self.data,
                     mn_offset,
                     mn_len,
@@ -5838,6 +6220,25 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Pentax(t)),
         None => return,
       },
+      // `%Samsung::Type2` (#210). The resolved [`SamsungTag`] rides in
+      // `ResolvedConv::Samsung` so the emit ([`emit_samsung_value`]) reapplies
+      // its `SamsungPrintConv` (and, for `0x0021 PictureWizard`, the capture
+      // loop descends to the binary members). An unknown Samsung tag is skipped
+      // here (the deferred Crypt/SubDirectory rows), matching `ProcessExif`'s
+      // `next unless $tagInfo` skip.
+      TableRef::Samsung => match makernotes::vendors::samsung::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Samsung(t)),
+        None => return,
+      },
+      // `%Panasonic::Leica2`..`Leica9` (#259). The resolved [`LeicaTag`] rides in
+      // `ResolvedConv::Leica` WITH its variant so the emit ([`emit_leica_value`])
+      // reapplies its `LeicaPrintConv` + evaluates the row `Condition`. An unknown
+      // Leica tag is skipped here (the deferred SubDirectory/binary rows), matching
+      // `ProcessExif`'s `next unless $tagInfo` skip.
+      TableRef::Leica(v) => match makernotes::vendors::leica::tags::lookup(v, tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Leica(v, t)),
+        None => return,
+      },
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
@@ -6054,11 +6455,14 @@ impl ExifMeta<'_> {
                 emissions: &[makernotes::VendorEmission]| {
       out.reserve(emissions.len());
       for e in emissions {
-        out.push(crate::emit::EmittedTag::new(
+        // Carry the emission's `Priority => N` into the `EmittedTag` so the sink
+        // applies the general duplicate-override rule (`ExifTool.pm:9544-9560`).
+        out.push(crate::emit::EmittedTag::new_with_priority(
           crate::value::Group::new("MakerNotes", group1),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
+          e.priority(),
         ));
       }
     };
@@ -6377,7 +6781,9 @@ trait ExifSink {
     value: &[u8],
   ) -> Result<(), core::convert::Infallible>;
   /// Write an ALREADY-RENDERED vendor maker-note value under a FULL group
-  /// (`family0`, `family1`) with its `Unknown=>1` flag.
+  /// (`family0`, `family1`) with its `Unknown=>1` flag, taking ExifTool's
+  /// default duplicate `Priority => 1` (`ExifTool.pm:9553`). A provided method
+  /// delegating to [`write_vendor_value_with_priority`](Self::write_vendor_value_with_priority).
   ///
   /// Unlike the scalar `write_*` writers (which fix `family0 = "EXIF"` and route
   /// a scalar through the terminal number gate), a vendor leaf's value is built
@@ -6390,6 +6796,7 @@ trait ExifSink {
   /// rides into the [`EmittedTag`](crate::emit::EmittedTag) so the shared engine
   /// ([`run_emission`](crate::emit::run_emission)) drops it centrally — exactly
   /// as a Canon `VendorEmission`'s flag flows today.
+  #[inline(always)]
   fn write_vendor_value(
     &mut self,
     family0: &str,
@@ -6397,6 +6804,28 @@ trait ExifSink {
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+  ) -> Result<(), core::convert::Infallible> {
+    self.write_vendor_value_with_priority(family0, family1, name, value, unknown, 1)
+  }
+
+  /// Like [`write_vendor_value`](Self::write_vendor_value) but carrying an
+  /// explicit ExifTool `Priority => N` for duplicate handling. `0` marks a
+  /// vendor leaf that NEVER overrides an existing duplicate of the same
+  /// `(doc, family1, name)` (`ExifTool.pm:9544-9560`) — e.g. the Canon
+  /// `Priority => 0` sub-table rows (`Canon::ShotInfo` `FNumber`/`ExposureTime`/
+  /// `BaseISO`, `Canon::FocalLength` `FocalLength`), whose EXIF/CTMD counterpart
+  /// must win the collapsed `Track<N>:<name>` row. The priority rides into the
+  /// [`VendorEmission`](makernotes::VendorEmission) (and thence the
+  /// [`EmittedTag`](crate::emit::EmittedTag)), so the sink's priority-aware
+  /// dedup applies the general override rule centrally.
+  fn write_vendor_value_with_priority(
+    &mut self,
+    family0: &str,
+    family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible>;
 }
 
@@ -6464,18 +6893,20 @@ impl ExifSink for crate::tagmap::TagMap {
     )
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     _family0: &str,
     family1: &str,
     name: &str,
     value: crate::value::TagValue,
     _unknown: bool,
+    _priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The `TagMap` keys on family-1 only (`-G1`), so this test sink stores the
     // value under `family1:name` (the `Unknown=>1` suppression is the engine's
     // job and is not modelled by this raw test sink — a caller that wants the
-    // gate tests it before writing).
+    // gate tests it before writing). The `priority` is the engine's concern and
+    // not modelled by this raw test sink either.
     crate::tagmap::TagMap::write_value(self, family1, name, value)
   }
 }
@@ -6583,23 +7014,26 @@ impl ExifSink for EmittedTagSink<'_> {
     Ok(())
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     family0: &str,
     family1: &str,
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The vendor value is already a complete `TagValue` (built by the vendor
     // `PrintConv`), so it bypasses `Self::push`'s `EXIF`/`unknown:false` shape:
-    // push the FULL group + flag, matching `push_maker_note_tags`'s
-    // `EmittedTag::new(Group::new("MakerNotes", group1), …, e.unknown())`.
-    self.tags.push(crate::emit::EmittedTag::new(
+    // push the FULL group + flag + `Priority => N`, matching
+    // `push_maker_note_tags`'s `EmittedTag::new_with_priority(Group::new(
+    // "MakerNotes", group1), …, e.unknown(), e.priority())`.
+    self.tags.push(crate::emit::EmittedTag::new_with_priority(
       crate::value::Group::new(family0, family1),
       smol_str::SmolStr::new(name),
       value,
       unknown,
+      priority,
     ));
     Ok(())
   }
@@ -6689,24 +7123,32 @@ impl ExifSink for VendorEmissionSink<'_> {
     Ok(())
   }
   #[inline(always)]
-  fn write_vendor_value(
+  fn write_vendor_value_with_priority(
     &mut self,
     _family0: &str,
     _family1: &str,
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
+    priority: u8,
   ) -> Result<(), core::convert::Infallible> {
     // The family-0/1 group is fixed (`("MakerNotes", "Canon")`) for every Canon
     // emission and re-applied by [`ExifMeta::push_maker_note_tags`] from
     // [`MakerNote::emission_group1`], so it is NOT stored on the
-    // `VendorEmission` (which carries only `name` / `value` / `unknown`, exactly
-    // as the vendor body parsers build it).
-    self.emissions.push(makernotes::VendorEmission::new(
-      smol_str::SmolStr::new(name),
-      value,
-      unknown,
-    ));
+    // `VendorEmission` (which carries only `name` / `value` / `unknown` /
+    // `priority`, exactly as the vendor body parsers build it). The `priority`
+    // is the Canon row's `Priority => N` (`0` for the `Canon::ShotInfo`
+    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength`
+    // rows), so a CTMD re-dispatch's `Track<N>:FNumber` never overrides the
+    // earlier ExposureInfo value of the same row.
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_priority(
+        smol_str::SmolStr::new(name),
+        value,
+        unknown,
+        priority,
+      ));
     Ok(())
   }
 }
@@ -6910,6 +7352,33 @@ fn emit_entry<S: ExifSink>(
       }
       emit_pentax_value(group1, name, raw, pentax_tag, print_conv, out)
     }
+    // `%Samsung::Type2` (#210). Like Sony/Panasonic/Pentax, the production
+    // Samsung capture runs in the dedicated isolated walker
+    // ([`samsung_makernote_isolated`]), and no core-IFD walk produces a
+    // `ResolvedConv::Samsung` entry (Samsung leaves exist only under
+    // `active_table == Samsung`). This arm keeps the match exhaustive: a
+    // SubDirectory row (PictureWizard) emits NOTHING (its members are the
+    // capture loop's job), and a plain LEAF renders via `emit_samsung_value`.
+    ResolvedConv::Samsung(samsung_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      emit_samsung_value(group1, entry, samsung_tag, print_conv, None, out)
+    }
+    // `%Panasonic::Leica2`..`Leica9` (#259). Like Pentax/Samsung, the production
+    // Leica capture runs in the dedicated isolated walker
+    // ([`leica_makernote_isolated`]), and no core-IFD walk produces a
+    // `ResolvedConv::Leica` entry (Leica leaves exist only under
+    // `active_table == TableRef::Leica(_)`). This arm keeps the match exhaustive:
+    // a plain LEAF renders via `emit_leica_value` (which also evaluates the row
+    // `Condition`).
+    ResolvedConv::Leica(variant, leica_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      // The defensive `emit_entry` arm never carries the Leica Typ-006 model
+      // (the production Leica capture is the isolated walker, which threads it);
+      // pass `None` here (a core-IFD walk never produces a Leica entry anyway).
+      emit_leica_value(
+        group1, entry, variant, leica_tag, None, print_conv, None, out,
+      )
+    }
   }
 }
 
@@ -6993,7 +7462,144 @@ fn emit_pentax_value<S: ExifSink>(
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   let value = pentax_tag.conv.apply(raw, print_conv);
-  out.write_vendor_value("MakerNotes", group1, name, value, pentax_tag.is_unknown())
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x0012
+  // ExposureTime` / `0x0013 FNumber` rows, `1` otherwise) so a `Priority => 0`
+  // leaf never overrides an earlier same-`(doc, family1, name)` value
+  // (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
+    "MakerNotes",
+    group1,
+    name,
+    value,
+    pentax_tag.is_unknown(),
+    pentax_tag.tag_priority(),
+  )
+}
+
+/// Render ONE Samsung Type2 maker-note LEAF into the sink — the emit-time
+/// reproduction of `%Samsung::Type2`'s per-tag emit through the shared `Walker`
+/// (#210).
+///
+/// Samsung is a near-SIMPLE vendor like Apple/Pentax: a plain LEAF renders via
+/// [`SamsungPrintConv::apply`](makernotes::vendors::samsung::printconv::SamsungPrintConv::apply)
+/// (taken BY VALUE — the conv is `Copy`) on the entry's RAW value, then writes
+/// the already-rendered [`TagValue`] under `("MakerNotes", group1)` carrying the
+/// row's `Unknown=>1` flag (`run_emission` drops it once, like the other
+/// vendors). The `0x0021 PictureWizard` SubDirectory is descended in the capture
+/// loop ([`samsung::emit_picture_wizard`]), never routed here — but a SubDirectory
+/// row that reaches this fn (defensively) emits NOTHING (neither parent pointer
+/// nor children), matching ExifTool's `if ($subdir) … next` (`Exif.pm:7103`).
+///
+/// The ONE non-simple step is a value-`Condition` gate
+/// ([`SamsungPrintConv::condition_holds`](makernotes::vendors::samsung::printconv::SamsungPrintConv::condition_holds)):
+/// the `0xa002 SerialNumber` row (`Samsung.pm:404-409`) is emitted only when its
+/// raw value matches `$$valPt =~ /^\w{5}/`; a failing Condition emits NOTHING and
+/// populates NO typed field (ExifTool's absent-tag behaviour, the Panasonic
+/// `single_hash_condition_holds` shape). Driving the gate INSIDE this single fn
+/// covers BOTH the production capture loop and the defensive `emit_entry` arm.
+#[cfg(feature = "alloc")]
+fn emit_samsung_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  samsung_tag: &makernotes::vendors::samsung::tags::SamsungTag,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::samsung::MakerNotesSamsung>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::samsung::{SamsungPrintConv, populate_typed};
+  // SubDirectory row — emit NEITHER the parent pointer NOR (here) the children;
+  // the capture loop dispatches the children from the on-disk span.
+  if samsung_tag.sub_table().is_some() {
+    return Ok(());
+  }
+  let raw = entry.value.raw();
+  // Value-`Condition` suppression (the `0xa002 SerialNumber`
+  // `$$valPt =~ /^\w{5}/` row, `Samsung.pm:404-409`). When the Condition fails
+  // ExifTool's `GetTagInfo` returns no tag ⇒ emit NOTHING and populate NO typed
+  // field (the absent-tag behaviour), exactly like the Panasonic
+  // `single_hash_condition_holds` gate. Every other Samsung leaf has no
+  // suppressible value-Condition, so this is a no-op for them.
+  if !SamsungPrintConv::condition_holds(entry.tag_id, raw) {
+    return Ok(());
+  }
+  let value = samsung_tag.conv.apply(raw, print_conv);
+  // Populate the typed surface (gate-passing only, exactly where the leaf emits).
+  if let Some(typed) = typed {
+    populate_typed(typed, entry.tag_id, raw);
+  }
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0xa019
+  // FNumber` / `0xa01a FocalLengthIn35mmFormat` rows, `1` otherwise) so a
+  // `Priority => 0` leaf never overrides an earlier same-`(doc, family1, name)`
+  // value (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
+    "MakerNotes",
+    group1,
+    samsung_tag.name(),
+    value,
+    samsung_tag.is_unknown(),
+    samsung_tag.tag_priority(),
+  )
+}
+
+/// Render ONE Leica maker-note LEAF into the sink — the emit-time reproduction
+/// of `%Panasonic::Leica2`..`Leica9`'s per-tag emit through the shared `Walker`
+/// (#259).
+///
+/// Leica is a SIMPLE vendor like Pentax/Samsung, with ONE wrinkle: some rows
+/// carry a `Condition` that gates emission (the faithful port of ExifTool's
+/// `GetTagInfo` returning no tag when the `Condition` fails). This emit:
+///
+/// 1. Evaluates the row `Condition` against the entry — the Leica5 0x0303
+///    `LensType` `$format eq "string"` gate (read off [`ExifEntry::on_disk_format`])
+///    and the Leica6 Typ-006 rows (`$$self{Model} =~ /Typ 006/`, threaded as
+///    `model`). A failing `Condition` writes NOTHING (no emission, no typed
+///    populate) — the absent-tag behaviour.
+/// 2. Applies the resolved tag's
+///    [`LeicaPrintConv`](makernotes::vendors::leica::printconv::LeicaPrintConv)
+///    (taken BY VALUE — the conv is `Copy`) on the entry's RAW value.
+/// 3. Writes the already-rendered [`TagValue`] under `("MakerNotes", group1)`.
+///    No Leica leaf is `Unknown => 1`, so the flag is always `false`.
+///
+/// `typed` is the optional sink for the typed `MakerNotesLeica` populate (lens +
+/// serial) — `Some` only for the production capture; `populate_typed` runs only
+/// where the leaf emits (gate-passing), mirroring the other vendors.
+///
+/// `model` is the parent `$$self{Model}`, consumed only by the Leica6 Typ-006
+/// `Condition`; every other Leica row ignores it.
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+fn emit_leica_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  variant: makernotes::vendors::leica::tags::LeicaVariant,
+  leica_tag: &makernotes::vendors::leica::tags::LeicaTag,
+  model: Option<&str>,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::leica::MakerNotesLeica>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::leica::tags::LeicaCondition;
+  // Row `Condition` gate. A failing Condition ⇒ `GetTagInfo` returns no tag ⇒
+  // emit NOTHING and populate NO typed field (the absent-tag behaviour).
+  if let Some(cond) = leica_tag.condition() {
+    let holds = match cond {
+      // `$format eq "string"` — the entry's ON-DISK format is `string` (ASCII).
+      LeicaCondition::FormatIsString => entry.on_disk_format == crate::exif::ifd::Format::Ascii,
+      // `$$self{Model} =~ /Typ 006/` — the captured Model contains "Typ 006".
+      LeicaCondition::ModelTyp006 => model.is_some_and(|m| m.contains("Typ 006")),
+    };
+    if !holds {
+      return Ok(());
+    }
+  }
+  let raw = entry.value.raw();
+  let value = leica_tag.conv.apply(raw, print_conv);
+  // Populate the typed surface (gate-passing only, exactly where the leaf emits).
+  if let Some(typed) = typed {
+    makernotes::vendors::leica::populate_typed(typed, variant, entry.tag_id, &value, raw);
+  }
+  // No Leica leaf is `Unknown => 1`.
+  out.write_vendor_value("MakerNotes", group1, leica_tag.name(), value, false)
 }
 
 /// Render ONE Sony maker-note leaf into the sink — the emit-time reproduction of
@@ -7091,12 +7697,17 @@ fn emit_sony_value<S: ExifSink>(
   if let Some(typed) = typed {
     populate_typed(typed, tag_id, raw, &value);
   }
-  out.write_vendor_value(
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x201b
+  // FocusMode` / `0xb04f DynamicRangeOptimizer` rows, `1` otherwise) so the
+  // sink's priority-aware dedup keeps an EARLIER same-`(doc, family1, name)`
+  // value over a `Priority => 0` leaf (`ExifTool.pm:9544-9560`).
+  out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
     sony_tag.name(),
     value,
     sony_tag.is_unknown(),
+    sony_tag.tag_priority(),
   )
 }
 
@@ -7155,12 +7766,17 @@ fn emit_nikon_value<S: ExifSink>(
   if let Some(typed) = typed {
     populate_typed(typed, entry.tag_id, &value, nikon_tag.name());
   }
-  out.write_vendor_value(
+  // Thread the row's ExifTool `Priority => N` (`0` for the walked `%Nikon::Main`
+  // `0x0002 ISO` row, `1` otherwise) so a `Priority => 0` leaf never overrides an
+  // earlier same-`(doc, family1, name)` value (`ExifTool.pm:9544-9560`) — the EXIF
+  // ISO is the more reliable duplicate (`Nikon.pm:1803`).
+  out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
     nikon_tag.name(),
     value,
     nikon_tag.is_unknown(),
+    nikon_tag.tag_priority(),
   )
 }
 
@@ -7495,7 +8111,15 @@ fn emit_canon_subtable<S: ExifSink>(
   };
 
   for (name, value) in positions {
-    out.write_vendor_value("MakerNotes", group1, &name, value, false)?;
+    // Thread the row's ExifTool `Priority => N` (`0` for the `Canon::ShotInfo`
+    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength`
+    // rows, `1` otherwise) onto the emission so the sink's priority-aware dedup
+    // keeps an EARLIER same-`(doc, family1, name)` value when this leaf is
+    // `Priority => 0` (`ExifTool.pm:9544-9560`) — the CTMD `Track<N>:FNumber`
+    // fix. Every walked sub-table position is an explicit `BinaryData` entry,
+    // never `Unknown`.
+    let priority = sub.tag_priority(&name);
+    out.write_vendor_value_with_priority("MakerNotes", group1, &name, value, false, priority)?;
   }
   Ok(())
 }
@@ -7692,6 +8316,8 @@ pub(in crate::exif) fn apple_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Apple IFD's declared length: the captured value (`blob`) end minus the `14 + header` body offset (`Exif.pm:6385` salvage gate).
+    dir_len: Some(blob.len().saturating_sub(ifd_offset)),
   };
   // The Apple Main IFD walk — the SAME `process_subdir` entry the Canon walk uses,
   // but with `ProcessProc::Exif` (Apple needs NO Canon DataMember pre-scan; the
@@ -7885,6 +8511,8 @@ pub(in crate::exif) fn sony_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Sony IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Sony Main IFD walk — `ProcessProc::Exif` (Sony needs NO Canon DataMember
   // pre-scan; the `if table == TableRef::Canon` hook is inert). `Fixed(order)` is
@@ -8169,6 +8797,8 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Panasonic IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Panasonic Main IFD walk — `ProcessProc::Exif` (Panasonic needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -8432,6 +9062,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Nikon IFD's declared length: the `0x927c` value size minus the layout's body offset (equal in both the blob and parent-TIFF layouts; the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(layout.ifd_offset())),
   };
   // The Nikon Main/Type2 IFD walk — `ProcessProc::Exif` (Nikon needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -8594,6 +9226,24 @@ pub(in crate::exif) fn nikon_makernote_isolated(
 /// `print_conv = false` the `-n` emissions (the typed slot is the SAME for both
 /// and ALWAYS returned inside the `Some`). Returns `None` for a degenerate blob
 /// too short to hold the IFD count word (the Pentax slot stays absent).
+/// ExifTool's `$count` for a Pentax binary SubDirectory entry — the IFD entry's
+/// element COUNT (`$count`, the value a `%Pentax::Main` SubDirectory-list
+/// `Condition` reads, `Exif.pm` `GetTagInfo`). The Walker carries the ON-DISK
+/// byte size (`value_size`) and the ON-DISK format; `count = value_size /
+/// byte_size`. For the implicit-`undef` SubDirectory rows (`CameraSettings` /
+/// `AEInfo` / `FlashInfo`) the on-disk format is `undef` (1 byte), so `$count`
+/// equals the byte length — matching the `(N bytes, undef[N])` ExifTool reports.
+/// A zero-byte format (unreachable for a real entry) yields 0 (no decode).
+#[cfg(feature = "alloc")]
+fn pentax_subdir_count(entry: &ExifEntry) -> usize {
+  let unit = entry.on_disk_format().byte_size();
+  if unit == 0 {
+    0
+  } else {
+    entry.value_size() / unit
+  }
+}
+
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::exif) fn pentax_makernote_isolated(
@@ -8698,6 +9348,8 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Pentax IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
   };
   // The Pentax Main IFD walk — `ProcessProc::Unknown` runs `LocateIFD` (Pentax's
   // offsets are inconsistent, `MakerNotes.pm:1816` / `subdir.rs`) then
@@ -8730,7 +9382,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
       let ResolvedConv::Pentax(pentax_tag) = entry.conv else {
         continue;
       };
-      if let Some(SubTable::LensRec) = pentax_tag.sub_table() {
+      if let Some(sub) = pentax_tag.sub_table() {
         // Re-slice the ON-DISK value SPAN from the Walker's buffer at the entry's
         // resolved `value_offset` + on-disk `value_size` (the Nikon CRUX-#2
         // pattern). An out-of-bounds extent yields `&[]` ⇒ the emitter emits
@@ -8740,9 +9392,64 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           .checked_add(entry.value_size())
           .and_then(|end| w.data.get(entry.value_offset()..end))
           .unwrap_or(&[]);
-        pentax::emit_lens_rec(block, print_conv, &mut *sink.emissions);
-        if print_conv {
-          pentax::populate_lens_type(&mut typed, block);
+        match sub {
+          SubTable::LensRec => {
+            pentax::emit_lens_rec(block, print_conv, &mut *sink.emissions);
+            if print_conv {
+              pentax::populate_lens_type(&mut typed, block);
+            }
+          }
+          // The `$count`-gated binary SubDirectory tables (#262 Phase 2a). `$count`
+          // is the IFD entry COUNT — `value_size / on_disk_format.byte_size()`,
+          // ExifTool's `$count` (the value the SubDirectory-list `Condition`
+          // selects on). The per-table emitter re-checks the exact K10D `Condition`
+          // and emits nothing for a non-K10D count (the scope-fence); a non-K10D
+          // body's differently-sized record never mis-decodes through the K10D
+          // layout. `CameraSettings` additionally model-gates its offset-13+ leaves
+          // on the threaded `$$self{Model}` (K10D / GX10 only).
+          SubTable::CameraSettings => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_camera_settings(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          SubTable::AEInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_aeinfo(block, count, print_conv, &mut *sink.emissions);
+          }
+          // The nested `%Pentax::LensData` SubDirectory inside `%Pentax::LensInfo2`
+          // (#262 Phase 2b). `emit_lens_info` re-checks the K10D `$count`
+          // `Condition` (the scope-fence — a deferred `LensInfo3`/`4`/`5` count
+          // emits nothing), slices the offset-4 `undef[17]` `LensData` span, and
+          // emits ONLY the five nested lens-detail leaves. The offset-0 `LensType`
+          // is NOT re-emitted — Phase 1's `0x003f LensRec` owns it.
+          SubTable::LensInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_lens_info(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          SubTable::FlashInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_flashinfo(block, count, print_conv, &mut *sink.emissions);
+          }
+          // The UNCONDITIONAL `%Pentax::CameraInfo` (0x0215) fixed `int32u` table
+          // (#262 Phase 2c). NO `$count` gate (the Main row has no `Condition`),
+          // so — unlike the gated tables above — `count` is not read. Emits the
+          // three serviceable-data scalars (ManufactureDate / ProductionCode /
+          // InternalSerialNumber); the offset-0 PentaxModelID is owned by the
+          // Phase-1 0x0005 leaf and is NOT re-emitted here.
+          SubTable::CameraInfo => {
+            pentax::subtables::emit_camera_info(block, print_conv, &mut *sink.emissions);
+          }
         }
         continue;
       }
@@ -8759,6 +9466,434 @@ pub(in crate::exif) fn pentax_makernote_isolated(
       if print_conv {
         pentax::populate_typed_value(&mut typed, entry.tag_id, entry.value.raw());
       }
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk the Samsung `%Samsung::Type2` IFD in a FRESH, ISOLATED [`Walker`] over
+/// the parent TIFF and capture its emissions + typed surface — the single entry
+/// point BOTH the `-j` production dispatch and the `-n` recompute drive (#210,
+/// structural isolation, mirroring [`pentax_makernote_isolated`]).
+///
+/// ## The walk
+///
+/// The `MakerNoteSamsung2` SubDirectory (`MakerNotes.pm:965-979`) gives body
+/// offset 0, `Base => Inherit`, `ByteOrder => 'Unknown'` and `FixBase => 1`,
+/// processed via `ProcessProc => \&ProcessUnknown` — Samsung "is very
+/// inconsistent here, and uses absolute offsets for some models and relative
+/// offsets for others". So this drives [`process_subdir`](Walker::process_subdir)
+/// with [`ProcessProc::Unknown`] (which runs `LocateIFD` then `ProcessExif`) +
+/// [`ByteOrderRule::Unknown`] (probe the entry-count word) +
+/// [`FixBaseMode::Heuristic`] (the standard offset-correction), exactly as the
+/// dispatched `detected` directs. The Type2 table's own `Format =>` directives
+/// (`0xa01a` int32u, `0x0030` undef) are resolved off the active Samsung table
+/// (`Exif.pm:6729`). `IfdKind::ExifIfd` is a non-Ifd0 kind, so the IFD0-only
+/// Make/Model tap never fires. The walk appends the Samsung leaves to `w.entries`
+/// from index 0, isolating every core side effect from the parent (FRESH warning
+/// channels / `warn_count` / `active_ifd_offsets` / `chain_guard`, all dropped on
+/// return).
+///
+/// ## The per-entry capture (the loop)
+///
+/// Each `ResolvedConv::Samsung` leaf renders via the plain
+/// [`emit_samsung_value`]; the ONE `0x0021 PictureWizard` SubDirectory row is
+/// descended by re-slicing its on-disk value SPAN (`value_offset` /
+/// `value_size`) from the Walker buffer and dispatching to
+/// [`samsung::emit_picture_wizard`] (the parent pointer is never emitted) —
+/// the Nikon/Pentax SubDirectory pattern. The typed [`MakerNotesSamsung`] is
+/// built from the SAME gate-passing entries.
+///
+/// A degenerate too-short blob (no room for the IFD count word) returns
+/// `Some(empty)` (vendor identified, nothing decoded), never `None`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+pub(in crate::exif) fn samsung_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  detected: makernotes::DetectedMakerNote,
+  parent_order: ByteOrder,
+  make: Option<&str>,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::samsung::MakerNotesSamsung,
+)> {
+  use makernotes::vendors::samsung::{self, MakerNotesSamsung, SubTable};
+  // The captured MakerNote bytes the dispatcher classified
+  // (`data[mn_offset .. mn_offset + mn_len]`, saturating end clamped).
+  let mn_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let _blob = data.get(mn_offset..mn_end)?;
+  // SAMSUNG2-ROUTE GATE. The dispatcher collapses THREE distinct routes onto
+  // `Vendor::Samsung`, but `%Samsung::Type2` (the table this helper walks) is the
+  // EXIF-format maker note of the `MakerNoteSamsung2` route ONLY:
+  //
+  //   * Samsung1a — `STMN\d{3}.\0{4}` (`MakerNotes.pm:951-956`): `Binary => 1`
+  //     ⇒ `NotIFD` (an old `%Samsung::Main` binary table, a future phase).
+  //   * Samsung1b — `STMN\d{3}` (`MakerNotes.pm:957-963`): a `%Samsung::Main`
+  //     `SubDirectory` (an IFD, but the OLD STMN table — not Type2).
+  //   * Samsung2 — `MakerNoteSamsung2` (`MakerNotes.pm:965-979`): the `%Type2`
+  //     EXIF-format IFD, the ONLY route carrying `FixBase => 1` (`:977`).
+  //
+  // `MakerNoteSamsung2` is the ONLY `Vendor::Samsung` arm that sets `FixBase`, and
+  // it is never `NotIFD`; the two STMN arms set NEITHER. So `fix_base && !is_not_ifd`
+  // selects EXACTLY the Samsung2 route. Without this gate an old STMN / Samsung1a
+  // payload (or a crafted `Make=SAMSUNG` blob) whose first bytes happen to look
+  // IFD-shaped in `LocateIFD`'s scan window would walk `%Type2` and emit BOGUS
+  // exifast-only `Samsung:*` leaves + populate the typed slot — a Phase-1 scope
+  // fence violation. The non-Samsung2 routes are deferred ⇒ emit NOTHING (the typed
+  // slot stays the empty default), mirroring the Pentax4 `NotIFD` discipline above.
+  // This single choke point also gates the `-n` recompute + `from_blob_with_context`.
+  if !detected.fix_base() || detected.is_not_ifd() {
+    return Some((std::vec::Vec::new(), MakerNotesSamsung::new()));
+  }
+  // The child IFD start: the MakerNote value offset + the dispatched body offset
+  // (0 for `MakerNoteSamsung2`). The IFD count word must sit inside the declared
+  // value, else a truncated `mn_len` lets the Walker read its count word from the
+  // UNRELATED following parent-TIFF bytes — spurious tags.
+  let body_offset = detected.body_offset() as usize;
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  match body_offset.checked_add(2) {
+    Some(min) if mn_len >= min => {}
+    _ => return Some((std::vec::Vec::new(), MakerNotesSamsung::new())),
+  }
+  // Translate the dispatched `SubDirectory` directives into the `process_subdir`
+  // modes. `Base => Inherit` ⇒ `value_offset_base 0` (out-of-line offsets are
+  // parent-TIFF-relative against `data`). The relocation Samsung needs for its
+  // absolute-offset models is handled by `ProcessProc::Unknown`'s `LocateIFD` +
+  // the `FixBase` heuristic, NOT a base shift.
+  let value_offset_base: i64 = match detected.base_rule() {
+    makernotes::BaseRule::Inherit => 0,
+    makernotes::BaseRule::RelativeToStart(_) => i64::try_from(mn_offset).unwrap_or(i64::MAX),
+    makernotes::BaseRule::Literal(n) if n >= 0 => n,
+    _ => 0,
+  };
+  // `ByteOrder => Unknown` ⇒ probe the entry-count word; `Explicit(o)` ⇒ fixed.
+  let byte_order_rule = match detected.byte_order() {
+    makernotes::ChildByteOrder::Unknown => ByteOrderRule::Unknown,
+    makernotes::ChildByteOrder::Explicit(o) => ByteOrderRule::Fixed(o),
+  };
+  // `FixBase => 1` ⇒ the standard offset-correction heuristic; absent ⇒ no fix.
+  let fix_base_mode = if detected.fix_base() {
+    FixBaseMode::Heuristic
+  } else {
+    FixBaseMode::No
+  };
+  let mut w = Walker {
+    data,
+    order: parent_order,
+    base: 0,
+    value_offset_base,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Samsung entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream.
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
+    // Samsung walk reads no model-conditional structure (no PENTAX-style make
+    // arm), but thread them for parity with the other vendors.
+    captured_make: make.map(String::from),
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Samsung leaf reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Samsung)` swaps it to
+    // the Samsung table for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Samsung IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
+  };
+  // The Samsung Type2 IFD walk — `ProcessProc::Unknown` runs `LocateIFD`
+  // (Samsung's offsets are inconsistent, `MakerNotes.pm:976`) then `ProcessExif`.
+  // The probed order + `FixBase` heuristic are resolved inside `process_subdir`.
+  // It appends the Samsung leaves to `w.entries` from index 0. The Samsung
+  // table's implicit-`undef` SubDirectory `format_override` materializes the
+  // `0x0021 PictureWizard` block as an empty zero-copy `RawValue::Bytes`; the
+  // capture loop re-slices the on-disk span.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Samsung,
+    byte_order_rule,
+    fix_base_mode,
+    ProcessProc::Unknown,
+  );
+  // Capture the walked `ResolvedConv::Samsung` leaves + the PictureWizard child
+  // into the vendor-emission `Vec`; build the typed `MakerNotesSamsung` from the
+  // SAME entries (the typed leaf set is disjoint from PictureWizard).
+  let g1 = vendor_group1_of(TableRef::Samsung).unwrap_or("Samsung");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = MakerNotesSamsung::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    // The `0xa020 EncryptionKey` DataMember (`Samsung.pm:489-490`), captured
+    // DURING the walk: `0xa020` precedes every `0xa021`+ Crypt tag in the
+    // ascending Type2 IFD, so by the time a Crypt entry is reached the key is
+    // set. Empty until captured (and stays empty if `0xa020` is absent/malformed)
+    // ⇒ a Crypt tag with no key emits nothing (`Samsung::Crypt`'s
+    // `$key or return undef`).
+    let mut encryption_key: std::vec::Vec<i64> = std::vec::Vec::new();
+    for entry in &w.entries {
+      // Only `ResolvedConv::Samsung` entries live in this run; a defensive
+      // non-Samsung conv (never produced under `TableRef::Samsung`) is skipped.
+      let ResolvedConv::Samsung(samsung_tag) = entry.conv else {
+        continue;
+      };
+      if let Some(sub) = samsung_tag.sub_table() {
+        match sub {
+          SubTable::PictureWizard => {
+            // The Walker decoded the `0x0021` entry as `int16u[N]` in the IFD's
+            // RESOLVED (probed) byte order — the SubDirectory inherits that order
+            // — so the members are exactly the decoded array. A non-int16u shape
+            // (never produced for this row) yields an empty slice ⇒ nothing
+            // emitted.
+            let members: &[u64] = match entry.value.raw() {
+              RawValue::U64(v) => v.as_slice(),
+              _ => &[],
+            };
+            samsung::emit_picture_wizard(members, print_conv, &mut *sink.emissions);
+          }
+        }
+        continue;
+      }
+      // Crypt tag (`RawConv => Samsung::Crypt`, `0xa021`..`0xa043` of the 16) —
+      // decrypt with the captured key + the row's salts/format, emitting the
+      // plaintext directly (no PrintConv: `-j` and `-n` render the same string).
+      // The decrypted arrays are raw-processing data, not camera-identity, so
+      // they populate no typed field.
+      if let Some(crypt_tag) = samsung_tag.crypt() {
+        samsung::emit_crypt(
+          samsung_tag.name(),
+          crypt_tag,
+          entry.value.raw(),
+          &encryption_key,
+          samsung_tag.is_unknown(),
+          &mut *sink.emissions,
+        );
+        continue;
+      }
+      // Plain leaf — the Samsung renderer + the gate-passing typed populate. The
+      // `0xa020 EncryptionKey` is one such leaf: it is emitted normally AND its
+      // raw int32u[11] is captured here as the Crypt key for the following rows
+      // (the `$$self{EncryptionKey} = [ split(" ",$val) ]; $val` DataMember tap).
+      if entry.tag_id == 0xa020 {
+        encryption_key = samsung::encryption_key_from_raw(entry.value.raw());
+      }
+      let Ok(()) = emit_samsung_value(
+        g1,
+        entry,
+        samsung_tag,
+        print_conv,
+        Some(&mut typed),
+        &mut sink,
+      );
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk a Leica MakerNote variant IFD (`%Panasonic::Leica2`..`Leica9`) in a
+/// FRESH, ISOLATED [`Walker`] and capture its emissions + the typed
+/// [`MakerNotesLeica`](makernotes::vendors::leica::MakerNotesLeica) — the single
+/// entry point BOTH the `-j` production dispatch and the `-n` recompute drive
+/// (#259, structural isolation, mirroring [`samsung_makernote_isolated`]).
+///
+/// `variant` selects which of the SIX Leica tables the walk resolves against
+/// (the dispatcher fanned the EIGHT detected signatures onto the table-bearing
+/// [`LeicaVariant`](makernotes::vendors::leica::tags::LeicaVariant), with
+/// Leica7→Leica6 and Leica8→Leica5). `detected` carries the dispatched
+/// `Start`/`Base`/`ByteOrder` the Walker applies.
+///
+/// ## Base-rule mapping (the Leica7 `NegativeOfBase` note)
+///
+/// The Leica variants use four base rules:
+/// - **Leica2** `Base => '$start'` ([`StartItself`](makernotes::BaseRule::StartItself))
+///   — out-of-line offsets are BLOB-body-relative ⇒ `value_offset_base =
+///   mn_offset + body_offset` (the file offset of the child IFD start).
+/// - **Leica4/Leica5/Leica8** `Base => '$start - 8'`
+///   ([`RelativeToStart(-8)`](makernotes::BaseRule::RelativeToStart)) — with
+///   `body_offset == 8` the child base is `mn_offset` ⇒ `value_offset_base =
+///   mn_offset` (blob-start-relative, the M9 fixup).
+/// - **Leica3/Leica6/Leica9** no `Base` ([`Inherit`](makernotes::BaseRule::Inherit))
+///   — offsets are parent-TIFF-relative against `data` ⇒ `value_offset_base = 0`.
+/// - **Leica7** `Base => '-$base'`
+///   ([`NegativeOfBase`](makernotes::BaseRule::NegativeOfBase)) — the child's
+///   out-of-line value pointers are ABSOLUTE FILE offsets, so they must be
+///   rebased to the slice `data` by SUBTRACTING the parent TIFF base ⇒
+///   `value_offset_base = -parent_base` (`parent_base` = the base of the IFD
+///   that contains this MakerNote entry). For a standalone / base-0 TIFF
+///   `parent_base == 0` ⇒ `-0`, identical to `Inherit` (an absolute pointer
+///   resolves directly against `data`). But a real JPEG `APP1` Exif block is
+///   SLICED at its NONZERO file offset and walked with that base retained, so an
+///   absolute Leica7 pointer `P` resolves at `data[P - parent_base]` — the
+///   slice-relative index. `value_offset_base` is SIGNED, so the negated base is
+///   expressible directly; the resolution site range-checks `off_signed >= 0`
+///   AND `off + size <= len`, so a pointer landing outside the slice is dropped
+///   (never wrapped). (The Leica7 *trailer* layout some JPEGs use — a
+///   `ProcessLeicaTrailer` blob with its own absolute base — is a separate,
+///   deferred case; the inline-IFD path here is byte-exact vs the `perl
+///   exiftool` oracle on the crafted standalone + nonzero-base Leica7 fixtures.)
+///
+/// A degenerate too-short blob (no room for the IFD count word) returns
+/// `Some(empty)` (vendor identified, nothing decoded), never `None`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+pub(in crate::exif) fn leica_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  variant: makernotes::vendors::leica::tags::LeicaVariant,
+  detected: makernotes::DetectedMakerNote,
+  parent_order: ByteOrder,
+  parent_base: u32,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::leica::MakerNotesLeica,
+)> {
+  use makernotes::vendors::leica::MakerNotesLeica;
+  // The captured MakerNote bytes the dispatcher classified
+  // (`data[mn_offset .. mn_offset + mn_len]`, saturating end clamped).
+  let mn_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let _blob = data.get(mn_offset..mn_end)?;
+  // The child IFD start: the MakerNote value offset + the dispatched body offset
+  // (8 for every Leica2..Leica9 variant). The IFD count word must sit inside the
+  // declared value, else a truncated `mn_len` lets the Walker read its count word
+  // from the UNRELATED following parent-TIFF bytes — spurious tags.
+  let body_offset = detected.body_offset() as usize;
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  match body_offset.checked_add(2) {
+    Some(min) if mn_len >= min => {}
+    _ => return Some((std::vec::Vec::new(), MakerNotesLeica::new())),
+  }
+  // Translate the dispatched `Base` rule into the `value_offset_base` shift (see
+  // the doc comment). `StartItself` ⇒ the child IFD start file offset; `$start -
+  // 8` (RelativeToStart, body_offset 8) ⇒ `mn_offset`; `Inherit` ⇒ 0; Leica7's
+  // `NegativeOfBase` ⇒ `-parent_base` (an absolute child pointer rebased to the
+  // slice; see below).
+  let value_offset_base: i64 = match detected.base_rule() {
+    makernotes::BaseRule::Inherit => 0,
+    // `Base => '$start'` — out-of-line offsets are relative to the child IFD
+    // start file offset (`mn_offset + body_offset`, ExifTool's `$start`).
+    makernotes::BaseRule::StartItself => i64::try_from(ifd_offset).unwrap_or(i64::MAX),
+    // `Base => '$start + delta'` — the child base is `$start + delta` =
+    // `mn_offset + body_offset + delta` (for Leica4/5/8 with delta -8 and
+    // body_offset 8 this is `mn_offset`, the blob start). Computed in i64;
+    // clamped non-negative (a degenerate negative result lands past EOF).
+    makernotes::BaseRule::RelativeToStart(delta) => {
+      (i64::try_from(ifd_offset).unwrap_or(i64::MAX) + i64::from(delta)).max(0)
+    }
+    // `Base => '-$base'` — Leica7. Out-of-line value pointers are ABSOLUTE FILE
+    // offsets, so they must be rebased to the slice `data` by subtracting the
+    // parent TIFF base: an absolute pointer `P` resolves at `data[P -
+    // parent_base] = data[P + value_offset_base]` with `value_offset_base =
+    // -parent_base` (`value_offset_base` is SIGNED; the resolution site
+    // range-checks `off_signed >= 0 && off + size <= len`, so a pointer landing
+    // before/after the slice is dropped, never wrapped). `parent_base` is the
+    // base of the IFD that CONTAINS this 0x927c entry — 0 for a standalone /
+    // base-0 TIFF (⇒ `-0`, identical to `Inherit`), but NONZERO for a real JPEG
+    // `APP1` Exif block (sliced at its file offset, walked with that base). The
+    // OLD code hardcoded 0 here and read embedded-APP1 Leica7 out-of-line values
+    // from the wrong offset / out of bounds.
+    makernotes::BaseRule::NegativeOfBase => -i64::from(parent_base),
+    makernotes::BaseRule::Literal(n) if n >= 0 => n,
+    _ => 0,
+  };
+  // `ByteOrder => Unknown` ⇒ probe the entry-count word; `Explicit(o)` ⇒ fixed.
+  let byte_order_rule = match detected.byte_order() {
+    makernotes::ChildByteOrder::Unknown => ByteOrderRule::Unknown,
+    makernotes::ChildByteOrder::Explicit(o) => ByteOrderRule::Fixed(o),
+  };
+  // No Leica2..Leica9 variant sets `FixBase` (`MakerNotes.pm:611-721`).
+  let fix_base_mode = if detected.fix_base() {
+    FixBaseMode::Heuristic
+  } else {
+    FixBaseMode::No
+  };
+  let mut w = Walker {
+    data,
+    order: parent_order,
+    base: 0,
+    value_offset_base,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Leica entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream.
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
+    // leaf reads Make.
+    captured_make: None,
+    captured_model: model.map(String::from),
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    file_type: None,
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Leica(variant))` swaps
+    // it to the Leica variant table for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Leica IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
+    dir_len: Some(mn_len.saturating_sub(body_offset)),
+  };
+  // The Leica variant IFD walk — `ProcessProc::Exif` directly (the Leica2..Leica9
+  // tables carry no `PROCESS_PROC`; only their deferred binary sub-tables do). The
+  // probed order is resolved inside `process_subdir`. It appends the Leica leaves
+  // to `w.entries` from index 0, isolating every core side effect from the parent.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Leica(variant),
+    byte_order_rule,
+    fix_base_mode,
+    ProcessProc::Exif,
+  );
+  // Capture the walked `ResolvedConv::Leica` leaves into the vendor-emission
+  // `Vec`; build the typed `MakerNotesLeica` from the SAME gate-passing entries.
+  let g1 = vendor_group1_of(TableRef::Leica(variant)).unwrap_or("Leica");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = MakerNotesLeica::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // Only `ResolvedConv::Leica` entries live in this run; a defensive
+      // non-Leica conv (never produced under `TableRef::Leica`) is skipped.
+      let ResolvedConv::Leica(entry_variant, leica_tag) = entry.conv else {
+        continue;
+      };
+      let Ok(()) = emit_leica_value(
+        g1,
+        entry,
+        entry_variant,
+        leica_tag,
+        model,
+        print_conv,
+        Some(&mut typed),
+        &mut sink,
+      );
     }
   }
   Some((emissions, typed))
@@ -8903,6 +10038,8 @@ pub(in crate::exif) fn canon_makernote_isolated(
     canon_focal_units: None,
     canon_lens_type: None,
     canon_focal_length_blob: None,
+    // `$$dirInfo{DirLen}` — the Canon MakerNote's declared length (`DirLen => $size`, the `0x927c` value size; Canon's body offset is 0). Gates the directory-size salvage clamp (`Exif.pm:6383-6388`, #248).
+    dir_len: Some(mn_len),
   };
   // The Canon Main IFD walk — the SAME `process_subdir` entry the recompute used
   // (`IfdKind::ExifIfd` directory kind, fixed parent order, no FixBase, the Canon
@@ -11672,6 +12809,8 @@ mod tests {
       canon_focal_units: None,
       canon_lens_type: None,
       canon_focal_length_blob: None,
+      // Test walk — no maker-note `DirLen`.
+      dir_len: None,
     }
   }
 
@@ -17006,5 +18145,101 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
       4,
       "bundled Panasonic::Main descend-no-parent SubDirectory count changed (was 4 @ 13.59)"
     );
+  }
+
+  /// `%Samsung::Type2` `0xa002 SerialNumber` value-`Condition`
+  /// (`$$valPt =~ /^\w{5}/`, `Samsung.pm:404-409`) at the EMISSION level, driven
+  /// end-to-end through the production isolated helper
+  /// [`samsung_makernote_isolated`]. A valid serial (first five raw bytes are
+  /// word chars) emits `SerialNumber`; the NX500-style value (`"0"` + NULs, fewer
+  /// than five leading word chars) emits NOTHING — exactly ExifTool's `GetTagInfo`
+  /// absent-tag outcome (bundled emits no `Samsung:SerialNumber` for NX500).
+  #[test]
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn samsung_serial_number_value_condition_emission() {
+    use crate::value::TagValue;
+    use makernotes::dispatch;
+
+    // A clean little-endian `%Samsung::Type2` IFD at offset 0, carrying:
+    //   - 0x0001 MakerNoteVersion, undef[4] = "0100" (inline) — this also makes
+    //     the `MakerNoteSamsung2` EXIF-format magic (`MakerNotes.pm:970`,
+    //     branch B / LE) match, so the blob dispatches as Samsung2.
+    //   - 0xa002 SerialNumber, string[N] (out-of-line value at an absolute
+    //     offset past the next-IFD word).
+    // `serial` is the on-disk string-value bytes (NUL-terminated).
+    fn samsung2_blob_with_serial(serial: &[u8]) -> Vec<u8> {
+      let count: u16 = 2;
+      // Entries start at offset 2; each entry is 12 bytes. next-IFD word follows.
+      // Out-of-line serial value lives right after the next-IFD word.
+      let entries_len = 2 + (count as usize) * 12 + 4; // count word + entries + next-IFD
+      let serial_off = entries_len as u32; // absolute (base 0)
+      let mut b: Vec<u8> = Vec::new();
+      b.extend_from_slice(&count.to_le_bytes()); // entry count = 2
+      // entry 0x0001 MakerNoteVersion — undef(7)[4] = "0100" inline.
+      b.extend_from_slice(&0x0001u16.to_le_bytes());
+      b.extend_from_slice(&7u16.to_le_bytes()); // format = undef
+      b.extend_from_slice(&4u32.to_le_bytes()); // count = 4
+      b.extend_from_slice(b"0100"); // inline value
+      // entry 0xa002 SerialNumber — string(2)[serial.len()], out-of-line.
+      b.extend_from_slice(&0xa002u16.to_le_bytes());
+      b.extend_from_slice(&2u16.to_le_bytes()); // format = string
+      b.extend_from_slice(&(serial.len() as u32).to_le_bytes());
+      b.extend_from_slice(&serial_off.to_le_bytes());
+      b.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+      b.extend_from_slice(serial); // out-of-line serial bytes
+      b
+    }
+
+    fn serial_emission(serial: &[u8], print_conv: bool) -> Option<TagValue> {
+      let blob = samsung2_blob_with_serial(serial);
+      // Dispatch with Make=SAMSUNG + TIFF_TYPE=SRW ⇒ the `MakerNoteSamsung2` arm
+      // (FixBase=1, an IFD), the only route that walks `%Type2`.
+      let detected = dispatch(&blob, Some("SAMSUNG"), None, Some("SRW"));
+      assert!(detected.vendor().is_samsung() && detected.fix_base() && !detected.is_not_ifd());
+      let (emissions, _typed) = samsung_makernote_isolated(
+        &blob,
+        0,
+        blob.len(),
+        detected,
+        ByteOrder::Little,
+        Some("SAMSUNG"),
+        None,
+        print_conv,
+      )
+      .expect("a well-formed Samsung2 IFD ⇒ Some");
+      // Sanity: MakerNoteVersion always emits (proves the walk located the IFD).
+      assert!(
+        emissions.iter().any(|e| e.name() == "MakerNoteVersion"),
+        "MakerNoteVersion must emit ⇒ the Type2 IFD was located"
+      );
+      emissions
+        .iter()
+        .find(|e| e.name() == "SerialNumber")
+        .map(|e| e.value().clone())
+    }
+
+    for print_conv in [true, false] {
+      // (a) Valid serial — first five bytes "AB12C" are word chars ⇒ emitted (no
+      // PrintConv on this row, so the value is the bare ASCII string in both modes).
+      assert_eq!(
+        serial_emission(b"AB12C7 ", print_conv),
+        Some(TagValue::Str("AB12C7".into())),
+        "a valid serial (first 5 bytes word chars) must emit Samsung:SerialNumber"
+      );
+      // (b) NX500-style value — "0" then NULs ⇒ NUL-trimmed `$$valPt` is "0"
+      // (< 5 leading word chars) ⇒ `/^\w{5}/` fails ⇒ NO emission (bundled emits
+      // no Samsung:SerialNumber for NX500).
+      assert_eq!(
+        serial_emission(b"0      ", print_conv),
+        None,
+        "the NX500-style 0xa002 fails /^\\w{{5}}/ ⇒ no Samsung:SerialNumber"
+      );
+      // (c) A non-word ASCII char inside the first five bytes also fails.
+      assert_eq!(
+        serial_emission(b"AB!CDE ", print_conv),
+        None,
+        "a non-word byte in the first five positions fails the Condition"
+      );
+    }
   }
 }

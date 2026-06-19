@@ -1904,7 +1904,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(_, g, n, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
+        .any(|(_, g, n, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 trailer tags present in the engine output"
     );
   }

@@ -59,9 +59,9 @@ use crate::{
     insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
   },
   metadata::{
-    CammMeta, CanonCtmdMeta, DjiProtobufMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue,
-    Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
-    QuickTimeStreamMeta, SonyRtmdMeta,
+    AudioSampleDesc, CammMeta, CanonCtmdMeta, DjiProtobufMeta, GoProConv, GoProMeta, GoProTag,
+    GoProTagValue, Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
+    QuickTimeStreamMeta, SonyRtmdMeta, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -892,6 +892,10 @@ fn be_u16(b: &[u8], off: usize) -> Option<u16> {
   Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
+fn be_i16(b: &[u8], off: usize) -> Option<i16> {
+  Some(i16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
+}
+
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
   Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
@@ -1183,6 +1187,36 @@ fn handler_class_print(code: &str) -> &'static str {
   match code {
     "mhlr" => "Media Handler",
     "dhlr" => "Data Handler",
+    _ => "",
+  }
+}
+
+/// The shared `%vendorID` PrintConv (QuickTime.pm:334-354), used by the `hdlr`
+/// `HandlerVendorID` (QuickTime.pm:8450), the `VisualSampleDesc` `VendorID`
+/// (QuickTime.pm:7629) and the `AudioSampleDesc` `AudioVendorID`
+/// (QuickTime.pm:7525). A hash miss is an empty string (the caller renders the
+/// ExifTool `Unknown ($val)` fallback); the all-zero RawConv-`undef` branch is
+/// applied at decode, so a present value is non-zero.
+fn vendor_id_print(code: &str) -> &'static str {
+  match code {
+    "appl" => "Apple",
+    "fe20" => "Olympus (fe20)",
+    "FFMP" => "FFmpeg",
+    "GIC " => "General Imaging Co.",
+    "kdak" => "Kodak",
+    "KMPI" => "Konica-Minolta",
+    "leic" => "Leica",
+    "mino" => "Minolta",
+    "niko" | "NIKO" => "Nikon",
+    "olym" => "Olympus",
+    "pana" => "Panasonic",
+    "pent" => "Pentax",
+    "pr01" => "Olympus (pr01)",
+    "sany" => "Sanyo",
+    "SMI " => "Sorenson Media Inc.",
+    "ZORA" => "Zoran Corporation",
+    "AR.D" => "Parrot AR.Drone",
+    " KD " => "Kodak",
     _ => "",
   }
 }
@@ -1711,45 +1745,219 @@ fn decode_hdlr_class(payload: &[u8]) -> Option<String> {
   Some(String::from_utf8_lossy(raw).into_owned())
 }
 
-/// Read the `stsd` (Sample Description) box's first-entry 4-byte format code
-/// (the `MetaFormat` / `OtherFormat` value — `undef[4]` at offset 4 of the
-/// sample-description entry, QuickTime.pm:7765/7803). The `stsd` body is
-/// `[version+flags:4][entry-count:4]` then each entry `[size:4][format:4]…`, so
-/// the FIRST entry's format 4cc is at body offset 12. Mirrors the stream
-/// walker's `walk_stsd` bounds (entry size >= 16, entry within the box). Returns
-/// the lossless 4-char string, or `None` when the box is too short / malformed.
-/// Timed-metadata tracks carry exactly one entry; ExifTool's `MetaFormat` is
-/// last-wins, but a single entry is the universal real-world shape.
-fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
-  // Walk ALL sample-description entries, LAST-WINS — ExifTool's
-  // `ProcessSampleDesc` per-entry `RawConv => '$$self{MetaFormat} = $val'`
-  // makes a later entry's format overwrite the earlier (QuickTime.pm:9640-
-  // 9648). A single entry (the universal real-world shape) resolves to itself.
-  // Each entry is `[size:4][format:4][reserved:6][data-ref-index:2]` + children.
-  let count = be_u32(payload, 4)? as usize;
+/// Visit EVERY valid `stsd` (Sample Description) entry's byte slice, faithful
+/// to ExifTool `ProcessSampleDesc`'s per-entry loop (QuickTime.pm:9640-9648).
+/// The `stsd` body is `[version+flags:4][entry-count:4]` then each entry
+/// `[size:4][format:4][reserved:6][data-ref-index:2]` + child atoms. `f`
+/// receives the FULL entry slice (`[size:4]`-relative, so the format 4cc is at
+/// entry offset 4); the per-handler decoders index entry-relative offsets.
+///
+/// Bounds (the SINGLE source of truth shared by [`decode_stsd_meta_format`] and
+/// the visual/audio sample-description decoders): stop on a missing `size`
+/// word, on a `size` that overflows `pos + size` (`checked_add`, so a crafted
+/// giant size breaks rather than wrapping/panicking), on `size < 8` (an entry
+/// needs at least its `[size:4][format:4]` header), or on an entry that
+/// overruns the box (QuickTime.pm:9641-9643 `$pos + $size > $dirLen`).
+fn for_each_stsd_entry(payload: &[u8], mut f: impl FnMut(&[u8])) {
+  let Some(count) = be_u32(payload, 4).map(|c| c as usize) else {
+    return;
+  };
   let mut pos = 8usize;
-  let mut last: Option<String> = None;
   for _ in 0..count {
     let Some(size) = be_u32(payload, pos).map(|s| s as usize) else {
       break;
     };
-    // ExifTool `ProcessSampleDesc` stops only on `$size < 8` (the entry needs at
-    // least the `[size:4][format:4]` header) or an overrunning entry
-    // (QuickTime.pm:9642-9643) — keeping the last-wins format accumulated so
-    // far. An 8-15 byte entry still contributes its offset-4 format. `checked_add`
-    // so a crafted overflowing `size` breaks rather than wrapping/panicking.
     let Some(entry_end) = pos.checked_add(size) else {
       break;
     };
     if size < 8 || entry_end > payload.len() {
       break;
     }
-    if let Some(raw) = payload.get(pos + 4..pos + 8) {
-      last = Some(String::from_utf8_lossy(raw).into_owned());
+    if let Some(entry) = payload.get(pos..entry_end) {
+      f(entry);
     }
     pos = entry_end;
   }
+}
+
+/// Read the `stsd` (Sample Description) box's format code (the `MetaFormat` /
+/// `OtherFormat` value — `undef[4]` at offset 4 of the sample-description entry,
+/// QuickTime.pm:7765/7803). ExifTool's `ProcessSampleDesc` per-entry `RawConv
+/// => '$$self{MetaFormat} = $val'` makes a later entry's format overwrite the
+/// earlier (QuickTime.pm:9640-9648), so this walks ALL entries and keeps the
+/// LAST. A single entry (the universal real-world shape) resolves to itself.
+/// Returns the lossless 4-char string, or `None` when the box is too short /
+/// malformed.
+fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
+  let mut last: Option<String> = None;
+  for_each_stsd_entry(payload, |entry| {
+    if let Some(raw) = entry.get(4..8) {
+      last = Some(String::from_utf8_lossy(raw).into_owned());
+    }
+  });
   last
+}
+
+/// Faithful `Image::ExifTool::GetFixed32u` (ExifTool.pm:6139-6143): read a
+/// big-endian `int32u`, divide by `0x10000` (16.16 fixed-point), then round to
+/// 5 decimal places to "remove insignificant digits":
+/// `int((Get32u/0x10000) * 1e5 + 0.5) / 1e5`. Drives the `VisualSampleDesc`
+/// `XResolution`/`YResolution` and the `AudioSampleDesc` `AudioSampleRate`
+/// (all `Format => 'fixed32u'`). An integer-valued result (e.g. `72.0`,
+/// `48000.0`) stringifies bare per Perl `%.15g` — the typed layer stores the
+/// `f64` and the emission renders it through `TagValue::F64`.
+fn get_fixed32u(raw: u32) -> f64 {
+  let val = f64::from(raw) / 65536.0;
+  // Perl `int()` truncates toward zero; the value is non-negative here.
+  ((val * 1e5 + 0.5) as i64) as f64 / 1e5
+}
+
+/// Faithful `Image::ExifTool::GetFixed16s` (ExifTool.pm:6121-6125): read a
+/// big-endian `int16s`, divide by `0x100` (8.8 fixed-point), then round to 3
+/// decimal places: `int((Get16s/0x100) * 1000 + (val<0 ? -0.5 : 0.5)) / 1000`.
+/// Drives the `AudioHeader` `Balance` (`Format => 'fixed16s'`, QuickTime.pm:7350).
+fn get_fixed16s(raw: i16) -> f64 {
+  let val = f64::from(raw) / 256.0;
+  let bias = if val < 0.0 { -0.5 } else { 0.5 };
+  ((val * 1000.0 + bias) as i64) as f64 / 1000.0
+}
+
+/// Decode a `%QuickTime::Handler`-style `string` field that is "sometimes a
+/// Pascal string, and sometimes a C string" — the shared `RawConv` of
+/// `HandlerDescription` (QuickTime.pm:8457-8460) and `CompressorName`
+/// (QuickTime.pm:7642-7645). `raw` is the field bytes (already sliced from the
+/// field offset to the end of the box for `HandlerDescription`, or the first
+/// 32 bytes for `CompressorName`).
+///
+/// ExifTool reads the value as `Format => 'string'`, which TRUNCATES at the
+/// first NUL (ReadValue, ExifTool.pm:6310-6311) BEFORE the `RawConv` runs; the
+/// `RawConv` then strips a leading counted-string length byte when the first
+/// byte is a control char (`\0`-`\x1f`) AND its ordinal is strictly less than
+/// the (NUL-truncated) length: `$val = substr($val, 1, ord(first))`. An empty
+/// result is `undef` (`None`). A C string with no leading control byte passes
+/// through verbatim.
+fn decode_qt_handler_string(raw: &[u8]) -> Option<String> {
+  // `Format => 'string'`: truncate at the first NUL (the ExifTool ReadValue
+  // string semantics) BEFORE the Pascal/C-string RawConv. `nul <= raw.len()`,
+  // so the `.get(..nul)` never misses (the `?` fallback is unreachable).
+  let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+  let val = raw.get(..nul)?;
+  // RawConv: a leading `\0`-`\x1f` byte whose ordinal is < the NUL-truncated
+  // length marks a counted (Pascal) string — take `ord(first)` bytes from
+  // index 1; otherwise the value is a plain C string. `first < val.len()` ⇒
+  // `1 + first <= val.len()`, so the counted slice is always in range.
+  let bytes: &[u8] = match val.first() {
+    Some(&first) if first <= 0x1f && (first as usize) < val.len() => {
+      val.get(1..1 + first as usize).unwrap_or(val)
+    }
+    _ => val,
+  };
+  if bytes.is_empty() {
+    return None;
+  }
+  Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Read the `hdlr` HandlerVendorID (`%QuickTime::Handler` key 12, `undef[4]`,
+/// QuickTime.pm:8446-8451). `RawConv => '$val eq "\0\0\0\0" ? undef : $val'`
+/// ⇒ an all-zero vendor is `None`. The lossless 4-char string otherwise.
+fn decode_hdlr_vendor_id(payload: &[u8]) -> Option<String> {
+  let raw = payload.get(12..16)?;
+  if raw == [0, 0, 0, 0] {
+    return None;
+  }
+  Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// Read the `hdlr` HandlerDescription (`%QuickTime::Handler` key 24, `string`
+/// to end of box, QuickTime.pm:8453-8461) through the shared Pascal/C-string
+/// [`decode_qt_handler_string`].
+fn decode_hdlr_description(payload: &[u8]) -> Option<String> {
+  let raw = payload.get(24..)?;
+  decode_qt_handler_string(raw)
+}
+
+/// Decode ONE `stsd` sample-description entry's `vide`-track
+/// `%QuickTime::VisualSampleDesc` binary fields (QuickTime.pm:7585-7647,
+/// `ProcessHybrid` + `FORMAT => 'int16u'` ⇒ key `N` is byte `2*N`). Offsets are
+/// relative to the sample entry start (the `[size:4]` field), so CompressorID
+/// (key 2 ⇒ byte 4) IS the format 4cc. A field whose offset overruns the entry
+/// is left `None` (ExifTool stops at `$entry >= $size`). The caller folds every
+/// entry with [`VisualSampleDesc::merge_from`] (per-tag last-wins). Child atoms
+/// (`btrt`/`colr`/`pasp`/`avcC`/…) are NOT walked (Phase 2/3).
+fn decode_visual_sample_desc(entry: &[u8]) -> VisualSampleDesc {
+  let mut v = VisualSampleDesc::new();
+  // CompressorID (key 2 ⇒ byte 4, string[4]): the codec 4cc, verbatim. The
+  // `string[4]` would NUL-truncate, but a real 4cc has no NUL; keep the lossy
+  // 4 chars to mirror ExifTool's `Get*`-then-string read.
+  if let Some(raw) = entry.get(4..8) {
+    v.set_compressor_id(Some(String::from_utf8_lossy(raw).into_owned()));
+  }
+  // VendorID (key 10 ⇒ byte 20, string[4], RawConv `length $val ? $val :
+  // undef`): NUL-truncate then drop an empty (all-zero) value.
+  if let Some(raw) = entry.get(20..24) {
+    let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    if let Some(trimmed) = raw.get(..nul).filter(|t| !t.is_empty()) {
+      v.set_vendor_id(Some(String::from_utf8_lossy(trimmed).into_owned()));
+    }
+  }
+  // SourceImageWidth/Height (keys 16/17 ⇒ bytes 32/34, int16u).
+  v.set_source_image_width(be_u16(entry, 32));
+  v.set_source_image_height(be_u16(entry, 34));
+  // XResolution/YResolution (keys 18/20 ⇒ bytes 36/40, fixed32u).
+  v.set_x_resolution(be_u32(entry, 36).map(get_fixed32u));
+  v.set_y_resolution(be_u32(entry, 40).map(get_fixed32u));
+  // CompressorName (key 25 ⇒ byte 50, string[32]) through the Pascal/C-string
+  // RawConv (ExifTool reads 32 bytes then NUL-truncates; the helper takes the
+  // shorter of the slice and the NUL position).
+  if let Some(raw) = entry.get(50..) {
+    // `string[32]` reads at most 32 bytes; the shared decoder truncates at the
+    // first NUL within that window.
+    let field = raw.get(..32).unwrap_or(raw);
+    v.set_compressor_name(decode_qt_handler_string(field));
+  }
+  // BitDepth (key 41 ⇒ byte 82, int16u).
+  v.set_bit_depth(be_u16(entry, 82));
+  v
+}
+
+/// Decode ONE `stsd` sample-description entry's `soun`-track
+/// `%QuickTime::AudioSampleDesc` binary fields (QuickTime.pm:7498-7530,
+/// `ProcessHybrid`; the table has no explicit `FORMAT`, so the default `int8u`
+/// ⇒ key `N` is byte `N`). `AudioFormat` (key 4 ⇒ byte 4) is the codec 4cc.
+/// The caller folds every entry with [`AudioSampleDesc::merge_from`] (per-tag
+/// last-wins). Child atoms (`wave`/`chan`/`esds`/`btrt`/…) are NOT walked
+/// (Phase 2/3).
+fn decode_audio_sample_desc(entry: &[u8]) -> AudioSampleDesc {
+  let mut a = AudioSampleDesc::new();
+  // AudioFormat (key 4 ⇒ byte 4, undef[4]): RawConv stashes `$$self{AudioFormat}`
+  // and returns `undef` unless the 4cc matches `/^[\w ]{4}$/i`.
+  let mut fmt: Option<String> = None;
+  if let Some(raw) = entry.get(4..8) {
+    let is_word_space = raw
+      .iter()
+      .all(|&b| b == b' ' || b == b'_' || b.is_ascii_alphanumeric());
+    let code = String::from_utf8_lossy(raw).into_owned();
+    fmt = Some(code.clone());
+    if is_word_space {
+      a.set_audio_format(Some(code));
+    }
+  }
+  // AudioVendorID (key 20 ⇒ byte 20, undef[4], Condition `AudioFormat ne
+  // "mp4s"`, RawConv all-zero ⇒ undef): the shared `%vendorID` PrintConv.
+  if fmt.as_deref() != Some("mp4s")
+    && let Some(raw) = entry.get(20..24)
+    && raw != [0, 0, 0, 0]
+  {
+    a.set_vendor_id(Some(String::from_utf8_lossy(raw).into_owned()));
+  }
+  // AudioChannels (key 24 ⇒ byte 24, int16u), AudioBitsPerSample (key 26 ⇒ byte
+  // 26, int16u) — emitted even when zero (no RawConv).
+  a.set_channels(be_u16(entry, 24));
+  a.set_bits_per_sample(be_u16(entry, 26));
+  // AudioSampleRate (key 32 ⇒ byte 32, fixed32u).
+  a.set_sample_rate(be_u32(entry, 32).map(get_fixed32u));
+  a
 }
 
 /// Decode every `mvhd` inside one `moov` atom into `qt` (QuickTime.pm:660-
@@ -1924,26 +2132,97 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
             w,
             |inner, ibody, iw| match &inner.atom_type {
               b"mdhd" => decode_mdhd(ibody, &mut track),
+              // The `mdia/hdlr` Media handler (QuickTime.pm:7227 / 8391-8461):
+              // HandlerClass (offset 4), HandlerType (offset 8, the 4cc that sets
+              // `$$self{HandlerType}` and gates the `stsd` sample-desc Condition),
+              // HandlerVendorID (offset 12, all-zero ⇒ None) and HandlerDescription
+              // (offset 24 to end, the Pascal/C-string RawConv).
               b"hdlr" => {
                 if let Some(code) = decode_hdlr(ibody) {
                   track.set_handler_code(code);
                 }
                 track.set_handler_class(decode_hdlr_class(ibody));
+                track.set_handler_vendor_id(decode_hdlr_vendor_id(ibody));
+                track.set_handler_description(decode_hdlr_description(ibody));
               }
-              // `minf/stbl/stsd` carries the sample-description 4-byte format
-              // code (the `MetaFormat`). Descend two more levels and pull it onto
-              // the track so the emission can surface `Track<N>:MetaFormat` for a
-              // `meta`-handler timed-metadata track (QuickTime.pm:7765/7803).
+              // `minf` holds the audio media header (`smhd` Balance) and the
+              // sample table (`stbl/stsd`). The `stsd` first-entry format 4cc is
+              // pulled onto the track as `meta_format` (the shared `$$self{MetaFormat}`
+              // slot — surfaced as `Track<N>:MetaFormat` for a `meta` handler,
+              // `OtherFormat` for any other, QuickTime.pm:7765/7805); a `vide`/`soun`
+              // handler ALSO decodes the per-handler Visual/Audio sample-description
+              // binary fields (QuickTime.pm:7370-7405 `%SampleTable` stsd dispatch on
+              // `$$self{HandlerType}`). The handler 4cc is already on the track here
+              // (the `hdlr` precedes `minf` in file order), mirroring ExifTool's
+              // parse-order Condition.
               b"minf" => {
                 walk_atoms(depth + 2, ibody, 0, ibody.len(), iw, |m, mbody, mw| {
-                  if &m.atom_type == b"stbl" {
-                    walk_atoms(depth + 3, mbody, 0, mbody.len(), mw, |s, sbody, _sw| {
-                      if &s.atom_type == b"stsd"
-                        && let Some(fmt) = decode_stsd_meta_format(sbody)
-                      {
-                        track.set_meta_format(Some(fmt));
-                      }
-                    });
+                  match &m.atom_type {
+                    // `smhd` AudioHeader (QuickTime.pm:7299-7301, 7345-7351): Balance
+                    // at body offset 4 (key 2 ⇒ 2*int16u), `fixed16s`.
+                    b"smhd" => {
+                      track.set_audio_balance(be_i16(mbody, 4).map(get_fixed16s));
+                    }
+                    b"stbl" => {
+                      walk_atoms(depth + 3, mbody, 0, mbody.len(), mw, |s, sbody, _sw| {
+                        if &s.atom_type == b"stsd" {
+                          // Shared MetaFormat/OtherFormat 4cc (last-wins across
+                          // entries, the existing `meta`-handler path).
+                          if let Some(fmt) = decode_stsd_meta_format(sbody) {
+                            track.set_meta_format(Some(fmt));
+                          }
+                          // Per-handler sample-description: ExifTool
+                          // `ProcessSampleDesc` decodes EVERY entry and a later
+                          // entry's present tag overrides the earlier (a later
+                          // absent tag does NOT clear it — QuickTime.pm:9640-9648).
+                          // ExifTool's `ProcessMOV` ALSO dispatches every `stsd`
+                          // atom in the `trak` (file order) through the same
+                          // `ProcessSampleDesc`, so a later DUPLICATE `stsd` atom
+                          // (e.g. one carrying only a codec 4cc) overrides only its
+                          // present fields and leaves the earlier descriptor intact.
+                          // Seeding the per-atom fold from the track's CURRENT
+                          // descriptor makes the same Some-only `merge_from` the
+                          // uniform last-wins at BOTH levels — across the entries
+                          // of one `stsd` AND across the `stsd` atoms of the trak.
+                          // A trak normally has ONE `stsd`, so the seed is `None`
+                          // and the result is byte-identical to a fresh fold; only
+                          // the malformed/duplicate-`stsd` edge differs. The
+                          // `vide`/`soun` dispatch is the track's `hdlr` type
+                          // (invariant across entries and atoms), so it is checked
+                          // once.
+                          match track.handler_code() {
+                            Some("vide") => {
+                              let mut acc = track.visual_sample_desc().cloned();
+                              for_each_stsd_entry(sbody, |entry| {
+                                let v = decode_visual_sample_desc(entry);
+                                match &mut acc {
+                                  Some(a) => a.merge_from(v),
+                                  None => acc = Some(v),
+                                }
+                              });
+                              if acc.is_some() {
+                                track.set_visual_sample_desc(acc);
+                              }
+                            }
+                            Some("soun") => {
+                              let mut acc = track.audio_sample_desc().cloned();
+                              for_each_stsd_entry(sbody, |entry| {
+                                let a = decode_audio_sample_desc(entry);
+                                match &mut acc {
+                                  Some(prev) => prev.merge_from(a),
+                                  None => acc = Some(a),
+                                }
+                              });
+                              if acc.is_some() {
+                                track.set_audio_sample_desc(acc);
+                              }
+                            }
+                            _ => {}
+                          }
+                        }
+                      });
+                    }
+                    _ => {}
                   }
                 });
               }
@@ -2388,14 +2667,17 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
   walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
     match &atom.atom_type {
       // The `moov/meta` Metadata-handler `hdlr`: the SAME `%QuickTime::Handler`
-      // table as the trak hdlr (QuickTime.pm:2824 / 8391-8444). HandlerClass =
+      // table as the trak hdlr (QuickTime.pm:2824 / 8391-8461). HandlerClass =
       // body offset-4 ComponentType (all-zero ⇒ None via the RawConv); the
-      // HandlerType = subtype at body offset 8.
+      // HandlerType = subtype at body offset 8; HandlerVendorID = offset 12
+      // (all-zero ⇒ None); HandlerDescription = offset 24 to end (Pascal/C-string).
       b"hdlr" => {
         qt.set_meta_handler_class(decode_hdlr_class(body));
         if let Some(code) = decode_hdlr(body) {
           qt.set_meta_handler_type(Some(code));
         }
+        qt.set_meta_handler_vendor_id(decode_hdlr_vendor_id(body));
+        qt.set_meta_handler_description(decode_hdlr_description(body));
       }
       // A `keys` box REPLACES the active key list (see the multi-box note above).
       b"keys" => key_names = parse_keys_box(body),
@@ -4577,6 +4859,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // value threaded across the whole brand walk so a CMT3 sees the most-recent
   // preceding CMT1 `Model`, even one in an earlier Canon `uuid` atom.
   let mut canon_uuid_model: Option<smol_str::SmolStr> = None;
+  // #218 — one FILE-SCOPED HEIF `iloc` extent budget bounds the total
+  // materialized extents across EVERY `meta` box anywhere in the file (not
+  // per-`meta`, not per-`iloc`-box); `scan_quicktime_brands` threads this same
+  // `&mut` through its recursion and into every `walk_heif_meta`. Seeded at
+  // the canonical ceiling; never fires on a conforming file (see
+  // `MAX_ILOC_EXTENTS`).
+  let mut iloc_extents_remaining: u64 = crate::formats::quicktime_brands::MAX_ILOC_EXTENTS;
   crate::formats::quicktime_brands::scan_quicktime_brands(
     scan_data,
     0,
@@ -4585,6 +4874,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     &mut heif_meta,
     &mut cr3_meta,
     &mut canon_uuid_model,
+    &mut iloc_extents_remaining,
   );
 
   // SP4 — CR3 / CRM file-type override. Canon.pm:9667 `OverrideFileType
@@ -5488,6 +5778,44 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // HandlerVendorID (`hdlr` offset 12, QuickTime.pm:8446-8451): the shared
+      // `%vendorID` PrintConv (a hash miss ⇒ `Unknown ($val)`); `-n` emits the
+      // raw 4-char code. Only present when non-zero (the all-zero RawConv-undef
+      // branch is applied at decode). Right after HandlerType (the `%Handler`
+      // binary-table field order: offset 8 before 12).
+      if let Some(vid) = track.handler_vendor_id()
+        && first_seen(grp, "HandlerVendorID")
+      {
+        let value = if print_conv {
+          let printed = vendor_id_print(vid);
+          if printed.is_empty() {
+            TagValue::Str(std::format!("Unknown ({vid})").into())
+          } else {
+            TagValue::Str(printed.into())
+          }
+        } else {
+          TagValue::Str(vid.into())
+        };
+        tags.push(EmittedTag::new(
+          track_group(),
+          "HandlerVendorID".into(),
+          value,
+          false,
+        ));
+      }
+      // HandlerDescription (`hdlr` offset 24 to end, QuickTime.pm:8453-8461):
+      // the post Pascal/C-string RawConv value, mode-invariant (no PrintConv/
+      // ValueConv). In ALL the codec fixtures; right after HandlerVendorID.
+      if let Some(desc) = track.handler_description()
+        && first_seen(grp, "HandlerDescription")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "HandlerDescription".into(),
+          TagValue::Str(desc.into()),
+          false,
+        ));
+      }
       // MetaFormat (`stsd` 4cc): the `MetaSampleDesc` `MetaFormat` tag, emitted
       // ONLY for a `meta`-handler track (QuickTime.pm:7393 `Condition =>
       // '$$self{HandlerType} eq "meta"'`) — a `soun`/`vide`/`hint` track routes
@@ -5504,6 +5832,205 @@ impl crate::emit::Taggable for Meta<'_> {
         tags.push(EmittedTag::new(
           track_group(),
           "MetaFormat".into(),
+          TagValue::Str(fmt.into()),
+          false,
+        ));
+      }
+      // Balance (`minf/smhd` AudioHeader key 2 ⇒ byte 4, `fixed16s`,
+      // QuickTime.pm:7350): the rounded 8.8 fixed-point, emitted for an audio
+      // track with an `smhd` (`-n` and `-j` identical — ValueConv-shaped only).
+      // Positioned before the audio sample-description fields (the oracle order).
+      if let Some(bal) = track.audio_balance()
+        && first_seen(grp, "Balance")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "Balance".into(),
+          TagValue::F64(bal),
+          false,
+        ));
+      }
+      // VisualSampleDesc (`vide` handler, QuickTime.pm:7585-7647): CompressorID,
+      // VendorID, SourceImageWidth/Height, XResolution/YResolution, CompressorName,
+      // BitDepth. Emitted in the `%VisualSampleDesc` field order (the oracle order;
+      // the conformance gate is key-order-insensitive). `CompressorID`/`VendorID`/
+      // `CompressorName` are mode-invariant strings; the dimensions are bare ints;
+      // the resolutions are the rounded 16.16 fixed-point `f64` (an integer-valued
+      // DPI like `72.0` stringifies bare per `%.15g`). `VendorID` uses the shared
+      // `%vendorID` PrintConv.
+      if let Some(v) = track.visual_sample_desc() {
+        if let Some(cid) = v.compressor_id()
+          && first_seen(grp, "CompressorID")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "CompressorID".into(),
+            TagValue::Str(cid.into()),
+            false,
+          ));
+        }
+        if let Some(vid) = v.vendor_id()
+          && first_seen(grp, "VendorID")
+        {
+          let value = if print_conv {
+            let printed = vendor_id_print(vid);
+            if printed.is_empty() {
+              TagValue::Str(std::format!("Unknown ({vid})").into())
+            } else {
+              TagValue::Str(printed.into())
+            }
+          } else {
+            TagValue::Str(vid.into())
+          };
+          tags.push(EmittedTag::new(
+            track_group(),
+            "VendorID".into(),
+            value,
+            false,
+          ));
+        }
+        if let Some(w) = v.source_image_width()
+          && first_seen(grp, "SourceImageWidth")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "SourceImageWidth".into(),
+            TagValue::U64(u64::from(w)),
+            false,
+          ));
+        }
+        if let Some(h) = v.source_image_height()
+          && first_seen(grp, "SourceImageHeight")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "SourceImageHeight".into(),
+            TagValue::U64(u64::from(h)),
+            false,
+          ));
+        }
+        if let Some(x) = v.x_resolution()
+          && first_seen(grp, "XResolution")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "XResolution".into(),
+            TagValue::F64(x),
+            false,
+          ));
+        }
+        if let Some(y) = v.y_resolution()
+          && first_seen(grp, "YResolution")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "YResolution".into(),
+            TagValue::F64(y),
+            false,
+          ));
+        }
+        if let Some(name) = v.compressor_name()
+          && first_seen(grp, "CompressorName")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "CompressorName".into(),
+            TagValue::Str(name.into()),
+            false,
+          ));
+        }
+        if let Some(b) = v.bit_depth()
+          && first_seen(grp, "BitDepth")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "BitDepth".into(),
+            TagValue::U64(u64::from(b)),
+            false,
+          ));
+        }
+      }
+      // AudioSampleDesc (`soun` handler, QuickTime.pm:7498-7530): AudioFormat,
+      // AudioVendorID, AudioChannels, AudioBitsPerSample, AudioSampleRate. The
+      // 4cc/vendor are mode-invariant strings; channels/bits are bare ints
+      // (emitted even when zero); the sample rate is the rounded 16.16 fixed `f64`.
+      if let Some(a) = track.audio_sample_desc() {
+        if let Some(fmt) = a.audio_format()
+          && first_seen(grp, "AudioFormat")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioFormat".into(),
+            TagValue::Str(fmt.into()),
+            false,
+          ));
+        }
+        if let Some(vid) = a.vendor_id()
+          && first_seen(grp, "AudioVendorID")
+        {
+          let value = if print_conv {
+            let printed = vendor_id_print(vid);
+            if printed.is_empty() {
+              TagValue::Str(std::format!("Unknown ({vid})").into())
+            } else {
+              TagValue::Str(printed.into())
+            }
+          } else {
+            TagValue::Str(vid.into())
+          };
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioVendorID".into(),
+            value,
+            false,
+          ));
+        }
+        if let Some(c) = a.channels()
+          && first_seen(grp, "AudioChannels")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioChannels".into(),
+            TagValue::U64(u64::from(c)),
+            false,
+          ));
+        }
+        if let Some(b) = a.bits_per_sample()
+          && first_seen(grp, "AudioBitsPerSample")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioBitsPerSample".into(),
+            TagValue::U64(u64::from(b)),
+            false,
+          ));
+        }
+        if let Some(r) = a.sample_rate()
+          && first_seen(grp, "AudioSampleRate")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioSampleRate".into(),
+            TagValue::F64(r),
+            false,
+          ));
+        }
+      }
+      // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
+      // a handler that is NOT `vide`/`soun`/`meta`/`hint` (those route to their
+      // own sample-desc table). Shares the `meta_format` slot (ExifTool stores
+      // both in `$$self{MetaFormat}`); the raw 4-char code verbatim in both modes.
+      // E.g. a `tmcd` time-code track or a `text` track.
+      if let Some(fmt) = track.meta_format()
+        && !matches!(
+          track.handler_code(),
+          Some("vide" | "soun" | "meta" | "hint")
+        )
+        && first_seen(grp, "OtherFormat")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "OtherFormat".into(),
           TagValue::Str(fmt.into()),
           false,
         ));
@@ -6295,7 +6822,32 @@ impl crate::emit::Taggable for Meta<'_> {
           );
         }
         if g3 {
-          tags.append(&mut ctmd_scratch);
+          // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
+          // `ctmd_scratch` carry one doc. Collapse the within-sample `(family1,
+          // name)` duplicates HONORING `Priority => N` BEFORE appending: a later
+          // same-key row overrides the earlier ONLY when its priority is
+          // non-zero AND `>=` the stored one (`ExifTool.pm:9544-9560`), keeping
+          // the priority-winner at the EARLIER row's position. This is what
+          // makes the re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority =>
+          // 0`, emitted after the type-5 payload) NOT clobber this sample's
+          // `ExposureInfo` `FNumber` (`Priority => 1`) — matching bundled
+          // (`Doc<N>:Track<N>:FNumber` = the ExposureInfo value).
+          let mut g3_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+            std::vec::Vec::new();
+          for tag in ctmd_scratch.drain(..) {
+            let key = (
+              smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+              smol_str::SmolStr::new(tag.tag().name()),
+            );
+            if let Some(slot) = g3_vals.iter_mut().find(|(k, _)| *k == key) {
+              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+                slot.1 = tag;
+              }
+            } else {
+              g3_vals.push((key, tag));
+            }
+          }
+          tags.extend(g3_vals.into_iter().map(|(_, tag)| tag));
         } else {
           if cur_doc != Some(doc_n) {
             flush_doc(&mut doc_vals, &mut ctmd_committed, &mut tags);
@@ -6307,7 +6859,15 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              // Within-sample last-wins, HONORING `Priority => N`: a later
+              // same-`(family1, name)` row overrides the stored value ONLY when
+              // its priority is non-zero AND `>=` the stored one
+              // (`ExifTool.pm:9544-9560`). So the `ShotInfo` `Track<N>:FNumber`
+              // (`Priority => 0`) leaves the earlier `ExposureInfo` `FNumber`
+              // (`Priority => 1`) in place — the `-G1` half of the CTMD fix.
+              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -6610,6 +7170,36 @@ impl crate::emit::Taggable for Meta<'_> {
         TagValue::Str(code.into())
       };
       tags.push(EmittedTag::new(main(), "HandlerType".into(), value, false));
+    }
+    // The `moov/meta` HandlerVendorID (offset 12) + HandlerDescription (offset
+    // 24), the SAME `%QuickTime::Handler` table, group `QuickTime` (NOT a
+    // `Track<N>`). Field order: after HandlerType (offsets 12 / 24). VendorID
+    // uses the shared `%vendorID` PrintConv; HandlerDescription is mode-invariant.
+    if let Some(vid) = self.qt.meta_handler_vendor_id() {
+      let value = if print_conv {
+        let printed = vendor_id_print(vid);
+        if printed.is_empty() {
+          TagValue::Str(std::format!("Unknown ({vid})").into())
+        } else {
+          TagValue::Str(printed.into())
+        }
+      } else {
+        TagValue::Str(vid.into())
+      };
+      tags.push(EmittedTag::new(
+        main(),
+        "HandlerVendorID".into(),
+        value,
+        false,
+      ));
+    }
+    if let Some(desc) = self.qt.meta_handler_description() {
+      tags.push(EmittedTag::new(
+        main(),
+        "HandlerDescription".into(),
+        TagValue::Str(desc.into()),
+        false,
+      ));
     }
 
     // ── SP2: udta camera atoms (QuickTime.pm:1585-1900) ────────────────
@@ -10223,11 +10813,16 @@ fn emit_ctmd_exif_info(
       for e in emissions {
         // The engine's Unknown-suppression runs centrally; the caller's CTMD
         // scratch is appended into the engine sink, so carry the flag through.
-        out.push(EmittedTag::new(
+        // Carry the emission's `Priority => N` too (`0` for the `Canon::ShotInfo`
+        // `FNumber`/`ExposureTime`/`BaseISO` rows): a `Track<N>:FNumber` from the
+        // re-dispatched ShotInfo must NOT override this sample's earlier
+        // `ExposureInfo` `FNumber` (`ExifTool.pm:9544-9560`).
+        out.push(EmittedTag::new_with_priority(
           group.clone(),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
+          e.priority(),
         ));
       }
     }
@@ -18812,5 +19407,357 @@ mod tests {
     payload.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
     payload.extend_from_slice(b"rtmd");
     assert!(decode_stsd_meta_format(&payload).is_none());
+  }
+
+  // ── stsd multi-entry sample-description (ProcessSampleDesc per-tag last-wins) ──
+
+  /// Build a `vide` `%QuickTime::VisualSampleDesc` sample entry (entry-relative
+  /// offsets: 4=CompressorID, 32/34=SrcW/H, 36/40=X/YRes, 50=CompressorName
+  /// Pascal, 82=BitDepth). `len` lets a test craft a SHORT entry (a later short
+  /// entry must not clear earlier fields).
+  fn vide_entry(
+    comp_id: &[u8; 4],
+    w: u16,
+    h: u16,
+    comp_name: &[u8],
+    bit_depth: u16,
+    len: usize,
+  ) -> Vec<u8> {
+    let mut e = vec![0u8; len];
+    wr(&mut e, 0, &(len as u32).to_be_bytes());
+    wr(&mut e, 4, comp_id);
+    if len > 34 {
+      wr(&mut e, 32, &w.to_be_bytes());
+      wr(&mut e, 34, &h.to_be_bytes());
+    }
+    if len > 40 {
+      wr(&mut e, 36, &(72u32 << 16).to_be_bytes());
+      wr(&mut e, 40, &(72u32 << 16).to_be_bytes());
+    }
+    if len > 50 && !comp_name.is_empty() {
+      // Pascal string: count byte then the bytes (within the 32-byte field).
+      wr(&mut e, 50, &[comp_name.len() as u8]);
+      wr(&mut e, 51, comp_name);
+    }
+    if len > 82 {
+      wr(&mut e, 82, &bit_depth.to_be_bytes());
+    }
+    e
+  }
+
+  /// Build a `soun` `%QuickTime::AudioSampleDesc` sample entry (entry-relative
+  /// offsets: 4=AudioFormat, 24=Channels, 26=BitsPerSample, 32=SampleRate).
+  fn soun_entry(fmt: &[u8; 4], channels: u16, bits: u16, rate: u16, len: usize) -> Vec<u8> {
+    let mut e = vec![0u8; len];
+    wr(&mut e, 0, &(len as u32).to_be_bytes());
+    wr(&mut e, 4, fmt);
+    if len > 24 {
+      wr(&mut e, 24, &channels.to_be_bytes());
+    }
+    if len > 26 {
+      wr(&mut e, 26, &bits.to_be_bytes());
+    }
+    if len > 32 {
+      wr(&mut e, 32, &(u32::from(rate) << 16).to_be_bytes());
+    }
+    e
+  }
+
+  /// Wrap one or more sample entries into an `stsd` box body
+  /// (`[version/flags:4][count:4]` + entries).
+  fn stsd_box(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = vec![0u8; 8];
+    wr(&mut body, 4, &(entries.len() as u32).to_be_bytes());
+    for e in entries {
+      body.extend_from_slice(e);
+    }
+    atom(b"stsd", &body)
+  }
+
+  /// Build the `trak` PAYLOAD (a `mdia(mdhd, hdlr<handler>, minf(stbl(stsd)))`)
+  /// that [`walk_trak`] consumes directly — no header to strip.
+  fn trak_payload_with_stsd(handler: &[u8; 4], stsd: &[u8]) -> Vec<u8> {
+    trak_payload_with_stsds(handler, &[stsd.to_vec()])
+  }
+
+  /// Build the `trak` PAYLOAD with MULTIPLE `stsd` atoms inside the one `stbl`
+  /// (file order), exercising the cross-`stsd`-atom fold. Each `stsd` is already
+  /// a full `atom(b"stsd", ..)`.
+  fn trak_payload_with_stsds(handler: &[u8; 4], stsds: &[Vec<u8>]) -> Vec<u8> {
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, handler);
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &600u32.to_be_bytes()); // MediaTimeScale
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut stbl_body = Vec::new();
+    for stsd in stsds {
+      stbl_body.extend_from_slice(stsd);
+    }
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    atom(b"mdia", &mdia_body)
+  }
+
+  /// **Codex R1/F1.** `ProcessSampleDesc` decodes EVERY `stsd` entry and the
+  /// LAST entry's value wins per tag. A two-entry `vide` stsd whose entries
+  /// differ must report the SECOND entry's CompressorID / dimensions /
+  /// CompressorName / BitDepth. Ground-truth cross-checked against bundled
+  /// ExifTool 13.59 on the same bytes (entry1 `avc1`/100×100/`CompA`/24, entry2
+  /// `hvc1`/200×200/`CompB`/32) → `CompressorID hvc1`, `CompressorName CompB`,
+  /// `SourceImageWidth 200`, `SourceImageHeight 200`, `BitDepth 32`.
+  #[test]
+  fn walk_trak_vide_multi_entry_stsd_last_wins() {
+    let e1 = vide_entry(b"avc1", 100, 100, b"CompA", 24, 86);
+    let e2 = vide_entry(b"hvc1", 200, 200, b"CompB", 32, 86);
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    assert_eq!(v.compressor_id(), Some("hvc1"));
+    assert_eq!(v.compressor_name(), Some("CompB"));
+    assert_eq!(v.source_image_width(), Some(200));
+    assert_eq!(v.source_image_height(), Some(200));
+    assert_eq!(v.bit_depth(), Some(32));
+  }
+
+  /// **Codex R1/F1 (Some-only last-wins).** A later SHORT entry overrides only
+  /// the tags it actually carries; a field absent from the short entry keeps
+  /// the earlier entry's value (ExifTool never re-extracts an absent field, so
+  /// the FoundTag survives). Cross-checked against bundled ExifTool 13.59:
+  /// entry1 full `avc1`/100×100/`CompA`/24 + entry2 16-byte `hvc1` ⇒
+  /// `CompressorID hvc1` but `CompressorName CompA`, `SourceImageWidth 100`,
+  /// `BitDepth 24` (all retained from entry1).
+  #[test]
+  fn walk_trak_vide_multi_entry_short_second_keeps_prior() {
+    let e1 = vide_entry(b"avc1", 100, 100, b"CompA", 24, 86);
+    let e2 = vide_entry(b"hvc1", 0, 0, b"", 0, 16); // only [size][format]
+    let payload = trak_payload_with_stsd(b"vide", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    assert_eq!(v.compressor_id(), Some("hvc1"), "later present tag wins");
+    assert_eq!(v.compressor_name(), Some("CompA"), "absent tag keeps prior");
+    assert_eq!(v.source_image_width(), Some(100), "absent tag keeps prior");
+    assert_eq!(v.source_image_height(), Some(100), "absent tag keeps prior");
+    assert_eq!(v.bit_depth(), Some(24), "absent tag keeps prior");
+  }
+
+  /// **Codex R1/F1.** Two-entry `soun` stsd → the SECOND entry's audio fields
+  /// win. Cross-checked against bundled ExifTool 13.59: entry1 `mp4a`/2/16/44100
+  /// and entry2 `lpcm`/6/24/48000 ⇒ `AudioFormat lpcm`, `AudioChannels 6`,
+  /// `AudioBitsPerSample 24`, `AudioSampleRate 48000`.
+  #[test]
+  fn walk_trak_soun_multi_entry_stsd_last_wins() {
+    let e1 = soun_entry(b"mp4a", 2, 16, 44100, 36);
+    let e2 = soun_entry(b"lpcm", 6, 24, 48000, 36);
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(a.audio_format(), Some("lpcm"));
+    assert_eq!(a.channels(), Some(6));
+    assert_eq!(a.bits_per_sample(), Some(24));
+    assert_eq!(a.sample_rate(), Some(48000.0));
+  }
+
+  /// **Codex R1/F1 (soun Some-only).** A later short `soun` entry keeps the
+  /// earlier entry's absent fields; only its present AudioFormat wins.
+  #[test]
+  fn walk_trak_soun_multi_entry_short_second_keeps_prior() {
+    let e1 = soun_entry(b"mp4a", 2, 16, 44100, 36);
+    let e2 = soun_entry(b"lpcm", 0, 0, 0, 16); // only [size][format]
+    let payload = trak_payload_with_stsd(b"soun", &stsd_box(&[e1, e2]));
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(a.audio_format(), Some("lpcm"), "later present tag wins");
+    assert_eq!(a.channels(), Some(2), "absent tag keeps prior");
+    assert_eq!(a.bits_per_sample(), Some(16), "absent tag keeps prior");
+    assert_eq!(a.sample_rate(), Some(44100.0), "absent tag keeps prior");
+  }
+
+  /// **Codex R2 (cross-`stsd`-atom Some-only last-wins).** ExifTool's
+  /// `ProcessMOV` dispatches EVERY `stsd` atom of a `trak` (file order) through
+  /// `ProcessSampleDesc`, so a later DUPLICATE short `stsd` atom (codec 4cc
+  /// only) overrides only its present field and keeps the earlier atom's
+  /// width/height/CompressorName/BitDepth. Ground-truth cross-checked against
+  /// bundled ExifTool 13.59 on the crafted two-`stsd` `vide` trak (atom1 full
+  /// `avc1`/100×100/`CompA`/24, atom2 16-byte `hvc1`) →
+  /// `CompressorID hvc1`, `CompressorName CompA`, `SourceImageWidth 100`,
+  /// `SourceImageHeight 100`, `BitDepth 24`.
+  #[test]
+  fn walk_trak_vide_two_stsd_atoms_short_second_keeps_prior() {
+    let full = stsd_box(&[vide_entry(b"avc1", 100, 100, b"CompA", 24, 86)]);
+    let short = stsd_box(&[vide_entry(b"hvc1", 0, 0, b"", 0, 16)]); // codec 4cc only
+    let payload = trak_payload_with_stsds(b"vide", &[full, short]);
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    assert_eq!(
+      v.compressor_id(),
+      Some("hvc1"),
+      "later atom's present tag wins"
+    );
+    assert_eq!(
+      v.compressor_name(),
+      Some("CompA"),
+      "absent in later atom keeps prior"
+    );
+    assert_eq!(
+      v.source_image_width(),
+      Some(100),
+      "absent in later atom keeps prior"
+    );
+    assert_eq!(
+      v.source_image_height(),
+      Some(100),
+      "absent in later atom keeps prior"
+    );
+    assert_eq!(v.bit_depth(), Some(24), "absent in later atom keeps prior");
+  }
+
+  /// **Codex R2 (soun cross-`stsd`-atom Some-only).** A later short `soun`
+  /// `stsd` atom overrides only AudioFormat and keeps the earlier atom's
+  /// AudioChannels/AudioBitsPerSample/AudioSampleRate. Cross-checked against
+  /// bundled ExifTool 13.59 on the crafted two-`stsd` `soun` trak (atom1 full
+  /// `mp4a`/2/16/44100, atom2 16-byte `lpcm`) → `AudioFormat lpcm`,
+  /// `AudioChannels 2`, `AudioBitsPerSample 16`, `AudioSampleRate 44100`.
+  #[test]
+  fn walk_trak_soun_two_stsd_atoms_short_second_keeps_prior() {
+    let full = stsd_box(&[soun_entry(b"mp4a", 2, 16, 44100, 36)]);
+    let short = stsd_box(&[soun_entry(b"lpcm", 0, 0, 0, 16)]); // codec 4cc only
+    let payload = trak_payload_with_stsds(b"soun", &[full, short]);
+    let track = walk_trak(1, &payload, Some(600));
+    let a = track.audio_sample_desc().expect("soun sample desc");
+    assert_eq!(
+      a.audio_format(),
+      Some("lpcm"),
+      "later atom's present tag wins"
+    );
+    assert_eq!(a.channels(), Some(2), "absent in later atom keeps prior");
+    assert_eq!(
+      a.bits_per_sample(),
+      Some(16),
+      "absent in later atom keeps prior"
+    );
+    assert_eq!(
+      a.sample_rate(),
+      Some(44100.0),
+      "absent in later atom keeps prior"
+    );
+  }
+
+  // ── Pascal/C-string RawConv (HandlerDescription + CompressorName) ──
+
+  /// **Codex R1/F2.** The `%QuickTime::Handler` `HandlerDescription` /
+  /// `%QuickTime::VisualSampleDesc` `CompressorName` `RawConv` strips a leading
+  /// counted-string length byte ONLY when its ordinal is STRICTLY LESS than the
+  /// (NUL-truncated) value length — `... if $val=~/^([\0-\x1f])/ and
+  /// ord($1)<length($val)`. A count byte that is NOT < the length is NOT a
+  /// counted string: the value (INCLUDING the leading control byte) passes
+  /// through as a C string. The finding's premise (classify purely on the first
+  /// byte + clamp) would diverge from ExifTool. Every expectation below is the
+  /// raw byte output of bundled ExifTool 13.59 on the same `hdlr`
+  /// HandlerDescription bytes.
+  #[test]
+  fn decode_qt_handler_string_classifies_count_against_length() {
+    // count 5 but only 3 bytes follow ⇒ 5 < 4 is FALSE ⇒ C string `\x05abc`
+    // (ExifTool 13.59: raw `\x05abc`, the `-s` display shows `.abc`). NOT "abc".
+    assert_eq!(
+      decode_qt_handler_string(b"\x05abc").as_deref(),
+      Some("\u{5}abc"),
+      "short counted string (ord >= len) stays a C string with the control byte"
+    );
+    // count 4, value length 4 ⇒ 4 < 4 false ⇒ C string `\x04abc`.
+    assert_eq!(
+      decode_qt_handler_string(b"\x04abc").as_deref(),
+      Some("\u{4}abc")
+    );
+    // count 3, value length 4 ⇒ 3 < 4 true ⇒ counted ⇒ substr(1,3) = "abc".
+    assert_eq!(decode_qt_handler_string(b"\x03abc").as_deref(), Some("abc"));
+    // count 2 within a 5-byte value ⇒ 2 < 5 true ⇒ "ab".
+    assert_eq!(decode_qt_handler_string(b"\x02abcd").as_deref(), Some("ab"));
+    // NUL truncation runs BEFORE the RawConv: `\x03ab\0XYZ` ⇒ value `\x03ab`
+    // (len 3) ⇒ 3 < 3 false ⇒ C string `\x03ab`.
+    assert_eq!(
+      decode_qt_handler_string(b"\x03ab\0XYZ").as_deref(),
+      Some("\u{3}ab")
+    );
+    // `\x02ab\0` ⇒ value `\x02ab` (len 3) ⇒ 2 < 3 true ⇒ "ab".
+    assert_eq!(decode_qt_handler_string(b"\x02ab\0").as_deref(), Some("ab"));
+    // A leading NUL truncates the value to empty ⇒ undef (None).
+    assert_eq!(decode_qt_handler_string(b"\0abc"), None);
+    // Plain C string, no leading control byte ⇒ verbatim (NUL-truncated).
+    assert_eq!(
+      decode_qt_handler_string(b"Hello\0junk").as_deref(),
+      Some("Hello")
+    );
+  }
+
+  /// **Codex R1/F2 (hdlr end-to-end).** A `hdlr` whose HandlerDescription
+  /// (offset 24) is the short counted string `\x05abc` decodes to the C string
+  /// `\x05abc` on the track, matching bundled ExifTool 13.59 on the same file.
+  #[test]
+  fn walk_trak_hdlr_short_counted_description_matches_exiftool() {
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"mdir");
+    hdlr_body.extend_from_slice(b"\x05abc"); // HandlerDescription at offset 24
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mdhd = atom(b"mdhd", &[0u8; 24]);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    let mdia = atom(b"mdia", &mdia_body);
+    let track = walk_trak(1, &mdia, None);
+    assert_eq!(track.handler_description(), Some("\u{5}abc"));
+  }
+
+  /// **Codex R1/F2 (stsd CompressorName end-to-end).** A `vide` sample entry
+  /// whose CompressorName (offset 50) is the short counted string `\x05abc`
+  /// (count 5, only 3 bytes follow) keeps the leading control byte as a C
+  /// string — `CompressorName \x05abc`, matching bundled ExifTool 13.59. An
+  /// in-range count (`\x03abc`) clamps to "abc".
+  #[test]
+  fn decode_visual_sample_desc_short_counted_compressor_name() {
+    // CompressorName field = `\x05abc` (5 > 3 follow) ⇒ C string `\x05abc`.
+    let mut e = vide_entry(b"avc1", 320, 240, b"", 24, 86);
+    wr(&mut e, 50, b"\x05abc");
+    let v = decode_visual_sample_desc(&e);
+    assert_eq!(v.compressor_name(), Some("\u{5}abc"));
+
+    // CompressorName field = `\x03abc` (3 < 4) ⇒ counted ⇒ "abc".
+    let mut e2 = vide_entry(b"avc1", 320, 240, b"", 24, 86);
+    wr(&mut e2, 50, b"\x03abc");
+    let v2 = decode_visual_sample_desc(&e2);
+    assert_eq!(v2.compressor_name(), Some("abc"));
+  }
+
+  /// The merge folds entries with per-tag last-wins directly (the unit beneath
+  /// the call-site iteration): a later `None` does not clear a prior `Some`.
+  #[test]
+  fn visual_sample_desc_merge_from_is_some_only_last_wins() {
+    let mut acc = VisualSampleDesc::new();
+    acc.set_compressor_id(Some("avc1".into()));
+    acc.set_source_image_width(Some(100));
+    acc.set_bit_depth(Some(24));
+    let mut later = VisualSampleDesc::new();
+    later.set_compressor_id(Some("hvc1".into())); // present ⇒ overrides
+    // width/bit_depth left None ⇒ must NOT clear the prior values
+    acc.merge_from(later);
+    assert_eq!(acc.compressor_id(), Some("hvc1"));
+    assert_eq!(acc.source_image_width(), Some(100));
+    assert_eq!(acc.bit_depth(), Some(24));
+  }
+
+  #[test]
+  fn audio_sample_desc_merge_from_is_some_only_last_wins() {
+    let mut acc = AudioSampleDesc::new();
+    acc.set_audio_format(Some("mp4a".into()));
+    acc.set_channels(Some(2));
+    acc.set_sample_rate(Some(44100.0));
+    let mut later = AudioSampleDesc::new();
+    later.set_audio_format(Some("lpcm".into()));
+    acc.merge_from(later);
+    assert_eq!(acc.audio_format(), Some("lpcm"));
+    assert_eq!(acc.channels(), Some(2));
+    assert_eq!(acc.sample_rate(), Some(44100.0));
   }
 }

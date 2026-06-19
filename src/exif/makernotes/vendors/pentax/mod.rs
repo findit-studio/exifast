@@ -39,9 +39,18 @@
 //! EffectiveLV 0x002d, PictureMode 0x000b/0x0033, RawDevelopmentProcess
 //! 0x0062), the multi-element-array PrintConvs (FlashMode 0x000c,
 //! AutoBracketing 0x0018, DriveMode 0x0034), the encrypted ShutterCount
-//! (0x005d), the binary SubDirectory tables (CameraSettings 0x0205, AEInfo
-//! 0x0206, LensInfo 0x0207, FlashInfo 0x0208, CameraInfo 0x0215, BatteryInfo
-//! 0x0216, AFInfo 0x021f, …) and the `PreviewImage` binary placeholder.
+//! (0x005d), the still-deferred binary SubDirectory tables (LensInfo 0x0207,
+//! CameraInfo 0x0215, BatteryInfo 0x0216, AFInfo 0x021f, …) and the
+//! `PreviewImage` binary placeholder.
+//!
+//! ## Phase 2a (#262) — three binary SubDirectory tables
+//!
+//! [`subtables`] ports the K10D variant of `%Pentax::CameraSettings` (0x0205),
+//! `%Pentax::AEInfo` (0x0206) and `%Pentax::FlashInfo` (0x0208), each selected
+//! by its `$count` `Condition` (the scope-fence: a non-K10D record size falls
+//! through to the deferred variant and emits nothing). The capture loop in
+//! [`crate::exif::pentax_makernote_isolated`] dispatches them by the SubTable
+//! marker exactly as it does the `0x003f LensRec` child.
 //!
 //! ## D8 compliance
 //!
@@ -55,6 +64,7 @@ pub mod cities;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
+pub mod subtables;
 pub mod tags;
 
 use smol_str::SmolStr;
@@ -225,7 +235,15 @@ pub(crate) fn emit_lens_rec(
     // ValueConv: the default space-joined int8u[2] pair, e.g. `"3 44"`.
     crate::value::TagValue::Str(SmolStr::from(std::format!("{series} {model}")))
   };
-  emissions.push(super::VendorEmission::new("LensType".into(), value, false));
+  // `%Pentax::LensRec` `LensType` (pos 0) is `Priority => 0` (`Pentax.pm:4202`):
+  // a duplicate never overrides an earlier same-`(doc, family1, name)` tag
+  // (`ExifTool.pm:9544-9560`).
+  emissions.push(super::VendorEmission::new_with_priority(
+    "LensType".into(),
+    value,
+    false,
+    0,
+  ));
 }
 
 /// Populate the typed lens identity from the LensRec byte pair — the typed-slot

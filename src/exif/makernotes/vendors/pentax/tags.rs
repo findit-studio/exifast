@@ -6,7 +6,8 @@
 //!
 //! Phase 1 ports the cleanly-portable plain LEAF tags (scalar / enum-hash /
 //! simple-ValueConv) that the K10D `Pentax.jpg` fixture emits, PLUS the
-//! `0x003f LensRec` SubDirectory (the only sub-table needed for `LensType`).
+//! `0x003f LensRec` SubDirectory (`LensType`); Phase 2a adds the K10D variants
+//! of the `CameraSettings`/`AEInfo`/`FlashInfo` binary SubDirectory tables.
 //! Deferred to a follow-up (excluded from the conformance golden via `-x`):
 //! the model-/`$count`-/`$format`-CONDITIONAL leaves (FocusMode 0x000d,
 //! AFPointSelected 0x000e, AFPointsInFocus 0x000f/0x003c, ExposureCompensation
@@ -14,11 +15,22 @@
 //! RawDevelopmentProcess 0x0062), the multi-element-array PrintConvs
 //! (FlashMode 0x000c, AutoBracketing 0x0018, DriveMode 0x0034), the encrypted
 //! ShutterCount (0x005d), the `IsOffset => 2` preview pointer PreviewImageStart
-//! (0x0004, needs the offset-rebasing subsystem), and ALL the binary SubDirectory
-//! tables
-//! (CameraSettings 0x0205, AEInfo 0x0206, LensInfo 0x0207, FlashInfo 0x0208,
-//! CameraInfo 0x0215, BatteryInfo 0x0216, AFInfo 0x021f, WBLevels 0x022d,
+//! (0x0004, needs the offset-rebasing subsystem), and the still-deferred binary
+//! SubDirectory tables
+//! (BatteryInfo 0x0216, AFInfo 0x021f, WBLevels 0x022d,
 //! ShakeReductionInfo 0x005c, PrintIM 0x0e00, …).
+//!
+//! Phase 2a (#262) adds the K10D variants of three binary SubDirectory tables —
+//! `%Pentax::CameraSettings` (0x0205), `%Pentax::AEInfo` (0x0206) and
+//! `%Pentax::FlashInfo` (0x0208) — selected by their `$count` `Condition`s so a
+//! non-K10D record size falls through to the deferred `*Unknown`/variant tables
+//! and emits nothing (the scope-fence). Phase 2b (#262) adds the K10D
+//! `%Pentax::LensInfo2` (0x0207) with its nested `%Pentax::LensData` SubDirectory
+//! (the five lens-detail leaves), `$count`-gated the same way. Phase 2c (#262)
+//! adds the UNCONDITIONAL `%Pentax::CameraInfo` (0x0215) — a fixed `int32u`
+//! binary table emitting `ManufactureDate`, `ProductionCode` and
+//! `InternalSerialNumber` (its offset-0 `PentaxModelID` is owned by the Phase-1
+//! `0x0005` leaf and is not re-emitted).
 
 #![deny(clippy::indexing_slicing)]
 
@@ -54,6 +66,22 @@ impl PentaxTag {
     self.name
   }
 
+  /// The ExifTool `Priority => N` of this `%Pentax::Main` leaf — `0` for a
+  /// `Priority => 0` row (never overrides an earlier same-`(doc, family1, name)`
+  /// tag, `ExifTool.pm:9544-9560`), `1` (the default) otherwise. The two walked
+  /// `%Pentax::Main` `Priority => 0` rows are `0x0012 ExposureTime`
+  /// (`Pentax.pm:1474`) and `0x0013 FNumber` (`Pentax.pm:1484`). The
+  /// `Priority => 0` rows in walked SUB-tables (`LensRec` `LensType`,
+  /// `LensData` `LensFocalLength`) are marked at their own emit sites.
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_priority(&self) -> u8 {
+    match self.id {
+      0x0012 | 0x0013 => 0,
+      _ => 1,
+    }
+  }
+
   /// `true` when bundled marks the tag `Unknown => 1`.
   #[must_use]
   #[inline(always)]
@@ -70,8 +98,9 @@ impl PentaxTag {
 
   /// The tag's [`SubTable`] pointer, if it is a SubDirectory row. `None` for a
   /// plain leaf. The shared `Walker`'s Pentax capture loop descends a
-  /// `Some(SubTable::…)` entry (`LensRec` → the `LensType` leaf) and emits NO
-  /// parent value, mirroring the Nikon/Sony SubDirectory handling.
+  /// `Some(SubTable::…)` entry (`LensRec` → the `LensType` leaf;
+  /// `CameraSettings`/`AEInfo`/`FlashInfo` → their binary leaf records) and
+  /// emits NO parent value, mirroring the Nikon/Sony SubDirectory handling.
   #[must_use]
   #[inline(always)]
   pub const fn sub_table(&self) -> Option<SubTable> {
@@ -79,7 +108,7 @@ impl PentaxTag {
   }
 }
 
-/// Pentax Main SubDirectory targets ported in Phase 1.
+/// Pentax Main SubDirectory targets ported so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SubTable {
@@ -88,6 +117,45 @@ pub enum SubTable {
   /// pair resolved against `%pentaxLensTypes`. Phase 1 reads ONLY that field
   /// (the LensType leaf); the trailing `ExtenderStatus` byte is deferred.
   LensRec,
+  /// `%Pentax::CameraSettings` at `0x0205` (`Pentax.pm:2784-2799`,
+  /// `:3361-3768`) — a `ProcessBinaryData`/`BigEndian` record. The K10D
+  /// variant is selected by `Condition => '$count < 25'` (`Pentax.pm:2788`);
+  /// a `$count >= 25` (K-01) entry falls through to the deferred
+  /// `CameraSettingsUnknown` table and emits nothing. The K10D-offset-13+
+  /// fields are additionally `$$self{Model} =~ /(K10D|GX10)\b/`-gated.
+  CameraSettings,
+  /// `%Pentax::LensInfo2` at `0x0207` (`Pentax.pm:2821-2850`, `:4240-4271`) — a
+  /// `ProcessBinaryData`/`BigEndian` record (21+ bytes: `LensType` `int8u[4]`
+  /// at offset 0, then a NESTED `LensData` `undef[17]` SubDirectory at offset
+  /// 4). The K10D variant is selected by
+  /// `Condition => '$count != 90 and $count != 91 and $count != 80 and
+  /// $count != 128 and $count != 168'` (`Pentax.pm:2847`); a `$count` in
+  /// `{90,91,80,128,168}` falls through to the deferred
+  /// `LensInfo3`/`LensInfo4`/`LensInfo5` tables and emits nothing (the
+  /// scope-fence). Phase 2b emits ONLY the five nested `LensData` lens-detail
+  /// leaves; `LensType` is owned by the Phase-1 `0x003f LensRec` row and is NOT
+  /// re-emitted here (the `LensInfo2`-offset-0 `LensType` is skipped).
+  LensInfo,
+  /// `%Pentax::AEInfo` at `0x0206` (`Pentax.pm:2800-2820`, `:3778-3990`) — a
+  /// `ProcessBinaryData` record. The K10D variant is selected by
+  /// `Condition => '$count <= 25 and $count != 21'` (`Pentax.pm:2804`); the
+  /// `$count == 21` (AEInfo2/K-01), `$count == 48|64` (AEInfo3) and the
+  /// `$count == 34` (AEInfoUnknown/Q) variants are deferred and emit nothing.
+  AEInfo,
+  /// `%Pentax::FlashInfo` at `0x0208` (`Pentax.pm:2852-2862`, `:4580-4708`) —
+  /// a `ProcessBinaryData` record. The K10D variant is selected by
+  /// `Condition => '$count == 27'` (`Pentax.pm:2855`); any other `$count`
+  /// falls through to the deferred `FlashInfoUnknown` table and emits nothing.
+  FlashInfo,
+  /// `%Pentax::CameraInfo` at `0x0215` (`Pentax.pm:2940-2944`, `:4717-4754`) — a
+  /// fixed `ProcessBinaryData` record (`FORMAT => 'int32u'`, so element offset N
+  /// = byte 4N) in the inherited MakerNote (BigEndian) order. UNCONDITIONAL: the
+  /// Main row carries NO `Condition` / `$count` gate and NO model variant, so it
+  /// applies to every Pentax body. Phase 2c emits the three serviceable-data
+  /// scalars (offset 1 `ManufactureDate`, offset 2 `ProductionCode` `int32u[2]`,
+  /// offset 4 `InternalSerialNumber`); the offset-0 `PentaxModelID` is owned by
+  /// the Phase-1 `0x0005` Main leaf and is NOT re-emitted here.
+  CameraInfo,
 }
 
 /// The ported `%Pentax::Main` rows — sorted by `id` for binary search.
@@ -381,6 +449,38 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     format: None,
   },
   PentaxTag {
+    id: 0x0205,
+    name: "CameraSettings",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::CameraSettings),
+    unknown: false,
+    format: None,
+  },
+  PentaxTag {
+    id: 0x0206,
+    name: "AEInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::AEInfo),
+    unknown: false,
+    format: None,
+  },
+  PentaxTag {
+    id: 0x0207,
+    name: "LensInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::LensInfo),
+    unknown: false,
+    format: None,
+  },
+  PentaxTag {
+    id: 0x0208,
+    name: "FlashInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::FlashInfo),
+    unknown: false,
+    format: None,
+  },
+  PentaxTag {
     id: 0x0209,
     name: "AEMeteringSegments",
     conv: PentaxPrintConv::MeteringSegments,
@@ -468,6 +568,14 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  PentaxTag {
+    id: 0x0215,
+    name: "CameraInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::CameraInfo),
+    unknown: false,
+    format: None,
+  },
 ];
 
 /// Look up a `%Pentax::Main` tag by ID. Returns `None` for an unported /
@@ -514,7 +622,9 @@ pub fn format_override(id: u16) -> Option<Format> {
 /// `N * value_size` heap amplification a crafted MakerNote with the SubDirectory
 /// repeated across many entries would otherwise force. Mirrors
 /// [`nikon::is_implicit_undef_subdir`](super::super::nikon::is_implicit_undef_subdir);
-/// Phase 1 matches ONLY `0x003f LensRec` (the sole SubDirectory row).
+/// matches the implicit-`undef` SubDirectory rows `0x003f LensRec`, `0x0205`
+/// CameraSettings, `0x0206` AEInfo, `0x0207` LensInfo, `0x0208` FlashInfo and
+/// `0x0215` CameraInfo.
 #[must_use]
 pub fn is_implicit_undef_subdir(id: u16) -> bool {
   lookup(id).is_some_and(|tag| tag.format_override().is_none() && tag.sub_table().is_some())
