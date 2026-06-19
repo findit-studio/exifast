@@ -7480,7 +7480,11 @@ fn emit_entry<S: ExifSink>(
       if pentax_tag.sub_table().is_some() {
         return Ok(());
       }
-      emit_pentax_value(group1, name, raw, pentax_tag, print_conv, out)
+      // `make` is not threaded into the defensive `emit_entry` arm (no core-IFD
+      // walk produces a Pentax leaf — production routes through the isolated
+      // walker). A `None` Make is faithful for the Make-gated leaves when Make
+      // is absent.
+      emit_pentax_value(group1, entry, raw, pentax_tag, model, None, print_conv, out)
     }
     // `%Samsung::Type2` (#210). Like Sony/Panasonic/Pentax, the production
     // Samsung capture runs in the dedicated isolated walker
@@ -7582,15 +7586,52 @@ fn emit_apple_value<S: ExifSink>(
 /// row's `Unknown=>1` flag (`run_emission` drops it once, like the other
 /// vendors). The `0x003f LensRec` SubDirectory is descended in the capture loop
 /// ([`pentax::emit_lens_rec`]), never routed here.
+/// `entry`/`model`/`make` thread ExifTool's `$count` / `$$self{Model}` /
+/// `$$self{Make}` / on-disk `$format` so the count-/`Make`-/`Model`-/`$format`-
+/// CONDITIONED `%Pentax::Main` leaves select their branch faithfully. The shared
+/// [`PentaxPrintConv`] / [`FormatOverride`] decoder implements ONE variant per
+/// leaf (the one the K10D/K-x fixtures verify byte-exact), and
+/// [`tags::conditional_leaf`](makernotes::vendors::pentax::tags::conditional_leaf)
+/// — which matches EXHAUSTIVELY on the full #173 leaf set — suppresses every
+/// OTHER context so a non-matching record emits NOTHING (never the ported
+/// variant flattened onto a Make/Model/count/format it was not decoded for). The
+/// gated leaves are `0x000d` FocusMode (`Make !~ /^Asahi/`), `0x000e`
+/// AFPointSelected (Model + count), `0x0016` ExposureCompensation (`$count==1`),
+/// `0x001d` FocalLength (the ÷10 Optio list ⇒ suppress), `0x002d` EffectiveLV
+/// (on-disk `$format eq "int16u"`), `0x004d` FlashExposureComp (`$count==1`) and
+/// `0x0062` RawDevelopmentProcess (`Make =~ /^(PENTAX|RICOH)/`); every
+/// confirmed-unconditional leaf is `Emit`.
+// Threads the render context plus the `$count`/`$$self{Make}`/`$$self{Model}`/
+// on-disk-`$format` Condition inputs; the sibling `emit_nikon_value`/
+// `emit_sony_value`/`emit_panasonic_value` carry the same allow for the same
+// reason (the 1:1 mapping to `parse_in_tiff`'s leaf branch).
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "alloc")]
 fn emit_pentax_value<S: ExifSink>(
   group1: &str,
-  name: &str,
+  entry: &ExifEntry,
   raw: &RawValue,
   pentax_tag: &makernotes::vendors::pentax::tags::PentaxTag,
+  model: Option<&str>,
+  make: Option<&str>,
   print_conv: bool,
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
+  // Per-leaf `Condition` selection (the array-of-variants / single-`Condition`
+  // leaves). A `Suppress` outcome means the entry's
+  // `$count`/`$$self{Make}`/`$$self{Model}`/on-disk `$format` selects a DIFFERENT
+  // ExifTool variant than the ported decoder, so emit NOTHING.
+  if makernotes::vendors::pentax::tags::conditional_leaf(
+    entry.tag_id,
+    pentax_subdir_count(entry),
+    model,
+    make,
+    entry.on_disk_format(),
+  )
+  .is_suppressed()
+  {
+    return Ok(());
+  }
   let value = pentax_tag.conv.apply(raw, print_conv);
   // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x0012
   // ExposureTime` / `0x0013 FNumber` rows, `1` otherwise) so a `Priority => 0`
@@ -7599,7 +7640,7 @@ fn emit_pentax_value<S: ExifSink>(
   out.write_vendor_value_with_priority(
     "MakerNotes",
     group1,
-    name,
+    pentax_tag.name(),
     value,
     pentax_tag.is_unknown(),
     pentax_tag.tag_priority(),
@@ -9374,6 +9415,49 @@ fn pentax_subdir_count(entry: &ExifEntry) -> usize {
   }
 }
 
+/// `Image::ExifTool::Pentax::CryptShutterCount` (`Pentax.pm:6860-6870`) — decrypt
+/// the `0x005d ShutterCount` `undef[4]` value with the saved `PentaxDate`
+/// (`0x0006`, `undef[4]`) and `PentaxTime` (`0x0007`, `undef[3]`) RAW bytes:
+///
+/// ```text
+/// return undef unless PentaxDate and PentaxTime and len(Date)==4 and len(Time)>=3;
+/// $date = unpack('N', PentaxDate);          # BigEndian int32u of the 4 date bytes
+/// $time = unpack('N', PentaxTime . "\0");   # BigEndian int32u of Time + a null byte
+/// return $val ^ $date ^ (0xffffffff - $time);
+/// ```
+///
+/// `$val` is the BigEndian `int32u` the RawConv read from the 4 shutter bytes
+/// (`unpack("N",$val)`). Returns `None` (ExifTool's `undef`) when Date/Time are
+/// absent or the shutter block is not exactly 4 bytes — then NO ShutterCount is
+/// emitted. All arithmetic is exact `u32` (the XOR cipher is fully portable; no
+/// floating point, no model gate).
+#[cfg(feature = "alloc")]
+fn pentax_decrypt_shutter_count(
+  shutter: &[u8],
+  date: Option<&[u8]>,
+  time: Option<&[u8]>,
+) -> Option<u32> {
+  // `length($val) == 4 ? unpack("N",$val) : undef` (the RawConv).
+  let &[s0, s1, s2, s3] = shutter else {
+    return None;
+  };
+  let val = u32::from_be_bytes([s0, s1, s2, s3]);
+  // `return undef unless ... length(Date)==4 and length(Time)>=3`.
+  let &[d0, d1, d2, d3] = date? else {
+    return None;
+  };
+  let time = time?;
+  let (Some(&t0), Some(&t1), Some(&t2)) = (time.first(), time.get(1), time.get(2)) else {
+    return None;
+  };
+  let date_n = u32::from_be_bytes([d0, d1, d2, d3]);
+  // `unpack('N', PentaxTime . "\0")` — the 3 time bytes + a trailing null byte.
+  let time_n = u32::from_be_bytes([t0, t1, t2, 0]);
+  // `$val ^ $date ^ (0xffffffff - $time)` (wrapping is irrelevant: `0xffffffff -
+  // time` never underflows for a u32 `time`).
+  Some(val ^ date_n ^ (0xffff_ffff - time_n))
+}
+
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::exif) fn pentax_makernote_isolated(
@@ -9504,6 +9588,30 @@ pub(in crate::exif) fn pentax_makernote_isolated(
   let g1 = vendor_group1_of(TableRef::Pentax).unwrap_or("Pentax");
   let mut emissions = std::vec::Vec::new();
   let mut typed = MakerNotesPentax::new();
+  // Pre-scan for the `0x0006 Date` (`undef[4]`) and `0x0007 Time` (`undef[3]`)
+  // RAW value bytes — ExifTool's `DataMember`/`RawConv` saves these as
+  // `$$self{PentaxDate}` / `$$self{PentaxTime}` in a first pass
+  // (`Pentax.pm:976-996`) so the LATER `0x005d ShutterCount` ValueConv
+  // (`CryptShutterCount`, `Pentax.pm:6860-6870`) can decrypt with them,
+  // independent of IFD entry order. A FRESH scan over the just-walked entries
+  // mirrors that DataMember pre-pass.
+  let mut pentax_date_bytes: Option<std::vec::Vec<u8>> = None;
+  let mut pentax_time_bytes: Option<std::vec::Vec<u8>> = None;
+  for entry in &w.entries {
+    match entry.tag_id {
+      0x0006 => {
+        if let RawValue::Bytes(b) = entry.value.raw() {
+          pentax_date_bytes = Some(b.clone());
+        }
+      }
+      0x0007 => {
+        if let RawValue::Bytes(b) = entry.value.raw() {
+          pentax_time_bytes = Some(b.clone());
+        }
+      }
+      _ => {}
+    }
+  }
   {
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
@@ -9580,16 +9688,75 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           SubTable::CameraInfo => {
             pentax::subtables::emit_camera_info(block, print_conv, &mut *sink.emissions);
           }
+          // `%Pentax::SRInfo` (0x005c) — the `$count == 4` variant gate
+          // (`Pentax.pm:2260`); a 2-byte K-3 record (`SRInfo2`) emits nothing
+          // (the scope-fence). #173.
+          SubTable::SrInfo => {
+            let count = pentax_subdir_count(entry);
+            pentax::subtables::emit_sr_info(block, count, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::BatteryInfo` (0x0216) — UNCONDITIONAL (BigEndian); its
+          // leaves are `$$self{Model}`-gated, so the threaded `model` selects the
+          // K10D-applicable PowerSource / battery-state / A/D leaves. #173.
+          SubTable::BatteryInfo => {
+            pentax::subtables::emit_battery_info(block, model, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::AFInfo` (0x021f) — the Main row is UNCONDITIONAL (BigEndian
+          // for the int16u/int16s leaves), but `0x0b AFPointsInFocus` is
+          // `$$self{Model}`-gated (excluded for K-1/K-3/K-70/KP/K-S1/S2), so the
+          // threaded `model` selects it. Emits AFPredictor/AFDefocus/
+          // AFIntegrationTime/AFPointsInFocus; the `Unknown => 1` AFPointsUnknown1/2
+          // are suppressed. #173.
+          SubTable::AfInfo => {
+            pentax::subtables::emit_af_info(block, model, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::ColorInfo` (0x0222) — UNCONDITIONAL (`FORMAT => 'int8s'`).
+          // Emits WBShiftAB / WBShiftGM. #173.
+          SubTable::ColorInfo => {
+            pentax::subtables::emit_color_info(block, print_conv, &mut *sink.emissions);
+          }
+        }
+        continue;
+      }
+      // `0x005d ShutterCount` (`Pentax.pm:2268-2291`) — the encrypted leaf. The
+      // RawConv reads a BigEndian `int32u` from the 4 raw bytes
+      // (`unpack("N",$val)`); the ValueConv (`CryptShutterCount`) XOR-decrypts it
+      // with the saved `PentaxDate`/`PentaxTime` value bytes:
+      // `$val ^ unpack('N',$date) ^ (0xffffffff - unpack('N',$time . "\0"))`.
+      // There is NO PrintConv ⇒ the decrypted integer is emitted for BOTH `-j`
+      // and `-n`. A record missing Date/Time (or not 4 bytes) emits NOTHING
+      // (`return undef`), matching ExifTool's `defined $val` gate. The conv is
+      // handled HERE (not via `PentaxPrintConv`) because it needs the cross-tag
+      // Date/Time DataMembers, not just the entry's own value.
+      if entry.tag_id == 0x005d {
+        if let RawValue::Bytes(shutter) = entry.value.raw() {
+          if let Some(count) = pentax_decrypt_shutter_count(
+            shutter,
+            pentax_date_bytes.as_deref(),
+            pentax_time_bytes.as_deref(),
+          ) {
+            let _ = sink.write_vendor_value_with_priority(
+              "MakerNotes",
+              g1,
+              "ShutterCount",
+              crate::value::TagValue::U64(u64::from(count)),
+              false,
+              1,
+            );
+          }
         }
         continue;
       }
       // Leaf tag — the plain Pentax `PrintConv` renderer + the gate-passing typed
-      // populate.
+      // populate. `entry`/`model` thread ExifTool's `$count`/`$$self{Model}` for
+      // the count-/model-CONDITIONED leaves' branch selection (#173).
       let Ok(()) = emit_pentax_value(
         g1,
-        entry.name(),
+        entry,
         entry.value.raw(),
         pentax_tag,
+        model,
+        make,
         print_conv,
         &mut sink,
       );
@@ -15731,6 +15898,41 @@ mod tests {
     assert_eq!(
       w.value_offset_base, 0,
       "value_offset_base restored to its prior value after the negative-FixBase sub-walk"
+    );
+  }
+
+  /// `CryptShutterCount` (`Pentax.pm:6860-6870`) decrypts the K10D `Pentax.jpg`
+  /// `0x005d ShutterCount` raw bytes `f4 26 ed 8d` with the saved Date
+  /// (`07 d8 03 02` = "2008:03:02") and Time (`0c 01 17` = "12:01:23") DataMember
+  /// bytes to the plaintext shutter count 1648 (verified against `exiftool -j`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn pentax_shutter_count_decrypts_to_1648() {
+    let shutter = [0xf4u8, 0x26, 0xed, 0x8d];
+    let date = [0x07u8, 0xd8, 0x03, 0x02];
+    let time = [0x0cu8, 0x01, 0x17];
+    assert_eq!(
+      super::pentax_decrypt_shutter_count(&shutter, Some(&date), Some(&time)),
+      Some(1648)
+    );
+    // Missing Date/Time ⇒ undef (no emission), matching ExifTool's guard.
+    assert_eq!(
+      super::pentax_decrypt_shutter_count(&shutter, None, Some(&time)),
+      None
+    );
+    assert_eq!(
+      super::pentax_decrypt_shutter_count(&shutter, Some(&date), None),
+      None
+    );
+    // A non-4-byte shutter block ⇒ undef (the RawConv `length($val) == 4` gate).
+    assert_eq!(
+      super::pentax_decrypt_shutter_count(&shutter[..3], Some(&date), Some(&time)),
+      None
+    );
+    // A short Time block (< 3 bytes) ⇒ undef.
+    assert_eq!(
+      super::pentax_decrypt_shutter_count(&shutter, Some(&date), Some(&time[..2])),
+      None
     );
   }
 

@@ -366,21 +366,21 @@ fn lens_info2_k10d_print_conv_byte_exact() {
   assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
   assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
   assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
-  // ONLY the five LensData leaves — LensType (offset 0-3) is NOT re-emitted here
-  // (Phase 1's 0x003f LensRec owns it), and the deferred LensData leaves
-  // (AutoAperture, MinAperture, FocusRangeIndex, MaxAperture) are NOT emitted.
+  // The four #173 LensData leaves now emit (verified against `exiftool -G1 -j
+  // Pentax.jpg`).
+  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
+  assert_eq!(find(&em, "MinAperture"), Some(&s("22")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+  // LensType (offset 0-3) is NOT re-emitted here (Phase 1's 0x003f LensRec owns it).
   assert!(
     find(&em, "LensType").is_none(),
     "LensType is owned by 0x003f, not 0x0207"
   );
-  assert!(find(&em, "AutoAperture").is_none());
-  assert!(find(&em, "MinAperture").is_none());
-  assert!(find(&em, "FocusRangeIndex").is_none());
-  assert!(find(&em, "MaxAperture").is_none());
   assert_eq!(
     em.len(),
-    5,
-    "LensInfo2 emits exactly the 5 ported LensData leaves"
+    9,
+    "LensInfo2 emits the nine ported LensData leaves"
   );
 }
 
@@ -434,7 +434,9 @@ fn lens_info2_focal_length_645z_gate() {
   // The other leaves are unaffected.
   assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
   assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(em.len(), 4, "645Z drops only LensFocalLength");
+  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
+  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+  assert_eq!(em.len(), 8, "645Z drops only LensFocalLength");
 }
 
 #[test]
@@ -562,18 +564,20 @@ fn lens_info_k100d_not_old_format_falls_through_to_lensinfo2() {
   block[20] = 0x01;
   let mut em = Vec::new();
   emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
-  // Decodes through LensInfo2 — the same five leaves as the K10D path. Byte 20 is
-  // not read by any of the five ported leaves (they live at LensData offsets
-  // 0/3/9/10 = block 4/7/13/14), so the values match the K10D fixture exactly.
+  // Decodes through LensInfo2 — the same nine leaves as the K10D path. Byte 20
+  // (LensData offset 16) is not read by any ported leaf (they live at LensData
+  // offsets 0/3/9/10/14), so the values match the K10D fixture exactly.
   assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
   assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
   assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
   assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
   assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
   assert_eq!(
     em.len(),
-    5,
-    "a non-old-format K100D decodes through LensInfo2 (5 leaves)"
+    9,
+    "a non-old-format K100D decodes through LensInfo2 (9 leaves)"
   );
 }
 
@@ -768,4 +772,334 @@ fn lens_data_focal_length_is_priority_zero() {
     "LensData LensFocalLength Priority=>0"
   );
   assert_eq!(prio("LensFStops"), Some(1));
+}
+
+/// The verbatim K10D `SRInfo` (0x005c) block (`exiftool -v3`: 4 bytes).
+const SRINFO_K10D: &[u8] = &[0x01, 0x01, 0x5c, 0x14];
+
+/// The verbatim K10D `BatteryInfo` (0x0216) block (6 bytes, BigEndian).
+const BATTERYINFO_K10D: &[u8] = &[0x02, 0x41, 0xad, 0xa8, 0x05, 0x01];
+
+/// The verbatim K10D `AFInfo` (0x021f) block (12 bytes, BigEndian).
+const AFINFO_K10D: &[u8] = &[
+  0x00, 0x20, 0x60, 0x20, 0x00, 0x04, 0x02, 0x00, 0x1f, 0x1f, 0x0d, 0x05,
+];
+
+/// The verbatim K10D `ColorInfo` (0x0222) block (18 bytes, `FORMAT => 'int8s'`).
+const COLORINFO_K10D: &[u8] = &[
+  0x20, 0x83, 0x1f, 0x64, 0x1f, 0x7d, 0x20, 0x9c, 0x21, 0x48, 0x20, 0xf6, 0x1f, 0x33, 0x1f, 0x0a,
+  0x00, 0x00,
+];
+
+#[test]
+fn sr_info_k10d_byte_exact() {
+  // -j — verified against `exiftool -G1 -j Pentax.jpg`.
+  let mut em = Vec::new();
+  emit_sr_info(SRINFO_K10D, 4, true, &mut em);
+  assert_eq!(find(&em, "SRResult"), Some(&s("Stabilized")));
+  assert_eq!(find(&em, "ShakeReduction"), Some(&s("On")));
+  assert_eq!(find(&em, "SRHalfPressTime"), Some(&s("1.53 s")));
+  assert_eq!(find(&em, "SRFocalLength"), Some(&s("10 mm")));
+  assert_eq!(em.len(), 4);
+  // -n — the post-ValueConv values.
+  let mut emn = Vec::new();
+  emit_sr_info(SRINFO_K10D, 4, false, &mut emn);
+  assert_eq!(find(&emn, "SRResult"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&emn, "ShakeReduction"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&emn, "SRFocalLength"), Some(&TagValue::F64(10.0)));
+}
+
+#[test]
+fn sr_info_count_not_4_is_scope_fenced() {
+  // A `$count != 4` record (the 2-byte K-3 SRInfo2 variant) emits nothing.
+  let mut em = Vec::new();
+  emit_sr_info(SRINFO_K10D, 2, true, &mut em);
+  assert!(em.is_empty());
+}
+
+#[test]
+fn battery_info_k10d_byte_exact() {
+  // -j — verified against `exiftool -G1 -j Pentax.jpg`.
+  let mut em = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K10D"), true, &mut em);
+  assert_eq!(find(&em, "PowerSource"), Some(&s("Body Battery")));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(&s("Full")));
+  assert_eq!(find(&em, "GripBatteryState"), Some(&s("Empty or Missing")));
+  assert_eq!(
+    find(&em, "BodyBatteryADNoLoad"),
+    Some(&s("173 (7.6V, 51%)"))
+  );
+  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(&s("168 (7.4V, 47%)")));
+  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(&TagValue::I64(5)));
+  assert_eq!(find(&em, "GripBatteryADLoad"), Some(&TagValue::I64(1)));
+  assert_eq!(em.len(), 7);
+}
+
+#[test]
+fn af_info_k10d_byte_exact() {
+  // -j — BigEndian; verified against `exiftool -G1 -j Pentax.jpg`. The two
+  // `Unknown => 1` AFPointsUnknown1/2 are suppressed.
+  let mut em = Vec::new();
+  emit_af_info(AFINFO_K10D, Some("PENTAX K10D"), true, &mut em);
+  assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
+  assert_eq!(find(&em, "AFDefocus"), Some(&TagValue::I64(2)));
+  assert_eq!(find(&em, "AFIntegrationTime"), Some(&s("0 ms")));
+  assert_eq!(
+    find(&em, "AFPointsInFocus"),
+    Some(&s("Center (horizontal)"))
+  );
+  assert!(find(&em, "AFPointsUnknown1").is_none());
+  assert!(find(&em, "AFPointsUnknown2").is_none());
+  assert_eq!(em.len(), 4);
+}
+
+#[test]
+fn color_info_k10d_byte_exact() {
+  // -j — `FORMAT => 'int8s'`; both WB shifts are 0 in Pentax.jpg.
+  let mut em = Vec::new();
+  emit_color_info(COLORINFO_K10D, true, &mut em);
+  assert_eq!(find(&em, "WBShiftAB"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "WBShiftGM"), Some(&TagValue::I64(0)));
+  assert_eq!(em.len(), 2);
+  // A signed value reads as int8s (e.g. byte 0xff => -1).
+  let mut signed = COLORINFO_K10D.to_vec();
+  signed[16] = 0xff;
+  let mut em2 = Vec::new();
+  emit_color_info(&signed, true, &mut em2);
+  assert_eq!(find(&em2, "WBShiftAB"), Some(&TagValue::I64(-1)));
+}
+
+// ---------------------------------------------------------------------------
+// #173 branch-selection regression tests: a non-K10D model must NEVER receive
+// the K10D BatteryInfo byte-layout / the model-excluded AFPointsInFocus hash.
+// The invariant: a leaf emits ONLY for the exact `$$self{Model}` its ExifTool
+// variant carries; any other model emits nothing at that offset (the
+// scope-fence), never a wrong value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn battery_info_kx_does_not_emit_k10d_ad_layout() {
+  // The K-x is NOT in any BatteryInfo `BodyBatteryAD*`/`GripBatteryAD*` model
+  // regex (offsets 2/3/4 are the int16u `BodyBatteryVoltage1`/`2` for the K-x —
+  // a DIFFERENT tag/format the port defers). With the SAME bytes a non-gated
+  // decoder WOULD invent `BodyBatteryADNoLoad = 173 (...)`; the gate suppresses
+  // every K10D-only AD leaf so none of them appears.
+  let mut em = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K-x"), true, &mut em);
+  for wrong in [
+    "BodyBatteryADNoLoad",
+    "BodyBatteryADLoad",
+    "GripBatteryADNoLoad",
+    "GripBatteryADLoad",
+    "GripBatteryState",
+  ] {
+    assert!(
+      find(&em, wrong).is_none(),
+      "K-x must not emit the K10D leaf {wrong}"
+    );
+  }
+  // PowerSource IS emitted for the K-x (its `Model !~ /K-3 Mark III/` gate
+  // holds); BodyBatteryState variant A does NOT match the K-x ⇒ suppressed.
+  assert!(find(&em, "PowerSource").is_some());
+  assert!(find(&em, "BodyBatteryState").is_none());
+}
+
+#[test]
+fn battery_info_k3iii_suppresses_powersource_variant() {
+  // For the K-3 Mark III the non-K-3III `PowerSource` hash (and the whole K10D
+  // AD layout) must NOT emit — the K-3III re-layout is deferred, so the record
+  // yields none of the ported leaves rather than the wrong-hash PowerSource.
+  let mut em = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K-3 Mark III"), true, &mut em);
+  assert!(find(&em, "PowerSource").is_none());
+  assert!(em.is_empty());
+}
+
+#[test]
+fn battery_info_istd_uses_raw_ad_variant() {
+  // The *istD takes the raw-int `BodyBatteryAD*` variant (B) — NO `%d (%.1fV..)`
+  // PrintConv — and the *ist `GripBatteryADNoLoad`/`ADLoad` raw leaves, but NOT
+  // the K10D/K20D-only `GripBatteryState`. This proves a DIFFERENT-but-faithful
+  // variant is selected (not the K10D PrintConv form).
+  let mut em = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX *ist D"), true, &mut em);
+  assert_eq!(find(&em, "BodyBatteryADNoLoad"), Some(&TagValue::I64(173)));
+  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(&TagValue::I64(168)));
+  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(&TagValue::I64(5)));
+  assert_eq!(find(&em, "GripBatteryADLoad"), Some(&TagValue::I64(1)));
+  assert!(find(&em, "GripBatteryState").is_none());
+  // A `None` model (defensive — production always threads IFD0's Model) matches
+  // ExifTool's `$$self{Model} !~ /K-3 Mark III/` on an undef Model = TRUE, so
+  // the model-INDEPENDENT non-K-3III PowerSource hash emits; but every leaf
+  // GATED on a positive model regex (the K10D-byte `BodyBatteryAD*` etc.)
+  // stays suppressed — never a wrong value.
+  let mut emn = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, None, true, &mut emn);
+  assert!(find(&emn, "PowerSource").is_some());
+  assert!(find(&emn, "BodyBatteryADNoLoad").is_none());
+  assert!(find(&emn, "BodyBatteryADLoad").is_none());
+  assert!(find(&emn, "GripBatteryADNoLoad").is_none());
+  assert!(find(&emn, "GripBatteryADLoad").is_none());
+  assert!(find(&emn, "BodyBatteryState").is_none());
+  assert!(find(&emn, "GripBatteryState").is_none());
+}
+
+#[test]
+fn af_info_excluded_models_drop_af_points_in_focus() {
+  // The K-3 (and K-1/K-70/KP/K-S1/K-S2) are EXCLUDED from `0x0b AFPointsInFocus`
+  // — those records have no such tag, so the gate must emit nothing there even
+  // though the same byte yields "Center (horizontal)" for the K10D.
+  for excluded in [
+    "PENTAX K-1",
+    "PENTAX K-3",
+    "PENTAX K-3 Mark III",
+    "PENTAX K-70",
+    "PENTAX KP",
+    "RICOH K-S1",
+    "PENTAX K-S2",
+  ] {
+    let mut em = Vec::new();
+    emit_af_info(AFINFO_K10D, Some(excluded), true, &mut em);
+    assert!(
+      find(&em, "AFPointsInFocus").is_none(),
+      "{excluded} must not emit AFPointsInFocus"
+    );
+    // The unconditional AF leaves still emit (only 0x0b is gated).
+    assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
+  }
+  // A non-excluded model (e.g. the K-5) keeps AFPointsInFocus.
+  let mut em = Vec::new();
+  emit_af_info(AFINFO_K10D, Some("PENTAX K-5"), true, &mut em);
+  assert_eq!(
+    find(&em, "AFPointsInFocus"),
+    Some(&s("Center (horizontal)"))
+  );
+}
+
+// ---------------------------------------------------------------------------
+// #173 ROUND-5 STRUCTURAL GATE-SUPPRESSION TESTS.
+//
+// Each #173 LensData leaf and each sub-table leaf carries an ExifTool
+// `Condition`. The invariant: every gate must be ACTUALLY CHECKED IN CODE (not
+// comment-only) — a leaf emits ONLY for the faithfully-decoded context its
+// `Condition` selects, and SUPPRESSES (emits nothing) otherwise. These tests
+// feed each gate a NON-verified context and assert zero emission for that leaf,
+// so a comment-only gate (one that documents the `Condition` but never branches)
+// would FAIL here. (Verified to fail if the MaxAperture `model != Some("K-5")`
+// check is reverted.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lens_data_max_aperture_k5_gate_suppresses() {
+  // `Pentax.pm:4559`: MaxAperture `Condition => '$$self{Model} ne "K-5"'` — an
+  // EXACT-string compare against the BARE literal `"K-5"` (NOT a `=~ /K-5/`
+  // regex). A model that is exactly `"K-5"` MUST suppress MaxAperture; the four
+  // other LensData leaves (AutoAperture/MinAperture/FocusRangeIndex + the
+  // unconditional ones) still emit.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("K-5"), true, &mut em);
+  assert!(
+    find(&em, "MaxAperture").is_none(),
+    "an exactly-\"K-5\" model must suppress MaxAperture (ne \"K-5\")"
+  );
+  // The gate is leaf-local: the sibling LensData leaves are unaffected.
+  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
+  assert_eq!(find(&em, "MinAperture"), Some(&s("22")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  // The K10D fixture-equivalent count emits the OTHER eight leaves (all but
+  // MaxAperture).
+  assert_eq!(
+    em.len(),
+    8,
+    "an exactly-\"K-5\" model drops only MaxAperture (8 of 9 leaves)"
+  );
+}
+
+#[test]
+fn lens_data_max_aperture_emits_for_full_pentax_k5_string() {
+  // The faithful-quirk control: `$$self{Model}` is the FULL IFD0 Model, so a
+  // REAL PENTAX K-5 body is `"PENTAX K-5"`, which is NOT exactly `"K-5"` ⇒ it
+  // STILL passes `ne "K-5"` and emits MaxAperture (matching ExifTool, which
+  // compares the full model against the bare literal — see `Pentax.pm:5148`
+  // keying on the full `"PENTAX K-3 II"`). A substring/regex gate would wrongly
+  // suppress this; the exact-equality gate must not.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K-5"), true, &mut em);
+  assert_eq!(
+    find(&em, "MaxAperture"),
+    Some(&s("3.9")),
+    "a full \"PENTAX K-5\" model is not exactly \"K-5\" ⇒ MaxAperture still emits"
+  );
+  assert_eq!(em.len(), 9, "\"PENTAX K-5\" emits all nine LensData leaves");
+}
+
+#[test]
+fn lens_data_max_aperture_emits_for_k10d_fixture() {
+  // The K10D fixture (`"PENTAX K10D"`, the byte-exact path) is not `"K-5"` ⇒
+  // MaxAperture emits `3.9` (the `Pentax.jpg` golden value). This pins that the
+  // gate does NOT over-suppress the fixture body.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), true, &mut em);
+  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+}
+
+#[test]
+fn af_info_af_points_in_focus_excluded_model_suppresses() {
+  // `Pentax.pm:5070`: `0x0b AFPointsInFocus` `Condition => '$$self{Model} !~
+  // /(K-(1|3|70|S1|S2)|KP)\b/'`. An EXCLUDED model (here the K-3, which `\b`
+  // also matches inside `K-3 Mark III`) MUST suppress AFPointsInFocus, even
+  // though the same byte yields "Center (horizontal)" for the K10D. The three
+  // unconditional AF leaves (AFPredictor/AFDefocus/AFIntegrationTime) still
+  // emit — proving the gate is leaf-local and actually branches.
+  let mut em = Vec::new();
+  emit_af_info(AFINFO_K10D, Some("PENTAX K-3"), true, &mut em);
+  assert!(
+    find(&em, "AFPointsInFocus").is_none(),
+    "a K-3 (excluded) must suppress AFPointsInFocus"
+  );
+  assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
+  assert_eq!(find(&em, "AFDefocus"), Some(&TagValue::I64(2)));
+  assert_eq!(find(&em, "AFIntegrationTime"), Some(&s("0 ms")));
+  assert_eq!(em.len(), 3, "an excluded model drops only AFPointsInFocus");
+}
+
+#[test]
+fn battery_info_non_k10d_model_suppresses_ad_layout() {
+  // `Pentax.pm:4848`…: the K10D-byte `BodyBatteryADNoLoad`/`ADLoad` (PrintConv
+  // variant A `/(K10D|GX10|K20D|GX20)\b/`) and `GripBatteryAD*`/`GripBatteryState`
+  // are all `$$self{Model}`-gated. A K-5 (whose offsets 2/3/4 are the DIFFERENT
+  // int16u `BodyBatteryVoltage*` tags the port defers) MUST suppress every
+  // K10D-byte AD leaf — never re-read the K10D byte as the wrong tag.
+  let mut em = Vec::new();
+  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K-5"), true, &mut em);
+  for wrong in [
+    "BodyBatteryADNoLoad",
+    "BodyBatteryADLoad",
+    "GripBatteryADNoLoad",
+    "GripBatteryADLoad",
+    "GripBatteryState",
+    "BodyBatteryState",
+  ] {
+    assert!(
+      find(&em, wrong).is_none(),
+      "a K-5 must suppress the K10D BatteryInfo leaf {wrong}"
+    );
+  }
+}
+
+#[test]
+fn lens_data_no_comment_only_gate_for_unconditional_leaves() {
+  // The UNCONDITIONAL LensData leaves (MinFocusDistance @3, FocusRangeIndex @3.1,
+  // NominalMax/MinAperture @10/10.1) carry NO ExifTool `Condition`, so they MUST
+  // emit for every in-gate model — including an exactly-"K-5" model (only
+  // MaxAperture is K-5-gated). This pins that the K-5 gate did not accidentally
+  // over-suppress its neighbours.
+  let mut em = Vec::new();
+  emit_lens_info(LENSINFO2_K10D, 69, Some("K-5"), true, &mut em);
+  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
 }

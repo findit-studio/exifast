@@ -77,6 +77,47 @@ pub enum PentaxPrintConv {
   /// An int-keyed PrintConv hash with a HEX `Unknown (0xNN)` fallback
   /// (`PrintHex => 1`).
   HashHex(&'static [(i64, &'static str)]),
+  /// `0x001d FocalLength` (the default non-Optio K10D variant,
+  /// `Pentax.pm:1752-1764`) — int32u; ValueConv `$val / 100`; PrintConv
+  /// `sprintf("%.1f mm", $val)`.
+  FocalLength,
+  /// `0x002d EffectiveLV` (the `$format eq "int16u"` variant,
+  /// `Pentax.pm:1884-1893`) — `Format => 'int16s'` (re-read signed); ValueConv
+  /// `$val / 1024`; PrintConv `sprintf("%.1f", $val)`.
+  EffectiveLv,
+  /// `0x0016 ExposureCompensation` (the `$count == 1` variant,
+  /// `Pentax.pm:1593-1604`) — int16u; ValueConv `($val - 50) / 10`; PrintConv
+  /// `$val ? sprintf("%+.1f", $val) : 0`.
+  ExposureCompensation,
+  /// `0x004d FlashExposureComp` (the `$count == 1` variant,
+  /// `Pentax.pm:2182-2189`) — int32s; ValueConv `$val / 256`; PrintConv
+  /// `$val ? sprintf("%+.1f", $val) : 0`.
+  FlashExposureComp,
+  /// `0x000c FlashMode` (`Pentax.pm:1131-1163`) — int16u `Count => -1`,
+  /// `PrintHex => 1`. A 2-element ARRAY PrintConv: element 0 via the
+  /// flash-mode hash, element 1 via the external-flash hash, joined with `"; "`
+  /// (`ExifTool.pm:3697`). `-n` ⇒ the space-joined raw run.
+  FlashMode,
+  /// `0x0018 AutoBracketing` (`Pentax.pm:1626-1685`) — int16u `Count => -1`. A
+  /// per-element ValueConv (`$val/3` for `$val<10`, …) then the bracket
+  /// PrintConv `sub` (element 0 `sprintf('%.1f')` unless falsy/fraction;
+  /// element 1 the extended-bracket label or `'No Extended Bracket'`), joined
+  /// with `' EV, '`. `-n` ⇒ the space-joined post-ValueConv run.
+  AutoBracketing,
+  /// `0x0033 PictureMode` (`Pentax.pm:1922-2016`) — int8u `Count => 3`,
+  /// `Relist => [[0,1], 2]` (join elements 0+1 with a space, keep element 2),
+  /// then a 2-element ARRAY PrintConv joined with `"; "`. `-n` ⇒ the raw
+  /// space-joined int8u[3] run (Relist runs only for the PrintConv side).
+  PictureMode,
+  /// `0x0034 DriveMode` (`Pentax.pm:2018-2062`) — int8u `Count => 4`, a
+  /// 4-element ARRAY PrintConv (one hash per element) joined with `"; "`.
+  /// `-n` ⇒ the raw space-joined int8u[4] run.
+  DriveMode,
+  /// `0x0032 ImageEditing` (`Pentax.pm:1904-1920`) — `Format => 'int8u',
+  /// Count => 4`; a HASH PrintConv keyed on the SPACE-JOINED run (e.g.
+  /// `"0 0 0 0" => 'None'`), decimal `Unknown (…)` fallback. `-n` ⇒ the
+  /// space-joined run.
+  StringKeyedHash(&'static [(&'static str, &'static str)]),
 }
 
 impl PentaxPrintConv {
@@ -188,8 +229,284 @@ impl PentaxPrintConv {
       PentaxPrintConv::MeteringSegments => metering_segments(raw, print_conv),
       PentaxPrintConv::Hash(table) => hash_label(raw, print_conv, table, false),
       PentaxPrintConv::HashHex(table) => hash_label(raw, print_conv, table, true),
+      PentaxPrintConv::FocalLength => {
+        let Some(n) = first_u64(raw) else {
+          return raw_to_tag_value(raw);
+        };
+        // ValueConv `$val / 100`.
+        let v = n as f64 / 100.0;
+        if !print_conv {
+          return TagValue::F64(v);
+        }
+        // PrintConv `sprintf("%.1f mm", $val)`.
+        TagValue::Str(SmolStr::from(std::format!("{v:.1} mm")))
+      }
+      PentaxPrintConv::EffectiveLv => {
+        // `Format => 'int16s'` already re-read the on-disk bytes signed, so the
+        // entry value is an `int16s`. ValueConv `$val / 1024`.
+        let Some(n) = first_i64(raw) else {
+          return raw_to_tag_value(raw);
+        };
+        let v = n as f64 / 1024.0;
+        if !print_conv {
+          return TagValue::F64(v);
+        }
+        // PrintConv `sprintf("%.1f", $val)`.
+        TagValue::Str(SmolStr::from(std::format!("{v:.1}")))
+      }
+      PentaxPrintConv::ExposureCompensation => signed_div_ev(raw, print_conv, 50.0, 10.0),
+      PentaxPrintConv::FlashExposureComp => signed_div_ev(raw, print_conv, 0.0, 256.0),
+      PentaxPrintConv::FlashMode => flash_mode(raw, print_conv),
+      PentaxPrintConv::AutoBracketing => auto_bracketing(raw, print_conv),
+      PentaxPrintConv::PictureMode => picture_mode(raw, print_conv),
+      PentaxPrintConv::DriveMode => drive_mode(raw, print_conv),
+      PentaxPrintConv::StringKeyedHash(table) => string_keyed_hash(raw, print_conv, table),
     }
   }
+}
+
+/// `0x0023`-style numeric ARRAY view of `raw` (each element as `i64`), or `None`
+/// for a non-numeric shape.
+fn numeric_elems(raw: &RawValue) -> Option<std::vec::Vec<i64>> {
+  match raw {
+    RawValue::U64(v) => Some(v.iter().map(|&n| n as i64).collect()),
+    RawValue::I64(v) => Some(v.clone()),
+    RawValue::Bytes(b) => Some(b.iter().map(|&n| i64::from(n)).collect()),
+    _ => None,
+  }
+}
+
+/// The shared `($val - sub) / div` ValueConv with the `$val ? sprintf("%+.1f",
+/// $val) : 0` PrintConv (`ExposureCompensation` 0x0016 = `(50, 10)`,
+/// `FlashExposureComp` 0x004d = `(0, 256)`). `-n` ⇒ the post-ValueConv `f64`.
+fn signed_div_ev(raw: &RawValue, print_conv: bool, sub: f64, div: f64) -> TagValue {
+  let Some(n) = first_i64(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  let v = (n as f64 - sub) / div;
+  if !print_conv {
+    return TagValue::F64(v);
+  }
+  if v == 0.0 {
+    return TagValue::I64(0);
+  }
+  TagValue::Str(SmolStr::from(std::format!("{v:+.1}")))
+}
+
+/// `0x000c FlashMode` (`Pentax.pm:1131-1163`) — `Count => -1`, `PrintHex => 1`,
+/// a 2-element ARRAY PrintConv: element 0 via [`FLASH_MODE_0`], element 1 via
+/// [`FLASH_MODE_1`], joined with `"; "`. A miss renders the `PrintHex`
+/// `Unknown (0xNN)` fallback. `-n` ⇒ the space-joined raw run.
+fn flash_mode(raw: &RawValue, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::Str(SmolStr::from(space_join(raw)));
+  }
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  let tables: [&[(i64, &str)]; 2] = [FLASH_MODE_0, FLASH_MODE_1];
+  let mut parts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  for (i, &n) in elems.iter().enumerate() {
+    // The Perl ARRAY PrintConv runs each element through ITS positional hash;
+    // an element past the 2-entry list falls through to the LAST hash
+    // (`ExifTool.pm:3666`, `$conv = $$convList[-1]` when the index runs off the
+    // end) — unreachable for the 2-element K10D record, but faithful.
+    let table = *tables
+      .get(i)
+      .or_else(|| tables.last())
+      .unwrap_or(&FLASH_MODE_0);
+    match hash_get(table, n) {
+      Some(l) => parts.push(l.to_string()),
+      None => parts.push(std::format!("Unknown (0x{n:x})")),
+    }
+  }
+  TagValue::Str(SmolStr::from(parts.join("; ")))
+}
+
+/// `0x0018 AutoBracketing` (`Pentax.pm:1626-1685`) — the per-element ValueConv
+/// then the bracket PrintConv `sub`. `-n` ⇒ the space-joined post-ValueConv run.
+fn auto_bracketing(raw: &RawValue, print_conv: bool) -> TagValue {
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  // ValueConv (applied to EACH element, `ExifTool.pm` ARRAY ValueConv):
+  //   return $val / 3 if $val < 10;
+  //   return $val - 9.5 if $val < 20;
+  //   return ($val - 0x1000) . '/2' if $val & 0x1000;
+  //   return ($val - 0x2000) . '/3' if $val & 0x2000;
+  //   return $val;
+  // Each converted element is a STRING (the `. '/2'` arms) or a number; keep the
+  // string form so the `-n` join + the PrintConv `split(' ')` see the same shape.
+  let conv = |val: i64| -> std::string::String {
+    if val < 10 {
+      crate::value::format_g(val as f64 / 3.0, 15)
+    } else if val < 20 {
+      crate::value::format_g(val as f64 - 9.5, 15)
+    } else if val & 0x1000 != 0 {
+      std::format!("{}/2", val - 0x1000)
+    } else if val & 0x2000 != 0 {
+      std::format!("{}/3", val - 0x2000)
+    } else {
+      val.to_string()
+    }
+  };
+  let vc: std::vec::Vec<std::string::String> = elems.iter().map(|&n| conv(n)).collect();
+  if !print_conv {
+    return TagValue::Str(SmolStr::from(vc.join(" ")));
+  }
+  // PrintConv `sub` (`Pentax.pm:1654-1666`):
+  //   my @v = split(' ', shift);
+  //   $v[0] = sprintf('%.1f', $v[0]) if $v[0] and $v[0]!~m{/};
+  //   if ($v[1]) { ...extended-bracket label... }
+  //   elsif (defined $v[1]) { $v[1] = 'No Extended Bracket' }
+  //   return join(' EV, ', @v);
+  let mut v: std::vec::Vec<std::string::String> = vc;
+  // `$v[0] = sprintf('%.1f', $v[0]) if $v[0] and $v[0]!~m{/}` — Perl numeric
+  // truthiness: "0" / "0.0" / "" are FALSE; a "/"-bearing fraction is skipped.
+  if let Some(first) = v.first_mut() {
+    if perl_str_true(first) && !first.contains('/') {
+      let f: f64 = first.parse().unwrap_or(0.0);
+      *first = std::format!("{f:.1}");
+    }
+  }
+  match v.get(1) {
+    Some(second) if perl_str_true(second) => {
+      // Extended bracket: `$t = $v[1] >> 8; sprintf('%s+%d', $s{$t}||"Unknown($t)",
+      // $v[1] & 0xff)`. `$v[1]` is the post-ValueConv string; for an element >= 20
+      // it is "<n>/2"/"<n>/3", but the extended-bracket arm only triggers for a
+      // value with a numeric `$v[1]` (a second element), so parse the integer.
+      let n: i64 = second
+        .split('/')
+        .next()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+      let t = n >> 8;
+      let label = match t {
+        1 => "WB-BA",
+        2 => "WB-GM",
+        3 => "Saturation",
+        4 => "Sharpness",
+        5 => "Contrast",
+        6 => "Hue",
+        7 => "HighLowKey",
+        _ => "",
+      };
+      let lo = n & 0xff;
+      let s1 = if label.is_empty() {
+        std::format!("Unknown({t})+{lo}")
+      } else {
+        std::format!("{label}+{lo}")
+      };
+      if let Some(slot) = v.get_mut(1) {
+        *slot = s1;
+      }
+    }
+    Some(_) => {
+      // `elsif (defined $v[1])` — a present-but-falsy second element.
+      if let Some(slot) = v.get_mut(1) {
+        *slot = "No Extended Bracket".to_string();
+      }
+    }
+    None => {}
+  }
+  TagValue::Str(SmolStr::from(v.join(" EV, ")))
+}
+
+/// Perl string truthiness for the AutoBracketing PrintConv: the empty string,
+/// `"0"` and any all-zero numeric string (`"0.0"`, `"0.00"`, `"00"`) are FALSE;
+/// everything else is TRUE.
+fn perl_str_true(s: &str) -> bool {
+  if s.is_empty() || s == "0" {
+    return false;
+  }
+  // A numeric string that evaluates to 0 (e.g. "0.0") is also Perl-false.
+  match s.parse::<f64>() {
+    Ok(f) => f != 0.0,
+    Err(_) => true,
+  }
+}
+
+/// `0x0033 PictureMode` (`Pentax.pm:1922-2016`) — `Count => 3`,
+/// `Relist => [[0,1], 2]`, a 2-element ARRAY PrintConv joined with `"; "`.
+/// `-n` ⇒ the raw space-joined int8u[3] run (Relist is a PrintConv-side regroup).
+fn picture_mode(raw: &RawValue, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::Str(SmolStr::from(space_join(raw)));
+  }
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  // Relist `[[0,1], 2]`: group 0 = elements 0 and 1 space-joined; group 1 =
+  // element 2 (`ExifTool.pm` Relist).
+  let g0 = match (elems.first(), elems.get(1)) {
+    (Some(a), Some(b)) => std::format!("{a} {b}"),
+    (Some(a), None) => a.to_string(),
+    _ => return raw_to_tag_value(raw),
+  };
+  // Group 0 via the string-keyed PICTURE_MODE hash; group 1 via the EV-step hash.
+  let part0 = match str_hash_get(PICTURE_MODE, &g0) {
+    Some(l) => l.to_string(),
+    None => std::format!("Unknown ({g0})"),
+  };
+  let Some(&g1) = elems.get(2) else {
+    // Only one Relist group present ⇒ just the first PrintConv element.
+    return TagValue::Str(SmolStr::from(part0));
+  };
+  let part1 = match hash_get(PICTURE_MODE_EV_STEPS, g1) {
+    Some(l) => l.to_string(),
+    None => std::format!("Unknown ({g1})"),
+  };
+  TagValue::Str(SmolStr::from(std::format!("{part0}; {part1}")))
+}
+
+/// `0x0034 DriveMode` (`Pentax.pm:2018-2062`) — `Count => 4`, a 4-element ARRAY
+/// PrintConv (one hash per element) joined with `"; "`. `-n` ⇒ the raw
+/// space-joined int8u[4] run.
+fn drive_mode(raw: &RawValue, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::Str(SmolStr::from(space_join(raw)));
+  }
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  let tables: [&[(i64, &str)]; 4] = [DRIVE_MODE_0, DRIVE_MODE_1, DRIVE_MODE_2, DRIVE_MODE_3];
+  let mut parts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  for (i, &n) in elems.iter().enumerate() {
+    let table = *tables
+      .get(i)
+      .or_else(|| tables.last())
+      .unwrap_or(&DRIVE_MODE_0);
+    match hash_get(table, n) {
+      Some(l) => parts.push(l.to_string()),
+      None => parts.push(std::format!("Unknown ({n})")),
+    }
+  }
+  TagValue::Str(SmolStr::from(parts.join("; ")))
+}
+
+/// A PrintConv HASH keyed on the SPACE-JOINED run (`0x0032 ImageEditing`,
+/// `Pentax.pm:1904-1920`): the multi-element value's default rendering (the
+/// `"0 0 0 0"` string) is the lookup key; a miss renders `Unknown (…)`. `-n` ⇒
+/// the space-joined run.
+fn string_keyed_hash(
+  raw: &RawValue,
+  print_conv: bool,
+  table: &[(&'static str, &'static str)],
+) -> TagValue {
+  let joined = space_join(raw);
+  if !print_conv {
+    return TagValue::Str(SmolStr::from(joined));
+  }
+  match str_hash_get(table, &joined) {
+    Some(l) => TagValue::Str(SmolStr::from(l)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({joined})"))),
+  }
+}
+
+/// Linear-search a `(string-key, label)` PrintConv hash (the keys are
+/// space-joined run strings; the lists are short, so a linear scan is fine).
+fn str_hash_get(table: &[(&'static str, &'static str)], key: &str) -> Option<&'static str> {
+  table.iter().find(|&&(k, _)| k == key).map(|&(_, v)| v)
 }
 
 /// Binary-search a sorted `(key, label)` hash.
@@ -739,6 +1056,304 @@ pub(crate) const MIN_FOCUS_DISTANCE: &[(i64, &str)] = &[
   (18, "3.0 m"),
   (19, "4-5 m"),
   (20, "5.6 m"),
+];
+
+// ---------------------------------------------------------------------------
+// `%Pentax::SRInfo` / `%Pentax::BatteryInfo` / `%Pentax::AFInfo` binary
+// SubDirectory PrintConv tables (#173). Each int-keyed hash is sorted by key for
+// binary search; each `*_BITS` table is the `DecodeBits` BITMASK label set.
+// ---------------------------------------------------------------------------
+
+/// `SRInfo` `0 SRResult` BITMASK (`Pentax.pm:3180-3185`) — `{ 0 => 'Not
+/// stabilized', BITMASK => { 0 => 'Stabilized', 6 => 'Not ready' } }`. The
+/// `0 => 'Not stabilized'` zero label is passed separately to `bitmask0`.
+pub(crate) const SR_RESULT_BITS: &[(u8, &str)] = &[(0, "Stabilized"), (6, "Not ready")];
+
+/// `SRInfo` `1 ShakeReduction` PrintConv (`Pentax.pm:3190-3203`). Sorted by key.
+pub(crate) const SHAKE_REDUCTION: &[(i64, &str)] = &[
+  (0, "Off"),
+  (1, "On"),
+  (4, "Off (4)"),
+  (5, "On but Disabled"),
+  (6, "On (Video)"),
+  (7, "On (7)"),
+  (15, "On (15)"),
+  (39, "On (mode 2)"),
+  (135, "On (135)"),
+  (167, "On (mode 1)"),
+];
+
+/// `BatteryInfo` `0.1 PowerSource` PrintConv (the non-K-3III variant, mask 0x0f,
+/// `Pentax.pm:4774-4779`). Sorted by key.
+pub(crate) const POWER_SOURCE: &[(i64, &str)] = &[
+  (1, "Camera Battery"),
+  (2, "Body Battery"),
+  (3, "Grip Battery"),
+  (4, "External Power Supply"),
+];
+
+/// `BatteryInfo` `1.1 BodyBatteryState` PrintConv (the *istD/K100D/K200D/K10D/K20D
+/// variant, mask 0xf0, `Pentax.pm:4810-4815`). Sorted by key.
+pub(crate) const BODY_BATTERY_STATE_K10D: &[(i64, &str)] = &[
+  (1, "Empty or Missing"),
+  (2, "Almost Empty"),
+  (3, "Running Low"),
+  (4, "Full"),
+];
+
+/// `BatteryInfo` `1.2 GripBatteryState` PrintConv (the K10D/K20D variant, mask
+/// 0x0f, `Pentax.pm:4836-4841`). Sorted by key.
+pub(crate) const GRIP_BATTERY_STATE_K10D: &[(i64, &str)] = &[
+  (1, "Empty or Missing"),
+  (2, "Almost Empty"),
+  (3, "Running Low"),
+  (4, "Full"),
+];
+
+/// `AFInfo` `0x0b AFPointsInFocus` PrintConv (the non-K-1/3/70/KP/K-S1/S2
+/// variant, `Pentax.pm:5077-5099`). Sorted by key.
+pub(crate) const AF_POINTS_IN_FOCUS: &[(i64, &str)] = &[
+  (0, "None"),
+  (1, "Lower-left, Bottom"),
+  (2, "Bottom"),
+  (3, "Lower-right, Bottom"),
+  (4, "Mid-left, Center"),
+  (5, "Center (horizontal)"),
+  (6, "Mid-right, Center"),
+  (7, "Upper-left, Top"),
+  (8, "Top"),
+  (9, "Upper-right, Top"),
+  (10, "Right"),
+  (11, "Lower-left, Mid-left"),
+  (12, "Upper-left, Mid-left"),
+  (13, "Bottom, Center"),
+  (14, "Top, Center"),
+  (15, "Lower-right, Mid-right"),
+  (16, "Upper-right, Mid-right"),
+  (17, "Left"),
+  (18, "Mid-left"),
+  (19, "Center (vertical)"),
+  (20, "Mid-right"),
+];
+
+/// `%Pentax::LensData` `0.2 MinAperture` PrintConv (`Pentax.pm:4407-4412`). The
+/// numeric-looking string labels (`"22"`) render as JSON numbers. Sorted by key.
+pub(crate) const LENS_MIN_APERTURE: &[(i64, &str)] = &[(0, "22"), (1, "32"), (2, "45"), (3, "16")];
+
+/// `%Pentax::LensData` `0.1 AutoAperture` PrintConv (`Pentax.pm:4400`). Sorted
+/// by key.
+pub(crate) const AUTO_APERTURE: &[(i64, &str)] = &[(0, "On"), (1, "Off")];
+
+/// `%Pentax::LensData` `3.1 FocusRangeIndex` PrintConv (`Pentax.pm:4472-4481`).
+/// Sorted by key for binary search.
+pub(crate) const FOCUS_RANGE_INDEX: &[(i64, &str)] = &[
+  (0, "5"),
+  (1, "4"),
+  (2, "6 (far)"),
+  (3, "7 (very far)"),
+  (4, "2"),
+  (5, "3"),
+  (6, "1 (close)"),
+  (7, "0 (very close)"),
+];
+
+// ---------------------------------------------------------------------------
+// `%Pentax::Main` ARRAY / string-keyed PrintConv tables for the conditional /
+// multi-element camera-indexing leaves (#173). The int-keyed positional element
+// hashes for the ARRAY-PrintConv leaves live here (referenced by the helpers
+// above); the simple int-keyed leaf hashes (FocusMode / AFPointSelected /
+// RawDevelopmentProcess) live in `tags.rs` beside the other `Hash(...)` tables.
+// ---------------------------------------------------------------------------
+
+/// `0x000c FlashMode` element 0 PrintConv (`Pentax.pm:1136-1151`, `PrintHex`).
+/// Sorted by key for binary search.
+pub(crate) const FLASH_MODE_0: &[(i64, &str)] = &[
+  (0x000, "Auto, Did not fire"),
+  (0x001, "Off, Did not fire"),
+  (0x002, "On, Did not fire"),
+  (0x003, "Auto, Did not fire, Red-eye reduction"),
+  (0x005, "On, Did not fire, Wireless (Master)"),
+  (0x100, "Auto, Fired"),
+  (0x102, "On, Fired"),
+  (0x103, "Auto, Fired, Red-eye reduction"),
+  (0x104, "On, Red-eye reduction"),
+  (0x105, "On, Wireless (Master)"),
+  (0x106, "On, Wireless (Control)"),
+  (0x108, "On, Soft"),
+  (0x109, "On, Slow-sync"),
+  (0x10a, "On, Slow-sync, Red-eye reduction"),
+  (0x10b, "On, Trailing-curtain Sync"),
+];
+
+/// `0x000c FlashMode` element 1 PrintConv — the AF-540FGZ external-flash hash
+/// (`Pentax.pm:1152-1162`, `PrintHex`). Sorted by key for binary search.
+pub(crate) const FLASH_MODE_1: &[(i64, &str)] = &[
+  (0x000, "n/a - Off-Auto-Aperture"),
+  (0x03f, "Internal"),
+  (0x100, "External, Auto"),
+  (0x23f, "External, Flash Problem"),
+  (0x300, "External, Manual"),
+  (0x304, "External, P-TTL Auto"),
+  (0x305, "External, Contrast-control Sync"),
+  (0x306, "External, High-speed Sync"),
+  (0x30c, "External, Wireless"),
+  (0x30d, "External, Wireless, High-speed Sync"),
+];
+
+/// `0x0033 PictureMode` element-0 PrintConv (`Pentax.pm:1928-2012`) — keyed on
+/// the space-joined Relist group `"$v0 $v1"`. The full bundled hash (the K10D
+/// fixture hits `"5 0" => 'Aperture Priority'`).
+pub(crate) const PICTURE_MODE: &[(&str, &str)] = &[
+  ("0 0", "Program"),
+  ("0 1", "Hi-speed Program"),
+  ("0 2", "DOF Program"),
+  ("0 3", "MTF Program"),
+  ("0 4", "Standard"),
+  ("0 5", "Portrait"),
+  ("0 6", "Landscape"),
+  ("0 7", "Macro"),
+  ("0 8", "Sport"),
+  ("0 9", "Night Scene Portrait"),
+  ("0 10", "No Flash"),
+  ("0 11", "Night Scene"),
+  ("0 12", "Surf & Snow"),
+  ("0 13", "Text"),
+  ("0 14", "Sunset"),
+  ("0 15", "Kids"),
+  ("0 16", "Pet"),
+  ("0 17", "Candlelight"),
+  ("0 18", "Museum"),
+  ("0 19", "Food"),
+  ("0 20", "Stage Lighting"),
+  ("0 21", "Night Snap"),
+  ("0 23", "Blue Sky"),
+  ("0 24", "Sunset"),
+  ("0 26", "Night Scene HDR"),
+  ("0 27", "HDR"),
+  ("0 28", "Quick Macro"),
+  ("0 29", "Forest"),
+  ("0 30", "Backlight Silhouette"),
+  ("0 31", "Max. Aperture Priority"),
+  ("0 32", "DOF"),
+  ("1 4", "Auto PICT (Standard)"),
+  ("1 5", "Auto PICT (Portrait)"),
+  ("1 6", "Auto PICT (Landscape)"),
+  ("1 7", "Auto PICT (Macro)"),
+  ("1 8", "Auto PICT (Sport)"),
+  ("2 0", "Program (HyP)"),
+  ("2 1", "Hi-speed Program (HyP)"),
+  ("2 2", "DOF Program (HyP)"),
+  ("2 3", "MTF Program (HyP)"),
+  ("2 22", "Shallow DOF (HyP)"),
+  ("3 0", "Green Mode"),
+  ("4 0", "Shutter Speed Priority"),
+  ("4 2", "Shutter Speed Priority 2"),
+  ("4 31", "Shutter Speed Priority 31"),
+  ("5 0", "Aperture Priority"),
+  ("5 2", "Aperture Priority 2"),
+  ("5 31", "Aperture Priority 31"),
+  ("6 0", "Program Tv Shift"),
+  ("7 0", "Program Av Shift"),
+  ("8 0", "Manual"),
+  ("9 0", "Bulb"),
+  ("10 0", "Aperture Priority, Off-Auto-Aperture"),
+  ("11 0", "Manual, Off-Auto-Aperture"),
+  ("12 0", "Bulb, Off-Auto-Aperture"),
+  ("19 0", "Astrotracer"),
+  ("13 0", "Shutter & Aperture Priority AE"),
+  ("14 0", "Shutter Priority AE"),
+  ("15 0", "Sensitivity Priority AE"),
+  ("16 0", "Flash X-Sync Speed AE"),
+  ("17 0", "Flash X-Sync Speed"),
+  ("18 0", "Auto Program (Normal)"),
+  ("18 1", "Auto Program (Hi-speed)"),
+  ("18 2", "Auto Program (DOF)"),
+  ("18 3", "Auto Program (MTF)"),
+  ("18 22", "Auto Program (Shallow DOF)"),
+  ("20 22", "Blur Control"),
+  ("24 0", "Aperture Priority (Adv.Hyp)"),
+  ("25 0", "Manual Exposure (Adv.Hyp)"),
+  ("26 0", "Shutter and Aperture Priority (TAv)"),
+  ("249 0", "Movie (TAv)"),
+  ("250 0", "Movie (TAv, Auto Aperture)"),
+  ("251 0", "Movie (Manual)"),
+  ("252 0", "Movie (Manual, Auto Aperture)"),
+  ("253 0", "Movie (Av)"),
+  ("254 0", "Movie (Av, Auto Aperture)"),
+  ("255 0", "Movie (P, Auto Aperture)"),
+  ("255 4", "Video (4)"),
+];
+
+/// `0x0033 PictureMode` element-1 PrintConv — the EV-step hash
+/// (`Pentax.pm:2013-2015`). Sorted by key for binary search.
+pub(crate) const PICTURE_MODE_EV_STEPS: &[(i64, &str)] =
+  &[(0, "1/2 EV steps"), (1, "1/3 EV steps")];
+
+/// `0x0034 DriveMode` element 0 PrintConv (`Pentax.pm:2022-2031`). Sorted by key.
+pub(crate) const DRIVE_MODE_0: &[(i64, &str)] = &[
+  (0, "Single-frame"),
+  (1, "Continuous"),
+  (2, "Continuous (Lo)"),
+  (3, "Burst"),
+  (4, "Continuous (Medium)"),
+  (5, "Continuous (Low)"),
+  (255, "Video"),
+];
+
+/// `0x0034 DriveMode` element 1 PrintConv (`Pentax.pm:2032-2038`). Sorted by key.
+pub(crate) const DRIVE_MODE_1: &[(i64, &str)] = &[
+  (0, "No Timer"),
+  (1, "Self-timer (12 s)"),
+  (2, "Self-timer (2 s)"),
+  (15, "Video"),
+  (16, "Mirror Lock-up"),
+  (255, "n/a"),
+];
+
+/// `0x0034 DriveMode` element 2 PrintConv (`Pentax.pm:2039-2043`). Sorted by key.
+pub(crate) const DRIVE_MODE_2: &[(i64, &str)] = &[
+  (0, "Shutter Button"),
+  (1, "Remote Control (3 s delay)"),
+  (2, "Remote Control"),
+  (4, "Remote Continuous Shooting"),
+];
+
+/// `0x0034 DriveMode` element 3 PrintConv (`Pentax.pm:2044-2061`, `PrintHex` in
+/// the table but rendered through the decimal `DecodeBits`-free hash — the keys
+/// are listed as hex literals, looked up against the integer value). Sorted by
+/// key for binary search.
+pub(crate) const DRIVE_MODE_3: &[(i64, &str)] = &[
+  (0x00, "Single Exposure"),
+  (0x01, "Multiple Exposure"),
+  (0x02, "Composite Average"),
+  (0x03, "Composite Additive"),
+  (0x04, "Composite Bright"),
+  (0x08, "Interval Shooting"),
+  (0x0a, "Interval Composite Average"),
+  (0x0b, "Interval Composite Additive"),
+  (0x0c, "Interval Composite Bright"),
+  (0x0f, "Interval Movie"),
+  (0x10, "HDR"),
+  (0x20, "HDR Strong 1"),
+  (0x30, "HDR Strong 2"),
+  (0x40, "HDR Strong 3"),
+  (0x50, "HDR Manual"),
+  (0xe0, "HDR Auto"),
+  (0xff, "Video"),
+];
+
+/// `0x0032 ImageEditing` PrintConv (`Pentax.pm:1909-1919`) — keyed on the
+/// space-joined int8u[4] run.
+pub(crate) const IMAGE_EDITING: &[(&str, &str)] = &[
+  ("0 0", "None"),
+  ("0 0 0 0", "None"),
+  ("0 0 0 4", "Digital Filter"),
+  ("1 0 0 0", "Resized"),
+  ("2 0 0 0", "Cropped"),
+  ("4 0 0 0", "Digital Filter 4"),
+  ("6 0 0 0", "Digital Filter 6"),
+  ("8 0 0 0", "Red-eye Correction"),
+  ("16 0 0 0", "Frame Synthesis?"),
 ];
 
 #[cfg(test)]
