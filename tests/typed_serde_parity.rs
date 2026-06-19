@@ -117,41 +117,44 @@ const NOT_ACTIVE: &[&str] = &[
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
   // The REAL Sony FX3 `.mp4` (#76) carries paired `.json` / `.n.json` goldens
-  // but is accept-deferred from the active byte-exact set: its full `ILME-FX3`
-  // `moov` exercises GENERAL-QuickTime container tags this Sony-rtmd port does
-  // not yet emit (the `vide`/`soun` `stsd` sample-description fields,
-  // HandlerDescription/TrackProperty, `tref` ContentDescribes, the `TimeZone`),
-  // so the no-`ee` `.json`/`.n.json` differ from the golden by those structural
-  // tags. The rtmd PAYLOAD proof (FNumber/ExposureTime/ISO/… byte-exact, the
-  // `parse_stsz` fixed-size-`stsz` fix) is pinned at `-ee` in
-  // `tests/timed_metadata_conformance.rs` (`sony_fx3_rtmd_mp4_*`), with the
-  // structural tags + the past-EOF `Track3:Warning` excluded there.
+  // but is accept-deferred from the active byte-exact set. The QuickTime
+  // container phase-1 port now emits its `vide`/`soun` `stsd` sample-description
+  // + `hdlr` HandlerDescription; the residual no-`ee` divergence is the `tapt`
+  // `TrackProperty`, the `tref` `ContentDescribes`, the `vmhd`
+  // GraphicsMode/OpColor, the `stts`-derived `VideoFrameRate`, and the
+  // `TimeZone` (later container phases). The rtmd PAYLOAD proof
+  // (FNumber/ExposureTime/ISO/… byte-exact, the `parse_stsz` fixed-size-`stsz`
+  // fix) is pinned at `-ee` in `tests/timed_metadata_conformance.rs`
+  // (`sony_fx3_rtmd_mp4_*`), with the residual tags + the past-EOF
+  // `Track3:Warning` excluded there.
   "QuickTime_sony_fx3_rtmd.mp4",
   // `QuickTime_insta360_real.insv` (the real OneRS capture, #91) — the
   // Insta360 trailer decode is byte-exact (see
-  // `tests/timed_metadata_conformance.rs::insta360_real_oners_insv_byte_exact`),
-  // but the OneRS file's full QuickTime `stsd` sample-description boxes + its
-  // 470-sample timed-`text` track are a pre-existing QuickTime *container* gap
-  // (NOT Insta360): the structural trak parse surfaces neither the `stsd` codec
-  // sub-tags (`CompressorID`/`AudioFormat`/`HandlerDescription`/`Gen*`/…) nor the
-  // text-track per-sample `SampleTime`/`SampleDuration`. Its `.json`/`.n.json`
-  // goldens therefore carry 25 structural tags the typed-serde path does not yet
-  // emit, so it is accept-deferred here (the conformance test excludes exactly
-  // those tails and is byte-exact on everything else).
+  // `tests/timed_metadata_conformance.rs::insta360_real_oners_insv_byte_exact`).
+  // The QuickTime container phase-1 port now emits its `vide`/`soun` `stsd`
+  // sample-description + HandlerDescription; the residual QuickTime *container*
+  // gap (NOT Insta360) is the `gmhd` `Gen*` fields, `pasp` PixelAspectRatio,
+  // `vmhd` GraphicsMode/OpColor, the `stts`-derived `VideoFrameRate`, and the
+  // 470-sample timed-`text` track's per-sample `SampleTime`/`SampleDuration`. So
+  // it is accept-deferred here (the conformance test excludes exactly those
+  // tails and is byte-exact on everything else).
   "QuickTime_insta360_real.insv",
   // `QuickTime_gopro_hero8_gpmf.mp4` (the real HERO8 Black, #211/#189) — the
   // gpmd timed-GPS Doc<N> port is SCHEDULED: `process_gopro` flat-merges every
   // gpmd sample into one `GoProMeta`, so a per-sample Doc<N> timed-source
   // retrofit (like camm/sony_rtmd/insta360) is needed before the gpmd GPS emits
-  // byte-exact. Until then the conformance test is `#[ignore]`d and the no-`ee`
-  // `.json` carries the `stsd` codec container tags exifast does not emit —
-  // accept-deferred here (same precedent as the two QuickTime fixtures above).
+  // byte-exact. Phase-1 emitted its `stsd` codec container tags; the residual
+  // no-`ee` gap is the `colr`/`btrt`/`tmcd`/`gmhd`/`tref` classes (later
+  // container phases) plus the gpmd Doc<N> port. The conformance test is
+  // `#[ignore]`d until then — accept-deferred here.
   "QuickTime_gopro_hero8_gpmf.mp4",
   // The #285 round-2 real-device fixtures (#109/#114/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
-  // MPF/JFIF for Matrice+thermal, XMP-GPano for the Insta360 equirect, the Rove
-  // dashcam GPS). Their no-ee .json carries tags exifast does not yet emit, so
-  // accept-deferred here until each port lands (then they move to active).
+  // MPF/JFIF for Matrice+thermal, XMP-GPano for the Insta360 equirect; the Rove
+  // dashcam's `stsd` is now emitted, its residual no-ee gap is the NOVATEK
+  // `udta` + the `minf` data-handler, a later container phase). Their no-ee
+  // .json carries tags exifast does not yet emit, so accept-deferred here until
+  // each port lands (then they move to active).
   "DJI_M3T_thermal.RJPEG",
   "DJI_Matrice30T.jpg",
   "Insta360ONE_equirectangular.jpg",
