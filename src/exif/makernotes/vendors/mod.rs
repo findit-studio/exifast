@@ -32,6 +32,7 @@
 pub mod apple;
 pub mod canon;
 pub mod dji;
+pub mod leica;
 pub mod nikon;
 pub mod panasonic;
 pub mod pentax;
@@ -41,6 +42,7 @@ pub mod sony;
 pub use apple::MakerNotesApple;
 pub use canon::MakerNotesCanon;
 pub use dji::MakerNotesDji;
+pub use leica::MakerNotesLeica;
 pub use nikon::MakerNotesNikon;
 pub use panasonic::MakerNotesPanasonic;
 pub use pentax::MakerNotesPentax;

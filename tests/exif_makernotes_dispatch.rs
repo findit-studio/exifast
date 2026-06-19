@@ -4258,3 +4258,514 @@ fn real_fixture_samsung_nx500_type2() {
     );
   }
 }
+
+// ===========================================================================
+// MakerNoteLeica2..Leica9 — the per-variant `%Panasonic::Leica*` table port (#259)
+// ===========================================================================
+//
+// Crafted standalone-TIFF fixtures (one per dispatched signature variant). Each
+// carries a `Leica Camera AG`/`LEICA CAMERA AG` Make + the variant's signature
+// header + a small child IFD with representative leaves, AND exercises the
+// variant's BASE RULE via an out-of-line value where the rule is non-trivial
+// (Leica2 `$start`, Leica3/6/7/9 inherit/`-$base`, Leica5 `$start - 8`). Every
+// fixture's byte array + the expected Leica `-j`/`-n` output were VERIFIED
+// against bundled `perl exiftool 13.59` (`-G1 -j [-n] -a -u`); the
+// `*_matches_bundled_exiftool` test re-runs that oracle when the binary is on
+// PATH / `$EXIFTOOL`.
+
+/// Crafted leica2 standalone TIFF (`Leica2` table, base rule `StartItself`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA2_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 3, 0, 0, 0,
+  77, 56, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 77, 56, 0, 1, 0, 124, 146, 7, 0, 62, 0, 0, 0, 87, 0, 0, 0,
+  0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 0, 0, 3, 0, 3, 3, 4, 0, 1, 0, 0, 0, 135, 214, 18, 0, 16, 3, 4,
+  0, 1, 0, 0, 0, 20, 0, 0, 0, 64, 3, 4, 0, 3, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 22, 0,
+  0, 0, 33, 0, 0, 0,
+];
+
+/// Crafted leica3 standalone TIFF (`Leica3` table, base rule `Inherit`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA3_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 3, 0, 0, 0,
+  82, 57, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 82, 57, 0, 1, 0, 124, 146, 7, 0, 24, 0, 0, 0, 87, 0, 0, 0,
+  0, 0, 0, 0, 1, 0, 13, 0, 3, 0, 3, 0, 0, 0, 105, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 1,
+];
+
+/// Crafted leica4 standalone TIFF (`Leica4` table, base rule `RelativeToStart(-8)`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA4_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 3, 0, 0, 0,
+  77, 57, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 77, 57, 0, 1, 0, 124, 146, 7, 0, 26, 0, 0, 0, 87, 0, 0, 0,
+  0, 0, 0, 0, 76, 69, 73, 67, 65, 48, 3, 0, 1, 0, 0, 48, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Crafted leica5 standalone TIFF (`Leica5` table, base rule `RelativeToStart(-8)`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA5_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 9, 0, 0, 0,
+  66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 75, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 32, 67, 65,
+  77, 69, 82, 65, 32, 65, 71, 0, 76, 101, 105, 99, 97, 32, 88, 49, 0, 1, 0, 124, 146, 7, 0, 52, 0,
+  0, 0, 93, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 1, 0, 2, 0, 5, 3, 4, 0, 1, 0, 0, 0, 6, 18,
+  15, 0, 8, 4, 2, 0, 14, 0, 0, 0, 38, 0, 0, 0, 0, 0, 0, 0, 68, 67, 73, 77, 47, 49, 48, 48, 76, 69,
+  73, 67, 65, 0,
+];
+
+/// Crafted leica6 standalone TIFF (`Leica6` table, base rule `Inherit`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA6_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 18, 0, 0, 0,
+  66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 84, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 76, 69, 73, 67, 65, 32, 77, 32, 40, 84, 121, 112, 32, 50,
+  52, 48, 41, 0, 1, 0, 124, 146, 7, 0, 42, 0, 0, 0, 102, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65,
+  0, 2, 255, 1, 0, 3, 3, 2, 0, 16, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 83, 117, 109, 109, 105, 108,
+  117, 120, 45, 77, 32, 53, 48, 32, 32, 0,
+];
+
+/// Crafted leica7 standalone TIFF (`Leica6` table, base rule `NegativeOfBase`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA7_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 28, 0, 0, 0,
+  66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 94, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 76, 69, 73, 67, 65, 32, 77, 32, 77, 111, 110, 111, 99, 104,
+  114, 111, 109, 32, 40, 84, 121, 112, 32, 50, 52, 54, 41, 0, 1, 0, 124, 146, 7, 0, 40, 0, 0, 0,
+  112, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 2, 255, 1, 0, 3, 3, 2, 0, 14, 0, 0, 0, 138, 0,
+  0, 0, 0, 0, 0, 0, 84, 101, 115, 116, 76, 101, 105, 99, 97, 76, 101, 110, 115, 0,
+];
+
+/// Crafted leica8 standalone TIFF (`Leica5` table, base rule `RelativeToStart(-8)`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA8_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 18, 0, 0, 0,
+  66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 84, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 32, 67, 65,
+  77, 69, 82, 65, 32, 65, 71, 0, 76, 69, 73, 67, 65, 32, 81, 32, 40, 84, 121, 112, 32, 49, 49, 54,
+  41, 0, 1, 0, 124, 146, 7, 0, 26, 0, 0, 0, 102, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 8, 0,
+  1, 0, 5, 3, 4, 0, 1, 0, 0, 0, 180, 121, 8, 0, 0, 0, 0, 0,
+];
+
+/// Crafted leica9 standalone TIFF (`Leica9` table, base rule `Inherit`), verified
+/// byte-exact against bundled `perl exiftool`.
+const LEICA9_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 10, 0, 0, 0,
+  66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 76, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67,
+  97, 109, 101, 114, 97, 32, 65, 71, 0, 76, 69, 73, 67, 65, 32, 77, 49, 48, 0, 1, 0, 124, 146, 7,
+  0, 51, 0, 0, 0, 94, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 2, 0, 2, 0, 90, 3, 9, 0, 1, 0, 0,
+  0, 240, 10, 0, 0, 112, 3, 2, 0, 13, 0, 0, 0, 132, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32,
+  65, 80, 79, 32, 53, 48, 0,
+];
+
+/// One Leica variant fixture's expected (key, -j value, -n value) Leica leaves.
+struct LeicaCase {
+  name: &'static str,
+  tiff: &'static [u8],
+  variant: exifast::exif::makernotes::vendors::leica::tags::LeicaVariant,
+  base_rule: exifast::exif::makernotes::BaseRule,
+  print_conv: &'static [(&'static str, fn() -> serde_json::Value)],
+  value_conv: &'static [(&'static str, fn() -> serde_json::Value)],
+}
+
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+fn leica_cases() -> Vec<LeicaCase> {
+  use exifast::exif::makernotes::BaseRule;
+  use exifast::exif::makernotes::vendors::leica::tags::LeicaVariant;
+  std::vec![
+    LeicaCase {
+      name: "leica2",
+      tiff: LEICA2_TIFF,
+      variant: LeicaVariant::Leica2,
+      base_rule: BaseRule::StartItself,
+      print_conv: &[
+        (
+          "Leica:ImageIDNumber",
+          (|| serde_json::json!("11 22 33")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:LensType",
+          (|| serde_json::json!("Summilux-M 50mm f/1.4 (II)")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:SerialNumber",
+          (|| serde_json::json!(1234567)) as fn() -> serde_json::Value
+        )
+      ],
+      value_conv: &[
+        (
+          "Leica:ImageIDNumber",
+          (|| serde_json::json!("11 22 33")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:LensType",
+          (|| serde_json::json!("5 0")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:SerialNumber",
+          (|| serde_json::json!(1234567)) as fn() -> serde_json::Value
+        )
+      ],
+    },
+    LeicaCase {
+      name: "leica3",
+      tiff: LEICA3_TIFF,
+      variant: LeicaVariant::Leica3,
+      base_rule: BaseRule::Inherit,
+      print_conv: &[(
+        "Leica:WB_RGBLevels",
+        (|| serde_json::json!("256 257 258")) as fn() -> serde_json::Value
+      )],
+      value_conv: &[(
+        "Leica:WB_RGBLevels",
+        (|| serde_json::json!("256 257 258")) as fn() -> serde_json::Value
+      )],
+    },
+    LeicaCase {
+      name: "leica4",
+      tiff: LEICA4_TIFF,
+      variant: LeicaVariant::Leica4,
+      base_rule: BaseRule::RelativeToStart(-8),
+      print_conv: &[],
+      value_conv: &[],
+    },
+    LeicaCase {
+      name: "leica5",
+      tiff: LEICA5_TIFF,
+      variant: LeicaVariant::Leica5,
+      base_rule: BaseRule::RelativeToStart(-8),
+      print_conv: &[
+        (
+          "Leica:OriginalDirectory",
+          (|| serde_json::json!("DCIM/100LEICA")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:SerialNumber",
+          (|| serde_json::json!(987654)) as fn() -> serde_json::Value
+        )
+      ],
+      value_conv: &[
+        (
+          "Leica:OriginalDirectory",
+          (|| serde_json::json!("DCIM/100LEICA")) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:SerialNumber",
+          (|| serde_json::json!(987654)) as fn() -> serde_json::Value
+        )
+      ],
+    },
+    LeicaCase {
+      name: "leica6",
+      tiff: LEICA6_TIFF,
+      variant: LeicaVariant::Leica6,
+      base_rule: BaseRule::Inherit,
+      print_conv: &[(
+        "Leica:LensType",
+        (|| serde_json::json!("Summilux-M 50")) as fn() -> serde_json::Value
+      )],
+      value_conv: &[(
+        "Leica:LensType",
+        (|| serde_json::json!("Summilux-M 50")) as fn() -> serde_json::Value
+      )],
+    },
+    LeicaCase {
+      name: "leica7",
+      tiff: LEICA7_TIFF,
+      variant: LeicaVariant::Leica6,
+      base_rule: BaseRule::NegativeOfBase,
+      print_conv: &[(
+        "Leica:LensType",
+        (|| serde_json::json!("TestLeicaLens")) as fn() -> serde_json::Value
+      )],
+      value_conv: &[(
+        "Leica:LensType",
+        (|| serde_json::json!("TestLeicaLens")) as fn() -> serde_json::Value
+      )],
+    },
+    LeicaCase {
+      name: "leica8",
+      tiff: LEICA8_TIFF,
+      variant: LeicaVariant::Leica5,
+      base_rule: BaseRule::Inherit,
+      print_conv: &[(
+        "Leica:SerialNumber",
+        (|| serde_json::json!(555444)) as fn() -> serde_json::Value
+      )],
+      value_conv: &[(
+        "Leica:SerialNumber",
+        (|| serde_json::json!(555444)) as fn() -> serde_json::Value
+      )],
+    },
+    LeicaCase {
+      name: "leica9",
+      tiff: LEICA9_TIFF,
+      variant: LeicaVariant::Leica9,
+      base_rule: BaseRule::Inherit,
+      print_conv: &[
+        (
+          "Leica:FNumber",
+          (|| serde_json::json!(2.8)) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:LensProfileName",
+          (|| serde_json::json!("Leica APO 50")) as fn() -> serde_json::Value
+        )
+      ],
+      value_conv: &[
+        (
+          "Leica:FNumber",
+          (|| serde_json::json!(2.8)) as fn() -> serde_json::Value
+        ),
+        (
+          "Leica:LensProfileName",
+          (|| serde_json::json!("Leica APO 50")) as fn() -> serde_json::Value
+        )
+      ],
+    },
+  ]
+}
+
+/// Each Leica2..Leica9 fixture dispatches to `Vendor::Leica` with the EXPECTED
+/// base rule, routes to its OWN variant table, and the full serializer emits the
+/// `Leica:*` leaves byte-identically to bundled in BOTH `-j` and `-n` modes.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica_variants_dispatch_and_emit() {
+  for case in leica_cases() {
+    let meta =
+      exifast::parse_exif(case.tiff).unwrap_or_else(|| panic!("{}: TIFF recognized", case.name));
+    let mn = meta
+      .maker_note()
+      .unwrap_or_else(|| panic!("{}: MakerNote captured", case.name));
+    assert!(mn.vendor().is_leica(), "{}: vendor = Leica", case.name);
+    assert_eq!(
+      mn.detected().base_rule(),
+      case.base_rule,
+      "{}: dispatched base rule",
+      case.name
+    );
+    // The Leica variant table populated the typed Leica slot (Leica4 has no
+    // plain leaf, so its slot is the empty default but PRESENT).
+    assert!(
+      mn.meta().leica().is_some(),
+      "{}: Leica typed slot populated (variant {:?})",
+      case.name,
+      case.variant
+    );
+    // The emission group is `Leica` (NOT `Panasonic`, the Leica1/Leica10 route),
+    // unless the variant has no leaf at all (Leica4 — then no emission carries a
+    // group; the default stays whatever the dispatch left, so only assert when
+    // there IS a leaf).
+    if !case.print_conv.is_empty() {
+      assert_eq!(
+        mn.emission_group1(),
+        "Leica",
+        "{}: emission group1 = Leica",
+        case.name
+      );
+    }
+    for (print_on, expected) in [(true, case.print_conv), (false, case.value_conv)] {
+      let mode = if print_on { "-j" } else { "-n" };
+      let json =
+        exifast::parser::extract_info(&std::format!("{}.tif", case.name), case.tiff, print_on);
+      let doc: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("{} {}: invalid JSON ({e})", case.name, mode));
+      let obj = doc
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|o| o.as_object())
+        .unwrap_or_else(|| panic!("{} {}: doc is [{{…}}]", case.name, mode));
+      for (key, val_fn) in expected {
+        let got = obj.get(*key).cloned();
+        let want = val_fn();
+        assert_eq!(
+          got.as_ref(),
+          Some(&want),
+          "{} {}: {} mismatch (keys: {:?})",
+          case.name,
+          mode,
+          key,
+          obj.keys().collect::<Vec<_>>()
+        );
+      }
+    }
+  }
+}
+
+/// Cross-check every Leica variant fixture against the bundled `perl exiftool`
+/// binary (`$EXIFTOOL` / PATH): each `Leica:*` leaf the Rust port emits must
+/// match `exiftool -G1 -j -n -a -u`, proving the per-variant table reads +
+/// base-rule offset math are byte-faithful. Skipped (not failed) when the
+/// binary is absent.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica_variants_match_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Leica variant cross-check skipped");
+    return;
+  }
+  let dir = std::env::temp_dir();
+  for case in leica_cases() {
+    let path = dir.join(std::format!("exifast_{}.tif", case.name));
+    std::fs::write(&path, case.tiff).expect("write temp Leica tif");
+    for (print_on, expected) in [(true, case.print_conv), (false, case.value_conv)] {
+      let mut args = std::vec!["-G1", "-j", "-a", "-u"];
+      if !print_on {
+        args.push("-n");
+      }
+      let out = Command::new(&tool)
+        .args(&args)
+        .arg(&path)
+        .output()
+        .expect("run exiftool");
+      assert!(out.status.success(), "{}: exiftool failed", case.name);
+      let json = String::from_utf8(out.stdout).expect("utf8");
+      let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+      let obj = doc
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|o| o.as_object())
+        .expect("doc is [{…}]");
+      for (key, val_fn) in expected {
+        assert_eq!(
+          obj.get(*key).cloned().as_ref(),
+          Some(&val_fn()),
+          "{} {}: bundled {} mismatch",
+          case.name,
+          if print_on { "-j" } else { "-n" },
+          key
+        );
+      }
+    }
+    let _ = std::fs::remove_file(&path);
+  }
+}
+
+/// A NONZERO-base regression for Leica7 `Base => '-$base'`
+/// ([`NegativeOfBase`](exifast::exif::makernotes::BaseRule::NegativeOfBase)) —
+/// the production failure mode the standalone (base-0) `LEICA7_TIFF` fixture
+/// misses.
+///
+/// The Leica7 `LEICA\0\x02\xff` MakerNote's out-of-line `LensType` (tag 0x0303)
+/// value pointer is an ABSOLUTE FILE offset. Here the Exif TIFF block is
+/// embedded in a JPEG `APP1` segment, so the container SLICES it at its NONZERO
+/// file offset (12 = SOI 2 + APP1 marker 2 + length 2 + `Exif\0\0` 6) and walks
+/// that slice with `base = 12` retained. The absolute pointer is `12 + 138 =
+/// 150` (the `"TestLeicaLens\0"` bytes sit at block offset 138). ExifTool's
+/// `Base => '-$base'` rebases it to the slice as `data[150 - 12] = data[138]`.
+///
+/// With the OLD `value_offset_base = 0` (assuming the parent base is always 0)
+/// the walker reads `data[150]`, whose `+14`-byte value runs PAST the 152-byte
+/// slice end => the value is dropped and NO `Leica:LensType` is emitted — the
+/// assertion below FAILS. The `-parent_base` (= `-12`) fix resolves it to
+/// `data[138]` => `"TestLeicaLens"`, byte-exact vs the `perl exiftool` oracle on
+/// the same JPEG (cross-checked when the binary is present).
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica7_embedded_app1_nonzero_base_reads_absolute_out_of_line_value() {
+  // JPEG: SOI + APP1[`Exif\0\0` + Leica7 TIFF block] + EOI. The Leica7 LensType
+  // value pointer is the ABSOLUTE file offset 150 (block offset 138 + base 12).
+  const LEICA7_APP1_JPEG: &[u8] = &[
+    255, 216, 255, 225, 0, 160, 69, 120, 105, 102, 0, 0, 73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2,
+    0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 28, 0, 0, 0, 66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0,
+    94, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67, 97, 109, 101, 114, 97, 32, 65, 71, 0,
+    76, 69, 73, 67, 65, 32, 77, 32, 77, 111, 110, 111, 99, 104, 114, 111, 109, 32, 40, 84, 121,
+    112, 32, 50, 52, 54, 41, 0, 1, 0, 124, 146, 7, 0, 40, 0, 0, 0, 112, 0, 0, 0, 0, 0, 0, 0, 76,
+    69, 73, 67, 65, 0, 2, 255, 1, 0, 3, 3, 2, 0, 14, 0, 0, 0, 150, 0, 0, 0, 0, 0, 0, 0, 84, 101,
+    115, 116, 76, 101, 105, 99, 97, 76, 101, 110, 115, 0, 255, 217,
+  ];
+
+  let meta =
+    exifast::exif::jpeg::parse_jpeg_exif(LEICA7_APP1_JPEG).expect("Leica7 APP1 JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_leica(), "vendor = Leica (Leica7 signature)");
+  assert_eq!(
+    mn.detected().base_rule(),
+    exifast::exif::makernotes::BaseRule::NegativeOfBase,
+    "Leica7 dispatched base rule = NegativeOfBase"
+  );
+
+  // The typed slot resolves the absolute-pointer LensType — these are the bytes
+  // the `-parent_base` rebase reads; with the old `value_offset_base = 0` the
+  // out-of-line read runs past the sliced block and the slot stays empty.
+  let leica = mn.meta().leica().expect("Leica typed slot populated");
+  assert_eq!(
+    leica.lens_name(),
+    Some("TestLeicaLens"),
+    "Leica7 out-of-line LensType (absolute ptr) must rebase to the slice"
+  );
+
+  // The full serializer emits `Leica:LensType = "TestLeicaLens"` in BOTH modes
+  // (a plain string => identical under -j and -n).
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("leica7_app1.jpg", LEICA7_APP1_JPEG, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("{mode}: invalid JSON ({e})"));
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("{mode}: doc is [{{…}}]"));
+    assert_eq!(
+      obj.get("Leica:LensType").and_then(|v| v.as_str()),
+      Some("TestLeicaLens"),
+      "{mode}: embedded-APP1 Leica7 LensType from the absolute out-of-line pointer (keys: {:?})",
+      obj.keys().collect::<Vec<_>>()
+    );
+  }
+}
+
+/// Cross-check the nonzero-base embedded-APP1 Leica7 JPEG against the bundled
+/// `perl exiftool` binary — `Leica:LensType` must match `exiftool -G1 -j -a -u`
+/// (`-n` too), proving the `-$base` absolute-pointer rebase is byte-faithful in
+/// a real container. Skipped (not failed) when the binary is absent.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica7_embedded_app1_nonzero_base_matches_bundled_exiftool() {
+  use std::process::Command;
+  // Same JPEG as the test above (absolute value pointer 150).
+  const LEICA7_APP1_JPEG: &[u8] = &[
+    255, 216, 255, 225, 0, 160, 69, 120, 105, 102, 0, 0, 73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2,
+    0, 16, 0, 0, 0, 50, 0, 0, 0, 16, 1, 2, 0, 28, 0, 0, 0, 66, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0,
+    94, 0, 0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67, 97, 109, 101, 114, 97, 32, 65, 71, 0,
+    76, 69, 73, 67, 65, 32, 77, 32, 77, 111, 110, 111, 99, 104, 114, 111, 109, 32, 40, 84, 121,
+    112, 32, 50, 52, 54, 41, 0, 1, 0, 124, 146, 7, 0, 40, 0, 0, 0, 112, 0, 0, 0, 0, 0, 0, 0, 76,
+    69, 73, 67, 65, 0, 2, 255, 1, 0, 3, 3, 2, 0, 14, 0, 0, 0, 150, 0, 0, 0, 0, 0, 0, 0, 84, 101,
+    115, 116, 76, 101, 105, 99, 97, 76, 101, 110, 115, 0, 255, 217,
+  ];
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Leica7 APP1 cross-check skipped");
+    return;
+  }
+  let path = std::env::temp_dir().join("exifast_leica7_app1.jpg");
+  std::fs::write(&path, LEICA7_APP1_JPEG).expect("write temp Leica7 APP1 jpg");
+  for print_on in [true, false] {
+    let mut args = std::vec!["-G1", "-j", "-a", "-u"];
+    if !print_on {
+      args.push("-n");
+    }
+    let out = Command::new(&tool)
+      .args(&args)
+      .arg(&path)
+      .output()
+      .expect("run exiftool");
+    assert!(out.status.success(), "exiftool failed");
+    let json = String::from_utf8(out.stdout).expect("utf8");
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .expect("doc is [{…}]");
+    assert_eq!(
+      obj.get("Leica:LensType").and_then(|v| v.as_str()),
+      Some("TestLeicaLens"),
+      "bundled {}: Leica7 APP1 LensType",
+      if print_on { "-j" } else { "-n" }
+    );
+  }
+  let _ = std::fs::remove_file(&path);
+}

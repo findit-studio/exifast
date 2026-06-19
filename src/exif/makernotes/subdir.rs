@@ -28,6 +28,7 @@
 //! See `docs/superpowers/specs/2026-06-15-makernote-engine-unification-design.md`.
 
 use crate::exif::ifd::ByteOrder;
+use crate::exif::makernotes::vendors::leica::tags::LeicaVariant;
 
 /// Which tag table the shared walker resolves names/formats/conversions against
 /// while walking a (sub-)directory. Replaces the `IfdKind`-keyed lookup so the
@@ -63,6 +64,16 @@ pub enum TableRef {
   Pentax,
   /// `%Samsung::Type2`.
   Samsung,
+  /// One of `%Panasonic::Leica2`..`Leica9` — the Leica MakerNote variant
+  /// tables (`Panasonic.pm:1604-2256`). The payload selects which of the SIX
+  /// distinct tables (Leica7 reuses `%Leica6`, Leica8 reuses `%Leica5`); the
+  /// dispatcher resolves the signature to the table-bearing [`LeicaVariant`].
+  /// A SIBLING-payload `TableRef` (rather than six bare variants) keeps the
+  /// shared-`Walker` dispatch matches to ONE `TableRef::Leica(v)` arm each, and
+  /// equality is variant-sensitive (`TableRef::Leica(a) == TableRef::Leica(b)`
+  /// iff `a == b`) — every existing `active_table == TableRef::X` check is for a
+  /// non-Leica table, so the payload does not affect them.
+  Leica(LeicaVariant),
 }
 
 /// `ProcessProc` (`MakerNotes.pm`) — the directory processor. The four real

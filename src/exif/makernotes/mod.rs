@@ -104,7 +104,7 @@ pub use vendor::{Vendor, VendorStatus};
 #[cfg(feature = "alloc")]
 pub use vendors::VendorEmission;
 pub use vendors::{
-  AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesNikon, MakerNotesPentax,
+  AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesLeica, MakerNotesNikon, MakerNotesPentax,
   MakerNotesSamsung, PanasonicMakerNote, SonyMakerNote,
 };
 
@@ -147,6 +147,11 @@ pub struct MakerNotesMeta {
   /// the Samsung Type2 port runs (`%Samsung::Type2`, the plain leaves +
   /// PictureWizard).
   samsung: Option<MakerNotesSamsung>,
+  /// Leica decoded data — populated when [`Vendor::Leica`] dispatched to one of
+  /// the Leica2..Leica9 variant tables (`%Panasonic::Leica2`..`Leica9`, the
+  /// plain camera-identity leaves). The Leica1/Leica10 cross-vendor routes
+  /// populate [`panasonic`](Self::panasonic) instead (they are Panasonic tags).
+  leica: Option<MakerNotesLeica>,
 }
 
 impl MakerNotesMeta {
@@ -166,6 +171,7 @@ impl MakerNotesMeta {
       nikon: None,
       pentax: None,
       samsung: None,
+      leica: None,
     }
   }
 
@@ -218,6 +224,12 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub fn set_samsung(&mut self, samsung: MakerNotesSamsung) {
     self.samsung = Some(samsung);
+  }
+
+  /// Replace the Leica slot — used by the IFD walker during walk (#259).
+  #[inline(always)]
+  pub fn set_leica(&mut self, leica: MakerNotesLeica) {
+    self.leica = Some(leica);
   }
 
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
@@ -455,6 +467,37 @@ impl MakerNotesMeta {
         });
         if let Some((typed, _emissions)) = parsed {
           meta.panasonic = Some(typed);
+        } else if let Some(variant) = vendors::leica::discriminate_variant(blob, make, model) {
+          // The Leica2..Leica9 variant tables (#259). Leica1/Leica10 did not
+          // match, so route the blob through the SAME isolated shared-`Walker`
+          // helper the production `-j`/`-n` dispatch uses
+          // (`exif::leica_makernote_isolated`), over the captured blob
+          // (`mn_offset = 0`, `mn_len = blob.len()`). The dispatched `detected`
+          // carries the per-variant `Start`/`Base`/`ByteOrder`; `model` threads
+          // the Leica6 Typ-006 `Condition`. The emissions are discarded —
+          // `from_blob` sets only the typed slot. A genuinely-unrecognized blob
+          // returns `None` from `discriminate_variant` and leaves the slot absent.
+          meta.leica = Some(
+            crate::exif::leica_makernote_isolated(
+              blob,
+              0,
+              blob.len(),
+              variant,
+              detected,
+              parent_order,
+              // The blob IS the whole buffer here (`mn_offset = 0`), with no
+              // parent TIFF slice — so the parent base is 0 and Leica7's
+              // `-$base` rebase is a no-op (`-0`). A Leica7 blob whose value
+              // pointers are absolute FILE offsets is only faithfully decoded on
+              // the in-TIFF path (which threads the real parent base); this
+              // blob-only constructor decodes blob-relative pointers, unchanged.
+              0,
+              model,
+              true,
+            )
+            .map(|(_emissions, typed)| typed)
+            .unwrap_or_default(),
+          );
         }
       }
       Vendor::Dji => {
@@ -643,6 +686,16 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub const fn samsung(&self) -> Option<&MakerNotesSamsung> {
     self.samsung.as_ref()
+  }
+
+  /// Leica decoded data — populated when the dispatcher resolved
+  /// [`Vendor::Leica`](Vendor::Leica) to a Leica2..Leica9 variant table (#259).
+  /// `None` for the Leica1/Leica10 cross-vendor routes (see
+  /// [`panasonic`](Self::panasonic)).
+  #[must_use]
+  #[inline(always)]
+  pub const fn leica(&self) -> Option<&MakerNotesLeica> {
+    self.leica.as_ref()
   }
 }
 
