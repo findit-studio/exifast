@@ -82,8 +82,8 @@ pub use png::{
 };
 pub use project::Project;
 pub use quicktime::{
-  AudioSampleDesc, HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeKeys, QuickTimeMeta,
-  QuickTimeUserData, VisualSampleDesc,
+  AudioSampleDesc, Bitrate, ColorRepresentation, HandlerKind, KodakFrea, MediaTrack, QuickTimeGps,
+  QuickTimeKeys, QuickTimeMeta, QuickTimeUserData, VisualSampleDesc,
 };
 pub use quicktime_brand::{
   Cr3Block, Cr3CmtKind, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta,
