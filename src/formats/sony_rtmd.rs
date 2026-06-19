@@ -973,10 +973,10 @@ pub fn process_rtmd(data: &[u8], out: &mut SonyRtmdMeta) {
   // For the cross-format domain layer (which feeds `GpsLocation` in
   // decimal degrees), exifast applies the sign so the typed projection
   // is unambiguous. The FAITHFUL bundled-value rendering is the unsigned
-  // form; the SIGNED form is exposed via the `signed_latitude` /
-  // `signed_longitude` derived accessors on [`SonyRtmdGpsSample`] (which
-  // are implicitly the `latitude` / `longitude` fields after we apply
-  // the ref here in the walker).
+  // form; the SIGNED form is folded directly into the `latitude` /
+  // `longitude` fields of [`SonyRtmdGpsSample`] here in the walker, so the
+  // `latitude()` / `longitude()` accessors and the `GpsLocation` projection
+  // carry the negative South/West coordinate.
   //
   // (This is a deliberate departure from bundled's per-Value rendering,
   // documented in the SonyRtmdGpsSample module docs.)
