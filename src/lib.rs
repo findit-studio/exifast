@@ -836,6 +836,59 @@ mod tests {
     assert!(camera.model().is_some_and(|m| m.starts_with("Canon EOS")));
   }
 
+  /// `media_metadata` over the real Sony rtmd timed-metadata fixtures projects
+  /// `GpsLocation` with the hemisphere SIGN already applied (#79). ExifTool
+  /// signs the decimal-degree coordinate by `GPSLatitudeRef` / `GPSLongitudeRef`
+  /// (`-122.165` for the West longitude of `QuickTime_sony_rtmd.mov`, per
+  /// `exiftool -ee -n -G3`); the rtmd walker's `apply_gps_ref_signs` folds the
+  /// `S`/`W` sign into the stored coordinate so `gps()` is unambiguous decimal
+  /// degrees, NOT the unsigned magnitude. The JSON goldens stay byte-identical
+  /// (they carry the faithful unsigned `GPS::ToDegrees($val)` + N/S/E/W `*Ref`);
+  /// the sign lives in the TYPED projection only.
+  #[test]
+  #[cfg(all(feature = "quicktime", feature = "std"))]
+  fn media_metadata_sony_rtmd_gps_is_signed_by_hemisphere() {
+    // West longitude ⇒ NEGATIVE; North latitude ⇒ POSITIVE (matches bundled
+    // `47.6284166666667 / -122.165`).
+    let west = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_sony_rtmd.mov"
+    ))
+    .expect("read QuickTime_sony_rtmd.mov fixture");
+    let md = media_metadata(&west).expect("sony rtmd projects to Some(MediaMetadata)");
+    let gps = md.gps().expect("gps domain populated from the rtmd fix");
+    let lat = gps.latitude().expect("signed latitude");
+    let lon = gps.longitude().expect("signed longitude");
+    assert!(
+      (lat - 47.628_416_666_666_67).abs() < 1e-9,
+      "North latitude positive, got {lat}"
+    );
+    assert!(
+      (lon + 122.165).abs() < 1e-9,
+      "West longitude negative, got {lon}"
+    );
+    // Sony rtmd never carries altitude (no `0x8506` in Sony.pm).
+    assert_eq!(gps.altitude_m(), None);
+
+    // East longitude ⇒ POSITIVE (locks the other sign direction; bundled
+    // `12 / 122.5` for the N/E `partialgps` fixture).
+    let east = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_sony_rtmd_partialgps.mov"
+    ))
+    .expect("read QuickTime_sony_rtmd_partialgps.mov fixture");
+    let md_e = media_metadata(&east).expect("partialgps projects to Some(MediaMetadata)");
+    let gps_e = md_e.gps().expect("gps domain populated");
+    assert!(
+      (gps_e.latitude().expect("lat") - 12.0).abs() < 1e-9,
+      "North latitude positive"
+    );
+    assert!(
+      (gps_e.longitude().expect("lon") - 122.5).abs() < 1e-9,
+      "East longitude stays positive"
+    );
+  }
+
   /// `media_metadata` returns `None` for empty input (no parser accepts an
   /// empty buffer) — `parse_bytes(..) == None` maps straight through.
   #[test]
