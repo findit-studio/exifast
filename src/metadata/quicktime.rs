@@ -345,6 +345,321 @@ impl Default for Bitrate {
   }
 }
 
+/// A `gmhd/gmin` Generic Media Info sub-atom decoded via the
+/// `%QuickTime::GenMediaInfo` ProcessBinaryData table (QuickTime.pm:8342). The
+/// table has no `FORMAT`, so the default `int8u` increment makes every key a
+/// raw byte offset into the `gmin` body. Found in the `minf` of a generic
+/// (text / timecode / NRT-metadata) track's `gmhd` Generic Media Header
+/// (QuickTime.pm:7315-7318). All five tags are emitted even when zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenMediaInfo {
+  /// `GenMediaVersion` (offset 0, `int8u`, QuickTime.pm:8345).
+  version: Option<u8>,
+  /// `GenFlags` (offset 1, `int8u[3]`, QuickTime.pm:8346): the space-joined
+  /// 3-byte flag triplet (the `int8u[3]` `join(" ", ...)` ValueConv).
+  flags: Option<String>,
+  /// `GenGraphicsMode` (offset 4, `int16u`, `PrintHex => 1`,
+  /// `PrintConv => \%graphicsMode`, QuickTime.pm:8347-8352): the QuickDraw
+  /// transfer-mode index. PrintConv label at `-j` (a miss ⇒ `Unknown (0x%x)`
+  /// since `PrintHex`), raw int at `-n`.
+  graphics_mode: Option<u16>,
+  /// `GenOpColor` (offset 6, `int16u[3]`, QuickTime.pm:8353): the space-joined
+  /// RGB operand-colour triplet.
+  op_color: Option<String>,
+  /// `GenBalance` (offset 12, `fixed16s`, QuickTime.pm:8354): the rounded 8.8
+  /// fixed-point sound balance (mode-invariant — ValueConv-shaped only).
+  balance: Option<f64>,
+}
+
+impl GenMediaInfo {
+  /// An empty generic media info record (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      version: None,
+      flags: None,
+      graphics_mode: None,
+      op_color: None,
+      balance: None,
+    }
+  }
+
+  /// `GenMediaVersion`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn version(&self) -> Option<u8> {
+    self.version
+  }
+
+  /// `GenFlags` — the space-joined `int8u[3]` triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn flags(&self) -> Option<&str> {
+    self.flags.as_deref()
+  }
+
+  /// `GenGraphicsMode` — the raw QuickDraw transfer-mode index.
+  #[inline(always)]
+  #[must_use]
+  pub const fn graphics_mode(&self) -> Option<u16> {
+    self.graphics_mode
+  }
+
+  /// `GenOpColor` — the space-joined `int16u[3]` RGB triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn op_color(&self) -> Option<&str> {
+    self.op_color.as_deref()
+  }
+
+  /// `GenBalance` — the rounded 8.8 fixed-point.
+  #[inline(always)]
+  #[must_use]
+  pub const fn balance(&self) -> Option<f64> {
+    self.balance
+  }
+
+  /// Set `GenMediaVersion`.
+  #[inline(always)]
+  pub const fn set_version(&mut self, v: Option<u8>) -> &mut Self {
+    self.version = v;
+    self
+  }
+
+  /// Set `GenFlags`.
+  #[inline(always)]
+  pub fn set_flags(&mut self, v: Option<String>) -> &mut Self {
+    self.flags = v;
+    self
+  }
+
+  /// Set `GenGraphicsMode`.
+  #[inline(always)]
+  pub const fn set_graphics_mode(&mut self, v: Option<u16>) -> &mut Self {
+    self.graphics_mode = v;
+    self
+  }
+
+  /// Set `GenOpColor`.
+  #[inline(always)]
+  pub fn set_op_color(&mut self, v: Option<String>) -> &mut Self {
+    self.op_color = v;
+    self
+  }
+
+  /// Set `GenBalance`.
+  #[inline(always)]
+  pub const fn set_balance(&mut self, v: Option<f64>) -> &mut Self {
+    self.balance = v;
+    self
+  }
+
+  /// Fold a later `gmin` child into `self` with ExifTool's per-field
+  /// LAST-WINS-when-present semantics. ExifTool's `ProcessBinaryData` skips a
+  /// field whose offset is past a SHORT atom but never DELETES an already-found
+  /// tag, so a full `gmin` followed by a short duplicate keeps the earlier
+  /// `Gen*` fields the short one could not reach, while overriding the ones it
+  /// did decode. Mirrors [`VisualSampleDesc::merge_from`] (every field here is a
+  /// plain last-wins — none is `PRIORITY => 0`). Verified against ExifTool
+  /// 13.59 (full then short-Version+Flags ⇒ GraphicsMode/OpColor/Balance
+  /// survive, Version/Flags last-win).
+  #[inline]
+  pub fn merge_from(&mut self, other: Self) {
+    if other.version.is_some() {
+      self.version = other.version;
+    }
+    if other.flags.is_some() {
+      self.flags = other.flags;
+    }
+    if other.graphics_mode.is_some() {
+      self.graphics_mode = other.graphics_mode;
+    }
+    if other.op_color.is_some() {
+      self.op_color = other.op_color;
+    }
+    if other.balance.is_some() {
+      self.balance = other.balance;
+    }
+  }
+}
+
+impl Default for GenMediaInfo {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// A `gmhd/tmcd/tcmi` Timecode Media Info sub-atom decoded via the
+/// `%QuickTime::TCMediaInfo` ProcessBinaryData table (QuickTime.pm:8297). The
+/// table has no `FORMAT` (default `int8u` increment), so every key is a raw
+/// byte offset into the `tcmi` body. Found in a timecode track's `gmhd`
+/// Generic Media Header, under the `tmcd` `TimeCode` SubDirectory (the `tcmi`
+/// child — QuickTime.pm:8280-8294). It carries the text-overlay styling for a
+/// burned-in timecode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TcMediaInfo {
+  /// `TextFont` (offset 4, `int16u`, `PrintConv => { 0 => System }`,
+  /// QuickTime.pm:8301-8304): the font ID. `0` ⇒ `System` at `-j`; any other
+  /// value ⇒ `Unknown ($val)` (no BITMASK, no PrintHex). Raw int at `-n`.
+  text_font: Option<u16>,
+  /// `TextFace` (offset 6, `int16u`, `PrintConv => { 0 => Plain, BITMASK
+  /// {...} }`, QuickTime.pm:8305-8320): the type-face style. `0` ⇒ `Plain`
+  /// (the direct hash hit); any other value ⇒ the `DecodeBits` of the set
+  /// Bold/Italic/Underline/Outline/Shadow/Condense/Extend bits at `-j`. Raw
+  /// int at `-n`.
+  text_face: Option<u16>,
+  /// `TextSize` (offset 8, `int16u`, QuickTime.pm:8321-8324): the point size
+  /// (bare int, both modes).
+  text_size: Option<u16>,
+  /// `TextColor` (offset 12, `int16u[3]`, QuickTime.pm:8326-8329): the
+  /// space-joined RGB foreground triplet.
+  text_color: Option<String>,
+  /// `BackgroundColor` (offset 18, `int16u[3]`, QuickTime.pm:8330-8333): the
+  /// space-joined RGB background triplet.
+  background_color: Option<String>,
+  /// `FontName` (offset 24, `pstring`, QuickTime.pm:8334-8338): the
+  /// length-prefixed Pascal string, `Decode`d with `CharsetQuickTime`
+  /// (MacRoman) by the ValueConv. Mode-invariant.
+  font_name: Option<String>,
+}
+
+impl TcMediaInfo {
+  /// An empty timecode media info record (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      text_font: None,
+      text_face: None,
+      text_size: None,
+      text_color: None,
+      background_color: None,
+      font_name: None,
+    }
+  }
+
+  /// `TextFont` — the raw font ID.
+  #[inline(always)]
+  #[must_use]
+  pub const fn text_font(&self) -> Option<u16> {
+    self.text_font
+  }
+
+  /// `TextFace` — the raw type-face style bits.
+  #[inline(always)]
+  #[must_use]
+  pub const fn text_face(&self) -> Option<u16> {
+    self.text_face
+  }
+
+  /// `TextSize` — the point size.
+  #[inline(always)]
+  #[must_use]
+  pub const fn text_size(&self) -> Option<u16> {
+    self.text_size
+  }
+
+  /// `TextColor` — the space-joined `int16u[3]` RGB triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn text_color(&self) -> Option<&str> {
+    self.text_color.as_deref()
+  }
+
+  /// `BackgroundColor` — the space-joined `int16u[3]` RGB triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn background_color(&self) -> Option<&str> {
+    self.background_color.as_deref()
+  }
+
+  /// `FontName` — the MacRoman-decoded Pascal string.
+  #[inline(always)]
+  #[must_use]
+  pub fn font_name(&self) -> Option<&str> {
+    self.font_name.as_deref()
+  }
+
+  /// Set `TextFont`.
+  #[inline(always)]
+  pub const fn set_text_font(&mut self, v: Option<u16>) -> &mut Self {
+    self.text_font = v;
+    self
+  }
+
+  /// Set `TextFace`.
+  #[inline(always)]
+  pub const fn set_text_face(&mut self, v: Option<u16>) -> &mut Self {
+    self.text_face = v;
+    self
+  }
+
+  /// Set `TextSize`.
+  #[inline(always)]
+  pub const fn set_text_size(&mut self, v: Option<u16>) -> &mut Self {
+    self.text_size = v;
+    self
+  }
+
+  /// Set `TextColor`.
+  #[inline(always)]
+  pub fn set_text_color(&mut self, v: Option<String>) -> &mut Self {
+    self.text_color = v;
+    self
+  }
+
+  /// Set `BackgroundColor`.
+  #[inline(always)]
+  pub fn set_background_color(&mut self, v: Option<String>) -> &mut Self {
+    self.background_color = v;
+    self
+  }
+
+  /// Set `FontName`.
+  #[inline(always)]
+  pub fn set_font_name(&mut self, v: Option<String>) -> &mut Self {
+    self.font_name = v;
+    self
+  }
+
+  /// Fold a later `tcmi` child into `self` with ExifTool's per-field
+  /// LAST-WINS-when-present semantics (see [`GenMediaInfo::merge_from`]): a full
+  /// `tcmi` followed by a short duplicate keeps the earlier `Text*`/`FontName`
+  /// fields the short one could not reach. Every field is a plain last-wins.
+  /// Verified against ExifTool 13.59 (full then short-TextFont ⇒ TextSize and
+  /// FontName survive, TextFont last-wins).
+  #[inline]
+  pub fn merge_from(&mut self, other: Self) {
+    if other.text_font.is_some() {
+      self.text_font = other.text_font;
+    }
+    if other.text_face.is_some() {
+      self.text_face = other.text_face;
+    }
+    if other.text_size.is_some() {
+      self.text_size = other.text_size;
+    }
+    if other.text_color.is_some() {
+      self.text_color = other.text_color;
+    }
+    if other.background_color.is_some() {
+      self.background_color = other.background_color;
+    }
+    if other.font_name.is_some() {
+      self.font_name = other.font_name;
+    }
+  }
+}
+
+impl Default for TcMediaInfo {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// A `vide`-track `stsd` Visual Sample Description (ExifTool
 /// `%QuickTime::VisualSampleDesc`, QuickTime.pm:7585). The codec-identity
 /// fields decoded by [`crate::formats::quicktime`] via the `ProcessHybrid`
@@ -913,6 +1228,27 @@ pub struct MediaTrack {
   /// The first `stsd` Audio Sample Description (a `soun`-handler track),
   /// [`AudioSampleDesc`]. `None` for a non-audio track or an undecoded `stsd`.
   audio_sample_desc: Option<AudioSampleDesc>,
+  /// `minf/vmhd` VideoHeader GraphicsMode (the `%QuickTime::VideoHeader` key 2
+  /// ⇒ byte 4, `int16u`, `PrintHex => 1`, `PrintConv => \%graphicsMode`,
+  /// QuickTime.pm:7335-7340). Present only for a video track with a `vmhd`.
+  /// Drives `Track<N>:GraphicsMode` (label at `-j`, raw int at `-n`).
+  video_graphics_mode: Option<u16>,
+  /// `minf/vmhd` VideoHeader OpColor (key 3 ⇒ byte 6, `int16u[3]`,
+  /// QuickTime.pm:7341): the space-joined RGB operand-colour triplet. Drives
+  /// `Track<N>:OpColor`.
+  video_op_color: Option<String>,
+  /// `tref/tmcd` TimecodeTrack — the referenced timecode track's ID
+  /// (`%QuickTime::TrackRef` `tmcd` ⇒ `int32u`, QuickTime.pm:3428). The `tref`
+  /// is a DIRECT child of `trak`. Drives `Track<N>:TimecodeTrack` (bare int).
+  timecode_track: Option<u32>,
+  /// `minf/gmhd/gmin` Generic Media Info ([`GenMediaInfo`],
+  /// QuickTime.pm:8272-8275). Present for a generic (text / timecode /
+  /// NRT-metadata) track with a `gmhd`. Drives the `Track<N>:Gen*` tags.
+  gen_media_info: Option<GenMediaInfo>,
+  /// `minf/gmhd/tmcd/tcmi` Timecode Media Info ([`TcMediaInfo`],
+  /// QuickTime.pm:8280-8294). Present for a timecode track whose `gmhd` carries
+  /// a `tmcd` `TimeCode` SubDirectory. Drives the `Track<N>` text-styling tags.
+  tc_media_info: Option<TcMediaInfo>,
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427 `1 =>
   /// 'Track#'`). ExifTool's `$track` counter is a `my` local of each
   /// `ProcessMOV` invocation (QuickTime.pm:9944) that increments per `trak`
@@ -964,6 +1300,11 @@ impl MediaTrack {
       audio_balance: None,
       visual_sample_desc: None,
       audio_sample_desc: None,
+      video_graphics_mode: None,
+      video_op_color: None,
+      timecode_track: None,
+      gen_media_info: None,
+      tc_media_info: None,
       track_group: None,
       warning: None,
     }
@@ -1154,6 +1495,42 @@ impl MediaTrack {
   #[must_use]
   pub const fn audio_sample_desc(&self) -> Option<&AudioSampleDesc> {
     self.audio_sample_desc.as_ref()
+  }
+
+  /// `minf/vmhd` VideoHeader GraphicsMode (the raw QuickDraw transfer-mode
+  /// index, `int16u`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_graphics_mode(&self) -> Option<u16> {
+    self.video_graphics_mode
+  }
+
+  /// `minf/vmhd` VideoHeader OpColor (the space-joined `int16u[3]` RGB triplet).
+  #[inline(always)]
+  #[must_use]
+  pub fn video_op_color(&self) -> Option<&str> {
+    self.video_op_color.as_deref()
+  }
+
+  /// `tref/tmcd` TimecodeTrack — the referenced timecode track's ID.
+  #[inline(always)]
+  #[must_use]
+  pub const fn timecode_track(&self) -> Option<u32> {
+    self.timecode_track
+  }
+
+  /// `minf/gmhd/gmin` Generic Media Info ([`GenMediaInfo`]).
+  #[inline(always)]
+  #[must_use]
+  pub const fn gen_media_info(&self) -> Option<&GenMediaInfo> {
+    self.gen_media_info.as_ref()
+  }
+
+  /// `minf/gmhd/tmcd/tcmi` Timecode Media Info ([`TcMediaInfo`]).
+  #[inline(always)]
+  #[must_use]
+  pub const fn tc_media_info(&self) -> Option<&TcMediaInfo> {
+    self.tc_media_info.as_ref()
   }
 
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427), reset
@@ -1361,6 +1738,41 @@ impl MediaTrack {
   #[inline(always)]
   pub fn set_audio_sample_desc(&mut self, v: Option<AudioSampleDesc>) -> &mut Self {
     self.audio_sample_desc = v;
+    self
+  }
+
+  /// Set the `minf/vmhd` VideoHeader GraphicsMode.
+  #[inline(always)]
+  pub const fn set_video_graphics_mode(&mut self, v: Option<u16>) -> &mut Self {
+    self.video_graphics_mode = v;
+    self
+  }
+
+  /// Set the `minf/vmhd` VideoHeader OpColor.
+  #[inline(always)]
+  pub fn set_video_op_color(&mut self, v: Option<String>) -> &mut Self {
+    self.video_op_color = v;
+    self
+  }
+
+  /// Set the `tref/tmcd` TimecodeTrack.
+  #[inline(always)]
+  pub const fn set_timecode_track(&mut self, v: Option<u32>) -> &mut Self {
+    self.timecode_track = v;
+    self
+  }
+
+  /// Set the `minf/gmhd/gmin` Generic Media Info.
+  #[inline(always)]
+  pub fn set_gen_media_info(&mut self, v: Option<GenMediaInfo>) -> &mut Self {
+    self.gen_media_info = v;
+    self
+  }
+
+  /// Set the `minf/gmhd/tmcd/tcmi` Timecode Media Info.
+  #[inline(always)]
+  pub fn set_tc_media_info(&mut self, v: Option<TcMediaInfo>) -> &mut Self {
+    self.tc_media_info = v;
     self
   }
 

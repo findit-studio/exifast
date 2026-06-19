@@ -1331,11 +1331,13 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   //
   // exifast emits a clean SUBSET of the bundled tags (zero extra). The QuickTime
   // container phase-1 port (#100) decodes the `hdlr` HandlerDescription and the
-  // `vide`/`soun`/other `stsd` sample-description fixed fields; the phase-2 port
-  // adds the `stsd`-entry `colr`/`pasp`/`btrt` CHILD atoms (the `ProcessHybrid`
-  // child-atom walk). So the retained set includes per-track `HandlerDescription`,
-  // the `vide` `CompressorID`/`SourceImageWidth`/`SourceImageHeight`/
-  // `XResolution`/`YResolution`/`CompressorName`/`BitDepth`, the `colr`
+  // `vide`/`soun`/other `stsd` sample-description fixed fields; phase-2 adds the
+  // `stsd`-entry `colr`/`pasp`/`btrt` CHILD atoms (the `ProcessHybrid`
+  // child-atom walk); phase-4 adds the `vmhd` `GraphicsMode`/`OpColor` and the
+  // `tref` `TimecodeTrack`. So the retained set includes per-track
+  // `HandlerDescription`, the `vide` `CompressorID`/`SourceImageWidth`/
+  // `SourceImageHeight`/`XResolution`/`YResolution`/`CompressorName`/`BitDepth`,
+  // the `vmhd` `GraphicsMode`/`OpColor`, the `tref` `TimecodeTrack`, the `colr`
   // `ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/`MatrixCoefficients`/
   // `VideoFullRangeFlag` (the CICP enums), the `pasp` `PixelAspectRatio`, the
   // `btrt` `BufferSize`/`MaxBitrate`/`AverageBitrate` (`PRIORITY => 0`), the `soun`
@@ -1352,9 +1354,9 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   //     `udta/hdlr` `mdir`/`appl`), family-1-scoped so the per-track
   //     `Track<N>:HandlerType`/`HandlerDescription` the port DOES emit is
   //     retained;
-  //   - the deferred per-track minf/stbl detail the port does NOT yet walk:
-  //     the `vmhd` `GraphicsMode`/`OpColor`, the `stts` `VideoFrameRate`, the
-  //     `tref` `TimecodeTrack`, and the `tmcd` `PlaybackFrameRate`.
+  //   - the deferred `stts`-derived frame rates the port does NOT yet walk:
+  //     the `stts` `VideoFrameRate` (Track1) and the `tmcd` `PlaybackFrameRate`
+  //     (Track3) — a later QuickTime-container phase.
   // The retained set is byte-exact vs the bundled `perl exiftool 13.59 -j -G1
   // -struct -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
   check(
@@ -1804,16 +1806,16 @@ fn heic_msf1_brand_conformance() {
   // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
   //
   // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
-  // -x ImageSpatialExtent -x GraphicsMode -x OpColor` + the `hvcC` HEVC
-  // sample-description config block (`HEVCConfigurationVersion`,
+  // -x ImageSpatialExtent` + the `hvcC` HEVC sample-description config block
+  // (`HEVCConfigurationVersion`,
   // `GeneralProfileSpace`/`GeneralTierFlag`/`GeneralProfileIDC`,
   // `GenProfileCompatibilityFlags`, `ConstraintIndicatorFlags`,
   // `GeneralLevelIDC`, `MinSpatialSegmentationIDC`, `ParallelismType`,
   // `ChromaFormat`, `BitDepthLuma`/`BitDepthChroma`, `AverageFrameRate`/
   // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`). The `pict`
   // track is a non-`vide`/`soun`/`meta` handler, so the phase-1 port (#100)
-  // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1" — now RETAINED (the
-  // `vmhd` `GraphicsMode`/`OpColor` stay deferred).
+  // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1"; the phase-4 port adds
+  // the `vmhd` `GraphicsMode`/`OpColor` — all three now RETAINED byte-exact.
   //
   // `-x Copy1:HandlerType` is the ONE non-obvious exclusion: the file carries
   // TWO `hdlr` boxes with the SAME tag NAME — the file-`meta` `hdlr` (which the
