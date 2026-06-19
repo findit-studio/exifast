@@ -4577,6 +4577,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // value threaded across the whole brand walk so a CMT3 sees the most-recent
   // preceding CMT1 `Model`, even one in an earlier Canon `uuid` atom.
   let mut canon_uuid_model: Option<smol_str::SmolStr> = None;
+  // #218 — one FILE-SCOPED HEIF `iloc` extent budget bounds the total
+  // materialized extents across EVERY `meta` box anywhere in the file (not
+  // per-`meta`, not per-`iloc`-box); `scan_quicktime_brands` threads this same
+  // `&mut` through its recursion and into every `walk_heif_meta`. Seeded at
+  // the canonical ceiling; never fires on a conforming file (see
+  // `MAX_ILOC_EXTENTS`).
+  let mut iloc_extents_remaining: u64 = crate::formats::quicktime_brands::MAX_ILOC_EXTENTS;
   crate::formats::quicktime_brands::scan_quicktime_brands(
     scan_data,
     0,
@@ -4585,6 +4592,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     &mut heif_meta,
     &mut cr3_meta,
     &mut canon_uuid_model,
+    &mut iloc_extents_remaining,
   );
 
   // SP4 — CR3 / CRM file-type override. Canon.pm:9667 `OverrideFileType
