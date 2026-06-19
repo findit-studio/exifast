@@ -41,5 +41,7 @@
   "Track1:MediaDuration": 0,
   "Track1:MediaLanguageCode": "und",
   "Track1:Warning": "[minor] The ExtractEmbedded option may find more tags in the media data",
-  "Track1:HandlerType": "text"
+  "Track1:HandlerType": "text",
+  "Track1:HandlerDescription": "nhml@GPAC0.5.1-DEV-rev5339",
+  "Track1:OtherFormat": "depi"
 }]

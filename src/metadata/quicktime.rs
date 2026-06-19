@@ -124,6 +124,360 @@ impl HandlerKind {
   }
 }
 
+/// A `vide`-track `stsd` Visual Sample Description (ExifTool
+/// `%QuickTime::VisualSampleDesc`, QuickTime.pm:7585). The codec-identity
+/// fields decoded by [`crate::formats::quicktime`] via the `ProcessHybrid`
+/// binary layout (the table's default `FORMAT => 'int16u'` sets the per-key
+/// byte stride to 2). Every field is optional: an entry too short for a given
+/// offset leaves it `None`.
+///
+/// `ProcessSampleDesc` decodes EVERY `stsd` entry, so this struct accumulates
+/// the per-tag LAST-WINS value across all entries (a later entry's present
+/// field overrides an earlier one; an absent field does not clear it — see
+/// [`VisualSampleDesc::merge_from`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualSampleDesc {
+  /// `CompressorID` (key 2 ⇒ byte 4, `string[4]`): the codec 4cc (`avc1`,
+  /// `hvc1`, `mp4v`, …). Drives `Track<N>:CompressorID`.
+  compressor_id: Option<String>,
+  /// `VendorID` (key 10 ⇒ byte 20, `string[4]`, `RawConv => 'length $val ?
+  /// $val : undef'`): `None` when the 4 bytes NUL-truncate to empty. Drives
+  /// `Track<N>:VendorID` (the shared `%vendorID` PrintConv).
+  vendor_id: Option<String>,
+  /// `SourceImageWidth` (key 16 ⇒ byte 32, `int16u`).
+  source_image_width: Option<u16>,
+  /// `SourceImageHeight` (key 17 ⇒ byte 34, `int16u`).
+  source_image_height: Option<u16>,
+  /// `XResolution` (key 18 ⇒ byte 36, `fixed32u`): the rounded 16.16
+  /// fixed-point DPI (`GetFixed32u`, ExifTool.pm:6139).
+  x_resolution: Option<f64>,
+  /// `YResolution` (key 20 ⇒ byte 40, `fixed32u`).
+  y_resolution: Option<f64>,
+  /// `CompressorName` (key 25 ⇒ byte 50, `string[32]`): the human-readable
+  /// encoder name, post the Pascal/C-string `RawConv` (QuickTime.pm:7640).
+  compressor_name: Option<String>,
+  /// `BitDepth` (key 41 ⇒ byte 82, `int16u`).
+  bit_depth: Option<u16>,
+}
+
+impl VisualSampleDesc {
+  /// An empty Visual Sample Description (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      compressor_id: None,
+      vendor_id: None,
+      source_image_width: None,
+      source_image_height: None,
+      x_resolution: None,
+      y_resolution: None,
+      compressor_name: None,
+      bit_depth: None,
+    }
+  }
+
+  /// `CompressorID` — the codec 4cc.
+  #[inline(always)]
+  #[must_use]
+  pub fn compressor_id(&self) -> Option<&str> {
+    self.compressor_id.as_deref()
+  }
+
+  /// `VendorID` — `None` when empty.
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// `SourceImageWidth`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn source_image_width(&self) -> Option<u16> {
+    self.source_image_width
+  }
+
+  /// `SourceImageHeight`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn source_image_height(&self) -> Option<u16> {
+    self.source_image_height
+  }
+
+  /// `XResolution` (rounded 16.16 fixed-point).
+  #[inline(always)]
+  #[must_use]
+  pub const fn x_resolution(&self) -> Option<f64> {
+    self.x_resolution
+  }
+
+  /// `YResolution` (rounded 16.16 fixed-point).
+  #[inline(always)]
+  #[must_use]
+  pub const fn y_resolution(&self) -> Option<f64> {
+    self.y_resolution
+  }
+
+  /// `CompressorName` (post Pascal/C-string `RawConv`).
+  #[inline(always)]
+  #[must_use]
+  pub fn compressor_name(&self) -> Option<&str> {
+    self.compressor_name.as_deref()
+  }
+
+  /// `BitDepth`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn bit_depth(&self) -> Option<u16> {
+    self.bit_depth
+  }
+
+  /// Set `CompressorID`.
+  #[inline(always)]
+  pub fn set_compressor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.compressor_id = v;
+    self
+  }
+
+  /// Set `VendorID`.
+  #[inline(always)]
+  pub fn set_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.vendor_id = v;
+    self
+  }
+
+  /// Set `SourceImageWidth`.
+  #[inline(always)]
+  pub const fn set_source_image_width(&mut self, v: Option<u16>) -> &mut Self {
+    self.source_image_width = v;
+    self
+  }
+
+  /// Set `SourceImageHeight`.
+  #[inline(always)]
+  pub const fn set_source_image_height(&mut self, v: Option<u16>) -> &mut Self {
+    self.source_image_height = v;
+    self
+  }
+
+  /// Set `XResolution`.
+  #[inline(always)]
+  pub const fn set_x_resolution(&mut self, v: Option<f64>) -> &mut Self {
+    self.x_resolution = v;
+    self
+  }
+
+  /// Set `YResolution`.
+  #[inline(always)]
+  pub const fn set_y_resolution(&mut self, v: Option<f64>) -> &mut Self {
+    self.y_resolution = v;
+    self
+  }
+
+  /// Set `CompressorName`.
+  #[inline(always)]
+  pub fn set_compressor_name(&mut self, v: Option<String>) -> &mut Self {
+    self.compressor_name = v;
+    self
+  }
+
+  /// Set `BitDepth`.
+  #[inline(always)]
+  pub const fn set_bit_depth(&mut self, v: Option<u16>) -> &mut Self {
+    self.bit_depth = v;
+    self
+  }
+
+  /// Fold a later `stsd` entry's Visual Sample Description into `self` with
+  /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics: each field set
+  /// (`Some`) in `other` overrides the prior value, while a field absent
+  /// (`None`) in `other` leaves the earlier value intact. ExifTool re-runs
+  /// `ProcessBinaryData` per entry, so a later entry's present tag overwrites
+  /// the FoundTag and an absent one never erases it (QuickTime.pm:9640-9648).
+  #[inline]
+  pub fn merge_from(&mut self, other: Self) {
+    if other.compressor_id.is_some() {
+      self.compressor_id = other.compressor_id;
+    }
+    if other.vendor_id.is_some() {
+      self.vendor_id = other.vendor_id;
+    }
+    if other.source_image_width.is_some() {
+      self.source_image_width = other.source_image_width;
+    }
+    if other.source_image_height.is_some() {
+      self.source_image_height = other.source_image_height;
+    }
+    if other.x_resolution.is_some() {
+      self.x_resolution = other.x_resolution;
+    }
+    if other.y_resolution.is_some() {
+      self.y_resolution = other.y_resolution;
+    }
+    if other.compressor_name.is_some() {
+      self.compressor_name = other.compressor_name;
+    }
+    if other.bit_depth.is_some() {
+      self.bit_depth = other.bit_depth;
+    }
+  }
+}
+
+impl Default for VisualSampleDesc {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// A `soun`-track `stsd` Audio Sample Description (ExifTool
+/// `%QuickTime::AudioSampleDesc`, QuickTime.pm:7498). The audio-identity fields
+/// decoded via `ProcessHybrid` (the table has no explicit `FORMAT`, so the
+/// default `int8u` sets a per-key byte stride of 1). `Balance` is NOT here — it
+/// comes from the track's `minf/smhd` AudioHeader (QuickTime.pm:7344), stored
+/// on the [`MediaTrack`].
+///
+/// `ProcessSampleDesc` decodes EVERY `stsd` entry, so this struct accumulates
+/// the per-tag LAST-WINS value across all entries (see
+/// [`AudioSampleDesc::merge_from`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSampleDesc {
+  /// `AudioFormat` (key 4 ⇒ byte 4, `undef[4]`): the codec 4cc (`mp4a`,
+  /// `twos`, …). The `RawConv` returns `undef` unless the 4cc matches
+  /// `/^[\w ]{4}$/i`, so a non-word/space code yields `None`
+  /// (QuickTime.pm:7510). Drives `Track<N>:AudioFormat`.
+  audio_format: Option<String>,
+  /// `AudioVendorID` (key 20 ⇒ byte 20, `undef[4]`, `RawConv => '$val eq
+  /// "\0\0\0\0" ? undef : $val'`, `Condition => '$$self{AudioFormat} ne
+  /// "mp4s"'`): `None` when all-zero or the format is `mp4s`. Drives
+  /// `Track<N>:AudioVendorID` (the shared `%vendorID` PrintConv).
+  vendor_id: Option<String>,
+  /// `AudioChannels` (key 24 ⇒ byte 24, `int16u`).
+  channels: Option<u16>,
+  /// `AudioBitsPerSample` (key 26 ⇒ byte 26, `int16u`).
+  bits_per_sample: Option<u16>,
+  /// `AudioSampleRate` (key 32 ⇒ byte 32, `fixed32u`): the rounded 16.16
+  /// fixed-point sample rate (`GetFixed32u`).
+  sample_rate: Option<f64>,
+}
+
+impl AudioSampleDesc {
+  /// An empty Audio Sample Description (every field `None`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      audio_format: None,
+      vendor_id: None,
+      channels: None,
+      bits_per_sample: None,
+      sample_rate: None,
+    }
+  }
+
+  /// `AudioFormat` — the codec 4cc (`None` if the `/^[\w ]{4}$/i` RawConv
+  /// rejected it).
+  #[inline(always)]
+  #[must_use]
+  pub fn audio_format(&self) -> Option<&str> {
+    self.audio_format.as_deref()
+  }
+
+  /// `AudioVendorID` — `None` when empty or format `mp4s`.
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// `AudioChannels`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn channels(&self) -> Option<u16> {
+    self.channels
+  }
+
+  /// `AudioBitsPerSample`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn bits_per_sample(&self) -> Option<u16> {
+    self.bits_per_sample
+  }
+
+  /// `AudioSampleRate` (rounded 16.16 fixed-point).
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_rate(&self) -> Option<f64> {
+    self.sample_rate
+  }
+
+  /// Set `AudioFormat`.
+  #[inline(always)]
+  pub fn set_audio_format(&mut self, v: Option<String>) -> &mut Self {
+    self.audio_format = v;
+    self
+  }
+
+  /// Set `AudioVendorID`.
+  #[inline(always)]
+  pub fn set_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.vendor_id = v;
+    self
+  }
+
+  /// Set `AudioChannels`.
+  #[inline(always)]
+  pub const fn set_channels(&mut self, v: Option<u16>) -> &mut Self {
+    self.channels = v;
+    self
+  }
+
+  /// Set `AudioBitsPerSample`.
+  #[inline(always)]
+  pub const fn set_bits_per_sample(&mut self, v: Option<u16>) -> &mut Self {
+    self.bits_per_sample = v;
+    self
+  }
+
+  /// Set `AudioSampleRate`.
+  #[inline(always)]
+  pub const fn set_sample_rate(&mut self, v: Option<f64>) -> &mut Self {
+    self.sample_rate = v;
+    self
+  }
+
+  /// Fold a later `stsd` entry's Audio Sample Description into `self` with
+  /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics (see
+  /// [`VisualSampleDesc::merge_from`]): a `Some` field in `other` overrides,
+  /// a `None` field leaves the earlier value (QuickTime.pm:9640-9648).
+  #[inline]
+  pub fn merge_from(&mut self, other: Self) {
+    if other.audio_format.is_some() {
+      self.audio_format = other.audio_format;
+    }
+    if other.vendor_id.is_some() {
+      self.vendor_id = other.vendor_id;
+    }
+    if other.channels.is_some() {
+      self.channels = other.channels;
+    }
+    if other.bits_per_sample.is_some() {
+      self.bits_per_sample = other.bits_per_sample;
+    }
+    if other.sample_rate.is_some() {
+      self.sample_rate = other.sample_rate;
+    }
+  }
+}
+
+impl Default for AudioSampleDesc {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// One QuickTime track — the typed mirror of a `trak` atom and its
 /// `tkhd` / `mdia(mdhd, hdlr)` children (QuickTime.pm:1424-1582,
 /// 7218-7327). All fields are optional: a fixture too short for a given
@@ -191,6 +545,27 @@ pub struct MediaTrack {
   /// sample-desc table; an unmatched handler to `OtherSampleDesc`'s
   /// `OtherFormat`, NOT `MetaFormat`).
   meta_format: Option<String>,
+  /// `hdlr` HandlerVendorID (the `mdia/hdlr` body offset 12, `undef[4]`,
+  /// QuickTime.pm:8446). `None` when all-zero (`RawConv => '$val eq
+  /// "\0\0\0\0" ? undef : $val'`). Drives `Track<N>:HandlerVendorID` (the
+  /// shared `%vendorID` PrintConv).
+  handler_vendor_id: Option<String>,
+  /// `hdlr` HandlerDescription (the `mdia/hdlr` body offset 24 to end,
+  /// `string`, QuickTime.pm:8452). The post-`RawConv` value: a leading
+  /// `\0`-`\x1f` byte marks a Pascal/counted string (`substr($val, 1,
+  /// ord(first))`), else a NUL-terminated C string; an empty result is `None`.
+  /// Drives `Track<N>:HandlerDescription`.
+  handler_description: Option<String>,
+  /// `minf/smhd` AudioHeader Balance (the `%QuickTime::AudioHeader` key 2 ⇒
+  /// byte 4, `fixed16s`, QuickTime.pm:7349). Present only for an audio track
+  /// with an `smhd`. Drives `Track<N>:Balance` (the rounded 16.8 fixed-point).
+  audio_balance: Option<f64>,
+  /// The first `stsd` Visual Sample Description (a `vide`-handler track),
+  /// [`VisualSampleDesc`]. `None` for a non-video track or an undecoded `stsd`.
+  visual_sample_desc: Option<VisualSampleDesc>,
+  /// The first `stsd` Audio Sample Description (a `soun`-handler track),
+  /// [`AudioSampleDesc`]. `None` for a non-audio track or an undecoded `stsd`.
+  audio_sample_desc: Option<AudioSampleDesc>,
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427 `1 =>
   /// 'Track#'`). ExifTool's `$track` counter is a `my` local of each
   /// `ProcessMOV` invocation (QuickTime.pm:9944) that increments per `trak`
@@ -237,6 +612,11 @@ impl MediaTrack {
       handler_code: None,
       handler: None,
       meta_format: None,
+      handler_vendor_id: None,
+      handler_description: None,
+      audio_balance: None,
+      visual_sample_desc: None,
+      audio_sample_desc: None,
       track_group: None,
       warning: None,
     }
@@ -388,6 +768,45 @@ impl MediaTrack {
   #[must_use]
   pub fn meta_format(&self) -> Option<&str> {
     self.meta_format.as_deref()
+  }
+
+  /// `hdlr` HandlerVendorID (`None` when all-zero).
+  #[inline(always)]
+  #[must_use]
+  pub fn handler_vendor_id(&self) -> Option<&str> {
+    self.handler_vendor_id.as_deref()
+  }
+
+  /// `hdlr` HandlerDescription (post the Pascal/C-string `RawConv`), `None`
+  /// when empty.
+  #[inline(always)]
+  #[must_use]
+  pub fn handler_description(&self) -> Option<&str> {
+    self.handler_description.as_deref()
+  }
+
+  /// `minf/smhd` Balance (the rounded 16.8 fixed-point), `None` for a track
+  /// with no audio media header.
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_balance(&self) -> Option<f64> {
+    self.audio_balance
+  }
+
+  /// The merged `stsd` Visual Sample Description (a `vide`-handler track;
+  /// per-tag last-wins across all sample-description entries).
+  #[inline(always)]
+  #[must_use]
+  pub const fn visual_sample_desc(&self) -> Option<&VisualSampleDesc> {
+    self.visual_sample_desc.as_ref()
+  }
+
+  /// The merged `stsd` Audio Sample Description (a `soun`-handler track;
+  /// per-tag last-wins across all sample-description entries).
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_sample_desc(&self) -> Option<&AudioSampleDesc> {
+    self.audio_sample_desc.as_ref()
   }
 
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427), reset
@@ -560,6 +979,41 @@ impl MediaTrack {
   #[inline(always)]
   pub fn set_meta_format(&mut self, v: Option<String>) -> &mut Self {
     self.meta_format = v;
+    self
+  }
+
+  /// Set the `hdlr` HandlerVendorID (already RawConv-filtered to non-zero).
+  #[inline(always)]
+  pub fn set_handler_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.handler_vendor_id = v;
+    self
+  }
+
+  /// Set the `hdlr` HandlerDescription (already RawConv-decoded).
+  #[inline(always)]
+  pub fn set_handler_description(&mut self, v: Option<String>) -> &mut Self {
+    self.handler_description = v;
+    self
+  }
+
+  /// Set the `minf/smhd` Balance.
+  #[inline(always)]
+  pub const fn set_audio_balance(&mut self, v: Option<f64>) -> &mut Self {
+    self.audio_balance = v;
+    self
+  }
+
+  /// Set the merged `stsd` Visual Sample Description.
+  #[inline(always)]
+  pub fn set_visual_sample_desc(&mut self, v: Option<VisualSampleDesc>) -> &mut Self {
+    self.visual_sample_desc = v;
+    self
+  }
+
+  /// Set the merged `stsd` Audio Sample Description.
+  #[inline(always)]
+  pub fn set_audio_sample_desc(&mut self, v: Option<AudioSampleDesc>) -> &mut Self {
+    self.audio_sample_desc = v;
     self
   }
 
@@ -1540,6 +1994,13 @@ pub struct QuickTimeMeta {
   /// `QuickTime:HandlerClass`. `None` for an all-zero ComponentType (the common
   /// case) or no `moov/meta/hdlr`.
   meta_handler_class: Option<String>,
+  /// **SP2** — the `moov/meta` HandlerVendorID (`hdlr` body offset 12,
+  /// `undef[4]`). `None` when all-zero. Surfaced as `QuickTime:HandlerVendorID`.
+  meta_handler_vendor_id: Option<String>,
+  /// **SP2** — the `moov/meta` HandlerDescription (`hdlr` body offset 24 to
+  /// end, post the Pascal/C-string `RawConv`). Surfaced as
+  /// `QuickTime:HandlerDescription`.
+  meta_handler_description: Option<String>,
   /// **SP2** — the `moov/udta` camera/metadata atoms. [`QuickTimeUserData`].
   user_data: QuickTimeUserData,
   /// **SP2** — the `moov/meta` Keys/ItemList camera/metadata. [`QuickTimeKeys`].
@@ -1576,6 +2037,8 @@ impl QuickTimeMeta {
       tracks: Vec::new(),
       meta_handler_type: None,
       meta_handler_class: None,
+      meta_handler_vendor_id: None,
+      meta_handler_description: None,
       user_data: QuickTimeUserData::new(),
       keys: QuickTimeKeys::new(),
     }
@@ -1977,6 +2440,21 @@ impl QuickTimeMeta {
     self.meta_handler_class.as_deref()
   }
 
+  /// **SP2** — the `moov/meta` HandlerVendorID (`None` when all-zero).
+  #[inline(always)]
+  #[must_use]
+  pub fn meta_handler_vendor_id(&self) -> Option<&str> {
+    self.meta_handler_vendor_id.as_deref()
+  }
+
+  /// **SP2** — the `moov/meta` HandlerDescription (post the Pascal/C-string
+  /// `RawConv`), `None` when empty.
+  #[inline(always)]
+  #[must_use]
+  pub fn meta_handler_description(&self) -> Option<&str> {
+    self.meta_handler_description.as_deref()
+  }
+
   /// **SP2** — the decoded `moov/udta` camera/metadata atoms.
   #[inline(always)]
   #[must_use]
@@ -2015,6 +2493,20 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub fn set_meta_handler_class(&mut self, v: Option<String>) -> &mut Self {
     self.meta_handler_class = v;
+    self
+  }
+
+  /// **SP2** — set the `moov/meta` HandlerVendorID (RawConv-filtered).
+  #[inline(always)]
+  pub fn set_meta_handler_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.meta_handler_vendor_id = v;
+    self
+  }
+
+  /// **SP2** — set the `moov/meta` HandlerDescription (RawConv-decoded).
+  #[inline(always)]
+  pub fn set_meta_handler_description(&mut self, v: Option<String>) -> &mut Self {
+    self.meta_handler_description = v;
     self
   }
 }

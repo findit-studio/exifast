@@ -3282,22 +3282,14 @@ fn insta360_atomspan_trailer_byte_exact() {
 // already matches byte-exact, so the no-`ee` test does NOT exclude it.
 const FX3_STRUCT_EXCL: &[&str] = &[
   "TimeZone",
-  "BitDepth",
-  "CompressorID",
-  "CompressorName",
+  // `vmhd` VideoHeader + `stts` frame-rate — still deferred (Phase 2/3); the
+  // `stsd` sample-description fields (Compressor*/SourceImage*/X/YResolution/
+  // BitDepth/Audio*/Balance) and the per-`trak` HandlerDescription are now
+  // emitted by the #100 container phase-1 port and compared byte-exact.
   "GraphicsMode",
   "OpColor",
-  "SourceImageWidth",
-  "SourceImageHeight",
-  "XResolution",
-  "YResolution",
   "VideoFrameRate",
-  "AudioFormat",
-  "AudioChannels",
-  "AudioBitsPerSample",
-  "AudioSampleRate",
-  "Balance",
-  "HandlerDescription",
+  // `tapt`/`prop` track property + `tref` ContentDescribes — not yet ported.
   "TrackProperty",
   "ContentDescribes",
 ];
@@ -3307,22 +3299,9 @@ const FX3_STRUCT_EXCL: &[&str] = &[
 /// read-error channel exifast does not yet model.
 const FX3_EE_EXCL: &[&str] = &[
   "TimeZone",
-  "BitDepth",
-  "CompressorID",
-  "CompressorName",
   "GraphicsMode",
   "OpColor",
-  "SourceImageWidth",
-  "SourceImageHeight",
-  "XResolution",
-  "YResolution",
   "VideoFrameRate",
-  "AudioFormat",
-  "AudioChannels",
-  "AudioBitsPerSample",
-  "AudioSampleRate",
-  "Balance",
-  "HandlerDescription",
   "TrackProperty",
   "ContentDescribes",
   "Warning",
@@ -3408,30 +3387,21 @@ fn sony_fx3_rtmd_mp4_noee_warning_byte_exact() {
 // timed-`text` subsystem (a large QuickTime-container item, out of scope for the
 // Insta360 trailer proof).
 const INSV_REAL_EXCL: &[&str] = &[
-  // `stsd` sample-description codec sub-tags (video / audio / generic-media).
-  "BitDepth",
-  "CompressorID",
-  "CompressorName",
+  // Still-deferred `stsd`/`vmhd`/`stts` detail (Phase 2/3): the `vmhd`
+  // VideoHeader, the `pasp` PixelAspectRatio, the `stts` frame-rate, and the
+  // `gmhd`/`gmin` GenMediaHeader. The `vide`/`soun` `stsd` sample-description
+  // fields, the per-`trak` HandlerDescription, and the `text`-handler
+  // `OtherFormat` are now emitted by the #100 container phase-1 port and
+  // compared byte-exact.
   "GraphicsMode",
-  "HandlerDescription",
   "OpColor",
   "PixelAspectRatio",
-  "SourceImageHeight",
-  "SourceImageWidth",
   "VideoFrameRate",
-  "XResolution",
-  "YResolution",
-  "AudioBitsPerSample",
-  "AudioChannels",
-  "AudioFormat",
-  "AudioSampleRate",
-  "Balance",
   "GenBalance",
   "GenFlags",
   "GenGraphicsMode",
   "GenMediaVersion",
   "GenOpColor",
-  "OtherFormat",
   // Per-sample timed-`text`-track table tags (the 470-sample text track).
   "SampleDuration",
   "SampleTime",

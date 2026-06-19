@@ -42,5 +42,6 @@
   "Track1:MediaModifyDate": "2017:02:22 11:27:27+00:00",
   "Track1:MediaTimeScale": 90000,
   "Track1:MediaDuration": "0.16 s",
-  "Track1:HandlerType": "Picture"
+  "Track1:HandlerType": "Picture",
+  "Track1:OtherFormat": "hvc1"
 }]

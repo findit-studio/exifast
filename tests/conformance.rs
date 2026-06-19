@@ -1329,9 +1329,15 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   // `-ee`-gated gpmd stream — so there is no `-ee`-gating divergence to pin
   // (cf. #211), and only the two standard goldens are needed.
   //
-  // exifast emits a clean SUBSET of the bundled tags (zero extra). The deferred
-  // tags, excluded via `tools/gen_golden.sh EXCLUDE` (`-x` is ExifTool TRUTH;
-  // we defer the unported, never edit a value):
+  // exifast emits a clean SUBSET of the bundled tags (zero extra). The QuickTime
+  // container phase-1 port (#100) now decodes the `hdlr` HandlerDescription and
+  // the `vide`/`soun`/other `stsd` sample-description, so the retained set
+  // includes per-track `HandlerDescription`, the `vide` `CompressorID`/
+  // `SourceImageWidth`/`SourceImageHeight`/`XResolution`/`YResolution`/
+  // `CompressorName`/`BitDepth`, the `soun` `Balance`/`AudioFormat`/
+  // `AudioChannels`/`AudioBitsPerSample`/`AudioSampleRate`, and the `tmcd`
+  // `OtherFormat`. The still-deferred tags, excluded via `tools/gen_golden.sh
+  // EXCLUDE` (`-x` is ExifTool TRUTH; we defer the unported, never edit a value):
   //   - `System:all`/`Composite:all` — filesystem + the deferred QuickTime
   //     Composite subsystem (incl. the `LocationInformation`-derived
   //     `GPSLatitude`/`Longitude`/`Position`), matching the `.mov` goldens;
@@ -1339,14 +1345,17 @@ fn quicktime_gopro_gpmf_mp4_conformance() {
   //     (`LocationInformation`) — udta atoms this port does not decode;
   //   - the movie-level `1QuickTime:HandlerType`/`HandlerVendorID` (the
   //     `udta/hdlr` `mdir`/`appl`), family-1-scoped so the per-track
-  //     `Track<N>:HandlerType` the port DOES emit is retained;
-  //   - the per-track `stsd` sample-description / codec tags the port walks
-  //     only for the `MetaFormat` 4cc, never the full sub-table
-  //     (`CompressorID`/`CompressorName`/`HandlerDescription`/`AudioFormat`/
-  //     color/bitrate/resolution/`TimecodeTrack`/`PlaybackFrameRate`/…).
-  // The retained set (movie header + per-track `tkhd`/`mdhd`/`hdlr` scalars)
-  // is byte-exact vs the bundled `perl exiftool 13.59 -j -G1 -struct
-  // -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
+  //     `Track<N>:HandlerType`/`HandlerDescription` the port DOES emit is
+  //     retained;
+  //   - the deferred per-track minf/stbl detail the phase-1 port does NOT walk:
+  //     the `vmhd` `GraphicsMode`/`OpColor`, the `colr` color tags
+  //     (`ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/
+  //     `MatrixCoefficients`/`VideoFullRangeFlag`), `pasp` `PixelAspectRatio`,
+  //     the `btrt` `BufferSize`/`MaxBitrate`/`AverageBitrate`, the `stts`
+  //     `VideoFrameRate`, the `tref` `TimecodeTrack`, and the `tmcd`
+  //     `PlaybackFrameRate`.
+  // The retained set is byte-exact vs the bundled `perl exiftool 13.59 -j -G1
+  // -struct -api QuickTimeUTC=1`, so the `-j`/`-n` renderings are oracle-pinned.
   check(
     "QuickTime_gopro_gpmf.mp4",
     "QuickTime_gopro_gpmf.mp4.json",
@@ -1753,12 +1762,14 @@ fn quicktime_nested_invalid_tkhd_conformance() {
 // `System:all` + `Composite:all` (the QuickTime Composite subsystem is the
 // Phase-2 forward item) AND the container/codec-config atoms this port does not
 // decode — the HEVC/AV1 `*Configuration*` sample-description fields, the HEIF
-// `ispe` `ImageSpatialExtent`, the codec-detail `stsd` `OtherFormat`, the
+// `ispe` `ImageSpatialExtent`, the `vmhd` `GraphicsMode`/`OpColor`, the
 // `mvex/mehd` `MovieFragmentSequence`, and the file-`meta` `hdlr`
-// `HandlerType`/`HandlerDescription`. exifast emits a strict SUBSET of the
-// oracle (verified: it produces NO tag the oracle lacks); every excluded key is
-// an unsupported container-structure tag, deferred via `-x`, never a value the
-// port gets wrong.
+// `HandlerType`/`HandlerDescription`. Since the QuickTime container phase-1 port
+// (#100) the per-track `stsd` `OtherFormat` (the `pict`/`text` 4cc) and the
+// `trak` `hdlr` `HandlerDescription` ARE now decoded and retained byte-exact.
+// exifast emits a strict SUBSET of the oracle (verified: it produces NO tag the
+// oracle lacks); every excluded key is an unsupported container-structure tag,
+// deferred via `-x`, never a value the port gets wrong.
 
 #[test]
 fn avif_brand_conformance() {
@@ -1792,12 +1803,16 @@ fn heic_msf1_brand_conformance() {
   // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
   //
   // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
-  // -x ImageSpatialExtent` + the `hvcC` HEVC sample-description config block
-  // (`HEVCConfigurationVersion`, `General*`, `*ProfileCompatibilityFlags`,
-  // `Constraint*`, `MinSpatialSegmentationIDC`, `ParallelismType`,
-  // `ChromaFormat`, `BitDepth*`, `*FrameRate`, `NumTemporalLayers`,
-  // `TemporalIDNested`) + the track `stsd`/`vmhd` detail (`GraphicsMode`,
-  // `OpColor`, `OtherFormat`).
+  // -x ImageSpatialExtent -x GraphicsMode -x OpColor` + the `hvcC` HEVC
+  // sample-description config block (`HEVCConfigurationVersion`,
+  // `GeneralProfileSpace`/`GeneralTierFlag`/`GeneralProfileIDC`,
+  // `GenProfileCompatibilityFlags`, `ConstraintIndicatorFlags`,
+  // `GeneralLevelIDC`, `MinSpatialSegmentationIDC`, `ParallelismType`,
+  // `ChromaFormat`, `BitDepthLuma`/`BitDepthChroma`, `AverageFrameRate`/
+  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`). The `pict`
+  // track is a non-`vide`/`soun`/`meta` handler, so the phase-1 port (#100)
+  // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1" — now RETAINED (the
+  // `vmhd` `GraphicsMode`/`OpColor` stay deferred).
   //
   // `-x Copy1:HandlerType` is the ONE non-obvious exclusion: the file carries
   // TWO `hdlr` boxes with the SAME tag NAME — the file-`meta` `hdlr` (which the
@@ -1823,11 +1838,11 @@ fn iso5_brand_conformance() {
   // track) decodes byte-exact incl. Track1:MediaLanguageCode "und",
   // Track1:HandlerType "Text", and the no-`-ee` Track1:Warning.
   //
-  // EXCLUDE: `-x System:all -x Composite:all -x MovieFragmentSequence
-  // -x HandlerDescription -x OtherFormat` — the `mvex/mehd`
-  // `MovieFragmentSequence`, the `trak` `hdlr` `HandlerDescription`
-  // ("nhml@GPAC…", collision-free — only the track carries one), and the
-  // `stsd` codec `OtherFormat` ("depi") are the unsupported container tags.
+  // EXCLUDE: `-x System:all -x Composite:all -x MovieFragmentSequence` — only
+  // the `mvex/mehd` `MovieFragmentSequence` is an unsupported container tag now.
+  // The phase-1 port (#100) decodes the `trak` `hdlr` `HandlerDescription`
+  // ("nhml@GPAC0.5.1-DEV-rev5339") and the `text`-handler `stsd` `OtherFormat`
+  // ("depi"), both RETAINED byte-exact.
   check(
     "ISOBMFF_iso5_brand.mp4",
     "ISOBMFF_iso5_brand.mp4.json",
