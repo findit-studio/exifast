@@ -660,6 +660,7 @@ fn extract_info_typed(
       ext_ref,
       cand.header_skip(),
       Some(cand.parent_type()),
+      extract_embedded,
     ) {
       Some(meta) => meta,
       None => {

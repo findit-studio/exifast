@@ -135,8 +135,12 @@ id3        = []
 # decoded inline (faithful to the small `%M2TS::AC3` ProcessBinaryData and
 # the AC-3 PES sample-rate scan, M2TS.pm:251-280); the MPEG-1/2 video/audio
 # arm is a deferred forward item (`mpeg-audio` is the AUDIO frame parser,
-# not the video).
-m2ts       = ["h264"]
+# not the video). Chains `quicktime` because the LIGOGPSINFO dashcam GPS arm
+# (M2TS.pm:308-318) `require`s `Image::ExifTool::LigoGPS` and routes through
+# `GetTagTable('Image::ExifTool::QuickTime::Stream')` — exifast's `LigoGPS`
+# walker (`process_ligogps`) and the shared `QuickTime::Stream` emitter
+# (`emit_ligogps`) both live behind the `quicktime` gate.
+m2ts       = ["h264", "quicktime"]
 # `matroska` — engine-only per FORMATS.md row 23. Leaf format (no
 # cross-format chains); ports the entire EBML walker + tag table.
 matroska   = []

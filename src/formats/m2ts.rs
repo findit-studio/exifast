@@ -54,7 +54,16 @@
 //! - **H.264 video (stream type 0x1b, M2TS.pm:342-351).** The PES payload is
 //!   forwarded to [`crate::formats::h264::parse_borrowed`] — the existing
 //!   1:1 port of `ParseH264Video`, which produces the AVCHD camera metadata
-//!   (Make / Model / DateTimeOriginal / ApertureSetting / GPS / …).
+//!   (Make / Model / DateTimeOriginal / ApertureSetting / GPS / …) from the
+//!   FIRST user-data SEI. The walk extent is `-ee`-gated (M2TS.pm:347): at `-ee`
+//!   the forward pass runs to EOF (so a FIRST user-data SEI past the no-`ee`
+//!   early-stop is reached + processed); at no-`ee` it early-stops as bundled
+//!   does without `ExtractEmbedded`. What is STILL deferred is the per-frame
+//!   LATER-SEI/MDPM `-ee` update (the AVCHD timed-GPS domain — later frames
+//!   refreshing `DateTimeOriginal` / MDPM GPS / exposure, H264.pm:1079-1082
+//!   `next unless ExtractEmbedded`): the `GotNAL06` latch suppresses every SEI
+//!   AFTER the first regardless of render mode. Deferred to #304 (the AVCHD #132
+//!   domain); see the H.264 arm in [`Walker::parse_pid`].
 //!
 //! ## What is deferred
 //!
@@ -63,22 +72,33 @@
 //!   `MPEG::ParseMPEGAudioVideo` produce no fixture-visible tags for the
 //!   canonical Canon-AVCHD M2TS reference, and the video side of the
 //!   exifast `mpeg` module is a Phase-2 forward item. Filed as a follow-up.
-//! - **Dashcam GPS arms** (M2TS.pm:308-572 — `LIGOGPSINFO`, Viidure, Innovv,
-//!   `$GPRMC`, DOD_LS600W, forum11320, vsys a6l, Jomise, …). Routed through
-//!   `LigoGPS::ProcessLigoGPS` / `QuickTime::ProcessFreeGPS` — both Phase-2
-//!   chained dependencies the M2TS chain does not pull. The LigoGPS agent
-//!   on the QuickTime chain owns the dashcam-GPS arms.
+//! - **LIGOGPSINFO dashcam GPS** (`type == 6 and $pid == 0x0300`,
+//!   M2TS.pm:308-318). IMPLEMENTED — the PES private stream (`%noSyntax`
+//!   stream_id 0xbf) carrying a `LIGOGPSINFO\0` block is routed to the shared
+//!   [`crate::formats::ligogps::process_ligogps`] decode (`noFuzz` =
+//!   `length != 200`) and emitted under the family-1 `LIGO` group via the shared
+//!   QuickTime `Stream` emitter ([`crate::formats::quicktime::emit_ligogps`]),
+//!   one `Doc<N>` per record, `-ee`-gated. Driven by the Pruveeo D90 fixture
+//!   (#138/#129). The OTHER dashcam GPS variants (M2TS.pm:319-572 — Viidure,
+//!   INNOVV, `$GPSINFO`/`$GPRMC`, DOD_LS600W, forum11320, vsys a6l, Jomise,
+//!   Blueskysea/Viofo freeGPS) each need their own real-device fixture and are
+//!   deferred (#129); the `$type < 0` arms are unreachable without the
+//!   `ExtractEmbedded > 2` `%gpsPID` unroll (not exposed).
 //! - **MISB metadata** (stream type 0x15, M2TS.pm:357-364). Routed through
 //!   `MISB::ParseMISB` (no exifast port).
 //! - **PCR back-scan for last timestamp** (M2TS.pm:653-694). IMPLEMENTED —
-//!   see [`Walker::backscan_last_pcr`]. The forward pass captures
-//!   `$startTime` on the FIRST PCR-bearing packet and `$endTime` on each
-//!   subsequent one, then STOPS as soon as every needed PID is parsed (on
-//!   real AVCHD this is near the START of the file). The backscan then walks
-//!   packets backward from EOF for the LAST PCR so `Duration = lastPCR -
-//!   firstPCR` spans the whole program. On the canonical Canon-AVCHD fixture
-//!   the needed PIDs are never all found (only 7 packets), so the backscan
-//!   never triggers and the single forward PCR still gives `Duration = 0 s`.
+//!   see [`Walker::backscan_last_pcr`]. The forward pass captures `$startTime`
+//!   on the FIRST PCR-bearing packet and `$endTime` on each subsequent one, and
+//!   STOPS as soon as every needed PID is parsed, switching to a backward scan
+//!   from EOF for the LAST PCR. This is the no-`ee` behavior (and bundled's
+//!   without `ExtractEmbedded`): the H.264 arm honours `ParseH264Video`'s own
+//!   `$more`, so the forward pass early-stops and the backscan finds the last
+//!   PCR. At `-ee` the H.264 arm forces `$more = 1` (M2TS.pm:347), keeping the
+//!   H.264 PID in `%needPID` to EOF (the full scan that also reaches the
+//!   LIGOGPSINFO PES), so the forward pass sees the LAST PCR directly and the
+//!   backscan never fires. Either way `Duration = lastPCR - firstPCR` spans the
+//!   program. On the canonical Canon-AVCHD fixture (7 packets) the single
+//!   forward PCR gives `Duration = 0 s`.
 //! - **`-fast` option** (M2TS.pm:659) — not exposed by the exifast surface.
 //! - **`ExtractEmbedded > 2` PID scan** (M2TS.pm:643-648) — same gating.
 //! - **LIGOGPSINFO trailer** (M2TS.pm:1016-1026) — same QuickTime chain.
@@ -95,6 +115,7 @@ use core::time::Duration;
 use std::{string::String, vec::Vec};
 
 use crate::format_parser::{FormatParser, parser_sealed};
+use crate::formats::ligogps as ligogps_fmt;
 
 // ===========================================================================
 // §1. Constants (M2TS.pm:38-128)
@@ -119,6 +140,14 @@ const SAVE_LEN_SMALL: usize = 256;
 const PID_NULL: u16 = 0x1fff;
 /// `PID == 0` — Program Association Table.
 const PID_PAT: u16 = 0;
+/// `PID == 0x0300` — the elementary PID the LIGOGPSINFO dashcam GPS arm is
+/// gated on (`$pid == 0x0300`, M2TS.pm:308). Both bundled samples (Pruveeo D90,
+/// «Wrong Way pass») write the LIGOGPSINFO PES private stream on this exact PID.
+const LIGO_DASHCAM_PID: u16 = 0x0300;
+/// The byte length that marks a LIGOGPSINFO block as FUZZED. `noFuzz` is
+/// `length($$dataPt) != 200` (M2TS.pm:314): the Pruveeo D90's 200-byte block IS
+/// fuzzed (defuzzed at decode), the «Wrong Way pass» 160-byte one is not.
+const LIGO_UNFUZZED_LEN: usize = 200;
 /// Expected `table_id` for PAT (`pid == 0`, M2TS.pm:787) — `0x00`.
 const TABLE_ID_PAT: u8 = 0x00;
 /// Expected `table_id` for PMT (`pid != 0`, M2TS.pm:787) — `0x02`.
@@ -408,16 +437,18 @@ pub struct Meta<'a> {
   /// `H264Meta<'a>`), but is stored at the Meta's own `'a` for GAT
   /// uniformity with formats whose sub-Metas DO borrow from the input.
   h264: Option<crate::formats::h264::H264Meta<'a>>,
-  /// `true` ⇒ emit the bundled minor warning at `serialize_tags` time.
-  /// Set when an H.264 PES payload was forwarded to the H.264 decoder
-  /// (the only `Warn` reachable from `ProcessM2TS` outside the deferred
-  /// dashcam-GPS arms).
-  emit_extract_embedded_warning: bool,
   /// The malformed-input `$et->Warn` corpus captured DURING the walk, in
   /// bundled emission order (M2TS.pm:618/708/733/764/783/796/798/831/838/930).
   /// Drained by the [`Diagnose`](crate::diagnostics::Diagnose) impl (Codex
   /// finding #9). Empty for a well-formed stream like the canonical fixture.
   warnings: Vec<crate::diagnostics::Diagnostic>,
+  /// Decoded LIGOGPSINFO dashcam GPS (`type == 6 and $pid == 0x0300`,
+  /// M2TS.pm:308-318). One [`crate::metadata::LigoGpsSample`] per decoded PES
+  /// private-stream record, each stamped with its GLOBAL `Doc<N>` ordinal
+  /// (LigoGPS.pm:243). `is_empty()` for a non-dashcam stream (the canonical
+  /// `M2TS.mts`). Emitted under the family-1 `LIGO` group through the shared
+  /// QuickTime `Stream` emitter and projected into [`crate::metadata::MediaMetadata::gps`].
+  ligogps: crate::metadata::LigoGpsMeta,
 }
 
 /// The discriminator that drives `FileType` finalization (M2TS.pm:617).
@@ -528,19 +559,13 @@ impl<'a> Meta<'a> {
     self.h264.as_ref()
   }
 
-  /// `true` when this stream should surface the bundled minor warning
-  /// `"[minor] The ExtractEmbedded option may find more tags in the video
-  /// data"` (M2TS.pm:349-351) — set whenever an H.264 PES payload was
-  /// forwarded to the H.264 decoder while `ExtractEmbedded` / `Validate` are
-  /// off (exifast does not expose those options, so it is unconditional). The
-  /// warning is yielded by this `Meta`'s
-  /// [`Diagnose`](crate::diagnostics::Diagnose) impl (drained centrally by
-  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics)); it is NOT part
-  /// of the [`crate::emit::Taggable`] tag stream.
+  /// Decoded LIGOGPSINFO dashcam GPS (`type == 6 and $pid == 0x0300`,
+  /// M2TS.pm:308-318). `is_empty()` for a non-dashcam stream. Each sample
+  /// carries its GLOBAL `Doc<N>` ordinal.
   #[must_use]
   #[inline(always)]
-  pub const fn emits_extract_embedded_warning(&self) -> bool {
-    self.emit_extract_embedded_warning
+  pub const fn ligogps(&self) -> &crate::metadata::LigoGpsMeta {
+    &self.ligogps
   }
 }
 
@@ -565,7 +590,12 @@ impl FormatParser for ProcessM2ts {
   /// candidate (`None`) or a partial [`Meta`] carrying its `$et->Warn`s through
   /// the [`Diagnose`](crate::diagnostics::Diagnose) channel (Golden-v2 §4).
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    parse_inner(data)
+    // The trait entry is the faithful no-`ee` baseline (`extract_embedded =
+    // false`): the H.264 arm early-stops as bundled does without
+    // `ExtractEmbedded`. The `-ee` full scan (M2TS.pm:347, which reaches the
+    // LIGOGPSINFO PES near EOF) is requested via [`parse_borrowed_with_ee`] from
+    // the mode-aware closed dispatch.
+    parse_inner(data, false)
   }
 }
 
@@ -576,13 +606,30 @@ impl FormatParser for ProcessM2ts {
 /// [`Diagnose`](crate::diagnostics::Diagnose) channel — never a Rust error.
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
-  parse_inner(data)
+  parse_inner(data, false)
 }
 
-/// Inner driver. `None` ⇒ no recognised M2TS framing.
-fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
+/// Like [`parse_borrowed`] but with the render-time `ExtractEmbedded` (`-ee`)
+/// mode threaded into the walk. `extract_embedded = true` mirrors M2TS.pm:347's
+/// `$more = 1` full scan — the H.264 arm keeps the forward pass running to EOF
+/// so the LIGOGPSINFO dashcam-GPS PES private stream (`type == 6 and $pid ==
+/// 0x0300`, M2TS.pm:308-318) is reached. `extract_embedded = false` is the
+/// faithful no-`ee` baseline (identical to [`parse_borrowed`]): the H.264 arm
+/// early-stops exactly as bundled does without `ExtractEmbedded`, so a late
+/// first user-data SEI past the early-stop is never parsed and its `H264:*` /
+/// GPS tags are not emitted (byte-identical to the pre-LIGOGPS behavior).
+#[must_use]
+pub fn parse_borrowed_with_ee(data: &[u8], extract_embedded: bool) -> Option<Meta<'_>> {
+  parse_inner(data, extract_embedded)
+}
+
+/// Inner driver. `None` ⇒ no recognised M2TS framing. `extract_embedded`
+/// mirrors ExifTool `-ee` (M2TS.pm:347) and is consumed ONLY by the walk
+/// (the H.264 arm's `$more` / full-scan decision); tag EMISSION re-reads the
+/// render mode from [`EmitOptions`](crate::emit::EmitOptions) at `tags()` time.
+fn parse_inner(data: &[u8], extract_embedded: bool) -> Option<Meta<'_>> {
   let probe = probe(data)?;
-  let mut walker = Walker::new(data, probe);
+  let mut walker = Walker::new(data, probe, extract_embedded);
   walker.run();
   Some(walker.finish())
 }
@@ -732,9 +779,6 @@ struct Walker<'a> {
   ac3_audio_sample_rate: Option<u8>,
   /// Nested H.264 Meta when an H.264 PES payload was forwarded.
   h264: Option<crate::formats::h264::H264Meta<'a>>,
-  /// `true` once an H.264 PES was forwarded — drives the bundled minor
-  /// warning (M2TS.pm:349-351).
-  saw_h264: bool,
   /// `$$et{ParsedH264}` (H264.pm:1102-1103) — set once the first H.264 frame
   /// for the stream has been handed to `ParseH264Video`. The bundled
   /// `ParseH264Video` returns `1` ("parse one more frame") only when the
@@ -752,21 +796,68 @@ struct Walker<'a> {
   /// Whether any PMT was parsed (gates the early `last unless %needPID`
   /// exit at M2TS.pm:653-654).
   need_count: usize,
-  /// `$et->Warn` corpus accumulated DURING the walk, in bundled emission
-  /// order (M2TS.pm:618/708/733/764/783/796/798/831/838/930 …). Drained by
-  /// the [`Diagnose`](crate::diagnostics::Diagnose) impl AFTER the nested
-  /// H.264 warnings and BEFORE the minor ExtractEmbedded warning is appended
-  /// — matching the document-level FoundTag order (Codex finding #9).
+  /// The `$et->Warn` corpus accumulated DURING the walk, in bundled emission
+  /// order (M2TS.pm:618/708/733/764/783/796/798/831/838/930 …). Mostly the
+  /// malformed-input warnings raised UNCONDITIONALLY, PLUS the mode-dependent
+  /// `[minor] ExtractEmbedded` warning (M2TS.pm:350) pushed at the H.264 walk
+  /// position at no-`ee` only (the walk knows `extract_embedded`). Drained by
+  /// the [`Diagnose`](crate::diagnostics::Diagnose) impl in this walk order, so
+  /// the document `ExifTool:Warning` priority-0 first-wins survivor is faithful.
   warnings: Vec<crate::diagnostics::Diagnostic>,
   /// `last` (M2TS.pm) — set when a ported `$et->Warn(...), last` site fires;
   /// stops the forward packet loop so subsequent packets are NOT processed
   /// (faithful to Perl terminating the `for(;;)` loop). The `next`-style Warn
   /// sites (`Bad PES syntax`, M2TS.pm:930) do NOT set this.
   stop_walk: bool,
+  /// Decoded LIGOGPSINFO dashcam GPS — the `type == 6 and $pid == 0x0300`
+  /// dashcam arm (M2TS.pm:308-318). Each PES private-stream record is routed to
+  /// the shared [`crate::formats::ligogps::process_ligogps`] decode and its
+  /// per-record samples appended here. `is_empty()` for a non-dashcam stream
+  /// (the canonical `M2TS.mts`, which carries no PID-0x0300 LIGOGPSINFO stream).
+  ligogps: crate::metadata::LigoGpsMeta,
+  /// The shared GLOBAL document counter (`$$et{DOC_COUNT}`) consumed by the
+  /// LIGOGPSINFO arm — bumped once per decoded record (`$$et{DOC_NUM} =
+  /// ++$$et{DOC_COUNT}`, LigoGPS.pm:243). M2TS has no `mebx`/`camm`/freeGPS
+  /// timed-metadata path that shares the counter (the dashcam GPS arm is the
+  /// ONLY `Doc<N>` producer in `ProcessM2TS`), so a private walker-owned counter
+  /// is faithful: each PID-0x0300 PES unit yields one record taking the next
+  /// `Doc<N>` in file (walk) order. Used to stamp [`Self::ligogps`] via
+  /// [`crate::metadata::LigoGpsMeta::stamp_doc_from`].
+  ligo_doc_counter: u32,
+  /// Latch — the LIGOGPSINFO walker's own `$et->Warn` (`LIGOGPSINFO format
+  /// error` / `LIGOGPSINFO coordinates out of range`, LigoGPS.pm:235/254) has
+  /// been pushed into [`Self::warnings`] AT ITS PES WALK POSITION. The warning
+  /// is a DOCUMENT-level `$et->Warn` (no `SET_GROUP1='LIGO'` in effect — the
+  /// same treatment the QuickTime LigoGPS path gives it), so it joins the
+  /// walk-ordered [`Self::warnings`] corpus rather than being appended after it
+  /// in `diagnostics()`: a malformed LIGOGPSINFO PES that decodes BEFORE a later
+  /// structural / H.264 `$et->Warn` must remain the document `ExifTool:Warning`
+  /// priority-0 FIRST-wins survivor (ExifTool.pm `%noDups`; Extra.pm Warning
+  /// `Priority => 0`). The latch keeps it to a SINGLE emit at the FIRST bad
+  /// record's position — faithful to first-wins, and matching the pre-existing
+  /// single-slot [`crate::metadata::LigoGpsMeta::warning`] (one surviving
+  /// message, never a `[x$n]` count).
+  ligo_warning_pushed: bool,
+  /// `$$et{OPTIONS}{ExtractEmbedded}` (M2TS.pm:347) — the render-time `-ee`
+  /// mode, threaded in at parse time because it gates the WALK EXTENT (not just
+  /// emission): the H.264 arm forces the `$more = 1` full scan to EOF (so the
+  /// LIGOGPSINFO PES near EOF is reached) ONLY at `-ee`; at no-`ee` it restores
+  /// `ParseH264Video`'s own `$more` so the walk early-stops as bundled does
+  /// without `ExtractEmbedded` (no late H.264 SEI parsed ⇒ no-`ee` output
+  /// byte-identical to the pre-LIGOGPS behavior). It ALSO gates, EXPLICITLY, the
+  /// LIGOGPSINFO PID-0x0300 decode arm (`type==6` arm — LIGOGPS is an
+  /// ExtractEmbedded feature): the decode runs ONLY at `-ee`, so the
+  /// mode-independent `Project` GPS projection cannot surface a fix at no-`ee`
+  /// regardless of where the PES sits in the walk (#307). And it gates the
+  /// in-walk `[minor] ExtractEmbedded` warning (M2TS.pm:350 — pushed at no-`ee`
+  /// only, at the H.264 walk position). The LIGOGPS emission re-reads the render
+  /// mode from [`EmitOptions`](crate::emit::EmitOptions) at `tags()` time
+  /// independently.
+  extract_embedded: bool,
 }
 
 impl<'a> Walker<'a> {
-  fn new(data: &'a [u8], probe: Probe) -> Self {
+  fn new(data: &'a [u8], probe: Probe, extract_embedded: bool) -> Self {
     // M2TS.pm:629-630 — initial `%didPID = ( 1 => 0, 2 => 0, 0x1fff => 0 )`
     // and `%needPID = ( 0 => 1 )`. The three reserved PIDs (Conditional Access
     // / Transport Stream Description / Null packets) are seeded DEFINED-BUT-
@@ -813,12 +904,15 @@ impl<'a> Walker<'a> {
       ac3_audio_channels: None,
       ac3_audio_sample_rate: None,
       h264: None,
-      saw_h264: false,
       parsed_h264: false,
       h264_frame_state: crate::formats::h264::H264FrameState::new(),
       need_count: 1, // PID 0 needed
       warnings: Vec::new(),
       stop_walk: false,
+      ligogps: crate::metadata::LigoGpsMeta::new(),
+      ligo_doc_counter: 0,
+      ligo_warning_pushed: false,
+      extract_embedded,
     }
   }
 
@@ -1555,7 +1649,7 @@ impl<'a> Walker<'a> {
 
   /// `ParsePID` dispatch (M2TS.pm:283-575). Tri-state return (see
   /// [`ParseOutcome`]).
-  fn parse_pid(&mut self, _pid: u16, stream_type: Option<u8>, payload: &[u8]) -> ParseOutcome {
+  fn parse_pid(&mut self, pid: u16, stream_type: Option<u8>, payload: &[u8]) -> ParseOutcome {
     let Some(t) = stream_type else {
       // M2TS.pm:292 `return -1 unless defined $type` — the PMT hasn't
       // identified this PID yet; keep waiting (do NOT mark it done).
@@ -1607,27 +1701,78 @@ impl<'a> Walker<'a> {
           (None, x) => x,
         };
         self.h264 = pieces;
-        self.saw_h264 = true;
-        // M2TS.pm:347-351 — when `ExtractEmbedded` is on bundled forces
-        // `$more = 1` (exifast doesn't expose that option, so off); ELSE (and
-        // `Validate` off, also unexposed) it raises the minor warning
-        // `$et->Warn('The ExtractEmbedded option…', 7)` RIGHT HERE, after
-        // `ParseH264Video` returns — so push it into the walk-ordered
-        // accumulator now (Codex finding #9; `Warn(msg,7)` ⇒ ignorable 3 +
-        // no_count, ExifTool.pm:5621-5630). `WAS_WARNED` dedups repeats to one.
-        self.warnings.push(crate::diagnostics::Diagnostic::new(
-          "The ExtractEmbedded option may find more tags in the video data".into(),
-          crate::diagnostics::Severity::Warn,
-          None,
-          3,
-          true,
-        ));
-        // The base `$more` is `ParseH264Video`'s own return value (H264.pm:345),
-        // which we now HONOUR: parse one more frame when this frame had no user
-        // data and we haven't already consumed our one extra frame.
+        // M2TS.pm:349-351 — at no-`ee` (and `Validate` off) bundled raises
+        // `$et->Warn('The ExtractEmbedded option may find more tags in the video
+        // data', 7)` RIGHT HERE, at the H.264 walk position, AFTER
+        // `ParseH264Video` returns. `Warn(msg, 7)` ⇒ ignorable-3 (`[minor] `) +
+        // `no_count` (`0x04`); `WAS_WARNED` collapses the repeats across frames
+        // to one. Push it into the walk-ordered structural corpus so the
+        // document `ExifTool:Warning` priority-0 FIRST-wins survivor is faithful:
+        // when a LATER structural `$et->Warn` follows (e.g. `M2TS synchronization
+        // error`, M2TS.pm:708), this earlier minor warning wins, matching
+        // bundled. At `-ee` bundled forces `$more = 1` INSTEAD of warning
+        // (M2TS.pm:347), so gate the push on `!self.extract_embedded`. (When the
+        // walk was render-mode-blind this had to live at TAG time; the
+        // `-ee`-gated walk now sees the mode, so the in-walk push — faithful to
+        // bundled's walk order — is restored.)
+        if !self.extract_embedded {
+          self.warnings.push(crate::diagnostics::Diagnostic::new(
+            "The ExtractEmbedded option may find more tags in the video data".into(),
+            crate::diagnostics::Severity::Warn,
+            None,
+            3,
+            true,
+          ));
+        }
+        // M2TS.pm:347-351 — `$more` is mode-dependent in the bundled, and the
+        // walk traversal it drives is `-ee`-GATED:
+        //   - `ExtractEmbedded` ON  ⇒ `$more = 1` (M2TS.pm:347) — keep parsing
+        //     EVERY H.264 frame to EOF (so the forward pass never empties
+        //     `%needPID` ⇒ never early-stops to the last-PCR backscan), which is
+        //     how the dashcam GPS PES private stream (`type==6 $pid==0x0300`,
+        //     processed via the M2TS.pm:897 ES path) gets REACHED at all — the
+        //     backscan decodes NO payload (M2TS.pm:756 `not defined $backScan`).
+        //   - `ExtractEmbedded` OFF ⇒ `$more` is `ParseH264Video`'s own return
+        //     (one extra frame when the first had no user data) AND a `$et->Warn`
+        //     fires (M2TS.pm:350) — the forward pass early-stops as soon as
+        //     `%needPID` empties (NO full scan to EOF).
+        //
+        // The per-sample H.264 data is DECODED into `self.h264` either way (one
+        // parse), but the WALK EXTENT is mode-aware exactly as the bundled
+        // `$more` is: the `$more = 1` full scan (M2TS.pm:347) is itself inside
+        // `if ($$et{OPTIONS}{ExtractEmbedded})`, so exifast force-`More`s ONLY at
+        // `-ee` (`self.extract_embedded`). At no-`ee` it RESTORES `ParseH264Video`'s
+        // own `$more` (`want_more` below) so the walk early-stops at exactly the
+        // pre-LIGOGPS budget — i.e. no-`ee` output is byte-identical to the
+        // pre-LIGOGPS behavior for EVERY file (a late FIRST user-data SEI lying
+        // past the early-stop is NOT reached at no-`ee`, so its `H264:*` / GPS /
+        // `DateTimeOriginal` tags are NOT emitted — matching ExifTool, which
+        // also early-stops at no-`ee`). The `[minor] ExtractEmbedded` warning is
+        // pushed above (in-walk, no-`ee` only, M2TS.pm:350).
+        //
+        // SCOPE — at `-ee` the full scan reaches EVERY PID (incl. the GPS 0x300
+        // stream near EOF): the `-ee`-gated full scan is what makes the
+        // LIGOGPSINFO PES extraction (the `type==6 $pid==0x0300` arm below)
+        // reachable. The full scan can also now REACH a FIRST user-data SEI that
+        // lay past the no-`ee` early-stop, and processing it at `-ee` is correct
+        // (ExifTool `-ee` processes H.264 SEI). What is STILL deferred is the
+        // per-frame LATER-SEI/MDPM `-ee` processing (the AVCHD timed-GPS domain:
+        // MDPM GPS + the exposure update from LATER frames — M2TS.pm:347 +
+        // H264.pm:1079-1082 `next unless ExtractEmbedded`): the stateful H.264
+        // decoder's `GotNAL06` latch (h264.rs:1419 — `got_nal06` ⇒ `continue`,
+        // UNCONDITIONAL of the render mode) still suppresses every SEI AFTER the
+        // first user-data SEI even at `-ee`. Threading `ExtractEmbedded` into the
+        // H.264 decoder so later SEI/MDPM records are processed at `-ee` is a
+        // substantial separate feature (AVCHD timed GPS), deferred to #304 (the
+        // AVCHD #132 domain).
+        //
+        // `ParseH264Video`'s own `$more` (H264.pm:1100-1104): want one more frame
+        // ONLY when this frame carried no user data and we have not already
+        // consumed our one extra frame (`ParsedH264`). This is the no-`ee` walk
+        // extent; at `-ee` it is overridden by the force-`More` full scan.
         let want_more = !found_user_data && !self.parsed_h264;
         self.parsed_h264 = true; // H264.pm:1103 `$$et{ParsedH264} = 1`.
-        if want_more {
+        if self.extract_embedded || want_more {
           ParseOutcome::More
         } else {
           ParseOutcome::Done
@@ -1649,12 +1794,88 @@ impl<'a> Walker<'a> {
       // leaves `$more = 0` when the MISB code is absent (which is always,
       // here — the MISB decoder isn't ported).
       0x15 => ParseOutcome::Done,
-      // M2TS.pm:373-573 — `$type < 0` arms (dashcam GPS / LIGOGPSINFO /
-      // INNOVV / `$GPRMC` / …). Not reached: our `$type` is always a
-      // valid stream type (no `-1` sentinel here — that's only set
-      // when ExtractEmbedded > 2 unrolls the `%gpsPID` set, which
-      // exifast doesn't expose). Deferred.
+      // M2TS.pm:308-318 — LIGOGPSINFO dashcam GPS on `type == 6 and $pid ==
+      // 0x0300`. The PES private stream (stream_id 0xbf, `%noSyntax`) carries a
+      // `LIGOGPSINFO\0`-prefixed block which the bundled routes to
+      // `LigoGPS::ProcessLigoGPS($et, {DataPt, DirName=>'Ligo0x0300'}, $tbl,
+      // length($$dataPt)!=200)`. The `$pid == 0x0300` guard is essential — only
+      // the Pruveeo-D90/«Wrong Way pass» dashcam variant lives here; a generic
+      // type-6 private stream on another PID must NOT be misread (the other
+      // dashcam arms — Viidure/INNOVV/$GPRMC/DOD_LS600W — need their own
+      // fixtures and are left to #129). The remaining `type == 6` cases (the
+      // commented-out forum16486 probe, M2TS.pm:365-371) are not ported.
+      //
+      // The decode is gated on `self.extract_embedded` (#307): LIGOGPSINFO is an
+      // ExtractEmbedded feature — in bundled this PES is reached ONLY when the
+      // `-ee` H.264 force-`More` full scan (M2TS.pm:347) keeps the walk running
+      // (no-`ee` early-stops first), so the LIGOGPS decode is intrinsically
+      // `-ee`-only. exifast's `Project` projection copies any decoded fix into
+      // `MediaMetadata::gps` MODE-INDEPENDENTLY, so the gate must be on the
+      // DECODE, not the incidental walk extent: an M2TS whose PID-0x0300 PES
+      // precedes the early-stop (or that never early-stops, e.g. no PCR) would
+      // otherwise decode + surface GPS at default no-`ee` parse, violating the
+      // contract that this GPS is parse-time `-ee` only. At no-`ee` the arm is
+      // skipped (falls to the `_` Done below) so NOTHING is decoded regardless of
+      // PID position; at `-ee` it is unchanged (the Pruveeo D90 lies past the
+      // early-stop, so it was already only reached at `-ee` — byte-identical).
+      6 if self.extract_embedded
+        && pid == LIGO_DASHCAM_PID
+        && payload.starts_with(ligogps_fmt::HDR_LIGOGPSINFO_PREFIX) =>
+      {
+        self.parse_ligogps(payload);
+        // M2TS.pm:316 `$more = 1` — keep parsing more PID-0x0300 records (every
+        // subsequent PES unit carries the next timed sample). `$$et{FoundGoodGPS}
+        // = 1` (M2TS.pm:315) only matters for the `$$et{FoundGoodGPS}` re-parse
+        // arm of OTHER private-data records, which we don't reach.
+        ParseOutcome::More
+      }
+      // M2TS.pm:373-573 — the `$type < 0` arms (the OTHER dashcam GPS variants:
+      // Blueskysea/Viofo freeGPS, INNOVV, `$GPSINFO`, `$GPRMC`, forum11320,
+      // DOD_LS600W, the `skip…LIGOGPSINFO` variant). Not reached: our `$type` is
+      // always a real PMT stream type (no `-1` sentinel — that is only set when
+      // ExtractEmbedded > 2 unrolls the `%gpsPID` set, which exifast doesn't
+      // expose). Each needs its own real-device fixture (#129); deferred.
       _ => ParseOutcome::Done,
+    }
+  }
+
+  /// LIGOGPSINFO dashcam GPS record (M2TS.pm:308-318). Decode the PES
+  /// private-stream `LIGOGPSINFO\0` block via the shared
+  /// [`crate::formats::ligogps::process_ligogps`] walker and stamp the new
+  /// records with consecutive GLOBAL `Doc<N>` ordinals off [`Self::ligo_doc_counter`].
+  ///
+  /// `noFuzz` is `length($$dataPt) != 200` (M2TS.pm:314): the Pruveeo D90's
+  /// 200-byte block IS fuzzed (`noFuzz == false` ⇒ the lat/lon are defuzzed by
+  /// `process_ligogps`); the «Wrong Way pass» 160-byte variant is NOT
+  /// (`noFuzz == true`). `ProcessLigoGPS` is called without a `LigoGPSScale`, so
+  /// the default scale 1 applies (the `process_ligogps` — not
+  /// `_with_scale` — entry).
+  fn parse_ligogps(&mut self, payload: &[u8]) {
+    let start = self.ligogps.sample_count();
+    let no_fuzz = payload.len() != LIGO_UNFUZZED_LEN;
+    ligogps_fmt::process_ligogps(payload, 0, &mut self.ligogps, no_fuzz);
+    // LigoGPS.pm:243 `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` once per decoded record,
+    // in walk order. Stamp the records this call just appended.
+    self.ligo_doc_counter = self.ligogps.stamp_doc_from(start, self.ligo_doc_counter);
+    // LigoGPS.pm:235/254 — the walker's own `$et->Warn('LIGOGPSINFO format error'
+    // / 'LIGOGPSINFO coordinates out of range')` fires RIGHT HERE, at the
+    // PID-0x0300 PES walk position, with no `SET_GROUP1='LIGO'` in effect (a
+    // DOCUMENT-level warning — the QuickTime LigoGPS path treats it the same).
+    // Push it into the walk-ordered [`Self::warnings`] corpus AT THIS POSITION
+    // (mirroring the in-walk `[minor] ExtractEmbedded` push at M2TS.pm:350) so a
+    // LATER structural / H.264 `$et->Warn` (e.g. `M2TS synchronization error`,
+    // M2TS.pm:708) does NOT displace it: the document `ExifTool:Warning`
+    // priority-0 FIRST-wins survivor stays this earlier LIGOGPS warning, exactly
+    // bundled's `%noDups`. The `ligo_warning_pushed` latch keeps it to a SINGLE
+    // emit at the FIRST bad record's position (`Diagnostic::warn` ⇒ plain
+    // ignorable-0 Warn, identical shape to the QuickTime path), so repeated bad
+    // PID-0x0300 records never double-count — matching the pre-existing
+    // single-slot `LigoGpsMeta::warning`.
+    if !self.ligo_warning_pushed
+      && let Some(w) = self.ligogps.warning()
+    {
+      self.warnings.push(crate::diagnostics::Diagnostic::warn(w));
+      self.ligo_warning_pushed = true;
     }
   }
 
@@ -1749,8 +1970,8 @@ impl<'a> Walker<'a> {
       ac3_audio_channels: self.ac3_audio_channels,
       ac3_audio_sample_rate: self.ac3_audio_sample_rate,
       h264: self.h264,
-      emit_extract_embedded_warning: self.saw_h264,
       warnings: self.warnings,
+      ligogps: self.ligogps,
     }
   }
 }
@@ -1880,11 +2101,18 @@ impl crate::emit::Taggable for Meta<'_> {
   /// is carried faithfully for the later `iter_tags`. No M2TS / AC3 table row
   /// is `Unknown => 1` ⇒ `unknown: false`.
   ///
-  /// The bundled minor warning (M2TS.pm:349-351) and the nested H.264
-  /// `Warn`s are NOT part of this stream (`run_emission` has no warning
-  /// channel); both are yielded by this `Meta`'s
-  /// [`Diagnose`](crate::diagnostics::Diagnose) impl and drained by
-  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics).
+  /// The `[minor] ExtractEmbedded` minor warning (M2TS.pm:347-350) is NOT part
+  /// of this stream — the walk now knows `extract_embedded`, so it is pushed
+  /// in-walk (no-`ee` only) into the structural corpus drained via
+  /// [`Diagnose`](crate::diagnostics::Diagnose), matching bundled's walk-order
+  /// first-wins. The
+  /// LIGOGPSINFO dashcam GPS (`type == 6 and $pid == 0x0300`, M2TS.pm:308-318) is
+  /// likewise emitted here through the shared QuickTime `Stream` emitter
+  /// ([`crate::formats::quicktime::emit_ligogps`]), `-ee`-gated. The
+  /// UNCONDITIONAL structural M2TS `$et->Warn`s and the nested H.264 `Warn`s are
+  /// NOT part of this stream (`run_emission` has no warning channel); both are
+  /// yielded by this `Meta`'s [`Diagnose`](crate::diagnostics::Diagnose) impl and
+  /// drained by [`run_diagnostics`](crate::diagnostics::run_diagnostics).
   fn tags(
     &self,
     opts: crate::emit::EmitOptions,
@@ -2025,6 +2253,20 @@ impl crate::emit::Taggable for Meta<'_> {
     // conformance path.
     if let Some(h) = &self.h264 {
       tags.extend(h.tags(opts));
+    }
+
+    // LIGOGPSINFO dashcam GPS (M2TS.pm:308-318) — emitted through the SAME
+    // shared QuickTime `Stream` emitter the bundled `GetTagTable('…QuickTime::
+    // Stream')` routes to ([`crate::formats::quicktime::emit_ligogps`]): the
+    // family-1 `LIGO` group, per-record `Doc<N>` axis under `-ee -G3`, the
+    // first-wins doc collapse at `-G1`/no-`ee`, and the per-tag GPS PrintConvs
+    // (lat/lon `ToDMS`, altitude `" m"`, speed/track `%.4f+0`). Gated on `-ee`
+    // inside the emitter: the binary LigoGPS family surfaces ONLY under
+    // ExtractEmbedded (these records live in the video PES, which the no-`ee`
+    // run never extracts), so a default (no-`ee`) M2TS render emits NO `LIGO:*`
+    // — matching the bundled `MPEG2_TS_pruveeo_d90.ts.json` no-`ee` golden.
+    if !self.ligogps.is_empty() {
+      crate::formats::quicktime::emit_ligogps(&self.ligogps, opts, print_conv, &mut tags);
     }
 
     tags.into_iter()
@@ -2220,10 +2462,20 @@ impl crate::metadata::Project for Meta<'_> {
 
     // Fold in the H.264 elementary stream's own projection (the video
     // TrackKind it contributes), with M2TS's container-level facts winning.
-    match &self.h264 {
+    let mut out = match &self.h264 {
       Some(h) => out.merge(Project::project(h)),
       None => out,
-    }
+    };
+
+    // LIGOGPSINFO dashcam GPS (M2TS.pm:308-318) — the FIRST decoded fix
+    // populates `MediaMetadata::gps` (lowest-tier dashcam vendor GPS, same as
+    // the QuickTime LigoGPS path). This projection is mode-independent (it reads
+    // whatever samples were decoded), but the DECODE itself is `-ee`-gated (the
+    // PID-0x0300 arm in `parse_pid`, #307), so at no-`ee` there are NO
+    // decoded samples and this surfaces nothing — regardless of where the PES
+    // sat in the walk. At `-ee` the first fix flows through to the domain GPS.
+    self.ligogps.project_into(&mut out);
+    out
   }
 }
 
@@ -2233,29 +2485,39 @@ impl crate::metadata::Project for Meta<'_> {
 
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for Meta<'_> {
-  /// Yield the M2TS `$et->Warn` corpus as
+  /// Yield the STRUCTURAL M2TS `$et->Warn` corpus as
   /// [`Diagnostic`](crate::diagnostics::Diagnostic)s, in bundled WALK order —
-  /// the order each `$et->Warn(...)` fired as `ProcessM2TS` ran the packet loop
-  /// (M2TS.pm:618/708/733/764/783/796/798/831/838/930), with the per-frame
-  /// H.264 sub-warnings (H264.pm:989/1058) and the minor `The ExtractEmbedded
-  /// option…` warning (M2TS.pm:349-351) captured AT THEIR walk positions too.
-  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) resolves the
-  /// document `ExifTool:Warning` first-wins (priority-0), so this true walk
-  /// order makes the surfaced warning faithful (Codex finding #9): e.g. a
-  /// stream whose H.264 minor warning fires BEFORE a later `M2TS
-  /// synchronization error` surfaces the minor warning as `ExifTool:Warning`,
-  /// matching bundled `exiftool`.
+  /// the order each UNCONDITIONAL `$et->Warn(...)` fired as `ProcessM2TS` ran the
+  /// packet loop (M2TS.pm:618/708/733/764/783/796/798/831/838/930), with the
+  /// per-frame H.264 sub-warnings (H264.pm:989/1058) captured AT THEIR walk
+  /// positions too. [`run_diagnostics`](crate::diagnostics::run_diagnostics)
+  /// resolves the document `ExifTool:Warning` first-wins (priority-0), so this
+  /// true walk order is faithful (Codex finding #9).
+  ///
+  /// The mode-dependent `[minor] ExtractEmbedded` minor warning (M2TS.pm:347-350)
+  /// IS in this drain: it is pushed at the H.264 walk position at no-`ee` only
+  /// (`!extract_embedded`), so a LATER structural warning (e.g. `M2TS
+  /// synchronization error`, M2TS.pm:708) does NOT displace it — exactly
+  /// bundled's `%noDups` first-wins. For a clean stream (`M2TS.mts` / the
+  /// Pruveeo D90 no-`ee`) it is the sole document warning.
   ///
   /// The corpus is assembled during the walk on the [`Walker`] and moved onto
-  /// [`Meta`]; this impl is a pure drain. The minor warning is `$et->Warn(msg,
-  /// 7)` (M2TS.pm:350): `7 = 0x04 | 0x03` ⇒ `$noCount` (no ` [x$n]` suffix,
-  /// ExifTool.pm:5621-5623) and `$ignorable & 0x03 == 3` (Validate-only level,
-  /// still `[minor] `-prefixed in normal mode, ExifTool.pm:5630) ⇒ stored as
-  /// `ignorable == 3`, `no_count == true`; the prefix is applied centrally.
-  /// Every other ported site is a plain `$et->Warn(msg)` (ignorable 0). The
-  /// nested H.264 warnings are captured per-frame (NOT re-drained from the
-  /// merged [`H264Meta`]) so the order is the true walk order.
+  /// [`Meta`]; this impl is a pure drain. Each structural site is a plain
+  /// `$et->Warn(msg)` (ignorable 0). The nested H.264 warnings are captured
+  /// per-frame (NOT re-drained from the merged [`H264Meta`]) so the order is the
+  /// true walk order. The `LIGOGPSINFO` walker's own out-of-range / format-error
+  /// `$et->Warn` (LigoGPS.pm:235/254) is pushed IN-WALK at its PID-0x0300 PES
+  /// position too (document-level, like the QuickTime LigoGPS path; latched to a
+  /// single emit) so it joins the same priority-0 FIRST-wins resolution — empty
+  /// for a clean decode.
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    // Pure drain — the LIGOGPSINFO walker's own `$et->Warn` (`LIGOGPSINFO format
+    // error` / `LIGOGPSINFO coordinates out of range`, LigoGPS.pm:235/254) is
+    // ALREADY in `self.warnings` at its PID-0x0300 PES walk position (pushed
+    // in-walk by `parse_ligogps`, latched to a single emit), so it takes part in
+    // the same priority-0 FIRST-wins resolution as every structural / H.264
+    // warning — no separate post-walk append (which would let a LATER structural
+    // warning wrongly win). Empty for a clean decode (the Pruveeo D90).
     self.warnings.clone()
   }
 }
@@ -2370,6 +2632,7 @@ mod tests {
         start: 0,
         tc_len: 4,
       },
+      false,
     );
     w.decode_ac3_descriptor(&desc);
     assert_eq!(w.ac3_audio_bitrate, Some(12));
@@ -2385,6 +2648,7 @@ mod tests {
         start: 0,
         tc_len: 0,
       },
+      false,
     );
     w.decode_ac3_descriptor(&[0, 0]);
     assert!(w.ac3_audio_bitrate.is_none());
@@ -2411,10 +2675,10 @@ mod tests {
   #[test]
   fn file_type_override_m2ts_vs_m2t() {
     let buf192 = synth(4, 4);
-    let m = parse_inner(&buf192).expect("must accept 192-byte stream");
+    let m = parse_inner(&buf192, false).expect("must accept 192-byte stream");
     assert_eq!(m.file_type().as_file_type(), "M2TS");
     let buf188 = synth(4, 0);
-    let m = parse_inner(&buf188).expect("must accept 188-byte stream");
+    let m = parse_inner(&buf188, false).expect("must accept 188-byte stream");
     assert_eq!(m.file_type().as_file_type(), "M2T");
   }
 
@@ -2430,7 +2694,7 @@ mod tests {
   fn truncated_packet_buffer_yields_no_meta() {
     let buf = synth(2, 4);
     let truncated = &buf[..200];
-    assert!(parse_inner(truncated).is_none());
+    assert!(parse_inner(truncated, false).is_none());
   }
 
   #[test]
@@ -2440,7 +2704,7 @@ mod tests {
     for i in (4..buf.len()).step_by(192) {
       buf[i] = 0xff;
     }
-    assert!(parse_inner(&buf).is_none());
+    assert!(parse_inner(&buf, false).is_none());
   }
 
   #[test]
@@ -2448,7 +2712,7 @@ mod tests {
     // A 188-byte stream whose PAT names a PMT PID that never appears.
     // Walker should run to EOF without emitting anything (no panic).
     let buf = synth(8, 0);
-    let meta = parse_inner(&buf).expect("probe accepts pure null packets");
+    let meta = parse_inner(&buf, false).expect("probe accepts pure null packets");
     assert!(meta.video_stream_type().is_none());
     assert!(meta.audio_stream_type().is_none());
     assert!(meta.h264().is_none());
@@ -2509,6 +2773,7 @@ mod tests {
         start: 0,
         tc_len: 0,
       },
+      false,
     );
     w.pmt_pids.push(pid);
     // `pos = 4` mirrors the prefix-walk entry (process_packet sets pos past the
@@ -2551,6 +2816,7 @@ mod tests {
         start: 0,
         tc_len: 4,
       },
+      false,
     );
     w.pmt_pids.push(pid);
     w.process_psi(pid, true, &packet, 4);
@@ -2603,7 +2869,7 @@ mod tests {
   #[test]
   fn meta_accessors_pass_through_synth() {
     let buf = synth(8, 4);
-    let m = parse_inner(&buf).expect("probe");
+    let m = parse_inner(&buf, false).expect("probe");
     assert_eq!(m.file_type(), FileTypeKind::M2ts);
     assert_eq!(m.video_stream_type(), None);
     assert_eq!(m.audio_stream_type(), None);

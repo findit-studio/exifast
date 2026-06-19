@@ -10863,9 +10863,13 @@ fn mp4_blackvue_dr770x_conformance() {
   );
 }
 
-// #138 — Pruveeo D90 dashcam: LIGOGPSINFO data in an MPEG-TS container.
+// #138 / #129 — Pruveeo D90 dashcam: LIGOGPSINFO data in an MPEG-TS container.
+// The no-`ee` path is byte-exact (M2TS/H264 structural tags; the Composite
+// `ImageSize`/`Megapixels` are excluded per the QuickTime/MPEG-MOV precedent —
+// the port has no Composite subsystem). The `-ee` LIGOGPSINFO timed GPS (the
+// `type == 6 and $pid == 0x0300` dashcam arm, M2TS.pm:308-318) is pinned in
+// `tests/timed_metadata_conformance.rs::pruveeo_d90_ligogps_ee_byte_exact`.
 #[test]
-#[ignore = "port gap: Pruveeo D90 LIGOGPSINFO in MPEG-TS; see #138"]
 fn mpeg2_ts_pruveeo_d90_conformance() {
   check(
     "MPEG2_TS_pruveeo_d90.ts",

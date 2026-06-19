@@ -11186,7 +11186,7 @@ fn parrot_emit_automation(
 /// variant — DateTimeOriginal (`ConvertDateTime`, verbatim) after Accelerometer
 /// (LigoGPS.pm:380).
 #[cfg(feature = "alloc")]
-fn emit_ligogps(
+pub(crate) fn emit_ligogps(
   meta: &crate::metadata::LigoGpsMeta,
   opts: crate::emit::EmitOptions,
   print_conv: bool,

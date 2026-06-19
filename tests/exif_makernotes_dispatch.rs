@@ -3527,7 +3527,7 @@ fn samsung_srw_makernote_dispatches_via_tiff_type() {
   let parser = any_parser_for("TIFF").expect("TIFF parser (exif feature)");
   let mut shared = SharedFlags::new();
   let meta = parser
-    .parse_any(&data, &mut shared, Some("srw"), 0, Some("SRW"))
+    .parse_any(&data, &mut shared, Some("srw"), 0, Some("SRW"), false)
     .expect("crafted SRW TIFF is recognized");
 
   let AnyMeta::Exif(exif) = &meta else {

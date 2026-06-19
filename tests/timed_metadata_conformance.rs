@@ -3764,3 +3764,45 @@ fn insta360_full_stream_rejects_duplicate_doc_key() {
     msg.message()
   );
 }
+
+// ── M2TS: LIGOGPSINFO dashcam timed GPS (#138 / #129) ────────────────────────
+
+// Pruveeo D90 dashcam: an MPEG-2 Transport Stream whose `type == 6 and $pid ==
+// 0x0300` PES private stream carries seven 200-byte `LIGOGPSINFO\0` blocks
+// (M2TS.pm:308-318). Each block decodes (decrypt + DEFUZZ — the 200-byte length
+// means `noFuzz == false`) to one timed GPS sample, taking a consecutive global
+// `Doc<N>` (LigoGPS.pm:243). The decode routes through the SAME shared
+// `LigoGPS::ProcessLigoGPS` walker and `QuickTime::Stream` emitter as the
+// QuickTime LigoGPS path, so the `-ee` output is the family-1 `LIGO` group with
+// the per-record GPS PrintConvs (lat/lon `ToDMS`, altitude `" m"`, speed/track
+// `%.4f+0`). Pinned byte-exact at `-ee -G1` (the doc axis collapsed to the first
+// fix) and `-ee -G3:1` (every record its own `Doc<N>:LIGO:*` row).
+#[test]
+fn pruveeo_d90_ligogps_ee_byte_exact() {
+  check_ee(
+    "MPEG2_TS_pruveeo_d90.ts",
+    "MPEG2_TS_pruveeo_d90.ts.ee.json",
+    false,
+  );
+  check_ee(
+    "MPEG2_TS_pruveeo_d90.ts",
+    "MPEG2_TS_pruveeo_d90.ts.ee.g3.json",
+    true,
+  );
+}
+
+// The DEFAULT (no-`ee`) render of the same Pruveeo D90 file emits NO `LIGO:*`
+// GPS — the binary LigoGPS records live in the video PES private stream, which
+// ExifTool extracts only under `-ee` (`emit_ligogps`'s `-ee` gate). The no-`ee`
+// document carries only the structural M2TS/H264 tags plus the `[minor]
+// ExtractEmbedded` hint (M2TS.pm:349-351). Byte-exact vs the no-`ee` `.json`
+// golden (Composite excluded — the port has no Composite subsystem). This is the
+// timed-suite mirror of `conformance.rs::mpeg2_ts_pruveeo_d90_conformance`.
+#[test]
+fn pruveeo_d90_noee_no_ligogps_byte_exact() {
+  check_noee_excluding(
+    "MPEG2_TS_pruveeo_d90.ts",
+    "MPEG2_TS_pruveeo_d90.ts.json",
+    NO_EXCL,
+  );
+}

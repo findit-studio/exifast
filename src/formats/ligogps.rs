@@ -125,6 +125,13 @@ const DEFAULT_FUZZED_SPD_SCL: f64 = 1.85407333;
 /// `LIGOGPSINFO\0`). Length is hard-coded throughout the bundled module.
 pub(crate) const HDR_LIGOGPSINFO: &[u8; 12] = b"LIGOGPSINFO\0";
 
+/// The bare 11-byte `LIGOGPSINFO` ASCII magic WITHOUT the trailing NUL — the
+/// fingerprint the M2TS dashcam arm matches (`$$dataPt =~ /^LIGOGPSINFO/s`,
+/// M2TS.pm:312). The PES private-stream block begins `LIGOGPSINFO\0…`, so the
+/// NUL-terminated [`HDR_LIGOGPSINFO`] would also match; the 11-byte prefix
+/// mirrors the bundled regex exactly.
+pub(crate) const HDR_LIGOGPSINFO_PREFIX: &[u8; 11] = b"LIGOGPSINFO";
+
 /// JSON-variant LIGOGPSINFO magic (`LIGOGPSINFO {` — a SPACE then `{`).
 /// ExifTool distinguishes the JSON `ProcessLigoJSON` form from the binary
 /// `ProcessLigoGPS` form by this byte-after-`LIGOGPSINFO` (QuickTime.pm:835

@@ -2585,7 +2585,7 @@ fn extract_info_with_options_threads_extract_embedded() {
 /// off and on render differently (see [`extract_info_with_options_threads_extract_embedded`]).
 #[test]
 fn rendered_new_with_options_threads_extract_embedded() {
-  use exifast::Rendered;
+  use exifast::{ParseOptions, Rendered};
 
   let data = fixture("QuickTime_gps0.mov");
   let meta = parse_bytes(&data).expect("recognized");
@@ -2593,7 +2593,11 @@ fn rendered_new_with_options_threads_extract_embedded() {
   let base = Rendered::new(&meta, true);
   assert!(!base.extract_embedded(), "Rendered::new defaults -ee off");
 
-  let on = Rendered::new_with_options(&meta, true, true);
+  let on = Rendered::new_with_options(
+    &meta,
+    true,
+    &ParseOptions::default().with_extract_embedded(true),
+  );
   assert!(on.extract_embedded(), "new_with_options carries -ee on");
 
   let off_json = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize off");

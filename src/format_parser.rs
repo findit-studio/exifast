@@ -718,8 +718,9 @@ impl AnyMeta<'_> {
     &self,
     mode: crate::emit::ConvMode,
   ) -> impl Iterator<Item = crate::value::Tag> + '_ {
-    // The generic-extraction path is the `-G1` default; `-ee` defaults off until
-    // the ParseOptions task threads the real flag.
+    // The generic-extraction path is the `-G1` default with `-ee` off — this
+    // option-free tag iterator is the faithful baseline; the `-ee`/`-G3`-aware
+    // render path is [`Rendered::new_with_options`] (driven by `ParseOptions`).
     let opts = crate::emit::EmitOptions::g1(mode, false);
     let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
     for e in self.collect_emitted(opts) {
@@ -1642,12 +1643,16 @@ pub struct Rendered<'a, 'm> {
   print_conv: bool,
   /// ExifTool `-ee` (extract embedded): gates per-sample timed-metadata
   /// emission. `Rendered::new` defaults it `false` (the faithful
-  /// `perl exiftool -j -G1` baseline); set via [`Rendered::new_with_options`].
-  /// Threaded into `serialize_tags` → `EmitOptions`; parsing is always-extract.
+  /// `perl exiftool -j -G1` baseline); set via [`Rendered::new_with_options`]
+  /// from a [`ParseOptions`](crate::ParseOptions). Threaded into
+  /// `serialize_tags` → `EmitOptions`; for most formats parsing is
+  /// always-extract (only M2TS's LIGOGPS walk is parse-time `-ee`-gated, via the
+  /// parse entry points, not this render flag).
   extract_embedded: bool,
   /// The group-key form the serializer renders: `-G1` (collapse the family-3
   /// `doc` axis — the conformance golden form) vs `-G3` (`Doc<N>:` prefix).
-  /// `Rendered::new` defaults to `G1`, matching the engine's `extract_info`.
+  /// `Rendered::new` defaults to `G1`, matching the engine's `extract_info`;
+  /// `new_with_options` takes it from [`ParseOptions::group3`](crate::ParseOptions::group3).
   group_mode: crate::serialize_key::GroupMode,
 }
 
@@ -1655,33 +1660,40 @@ pub struct Rendered<'a, 'm> {
 #[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
 impl<'a, 'm> Rendered<'a, 'm> {
   /// Wrap `meta` for serialization in the given mode (`print_conv = true` ⇒
-  /// `-j` PrintConv strings; `false` ⇒ `-n` raw post-ValueConv scalars).
-  /// `extract_embedded` defaults `false` (the faithful baseline); use
-  /// [`new_with_options`](Self::new_with_options) to set ExifTool `-ee`.
+  /// `-j` PrintConv strings; `false` ⇒ `-n` raw post-ValueConv scalars). Uses
+  /// the default [`ParseOptions`](crate::ParseOptions) — ExifTool `-ee` off and
+  /// the `-G1` key form (the faithful baseline); use
+  /// [`new_with_options`](Self::new_with_options) to set `-ee` / `-G3`.
   #[must_use]
   #[inline(always)]
-  pub const fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
-    Self::new_with_options(meta, print_conv, false)
+  pub fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
+    Self::new_with_options(meta, print_conv, &crate::ParseOptions::default())
   }
 
-  /// Wrap `meta` like [`new`](Self::new) but also set ExifTool `-ee`
-  /// (`extract_embedded`): `true` ⇒ emit the per-sample timed-metadata tags;
-  /// `false` ⇒ the faithful baseline (no per-sample tags, the
-  /// `[minor] ExtractEmbedded` warning instead). The flag is threaded into
-  /// `serialize_tags` → `EmitOptions` and consumed at render time — the typed
-  /// per-sample data is parsed unconditionally either way.
+  /// Wrap `meta` like [`new`](Self::new) but drive the render from an explicit
+  /// [`ParseOptions`](crate::ParseOptions) — the SAME options type the parse
+  /// entry points take, so the parse-time and render-time `-ee` are expressed
+  /// consistently. [`ParseOptions::extract_embedded`](crate::ParseOptions::extract_embedded)
+  /// ⇒ ExifTool `-ee` (`true` emits the per-sample timed-metadata tags; `false`
+  /// is the faithful baseline — no per-sample tags, the `[minor] ExtractEmbedded`
+  /// warning instead) and
+  /// [`ParseOptions::group3`](crate::ParseOptions::group3) ⇒ the `-G3` vs `-G1`
+  /// key form. Both are threaded into `serialize_tags` → `EmitOptions` and
+  /// consumed at render time; the per-sample data this gates was either parsed
+  /// unconditionally (most formats) or by an `-ee` parse entry
+  /// ([`crate::parse_bytes_with_options`], for the M2TS LIGOGPS walk).
   #[must_use]
   #[inline(always)]
   pub const fn new_with_options(
     meta: &'a AnyMeta<'m>,
     print_conv: bool,
-    extract_embedded: bool,
+    options: &crate::ParseOptions,
   ) -> Self {
     Self {
       meta,
       print_conv,
-      extract_embedded,
-      group_mode: crate::serialize_key::GroupMode::G1,
+      extract_embedded: options.extract_embedded(),
+      group_mode: options.group_mode(),
     }
   }
 
@@ -1798,6 +1810,14 @@ impl AnyParser {
   /// (bundled's `TIFF_TYPE eq 'TIFF'`, `ExifTool.pm:8715`/`:8767`); every other
   /// arm ignores it. `None` ⇒ gate off (no synthesized PageCount).
   ///
+  /// `extract_embedded` mirrors ExifTool `-ee` (default `false` ⇒ the faithful
+  /// no-`ee` baseline). It is consumed ONLY by the M2TS arm, where the walk
+  /// extent is mode-aware (M2TS.pm:347's `$more = 1` full scan to EOF — needed
+  /// to reach the LIGOGPSINFO dashcam-GPS PES — is itself inside
+  /// `if ($$et{OPTIONS}{ExtractEmbedded})`); every other format parses
+  /// mode-agnostically and re-reads the render mode from
+  /// [`EmitOptions`](crate::emit::EmitOptions) at `serialize_tags` time.
+  ///
   /// Returns `Some(meta)` for the first parser that accepts `bytes`, or
   /// `None` to reject this candidate. No ported format has a Rust-level
   /// fatal mode — a malformed input is either rejected (`None`) or accepted
@@ -1818,6 +1838,7 @@ impl AnyParser {
     ext: Option<&str>,
     header_skip: usize,
     tiff_parent_type: Option<&str>,
+    extract_embedded: bool,
   ) -> Option<AnyMeta<'a>> {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` below is empty and the parameters are unused. Discard them
@@ -1852,13 +1873,24 @@ impl AnyParser {
       feature = "riff",
       feature = "xmp",
     )))]
-    let _ = (bytes, shared, ext, header_skip, tiff_parent_type);
+    let _ = (
+      bytes,
+      shared,
+      ext,
+      header_skip,
+      tiff_parent_type,
+      extract_embedded,
+    );
     // `header_skip` and `tiff_parent_type` are consumed ONLY by the `JPEG`/`TIFF`
     // (`AnyParser::Exif`) arm; every other format starts at file offset 0 and is
     // not a TIFF subtype. Discard them here so a single-format build whose one
     // arm is not `Exif` stays warning-clean (the `Exif` arm's later use of the
     // `Copy` `usize` / `Option<&str>` is unaffected).
     let _ = (header_skip, tiff_parent_type);
+    // `extract_embedded` is consumed only by the `M2ts` arm (which reads it
+    // directly); discard it once here so the other arms stay warning-clean in
+    // every feature combination (incl. an M2TS-disabled build).
+    let _ = extract_embedded;
     match self {
       #[cfg(feature = "moi")]
       AnyParser::Moi(p) => {
@@ -1913,9 +1945,12 @@ impl AnyParser {
       AnyParser::M2ts(p) => {
         // M2TS is a leaf format (Engine-only; the H.264 sub-Meta is owned
         // by the M2TS Meta, not shared state): `shared` and `ext` are
-        // unused.
-        let _ = (shared, ext);
-        p.parse(bytes).map(AnyMeta::M2ts)
+        // unused. `extract_embedded` (M2TS.pm:347) IS threaded here — it gates
+        // the walk extent (the `$more = 1` full scan to EOF that reaches the
+        // LIGOGPSINFO PES). At no-`ee` the walk early-stops as bundled does
+        // without `ExtractEmbedded`, byte-identical to the pre-LIGOGPS baseline.
+        let _ = (p, shared, ext);
+        crate::formats::m2ts::parse_borrowed_with_ee(bytes, extract_embedded).map(AnyMeta::M2ts)
       }
       #[cfg(feature = "mp3")]
       AnyParser::Mp3(p) => {
@@ -2473,7 +2508,7 @@ mod tests {
     let parser = any_parser_for("MOI").expect("MOI feature enabled");
     let mut shared = SharedFlags::new();
     // `header_skip == 0`: an ordinary (non-header-skip) candidate.
-    let result = parser.parse_any(bytes, &mut shared, None, 0, None);
+    let result = parser.parse_any(bytes, &mut shared, None, 0, None, false);
     // The exact `Some`/`None` outcome depends on the MOI parser's
     // acceptance rules for a 16-byte buffer; this test just verifies the
     // dispatch doesn't panic and routes through the closed `AnyMeta` enum.
@@ -2498,7 +2533,7 @@ mod tests {
     let meta = {
       // `ext` is a short-lived String dropped at the end of this block.
       let ext: String = String::from("MP3");
-      let m = parser.parse_any(&bytes, &mut shared, Some(ext.as_str()), 0, None);
+      let m = parser.parse_any(&bytes, &mut shared, Some(ext.as_str()), 0, None, false);
       // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
       m
     };
@@ -2523,7 +2558,7 @@ mod tests {
     let parser = any_parser_for("AAC").expect("AAC feature enabled");
     let mut shared = SharedFlags::new();
     let meta = parser
-      .parse_any(&data, &mut shared, Some("AAC"), 0, None)
+      .parse_any(&data, &mut shared, Some("AAC"), 0, None, false)
       .expect("AAC recognized");
 
     // -j (PrintConv): a flat object of AAC:* tags; no SourceFile / File:* /

@@ -1,7 +1,6 @@
 [{
   "SourceFile": "MPEG2_TS_pruveeo_d90.ts",
   "ExifTool:ExifToolVersion": 13.59,
-  "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
   "File:FileType": "M2T",
   "File:FileTypeExtension": "m2t",
   "File:MIMEType": "video/mpeg",
@@ -9,5 +8,12 @@
   "M2TS:AudioStreamType": "MPEG-2 AAC Audio",
   "M2TS:Duration": "7.44 s",
   "H264:ImageWidth": 1920,
-  "H264:ImageHeight": 1080
+  "H264:ImageHeight": 1080,
+  "LIGO:GPSDateTime": "2026:02:16 16:13:26",
+  "LIGO:GPSLatitude": "30 deg 24' 9.10\" N",
+  "LIGO:GPSLongitude": "89 deg 1' 33.12\" W",
+  "LIGO:GPSSpeed": 18.5407,
+  "LIGO:GPSTrack": 178.3,
+  "LIGO:GPSAltitude": "-27.9 m",
+  "LIGO:Accelerometer": "0.00 0.00 0.00"
 }]
