@@ -1,0 +1,23 @@
+[
+  {
+    "ExifTool:ExifToolVersion": 13.55,
+    "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
+    "File:FileName": "MPEG2_TS_pruveeo_d90.ts",
+    "File:Directory": "tests/fixtures",
+    "File:FileSize": 10092544,
+    "File:FileModifyDate": "2026:06:19 19:24:31+09:00",
+    "File:FileAccessDate": "2026:06:19 19:24:31+09:00",
+    "File:FileInodeChangeDate": "2026:06:19 19:24:31+09:00",
+    "File:FilePermissions": 100644,
+    "File:FileType": "M2T",
+    "File:FileTypeExtension": "M2T",
+    "File:MIMEType": "video/mpeg",
+    "M2TS:VideoStreamType": 27,
+    "M2TS:AudioStreamType": 15,
+    "M2TS:Duration": 7.437,
+    "H264:ImageWidth": 1920,
+    "H264:ImageHeight": 1080,
+    "Composite:ImageSize": "1920 1080",
+    "Composite:Megapixels": 2.0736
+  }
+]
