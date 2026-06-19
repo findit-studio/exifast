@@ -9497,6 +9497,13 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   let mut typed = MakerNotesSamsung::new();
   {
     let mut sink = VendorEmissionSink::new(&mut emissions);
+    // The `0xa020 EncryptionKey` DataMember (`Samsung.pm:489-490`), captured
+    // DURING the walk: `0xa020` precedes every `0xa021`+ Crypt tag in the
+    // ascending Type2 IFD, so by the time a Crypt entry is reached the key is
+    // set. Empty until captured (and stays empty if `0xa020` is absent/malformed)
+    // ⇒ a Crypt tag with no key emits nothing (`Samsung::Crypt`'s
+    // `$key or return undef`).
+    let mut encryption_key: std::vec::Vec<i64> = std::vec::Vec::new();
     for entry in &w.entries {
       // Only `ResolvedConv::Samsung` entries live in this run; a defensive
       // non-Samsung conv (never produced under `TableRef::Samsung`) is skipped.
@@ -9520,7 +9527,29 @@ pub(in crate::exif) fn samsung_makernote_isolated(
         }
         continue;
       }
-      // Leaf tag — the plain Samsung renderer + the gate-passing typed populate.
+      // Crypt tag (`RawConv => Samsung::Crypt`, `0xa021`..`0xa043` of the 16) —
+      // decrypt with the captured key + the row's salts/format, emitting the
+      // plaintext directly (no PrintConv: `-j` and `-n` render the same string).
+      // The decrypted arrays are raw-processing data, not camera-identity, so
+      // they populate no typed field.
+      if let Some(crypt_tag) = samsung_tag.crypt() {
+        samsung::emit_crypt(
+          samsung_tag.name(),
+          crypt_tag,
+          entry.value.raw(),
+          &encryption_key,
+          samsung_tag.is_unknown(),
+          &mut *sink.emissions,
+        );
+        continue;
+      }
+      // Plain leaf — the Samsung renderer + the gate-passing typed populate. The
+      // `0xa020 EncryptionKey` is one such leaf: it is emitted normally AND its
+      // raw int32u[11] is captured here as the Crypt key for the following rows
+      // (the `$$self{EncryptionKey} = [ split(" ",$val) ]; $val` DataMember tap).
+      if entry.tag_id == 0xa020 {
+        encryption_key = samsung::encryption_key_from_raw(entry.value.raw());
+      }
       let Ok(()) = emit_samsung_value(
         g1,
         entry,

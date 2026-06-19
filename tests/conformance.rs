@@ -8956,8 +8956,9 @@ fn makernotes_samsung_nx500_conformance() {
   // `MakerNoteSamsung2` (`MakerNotes.pm:965-979`, EXIF-format magic) and walks
   // `%Samsung::Type2` through the shared `Walker` (body offset 0, inherit base,
   // `ByteOrder => Unknown` probed to big-endian, `FixBase => 1`, `ProcessProc =>
-  // ProcessUnknown`). exifast emits all 27 plain `Samsung:*` leaves
-  // byte-identically to bundled ExifTool 13.59 — the camera-indexing identity
+  // ProcessUnknown`). exifast emits all 45 `Samsung:*` leaves (29 plain + the
+  // 16 decrypted Crypt leaves, #242) byte-identically to bundled ExifTool 13.59
+  // — the camera-indexing identity
   // (`DeviceType` = "High-end NX Camera", `SamsungModelID` = "Various Models
   // (0x5001038)", `LensType` = "Samsung NX 45mm F1.8" via %samsungLensTypes,
   // `FirmwareName` = "1.10", `LensFirmware` = "01.00_01.10",
@@ -8969,27 +8970,36 @@ fn makernotes_samsung_nx500_conformance() {
   // ASCII-string render), the `CameraTemperature` undef rational, `SensorAreas`,
   // `SmartAlbumColor` = "n/a" (the `\0{4}` branch), and the five
   // `%Samsung::PictureWizard` ProcessBinaryData members (PictureWizardMode =
-  // "Standard", Color = 65535, the -4-shifted Saturation/Sharpness/Contrast).
+  // "Standard", Color = 65535, the -4-shifted Saturation/Sharpness/Contrast),
+  // and the 16 decrypted Crypt leaves (#242, e.g. ColorMatrix =
+  // "436 -120 -60 -42 312 -14 2 -94 348", WB_RGGBLevelsBlack = "128 128 128 128").
   // The "[minor] Unrecognized MakerNotes" warning bundled emitted while Samsung
-  // was undecoded is GONE (the vendor now decodes). All 27 match for BOTH the
-  // `-j` PrintConv and `-n` numeric snapshots.
+  // was undecoded is GONE (the vendor now decodes). All 45 match for BOTH the
+  // `-j` PrintConv and `-n` numeric snapshots (a Crypt row has no PrintConv, so
+  // its plaintext is identical in both).
+  //
+  // #242: the 16 `RawConv => Samsung::Crypt(...)` encrypted leaves are now
+  // DECRYPTED and emitted — WB_RGGBLevels{Uncorrected,Auto,Illuminator1,
+  // Illuminator2,Black}, ColorMatrix{,SRGB,AdobeRGB}, CbCr{MatrixDefault,Matrix,
+  // GainDefault,Gain}, ToneCurve{SRGBDefault,AdobeRGBDefault,SRGB,AdobeRGB}. The
+  // cipher (`Samsung::Crypt`, Samsung.pm:1579-1605) decrypts each with the
+  // `0xa020 EncryptionKey` int32u[11] captured DURING the Type2 walk; exifast's
+  // plaintext space-joined integers match bundled ExifTool 13.59 BYTE-EXACT (the
+  // real-input proof the cipher port is correct).
   //
   // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the tags
   // exifast does NOT emit — every exclusion is a documented deferral (none masks
   // a Samsung-Type2 faithfulness gap; the diff carries NO tag exifast emits that
   // bundled does not):
-  //   -x Samsung:<16 Crypt tags> — the `RawConv => Samsung::Crypt(...)`
-  //                        encrypted block `0xa021`..`0xa057` EXCEPT the plain
-  //                        `0xa025` (WB_RGGBLevels*, ColorMatrix*, CbCr*,
-  //                        ToneCurve*) — raw-processing data, deferred.
-  //                        (`0xa020 EncryptionKey` + `0xa025`
-  //                        HighlightLinearityLimit are plain leaves, EMITTED.)
   //   -x PreviewIFD:all  — the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD
   //                        (PreviewImage + its IFD tags), deferred.
   //   -x SubIFD:all -x SubIFD1:all — the SRW raw/JpgFromRaw sub-IFDs (the raw
   //                        image strips + the embedded JPEG), not walked.
   //   -x Composite:all   — exifast has no EXIF Composite subsystem (drops the
   //                        Composite:LensID/ImageSize/WB_RGGBLevels/… synthesis).
+  // (The deferred `Unknown => 1` Crypt rows 0xa048/0xa05x are NOT excluded here:
+  // ExifTool suppresses them from default `-j` output, so bundled never emits
+  // them either — no `-x` is needed.)
   // (The `0x0011 OrientationInfo` row is absent from this body. The
   // `0xa002 SerialNumber` row IS present, but its value is `"0"` + NULs, which
   // fails the `Condition => '$$valPt =~ /^\w{5}/'` gate (`Samsung.pm:404-409`)
