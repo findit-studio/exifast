@@ -43,5 +43,7 @@
   "Track1:MediaTimeScale": 90000,
   "Track1:MediaDuration": 0.16,
   "Track1:HandlerType": "pict",
+  "Track1:GraphicsMode": 0,
+  "Track1:OpColor": "0 0 0",
   "Track1:OtherFormat": "hvc1"
 }]

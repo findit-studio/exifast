@@ -60,9 +60,9 @@ use crate::{
   },
   metadata::{
     AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
-    GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta, LigoGpsMeta,
-    MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
-    VisualSampleDesc,
+    GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta,
+    LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
+    SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -1293,6 +1293,109 @@ fn matrix_coefficients_print(v: u16) -> Option<&'static str> {
   })
 }
 
+/// The shared `%graphicsMode` PrintConv hash (QuickTime.pm:378-412), used by
+/// `GraphicsMode` (`vmhd`) and `GenGraphicsMode` (`gmin`). Returns the QuickDraw
+/// transfer-mode label, or `None` on a miss (the caller then formats the
+/// `PrintHex` `Unknown (0x%x)` fallback). The hash keys are the raw `int16u`
+/// values (the table's `PrintHex => 1` affects only the display, not lookup).
+fn graphics_mode_print(v: u16) -> Option<&'static str> {
+  Some(match v {
+    0x00 => "srcCopy",
+    0x01 => "srcOr",
+    0x02 => "srcXor",
+    0x03 => "srcBic",
+    0x04 => "notSrcCopy",
+    0x05 => "notSrcOr",
+    0x06 => "notSrcXor",
+    0x07 => "notSrcBic",
+    0x08 => "patCopy",
+    0x09 => "patOr",
+    0x0a => "patXor",
+    0x0b => "patBic",
+    0x0c => "notPatCopy",
+    0x0d => "notPatOr",
+    0x0e => "notPatXor",
+    0x0f => "notPatBic",
+    0x20 => "blend",
+    0x21 => "addPin",
+    0x22 => "addOver",
+    0x23 => "subPin",
+    0x24 => "transparent",
+    0x25 => "addMax",
+    0x26 => "subOver",
+    0x27 => "addMin",
+    0x31 => "grayishTextOr",
+    0x32 => "hilite",
+    0x40 => "ditherCopy",
+    0x100 => "Alpha",
+    0x101 => "White Alpha",
+    0x102 => "Pre-multiplied Black Alpha",
+    0x110 => "Component Alpha",
+    _ => return None,
+  })
+}
+
+/// Render a `%graphicsMode` `int16u` field for `print_conv` (`GraphicsMode` /
+/// `GenGraphicsMode`): the PrintConv label at `-j`, and — because the table
+/// sets `PrintHex => 1` — the `Unknown (0x%x)` hex fallback on a hash miss
+/// (ExifTool.pm:3628-3634). The bare raw int rides at `-n`.
+fn graphics_mode_value(v: u16, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    match graphics_mode_print(v) {
+      Some(s) => TagValue::Str(s.into()),
+      None => TagValue::Str(std::format!("Unknown (0x{v:x})").into()),
+    }
+  } else {
+    TagValue::U64(u64::from(v))
+  }
+}
+
+/// The `%QuickTime::TCMediaInfo` `TextFace` BITMASK labels (QuickTime.pm:8310-
+/// 8318), in bit order, for `DecodeBits`. Bit 0 = Bold … bit 6 = Extend.
+const TEXT_FACE_BITS: &[(u8, &str)] = &[
+  (0, "Bold"),
+  (1, "Italic"),
+  (2, "Underline"),
+  (3, "Outline"),
+  (4, "Shadow"),
+  (5, "Condense"),
+  (6, "Extend"),
+];
+
+/// Render the `TextFace` `int16u` field for `print_conv` (QuickTime.pm:8305-
+/// 8320): the PrintConv hash is `{ 0 => Plain, BITMASK => {...} }`. ExifTool
+/// first checks the direct key (`$$conv{$val}`) — so `0` ⇒ `Plain` — and falls
+/// back to `DecodeBits` of the set style bits otherwise (ExifTool.pm:3616-3618).
+/// The bare raw int rides at `-n`.
+fn text_face_value(v: u16, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  if v == 0 {
+    return TagValue::Str("Plain".into());
+  }
+  // No `BitsPerWord` on the table ⇒ DecodeBits default of 32 (the helper maps
+  // a `0` bits argument to 32). The value is a single non-negative `int16u`.
+  TagValue::Str(crate::convert::decode_bits(&std::format!("{v}"), Some(TEXT_FACE_BITS), 0).into())
+}
+
+/// Render the `TextFont` `int16u` field for `print_conv` (QuickTime.pm:8301-
+/// 8304): the PrintConv hash is `{ 0 => System }` — no BITMASK, no PrintHex —
+/// so `0` ⇒ `System` and any other value ⇒ `Unknown ($val)` (decimal,
+/// ExifTool.pm:3633). The bare raw int rides at `-n`.
+fn text_font_value(v: u16, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  match v {
+    0 => TagValue::Str("System".into()),
+    _ => TagValue::Str(std::format!("Unknown ({v})").into()),
+  }
+}
+
 /// Render a `%QuickTime::ColorRep` CICP `int16u` field for `print_conv`: the
 /// PrintConv label (via `lookup`) at `-j`, the ExifTool `Unknown ($val)`
 /// fallback on a hash miss, and the bare raw int at `-n`. Mirrors the
@@ -2337,6 +2440,225 @@ fn decode_btrt(body: &[u8]) -> Option<Bitrate> {
   Some(b)
 }
 
+/// Read a fixed-count `int16u[n]` array at byte `off` and join the values with
+/// single spaces (the ExifTool `join(" ", unpack ...)` ValueConv shape —
+/// `OpColor` / `GenOpColor` / `TextColor` / `BackgroundColor` are all
+/// `int16u[3]`). `ReadValue` (ExifTool.pm:6300-6311) CLAMPS an oversized count
+/// to the COMPLETE elements that fit (`$count = int($size / $len)`, `$len == 2`)
+/// and returns the partial list; it returns `undef` only when not one complete
+/// element remains (`$count < 1`). So a short box that holds e.g. 2 of 3
+/// `int16u` emits `"v0 v1"`, 1.5 elements emits `"v0"` (the trailing odd byte is
+/// ignored), and <1 element drops the field. Verified against ExifTool 13.59
+/// (`int16u[3]` with 4/3/2/1/0 bytes ⇒ `"v0 v1"` / `"v0"` / `"v0"` / omit /
+/// omit) — the same clamp the `FontName` pstring uses. Returns `None` when no
+/// complete element is present at `off`.
+fn read_be_u16_array_clamped(body: &[u8], off: usize, count: usize) -> Option<String> {
+  // `int(size / len)` complete elements, capped at the declared count.
+  let avail = body.len().saturating_sub(off) / 2;
+  let n = count.min(avail);
+  if n == 0 {
+    return None;
+  }
+  // `be_u16` cannot fail for `i < n`: `n <= avail` guarantees the bytes exist.
+  let joined = (0..n)
+    .map(|i| be_u16(body, off + i * 2).unwrap_or(0).to_string())
+    .collect::<std::vec::Vec<_>>()
+    .join(" ");
+  Some(joined)
+}
+
+/// Read a fixed-count `int8u[n]` array at byte `off`, joined with single spaces
+/// (`GenFlags` is `int8u[3]`). The same `ReadValue` clamp as
+/// [`read_be_u16_array_clamped`] but with `$len == 1`, so the available count is
+/// the raw remaining-byte count capped at `count`; `None` only when no byte
+/// remains at `off`. Verified against ExifTool 13.59 (`int8u[3]` with 2/1/0
+/// bytes ⇒ `"a b"` / `"a"` / omit).
+fn read_u8_array_clamped(body: &[u8], off: usize, count: usize) -> Option<String> {
+  let avail = body.len().saturating_sub(off);
+  let n = count.min(avail);
+  if n == 0 {
+    return None;
+  }
+  let joined = (0..n)
+    .map(|i| body.get(off + i).copied().unwrap_or(0).to_string())
+    .collect::<std::vec::Vec<_>>()
+    .join(" ");
+  Some(joined)
+}
+
+/// Decode the `vmhd` VideoHeader (`%QuickTime::VideoHeader`, QuickTime.pm:7330,
+/// ProcessBinaryData, `FORMAT => 'int16u'` ⇒ a 2-byte index increment). The
+/// body is `[version+flags:4][GraphicsMode:int16u][OpColor:int16u[3]]`:
+/// GraphicsMode is key 2 ⇒ byte 4, OpColor is key 3 ⇒ byte 6. Returns the
+/// `(GraphicsMode, OpColor)` pair; a short box CLAMPS OpColor to the complete
+/// `int16u` elements that fit (`ReadValue`), so 2-of-3 ⇒ `"v0 v1"`, and only
+/// drops OpColor when not one full element remains.
+fn decode_vmhd(body: &[u8]) -> (Option<u16>, Option<String>) {
+  (be_u16(body, 4), read_be_u16_array_clamped(body, 6, 3))
+}
+
+/// Decode the `gmin` Generic Media Info (`%QuickTime::GenMediaInfo`,
+/// QuickTime.pm:8342, ProcessBinaryData, default `int8u` ⇒ a 1-byte index
+/// increment so each key is a raw byte offset). Body layout:
+/// `GenMediaVersion`(0,int8u) `GenFlags`(1,int8u[3]) `GenGraphicsMode`(4,int16u)
+/// `GenOpColor`(6,int16u[3]) `GenBalance`(12,fixed16s). Each field is read
+/// independently; a short box CLAMPS the counted arrays (`GenFlags`,
+/// `GenOpColor`) to their complete elements (`ReadValue`) and leaves any field
+/// past the end `None`. Returns `None` only when not one field could be read (an
+/// empty payload).
+fn decode_gmin(body: &[u8]) -> Option<GenMediaInfo> {
+  let version = body.first().copied();
+  // `GenFlags` int8u[3] at byte 1 — clamps to the complete bytes present
+  // (`ReadValue` with `$len == 1`): 2-of-3 ⇒ `"a b"`, dropped only at 0 bytes.
+  let flags = read_u8_array_clamped(body, 1, 3);
+  let graphics_mode = be_u16(body, 4);
+  let op_color = read_be_u16_array_clamped(body, 6, 3);
+  let balance = be_i16(body, 12).map(get_fixed16s);
+  if version.is_none()
+    && flags.is_none()
+    && graphics_mode.is_none()
+    && op_color.is_none()
+    && balance.is_none()
+  {
+    return None;
+  }
+  let mut g = GenMediaInfo::new();
+  g.set_version(version);
+  g.set_flags(flags);
+  g.set_graphics_mode(graphics_mode);
+  g.set_op_color(op_color);
+  g.set_balance(balance);
+  Some(g)
+}
+
+/// Decode the `tcmi` Timecode Media Info (`%QuickTime::TCMediaInfo`,
+/// QuickTime.pm:8297, ProcessBinaryData, default `int8u` ⇒ raw byte offsets).
+/// Body layout: `TextFont`(4,int16u) `TextFace`(6,int16u) `TextSize`(8,int16u)
+/// `TextColor`(12,int16u[3]) `BackgroundColor`(18,int16u[3])
+/// `FontName`(24,pstring). The `pstring` reads a leading `int8u` length byte at
+/// 24 then that many `string` bytes (`Decode`d as `CharsetQuickTime` =
+/// MacRoman). Each field is independent; a short box CLAMPS the counted arrays
+/// (`TextColor`, `BackgroundColor`) to their complete `int16u` elements
+/// (`ReadValue`) and leaves any field past the end `None`.
+fn decode_tcmi(body: &[u8]) -> Option<TcMediaInfo> {
+  let text_font = be_u16(body, 4);
+  let text_face = be_u16(body, 6);
+  let text_size = be_u16(body, 8);
+  let text_color = read_be_u16_array_clamped(body, 12, 3);
+  let background_color = read_be_u16_array_clamped(body, 18, 3);
+  // `FontName` (`pstring`): byte 24 is the length, bytes 25.. are the value.
+  // ProcessBinaryData (ExifTool.pm:9972-9975) sets `count = Get8u(24)`,
+  // `--$more` (the bytes after the length byte), then `Format => 'string'` and
+  // `ReadValue($dataPt, 25, 'string', $count, $more)`. `ReadValue`
+  // (ExifTool.pm:6296-6311) CLAMPS an oversized `count` to the remaining bytes
+  // (`$count = int($size / $len)` with `$len == 1`), returning the PARTIAL
+  // string when ≥1 byte is present; a zero `count` returns `''` (defined). So
+  // once the length byte EXISTS, `FontName` is always emitted — the declared
+  // length is clamped to `body[25..]`, NUL-truncated, and even an empty result
+  // (zero length, out-of-range with no bytes, or a leading NUL) is `Some("")`.
+  // Verified against ExifTool 13.59 (declared 9 / "Hel" ⇒ "Hel"; length 0 ⇒
+  // ""; declared-3 / NUL.. ⇒ ""). `FontName` is absent ONLY when byte 24 is
+  // missing (`$more <= 0` at ExifTool.pm:9964 skips the tag).
+  let font_name = body.get(24).map(|&len| {
+    let len = usize::from(len);
+    let avail = body.get(25..).unwrap_or(&[]);
+    // Clamp the declared length to the bytes actually present (`ReadValue`
+    // shortens an oversized count), then NUL-truncate (`Format => 'string'`).
+    let clamped = avail.get(..len.min(avail.len())).unwrap_or(avail);
+    let nul = clamped
+      .iter()
+      .position(|&c| c == 0)
+      .unwrap_or(clamped.len());
+    let bytes = clamped.get(..nul).unwrap_or(clamped);
+    crate::charset::decode_macroman(bytes)
+  });
+  if text_font.is_none()
+    && text_face.is_none()
+    && text_size.is_none()
+    && text_color.is_none()
+    && background_color.is_none()
+    && font_name.is_none()
+  {
+    return None;
+  }
+  let mut t = TcMediaInfo::new();
+  t.set_text_font(text_font);
+  t.set_text_face(text_face);
+  t.set_text_size(text_size);
+  t.set_text_color(text_color);
+  t.set_background_color(background_color);
+  t.set_font_name(font_name);
+  Some(t)
+}
+
+/// Walk a `gmhd` Generic Media Header (`%QuickTime::GenMediaHeader`,
+/// QuickTime.pm:8270, `PROCESS_PROC => \&ProcessMOV` ⇒ a child-atom box walk)
+/// onto `track`. Recognized children: `gmin` ([`GenMediaInfo`]) and `tmcd`
+/// (the `TimeCode` SubDirectory, itself a `ProcessMOV` box holding `tcmi` ⇒
+/// [`TcMediaInfo`], QuickTime.pm:8280-8294). `text`/`dbgi`/`gpmd` and any other
+/// child are ExifTool `Binary`/`Unknown` (skipped). `depth` is the enclosing
+/// `minf` walk's child depth; warnings thread through `w` (the track's slot).
+fn walk_gmhd(depth: u32, body: &[u8], w: &mut Option<String>, track: &mut MediaTrack) {
+  walk_atoms(depth, body, 0, body.len(), w, |g, gbody, gw| {
+    match &g.atom_type {
+      // A later `gmin` child fills/overrides only the fields it decoded
+      // (Some-only last-wins, seeded from the track's current value — the same
+      // `merge_from` fold P2/P3 use for the `stsd` sample-desc children); a
+      // field a SHORT duplicate could not reach survives from the earlier child
+      // (ExifTool keeps the already-found tag).
+      b"gmin" => {
+        if let Some(info) = decode_gmin(gbody) {
+          let merged = match track.gen_media_info().cloned() {
+            Some(mut existing) => {
+              existing.merge_from(info);
+              existing
+            }
+            None => info,
+          };
+          track.set_gen_media_info(Some(merged));
+        }
+      }
+      // `tmcd` here is the `TimeCode` SubDirectory (NOT the `stsd` timecode
+      // sample-desc 4cc) — a `ProcessMOV` box whose `tcmi` child is the
+      // TCMediaInfo binary table. A later `tcmi` merges field-by-field too.
+      b"tmcd" => {
+        walk_atoms(depth + 1, gbody, 0, gbody.len(), gw, |t, tbody, _tw| {
+          if &t.atom_type == b"tcmi"
+            && let Some(info) = decode_tcmi(tbody)
+          {
+            let merged = match track.tc_media_info().cloned() {
+              Some(mut existing) => {
+                existing.merge_from(info);
+                existing
+              }
+              None => info,
+            };
+            track.set_tc_media_info(Some(merged));
+          }
+        });
+      }
+      _ => {}
+    }
+  });
+}
+
+/// Walk a `tref` TrackRef box (`%QuickTime::TrackRef`, QuickTime.pm:3424,
+/// `PROCESS_PROC => \&ProcessMOV`) for the `tmcd` `TimecodeTrack` reference
+/// (`Format => 'int32u'`, QuickTime.pm:3428) onto `track`. The `tref` is a
+/// DIRECT child of `trak`; its `tmcd` child atom's 4-byte payload is the
+/// referenced timecode track's ID. The other reference types (`chap`/`cdsc`/
+/// `clcp`/…) are not surfaced this phase. `depth` is the enclosing `trak`
+/// walk's child depth; warnings thread through `w`.
+fn walk_tref(depth: u32, body: &[u8], w: &mut Option<String>, track: &mut MediaTrack) {
+  walk_atoms(depth, body, 0, body.len(), w, |r, rbody, _rw| {
+    if &r.atom_type == b"tmcd"
+      && let Some(id) = be_u32(rbody, 0)
+    {
+      track.set_timecode_track(Some(id));
+    }
+  });
+}
+
 /// Walk the `colr`/`pasp`/`btrt` child atoms of ONE `vide`-track `stsd` sample
 /// entry, folding them onto `v` (the [`VisualSampleDesc`] for this entry).
 /// `child_pos` is the `ProcessHybrid` boundary already located by the caller
@@ -2578,6 +2900,10 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
           let decoded = decode_tkhd(body, movie_timescale);
           track.merge_track_header(decoded);
         }
+        // `tref` TrackRef (QuickTime.pm:1444-1447) — a DIRECT child of `trak`
+        // (sibling to `tkhd`/`mdia`), holding the `tmcd` `TimecodeTrack`
+        // reference (the referenced timecode track's ID).
+        b"tref" => walk_tref(depth + 1, body, w, &mut track),
         b"mdia" => {
           // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237). This
           // re-enters `walk_atoms` from inside the trak walk, so it runs one
@@ -2621,6 +2947,24 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                     b"smhd" => {
                       track.set_audio_balance(be_i16(mbody, 4).map(get_fixed16s));
                     }
+                    // `vmhd` VideoHeader (QuickTime.pm:7295-7297, 7330-7342):
+                    // GraphicsMode (key 2 ⇒ byte 4) + OpColor (key 3 ⇒ byte 6).
+                    b"vmhd" => {
+                      // Some-only last-wins: a short duplicate `vmhd` (only
+                      // GraphicsMode) overrides GraphicsMode but must KEEP the
+                      // earlier OpColor (ExifTool does not delete a found tag).
+                      let (gm, op) = decode_vmhd(mbody);
+                      if gm.is_some() {
+                        track.set_video_graphics_mode(gm);
+                      }
+                      if op.is_some() {
+                        track.set_video_op_color(op);
+                      }
+                    }
+                    // `gmhd` GenMediaHeader (QuickTime.pm:7315-7318, 8270-8285):
+                    // the `gmin` GenMediaInfo + the `tmcd`/`tcmi` TCMediaInfo
+                    // (a generic / timecode / NRT-metadata track's media header).
+                    b"gmhd" => walk_gmhd(depth + 3, mbody, mw, &mut track),
                     b"stbl" => {
                       walk_atoms(depth + 3, mbody, 0, mbody.len(), mw, |s, sbody, _sw| {
                         if &s.atom_type == b"stsd" {
@@ -6123,6 +6467,20 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // TimecodeTrack (`tref/tmcd`, QuickTime.pm:3428, `int32u`): the referenced
+      // timecode track's ID — a bare int in both modes. The `tref` is parsed at
+      // the `trak` level; the oracle emits it between the `tkhd` ImageHeight and
+      // the `mdhd` MediaHeaderVersion (file order: `tref` precedes `mdia`).
+      if let Some(id) = track.timecode_track()
+        && first_seen(grp, "TimecodeTrack")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TimecodeTrack".into(),
+          TagValue::U64(u64::from(id)),
+          false,
+        ));
+      }
       if let Some(v) = track.media_header_version()
         && first_seen(grp, "MediaHeaderVersion")
       {
@@ -6308,6 +6666,155 @@ impl crate::emit::Taggable for Meta<'_> {
           TagValue::Str(desc.into()),
           false,
         ));
+      }
+      // VideoHeader (`minf/vmhd`, QuickTime.pm:7330-7342): GraphicsMode (the
+      // `%graphicsMode` PrintConv label / `Unknown (0x%x)` at `-j`, raw int at
+      // `-n`) then OpColor (the space-joined `int16u[3]`, mode-invariant).
+      // Emitted right after HandlerDescription for a `vide` track (the oracle
+      // order: `HandlerDescription, GraphicsMode, OpColor, CompressorID`).
+      if let Some(gm) = track.video_graphics_mode()
+        && first_seen(grp, "GraphicsMode")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "GraphicsMode".into(),
+          graphics_mode_value(gm, print_conv),
+          false,
+        ));
+      }
+      if let Some(op) = track.video_op_color()
+        && first_seen(grp, "OpColor")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "OpColor".into(),
+          TagValue::Str(op.into()),
+          false,
+        ));
+      }
+      // GenMediaInfo (`minf/gmhd/gmin`, QuickTime.pm:8342-8355): the generic
+      // media header — GenMediaVersion / GenFlags / GenGraphicsMode (the
+      // `%graphicsMode` PrintConv, same as `GraphicsMode`) / GenOpColor /
+      // GenBalance, in the table field order. Emitted right after
+      // HandlerDescription for a generic (text / timecode / NRT-metadata) track.
+      if let Some(g) = track.gen_media_info() {
+        if let Some(ver) = g.version()
+          && first_seen(grp, "GenMediaVersion")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "GenMediaVersion".into(),
+            TagValue::U64(u64::from(ver)),
+            false,
+          ));
+        }
+        if let Some(flags) = g.flags()
+          && first_seen(grp, "GenFlags")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "GenFlags".into(),
+            TagValue::Str(flags.into()),
+            false,
+          ));
+        }
+        if let Some(gm) = g.graphics_mode()
+          && first_seen(grp, "GenGraphicsMode")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "GenGraphicsMode".into(),
+            graphics_mode_value(gm, print_conv),
+            false,
+          ));
+        }
+        if let Some(op) = g.op_color()
+          && first_seen(grp, "GenOpColor")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "GenOpColor".into(),
+            TagValue::Str(op.into()),
+            false,
+          ));
+        }
+        if let Some(bal) = g.balance()
+          && first_seen(grp, "GenBalance")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "GenBalance".into(),
+            TagValue::F64(bal),
+            false,
+          ));
+        }
+      }
+      // TCMediaInfo (`minf/gmhd/tmcd/tcmi`, QuickTime.pm:8297-8338): the
+      // burned-in-timecode text styling — TextFont (`{0 => System}`/`Unknown`) /
+      // TextFace (`{0 => Plain, BITMASK}` DecodeBits) / TextSize / TextColor /
+      // BackgroundColor (space-joined `int16u[3]`) / FontName (the MacRoman
+      // pstring). In the table field order, right after the `gmin` Gen* block.
+      if let Some(t) = track.tc_media_info() {
+        if let Some(font) = t.text_font()
+          && first_seen(grp, "TextFont")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "TextFont".into(),
+            text_font_value(font, print_conv),
+            false,
+          ));
+        }
+        if let Some(face) = t.text_face()
+          && first_seen(grp, "TextFace")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "TextFace".into(),
+            text_face_value(face, print_conv),
+            false,
+          ));
+        }
+        if let Some(size) = t.text_size()
+          && first_seen(grp, "TextSize")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "TextSize".into(),
+            TagValue::U64(u64::from(size)),
+            false,
+          ));
+        }
+        if let Some(color) = t.text_color()
+          && first_seen(grp, "TextColor")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "TextColor".into(),
+            TagValue::Str(color.into()),
+            false,
+          ));
+        }
+        if let Some(bg) = t.background_color()
+          && first_seen(grp, "BackgroundColor")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "BackgroundColor".into(),
+            TagValue::Str(bg.into()),
+            false,
+          ));
+        }
+        if let Some(name) = t.font_name()
+          && first_seen(grp, "FontName")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "FontName".into(),
+            TagValue::Str(name.into()),
+            false,
+          ));
+        }
       }
       // MetaFormat (`stsd` 4cc): the `MetaSampleDesc` `MetaFormat` tag, emitted
       // ONLY for a `meta`-handler track (QuickTime.pm:7393 `Condition =>
@@ -20449,6 +20956,29 @@ mod tests {
     atom(b"mdia", &mdia_body)
   }
 
+  /// Build a `trak` PAYLOAD whose `minf` carries the given EXTRA media-header
+  /// atoms (`vmhd`/`gmhd`) ahead of a minimal `stbl`. Used by the container
+  /// phase-4 tests: the `vmhd`/`gmhd` decoders hook into the same `minf` walk
+  /// as `smhd`/`stbl`.
+  fn trak_payload_with_minf_extra(handler: &[u8; 4], extra: &[Vec<u8>]) -> Vec<u8> {
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, handler);
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &600u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut minf_body = Vec::new();
+    for a in extra {
+      minf_body.extend_from_slice(a);
+    }
+    minf_body.extend_from_slice(&atom(b"stbl", &stsd_box(&[])));
+    let minf = atom(b"minf", &minf_body);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    atom(b"mdia", &mdia_body)
+  }
+
   /// **Codex R1/F1.** `ProcessSampleDesc` decodes EVERY `stsd` entry and the
   /// LAST entry's value wins per tag. A two-entry `vide` stsd whose entries
   /// differ must report the SECOND entry's CompressorID / dimensions /
@@ -21128,6 +21658,488 @@ mod tests {
     );
     assert_eq!(bt.max_bitrate(), Some(800));
     assert_eq!(bt.average_bitrate(), Some(900));
+  }
+
+  // ── Container phase 4: vmhd / gmhd(gmin,tcmi) / tref ──────────────────
+
+  /// `decode_vmhd` reads GraphicsMode (key 2 ⇒ byte 4, `int16u`) + OpColor
+  /// (key 3 ⇒ byte 6, `int16u[3]`) past the 4-byte version+flags. Bytes match
+  /// the bundled `gopro_gpmf.mp4` Track1 `vmhd` (`00000001 0000 0000 0000
+  /// 0000` ⇒ GraphicsMode 0, OpColor "0 0 0").
+  #[test]
+  fn decode_vmhd_graphics_mode_and_opcolor() {
+    let (gm, op) = decode_vmhd(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(gm, Some(0));
+    assert_eq!(op.as_deref(), Some("0 0 0"));
+    // A non-zero GraphicsMode + RGB OpColor (`0x0040 ditherCopy`, `8000 8000 8000`).
+    let (gm2, op2) = decode_vmhd(&[0, 0, 0, 1, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0]);
+    assert_eq!(gm2, Some(0x40));
+    assert_eq!(op2.as_deref(), Some("32768 32768 32768"));
+  }
+
+  /// **Codex R2/R3.** `OpColor` is `int16u[3]`: ExifTool's `ReadValue`
+  /// (ExifTool.pm:6300-6311) CLAMPS an oversized count to the complete elements
+  /// that fit and emits the partial list, rather than dropping the whole field
+  /// (the same clamp `FontName`'s pstring uses). Ground-truth cross-checked
+  /// against bundled ExifTool 13.59 on the matching crafted `vmhd`: 4 OpColor
+  /// bytes ⇒ "32768 32768", 3 bytes ⇒ "32768" (trailing odd byte ignored), 2
+  /// bytes ⇒ "32768", 1 byte ⇒ OpColor omitted (no complete element).
+  #[test]
+  fn decode_vmhd_opcolor_clamps_partial_array() {
+    // 2 of 3 int16u present (4 bytes at offset 6).
+    let (gm, op) = decode_vmhd(&[0, 0, 0, 1, 0, 0x40, 0x80, 0, 0x80, 0]);
+    assert_eq!(gm, Some(0x40));
+    assert_eq!(op.as_deref(), Some("32768 32768"));
+    // 1.5 elements (3 bytes) ⇒ 1 complete int16u, the odd byte dropped.
+    let (_, op15) = decode_vmhd(&[0, 0, 0, 1, 0, 0x40, 0x80, 0, 0x80]);
+    assert_eq!(op15.as_deref(), Some("32768"));
+    // 1 element (2 bytes).
+    let (_, op1) = decode_vmhd(&[0, 0, 0, 1, 0, 5, 0, 1]);
+    assert_eq!(op1.as_deref(), Some("1"));
+    // 0.5 element (1 byte) ⇒ no complete int16u ⇒ OpColor omitted.
+    let (gm05, op05) = decode_vmhd(&[0, 0, 0, 1, 0, 5, 0x80]);
+    assert_eq!(gm05, Some(5));
+    assert_eq!(op05, None);
+    // No OpColor bytes at all.
+    assert_eq!(decode_vmhd(&[0, 0, 0, 1, 0, 5]).1, None);
+  }
+
+  /// `decode_gmin` reads the `%QuickTime::GenMediaInfo` byte-addressed fields
+  /// (default `int8u` increment). Bytes match the bundled `gopro_hero8` Track3
+  /// `gmin` (`00 000000 0040 800080008000 0000` ⇒ Version 0, Flags "0 0 0",
+  /// GraphicsMode 0x40, OpColor "32768 32768 32768", Balance 0).
+  #[test]
+  fn decode_gmin_all_fields() {
+    let g = decode_gmin(&[0, 0, 0, 0, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0, 0]).expect("gmin");
+    assert_eq!(g.version(), Some(0));
+    assert_eq!(g.flags(), Some("0 0 0"));
+    assert_eq!(g.graphics_mode(), Some(0x40));
+    assert_eq!(g.op_color(), Some("32768 32768 32768"));
+    assert_eq!(g.balance(), Some(0.0));
+    // An empty payload is None; a 1-byte payload still has a Version.
+    assert_eq!(decode_gmin(&[]), None);
+    assert_eq!(decode_gmin(&[7]).expect("ver-only").version(), Some(7));
+  }
+
+  /// **Codex R2/R3.** `GenFlags` (`int8u[3]`) and `GenOpColor` (`int16u[3]`)
+  /// CLAMP to their complete elements on a short `gmin`, exactly like
+  /// `ReadValue` (the partial list is emitted, not dropped). Ground-truth
+  /// cross-checked against bundled ExifTool 13.59 on the matching crafted
+  /// `gmin`: GenFlags with 2 bytes ⇒ "1 2", 1 byte ⇒ "1"; GenOpColor with 4
+  /// bytes ⇒ "32768 32768", 2 bytes ⇒ "32768"; GenBalance (scalar `fixed16s`,
+  /// one 2-byte element) with 1 byte ⇒ omitted.
+  #[test]
+  fn decode_gmin_counted_arrays_clamp_partial() {
+    // GenFlags only (offset 1): 2 of 3 bytes present (body len 3).
+    let g = decode_gmin(&[0, 1, 2]).expect("gmin");
+    assert_eq!(g.flags(), Some("1 2"));
+    assert_eq!(g.op_color(), None);
+    // GenFlags 1 of 3 (body len 2).
+    assert_eq!(decode_gmin(&[0, 1]).expect("gmin").flags(), Some("1"));
+    // GenOpColor at offset 6: 2 of 3 int16u (4 bytes), GenBalance absent.
+    let g2 = decode_gmin(&[0, 1, 2, 3, 0, 0x40, 0x80, 0, 0x80, 0]).expect("gmin");
+    assert_eq!(g2.flags(), Some("1 2 3"));
+    assert_eq!(g2.op_color(), Some("32768 32768"));
+    assert_eq!(g2.balance(), None);
+    // GenOpColor 1 of 3 (2 bytes).
+    let g3 = decode_gmin(&[0, 1, 2, 3, 0, 0x40, 0x80, 0]).expect("gmin");
+    assert_eq!(g3.op_color(), Some("32768"));
+    // GenBalance is a scalar `fixed16s`: 1 of its 2 bytes ⇒ omitted (no full
+    // element), the arrays still clamp to their full values.
+    let g4 = decode_gmin(&[0, 1, 2, 3, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0x01]).expect("gmin");
+    assert_eq!(g4.op_color(), Some("32768 32768 32768"));
+    assert_eq!(g4.balance(), None);
+  }
+
+  /// `decode_tcmi` reads the `%QuickTime::TCMediaInfo` fields (byte-addressed).
+  /// Bytes match the bundled `gopro_hero8` Track3 `tcmi`: TextFont 0x15 (=21),
+  /// TextFace 0, TextSize 0x0a (=10), TextColor "0 0 0", BackgroundColor
+  /// "65535 65535 65535", FontName "Helvetica" (a 9-byte pstring at offset 24).
+  #[test]
+  fn decode_tcmi_all_fields_with_pstring_fontname() {
+    // TextFont 0x0015 at 4, TextSize 0x000a at 8, TextColor "0 0 0" at 12,
+    // BackgroundColor 0xffff×3 at 18, then a 9-byte "Helvetica" pstring at 24.
+    let mut body = vec![0u8; 25];
+    wr(&mut body, 4, &[0x00, 0x15]);
+    wr(&mut body, 8, &[0x00, 0x0a]);
+    wr(&mut body, 18, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    wr(&mut body, 24, &[9]);
+    body.extend_from_slice(b"Helvetica");
+    let t = decode_tcmi(&body).expect("tcmi");
+    assert_eq!(t.text_font(), Some(21));
+    assert_eq!(t.text_face(), Some(0));
+    assert_eq!(t.text_size(), Some(10));
+    assert_eq!(t.text_color(), Some("0 0 0"));
+    assert_eq!(t.background_color(), Some("65535 65535 65535"));
+    assert_eq!(t.font_name(), Some("Helvetica"));
+    // A zero-length pstring (length byte present, byte 24 == 0) ⇒ FontName ""
+    // (ExifTool `ReadValue` returns the empty string when `count == 0`,
+    // ExifTool.pm:6297 — verified empirically against 13.59); an empty payload
+    // (byte 24 absent) ⇒ the FontName tag is never read, struct is `None`.
+    let mut nofont = vec![0u8; 25];
+    wr(&mut nofont, 4, &[0x00, 0x01]);
+    assert_eq!(decode_tcmi(&nofont).expect("tcmi").font_name(), Some(""));
+    assert_eq!(decode_tcmi(&[]), None);
+  }
+
+  /// **Codex R1/F1.** `FontName` is a `pstring`: ExifTool's `ReadValue`
+  /// (ExifTool.pm:6300-6311) CLAMPS an oversized declared length to the bytes
+  /// actually present and returns the PARTIAL string, rather than dropping the
+  /// tag. Ground-truth cross-checked against bundled ExifTool 13.59: a truncated
+  /// `tcmi` with declared length 9 but only "Hel" present ⇒ FontName "Hel"; a
+  /// declared length 5 with a single byte "H" ⇒ "H".
+  #[test]
+  fn decode_tcmi_oversized_fontname_pstring_clamps_to_partial() {
+    // Declared length 9, but only "Hel" (3 bytes) follow the length byte.
+    let mut body = vec![0u8; 25];
+    wr(&mut body, 4, &[0x00, 0x15]); // TextFont 21 so the struct is populated
+    wr(&mut body, 24, &[9]);
+    body.extend_from_slice(b"Hel");
+    assert_eq!(decode_tcmi(&body).expect("tcmi").font_name(), Some("Hel"));
+    // Declared length 5, only one byte "H" present ⇒ clamp to "H".
+    let mut body1 = vec![0u8; 25];
+    wr(&mut body1, 4, &[0x00, 0x15]);
+    wr(&mut body1, 24, &[5]);
+    body1.extend_from_slice(b"H");
+    assert_eq!(decode_tcmi(&body1).expect("tcmi").font_name(), Some("H"));
+    // A leading NUL after a valid length ⇒ `Format => 'string'` truncates to
+    // "" (still emitted — ExifTool 13.59 reports FontName "").
+    let mut body0 = vec![0u8; 25];
+    wr(&mut body0, 4, &[0x00, 0x15]);
+    wr(&mut body0, 24, &[3]);
+    body0.extend_from_slice(&[0x00, b'A', b'B']);
+    assert_eq!(decode_tcmi(&body0).expect("tcmi").font_name(), Some(""));
+  }
+
+  /// **Codex R2/R3.** `TextColor` and `BackgroundColor` (both `int16u[3]`)
+  /// CLAMP to their complete elements on a short `tcmi`, like `ReadValue`.
+  /// Ground-truth cross-checked against bundled ExifTool 13.59 on the matching
+  /// crafted `tcmi`: TextColor (offset 12) with 4 bytes ⇒ "0 0", 3 bytes ⇒ "0",
+  /// 2 bytes ⇒ "0"; BackgroundColor (offset 18) with 4 bytes ⇒ "65535 65535", 2
+  /// bytes ⇒ "65535". A field with no complete element present is dropped.
+  #[test]
+  fn decode_tcmi_color_arrays_clamp_partial() {
+    // TextColor truncated to 2 of 3 int16u (body ends at offset 16), no BG.
+    let mut tc2 = vec![0u8; 16];
+    wr(&mut tc2, 4, &[0x00, 0x15]); // TextFont 21
+    assert_eq!(decode_tcmi(&tc2).expect("tcmi").text_color(), Some("0 0"));
+    assert_eq!(decode_tcmi(&tc2).expect("tcmi").background_color(), None);
+    // TextColor 1.5 elements (3 bytes ⇒ 1 complete, odd byte dropped).
+    let mut tc15 = vec![0u8; 15];
+    wr(&mut tc15, 4, &[0x00, 0x15]);
+    assert_eq!(decode_tcmi(&tc15).expect("tcmi").text_color(), Some("0"));
+    // TextColor 1 element (2 bytes), with a distinguishing value.
+    let mut tc1 = vec![0u8; 14];
+    wr(&mut tc1, 4, &[0x00, 0x15]);
+    wr(&mut tc1, 12, &[0x12, 0x34]);
+    assert_eq!(decode_tcmi(&tc1).expect("tcmi").text_color(), Some("4660"));
+    // BackgroundColor truncated to 2 of 3 (body ends at offset 22), TextColor full.
+    let mut bg2 = vec![0u8; 22];
+    wr(&mut bg2, 4, &[0x00, 0x15]);
+    wr(&mut bg2, 18, &[0xff, 0xff, 0xff, 0xff]);
+    let t = decode_tcmi(&bg2).expect("tcmi");
+    assert_eq!(t.text_color(), Some("0 0 0"));
+    assert_eq!(t.background_color(), Some("65535 65535"));
+    // BackgroundColor 1 of 3 (2 bytes, body ends at 20).
+    let mut bg1 = vec![0u8; 20];
+    wr(&mut bg1, 4, &[0x00, 0x15]);
+    wr(&mut bg1, 18, &[0xff, 0xff]);
+    assert_eq!(
+      decode_tcmi(&bg1).expect("tcmi").background_color(),
+      Some("65535")
+    );
+  }
+
+  /// `graphics_mode_value`: PrintConv label at `-j` (a hit), the `PrintHex`
+  /// `Unknown (0x%x)` fallback on a miss, and the bare raw int at `-n`.
+  #[test]
+  fn graphics_mode_value_printconv_and_hex_unknown() {
+    use crate::value::TagValue;
+    assert_eq!(
+      graphics_mode_value(0, true),
+      TagValue::Str("srcCopy".into())
+    );
+    assert_eq!(
+      graphics_mode_value(0x40, true),
+      TagValue::Str("ditherCopy".into())
+    );
+    // A miss renders hex (PrintHex => 1), not decimal.
+    assert_eq!(
+      graphics_mode_value(0x99, true),
+      TagValue::Str("Unknown (0x99)".into())
+    );
+    assert_eq!(graphics_mode_value(0x40, false), TagValue::U64(0x40));
+  }
+
+  /// `text_face_value`: `0 => Plain` (the direct hash hit takes precedence over
+  /// the BITMASK), the `DecodeBits` of the set style bits otherwise, and the raw
+  /// int at `-n`. ExifTool 13.59: face 0 ⇒ "Plain", face 3 (Bold|Italic) ⇒
+  /// "Bold, Italic".
+  #[test]
+  fn text_face_value_plain_and_bitmask() {
+    use crate::value::TagValue;
+    assert_eq!(text_face_value(0, true), TagValue::Str("Plain".into()));
+    assert_eq!(
+      text_face_value(0b11, true),
+      TagValue::Str("Bold, Italic".into())
+    );
+    assert_eq!(
+      text_face_value(0b100, true),
+      TagValue::Str("Underline".into())
+    );
+    assert_eq!(text_face_value(0b11, false), TagValue::U64(3));
+  }
+
+  /// `text_font_value`: `0 => System`, `Unknown ($val)` (DECIMAL — no PrintHex)
+  /// on a miss, and the raw int at `-n`. ExifTool 13.59 on the hero8 font 21 ⇒
+  /// "Unknown (21)".
+  #[test]
+  fn text_font_value_system_and_decimal_unknown() {
+    use crate::value::TagValue;
+    assert_eq!(text_font_value(0, true), TagValue::Str("System".into()));
+    assert_eq!(
+      text_font_value(21, true),
+      TagValue::Str("Unknown (21)".into())
+    );
+    assert_eq!(text_font_value(21, false), TagValue::U64(21));
+  }
+
+  /// End-to-end: a `vide` `trak` whose `minf` carries a `vmhd` decodes
+  /// GraphicsMode + OpColor onto the track (the `gopro_gpmf.mp4` Track1 shape).
+  #[test]
+  fn walk_trak_vide_decodes_vmhd() {
+    let vmhd = atom(b"vmhd", &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let payload = trak_payload_with_minf_extra(b"vide", &[vmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    assert_eq!(track.video_graphics_mode(), Some(0));
+    assert_eq!(track.video_op_color(), Some("0 0 0"));
+  }
+
+  /// End-to-end: a generic (`tmcd`-handler) `trak` whose `minf` carries a
+  /// `gmhd` with `gmin` + `tmcd`/`tcmi` decodes both the GenMediaInfo and the
+  /// TCMediaInfo onto the track (the `gopro_hero8` Track3 shape).
+  #[test]
+  fn walk_trak_decodes_gmhd_gmin_and_tcmi() {
+    let gmin = atom(
+      b"gmin",
+      &[0, 0, 0, 0, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0, 0],
+    );
+    let mut tcmi_body = vec![0u8; 25];
+    wr(&mut tcmi_body, 4, &[0x00, 0x15]); // TextFont 21
+    wr(&mut tcmi_body, 8, &[0x00, 0x0a]); // TextSize 10
+    wr(&mut tcmi_body, 24, &[9]);
+    tcmi_body.extend_from_slice(b"Helvetica");
+    let tcmi = atom(b"tcmi", &tcmi_body);
+    let tmcd = atom(b"tmcd", &tcmi); // the `TimeCode` container holding `tcmi`
+    let mut gmhd_body = gmin;
+    gmhd_body.extend_from_slice(&tmcd);
+    let gmhd = atom(b"gmhd", &gmhd_body);
+    let payload = trak_payload_with_minf_extra(b"tmcd", &[gmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    let g = track.gen_media_info().expect("gmin");
+    assert_eq!(g.graphics_mode(), Some(0x40));
+    assert_eq!(g.op_color(), Some("32768 32768 32768"));
+    let t = track.tc_media_info().expect("tcmi");
+    assert_eq!(t.text_font(), Some(21));
+    assert_eq!(t.text_size(), Some(10));
+    assert_eq!(t.font_name(), Some("Helvetica"));
+  }
+
+  /// **Codex R1/F2.** `GenMediaInfo::merge_from` is Some-only last-wins (the
+  /// same fold P2/P3 use for the `stsd` children): a field set in the later
+  /// child overrides, a field absent in the later child leaves the earlier
+  /// value intact. Mirrors ExifTool's "skip past-the-end offset, never delete a
+  /// found tag" for a short duplicate `gmin`.
+  #[test]
+  fn gen_media_info_merge_from_is_some_only_last_wins() {
+    let mut acc =
+      decode_gmin(&[0, 0, 0, 0, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0, 0]).expect("full gmin");
+    // A short duplicate: only Version (7) + Flags ("1 2 3") reach.
+    let later = decode_gmin(&[7, 1, 2, 3]).expect("short gmin");
+    acc.merge_from(later);
+    assert_eq!(acc.version(), Some(7)); // last-wins
+    assert_eq!(acc.flags(), Some("1 2 3")); // last-wins
+    assert_eq!(acc.graphics_mode(), Some(0x40)); // survives
+    assert_eq!(acc.op_color(), Some("32768 32768 32768")); // survives
+    assert_eq!(acc.balance(), Some(0.0)); // survives
+  }
+
+  /// **Codex R1/F2.** `TcMediaInfo::merge_from` is Some-only last-wins: a short
+  /// duplicate `tcmi` (only TextFont) overrides TextFont but keeps the earlier
+  /// TextSize / FontName.
+  #[test]
+  fn tc_media_info_merge_from_is_some_only_last_wins() {
+    let mut full = vec![0u8; 25];
+    wr(&mut full, 4, &[0x00, 0x15]); // TextFont 21
+    wr(&mut full, 8, &[0x00, 0x0a]); // TextSize 10
+    wr(&mut full, 24, &[9]);
+    full.extend_from_slice(b"Helvetica");
+    let mut acc = decode_tcmi(&full).expect("full tcmi");
+    // A short duplicate: only TextFont (99) present (6-byte body).
+    let mut short = vec![0u8; 6];
+    wr(&mut short, 4, &[0x00, 0x63]); // TextFont 99
+    let later = decode_tcmi(&short).expect("short tcmi");
+    acc.merge_from(later);
+    assert_eq!(acc.text_font(), Some(99)); // last-wins
+    assert_eq!(acc.text_size(), Some(10)); // survives
+    assert_eq!(acc.font_name(), Some("Helvetica")); // survives
+  }
+
+  /// **Codex R1/F2 (vmhd dup end-to-end).** A `vide` `minf` with a FULL `vmhd`
+  /// (GraphicsMode 0x40, OpColor "32768 32768 32768") followed by a SHORT
+  /// duplicate `vmhd` (only GraphicsMode 0x05) must report GraphicsMode 5
+  /// (last-wins) while KEEPING the earlier OpColor. Ground-truth against ExifTool
+  /// 13.59: GraphicsMode "notSrcOr" (5), OpColor "32768 32768 32768".
+  #[test]
+  fn walk_trak_vide_duplicate_vmhd_keeps_earlier_opcolor() {
+    let full = atom(b"vmhd", &[0, 0, 0, 1, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0]);
+    let short = atom(b"vmhd", &[0, 0, 0, 1, 0, 0x05]); // only GraphicsMode
+    let payload = trak_payload_with_minf_extra(b"vide", &[full, short]);
+    let track = walk_trak(1, &payload, Some(600));
+    assert_eq!(track.video_graphics_mode(), Some(0x05));
+    assert_eq!(track.video_op_color(), Some("32768 32768 32768"));
+  }
+
+  /// **Codex R3.** A FULL `vmhd` then a SHORT duplicate whose OpColor is itself
+  /// PARTIAL (2 of 3 `int16u`) — the clamped partial value is a PRESENT field, so
+  /// it LAST-WINS over the earlier full OpColor (the merge composes with the
+  /// array clamp). Ground-truth against ExifTool 13.59 on the identical bytes:
+  /// GraphicsMode "notSrcOr" (5), OpColor "4369 8738".
+  #[test]
+  fn walk_trak_vide_duplicate_vmhd_partial_opcolor_last_wins() {
+    let full = atom(b"vmhd", &[0, 0, 0, 1, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0]);
+    // GraphicsMode 5, OpColor only 2 int16u (0x1111, 0x2222).
+    let part = atom(b"vmhd", &[0, 0, 0, 1, 0, 0x05, 0x11, 0x11, 0x22, 0x22]);
+    let payload = trak_payload_with_minf_extra(b"vide", &[full, part]);
+    let track = walk_trak(1, &payload, Some(600));
+    assert_eq!(track.video_graphics_mode(), Some(0x05));
+    assert_eq!(track.video_op_color(), Some("4369 8738")); // partial dup last-wins
+  }
+
+  /// **Codex R1/F2 (gmin dup end-to-end).** A `gmhd` with a FULL `gmin` then a
+  /// SHORT duplicate `gmin` (only Version + Flags) keeps the earlier
+  /// GenGraphicsMode / GenOpColor / GenBalance while taking the later Version /
+  /// Flags. Ground-truth against ExifTool 13.59.
+  #[test]
+  fn walk_trak_duplicate_gmin_keeps_earlier_fields() {
+    let full = atom(
+      b"gmin",
+      &[0, 0, 0, 0, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0, 0],
+    );
+    let short = atom(b"gmin", &[7, 1, 2, 3]); // Version 7, Flags "1 2 3"
+    let mut gmhd_body = full;
+    gmhd_body.extend_from_slice(&short);
+    let gmhd = atom(b"gmhd", &gmhd_body);
+    let payload = trak_payload_with_minf_extra(b"tmcd", &[gmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    let g = track.gen_media_info().expect("gmin");
+    assert_eq!(g.version(), Some(7)); // last-wins
+    assert_eq!(g.flags(), Some("1 2 3")); // last-wins
+    assert_eq!(g.graphics_mode(), Some(0x40)); // survives
+    assert_eq!(g.op_color(), Some("32768 32768 32768")); // survives
+    assert_eq!(g.balance(), Some(0.0)); // survives
+  }
+
+  /// **Codex R3.** A FULL `gmin` then a SHORT duplicate carrying a PARTIAL
+  /// GenOpColor (2 of 3 `int16u`) and full GenFlags, but not reaching GenBalance.
+  /// The partial GenOpColor + GenFlags last-win; GenBalance survives from the
+  /// earlier child. Ground-truth against ExifTool 13.59: Version 7, GenFlags
+  /// "9 9 9", GenGraphicsMode 5, GenOpColor "4369 8738", GenBalance 1.
+  #[test]
+  fn walk_trak_duplicate_gmin_partial_opcolor_last_wins() {
+    let full = atom(
+      b"gmin",
+      &[0, 1, 2, 3, 0, 0x40, 0x80, 0, 0x80, 0, 0x80, 0, 0x01, 0x00],
+    );
+    // Version 7, Flags "9 9 9", GraphicsMode 5, GenOpColor 2 int16u (0x1111,0x2222).
+    let part = atom(b"gmin", &[7, 9, 9, 9, 0, 0x05, 0x11, 0x11, 0x22, 0x22]);
+    let mut gmhd_body = full;
+    gmhd_body.extend_from_slice(&part);
+    let gmhd = atom(b"gmhd", &gmhd_body);
+    let payload = trak_payload_with_minf_extra(b"tmcd", &[gmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    let g = track.gen_media_info().expect("gmin");
+    assert_eq!(g.version(), Some(7)); // last-wins
+    assert_eq!(g.flags(), Some("9 9 9")); // last-wins
+    assert_eq!(g.graphics_mode(), Some(0x05)); // last-wins
+    assert_eq!(g.op_color(), Some("4369 8738")); // partial dup last-wins
+    assert_eq!(g.balance(), Some(1.0)); // survives (dup did not reach), 0x0100/256
+  }
+
+  /// **Codex R1/F2 (tcmi dup end-to-end).** A `gmhd` whose `tmcd` SubDirectory
+  /// holds a FULL `tcmi` (TextFont 21, TextSize 10, FontName "Helvetica") then a
+  /// `tmcd`/`tcmi` SHORT duplicate (only TextFont 99) keeps the earlier TextSize
+  /// / FontName while taking the later TextFont. Ground-truth against ExifTool
+  /// 13.59.
+  #[test]
+  fn walk_trak_duplicate_tcmi_keeps_earlier_fields() {
+    let mut full_body = vec![0u8; 25];
+    wr(&mut full_body, 4, &[0x00, 0x15]); // TextFont 21
+    wr(&mut full_body, 8, &[0x00, 0x0a]); // TextSize 10
+    wr(&mut full_body, 24, &[9]);
+    full_body.extend_from_slice(b"Helvetica");
+    let tmcd_full = atom(b"tmcd", &atom(b"tcmi", &full_body));
+    let mut short_body = vec![0u8; 6];
+    wr(&mut short_body, 4, &[0x00, 0x63]); // TextFont 99
+    let tmcd_short = atom(b"tmcd", &atom(b"tcmi", &short_body));
+    let mut gmhd_body = tmcd_full;
+    gmhd_body.extend_from_slice(&tmcd_short);
+    let gmhd = atom(b"gmhd", &gmhd_body);
+    let payload = trak_payload_with_minf_extra(b"tmcd", &[gmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    let t = track.tc_media_info().expect("tcmi");
+    assert_eq!(t.text_font(), Some(99)); // last-wins
+    assert_eq!(t.text_size(), Some(10)); // survives
+    assert_eq!(t.font_name(), Some("Helvetica")); // survives
+  }
+
+  /// **Codex R3.** A FULL `tcmi` then a SHORT duplicate whose TextColor is
+  /// PARTIAL (2 of 3 `int16u`) and which does not reach BackgroundColor /
+  /// FontName. The partial TextColor last-wins; BackgroundColor and FontName
+  /// survive from the earlier child. Ground-truth against ExifTool 13.59:
+  /// TextColor "4369 8738", BackgroundColor "65535 65535 65535", FontName
+  /// "Helvetica".
+  #[test]
+  fn walk_trak_duplicate_tcmi_partial_textcolor_last_wins() {
+    let mut full_body = vec![0u8; 25];
+    wr(&mut full_body, 4, &[0x00, 0x15]); // TextFont 21
+    wr(&mut full_body, 8, &[0x00, 0x0a]); // TextSize 10
+    wr(&mut full_body, 18, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // BG 65535x3
+    wr(&mut full_body, 24, &[9]);
+    full_body.extend_from_slice(b"Helvetica");
+    let tmcd_full = atom(b"tmcd", &atom(b"tcmi", &full_body));
+    // A short duplicate: TextFont present, TextColor only 2 int16u (body ends at 16).
+    let mut part_body = vec![0u8; 16];
+    wr(&mut part_body, 4, &[0x00, 0x15]); // TextFont 21
+    wr(&mut part_body, 12, &[0x11, 0x11, 0x22, 0x22]); // TextColor 4369 8738 (2 of 3)
+    let tmcd_part = atom(b"tmcd", &atom(b"tcmi", &part_body));
+    let mut gmhd_body = tmcd_full;
+    gmhd_body.extend_from_slice(&tmcd_part);
+    let gmhd = atom(b"gmhd", &gmhd_body);
+    let payload = trak_payload_with_minf_extra(b"tmcd", &[gmhd]);
+    let track = walk_trak(1, &payload, Some(600));
+    let t = track.tc_media_info().expect("tcmi");
+    assert_eq!(t.text_color(), Some("4369 8738")); // partial dup last-wins
+    assert_eq!(t.background_color(), Some("65535 65535 65535")); // survives
+    assert_eq!(t.font_name(), Some("Helvetica")); // survives
+  }
+
+  /// End-to-end: a `tref` (a DIRECT child of `trak`, sibling to `mdia`) with a
+  /// `tmcd` reference decodes `TimecodeTrack` onto the track. Bytes match the
+  /// bundled `gopro_hero8` Track1 `tref` (`tmcd` ⇒ `00 00 00 03` = 3).
+  #[test]
+  fn walk_trak_decodes_tref_timecode_track() {
+    let tmcd_ref = atom(b"tmcd", &3u32.to_be_bytes());
+    let tref = atom(b"tref", &tmcd_ref);
+    let mut payload = tref;
+    payload.extend_from_slice(&trak_payload_with_stsd(
+      b"vide",
+      &stsd_box(&[vide_entry(b"avc1", 848, 480, b"", 24, 86)]),
+    ));
+    let track = walk_trak(1, &payload, Some(600));
+    assert_eq!(track.timecode_track(), Some(3));
+    // The `mdia`-borne fields still decode (the tref does not disturb them).
+    assert_eq!(track.handler_code(), Some("vide"));
   }
 
   // ── Pascal/C-string RawConv (HandlerDescription + CompressorName) ──

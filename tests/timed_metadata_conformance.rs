@@ -220,46 +220,25 @@ fn gsen_ee_byte_exact() {
 /// `Doc<N>` / `Doc<N>-<M>` is its own row. Byte-exact vs bundled ExifTool 13.59.
 ///
 /// NOTE: the DEFAULT (no-`ee`) `.json` is NOT byte-exact yet — its residual gap
-/// is the QuickTime *container* classes (`colr`/`tmcd`/`gmhd`/`tref`/`Gen*`/
-/// `ColorProfiles`/`VideoFrameRate`/`TimecodeTrack`), later container phases —
-/// so `quicktime_gopro_hero8_gpmf_conformance` (the no-`ee` path) stays
+/// is now down to the two `stts`-derived frame rates `VideoFrameRate` /
+/// `PlaybackFrameRate` (a LATER QuickTime-container phase), so
+/// `quicktime_gopro_hero8_gpmf_conformance` (the no-`ee` path) stays
 /// `#[ignore]`d. This `-ee` test exercises the gpmd `Doc<N>` port that #211
 /// adds: with `-ee` the per-sample GPMF timed block is what changes, and it IS
 /// byte-exact.
 /// The QuickTime *container* tags the hero8 goldens carry that exifast does not
 /// yet emit — the SAME residual gap as the no-`ee` `.json` conformance, and
-/// ENTIRELY outside the #211 `gpmd` timed-`Doc<N>` scope: the `colr` color
-/// profile (`ColorProfiles`/`ColorPrimaries`/`TransferCharacteristics`/
-/// `MatrixCoefficients`/`VideoFullRangeFlag`), the `tref` `TimecodeTrack`, the
-/// `gmhd`/`gmin`/`text` GenMediaHeader (`Gen*`/`TextFont`/`FontName`/…), the
-/// `stts`-derived `VideoFrameRate`/`PlaybackFrameRate`, and the `vmhd`
-/// GraphicsMode/OpColor — all later QuickTime-container phases. Dropping these
-/// from BOTH sides isolates the `gpmd`/`fdsc` timed `Doc<N>` stream this test
-/// pins, which IS byte-exact. (NOT `SampleTime`/`SampleDuration` — those are
-/// emitted correctly for the gpmd/fdsc tracks here.)
-const HERO8_CONTAINER_EXCL: &[&str] = &[
-  "TimecodeTrack",
-  "GraphicsMode",
-  "OpColor",
-  "ColorProfiles",
-  "ColorPrimaries",
-  "TransferCharacteristics",
-  "MatrixCoefficients",
-  "VideoFullRangeFlag",
-  "VideoFrameRate",
-  "GenMediaVersion",
-  "GenFlags",
-  "GenGraphicsMode",
-  "GenOpColor",
-  "GenBalance",
-  "TextFont",
-  "TextFace",
-  "TextSize",
-  "TextColor",
-  "BackgroundColor",
-  "FontName",
-  "PlaybackFrameRate",
-];
+/// ENTIRELY outside the #211 `gpmd` timed-`Doc<N>` scope. After QuickTime
+/// container phase 4 (the `vmhd` GraphicsMode/OpColor, the `tref`
+/// `TimecodeTrack`, and the `gmhd`/`gmin`/`tmcd`/`tcmi` GenMediaHeader
+/// `Gen*`/`Text*`/`FontName` — now emitted byte-exact) and phase 2 (the `colr`
+/// `ColorProfiles`/CICP fields), the ONLY residual is the two `stts`-derived
+/// frame rates, a LATER container phase (P5+): `VideoFrameRate` (Track1) and
+/// `PlaybackFrameRate` (Track3). Dropping just those two from BOTH sides
+/// isolates the `gpmd`/`fdsc` timed `Doc<N>` stream this test pins, which IS
+/// byte-exact. (NOT `SampleTime`/`SampleDuration` — those are emitted correctly
+/// for the gpmd/fdsc tracks here.)
+const HERO8_CONTAINER_EXCL: &[&str] = &["VideoFrameRate", "PlaybackFrameRate"];
 
 #[test]
 fn gopro_hero8_gpmd_ee_byte_exact() {
@@ -3438,9 +3417,9 @@ fn sony_fx3_rtmd_mp4_noee_warning_byte_exact() {
 // EXCLUDED tails (`INSV_REAL_EXCL`): the OneRS file carries full QuickTime `stsd`
 // sample-description boxes + a 470-sample timed-`text` track that this port's
 // structural trak parse does not surface — a pre-existing QuickTime *container*
-// gap (NOT Insta360): the `stsd` codec sub-tags (`CompressorID`/`AudioFormat`/
-// `HandlerDescription`/`Gen*`/`BitDepth`/…) and the per-sample
-// `SampleTime`/`SampleDuration` of the `text` handler track. (Contrast `camm`,
+// gap (NOT Insta360): the residual `pasp` `PixelAspectRatio`, the `stts`
+// `VideoFrameRate`, and the per-sample `SampleTime`/`SampleDuration` of the
+// `text` handler track. (Contrast `camm`,
 // whose metadata-handler track DOES surface `SampleTime`/`SampleDuration` — see
 // `camm_ee_byte_exact_gps_columns`.) Everything exifast emits is byte-IDENTICAL
 // to the bundled oracle; the excluded tails are the only structural absences and
@@ -3461,21 +3440,14 @@ fn sony_fx3_rtmd_mp4_noee_warning_byte_exact() {
 // timed-`text` subsystem (a large QuickTime-container item, out of scope for the
 // Insta360 trailer proof).
 const INSV_REAL_EXCL: &[&str] = &[
-  // Still-deferred `stsd`/`vmhd`/`stts` detail (Phase 2/3): the `vmhd`
-  // VideoHeader, the `pasp` PixelAspectRatio, the `stts` frame-rate, and the
-  // `gmhd`/`gmin` GenMediaHeader. The `vide`/`soun` `stsd` sample-description
-  // fields, the per-`trak` HandlerDescription, and the `text`-handler
-  // `OtherFormat` are now emitted by the #100 container phase-1 port and
+  // Still-deferred `stsd`/`stts` detail: the `pasp` PixelAspectRatio and the
+  // `stts` frame-rate. The `vide`/`soun` `stsd` sample-description fields and
+  // the per-`trak` HandlerDescription / `text`-handler `OtherFormat` are emitted
+  // by the #100 container phase-1 port; the `vmhd` `GraphicsMode`/`OpColor` and
+  // the `gmhd`/`gmin` GenMediaHeader `Gen*` by the container phase-4 port — all
   // compared byte-exact.
-  "GraphicsMode",
-  "OpColor",
   "PixelAspectRatio",
   "VideoFrameRate",
-  "GenBalance",
-  "GenFlags",
-  "GenGraphicsMode",
-  "GenMediaVersion",
-  "GenOpColor",
   // Per-sample timed-`text`-track table tags (the 470-sample text track).
   "SampleDuration",
   "SampleTime",

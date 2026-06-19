@@ -131,22 +131,24 @@ const NOT_ACTIVE: &[&str] = &[
   // `QuickTime_insta360_real.insv` (the real OneRS capture, #91) — the
   // Insta360 trailer decode is byte-exact (see
   // `tests/timed_metadata_conformance.rs::insta360_real_oners_insv_byte_exact`).
-  // The QuickTime container phase-1 port now emits its `vide`/`soun` `stsd`
-  // sample-description + HandlerDescription; the residual QuickTime *container*
-  // gap (NOT Insta360) is the `gmhd` `Gen*` fields, `pasp` PixelAspectRatio,
-  // `vmhd` GraphicsMode/OpColor, the `stts`-derived `VideoFrameRate`, and the
-  // 470-sample timed-`text` track's per-sample `SampleTime`/`SampleDuration`. So
-  // it is accept-deferred here (the conformance test excludes exactly those
-  // tails and is byte-exact on everything else).
+  // The QuickTime container ports now emit its `vide`/`soun` `stsd`
+  // sample-description + HandlerDescription (phase 1) and the `vmhd`
+  // GraphicsMode/OpColor + `gmhd`/`gmin` `Gen*` (phase 4); the residual QuickTime
+  // *container* gap (NOT Insta360) is the `pasp` PixelAspectRatio, the
+  // `stts`-derived `VideoFrameRate`, and the 470-sample timed-`text` track's
+  // per-sample `SampleTime`/`SampleDuration`. So it is accept-deferred here (the
+  // conformance test excludes exactly those tails and is byte-exact on
+  // everything else).
   "QuickTime_insta360_real.insv",
   // `QuickTime_gopro_hero8_gpmf.mp4` (the real HERO8 Black, #211/#189) — the
-  // gpmd timed-GPS Doc<N> port is SCHEDULED: `process_gopro` flat-merges every
-  // gpmd sample into one `GoProMeta`, so a per-sample Doc<N> timed-source
-  // retrofit (like camm/sony_rtmd/insta360) is needed before the gpmd GPS emits
-  // byte-exact. Phase-1 emitted its `stsd` codec container tags; the residual
-  // no-`ee` gap is the `colr`/`btrt`/`tmcd`/`gmhd`/`tref` classes (later
-  // container phases) plus the gpmd Doc<N> port. The conformance test is
-  // `#[ignore]`d until then — accept-deferred here.
+  // gpmd timed-GPS Doc<N> port landed (#211, the `-ee` path is byte-exact). The
+  // no-`ee` `.json` container tags are now emitted through container phase 1
+  // (`stsd`), phase 2 (`colr`/`pasp`/`btrt`), and phase 4 (`vmhd`
+  // GraphicsMode/OpColor, `tref` TimecodeTrack, `gmhd`/`gmin`/`tcmi` Gen*/Text*).
+  // The ONLY residual no-`ee` gap is the two `stts`-derived frame rates
+  // (`Track1:VideoFrameRate`, `Track3:PlaybackFrameRate`) — a later
+  // QuickTime-container phase — so `quicktime_gopro_hero8_gpmf_conformance` stays
+  // `#[ignore]`d and this fixture is accept-deferred here until then.
   "QuickTime_gopro_hero8_gpmf.mp4",
   // The #285 round-2 real-device fixtures (#109/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
