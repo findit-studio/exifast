@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "RIFF_webp_improper_exif.webp",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Improper EXIF header",
+  "File:FileType": "Extended WEBP",
+  "File:FileTypeExtension": "webp",
+  "File:MIMEType": "image/webp",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "RIFF:WebP_Flags": "(none)",
+  "RIFF:ImageWidth": 1,
+  "RIFF:ImageHeight": 1,
+  "RIFF:VP8Version": "0 (bicubic reconstruction, normal loop)",
+  "RIFF:HorizontalScale": 0,
+  "RIFF:VerticalScale": 0,
+  "IFD0:Artist": "AA"
+}]

@@ -680,7 +680,17 @@ const NOT_ACTIVE: &[&str] = &[
 /// container phase 7 emits the last two no-`ee` residual `stts`-derived frame
 /// rates (`Track1:VideoFrameRate`, `Track3:PlaybackFrameRate`), making the
 /// no-`ee` `.json`/`.n.json` byte-exact, so it moves out of [`NOT_ACTIVE`].
-const EXPECTED_ACTIVE_FIXTURES: usize = 532;
+/// 532 → 533 after `RIFF.webp` activated — the WEBP container chunk port
+/// (`src/formats/riff.rs` VP8X/VP8/VP8L/ALPH + the embedded EXIF/XMP seam, #153/
+/// #160) emits the 1x1 Extended-WEBP dimensions/flags, the embedded IFD0 EXIF
+/// (via the shared `ProcessTIFF` parser), and the XMP-x/XMP-dc tags
+/// byte-identically, so it enters the active set.
+/// 533 → 536 after the three malformed-WEBP metadata fixtures
+/// (`RIFF_webp_improper_exif.webp`, `RIFF_webp_incorrect_xmp.webp`,
+/// `RIFF_webp_multi_meta.webp`, #153 Codex R1) activated — they pin the
+/// byte-exact `[minor]` `Improper EXIF header` / `Incorrect XMP tag ID`
+/// warnings and the repeated-chunk ordered-replay tag retention.
+const EXPECTED_ACTIVE_FIXTURES: usize = 536;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

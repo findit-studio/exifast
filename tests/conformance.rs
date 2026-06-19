@@ -354,6 +354,87 @@ fn riff_truncated_fmt_conformance() {
 }
 
 #[test]
+fn riff_webp_conformance() {
+  // FORMATS.md row 26 (WEBP via the RIFF walker) — bundled
+  // `lib/Image/ExifTool/t/images/RIFF.webp` (586 bytes, a 1x1 Extended WEBP).
+  // Exercises the WEBP chunk tables + the embedded EXIF/XMP seam (#153, #160):
+  //  - `VP8X` (`%RIFF::VP8X`, RIFF.pm:1351-1379): WebP_Flags BITMASK
+  //    ("XMP, EXIF, Alpha"), the 24-bit canvas ImageWidth/Height (1x1), AND the
+  //    `OverrideFileType('Extended WEBP', undef, 'webp')` promotion
+  //    (RIFF.pm:2106 -> `File:FileType` = "Extended WEBP", extension "webp").
+  //  - `ALPH` (`%RIFF::ALPH`, RIFF.pm:1467-1497): AlphaPreprocessing/Filtering/
+  //    Compression (all three read byte 0 `& 0x03`, verbatim per the table).
+  //  - `VP8 ` (`%RIFF::VP8`, RIFF.pm:1279-1319): VP8Version (Mask 0x0e) +
+  //    Horizontal/VerticalScale (Mask 0xc000); its ImageWidth/Height are the
+  //    `Priority => 0` duplicates the `VP8X` canvas suppresses (the `-a`-only
+  //    `RIFF:Copy1`, absent from this default `-j`/`-n` output).
+  //  - `EXIF` chunk (RIFF.pm:557-576): the embedded `MM\0*` TIFF block re-walked
+  //    through the shared `ProcessTIFF` parser -> `File:ExifByteOrder` + IFD0
+  //    (XResolution/YResolution/ResolutionUnit/Artist/YCbCrPositioning).
+  //  - `XMP ` chunk (RIFF.pm:577-580): the standard packet -> XMP-x:XMPToolkit +
+  //    XMP-dc:Subject (a Bag -> ["test"]).
+  // Goldens drop `Composite:*` (ImageSize/Megapixels synthesized from the VP8X
+  // dimensions; this port has no Composite subsystem) and `System:*` — the
+  // standard `EXCLUDE="-x Composite:all"` regen (see `tools/gen_golden.sh`).
+  check("RIFF.webp", "RIFF.webp.json", true);
+  check("RIFF.webp", "RIFF.webp.n.json", false);
+}
+
+#[test]
+fn riff_webp_malformed_metadata_conformance() {
+  // Malformed embedded-metadata WEBP variants (#153 Codex R1) — CRAFTED 1x1
+  // Extended-WEBP fixtures pinning the byte-exact `ExifTool:Warning` and the
+  // repeated-chunk tag retention against bundled 13.59.
+  //
+  //  - `RIFF_webp_improper_exif.webp`: a single `EXIF` chunk with the
+  //    non-standard `Exif\0\0` header (RIFF.pm:567 `Warn(..., 1)`) ⇒ the
+  //    MINOR `"[minor] Improper EXIF header"` warning (NOT a plain
+  //    `ExifTool:Warning`) plus the chunk's `IFD0:Artist` (the 6-byte header
+  //    stripped, the TIFF re-walked through `ProcessTIFF`).
+  //  - `RIFF_webp_incorrect_xmp.webp`: a single `XMP\0` chunk (the incorrect
+  //    tag ID, RIFF.pm:582-587 `Warn(..., 1)`) ⇒ `"[minor] Incorrect XMP tag
+  //    ID"` plus the packet's `XMP-x:XMPToolkit`.
+  //  - `RIFF_webp_multi_meta.webp`: TWO `EXIF` chunks (IFD0:Artist then
+  //    IFD0:Make) and TWO `XMP ` chunks (x:xmptk then dc:creator). RIFF
+  //    dispatches EVERY metadata chunk it walks (RIFF.pm:557-587), so the
+  //    output retains the DISTINCT tags from all four — `IFD0:Artist`,
+  //    `IFD0:Make`, `XMP-x:XMPToolkit`, `XMP-dc:Creator` — proving the ordered
+  //    replay (a single Option would drop the earlier EXIF/XMP chunk).
+  // Composite:* (ImageSize/Megapixels synthesized from the VP8X canvas) is
+  // dropped via `EXCLUDE="-x Composite:all"` at regen, like `RIFF.webp`.
+  check(
+    "RIFF_webp_improper_exif.webp",
+    "RIFF_webp_improper_exif.webp.json",
+    true,
+  );
+  check(
+    "RIFF_webp_improper_exif.webp",
+    "RIFF_webp_improper_exif.webp.n.json",
+    false,
+  );
+  check(
+    "RIFF_webp_incorrect_xmp.webp",
+    "RIFF_webp_incorrect_xmp.webp.json",
+    true,
+  );
+  check(
+    "RIFF_webp_incorrect_xmp.webp",
+    "RIFF_webp_incorrect_xmp.webp.n.json",
+    false,
+  );
+  check(
+    "RIFF_webp_multi_meta.webp",
+    "RIFF_webp_multi_meta.webp.json",
+    true,
+  );
+  check(
+    "RIFF_webp_multi_meta.webp",
+    "RIFF_webp_multi_meta.webp.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

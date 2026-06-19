@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "RIFF_webp_incorrect_xmp.webp",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Incorrect XMP tag ID",
+  "File:FileType": "Extended WEBP",
+  "File:FileTypeExtension": "WEBP",
+  "File:MIMEType": "image/webp",
+  "RIFF:WebP_Flags": 0,
+  "RIFF:ImageWidth": 1,
+  "RIFF:ImageHeight": 1,
+  "RIFF:VP8Version": 0,
+  "RIFF:HorizontalScale": 0,
+  "RIFF:VerticalScale": 0,
+  "XMP-x:XMPToolkit": "TKx"
+}]

@@ -4,8 +4,9 @@
 #![cfg(feature = "riff")]
 //! Faithful port of `Image::ExifTool::RIFF` (`lib/Image/ExifTool/RIFF.pm`):
 //! reads RIFF/RIFX containers — primarily AVI (Audio Video Interleaved) in
-//! this port, with WAV/WEBP carrying the same outer walker but minimal
-//! interior decoding (see §Deferrals).
+//! this port, plus the WEBP chunk tables (VP8X/VP8/VP8L/ALPH dimensions +
+//! flags, embedded EXIF/XMP) and the WAV outer walker with minimal interior
+//! decoding (see §Deferrals).
 //!
 //! ## RIFF format
 //!
@@ -74,11 +75,19 @@
 //!   (RIFF.pm:2045) all parse OK as opaque chunks but emit nothing.
 //!   AVI is the primary product target; pure-audio RIFF files have
 //!   dedicated audio ports (FLAC/AAC/etc.) or are deferred.
-//! - **WEBP-specific tag tables.** `VP8`/`VP8L`/`VP8X`/`ALPH`/`ANIM`/`ANMF`
-//!   (RIFF.pm:1279-1488), `ICCP`, embedded `EXIF`/`XMP `, the `Extended
-//!   WEBP` `OverrideFileType` (RIFF.pm:2106). WEBP is an image format —
-//!   PNG/JPEG/TIFF land first; WEBP through this RIFF walker is a thin
-//!   subdir hop above what's needed.
+//! - **WEBP container chunks (PORTED, #153/#160).** `VP8X` (WebP_Flags BITMASK
+//!   + 24-bit canvas dims + the `Extended WEBP` `OverrideFileType`,
+//!   RIFF.pm:2106), `VP8 ` (lossy VP8Version + dims + scales), `VP8L`
+//!   (lossless dims + AlphaIsUsed + the `(lossless)` FileType suffix), and
+//!   `ALPH` (RIFF.pm:1279-1497) emit their `RIFF:*` tags; the embedded
+//!   `EXIF`/`Exif` chunk re-walks through the shared `ProcessTIFF` IFD parser
+//!   ([`crate::exif::parse_exif_block`]) and the `XMP `/`XMP\0` chunk through
+//!   the ported XMP module ([`crate::formats::xmp::parse_borrowed`]) — the same
+//!   container→EXIF/XMP seam PNG's `eXIf`/raw-profile path uses. Still deferred:
+//!   `ANIM`/`ANMF` (animation Duration), and the `ICCP` ICC-profile decode
+//!   (exifast has no ported `ICC_Profile` module — the same color-management
+//!   deferral PNG `iCCP` / JPEG `APP2` ICC carry; the profile is captured-but-
+//!   not-decoded).
 //! - **OpenDML extras.** Only `dmlh` `TotalFrameCount` (RIFF.pm:1156-1158)
 //!   is emitted; the broader OpenDML 2.0 index extensions (`indx`/`ix##`)
 //!   are not parsed.
@@ -162,6 +171,61 @@ const fn riff_mime_for(file_type: &str) -> &'static str {
   }
 }
 
+/// Append ` (lossless)` to the CURRENT RIFF FileType for a `VP8L` chunk
+/// (RIFF.pm:1330-1334 `$$self{VALUE}{FileType} . ' (lossless)'`).
+///
+/// The base is whatever FileType is current when the `VP8L` chunk is walked:
+/// the form-type base (`%riffType`: `WAV`/`AVI`/`WEBP`/`LA`/`OFR`/`PAC`/`WV`,
+/// or the inert `RIFF` fallback) OR the `Extended WEBP` a prior `VP8X` set on a
+/// WEBP form. The result is kept a `&'static str` (the engine's
+/// `ExplicitWithMime`/`ExplicitWithMimeAndExt` finalize requires `'static`) by
+/// enumerating the closed set rather than allocating. A non-WEBP base yields
+/// e.g. `WAV (lossless)` — matching bundled 13.59 — while the MIME is left
+/// unchanged by the caller.
+///
+/// **Idempotent & preserving** (the append must be applied AT MOST ONCE).
+/// ExifTool's RawConv (RIFF.pm:1332) literally appends ` (lossless)` to
+/// whatever `FileType` currently holds — but the walker re-runs this for EVERY
+/// valid `VP8L` chunk, feeding back the PREVIOUS override. A second `VP8L`
+/// therefore sees an already-suffixed `current` (e.g. `WAV (lossless)` /
+/// `Extended WEBP (lossless)`). For such an already-lossless input we return it
+/// UNCHANGED — never double-appending and never collapsing an unrecognized
+/// already-lossless type into `RIFF (lossless)`. The set of reachable `current`
+/// values is closed (a `%riffType`/`RIFF` base, an `Extended WEBP` from a prior
+/// `VP8X`, or one of this function's own outputs), so the already-lossless
+/// states are enumerated explicitly to keep the `&'static str` (no owned
+/// `String`/allocation needed).
+#[must_use]
+const fn vp8l_lossless_file_type(current: &str) -> &'static str {
+  match current.as_bytes() {
+    b"WEBP" => "WEBP (lossless)",
+    b"Extended WEBP" => "Extended WEBP (lossless)",
+    b"WAV" => "WAV (lossless)",
+    b"AVI" => "AVI (lossless)",
+    b"LA" => "LA (lossless)",
+    b"OFR" => "OFR (lossless)",
+    b"PAC" => "PAC (lossless)",
+    b"WV" => "WV (lossless)",
+    // Already-lossless inputs (a SECOND walked `VP8L` is fed the prior override)
+    // are returned UNCHANGED — the append happens at most once. Enumerated to
+    // preserve the exact `&'static str` rather than re-appending or falling
+    // through to the `RIFF (lossless)` arm below.
+    b"WEBP (lossless)" => "WEBP (lossless)",
+    b"Extended WEBP (lossless)" => "Extended WEBP (lossless)",
+    b"WAV (lossless)" => "WAV (lossless)",
+    b"AVI (lossless)" => "AVI (lossless)",
+    b"LA (lossless)" => "LA (lossless)",
+    b"OFR (lossless)" => "OFR (lossless)",
+    b"PAC (lossless)" => "PAC (lossless)",
+    b"WV (lossless)" => "WV (lossless)",
+    b"RIFF (lossless)" => "RIFF (lossless)",
+    // The inert `RIFF` fallback (an unrecognized form type) and any other
+    // not-yet-lossless value append literally once (bundled appends to whatever
+    // `FileType` holds).
+    _ => "RIFF (lossless)",
+  }
+}
+
 // ===========================================================================
 // §2. Value types — `RiffEntry`, `RiffStream`, `RiffMeta`
 // ===========================================================================
@@ -176,16 +240,40 @@ pub struct RiffEntry {
   group: SmolStr,
   name: SmolStr,
   value: RiffValue,
+  /// ExifTool `Priority => N` for this tag's duplicate handling (default `1`).
+  /// The WEBP `VP8`/`VP8L` `ImageWidth`/`ImageHeight` are `Priority => 0`
+  /// (RIFF.pm:1301/1312/1329/1340), so when an Extended-WEBP `VP8X` already
+  /// emitted the canvas `ImageWidth`/`ImageHeight` (priority `1`), the
+  /// lossy/lossless bitstream's duplicate NEVER overrides it — ExifTool keeps
+  /// the `VP8X` value and demotes the bitstream pair to the `-a`-only
+  /// `RIFF:Copy1` (absent from the default `-j`/`-n` output). Threaded to
+  /// [`crate::emit::EmittedTag::new_with_priority`] so the shared `TagMap`
+  /// dedup reproduces that first-wins exactly.
+  priority: u8,
 }
 
 impl RiffEntry {
-  /// Construct an entry. Internal helper for the walker.
+  /// Construct an entry with ExifTool's default duplicate `Priority => 1`.
+  /// Internal helper for the walker.
   #[inline]
   fn new(group: &'static str, name: &'static str, value: RiffValue) -> Self {
+    Self::new_with_priority(group, name, value, 1)
+  }
+
+  /// Construct an entry carrying an explicit ExifTool `Priority => N`
+  /// (RIFF.pm `Priority => 0` for the `VP8`/`VP8L` dimension duplicates).
+  #[inline]
+  fn new_with_priority(
+    group: &'static str,
+    name: &'static str,
+    value: RiffValue,
+    priority: u8,
+  ) -> Self {
     Self {
       group: SmolStr::new_static(group),
       name: SmolStr::new_static(name),
       value,
+      priority,
     }
   }
 
@@ -208,6 +296,14 @@ impl RiffEntry {
   #[inline(always)]
   pub const fn value_ref(&self) -> &RiffValue {
     &self.value
+  }
+
+  /// ExifTool `Priority => N` for this tag (default `1`; `0` for the
+  /// `VP8`/`VP8L` dimension duplicates that never override a `VP8X` canvas).
+  #[must_use]
+  #[inline(always)]
+  pub const fn priority(&self) -> u8 {
+    self.priority
   }
 }
 
@@ -286,6 +382,30 @@ impl RiffStream {
   }
 }
 
+/// One embedded WEBP metadata chunk captured during the walk, in chunk order.
+///
+/// RIFF.pm dispatches EVERY `EXIF`/`Exif` and `XMP `/`XMP\0` chunk it walks
+/// (RIFF.pm:557-587) — to `ProcessTIFF` and `ProcessXMP` respectively — so a
+/// file carrying repeated metadata chunks contributes the tags of ALL of them.
+/// The payload is a sub-slice BORROWED from the input (zero-copy); it is
+/// re-parsed at emit time. The `improper_header` / `incorrect_tag_id` flags
+/// drive the per-chunk minor warnings (`$self->Warn(..., 1)`, RIFF.pm:567/585).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebpMetaChunk<'a> {
+  /// An `EXIF`/`Exif` chunk — a complete TIFF block (`II*\0`/`MM\0*`), with any
+  /// leading `Exif\0\0` header already stripped (RIFF.pm:557-572). `improper`
+  /// is `true` for the `Exif\0\0`-prefixed form (the `[minor] Improper EXIF
+  /// header` warning, RIFF.pm:567).
+  Exif { block: &'a [u8], improper: bool },
+  /// An `XMP `/`XMP\0` chunk — a standard XMP packet (RIFF.pm:577-587).
+  /// `incorrect_id` is `true` for the non-standard `XMP\0` tag ID (the
+  /// `[minor] Incorrect XMP tag ID` warning, RIFF.pm:582-587).
+  Xmp {
+    packet: &'a [u8],
+    incorrect_id: bool,
+  },
+}
+
 /// Typed RIFF metadata — the lib-first output of [`ProcessRiff`].
 ///
 /// D8 convention: no public fields; accessors only.
@@ -297,9 +417,10 @@ impl RiffStream {
 /// The Meta owns MOST of its data — RIFF values are heavily transformed during
 /// the walk (date conversion, FourCC slicing, PCM/codec-table lookup), so the
 /// emitted entries borrow nothing. The one exception is the raw Pentax AVI
-/// MakerNote payload, held as a `&'a [u8]` sub-slice of the input (zero-copy;
-/// decoded at emit time, #157) — so the `'a` GAT lifetime is a real input
-/// borrow rather than the MXF-style phantom.
+/// MakerNote payload AND the embedded WEBP `EXIF`/`XMP ` chunk payloads, each
+/// held as a `&'a [u8]` sub-slice of the input (zero-copy; decoded at emit
+/// time, #153/#157) — so the `'a` GAT lifetime is a real input borrow rather
+/// than the MXF-style phantom.
 #[derive(Debug, Clone)]
 pub struct RiffMeta<'a> {
   entries: Vec<RiffEntry>,
@@ -332,6 +453,24 @@ pub struct RiffMeta<'a> {
   /// `%Pentax::Main` walker, mirroring the Canon CTMD re-dispatch. `None` for a
   /// non-Pentax AVI (#157).
   pentax_makernote: Option<&'a [u8]>,
+  /// The embedded WEBP metadata chunks (`EXIF`/`Exif` TIFF blocks and
+  /// `XMP `/`XMP\0` packets) in WALK ORDER (RIFF.pm:557-587). ExifTool
+  /// dispatches EVERY such chunk occurrence as it walks (each EXIF block to
+  /// `ProcessTIFF`, each XMP packet to `ProcessXMP`), so a file with repeated
+  /// metadata chunks retains the tags of ALL of them (later chunks last-win
+  /// only on a per-tag collision). Each payload is a sub-slice BORROWED from
+  /// the input (zero-copy); replayed in this order at emit time through the
+  /// shared [`crate::exif::parse_exif_block`] / [`crate::formats::xmp::parse_borrowed`]
+  /// seams (the same ones PNG `eXIf`/raw-profile XMP use). Empty for a non-WEBP
+  /// RIFF or a WEBP with no metadata chunks.
+  webp_meta: Vec<WebpMetaChunk<'a>>,
+  /// `true` when a `VP8X` (on a WEBP form) or `VP8L` chunk fired
+  /// `OverrideFileType(..., 'webp')` (RIFF.pm:2106 / 1332) — the explicit
+  /// `webp` `$normExt`. Drives `File:FileTypeExtension = webp` even for a
+  /// non-WEBP base type (e.g. a `WAV (lossless)` from a WAVE+VP8L). A plain
+  /// WEBP gets its `webp` extension from the `%fileTypeExt` default, not this
+  /// flag.
+  webp_ext_override: bool,
 }
 
 impl Default for RiffMeta<'_> {
@@ -345,11 +484,13 @@ impl Default for RiffMeta<'_> {
       corrupted: false,
       unsupported_charset: None,
       pentax_makernote: None,
+      webp_meta: Vec::new(),
+      webp_ext_override: false,
     }
   }
 }
 
-impl RiffMeta<'_> {
+impl<'a> RiffMeta<'a> {
   /// Every emitted RIFF tag, in file order.
   #[must_use]
   #[inline(always)]
@@ -386,6 +527,46 @@ impl RiffMeta<'_> {
   #[inline(always)]
   pub const fn is_rf64(&self) -> bool {
     self.rf64
+  }
+
+  /// The FIRST embedded WEBP EXIF TIFF block (`EXIF`/`Exif` chunk, `Exif\0\0`
+  /// header already stripped), borrowed from the input, or `None` if this is
+  /// not a WEBP carrying an EXIF chunk. A WEBP may carry several EXIF chunks
+  /// (all replayed at emit time, in walk order); this accessor surfaces only
+  /// the first for callers that want a single block. Re-walked via
+  /// [`crate::exif::parse_exif_block`].
+  #[must_use]
+  #[inline]
+  pub fn webp_exif(&self) -> Option<&'a [u8]> {
+    self.webp_meta.iter().find_map(|c| match *c {
+      WebpMetaChunk::Exif { block, .. } => Some(block),
+      WebpMetaChunk::Xmp { .. } => None,
+    })
+  }
+
+  /// The FIRST embedded WEBP XMP packet (`XMP `/`XMP\0` chunk), borrowed from
+  /// the input, or `None` if this is not a WEBP carrying an XMP chunk. A WEBP
+  /// may carry several XMP chunks (all replayed at emit time, in walk order);
+  /// this accessor surfaces only the first. Parsed via
+  /// [`crate::formats::xmp::parse_borrowed`].
+  #[must_use]
+  #[inline]
+  pub fn webp_xmp(&self) -> Option<&'a [u8]> {
+    self.webp_meta.iter().find_map(|c| match *c {
+      WebpMetaChunk::Xmp { packet, .. } => Some(packet),
+      WebpMetaChunk::Exif { .. } => None,
+    })
+  }
+
+  /// `true` when a `VP8X` (WEBP-form) or `VP8L` chunk applied the explicit
+  /// `webp` file-type extension override (RIFF.pm:2106 / 1332). The engine's
+  /// finalize uses this to surface `File:FileTypeExtension = webp` even when
+  /// the base file type is non-WEBP (e.g. a `WAV (lossless)` from a WAVE
+  /// carrying a `VP8L` chunk).
+  #[must_use]
+  #[inline(always)]
+  pub const fn webp_ext_override(&self) -> bool {
+    self.webp_ext_override
   }
 }
 
@@ -455,10 +636,14 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
   // Bundled passes `undef` MIME when `$type` is undef; we surface the inert
   // `"RIFF"` fallback so the engine's `ExplicitWithMime` finalize always
   // has a target. Real-input AVI / WAV / WEBP all hit the matched arms.
-  let (file_type, mime): (&'static str, &'static str) = match riff_type_for(&form) {
+  let (base_file_type, mime): (&'static str, &'static str) = match riff_type_for(&form) {
     Some(t) => (t, riff_mime_for(t)),
     None => ("RIFF", "application/octet-stream"),
   };
+  // RIFF.pm:2106 gates the `Extended WEBP` override on `$type eq 'WEBP'` (the
+  // ORIGINAL form-type lookup), so a non-WEBP RIFF (WAV/AVI/private form)
+  // carrying a top-level `VP8X` must NOT be promoted to WEBP.
+  let form_is_webp = riff_type_for(&form) == Some("WEBP");
 
   let mut walker = Walker {
     data,
@@ -470,6 +655,11 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     unsupported_charset: None,
     err: false,
     pentax_makernote: None,
+    base_file_type,
+    form_is_webp,
+    webp_file_type_override: None,
+    webp_ext_override: false,
+    webp_meta: Vec::new(),
   };
 
   // RIFF.pm:2058: `my $riffEnd = Get32u(\$buff, 4) + 8; $riffEnd += $riffEnd & 0x01;`
@@ -480,6 +670,15 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
 
   walker.walk_top();
 
+  // RIFF.pm:2106 / RIFF.pm:1332: the `VP8X` (`Extended WEBP`) and `VP8L`
+  // (` (lossless)`) `OverrideFileType` results, resolved during the walk
+  // (the VP8X branch is gated on the WEBP form type; VP8L appends to whatever
+  // FileType is current). MIME is left UNCHANGED — both `OverrideFileType`
+  // calls pass an undef/empty `$mimeType` (`%mimeType` has no `Extended WEBP`
+  // / ` (lossless)` key), so `SetFileType`'s form-type MIME stands.
+  let file_type = walker.webp_file_type_override.unwrap_or(base_file_type);
+  let webp_ext_override = walker.webp_ext_override;
+
   Some(RiffMeta {
     entries: walker.entries,
     streams: walker.streams,
@@ -489,6 +688,8 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     corrupted: walker.err,
     unsupported_charset: walker.unsupported_charset,
     pentax_makernote: walker.pentax_makernote,
+    webp_meta: walker.webp_meta,
+    webp_ext_override,
   })
 }
 
@@ -528,6 +729,34 @@ struct Walker<'a> {
   /// emit time (when the `-j`/`-n` mode is known) through the shared
   /// `%Pentax::Main` walker. `None` for a non-Pentax AVI (#157).
   pentax_makernote: Option<&'a [u8]>,
+  /// The ORIGINAL form-type's `SetFileType` value (`%riffType` lookup of the
+  /// 4cc after `RIFF`/`RF64`, RIFF.pm:2041/2053) — `WAV` / `AVI` / `WEBP` / …
+  /// / `RIFF`. The `VP8L` RawConv appends ` (lossless)` to the CURRENT FileType
+  /// (RIFF.pm:1332 `$$self{VALUE}{FileType} . ' (lossless)'`), which starts as
+  /// this base; read at the `VP8L` chunk.
+  base_file_type: &'static str,
+  /// `true` when the form type (`$type`) is `WEBP` — RIFF.pm:2106 gates the
+  /// `Extended WEBP` `OverrideFileType` on `$type eq 'WEBP'`, so a `VP8X` chunk
+  /// in a non-WEBP RIFF (WAV/AVI/private form) must NOT promote to WEBP.
+  form_is_webp: bool,
+  /// The resolved `OverrideFileType` result so far: `Some("Extended WEBP")`
+  /// after a `VP8X` on a WEBP form (RIFF.pm:2106), and/or the
+  /// ` (lossless)`-suffixed type after a `VP8L` (RIFF.pm:1332). `None` until an
+  /// override fires; the post-walk `file_type` falls back to `base_file_type`.
+  /// MIME is NEVER changed by these overrides (both pass an undef `$mimeType`).
+  webp_file_type_override: Option<&'static str>,
+  /// `true` once a `VP8X` (WEBP form) or `VP8L` chunk fired
+  /// `OverrideFileType(..., 'webp')` — the explicit `webp` `$normExt`
+  /// (RIFF.pm:2106 / 1332). Surfaced to the engine to force
+  /// `File:FileTypeExtension = webp` even for a non-WEBP base type.
+  webp_ext_override: bool,
+  /// The embedded WEBP metadata chunks (`EXIF`/`Exif` blocks + `XMP `/`XMP\0`
+  /// packets) in WALK ORDER — ExifTool dispatches EVERY such chunk it walks
+  /// (RIFF.pm:557-587), so this is an ORDERED LIST, not a single slot. Each
+  /// payload is borrowed from the input (zero-copy); replayed at emit time
+  /// through [`crate::exif::parse_exif_block`] / [`crate::formats::xmp::parse_borrowed`].
+  /// Empty until a metadata chunk is seen.
+  webp_meta: Vec<WebpMetaChunk<'a>>,
 }
 
 impl<'a> Walker<'a> {
@@ -732,6 +961,94 @@ impl<'a> Walker<'a> {
             };
           }
         }
+        // WEBP extended-format chunk (`VP8X`, RIFF.pm:603-606 -> `%RIFF::VP8X`,
+        // RIFF.pm:1351-1379). Emits `WebP_Flags`/`ImageWidth`/`ImageHeight`. The
+        // `Extended WEBP` promotion is GATED on the WEBP form type (RIFF.pm:2106
+        // `... if $tag eq 'VP8X' and $type eq 'WEBP'`): a `VP8X` in a non-WEBP
+        // RIFF (WAV/AVI/private form) emits the tags but does NOT promote — so
+        // the file is not mis-finalized as WEBP. When it fires, the explicit
+        // `webp` `$normExt` is recorded for `File:FileTypeExtension`.
+        b"VP8X" => {
+          emit_webp_vp8x(body, &mut self.entries);
+          if self.form_is_webp {
+            self.webp_file_type_override = Some("Extended WEBP");
+            self.webp_ext_override = true;
+          }
+        }
+        // WEBP lossy bitstream (`VP8 `, RIFF.pm:593-597 -> `%RIFF::VP8`,
+        // RIFF.pm:1279-1319). The Condition `^...\x9d\x01\x2a` gates dispatch
+        // (RIFF.pm:595); a non-matching body is the deferred `UnknownEXIF`-style
+        // miss (no tags). The `ImageWidth`/`ImageHeight` are `Priority => 0`
+        // (RIFF.pm:1301/1312) -> they never override a `VP8X` canvas.
+        b"VP8 " => emit_webp_vp8(body, &mut self.entries),
+        // WEBP lossless (`VP8L`, RIFF.pm:598-601 -> `%RIFF::VP8L`,
+        // RIFF.pm:1322-1348). Condition `^\x2f` (RIFF.pm:600); the `ImageWidth`
+        // RawConv (RIFF.pm:1330-1334) APPENDS ` (lossless)` to the CURRENT
+        // FileType — `$$self{VALUE}{FileType} . ' (lossless)'`, with the
+        // explicit `webp` `$normExt`. That base is whatever FileType is current
+        // when the chunk is walked: a prior `VP8X` may have set `Extended WEBP`,
+        // otherwise it is the form-type base (`WEBP`/`WAV`/`AVI`/…). This is NOT
+        // gated on the WEBP form, so a non-WEBP RIFF carrying a `VP8L` becomes
+        // e.g. `WAV (lossless)` (verified vs bundled 13.59) — but its MIME and
+        // base type are preserved (it is NOT finalized as WEBP).
+        b"VP8L" => {
+          if emit_webp_vp8l(body, &mut self.entries) {
+            let current = self.webp_file_type_override.unwrap_or(self.base_file_type);
+            self.webp_file_type_override = Some(vp8l_lossless_file_type(current));
+            self.webp_ext_override = true;
+          }
+        }
+        // WEBP alpha (`ALPH`, RIFF.pm:615-618 -> `%RIFF::ALPH`,
+        // RIFF.pm:1467-1497). Emits AlphaPreprocessing/Filtering/Compression.
+        b"ALPH" => emit_webp_alph(body, &mut self.entries),
+        // WEBP embedded EXIF (`EXIF`/`Exif`, RIFF.pm:557-576). A complete TIFF
+        // block dispatched to the standard `ProcessTIFF` IFD walker. Three
+        // bundled conditions: a bare `II*\0`/`MM\0*` header (Start=0); an
+        // `Exif\0\0`-prefixed block (Start=6, `Improper EXIF header` warning);
+        // else the deferred `UnknownEXIF` (Binary => 1). We CAPTURE the TIFF
+        // slice here (zero-copy) and re-walk it at emit time via
+        // [`crate::exif::parse_exif_block`] (the QuickTime/PNG `eXIf` seam).
+        b"EXIF" | b"Exif" => {
+          if matches!(body.get(0..4), Some(b"II\x2a\x00" | b"MM\x00\x2a")) {
+            // RIFF dispatches EVERY EXIF chunk it walks (RIFF.pm:557-563), so
+            // append to the ordered list — a file with repeated EXIF chunks
+            // keeps the tags of all of them (later chunks last-win per-tag).
+            self.webp_meta.push(WebpMetaChunk::Exif {
+              block: body,
+              improper: false,
+            });
+          } else if body.get(0..6) == Some(b"Exif\x00\x00")
+            && let Some(block) = body.get(6..)
+            && matches!(block.get(0..4), Some(b"II\x2a\x00" | b"MM\x00\x2a"))
+          {
+            // RIFF.pm:567/571 `Start => 6` -> the TIFF block begins after the
+            // 6-byte `Exif\0\0` header; bundled accepts it with a minor
+            // `Warn("Improper EXIF header", 1)`.
+            self.webp_meta.push(WebpMetaChunk::Exif {
+              block,
+              improper: true,
+            });
+          }
+          // else: `UnknownEXIF` (Binary => 1) -- deferred, no emission.
+        }
+        // WEBP embedded XMP (`XMP `, RIFF.pm:577-580; the incorrect `XMP\0`
+        // variant, RIFF.pm:582-587). A standard XMP packet dispatched to
+        // `ProcessXMP`. We CAPTURE the packet and parse it at emit time via the
+        // ported [`crate::formats::xmp::parse_borrowed`] (PNG raw-profile seam).
+        b"XMP " => self.webp_meta.push(WebpMetaChunk::Xmp {
+          packet: body,
+          incorrect_id: false,
+        }),
+        b"XMP\x00" => self.webp_meta.push(WebpMetaChunk::Xmp {
+          packet: body,
+          incorrect_id: true,
+        }),
+        // WEBP embedded ICC profile (`ICCP`, RIFF.pm:588-592 -> ICC_Profile::
+        // Main). exifast has NO ported ICC_Profile module (color management is
+        // out of the camera-metadata scope -- the same deferral PNG `iCCP` and
+        // JPEG `APP2` ICC carry), so the profile is not decoded into
+        // `ICC_Profile:*` tags. Skipped (no fixture in the suite carries ICCP).
+        b"ICCP" => {}
         // Skip image-data / index chunks (RIFF.pm:2148-2150).
         b"data" | b"idx1" => {}
         // JUNK (vendor maker-note variants + TextJunk fallback) — all
@@ -1611,6 +1928,178 @@ fn emit_acid(payload: &[u8], entries: &mut Vec<RiffEntry>) {
       RiffValue::F64(le_f32_at(payload, 20) as f64),
     ));
   }
+}
+
+/// `VP8X` WEBP extended-info chunk (RIFF.pm:1351-1379, `%RIFF::VP8X`,
+/// `ProcessBinaryData`, little-endian). Emits (in offset order):
+/// - `WebP_Flags` (offset 0, int32u) — the BITMASK flags word (PrintConv at
+///   emit time, [`print_conv_u32`]); stored as the RAW int (`-n` => `28`).
+/// - `ImageWidth` (offset 4, int32u, ValueConv `($val & 0xffffff) + 1`).
+/// - `ImageHeight` (offset 6, int32u, ValueConv `($val >> 8) + 1`).
+///
+/// The offset-4 and offset-6 int32u reads OVERLAP (ExifTool reads a full
+/// `int32u` at each byte offset); a 10-byte VP8X data block satisfies both.
+#[cfg(feature = "alloc")]
+fn emit_webp_vp8x(body: &[u8], entries: &mut Vec<RiffEntry>) {
+  // 0: WebP_Flags int32u (raw; BITMASK PrintConv applied at emit time).
+  if body.len() >= 4 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "WebP_Flags",
+      RiffValue::U32(le_u32_at(body, 0)),
+    ));
+  }
+  // 4: ImageWidth int32u, ValueConv `($val & 0xffffff) + 1`.
+  if body.len() >= 8 {
+    let raw = le_u32_at(body, 4);
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "ImageWidth",
+      RiffValue::U32((raw & 0x00ff_ffff) + 1),
+    ));
+  }
+  // 6: ImageHeight int32u, ValueConv `($val >> 8) + 1`.
+  if body.len() >= 10 {
+    let raw = le_u32_at(body, 6);
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "ImageHeight",
+      RiffValue::U32((raw >> 8) + 1),
+    ));
+  }
+}
+
+/// `VP8 ` WEBP lossy bitstream (RIFF.pm:1279-1319, `%RIFF::VP8`,
+/// `ProcessBinaryData`, little-endian). The `%Main` Condition `^...\x9d\x01\x2a`
+/// (RIFF.pm:595) gates dispatch — bytes 3..6 must be `9d 01 2a`. Emits:
+/// - `VP8Version` (offset 0, Mask `0x0e` => `(b0 & 0x0e) >> 1`; PrintConv).
+/// - `ImageWidth` (offset 6, int16u, Mask `0x3fff`; `Priority => 0`).
+/// - `HorizontalScale` (offset 6, int16u, Mask `0xc000` => `>> 14`).
+/// - `ImageHeight` (offset 8, int16u, Mask `0x3fff`; `Priority => 0`).
+/// - `VerticalScale` (offset 8, int16u, Mask `0xc000` => `>> 14`).
+///
+/// The `ImageWidth`/`ImageHeight` carry `Priority => 0` so an Extended-WEBP
+/// `VP8X` canvas (emitted first, priority `1`) is NEVER overridden — ExifTool
+/// demotes the bitstream pair to the `-a`-only `RIFF:Copy1`.
+#[cfg(feature = "alloc")]
+fn emit_webp_vp8(body: &[u8], entries: &mut Vec<RiffEntry>) {
+  // %Main Condition `^...\x9d\x01\x2a` (RIFF.pm:595): a non-matching body is the
+  // deferred `UnknownEXIF`-style miss (no tags).
+  if body.get(3..6) != Some(b"\x9d\x01\x2a") {
+    return;
+  }
+  // 0: VP8Version Mask 0x0e (BitShift 1).
+  if let Some(&b0) = body.first() {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "VP8Version",
+      RiffValue::U32(u32::from((b0 & 0x0e) >> 1)),
+    ));
+  }
+  // 6: ImageWidth int16u Mask 0x3fff (Priority 0); HorizontalScale Mask 0xc000.
+  if body.len() >= 8 {
+    let w = le_u16_at(body, 6);
+    entries.push(RiffEntry::new_with_priority(
+      "RIFF",
+      "ImageWidth",
+      RiffValue::U32(u32::from(w & 0x3fff)),
+      0,
+    ));
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "HorizontalScale",
+      RiffValue::U32(u32::from((w & 0xc000) >> 14)),
+    ));
+  }
+  // 8: ImageHeight int16u Mask 0x3fff (Priority 0); VerticalScale Mask 0xc000.
+  if body.len() >= 10 {
+    let h = le_u16_at(body, 8);
+    entries.push(RiffEntry::new_with_priority(
+      "RIFF",
+      "ImageHeight",
+      RiffValue::U32(u32::from(h & 0x3fff)),
+      0,
+    ));
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "VerticalScale",
+      RiffValue::U32(u32::from((h & 0xc000) >> 14)),
+    ));
+  }
+}
+
+/// `VP8L` WEBP lossless info (RIFF.pm:1322-1348, `%RIFF::VP8L`,
+/// `ProcessBinaryData`, little-endian). The `%Main` Condition `^\x2f`
+/// (RIFF.pm:600) gates dispatch — byte 0 must be `0x2f`. Emits:
+/// - `ImageWidth` (offset 1, int16u, ValueConv `($val & 0x3fff) + 1`;
+///   `Priority => 0`; RawConv appends ` (lossless)` to the FileType).
+/// - `ImageHeight` (offset 2, int32u, ValueConv `(($val >> 6) & 0x3fff) + 1`;
+///   `Priority => 0`).
+/// - `AlphaIsUsed` (offset 4, Mask `0x10` => `(b4 & 0x10) >> 4`; PrintConv).
+///
+/// Returns `true` when the lossless ImageWidth was emitted (so the caller can
+/// apply the `(lossless)` FileType override, RIFF.pm:1330-1334).
+#[cfg(feature = "alloc")]
+fn emit_webp_vp8l(body: &[u8], entries: &mut Vec<RiffEntry>) -> bool {
+  // %Main Condition `^\x2f` (RIFF.pm:600).
+  if body.first() != Some(&0x2f) {
+    return false;
+  }
+  let mut emitted_width = false;
+  // 1: ImageWidth int16u, ValueConv `($val & 0x3fff) + 1` (Priority 0).
+  if body.len() >= 3 {
+    let raw = le_u16_at(body, 1);
+    entries.push(RiffEntry::new_with_priority(
+      "RIFF",
+      "ImageWidth",
+      RiffValue::U32(u32::from(raw & 0x3fff) + 1),
+      0,
+    ));
+    emitted_width = true;
+  }
+  // 2: ImageHeight int32u, ValueConv `(($val >> 6) & 0x3fff) + 1` (Priority 0).
+  if body.len() >= 6 {
+    let raw = le_u32_at(body, 2);
+    entries.push(RiffEntry::new_with_priority(
+      "RIFF",
+      "ImageHeight",
+      RiffValue::U32(((raw >> 6) & 0x3fff) + 1),
+      0,
+    ));
+  }
+  // 4: AlphaIsUsed Mask 0x10 (BitShift 4).
+  if let Some(&b4) = body.get(4) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "AlphaIsUsed",
+      RiffValue::U32(u32::from((b4 & 0x10) >> 4)),
+    ));
+  }
+  emitted_width
+}
+
+/// `ALPH` WEBP alpha info (RIFF.pm:1467-1497, `%RIFF::ALPH`,
+/// `ProcessBinaryData`). All three fields read byte 0 with `Mask => 0x03`
+/// (BitShift 0 — ExifTool's auto-`BitShift` is the lowest set bit of the mask,
+/// so the SAME low 2 bits feed every field, verbatim per the table). Emits:
+/// - `AlphaPreprocessing` (offset 0,   Mask `0x03`; PrintConv).
+/// - `AlphaFiltering`     (offset 0.1, Mask `0x03`; PrintConv).
+/// - `AlphaCompression`   (offset 0.2, Mask `0x03`; PrintConv).
+#[cfg(feature = "alloc")]
+fn emit_webp_alph(body: &[u8], entries: &mut Vec<RiffEntry>) {
+  let Some(&b0) = body.first() else { return };
+  let v = u32::from(b0 & 0x03);
+  entries.push(RiffEntry::new(
+    "RIFF",
+    "AlphaPreprocessing",
+    RiffValue::U32(v),
+  ));
+  entries.push(RiffEntry::new("RIFF", "AlphaFiltering", RiffValue::U32(v)));
+  entries.push(RiffEntry::new(
+    "RIFF",
+    "AlphaCompression",
+    RiffValue::U32(v),
+  ));
 }
 
 /// `labl`/`note` ValueConv (RIFF.pm:372/377): `my $str=substr($val,4);
@@ -2612,6 +3101,48 @@ impl crate::diagnostics::Diagnose for RiffMeta<'_> {
         "Unsupported character set ({code_page})"
       )));
     }
+    // WEBP embedded EXIF/XMP: replay EVERY captured metadata chunk in WALK
+    // ORDER (RIFF.pm dispatches each one as it walks, RIFF.pm:557-587). For
+    // each chunk, the in-walk minor warning (the `Exif\0\0`-header
+    // `Improper EXIF header`, RIFF.pm:567 / the `XMP\0` `Incorrect XMP tag ID`,
+    // RIFF.pm:585 — BOTH `$self->Warn(..., 1)`, so `[minor]`-prefixed) precedes
+    // that chunk's re-walked sub-Meta diagnostics (the same chunk-then-subdir
+    // order PNG's `eXIf` seam uses). With repeated chunks the warnings emit in
+    // walk order, matching the `Warning` priority-0 first-extracted-by-position
+    // rule. All fire BEFORE the end-of-walk corruption notice.
+    for chunk in &self.webp_meta {
+      match *chunk {
+        #[cfg(feature = "exif")]
+        WebpMetaChunk::Exif { block, improper } => {
+          if improper {
+            out.push(crate::diagnostics::Diagnostic::warn_minor(
+              "Improper EXIF header",
+            ));
+          }
+          if let Some(exif_meta) = crate::exif::parse_exif_block(block) {
+            out.extend(crate::diagnostics::Diagnose::diagnostics(&exif_meta));
+          }
+        }
+        #[cfg(feature = "xmp")]
+        WebpMetaChunk::Xmp {
+          packet,
+          incorrect_id,
+        } => {
+          if incorrect_id {
+            out.push(crate::diagnostics::Diagnostic::warn_minor(
+              "Incorrect XMP tag ID",
+            ));
+          }
+          if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
+            out.extend(crate::diagnostics::Diagnose::diagnostics(&xmp_meta));
+          }
+        }
+        #[cfg(not(feature = "exif"))]
+        WebpMetaChunk::Exif { .. } => {}
+        #[cfg(not(feature = "xmp"))]
+        WebpMetaChunk::Xmp { .. } => {}
+      }
+    }
     if self.corrupted {
       out.push(crate::diagnostics::Diagnostic::warn(
         "Error reading RIFF file (corrupted?)",
@@ -2685,6 +3216,39 @@ impl crate::emit::Taggable for RiffMeta<'_> {
         ));
       }
     }
+    // WEBP embedded EXIF/XMP (`EXIF`/`Exif` + `XMP `/`XMP\0` chunks,
+    // RIFF.pm:557-587): replay EVERY captured chunk in WALK ORDER. Each EXIF
+    // chunk's TIFF block is re-walked through the shared `ProcessTIFF` parser
+    // ([`crate::exif::parse_exif_block`]) and each XMP packet through the ported
+    // XMP module ([`crate::formats::xmp::parse_borrowed`]); their `Taggable`
+    // streams splice here, flowing through the same `run_emission` engine —
+    // exactly as bundled dispatches each WEBP `EXIF`/`XMP ` SubDirectory to
+    // `Exif::Main`/`ProcessTIFF` / `ProcessXMP` (the PNG `eXIf`/raw-profile
+    // seams). With repeated chunks, ALL of their distinct tags are retained;
+    // the engine's central last-wins dedup resolves a per-tag collision to the
+    // LATER (walk-order) chunk, matching bundled (e.g. two `EXIF` chunks
+    // carrying `Artist` then `Make` keep both; two carrying `Artist` keep the
+    // second's value).
+    for chunk in &self.webp_meta {
+      match *chunk {
+        #[cfg(feature = "exif")]
+        WebpMetaChunk::Exif { block, .. } => {
+          if let Some(exif_meta) = crate::exif::parse_exif_block(block) {
+            tags.extend(exif_meta.tags(opts));
+          }
+        }
+        #[cfg(feature = "xmp")]
+        WebpMetaChunk::Xmp { packet, .. } => {
+          if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
+            tags.extend(xmp_meta.tags(opts));
+          }
+        }
+        #[cfg(not(feature = "exif"))]
+        WebpMetaChunk::Exif { .. } => {}
+        #[cfg(not(feature = "xmp"))]
+        WebpMetaChunk::Xmp { .. } => {}
+      }
+    }
     tags.into_iter()
   }
 }
@@ -2755,7 +3319,10 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
       }
     }
   };
-  EmittedTag::new(g(), name.into(), value, false)
+  // The WEBP `VP8`/`VP8L` dimension duplicates carry `Priority => 0` so they
+  // never override the `VP8X` canvas `ImageWidth`/`ImageHeight` (RIFF.pm:1301/
+  // 1312/1329/1340); every other RIFF tag keeps the default `Priority => 1`.
+  EmittedTag::new_with_priority(g(), name.into(), value, false, entry.priority())
 }
 
 /// PrintConv for `Str`-typed values. `RIFF:StreamType` maps the FourCC to a
@@ -2903,6 +3470,52 @@ fn print_conv_u32(group: &str, name: &str, val: u32) -> Option<String> {
     ("RIFF", "SMPTEFormat") => {
       Some(smpte_format_label(val).map_or_else(|| std::format!("Unknown ({val})"), str::to_string))
     }
+    // WEBP `VP8X` WebP_Flags BITMASK (RIFF.pm:1361-1367) — DecodeBits over a
+    // 32-bit word; `0 => "(none)"`, set bit `n` => label or `"[n]"`, joined ", ".
+    ("RIFF", "WebP_Flags") => Some(webp_flags_print(val)),
+    // WEBP `VP8 ` VP8Version hash (RIFF.pm:1290-1295). A plain `PrintConv => {}`
+    // with no `OTHER` => a hash MISS renders ExifTool's generic `Unknown ($val)`.
+    ("RIFF", "VP8Version") => Some(
+      webp_vp8_version_label(val).map_or_else(|| std::format!("Unknown ({val})"), str::to_string),
+    ),
+    // WEBP `ALPH` AlphaPreprocessing hash (RIFF.pm:1474-1477).
+    ("RIFF", "AlphaPreprocessing") => Some(
+      match val {
+        0 => "none",
+        1 => "Level Reduction",
+        _ => return Some(std::format!("Unknown ({val})")),
+      }
+      .to_string(),
+    ),
+    // WEBP `ALPH` AlphaFiltering hash (RIFF.pm:1482-1487).
+    ("RIFF", "AlphaFiltering") => Some(
+      match val {
+        0 => "none",
+        1 => "Horizontal",
+        2 => "Vertical",
+        3 => "Gradient",
+        _ => return Some(std::format!("Unknown ({val})")),
+      }
+      .to_string(),
+    ),
+    // WEBP `ALPH` AlphaCompression hash (RIFF.pm:1492-1495).
+    ("RIFF", "AlphaCompression") => Some(
+      match val {
+        0 => "none",
+        1 => "Lossless",
+        _ => return Some(std::format!("Unknown ({val})")),
+      }
+      .to_string(),
+    ),
+    // WEBP `VP8L` AlphaIsUsed hash (RIFF.pm:1346).
+    ("RIFF", "AlphaIsUsed") => Some(
+      match val {
+        0 => "No",
+        1 => "Yes",
+        _ => return Some(std::format!("Unknown ({val})")),
+      }
+      .to_string(),
+    ),
     _ => None,
   }
 }
@@ -2959,6 +3572,37 @@ fn acidizer_flags_print(val: u32) -> String {
     (4, "High octave"),
   ];
   crate::convert::decode_bits(&val.to_string(), Some(FLAGS), 0)
+}
+
+/// `VP8X` `WebP_Flags` BITMASK PrintConv (RIFF.pm:1361-1367). DecodeBits over a
+/// 32-bit word (default `BitsPerWord`): bit `n` => label or `"[n]"`, joined with
+/// `", "`, `0` => `"(none)"`. Bits {1:Animation, 2:XMP, 3:EXIF, 4:Alpha,
+/// 5:ICC Profile}.
+#[cfg(feature = "alloc")]
+fn webp_flags_print(val: u32) -> String {
+  const FLAGS: &[(u8, &str)] = &[
+    (1, "Animation"),
+    (2, "XMP"),
+    (3, "EXIF"),
+    (4, "Alpha"),
+    (5, "ICC Profile"),
+  ];
+  crate::convert::decode_bits(&val.to_string(), Some(FLAGS), 0)
+}
+
+/// `VP8 ` `VP8Version` hash PrintConv (RIFF.pm:1290-1295). The post-Mask
+/// (`0x0e >> 1`) reconstruction-method code 0..=3. Returns `None` for an
+/// unlisted key; the caller renders the generic `Unknown ($val)` fallback (this
+/// plain hash has no `OTHER`/`PrintHex`).
+#[cfg(feature = "alloc")]
+const fn webp_vp8_version_label(val: u32) -> Option<&'static str> {
+  match val {
+    0 => Some("0 (bicubic reconstruction, normal loop)"),
+    1 => Some("1 (bilinear reconstruction, simple loop)"),
+    2 => Some("2 (bilinear reconstruction, no loop)"),
+    3 => Some("3 (no reconstruction, no loop)"),
+    _ => None,
+  }
 }
 
 /// `acid` `RootNote` hash PrintConv (RIFF.pm:1517-1530). MIDI note numbers
@@ -4038,6 +4682,11 @@ mod tests {
       unsupported_charset: None,
       err: false,
       pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
     };
     walker.process_chunks_hydt(&body);
     let captured = walker
@@ -4112,6 +4761,11 @@ mod tests {
       unsupported_charset: None,
       err: false,
       pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
     };
     walker.walk_top();
     assert_eq!(
@@ -4294,5 +4948,199 @@ mod tests {
     // see https://perldoc.perl.org/functions/sprintf. Our format_4g should
     // match.
     assert_eq!(format_4g(1234.5), "1234");
+  }
+
+  /// Build a RIFF file: 'RIFF' + size + `form`, then the given chunk bytes.
+  fn riff_with(form: &[u8; 4], chunks: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    buf.extend_from_slice(form);
+    buf.extend_from_slice(chunks);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+    buf
+  }
+
+  /// One RIFF chunk: `tag` + LE32 len + body (+ a pad byte for an odd length).
+  fn chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    if body.len() & 1 == 1 {
+      out.push(0);
+    }
+    out
+  }
+
+  #[test]
+  fn non_webp_riff_with_vp8x_vp8l_is_not_finalized_as_webp() {
+    // #153 Codex R1 (RIFF.pm:2106 / 1332): the `Extended WEBP` `OverrideFileType`
+    // is gated on `$type eq 'WEBP'`, so a non-WEBP RIFF (here a WAVE) carrying
+    // a top-level `VP8X` must NOT be promoted to WEBP. The (ungated) `VP8L`
+    // RawConv appends ` (lossless)` to the CURRENT FileType, but the base type
+    // and MIME are preserved. Verified vs bundled 13.59: a WAVE + VP8X + VP8L
+    // ⇒ `File:FileType = "WAV (lossless)"`, `File:MIMEType = audio/x-wav`,
+    // `File:FileTypeExtension = webp`.
+    let vp8x_body = [0u8; 10]; // flags=0, width int24, height int24 (→ 1x1)
+    let vp8l_body = [0x2fu8, 0, 0, 0, 0]; // Condition `^\x2f`; width/height/alpha
+    let mut chunks = chunk(b"VP8X", &vp8x_body);
+    chunks.extend_from_slice(&chunk(b"VP8L", &vp8l_body));
+    let bytes = riff_with(b"WAVE", &chunks);
+    let meta = parse_borrowed(&bytes).expect("WAVE parses");
+
+    // The VP8X promotion is GATED OUT (form is WAVE, not WEBP); VP8L appends
+    // ` (lossless)` to the WAV base. NOT WEBP / Extended WEBP.
+    assert_eq!(meta.file_type(), "WAV (lossless)");
+    assert!(
+      !meta.file_type().contains("WEBP"),
+      "a non-WEBP RIFF carrying VP8X/VP8L must not be finalized as WEBP"
+    );
+    // MIME is unchanged — both OverrideFileType calls pass an undef $mimeType.
+    assert_eq!(meta.mime(), "audio/x-wav");
+    // The VP8L override fired `OverrideFileType(..., 'webp')` ⇒ webp extension.
+    assert!(meta.webp_ext_override());
+    // The VP8X tags are still emitted (the chunk is dispatched; only the
+    // FileType promotion is gated).
+    assert!(
+      meta.entries().iter().any(|e| e.name() == "WebP_Flags"),
+      "the VP8X chunk still emits its tags on a non-WEBP form"
+    );
+  }
+
+  #[test]
+  fn non_webp_riff_with_only_vp8x_keeps_base_type_and_extension() {
+    // #153 Codex R1 corner: a non-WEBP RIFF with ONLY a `VP8X` (no `VP8L`) fires
+    // NO `OverrideFileType` at all (the VP8X branch is gated on the WEBP form;
+    // no VP8L append). Verified vs bundled 13.59: WAVE + VP8X ⇒ `WAV`,
+    // extension `wav`, MIME `audio/x-wav` — i.e. the base type/extension stand.
+    let vp8x_body = [0u8; 10];
+    let bytes = riff_with(b"WAVE", &chunk(b"VP8X", &vp8x_body));
+    let meta = parse_borrowed(&bytes).expect("WAVE parses");
+    assert_eq!(meta.file_type(), "WAV");
+    assert_eq!(meta.mime(), "audio/x-wav");
+    assert!(
+      !meta.webp_ext_override(),
+      "a gated-out VP8X must NOT apply the webp file-type extension"
+    );
+  }
+
+  #[test]
+  fn private_riff_form_with_vp8l_appends_lossless_to_inert_riff() {
+    // #153 Codex R1: an unrecognized RIFF form type (`%riffType` miss) finalizes to
+    // the inert `RIFF` base; a `VP8L` chunk appends ` (lossless)` to it — never
+    // promoting to WEBP. The MIME is the inert octet-stream fallback.
+    let vp8l_body = [0x2fu8, 0, 0, 0, 0];
+    let bytes = riff_with(b"ABCD", &chunk(b"VP8L", &vp8l_body));
+    let meta = parse_borrowed(&bytes).expect("private RIFF parses");
+    assert_eq!(meta.file_type(), "RIFF (lossless)");
+    assert!(!meta.file_type().contains("WEBP"));
+    assert_eq!(meta.mime(), "application/octet-stream");
+  }
+
+  #[test]
+  fn webp_with_two_vp8l_chunks_keeps_single_lossless_suffix() {
+    // #153 Codex R2 (RIFF.pm:1332): the `VP8L` RawConv re-runs for EVERY valid
+    // `VP8L` chunk, and the walker feeds back the PREVIOUS override as the
+    // CURRENT FileType. A second walked `VP8L` therefore sees `WEBP (lossless)`
+    // (the first override). The append must be IDEMPOTENT — the FileType stays
+    // `WEBP (lossless)`, NOT double-suffixed and NOT rewritten to the
+    // unrecognized-type `RIFF (lossless)` fallback.
+    let vp8l_body = [0x2fu8, 0, 0, 0, 0]; // Condition `^\x2f`
+    let mut chunks = chunk(b"VP8L", &vp8l_body);
+    chunks.extend_from_slice(&chunk(b"VP8L", &vp8l_body));
+    let bytes = riff_with(b"WEBP", &chunks);
+    let meta = parse_borrowed(&bytes).expect("WEBP parses");
+
+    // The second VP8L must not corrupt the FileType.
+    assert_eq!(meta.file_type(), "WEBP (lossless)");
+    assert!(
+      !meta.file_type().contains("RIFF"),
+      "a second VP8L must NOT rewrite the FileType to RIFF (lossless)"
+    );
+    assert!(
+      !meta.file_type().contains("(lossless) (lossless)"),
+      "the ` (lossless)` suffix must be appended at most once"
+    );
+    assert_eq!(meta.mime(), "image/webp");
+  }
+
+  #[test]
+  fn non_webp_riff_with_two_vp8l_chunks_keeps_single_lossless_suffix() {
+    // #153 Codex R2 (RIFF.pm:1332): same idempotence guarantee for a NON-WEBP
+    // form. A WAVE carrying two valid `VP8L` chunks finalizes to `WAV (lossless)`
+    // after the first; the second `VP8L` sees `WAV (lossless)` as the current
+    // FileType and must leave it UNCHANGED — never collapsing the already-
+    // suffixed (non-base) value into `RIFF (lossless)`, never double-appending.
+    let vp8l_body = [0x2fu8, 0, 0, 0, 0];
+    let mut chunks = chunk(b"VP8L", &vp8l_body);
+    chunks.extend_from_slice(&chunk(b"VP8L", &vp8l_body));
+    let bytes = riff_with(b"WAVE", &chunks);
+    let meta = parse_borrowed(&bytes).expect("WAVE parses");
+
+    assert_eq!(meta.file_type(), "WAV (lossless)");
+    assert!(
+      !meta.file_type().contains("RIFF"),
+      "a second VP8L on a non-WEBP form must NOT rewrite to RIFF (lossless)"
+    );
+    assert!(
+      !meta.file_type().contains("(lossless) (lossless)"),
+      "the ` (lossless)` suffix must be appended at most once"
+    );
+    // MIME stays the WAV form's — the lossless override never touches MIME.
+    assert_eq!(meta.mime(), "audio/x-wav");
+  }
+
+  #[cfg(feature = "exif")]
+  #[test]
+  fn repeated_webp_exif_chunks_retain_tags_from_every_chunk() {
+    // #153 Codex R1 (RIFF.pm:557-576): RIFF dispatches EVERY `EXIF` chunk it walks,
+    // so a WEBP carrying two EXIF chunks — the first with IFD0:Artist, the
+    // second with IFD0:Make — must retain BOTH tags (a single Option would drop
+    // the first chunk entirely). Verified vs bundled 13.59 (both `IFD0:Artist`
+    // and `IFD0:Make` are emitted).
+    use crate::emit::{ConvMode, Taggable};
+    // A minimal `II*\0` TIFF with one ASCII IFD0 tag `tag_id` = `val` (≤4 bytes,
+    // stored inline).
+    fn tiff_one_ascii(tag_id: u16, val: &[u8]) -> Vec<u8> {
+      assert!(val.len() <= 4);
+      let mut t = Vec::new();
+      t.extend_from_slice(b"II\x2a\x00");
+      t.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+      t.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+      t.extend_from_slice(&tag_id.to_le_bytes());
+      t.extend_from_slice(&2u16.to_le_bytes()); // type ASCII
+      t.extend_from_slice(&(val.len() as u32).to_le_bytes());
+      let mut vo = val.to_vec();
+      vo.resize(4, 0);
+      t.extend_from_slice(&vo);
+      t.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+      t
+    }
+    let vp8x_body = [0u8; 10];
+    let exif1 = tiff_one_ascii(0x013b, b"AA\x00"); // Artist = "AA"
+    let exif2 = tiff_one_ascii(0x010f, b"MK\x00"); // Make = "MK"
+    let mut chunks = chunk(b"VP8X", &vp8x_body);
+    chunks.extend_from_slice(&chunk(b"EXIF", &exif1));
+    chunks.extend_from_slice(&chunk(b"EXIF", &exif2));
+    let bytes = riff_with(b"WEBP", &chunks);
+    let meta = parse_borrowed(&bytes).expect("WEBP parses");
+
+    let emitted: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
+    let artist = emitted
+      .iter()
+      .find(|t| t.tag().name() == "Artist")
+      .expect("the FIRST EXIF chunk's IFD0:Artist must survive");
+    let make = emitted
+      .iter()
+      .find(|t| t.tag().name() == "Make")
+      .expect("the SECOND EXIF chunk's IFD0:Make must survive");
+    assert_eq!(artist.tag().group_ref().family1(), "IFD0");
+    assert_eq!(make.tag().group_ref().family1(), "IFD0");
+    // The captured-chunk list holds both EXIF chunks, in walk order.
+    assert_eq!(meta.webp_meta.len(), 2);
   }
 }
