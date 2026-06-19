@@ -1,6 +1,6 @@
 [{
   "SourceFile": "QuickTime_gopro_hero8_gpmf.mp4",
-  "ExifTool:ExifToolVersion": 13.55,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "MP4",
   "File:FileTypeExtension": "MP4",
   "File:MIMEType": "video/mp4",
@@ -185,9 +185,5 @@
   "Track5:GenGraphicsMode": 0,
   "Track5:GenOpColor": "0 0 0",
   "Track5:GenBalance": 0,
-  "Track5:MetaFormat": "fdsc",
-  "Composite:ImageSize": "848 480",
-  "Composite:Megapixels": 0.40704,
-  "Composite:AvgBitrate": 2755821,
-  "Composite:Rotation": 0
+  "Track5:MetaFormat": "fdsc"
 }]
