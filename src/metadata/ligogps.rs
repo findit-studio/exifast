@@ -186,6 +186,21 @@ pub struct LigoGpsSample {
   /// per-record doc ordinal for it (so the NEXT record's `Doc<N>` is the burned
   /// slot's successor) but skips all tag emission. `false` for a real sample.
   suppressed: bool,
+  /// `true` when this record was produced by the `gpmd` MetaFormat Kingslim
+  /// dispatch (`Image::ExifTool::QuickTime::dispatch_gpmd` → `ProcessFreeGPS` →
+  /// `ProcessLigoGPS`, QuickTimeStream.pl:181-212 / :1843-1888), as opposed to
+  /// the movie-level binary LigoGPS paths (the `moov`-`gps `-box and the
+  /// brute-force `mdat` scan) or the `udta`/file-end-trailer paths. ALL of these
+  /// land in the SAME shared [`LigoGpsMeta`] accumulator, but only the
+  /// gpmd-dispatched ones are emitted by ExifTool's `ProcessSamples` IN-STREAM at
+  /// their `Doc<N>` walk position INTERLEAVED with the other `gpmd`-dispatched
+  /// sources (the SP3 [`crate::metadata::GpsOrigin::Gpmd`] fixes + the matched-
+  /// empty [`crate::metadata::GpmdTimingOnly`] markers). The QuickTime emitter
+  /// uses this marker to pull exactly those records into the single `gpmd`
+  /// doc-ordered merge (mirroring how `GpsOrigin::Gpmd` tags the SP3 fixes); the
+  /// non-gpmd records emit through the standalone `emit_ligogps` block unchanged.
+  /// `false` for every non-gpmd record (and every unit-built sample).
+  gpmd_dispatched: bool,
 }
 
 impl LigoGpsSample {
@@ -208,6 +223,7 @@ impl LigoGpsSample {
       source: LigoSource::Binary,
       doc: None,
       suppressed: false,
+      gpmd_dispatched: false,
     }
   }
 
@@ -327,6 +343,15 @@ impl LigoGpsSample {
     self.doc
   }
 
+  /// `true` when this record was produced by the `gpmd` MetaFormat Kingslim
+  /// dispatch (interleaved with the other `gpmd`-dispatched sources in the
+  /// QuickTime emitter's single doc-ordered merge). See [`Self::gpmd_dispatched`].
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn is_gpmd_dispatched(&self) -> bool {
+    self.gpmd_dispatched
+  }
+
   /// `true` when no field is populated.
   #[inline(always)]
   #[must_use]
@@ -434,6 +459,14 @@ impl LigoGpsSample {
   #[inline(always)]
   pub(crate) const fn set_doc(&mut self, v: Option<u32>) -> &mut Self {
     self.doc = v;
+    self
+  }
+
+  /// Mark this record as produced by the `gpmd` Kingslim dispatch. Used by
+  /// [`LigoGpsMeta::stamp_gpmd_dispatched_from`]. See [`Self::gpmd_dispatched`].
+  #[inline(always)]
+  pub(crate) const fn set_gpmd_dispatched(&mut self, v: bool) -> &mut Self {
+    self.gpmd_dispatched = v;
     self
   }
 }
@@ -551,6 +584,24 @@ impl LigoGpsMeta {
       }
     }
     counter
+  }
+
+  /// Mark every sample at or after `start` as `gpmd`-dispatched — the records a
+  /// `gpmd` MetaFormat Kingslim sample's [`ProcessFreeGPS`] decode appended since
+  /// the caller took its [`Self::sample_count`] watermark. Mirrors
+  /// [`Self::stamp_doc_from`]'s watermark-then-stamp discipline. The QuickTime
+  /// emitter pulls exactly these records into the single `gpmd` doc-ordered merge
+  /// (interleaved with the SP3 `gpmd` fixes + timing-only markers), so they emit
+  /// at their `Doc<N>` walk position rather than in the trailing standalone
+  /// LigoGPS block. See [`LigoGpsSample::gpmd_dispatched`].
+  ///
+  /// [`ProcessFreeGPS`]: crate::formats::quicktime_freegps::process_free_gps
+  pub(crate) fn stamp_gpmd_dispatched_from(&mut self, start: usize) {
+    if let Some(slice) = self.samples.get_mut(start..) {
+      for s in slice {
+        s.set_gpmd_dispatched(true);
+      }
+    }
   }
 
   /// Move every sample of `other` to the END of this holder (preserving its

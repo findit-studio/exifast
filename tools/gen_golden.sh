@@ -186,6 +186,8 @@ case "$FIX" in
   QuickTime_gps0_oor0.mov | QuickTime_gps_kenwood.mov | QuickTime_insta360.mp4 | \
   QuickTime_insta360_badstride.mp4 | QuickTime_insta360_chained.mp4 | \
   QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
+  QuickTime_fmas_n2s.mov | QuickTime_wolfbox_redtiger_f9.mov | \
+  QuickTime_fmas_empty_then_valid.mov | \
   MPEG2_TS_pruveeo_d90.ts)
     EXCLUDE_ARR+=(-x Composite:GPSPosition) ;;
   # `QuickTime_mebx_gps.mov`: a crafted single-`mebx`-GPS fixture — bundled builds

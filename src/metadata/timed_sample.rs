@@ -169,6 +169,18 @@ impl TimedSample for GpsSample {
   fn doc(&self) -> Option<u32> {
     self.doc()
   }
+  // The sample-table `(SampleTime, SampleDuration)` is surfaced ONLY for a
+  // `gpmd` MetaFormat dashcam variant (FMAS / Wolfbox / Rove) — a
+  // `ProcessSamples`-dispatched fix ExifTool emits ahead of the payload under
+  // its `Track<N>` (QuickTimeStream.pl:1520, 161-162). The movie-level freeGPS
+  // sources (`moov`-`gps `-box, brute-force `mdat` scan) and the top-level magic
+  // boxes (`gps0`/`gsen`/`3gf`/Kenwood) carry NO sample-table timing — they keep
+  // the trait default `None`, so their goldens (which have none) stay byte-exact.
+  #[inline(always)]
+  fn sample_timing(&self) -> Option<(Option<f64>, Option<f64>)> {
+    matches!(self.origin(), Some(crate::metadata::GpsOrigin::Gpmd { .. }))
+      .then(|| (self.sample_time(), self.sample_duration()))
+  }
 }
 
 // ── GoProGpsSample (GPS5 / GPS9) ─────────────────────────────────────────────

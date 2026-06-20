@@ -2846,10 +2846,35 @@ fn decode_type20_nextbase512(data: &[u8], out: &mut QuickTimeStreamMeta) {
 // vector via [`FreeGpsTags::emit`]; the GoPro branch routes to the GoPro
 // KLV walker.
 
+/// The outcome of [`dispatch_gpmd`] — which arm of the bundled
+/// QuickTimeStream.pl:181-212 `gpmd` Condition cascade matched. The walker uses
+/// it to decide whether to open the per-sample `Doc<N>` ITSELF: a self-contained
+/// variant matches its Condition (so ExifTool's `FoundSomething` opens a `Doc<N>`
+/// and emits `SampleTime`/`SampleDuration`) EVEN WHEN the process-proc decodes
+/// no fix, whereas Kingslim owns a SEPARATE LigoGPS `Doc<N>` opened lazily at
+/// finalization (so the walker must NOT consume a second ordinal for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpmdDispatch {
+  /// No dashcam-variant Condition matched — the caller falls back to the GoPro
+  /// GPMF parser (the no-`Condition` `gpmd_GoPro` arm, QuickTimeStream.pl:209).
+  NoMatch,
+  /// The Kingslim D4 arm (`^.{21}\0\0\0A[NS][EW]` → `ProcessFreeGPS` →
+  /// LigoGPS). Its GPS lives in the LigoGPS block, which opens its OWN `Doc<N>`
+  /// off the shared counter at finalization, so the walker must add NO `gpmd`
+  /// doc/timing here.
+  Kingslim,
+  /// A self-contained dashcam variant — Rove (`Process_text`), FMAS
+  /// (`ProcessFMAS`), or Wolfbox (`ProcessWolfbox`). Its Condition matched, so
+  /// the walker opens ONE per-sample `Doc<N>` regardless of whether the
+  /// process-proc appended a [`GpsSample`]: a produced fix is stamped with that
+  /// doc + `Track<N>` + sample timing, and a matched-but-empty sample records a
+  /// [`crate::metadata::GpmdTimingOnly`] marker carrying the same doc + timing.
+  SelfContained,
+}
+
 /// Dispatch a `gpmd` sample by the bundled QuickTimeStream.pl:181-212
-/// Condition cascade. Returns `true` if any of the dashcam-variant branches
-/// matched (Kingslim / Rove / FMAS / Wolfbox); the caller falls back to the
-/// GoPro GPMF parser on `false`.
+/// Condition cascade. Returns the matched arm (see [`GpmdDispatch`]); the caller
+/// falls back to the GoPro GPMF parser on [`GpmdDispatch::NoMatch`].
 ///
 /// `data` is the raw sample bytes (no `freeGPS ` 16-byte header — these
 /// arrive through the `stbl` sample tables, not the brute-force mdat scan).
@@ -2873,7 +2898,7 @@ pub fn dispatch_gpmd(
   out: &mut QuickTimeStreamMeta,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
   free_gps_state: &mut FreeGpsState,
-) -> bool {
+) -> GpmdDispatch {
   // gpmd_Kingslim — `^.{21}\0\0\0A[NS][EW]` (QuickTimeStream.pl:183).
   // A real Kingslim D4 `gpmd` sample carries `LIGOGPSINFO\0` at offset 0x50
   // (80) and a `####`/ASCII LigoGPS record at 0x50+0x14 (QuickTimeStream.pl
@@ -2898,6 +2923,18 @@ pub fn dispatch_gpmd(
     // WALK-LEVEL `free_gps_state` (not a throwaway) makes that `FoundEmbedded`
     // propagate to `extract_stream`, suppressing the brute-force `mdat` scan
     // (QuickTimeStream.pl:3689) — faithful to bundled's `gpmd_Kingslim`.
+    //
+    // Watermark the SHARED LigoGPS accumulator BEFORE the decode so we can flag
+    // EXACTLY the records THIS `gpmd` sample produced as `gpmd`-dispatched (the
+    // same accumulator also holds the movie-level `moov`-`gps `-box / `mdat`-scan
+    // and the `udta`/trailer LigoGPS records — those must NOT be flagged). The
+    // flag lets the QuickTime emitter interleave these records with the other
+    // `gpmd`-dispatched sources (the SP3 `GpsOrigin::Gpmd` fixes + the matched-
+    // empty `GpmdTimingOnly` markers) in ONE doc-ordered merge at their `Doc<N>`
+    // walk position — the structural close of the gpmd-emission-order class — so a
+    // mixed `gpmd` track (a Kingslim LigoGPS sample then a matched-empty FMAS
+    // sample) emits `Doc1`-LIGO before `Doc2`-timing, not the reverse.
+    let ligo_start = ligogps_out.sample_count();
     process_free_gps(
       data,
       None,
@@ -2907,25 +2944,26 @@ pub fn dispatch_gpmd(
       out,
       Some(ligogps_out),
     );
-    return true;
+    ligogps_out.stamp_gpmd_dispatched_from(ligo_start);
+    return GpmdDispatch::Kingslim;
   }
   // gpmd_Rove — `^\0\0\xf2\xe1\xf0\xeeTT` (QuickTimeStream.pl:190).
   if data.get(0..8) == Some(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54][..]) {
     process_text(data, out);
-    return true;
+    return GpmdDispatch::SelfContained;
   }
   // gpmd_FMAS — `^FMAS\0\0\0\0` (QuickTimeStream.pl:197).
   if data.get(0..8) == Some(b"FMAS\0\0\0\0".as_slice()) {
     process_fmas(data, out);
-    return true;
+    return GpmdDispatch::SelfContained;
   }
   // gpmd_Wolfbox — `^.{136}(0{16}[A-Z]{4}|https:\/\/www.redtiger\0)`
   // (QuickTimeStream.pl:204).
   if detect_wolfbox(data) {
     process_wolfbox(data, out);
-    return true;
+    return GpmdDispatch::SelfContained;
   }
-  false
+  GpmdDispatch::NoMatch
 }
 
 /// Detect the Wolfbox / Redtiger Condition (QuickTimeStream.pl:204):
@@ -5691,7 +5729,11 @@ mod tests {
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut state = FreeGpsState::new();
     let matched = dispatch_gpmd(&d, &mut out, &mut lg, &mut state);
-    assert!(matched, "Kingslim Condition should match");
+    assert_eq!(
+      matched,
+      GpmdDispatch::Kingslim,
+      "Kingslim Condition should match (LigoGPS arm; own deferred Doc)"
+    );
     // Route reached the GPSType-5 / LigoGPS arm AND decoded the record into
     // the LigoGPS accumulator (NOT GPSType-14/XBHT, NOT the Type-3/4 freeGPS
     // arm — those would leave `lg` empty / push to `out`).
@@ -5752,7 +5794,10 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut state = FreeGpsState::new();
-    assert!(dispatch_gpmd(&d, &mut out, &mut lg, &mut state));
+    assert_eq!(
+      dispatch_gpmd(&d, &mut out, &mut lg, &mut state),
+      GpmdDispatch::SelfContained
+    );
     // `Process_text` does NOT set `$$et{FoundEmbedded}` — leave it clear.
     assert!(!state.found_embedded());
   }
@@ -5766,7 +5811,10 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut state = FreeGpsState::new();
-    assert!(dispatch_gpmd(&d, &mut out, &mut lg, &mut state));
+    assert_eq!(
+      dispatch_gpmd(&d, &mut out, &mut lg, &mut state),
+      GpmdDispatch::SelfContained
+    );
     // `ProcessFMAS` does NOT set `$$et{FoundEmbedded}` — leave it clear.
     assert!(!state.found_embedded());
   }
@@ -5794,19 +5842,25 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut state = FreeGpsState::new();
-    assert!(dispatch_gpmd(&d, &mut out, &mut lg, &mut state));
+    assert_eq!(
+      dispatch_gpmd(&d, &mut out, &mut lg, &mut state),
+      GpmdDispatch::SelfContained
+    );
     // `ProcessWolfbox` does NOT set `$$et{FoundEmbedded}` — leave it clear.
     assert!(!state.found_embedded());
   }
 
   #[test]
-  fn dispatch_gpmd_returns_false_for_gopro_fallback() {
+  fn dispatch_gpmd_returns_nomatch_for_gopro_fallback() {
     // No marker matches → caller routes to GoPro KLV walker.
     let d = vec![0u8; 256];
     let mut out = QuickTimeStreamMeta::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut state = FreeGpsState::new();
-    assert!(!dispatch_gpmd(&d, &mut out, &mut lg, &mut state));
+    assert_eq!(
+      dispatch_gpmd(&d, &mut out, &mut lg, &mut state),
+      GpmdDispatch::NoMatch
+    );
     assert!(!state.found_embedded());
   }
 
