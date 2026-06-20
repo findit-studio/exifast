@@ -72,12 +72,48 @@ EXCLUDE_ARR=(${EXCLUDE:-})
 # be forgotten on regen; non-XMP fixtures are unaffected and keep their ported
 # Composite tags. (Idempotent if the caller already passed it via EXCLUDE.)
 case "$FIX" in
+  # The XMP-GPS-altitude fixtures (#133 PR 2): the `Composite:GPSAltitude` def
+  # `Desire`s the XMP altitude/ref pair (GPS.pm:406), so exifast emits
+  # `Composite:GPSAltitude` from the embedded `XMP-exif:GPSAltitude`/`…Ref`
+  # (byte-matching bundled). The XMP-only ref composites bundled ALSO synthesizes
+  # (`Composite:GPSLatitudeRef`/`GPSLongitudeRef`/`GPSPosition`) are NOT ported,
+  # so drop ONLY those three (NOT `Composite:all` — that would also drop the
+  # ported `GPSAltitude`). Must precede the generic `XMP*` arm (first match wins).
+  XMP_gps_abovesea.xmp | XMP_gps_belowsea.xmp)
+    EXCLUDE_ARR+=(-x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
+                  -x Composite:GPSPosition) ;;
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
   # The PNG raw-profile fixtures (#179) carry the engine-synthesized
   # `Composite:ImageSize`/`Megapixels` (from the IHDR dimensions) that the PNG
   # port does not emit (it has no Composite subsystem). Drop Composite so the
   # decoded profile content (`XMP-*`) is what the golden compares.
   PNG_rawprofile_*) EXCLUDE_ARR+=(-x Composite:all) ;;
+  # The GPS-bearing stills (#133 PR 2): exifast emits the ported GPS Composites
+  # (`Composite:GPSLatitude`/`GPSLongitude`/`GPSAltitude`/`GPSDateTime`/
+  # `GPSPosition`, GPS.pm/Exif.pm) but NOT the still-deferred camera composites
+  # (`Aperture`/`ImageSize`/`Megapixels`/`ShutterSpeed`/`FocalLength35efl`/
+  # `CircleOfConfusion`/`FOV`/`HyperfocalDistance`/`LightValue`/
+  # `ScaleFactor35efl` — the EXIF/lens Composite subsystem, a later #133 PR). So
+  # these goldens KEEP the GPS Composites and drop ONLY the unported ones by
+  # name (NOT `Composite:all`), byte-matching exifast — PLUS the same non-GPS
+  # JPEG-port deferrals these goldens already excluded (the APP13 Photoshop/IPTC
+  # segment + `IFD1:ThumbnailImage` binary body for `ExifGPS.jpg`; the embedded
+  # `XMP:*` + `IFD1:ThumbnailImage` for `DJIPhantom4.jpg`), so the GPS
+  # Composites are the ONLY net change vs the pre-#133 goldens. `ExifGPS.tif`
+  # carries ONLY GPS Composites and no deferred segments, so it needs no
+  # exclusion at all (default path).
+  ExifGPS.jpg)
+    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest -x IFD1:ThumbnailImage \
+                  -x Composite:Aperture -x Composite:ImageSize \
+                  -x Composite:Megapixels -x Composite:ShutterSpeed \
+                  -x Composite:FocalLength35efl) ;;
+  DJIPhantom4.jpg)
+    EXCLUDE_ARR+=(-x XMP:all -x IFD1:ThumbnailImage \
+                  -x Composite:Aperture -x Composite:CircleOfConfusion \
+                  -x Composite:FOV -x Composite:FocalLength35efl \
+                  -x Composite:HyperfocalDistance -x Composite:ImageSize \
+                  -x Composite:LightValue -x Composite:Megapixels \
+                  -x Composite:ScaleFactor35efl -x Composite:ShutterSpeed) ;;
 esac
 
 # Run from the fixtures dir and pass only the basename so the embedded

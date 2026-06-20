@@ -16,5 +16,10 @@
   "GPS:GPSAltitude": 35,
   "GPS:GPSTimeStamp": "16:45:09",
   "GPS:GPSMapDatum": "WGS84",
-  "GPS:GPSDateStamp": "2021:08:14"
+  "GPS:GPSDateStamp": "2021:08:14",
+  "Composite:GPSAltitude": 35,
+  "Composite:GPSDateTime": "2021:08:14 16:45:09Z",
+  "Composite:GPSLatitude": 48.85815,
+  "Composite:GPSLongitude": 2.34893333333333,
+  "Composite:GPSPosition": "48.85815 2.34893333333333"
 }]

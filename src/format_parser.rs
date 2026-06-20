@@ -767,20 +767,46 @@ impl AnyMeta<'_> {
     // this generic-extraction API yields the same `Composite:*` set. Appended
     // last (preserves their positional last-ness, matching the JSON path).
     //
-    // Inputs resolve from each ingredient's ValueConv (raw) value REGARDLESS of
-    // `mode` (ExifTool.pm:4112), mirroring the JSON path: under `-n`, `out`
-    // already holds raw values (its own resolution view, `None`); under `-j`, we
-    // re-collect the SAME stream in ValueConv mode into `raw_view` and resolve
-    // inputs from it while the composite's rendered value lands in `out`.
-    let mut raw_view;
-    let resolve_src = if mode == crate::emit::ConvMode::PrintConv {
-      raw_view = self.collect_deduped_tags(crate::emit::ConvMode::ValueConv);
-      Some(&mut raw_view)
-    } else {
-      None
-    };
-    crate::composite::build_composites_into_tags(&mut out, resolve_src, mode);
+    // The engine needs BOTH a ValueConv view (`$val[i]`, ExifTool.pm:4112) and
+    // a PrintConv view (`$prt[i]`, ExifTool.pm:4116) regardless of `mode`
+    // (`GPSPosition`'s PrintConv reads `$prt[i]`). `out` is the active-mode view;
+    // we re-collect the SAME stream in the OPPOSITE mode for the other view.
+    let mut other_view = self.collect_deduped_tags(mode.flipped());
+    if !self.defers_composites() {
+      crate::composite::build_composites_into_tags(&mut out, Some(&mut other_view), mode);
+    }
     out.into_iter()
+  }
+
+  /// Does this `AnyMeta` DEFER the Composite post-pass to a later #133 PR?
+  ///
+  /// The GPS Composites are `SubDoc => 1` (GPS.pm/Exif.pm — generate for every
+  /// sub-document). For a STILL (a single Main document) they build at Main, and
+  /// #133 PR 2 ports them there. For the TIMED / video formats the GPS lives in
+  /// per-sample sub-documents (`Doc<N>`), so the faithful build requires the
+  /// SubDoc / `Doc<N>` Composite axis that #133 PR 5 adds — and bundled's
+  /// per-frame `Doc<N>:GPSLatitude`/`…Position` are exactly that axis. Until
+  /// then these formats keep their Composites EXCLUDED (the M2TS/QuickTime
+  /// golden precedent), so the post-pass is skipped:
+  ///
+  /// * `M2ts` — the AVCHD H.264 PES GPS is timed; bundled builds `Doc<N>` GPS
+  ///   Composites under `-ee` (and a Main set from the first frame), the PR-5
+  ///   SubDoc shape. (Its non-GPS goldens stay byte-identical.)
+  /// * `H264` — engine-only: a raw `.h264` is `Unknown file type`, so bundled
+  ///   NEVER reaches `BuildCompositeTags` for it (its GPS only becomes a
+  ///   Composite through the M2TS file pipeline, as a timed `Doc<N>` sample).
+  ///
+  /// Every still / single-document format (TIFF/JPEG EXIF, XMP, the audio
+  /// Durations) returns `false` and builds its Composites in this PR.
+  #[cfg(feature = "alloc")]
+  const fn defers_composites(&self) -> bool {
+    match self {
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(_) => true,
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(_) => true,
+      _ => false,
+    }
   }
 
   /// Serialize this typed Meta's FORMAT tags into the inline tag-collection
@@ -826,32 +852,26 @@ impl AnyMeta<'_> {
     // ExifTool.pm:1125). `doc_count` is the highest family-3 sub-document index
     // present (reserved for `SubDoc` composites; the Duration defs build at Main
     // only).
-    let doc_count = out.entries().iter().map(|e| e.0).max().unwrap_or(0);
-    // ExifTool resolves a composite's inputs from each ingredient's ValueConv
-    // (raw) value — `GetValue($tag, 'ValueConv')`, ExifTool.pm:4112 — REGARDLESS
-    // of the `-j`/`-n` output mode. Under `-n` the emitted `out` already holds
-    // those raw values, so it is its own resolution view. Under `-j` the emitted
-    // values are PrintConv strings, so we re-emit the SAME Meta in ValueConv mode
-    // into a throwaway `raw_view` (identical tag set + dedup; only the rendered
-    // values differ) and resolve inputs from it, while the composite's RENDERED
-    // (`-j`) value still lands in `out`. (Duration's ingredients have no
-    // PrintConv, so raw == rendered and the goldens are unchanged; the GPS /
-    // datetime composites of later #133 PRs are the ones that genuinely need the
-    // raw `"N"`/`"S"` / decimal-coordinate inputs.)
-    let mut raw_view;
-    let resolve_src = if print_conv {
-      raw_view = crate::tagmap::TagMap::new();
-      let raw_opts = crate::emit::EmitOptions::with_group_mode(
-        crate::emit::ConvMode::ValueConv,
-        extract_embedded,
-        group_mode,
-      );
-      crate::emit::run_emission(self, raw_opts, &mut raw_view);
-      Some(&mut raw_view)
-    } else {
-      None
-    };
-    crate::composite::build_composites(out, resolve_src, mode, doc_count);
+    // ExifTool's `BuildCompositeTags` builds BOTH a `@val` array (each input's
+    // ValueConv value, `GetValue($tag, 'ValueConv')`, ExifTool.pm:4112) and a
+    // `@prt` array (each input's PrintConv value, ExifTool.pm:4116). A
+    // composite's `RawConv`/`ValueConv` reads `$val[i]`; its `PrintConv` may read
+    // `$prt[i]` (`Composite:GPSPosition`'s PrintConv is the literal `"$prt[0],
+    // $prt[1]"`). So the engine needs BOTH views REGARDLESS of `-j`/`-n`: `out`
+    // is the active-mode view, and we re-emit the SAME Meta in the OPPOSITE mode
+    // (identical tag set + dedup; only the rendered values differ) for the other
+    // view. (Duration's ingredients have no PrintConv difference, so its goldens
+    // are unchanged; the GPS composites genuinely need the raw `"N"`/`"S"` /
+    // decimal `$val[i]` AND the DMS `$prt[i]`.) Skipped for the timed/video
+    // formats whose GPS Composites defer to #133 PR 5 (`defers_composites`).
+    if !self.defers_composites() {
+      let doc_count = out.entries().iter().map(|e| e.0).max().unwrap_or(0);
+      let mut other_view = crate::tagmap::TagMap::new();
+      let other_opts =
+        crate::emit::EmitOptions::with_group_mode(mode.flipped(), extract_embedded, group_mode);
+      crate::emit::run_emission(self, other_opts, &mut other_view);
+      crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count);
+    }
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }

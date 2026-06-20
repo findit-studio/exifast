@@ -15,6 +15,9 @@
 //! `datetime::convert_duration`) so the Real / MXF / MOI / M2TS / Flash callers
 //! keep their signatures.
 
+pub(crate) mod datetime;
+pub(crate) mod gps;
+
 #[cfg(feature = "alloc")]
 use crate::value::TagValue;
 

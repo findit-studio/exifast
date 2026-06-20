@@ -7,7 +7,9 @@
 
 #![cfg(feature = "alloc")]
 
-use super::table::{CompositeDef, CompositeInput, CompositePrintConv, CompositeValue, InputKind};
+use super::table::{
+  CompositeDef, CompositeInput, CompositePrintConv, CompositeRaw, CompositeValue, InputKind,
+};
 use super::*;
 use crate::emit::ConvMode;
 use crate::tagmap::TagMap;
@@ -47,8 +49,10 @@ const fn inh(group: &'static [&'static str], name: &'static str) -> CompositeInp
 }
 
 /// Sum the present inputs (a stand-in derivation; `Missing`/non-numeric ⇒ 0).
-fn sum_inputs(v: &[CompositeValue]) -> Option<f64> {
-  Some(v.iter().map(|x| x.coerce_numeric().unwrap_or(0.0)).sum())
+fn sum_inputs(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  Some(CompositeRaw::Num(
+    v.iter().map(|x| x.coerce_numeric().unwrap_or(0.0)).sum(),
+  ))
 }
 
 /// Build a TagMap with the given `(group, name, value)` entries in order.
@@ -70,6 +74,7 @@ const SUM_AB: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A"), req(GX, "B")],
   derive: sum_inputs,
   print_conv: CompositePrintConv::ConvertDuration,
+  priority: 1,
   sort_key: "X-Sum",
 };
 
@@ -96,6 +101,7 @@ fn desire_absent_still_builds_with_undef_element() {
     inputs: &[req(GX, "A"), des(GX, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Sum",
   };
   // B (Desire) absent ⇒ element None (counted as 0) but the composite builds.
@@ -111,6 +117,7 @@ fn inhibit_present_suppresses() {
     inputs: &[req(GX, "A"), inh(GX, "Block")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Sum",
   };
   // The Inhibit tag `X:Block` is present ⇒ the composite is suppressed.
@@ -138,6 +145,7 @@ fn inhibit_present_nonnumeric_string_suppresses() {
     inputs: &[req(GX, "A"), inh(GX, "Block")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Sum",
   };
   // `X:Block = "present"` is a non-numeric string ⇒ still suppresses.
@@ -162,20 +170,21 @@ fn desire_present_nonnumeric_string_reaches_derive() {
   // Finding-1: a present-but-non-numeric (string) Desire reaches `derive` as a
   // `Present(Str)` element (so future GPS/EXIF/datetime defs can read strings),
   // NOT as a `Missing`. The derive here asserts the raw value it was handed.
-  fn assert_first_is_str(v: &[CompositeValue]) -> Option<f64> {
+  fn assert_first_is_str(v: &[CompositeValue]) -> Option<CompositeRaw> {
     assert_eq!(
       v.first().and_then(CompositeValue::value),
       Some(&TagValue::Str("N".into())),
       "a present string Desire must arrive as Present(Str), not Missing"
     );
     assert!(v.first().is_some_and(CompositeValue::is_present));
-    Some(1.0)
+    Some(CompositeRaw::Num(1.0))
   }
   const DEF: CompositeDef = CompositeDef {
     name: "Dur",
     inputs: &[des(GX, "Ref")],
     derive: assert_first_is_str,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Dur",
   };
   let mut m = map_with(&[("X", "Ref", TagValue::Str("N".into()))]);
@@ -193,6 +202,7 @@ fn composite_requires_composite_deferred_then_built() {
     inputs: &[req(GX, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Inner",
   };
   const OUTER: CompositeDef = CompositeDef {
@@ -200,6 +210,7 @@ fn composite_requires_composite_deferred_then_built() {
     inputs: &[req(GCOMPOSITE, "Inner"), req(GX, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Outer",
   };
   let mut m = map_with(&[("X", "A", TagValue::I64(10)), ("X", "B", TagValue::I64(5))]);
@@ -218,6 +229,7 @@ fn composite_requires_composite_in_reverse_sort_order() {
     inputs: &[req(GX, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "Z-Inner", // sorts AFTER Outer
   };
   const OUTER: CompositeDef = CompositeDef {
@@ -225,6 +237,7 @@ fn composite_requires_composite_in_reverse_sort_order() {
     inputs: &[req(GCOMPOSITE, "Inner")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "A-Outer", // sorts BEFORE Inner ⇒ attempted first ⇒ defers
   };
   let mut m = map_with(&[("X", "A", TagValue::I64(7))]);
@@ -243,6 +256,7 @@ fn circular_dependency_does_not_loop() {
     inputs: &[req(GCOMPOSITE, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "M-A",
   };
   const B: CompositeDef = CompositeDef {
@@ -250,6 +264,7 @@ fn circular_dependency_does_not_loop() {
     inputs: &[req(GCOMPOSITE, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "M-B",
   };
   let mut m = TagMap::new();
@@ -267,6 +282,7 @@ fn last_emitted_duplicate_wins_across_group_set() {
     inputs: &[req(GP_Q, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    priority: 1,
     sort_key: "X-Sum",
   };
   let mut m = map_with(&[("P", "A", TagValue::I64(1)), ("Q", "A", TagValue::I64(99))]);
@@ -275,7 +291,7 @@ fn last_emitted_duplicate_wins_across_group_set() {
 }
 
 /// A derivation that always aborts (the `… ? … : undef` guard).
-fn always_none(_v: &[CompositeValue]) -> Option<f64> {
+fn always_none(_v: &[CompositeValue]) -> Option<CompositeRaw> {
   None
 }
 
@@ -284,6 +300,7 @@ const NONE_DEF: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A")],
   derive: always_none,
   print_conv: CompositePrintConv::ConvertDuration,
+  priority: 1,
   sort_key: "X-Sum",
 };
 
@@ -297,8 +314,8 @@ fn derive_returning_none_emits_nothing() {
 }
 
 /// A derivation yielding input 0's numeric coercion verbatim.
-fn first_input(v: &[CompositeValue]) -> Option<f64> {
-  v.first()?.coerce_numeric()
+fn first_input(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  Some(CompositeRaw::Num(v.first()?.coerce_numeric()?))
 }
 
 const DUR_DEF: CompositeDef = CompositeDef {
@@ -306,6 +323,7 @@ const DUR_DEF: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A")],
   derive: first_input,
   print_conv: CompositePrintConv::ConvertDuration,
+  priority: 1,
   sort_key: "X-Dur",
 };
 
@@ -336,6 +354,7 @@ const PROBE_DEF: CompositeDef = CompositeDef {
   // ValueConv output ⇒ a bare f64, so the resolved-then-coerced value is read
   // back directly (no ConvertDuration formatting to decode).
   print_conv: CompositePrintConv::ConvertDuration,
+  priority: 1,
   sort_key: "X-Probe",
 };
 
@@ -391,6 +410,7 @@ const SIGNED_SUM: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A"), req(GX, "B")],
   derive: sum_inputs,
   print_conv: CompositePrintConv::ConvertDuration,
+  priority: 1,
   sort_key: "X-Sum",
 };
 
@@ -431,4 +451,233 @@ fn signed_and_whitespace_string_ingredients_coerce_via_shared_perl_rule() {
   ]);
   build_into(&[SIGNED_SUM], &mut m3, None, ConvMode::ValueConv);
   assert_eq!(composite(&m3, "Sum"), Some(TagValue::F64(100.0)));
+}
+
+// ===========================================================================
+// The registered GPS Composites (GPS.pm / Exif.pm) — end-to-end through the
+// real `REGISTRY` over a two-view (ValueConv + PrintConv) GPS TagMap pair. These
+// mirror the bundled-ExifTool `ExifGPS.tif` truth and exercise the `$prt[i]`
+// wiring + the `GPSPosition`-requires-two-Composites fixpoint deferral.
+// ===========================================================================
+
+#[cfg(feature = "exif")]
+mod gps {
+  use super::*;
+
+  /// The ExifGPS.tif GPS inputs as the (ValueConv view, PrintConv view) pair the
+  /// engine reads `$val[i]` / `$prt[i]` from. ValueConv: decimal coords + `"N"`/
+  /// `"E"` refs + altitude `35`/ref `0` + the date/time strings. PrintConv: the
+  /// GPS-main DMS strings + `"North"`/`"East"` + `"Above Sea Level"`.
+  fn exifgps_views() -> (TagMap, TagMap) {
+    let val = map_with(&[
+      ("GPS", "GPSLatitude", TagValue::F64(48.85815)),
+      ("GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+      ("GPS", "GPSLongitude", TagValue::F64(2.34893333333333)),
+      ("GPS", "GPSLongitudeRef", TagValue::Str("E".into())),
+      ("GPS", "GPSAltitude", TagValue::F64(35.0)),
+      ("GPS", "GPSAltitudeRef", TagValue::U64(0)),
+      ("GPS", "GPSDateStamp", TagValue::Str("2021:08:14".into())),
+      ("GPS", "GPSTimeStamp", TagValue::Str("16:45:09".into())),
+    ]);
+    let prt = map_with(&[
+      (
+        "GPS",
+        "GPSLatitude",
+        TagValue::Str("48 deg 51' 29.34\"".into()),
+      ),
+      ("GPS", "GPSLatitudeRef", TagValue::Str("North".into())),
+      (
+        "GPS",
+        "GPSLongitude",
+        TagValue::Str("2 deg 20' 56.16\"".into()),
+      ),
+      ("GPS", "GPSLongitudeRef", TagValue::Str("East".into())),
+      ("GPS", "GPSAltitude", TagValue::Str("35 m".into())),
+      (
+        "GPS",
+        "GPSAltitudeRef",
+        TagValue::Str("Above Sea Level".into()),
+      ),
+      ("GPS", "GPSDateStamp", TagValue::Str("2021:08:14".into())),
+      ("GPS", "GPSTimeStamp", TagValue::Str("16:45:09".into())),
+    ]);
+    (val, prt)
+  }
+
+  #[test]
+  fn printconv_builds_all_gps_composites_byte_exact() {
+    // `-j`: `out` = the PrintConv view, `other` = the ValueConv view. Byte-exact
+    // against bundled `ExifGPS.tif` `Composite:*`.
+    let (mut val, mut prt) = exifgps_views();
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "GPSLatitude"),
+      Some(TagValue::Str("48 deg 51' 29.34\" N".into()))
+    );
+    assert_eq!(
+      composite(&prt, "GPSLongitude"),
+      Some(TagValue::Str("2 deg 20' 56.16\" E".into()))
+    );
+    assert_eq!(
+      composite(&prt, "GPSAltitude"),
+      Some(TagValue::Str("35 m Above Sea Level".into()))
+    );
+    assert_eq!(
+      composite(&prt, "GPSDateTime"),
+      Some(TagValue::Str("2021:08:14 16:45:09Z".into()))
+    );
+    // `GPSPosition`'s PrintConv is the literal `"$prt[0], $prt[1]"` — the two
+    // ingredient Composites' DMS strings (the `$prt[i]` wiring under test).
+    assert_eq!(
+      composite(&prt, "GPSPosition"),
+      Some(TagValue::Str(
+        "48 deg 51' 29.34\" N, 2 deg 20' 56.16\" E".into()
+      ))
+    );
+  }
+
+  #[test]
+  fn valueconv_builds_all_gps_composites_byte_exact() {
+    // `-n`: `out` = the ValueConv view, `other` = the PrintConv view. Byte-exact
+    // against bundled `ExifGPS.tif` `-n` `Composite:*`.
+    let (mut val, mut prt) = exifgps_views();
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "GPSLatitude"),
+      Some(TagValue::F64(48.85815))
+    );
+    assert_eq!(
+      composite(&val, "GPSLongitude"),
+      Some(TagValue::F64(2.34893333333333))
+    );
+    assert_eq!(composite(&val, "GPSAltitude"), Some(TagValue::F64(35.0)));
+    assert_eq!(
+      composite(&val, "GPSDateTime"),
+      Some(TagValue::Str("2021:08:14 16:45:09Z".into()))
+    );
+    // `GPSPosition`'s ValueConv is `"$val[0] $val[1]"` — the decimal coords.
+    assert_eq!(
+      composite(&val, "GPSPosition"),
+      Some(TagValue::Str("48.85815 2.34893333333333".into()))
+    );
+  }
+
+  #[test]
+  fn ref_sign_negates_south_and_west() {
+    // ValueConv `$val[1] =~ /^S/i ? -$val[0]` (lat) / `/^W/i ? -$val[0]` (lon).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("GPS", "GPSLatitude", TagValue::F64(48.85815)),
+      ("GPS", "GPSLatitudeRef", TagValue::Str("S".into())),
+      ("GPS", "GPSLongitude", TagValue::F64(2.34893333333333)),
+      ("GPS", "GPSLongitudeRef", TagValue::Str("W".into())),
+    ];
+    let mut out = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&out, "GPSLatitude"),
+      Some(TagValue::F64(-48.85815)),
+      "ref S ⇒ negative latitude"
+    );
+    assert_eq!(
+      composite(&out, "GPSLongitude"),
+      Some(TagValue::F64(-2.34893333333333)),
+      "ref W ⇒ negative longitude"
+    );
+  }
+
+  #[test]
+  fn gps_position_requires_both_composites_fixpoint_defers() {
+    // `GPSPosition` `Require`s `Composite:GPSLatitude` + `Composite:GPSLongitude`
+    // (sort_key `Composite-GPSPosition`, AFTER `GPS-…`), so it is attempted, the
+    // two ingredient Composites are not yet built ⇒ it DEFERS, then builds in a
+    // later pass once they exist (the composite-on-composite fixpoint).
+    let (mut val, mut prt) = exifgps_views();
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    // Built only because the deferral resolved Composite:GPSLatitude/Longitude.
+    assert_eq!(
+      composite(&val, "GPSPosition"),
+      Some(TagValue::Str("48.85815 2.34893333333333".into()))
+    );
+  }
+
+  #[test]
+  fn gps_position_not_built_when_a_coordinate_is_missing() {
+    // No `GPSLongitude` ⇒ `Composite:GPSLongitude` never builds ⇒ `GPSPosition`'s
+    // `Require` of it fails (after the fixpoint settles), so neither builds.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("GPS", "GPSLatitude", TagValue::F64(48.85815)),
+      ("GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+    ];
+    let mut out = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&out, "GPSLatitude"),
+      Some(TagValue::F64(48.85815))
+    );
+    assert_eq!(composite(&out, "GPSLongitude"), None);
+    assert_eq!(composite(&out, "GPSPosition"), None);
+  }
+
+  #[test]
+  fn gps_datetime_requires_both_date_and_time() {
+    // `GPSDateTime` `Require`s GPSDateStamp + GPSTimeStamp; a TimeStamp-only
+    // input (the `ExifGPS.jpg` shape) must NOT build it.
+    let entries: &[(&str, &str, TagValue)] =
+      &[("GPS", "GPSTimeStamp", TagValue::Str("16:45:09".into()))];
+    let mut out = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&out, "GPSDateTime"), None);
+  }
+
+  #[test]
+  fn gps_altitude_requires_a_ref() {
+    // The RawConv `(defined $val[1] or defined $val[3]) ? $val : undef` — an
+    // altitude with NO ref builds nothing.
+    let entries: &[(&str, &str, TagValue)] = &[("GPS", "GPSAltitude", TagValue::F64(35.0))];
+    let mut out = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&out, "GPSAltitude"), None);
+  }
+
+  #[test]
+  fn gps_altitude_comma_decimal_is_isfloat_normalized_both_modes() {
+    // ExifTool `IsFloat($val[$_])` translates `,`→`.` IN PLACE (ExifTool.pm:5951),
+    // so the altitude `"12,5"` (the wire string XMP preserves) is coerced AS
+    // `12.5`, NOT `12` (a raw `$val+0` would treat the comma as a numeric-prefix
+    // terminator). Bundled-ExifTool 13.59 on an `XMP-exif:GPSAltitude=12,5` +
+    // above-sea ref emits `Composite:GPSAltitude` = `12.5` (-n) / `12.5 m Above
+    // Sea Level` (-j). The input arrives at the GPS pair (index 0/1) as a string.
+    let val_entries: &[(&str, &str, TagValue)] = &[
+      ("GPS", "GPSAltitude", TagValue::Str("12,5".into())),
+      ("GPS", "GPSAltitudeRef", TagValue::U64(0)),
+    ];
+    let prt_entries: &[(&str, &str, TagValue)] = &[
+      ("GPS", "GPSAltitude", TagValue::Str("12,5 m".into())),
+      (
+        "GPS",
+        "GPSAltitudeRef",
+        TagValue::Str("Above Sea Level".into()),
+      ),
+    ];
+
+    // `-n` (ValueConv): the normalized `12.5`, not `12`.
+    let mut val = map_with(val_entries);
+    let mut prt = map_with(prt_entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "GPSAltitude"), Some(TagValue::F64(12.5)));
+
+    // `-j` (PrintConv): `(int($val[0]*10)/10) m $prt[1]` over the normalized
+    // value ⇒ `12.5 m Above Sea Level`, not `12 m …`.
+    let mut val = map_with(val_entries);
+    let mut prt = map_with(prt_entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "GPSAltitude"),
+      Some(TagValue::Str("12.5 m Above Sea Level".into()))
+    );
+  }
 }
