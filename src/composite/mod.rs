@@ -101,15 +101,25 @@ trait CompositeSink {
 impl CompositeSink for crate::tagmap::TagMap {
   fn resolve(&self, groups: &[&str], name: &str) -> CompositeValue {
     let group_ok = |g: &str| groups.is_empty() || groups.contains(&g);
-    // Reverse scan for the LAST match (entries are in first-occurrence order;
-    // the last duplicate is the highest-precedence — `APE_dup_override`).
-    match self
-      .entries()
-      .iter()
-      .rev()
-      .find(|(doc, _sub, fam1, n, _pri, _val)| {
-        *doc == 0 && n.as_str() == name && group_ok(fam1.as_str())
-      }) {
+    let pred = |entry: &&(u32, u32, smol_str::SmolStr, smol_str::SmolStr, u8, TagValue)| {
+      entry.0 == 0 && entry.3.as_str() == name && group_ok(entry.2.as_str())
+    };
+    // A GROUP-SCOPED input (`groups` non-empty) takes the LAST match within that
+    // group set — the duplicate-override precedence (`APE_dup_override`: a later
+    // `APE:SampleRate=48000` overrides an earlier `MAC:SampleRate=44100`). A
+    // BARE-NAME input (empty `groups`) takes the FIRST match across ALL groups —
+    // ExifTool's bare-name lookup returns the PRIORITY-directory value (the main
+    // EXIF IFD), which exifast emits BEFORE the lower-priority MakerNote
+    // duplicate; so `Composite:FocalLength35efl`'s bare `FocalLength` resolves to
+    // `ExifIFD:FocalLength` (50.0), NOT a later `Nikon:FocalLength` (50.4). (The
+    // entries are in first-occurrence emission order: EXIF IFDs precede MakerNote
+    // sub-tables, mirroring ExifTool's `$$self{PRIORITY}` directory.)
+    let found = if groups.is_empty() {
+      self.entries().iter().find(pred)
+    } else {
+      self.entries().iter().rev().find(pred)
+    };
+    match found {
       Some(entry) => CompositeValue::Present(entry.5.clone()),
       None => CompositeValue::Missing,
     }
@@ -132,11 +142,18 @@ impl CompositeSink for crate::tagmap::TagMap {
 impl CompositeSink for std::vec::Vec<crate::value::Tag> {
   fn resolve(&self, groups: &[&str], name: &str) -> CompositeValue {
     let group_ok = |g: &str| groups.is_empty() || groups.contains(&g);
-    match self
-      .iter()
-      .rev()
-      .find(|t| t.group_ref().doc() == 0 && t.name() == name && group_ok(t.group_ref().family1()))
-    {
+    let pred = |t: &&crate::value::Tag| {
+      t.group_ref().doc() == 0 && t.name() == name && group_ok(t.group_ref().family1())
+    };
+    // Bare-name (empty `groups`) ⇒ FIRST match (the priority-directory EXIF tag,
+    // emitted before its MakerNote duplicate); group-scoped ⇒ LAST match (the
+    // duplicate-override). See the `TagMap` impl's note.
+    let found = if groups.is_empty() {
+      self.iter().find(pred)
+    } else {
+      self.iter().rev().find(pred)
+    };
+    match found {
       Some(tag) => CompositeValue::Present(t_value(tag).clone()),
       None => CompositeValue::Missing,
     }
@@ -350,9 +367,11 @@ fn run_fixpoint<S: CompositeSink>(
         continue;
       }
 
-      // All inputs resolved: run the derivation (`$val` from `$val[]`).
+      // All inputs resolved: run the derivation (`$val` from `$val[]`, and
+      // `$prt[]` for the few defs whose ValueConv reads a PrintConv input —
+      // `Composite:LightValue`'s `CalculateLV(...,$prt[2])`, Exif.pm:4801).
       not_built.remove(def.name);
-      if let Some(raw) = (def.derive)(&vals) {
+      if let Some(raw) = (def.derive)(&vals, &prts) {
         // Append the ValueConv form to `val_view` and the PrintConv form to
         // `prt_view`, so a dependent composite reads both. When the two views
         // coincide (`None` prt_view), append the active-mode form once.

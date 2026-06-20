@@ -77,5 +77,13 @@
   "Samsung:ToneCurveSRGBDefault": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
   "Samsung:ToneCurveAdobeRGBDefault": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
   "Samsung:ToneCurveSRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
-  "Samsung:ToneCurveAdobeRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255"
+  "Samsung:ToneCurveAdobeRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
+  "Composite:Aperture": 9,
+  "Composite:ScaleFactor35efl": 1.53333333333333,
+  "Composite:ShutterSpeed": 0.00625,
+  "Composite:CircleOfConfusion": 0.0195953873666521,
+  "Composite:FOV": 29.2417726767321,
+  "Composite:FocalLength35efl": 68.9999999999999,
+  "Composite:HyperfocalDistance": 11.4822940618623,
+  "Composite:LightValue": 6.01792190799726
 }]

@@ -166,11 +166,16 @@ impl CompositeValue {
   /// non-`IsFloat` STRING operand (a zero-denominator rational that ValueConv'd
   /// to `"undef"`) is now carried through (the passthrough fix) instead of being
   /// coerced to `0`. Restricting to `coerce_numeric`-eligible operands (rather
-  /// than every present value) deliberately leaves the `Rational`-operand case
-  /// suppressed: building it faithfully needs the bare-name group precedence
-  /// (ExifTool picks `EXIF:FNumber` over a later `Samsung:FNumber`) plus a
-  /// `Rational` coercion — a separate pre-existing gap whose only golden
-  /// (`SamsungNX500.srw`, generated `-x Composite:all`) is outside this fix.
+  /// than every present value) deliberately leaves a raw [`Rational`](TagValue::
+  /// Rational)-shaped operand suppressed (no current golden exercises a
+  /// `Rational`-valued `FNumber`/`ExposureTime` reaching the selection; the EXIF
+  /// rational tags ValueConv to a numeric scalar before the post-pass reads
+  /// them). The bare-name group precedence (ExifTool picks the priority-directory
+  /// `EXIF:FNumber` over a later `Samsung:FNumber`) IS honoured — the engine's
+  /// bare-name resolver takes the FIRST-emitted match (see
+  /// [`crate::composite::CompositeSink::resolve`]), so `SamsungNX500.srw`'s
+  /// `Composite:Aperture`/`ShutterSpeed` resolve to the EXIF operands and build
+  /// byte-identically.
   pub(crate) fn selected_scalar(&self) -> Option<TagValue> {
     let v = self.value()?;
     self.coerce_numeric().map(|_| v.clone())
@@ -230,6 +235,39 @@ pub(crate) enum CompositePrintConv {
   /// `SubSecModifyDate` — the identity at exifast's option set, in BOTH modes
   /// (the RawConv-assembled `Text` string).
   SubSecDateTime,
+  /// `Composite:ScaleFactor35efl` PrintConv (`sprintf("%.1f", $val)`,
+  /// Exif.pm:4843) — the 1-decimal string under `-j` (emitted as a BARE JSON
+  /// number by the `EscapeJSON` gate, e.g. `4.4`); the bare numeric `$val`
+  /// (full precision, e.g. `4.3956043956044`) under `-n`.
+  ScaleFactor35efl,
+  /// `Composite:FocalLength35efl` PrintConv (Exif.pm:4815) — `$val[1] ?
+  /// sprintf("%.1f mm (35 mm equivalent: %.1f mm)", $val[0], $val) :
+  /// sprintf("%.1f mm", $val)`. Reads `$val[0]` (FocalLength) and `$val[1]`
+  /// (`Composite:ScaleFactor35efl`); the `-n` form is the bare numeric `$val`
+  /// (the 35mm-equiv, e.g. `75`).
+  FocalLength35efl,
+  /// `Composite:CircleOfConfusion` PrintConv (`sprintf("%.3f mm", $val)`,
+  /// Exif.pm:4853) — the 3-decimal `"… mm"` string under `-j`; the bare numeric
+  /// `$val` under `-n` (which the `EscapeJSON` gate quotes when its `%.15g`
+  /// rendering exceeds the 16-fraction-digit cap, e.g. `"0.00683552429306715"`).
+  CircleOfConfusion,
+  /// `Composite:HyperfocalDistance` PrintConv (`sprintf("%.2f m", $val)`,
+  /// Exif.pm:4868) — the 2-decimal `"… m"` string under `-j`; the bare numeric
+  /// `$val` under `-n`. When the ValueConv returned the literal `'inf'` (a
+  /// `Text` raw), `-n` emits the string `"inf"` and `-j` emits `"Inf m"`.
+  HyperfocalDistance,
+  /// `Composite:DOF` PrintConv (Exif.pm:4894) — the split-and-formatted
+  /// `"<dof> m (<near> - <far> m)"` (or `"inf (… m - inf)"`) string under `-j`;
+  /// the ValueConv space-joined `"<near> <far>"` string under `-n`.
+  Dof,
+  /// `Composite:FOV` PrintConv (Exif.pm:4936) — `"<angle> deg"` plus an optional
+  /// ` (<dist> m)` under `-j`; the ValueConv `"<angle>"` (or `"<angle> <dist>"`)
+  /// string under `-n` (a lone angle is emitted BARE by the `EscapeJSON` gate).
+  Fov,
+  /// `Composite:LightValue` PrintConv (`sprintf("%.1f", $val)`, Exif.pm:4802) —
+  /// the 1-decimal string under `-j` (emitted as a BARE number by the gate, e.g.
+  /// `8.0`); the bare numeric `$val` under `-n` (e.g. `7.96578428466209`).
+  LightValue,
 }
 
 impl CompositePrintConv {
@@ -401,6 +439,96 @@ impl CompositePrintConv {
           }
         }
       }
+      CompositePrintConv::ScaleFactor35efl => {
+        // `$val` is the numeric scale factor. `-n` the bare f64; `-j`
+        // `sprintf("%.1f", $val)` — a `Str` the `EscapeJSON` gate emits bare.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => TagValue::Str(std::format!("{n:.1}").into()),
+        }
+      }
+      CompositePrintConv::FocalLength35efl => {
+        // `$val` is the 35mm-equiv focal (`Num`). `-n` the bare f64; `-j` the
+        // two-branch PrintConv reading `$val[0]` (FocalLength) + `$val[1]`
+        // (`Composite:ScaleFactor35efl`).
+        let equiv = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(equiv),
+          ConvMode::PrintConv => {
+            // `$val[0]` is the lens FocalLength; `$val[1]` the (optional) scale
+            // factor — both `ToFloat`-coerced as in the ValueConv.
+            let focal = vals
+              .first()
+              .and_then(crate::composite::convs::lens::to_float)
+              .unwrap_or(0.0);
+            let sf = vals
+              .get(1)
+              .and_then(crate::composite::convs::lens::to_float);
+            TagValue::Str(
+              crate::composite::convs::lens::print_focal_length_35efl(focal, sf, equiv).into(),
+            )
+          }
+        }
+      }
+      CompositePrintConv::CircleOfConfusion => {
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::lens::print_circle_of_confusion(n).into())
+          }
+        }
+      }
+      CompositePrintConv::HyperfocalDistance => match raw {
+        // A finite numeric distance: `-n` the bare f64; `-j` `sprintf("%.2f m")`.
+        CompositeRaw::Num(n) => match mode {
+          ConvMode::ValueConv => TagValue::F64(*n),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::lens::print_hyperfocal(*n).into())
+          }
+        },
+        // The `'inf'` ValueConv literal: `-n` the string `"inf"`; `-j` `"Inf m"`.
+        CompositeRaw::Text(s) => match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::lens::print_hyperfocal(f64::INFINITY).into())
+          }
+        },
+        CompositeRaw::Scalar(_) => TagValue::Str(Default::default()),
+      },
+      CompositePrintConv::Dof => {
+        // `$val` is the space-joined `"<near> <far>"` ValueConv string. `-n` the
+        // bare string; `-j` the split-and-format PrintConv.
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => TagValue::Str(crate::composite::convs::lens::print_dof(s).into()),
+        }
+      }
+      CompositePrintConv::Fov => {
+        // `$val` is the `"<angle>"` / `"<angle> <dist>"` ValueConv string. `-n`
+        // the bare string (a lone angle is emitted bare by the gate); `-j` the
+        // split-and-format PrintConv.
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => TagValue::Str(crate::composite::convs::lens::print_fov(s).into()),
+        }
+      }
+      CompositePrintConv::LightValue => {
+        // `$val` is the numeric light value. `-n` the bare f64; `-j`
+        // `sprintf("%.1f", $val)` — a `Str` the gate emits bare.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => TagValue::Str(std::format!("{n:.1}").into()),
+        }
+      }
     }
   }
 }
@@ -454,19 +582,26 @@ impl InputKind {
 ///
 /// `derive` receives the resolved inputs by index as [`CompositeValue`]s
 /// (`Present(value)` carrying the raw [`TagValue`] when the ingredient was
-/// extracted, `Missing` when an absent `Desire`/`Inhibit`) and performs ITS OWN
-/// Perl coercion — the Duration defs coerce numeric + apply the Perl-truthy
-/// `&&` guard; the GPS defs read string/decimal ingredients. It returns the
-/// composite's raw value [`CompositeRaw`] (`$val`), or `None` to abort the build
-/// (ExifTool's `… ? … : undef` guard, e.g. APE.pm:90, the GPSAltitude RawConv).
+/// extracted, `Missing` when an absent `Desire`/`Inhibit`) — the `$val[]` array
+/// — AND the parallel `$prt[]` array (each input's PrintConv-view value,
+/// `None` for a `Missing` input), for the few defs whose ValueConv reads a
+/// PrintConv input (`Composite:LightValue`'s `CalculateLV($val[0],$val[1],
+/// $prt[2])`, Exif.pm:4801). It performs ITS OWN Perl coercion — the Duration
+/// defs coerce numeric + apply the Perl-truthy `&&` guard; the GPS defs read
+/// string/decimal ingredients; the lens defs `ToFloat` their inputs. It returns
+/// the composite's raw value [`CompositeRaw`] (`$val`), or `None` to abort the
+/// build (ExifTool's `… ? … : undef` guard, e.g. APE.pm:90, the GPSAltitude
+/// RawConv).
 #[derive(Clone, Copy)]
 pub(crate) struct CompositeDef {
   /// The composite tag name (the `-G1` key is `Composite:<name>`).
   pub(crate) name: &'static str,
   /// The inputs in index order (ExifTool `{ 0 => …, 1 => … }`).
   pub(crate) inputs: &'static [CompositeInput],
-  /// The def's `RawConv`/`ValueConv` arithmetic over the resolved inputs.
-  pub(crate) derive: fn(&[CompositeValue]) -> Option<CompositeRaw>,
+  /// The def's `RawConv`/`ValueConv` arithmetic over the resolved inputs
+  /// (`$val[]`) and their PrintConv-view counterparts (`$prt[]`, read only by
+  /// the defs whose ValueConv interpolates a `$prt[i]`).
+  pub(crate) derive: fn(&[CompositeValue], &[Option<TagValue>]) -> Option<CompositeRaw>,
   /// The def's `PrintConv`.
   pub(crate) print_conv: CompositePrintConv,
   /// ExifTool `Priority => N` (default `1`). `GPSPosition` is `Priority => 0`
@@ -549,7 +684,7 @@ const fn bare_des(name: &'static str) -> CompositeInput {
 /// a numeric/`Bytes` zero are falsy). The arithmetic itself then coerces every
 /// ingredient via Perl numeric coercion.
 #[cfg(feature = "ape")]
-fn ape_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn ape_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let tf_raw = v.get(1)?;
   // `$val[0] && $val[1]` — Perl-boolean on the RAW values (string-truthy).
@@ -567,7 +702,7 @@ fn ape_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// `$val[0]`=SampleRate, `[1]`=TotalSamples. The `and` guard is Perl-truthy on
 /// the RAW ingredients (string-truthy), then the arithmetic coerces numeric.
 #[cfg(feature = "flac")]
-fn flac_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn flac_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let total_raw = v.get(1)?;
   if !sr_raw.is_truthy() || !total_raw.is_truthy() {
@@ -582,7 +717,7 @@ fn flac_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// `$val[0]`=SampleRate, `[1]`=NumSampleFrames. The `and` guard is Perl-truthy
 /// on the RAW ingredients (string-truthy), then the arithmetic coerces numeric.
 #[cfg(feature = "aiff")]
-fn aiff_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn aiff_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let frames_raw = v.get(1)?;
   if !sr_raw.is_truthy() || !frames_raw.is_truthy() {
@@ -597,7 +732,7 @@ fn aiff_duration(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// $val[0]`. `$val[0]`=GPS:GPSLatitude (decimal degrees), `[1]`=GPSLatitudeRef
 /// (`"N"`/`"S"`). The ref is case-insensitively `^S` ⇒ negate.
 #[cfg(feature = "exif")]
-fn gps_latitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn gps_latitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let lat = v.first()?.coerce_numeric()?;
   let ref_s = v.get(1)?.as_text()?;
   Some(CompositeRaw::Num(if ref_starts_with(&ref_s, b'S') {
@@ -610,7 +745,7 @@ fn gps_latitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// `Composite:GPSLongitude` ValueConv (GPS.pm:399) `$val[1] =~ /^W/i ? -$val[0]
 /// : $val[0]`.
 #[cfg(feature = "exif")]
-fn gps_longitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn gps_longitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let lon = v.first()?.coerce_numeric()?;
   let ref_s = v.get(1)?.as_text()?;
   Some(CompositeRaw::Num(if ref_starts_with(&ref_s, b'W') {
@@ -627,7 +762,7 @@ fn gps_longitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// : $val[$_] } return undef`. Inputs: 0=GPS:GPSAltitude, 1=GPS:GPSAltitudeRef,
 /// 2=XMP:GPSAltitude, 3=XMP:GPSAltitudeRef.
 #[cfg(feature = "exif")]
-fn gps_altitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn gps_altitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   // RawConv: require a ref (`$val[1]` OR `$val[3]` defined).
   let have_ref = v.get(1).is_some_and(CompositeValue::is_present)
     || v.get(3).is_some_and(CompositeValue::is_present);
@@ -667,7 +802,7 @@ fn gps_altitude(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// `Composite:GPSDateTime` ValueConv (GPS.pm:361) `"$val[0] $val[1]Z"`.
 /// `$val[0]`=GPS:GPSDateStamp, `[1]`=GPS:GPSTimeStamp (both ValueConv strings).
 #[cfg(feature = "exif")]
-fn gps_datetime(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn gps_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let date = v.first()?.as_text()?;
   let time = v.get(1)?.as_text()?;
   Some(CompositeRaw::Text(std::format!("{date} {time}Z")))
@@ -677,7 +812,7 @@ fn gps_datetime(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// length($val[1])) ? "$val[0] $val[1]" : undef`. `$val[0]`=Composite:GPSLatitude
 /// (decimal), `[1]`=Composite:GPSLongitude (decimal) — both string-context.
 #[cfg(feature = "exif")]
-fn gps_position(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn gps_position(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let lat = v
     .first()
     .and_then(CompositeValue::as_text)
@@ -725,7 +860,7 @@ fn ref_starts_with(s: &str, c: u8) -> bool {
 /// CR2/Canon 1D RAW/IIQ/EIP). A future port that threads `TIFF_TYPE` into the
 /// post-pass can add it.
 #[cfg(feature = "exif")]
-fn image_size(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn image_size(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   // `return $val[4] if $val[4]` — a present + Perl-truthy RawImageCroppedSize is
   // already a `"WxH"` string; use it verbatim.
   if let Some(cropped) = v.get(4)
@@ -751,7 +886,7 @@ fn image_size(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// `Composite:ImageSize` ValueConv string (`"W H"`); the two `\d+` runs are the
 /// dimensions, their product over a million is the megapixel count (`Num`).
 #[cfg(feature = "exif")]
-fn megapixels(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn megapixels(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let size = v.first()?.as_text()?;
   // `($val =~ /\d+/g)` — every maximal ASCII-digit run, in order.
   let mut digits = size
@@ -788,7 +923,7 @@ fn megapixels(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// coerces numerically (a non-numeric BulbDuration is not `> 0`), but the
 /// SELECTED value remains `$val[2]`'s raw scalar.
 #[cfg(feature = "exif")]
-fn shutter_speed(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn shutter_speed(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   // `($val[2] and $val[2]>0)` — BulbDuration present + Perl-truthy AND
   // numerically positive ⇒ it wins (selected VERBATIM, not the coerced number).
   if let Some(b) = v.get(2)
@@ -818,7 +953,7 @@ fn shutter_speed(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// coerced to `0`. Truthiness is the RAW Perl-boolean (a wire `"0.0"` is
 /// truthy, picked, then `PrintFNumber` passes it through since it is non-float).
 #[cfg(feature = "exif")]
-fn aperture(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn aperture(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   // `$val[0] || $val[1]` — first Perl-truthy operand, selected VERBATIM.
   if let Some(f) = v.first()
     && f.is_truthy()
@@ -839,12 +974,356 @@ fn aperture(v: &[CompositeValue]) -> Option<CompositeRaw> {
 /// [`crate::composite::convs::datetime::sub_sec_assemble`] (the regex-faithful
 /// assembly); `None` ⇒ neither a usable sub-second nor an offset ⇒ not built.
 #[cfg(feature = "exif")]
-fn sub_sec_datetime(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn sub_sec_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   let date = v.first()?.as_text()?;
   let sub_sec = v.get(1).and_then(CompositeValue::as_text);
   let offset = v.get(2).and_then(CompositeValue::as_text);
   crate::composite::convs::datetime::sub_sec_assemble(&date, sub_sec.as_deref(), offset.as_deref())
     .map(CompositeRaw::Text)
+}
+
+/// `Composite:ScaleFactor35efl` ValueConv (Exif.pm:4843):
+/// `Image::ExifTool::Exif::CalcScaleFactor35efl($self, @val)`. The 16 documented
+/// `Desire` inputs are `$val[0..15]`; exifast appends `Make` at index 16 (an
+/// extra `Desire`) to supply the `$$et{Make}` the Canon-branch check reads — the
+/// post-pass has no ExifTool object. Delegates to
+/// [`crate::composite::convs::lens::calc_scale_factor_35efl`] (the generic path);
+/// the Canon branch is DEFERRED (returns `None`, no `ScaleFactor35efl` emitted).
+#[cfg(feature = "exif")]
+fn scale_factor_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::{
+    ScaleFactorInputs, ScaleFactorOutcome, calc_scale_factor_35efl,
+  };
+  // `$$et{Make} eq 'Canon'` — the IFD0 Make supplied at the appended index 16.
+  let is_canon = v
+    .get(16)
+    .and_then(CompositeValue::as_text)
+    .is_some_and(|m| m == "Canon");
+  let inputs = ScaleFactorInputs {
+    focal: v.first(),
+    foc35: v.get(1),
+    digital_zoom: v.get(2),
+    focal_plane_diagonal: v.get(3),
+    sensor_size: v.get(4),
+    focal_plane_x_size: v.get(5),
+    focal_plane_y_size: v.get(6),
+    resolution_unit: v.get(7),
+    x_resolution: v.get(8),
+    y_resolution: v.get(9),
+    size_pairs: [
+      (v.get(10), v.get(11)), // ExifImageWidth/Height
+      (v.get(12), v.get(13)), // CanonImageWidth/Height
+      (v.get(14), v.get(15)), // ImageWidth/Height
+    ],
+  };
+  match calc_scale_factor_35efl(is_canon, &inputs) {
+    ScaleFactorOutcome::Factor(f) => Some(CompositeRaw::Num(f)),
+    // The Canon-branch refinement is unported (DEFER) and a `undef` result both
+    // emit NO `ScaleFactor35efl` — exactly ExifTool's `undef` ValueConv.
+    ScaleFactorOutcome::CanonBranch | ScaleFactorOutcome::Undef => None,
+  }
+}
+
+/// `Composite:FocalLength35efl` ValueConv (Exif.pm:4814):
+/// `ToFloat(@val); ($val[0] || 0) * ($val[1] || 1)`. `$val[0]`=FocalLength
+/// (Require), `[1]`=`Composite:ScaleFactor35efl` (Desire). The 35mm-equiv focal
+/// is the lens focal times the scale factor (defaulting the missing factor to
+/// `1`, the missing focal to `0`).
+///
+/// ## The Canon-deferred-ScaleFactor guard (an unported-`CalcSensorDiag` gap)
+///
+/// FocalLength35efl only DESIRES ScaleFactor, so absent a ScaleFactor it falls
+/// through to the focal-only `$val[0] * 1`. That is FAITHFUL when ExifTool ALSO
+/// built no ScaleFactor (e.g. `Exif.tif` — `Make=Canon`, no
+/// `FocalLengthIn35mmFormat`, NO sensor data ⇒ both ExifTool and exifast emit
+/// `"50.0 mm"`). But for a `Make=Canon` body WITH FocalPlane sensor data
+/// (`XMP.xmp`: `FocalPlaneXResolution` present), ExifTool's `CalcScaleFactor35efl`
+/// Canon `CalcSensorDiag` branch (Exif.pm:5464) BUILDS a ScaleFactor (6.08) the
+/// exifast post-pass cannot reach (no `TAG_EXTRA{Rational}` handle) — so
+/// ExifTool's FocalLength35efl is the SCALE-FACTOR form (`"5.8 mm (35 mm
+/// equivalent: 35.3 mm)"`) while exifast's focal-only fall-through (`"5.8 mm"`)
+/// DIVERGES. So when the ScaleFactor is absent BECAUSE the Canon branch would
+/// have produced it (`Make=Canon` ∧ no `FocalLengthIn35mmFormat` ∧ FocalPlane
+/// sensor data present), exifast DEFERS FocalLength35efl (emits nothing) rather
+/// than the wrong focal-only value — the same deferral its
+/// `Require`-ScaleFactor siblings (`CircleOfConfusion`/`FOV`/`HyperfocalDistance`)
+/// take automatically. The extra inputs: `2`=Make, `3`=FocalLengthIn35mmFormat,
+/// `4`=FocalPlaneXResolution, `5`=SensorSize, `6`=FocalPlaneDiagonal,
+/// `7`=FocalPlaneXSize, `8`=FocalPlaneYSize (the full `CalcScaleFactor35efl`
+/// generic-`$diag` sensor set, so the Canon-deferral guard matches every source
+/// ExifTool could compute a ScaleFactor from).
+#[cfg(feature = "exif")]
+fn focal_length_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::to_float;
+  // The Canon-deferred-ScaleFactor guard: ScaleFactor absent (`$val[1]` Missing)
+  // BUT ExifTool's Canon branch would have built one ⇒ defer (the focal-only
+  // fall-through would be the WRONG value).
+  let scale_factor_missing = !v.get(1).is_some_and(CompositeValue::is_present);
+  if scale_factor_missing {
+    let is_canon = v
+      .get(2)
+      .and_then(CompositeValue::as_text)
+      .is_some_and(|m| m == "Canon");
+    // The simple `$foc35/$focal` ScaleFactor path did NOT fire — so ExifTool
+    // would reach the Canon/sensor branch. That path is `return $foc35 / $focal
+    // if $focal and $foc35` (Exif.pm:5460): it fires ONLY when BOTH operands —
+    // `$focal` (FocalLength, v[0]) AND `$foc35` (FocalLengthIn35mmFormat, v[3])
+    // — are POST-ToFloat Perl-truthy. Perl `and` on a number is true iff
+    // non-zero, so a present-but-falsy `0`/`0.0`/`-0.0`, or a non-numeric string
+    // (`"abc"`/`""`/`"Inf"`) whose `ToFloat` is `undef`, makes that operand
+    // FALSY. If EITHER operand is falsy the simple path does NOT fire and the
+    // Canon branch can still build a ScaleFactor from sensor data — so the guard
+    // keys off the FULL predicate, not just `foc35` (a present-but-falsy
+    // FocalLength with a truthy foc35 also fails `$focal and $foc35`, so it too
+    // must not suppress the Canon deferral, else FocalLength35efl would emit the
+    // wrong focal-only value).
+    let focal_truthy = v.first().and_then(to_float).is_some_and(|f| f != 0.0);
+    let foc35_truthy = v.get(3).and_then(to_float).is_some_and(|f| f != 0.0);
+    let simple_path_fires = focal_truthy && foc35_truthy;
+    // Any FocalPlane sensor input `CalcScaleFactor35efl` can derive `$diag` from
+    // (Exif.pm:5470-5505) — the FULL generic-path set the deferred Canon branch
+    // can fall through to: SensorSize, FocalPlaneDiagonal, FocalPlaneX/YSize, and
+    // the FocalPlaneXResolution + image-size route. If ANY is present ExifTool
+    // could compute a ScaleFactor exifast can't, so the focal-only fall-through
+    // would diverge ⇒ defer. (The FocalPlaneX/YSize aspect-ratio path was the gap.)
+    let has_sensor_data = v.get(4).is_some_and(CompositeValue::is_present) // FocalPlaneXResolution
+      || v.get(5).is_some_and(CompositeValue::is_present) // SensorSize
+      || v.get(6).is_some_and(CompositeValue::is_present) // FocalPlaneDiagonal
+      || v.get(7).is_some_and(CompositeValue::is_present) // FocalPlaneXSize
+      || v.get(8).is_some_and(CompositeValue::is_present); // FocalPlaneYSize
+    if is_canon && !simple_path_fires && has_sensor_data {
+      return None;
+    }
+  }
+  // `ToFloat(@val)` then `($val[0] || 0) * ($val[1] || 1)` — Perl-truthy
+  // defaults: a falsy/undef focal ⇒ 0, a falsy/undef scale factor ⇒ 1.
+  let focal = match v.first().and_then(to_float) {
+    Some(f) if f != 0.0 => f,
+    _ => 0.0,
+  };
+  let sf = match v.get(1).and_then(to_float) {
+    Some(s) if s != 0.0 => s,
+    _ => 1.0,
+  };
+  Some(CompositeRaw::Num(focal * sf))
+}
+
+/// `Composite:CircleOfConfusion` ValueConv (Exif.pm:4851):
+/// `sqrt(24*24+36*36) / ($val * 1440)`. `$val`=`Composite:ScaleFactor35efl`
+/// (Require). The circle of confusion in mm.
+///
+/// This ValueConv reads `$val` (the single required ScaleFactor) DIRECTLY — it
+/// does NOT call `ToFloat`, so the FULL-precision ScaleFactor f64 is used, NOT
+/// the `%.15g`-reparsed form [`to_float`](crate::composite::convs::lens::to_float)
+/// applies. (At 15 sig figs the CoC bytes are identical either way, but the
+/// raw read is faithful to the ValueConv.)
+#[cfg(feature = "exif")]
+fn circle_of_confusion(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::frame_diag_35mm;
+  let sf = v.first()?.coerce_numeric()?;
+  Some(CompositeRaw::Num(frame_diag_35mm() / (sf * 1440.0)))
+}
+
+/// `Composite:HyperfocalDistance` ValueConv (Exif.pm:4859):
+///
+/// ```perl
+/// ToFloat(@val);
+/// return 'inf' unless $val[1] and $val[2];
+/// return $val[0] * $val[0] / ($val[1] * $val[2] * 1000);
+/// ```
+///
+/// `$val[0]`=FocalLength, `[1]`=`Composite:Aperture`, `[2]`=`Composite:
+/// CircleOfConfusion` (all Require). When aperture or CoC is falsy the literal
+/// `'inf'` is returned (a `Text` raw, rendered as `"inf"`/`"Inf m"`); otherwise
+/// `focal^2 / (aperture * CoC * 1000)`.
+#[cfg(feature = "exif")]
+fn hyperfocal_distance(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::to_float;
+  // `ToFloat(@val)` — a non-`ToFloat` input becomes undef; the formula then sees
+  // `0`-or-undef as falsy. (`$val[i] || 0` is implicit in the `unless`/product.)
+  let focal = v.first().and_then(to_float).unwrap_or(0.0);
+  let aperture = v.get(1).and_then(to_float).unwrap_or(0.0);
+  let coc = v.get(2).and_then(to_float).unwrap_or(0.0);
+  // `return 'inf' unless $val[1] and $val[2]` (Perl-truthy: nonzero).
+  if aperture == 0.0 || coc == 0.0 {
+    return Some(CompositeRaw::Text("inf".to_string()));
+  }
+  // `return $val[0] * $val[0] / ($val[1] * $val[2] * 1000)`.
+  Some(CompositeRaw::Num(focal * focal / (aperture * coc * 1000.0)))
+}
+
+/// `Composite:DOF` ValueConv (Exif.pm:4876):
+///
+/// ```perl
+/// ToFloat(@val);
+/// my ($d, $f) = ($val[3], $val[0]);
+/// if (defined $d) { $d or $d = 1e10; }
+/// else {
+///     $d = $val[4] || $val[5] || $val[6];
+///     unless (defined $d) {
+///         return undef unless defined $val[7] and defined $val[8];
+///         $d = ($val[7] + $val[8]) / 2;
+///     }
+/// }
+/// return 0 unless $f and $val[2];
+/// my $t = $val[1] * $val[2] * ($d * 1000 - $f) / ($f * $f);
+/// my @v = ($d / (1 + $t), $d / (1 - $t));
+/// $v[1] < 0 and $v[1] = 0;
+/// return join(' ', @v);
+/// ```
+///
+/// `$val[0]`=FocalLength, `[1]`=`Composite:Aperture`, `[2]`=`Composite:
+/// CircleOfConfusion` (Require); `[3]`=FocusDistance, `[4]`=SubjectDistance,
+/// `[5]`=ObjectDistance, `[6]`=ApproximateFocusDistance, `[7]`=FocusDistanceLower,
+/// `[8]`=FocusDistanceUpper (Desire). The result is the space-joined `"<near>
+/// <far>"` (each Perl-NV-stringified), or `"0"` when focal/CoC is falsy.
+#[cfg(feature = "exif")]
+fn dof(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::to_float;
+  use crate::composite::convs::perl_nv_str;
+  // `ToFloat(@val)` runs FIRST, mutating EVERY `$val[i]` to its float (or undef)
+  // BEFORE any `defined`/`||` test. So every `defined $d` / `$d or` / `defined
+  // $val[7]` decision below keys on the POST-ToFloat value, NOT raw tag presence:
+  // a present-but-non-numeric ingredient is `undef` and falls through exactly as
+  // Perl's `ToFloat`-coerced array does. Precompute each Option<f64> once.
+  let f = v.first().and_then(to_float).unwrap_or(0.0);
+  let aperture = v.get(1).and_then(to_float).unwrap_or(0.0);
+  let coc = v.get(2).and_then(to_float).unwrap_or(0.0);
+  let d3 = v.get(3).and_then(to_float); // FocusDistance
+  let d4 = v.get(4).and_then(to_float); // SubjectDistance
+  let d5 = v.get(5).and_then(to_float); // ObjectDistance
+  let d6 = v.get(6).and_then(to_float); // ApproximateFocusDistance
+  let d7 = v.get(7).and_then(to_float); // FocusDistanceLower
+  let d8 = v.get(8).and_then(to_float); // FocusDistanceUpper
+
+  // `my ($d, $f) = ($val[3], $val[0]); if (defined $d) { $d or $d = 1e10; }`.
+  // `defined $d` is the POST-ToFloat definedness of FocusDistance — a non-numeric
+  // FocusDistance is `undef` here and DOES fall to the alternatives below (it does
+  // NOT short-circuit to the `1e10` sentinel). A defined falsy `0` ⇒ `1e10`.
+  let d = if let Some(dv) = d3 {
+    if dv == 0.0 { 1e10 } else { dv }
+  } else {
+    // `$d = $val[4] || $val[5] || $val[6]` — Perl `||` returns the first truthy
+    // operand, else the LAST operand. So the result is truthy(d4)→d4,
+    // else truthy(d5)→d5, else d6 (its value — defined `0` included). `defined $d`
+    // afterwards is therefore truthy(d4) || truthy(d5) || d6.is_some().
+    let alt = if d4.is_some_and(|x| x != 0.0) {
+      d4
+    } else if d5.is_some_and(|x| x != 0.0) {
+      d5
+    } else {
+      d6 // first-truthy fell through ⇒ the last operand `$val[6]` (Some(0)/value/None)
+    };
+    match alt {
+      Some(dv) => dv,
+      None => {
+        // `unless (defined $d) { return undef unless defined $val[7] and
+        // defined $val[8]; $d = ($val[7] + $val[8]) / 2; }`. Reached only when the
+        // `||` chain is `undef` (4/5 not truthy AND 6 undef). The lower/upper
+        // average needs BOTH POST-ToFloat values defined (a present-non-numeric
+        // bound is undef ⇒ the composite is undef, not averaged-as-0).
+        let (Some(lo), Some(hi)) = (d7, d8) else {
+          return None;
+        };
+        (lo + hi) / 2.0
+      }
+    }
+  };
+
+  // `return 0 unless $f and $val[2]` (Perl-truthy focal AND CoC).
+  if f == 0.0 || coc == 0.0 {
+    return Some(CompositeRaw::Text(perl_nv_str(0.0)));
+  }
+  // `$t = $val[1] * $val[2] * ($d*1000 - $f) / ($f*$f)`.
+  let t = aperture * coc * (d * 1000.0 - f) / (f * f);
+  // `@v = ($d/(1+$t), $d/(1-$t)); $v[1] < 0 and $v[1] = 0`.
+  let near = d / (1.0 + t);
+  let mut far = d / (1.0 - t);
+  if far < 0.0 {
+    far = 0.0;
+  }
+  // `join(' ', @v)` — each f64 via Perl's default NV stringification.
+  Some(CompositeRaw::Text(std::format!(
+    "{} {}",
+    perl_nv_str(near),
+    perl_nv_str(far)
+  )))
+}
+
+/// `Composite:FOV` ValueConv (Exif.pm:4924):
+///
+/// ```perl
+/// ToFloat(@val);
+/// return undef unless $val[0] and $val[1];
+/// my $corr = 1;
+/// if ($val[2]) { my $d = 1000 * $val[2] - $val[0]; $corr += $val[0]/$d if $d > 0; }
+/// my $fd2 = atan2(36, 2*$val[0]*$val[1]*$corr);
+/// my @fov = ( $fd2 * 360 / 3.14159 );
+/// if ($val[2] and $val[2] > 0 and $val[2] < 10000) {
+///     push @fov, 2 * $val[2] * sin($fd2) / cos($fd2);
+/// }
+/// return join(' ', @fov);
+/// ```
+///
+/// `$val[0]`=FocalLength, `[1]`=`Composite:ScaleFactor35efl` (Require);
+/// `[2]`=FocusDistance (Desire). The angle uses the literal `3.14159`
+/// (Exif.pm:4932 — a TRUNCATED pi, ported byte-exact); a present in-range focus
+/// distance appends the subject-field width.
+// The literal `3.14159` is REQUIRED for byte-exact parity with ExifTool's FOV
+// ValueConv (Exif.pm:4932); `std::f64::consts::PI` (3.141592653589793) would
+// change the angle in the 6th significant figure.
+#[allow(clippy::approx_constant)]
+#[cfg(feature = "exif")]
+fn fov(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::to_float;
+  use crate::composite::convs::perl_nv_str;
+  let focal = v.first().and_then(to_float).unwrap_or(0.0);
+  let scale = v.get(1).and_then(to_float).unwrap_or(0.0);
+  // `return undef unless $val[0] and $val[1]` (Perl-truthy focal AND scale).
+  if focal == 0.0 || scale == 0.0 {
+    return None;
+  }
+  let focus_dist = v.get(2).and_then(to_float).unwrap_or(0.0);
+  // `my $corr = 1; if ($val[2]) { my $d = 1000*$val[2] - $val[0]; $corr +=
+  // $val[0]/$d if $d > 0; }`.
+  let mut corr = 1.0;
+  if focus_dist != 0.0 {
+    let d = 1000.0 * focus_dist - focal;
+    if d > 0.0 {
+      corr += focal / d;
+    }
+  }
+  // `my $fd2 = atan2(36, 2*$val[0]*$val[1]*$corr)`.
+  let fd2 = 36.0_f64.atan2(2.0 * focal * scale * corr);
+  // `@fov = ($fd2 * 360 / 3.14159)` — the TRUNCATED-pi literal (Exif.pm:4932).
+  let angle = fd2 * 360.0 / 3.14159;
+  let mut out = perl_nv_str(angle);
+  // `if ($val[2] and $val[2] > 0 and $val[2] < 10000) { push @fov, 2*$val[2]*
+  // sin($fd2)/cos($fd2); }`.
+  if focus_dist != 0.0 && focus_dist > 0.0 && focus_dist < 10000.0 {
+    let width = 2.0 * focus_dist * fd2.sin() / fd2.cos();
+    out.push(' ');
+    out.push_str(&perl_nv_str(width));
+  }
+  Some(CompositeRaw::Text(out))
+}
+
+/// `Composite:LightValue` ValueConv (Exif.pm:4801):
+/// `Image::ExifTool::Exif::CalculateLV($val[0],$val[1],$prt[2])`. `$val[0]`=
+/// `Composite:Aperture`, `[1]`=`Composite:ShutterSpeed`, `$prt[2]`=ISO's
+/// PrintConv value (all Require). Delegates to
+/// [`crate::composite::convs::lens::calculate_lv`] (the log2 LV formula); `None`
+/// ⇒ a non-positive/non-float input ⇒ not built.
+#[cfg(feature = "exif")]
+fn light_value(v: &[CompositeValue], prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  use crate::composite::convs::lens::calculate_lv;
+  // `$val[0]` Aperture, `$val[1]` ShutterSpeed (ValueConv views), `$prt[2]` the
+  // ISO PRINTCONV value (Exif.pm:4801 uses `$prt[2]`, not `$val[2]`).
+  let aperture = v.first()?.as_text()?;
+  let shutter = v.get(1)?.as_text()?;
+  let iso_prt = prts.get(2)?.as_ref()?;
+  let iso_text = crate::composite::value_text(iso_prt);
+  calculate_lv(&aperture, &shutter, &iso_text).map(CompositeRaw::Num)
 }
 
 /// APE `Duration` (APE.pm:83-92). Registered only when the `ape` feature is on.
@@ -1076,6 +1555,150 @@ const SUBSEC_MODIFY_DATE: CompositeDef = CompositeDef {
   sort_key: "Composite-SubSecModifyDate",
 };
 
+/// `Composite:ScaleFactor35efl` (Exif.pm:4817). All 16 documented inputs are
+/// `Desire` — bare names (any group) except `2 => 'Composite:DigitalZoom'`
+/// (group-prefixed; unported ⇒ always `Missing`). exifast appends `16 => 'Make'`
+/// (an extra bare `Desire`) to supply `$$et{Make}` for the Canon-branch check.
+#[cfg(feature = "exif")]
+const SCALE_FACTOR_35EFL: CompositeDef = CompositeDef {
+  name: "ScaleFactor35efl",
+  inputs: &[
+    bare_des("FocalLength"),              // 0
+    bare_des("FocalLengthIn35mmFormat"),  // 1
+    des(&["Composite"], "DigitalZoom"),   // 2
+    bare_des("FocalPlaneDiagonal"),       // 3
+    bare_des("SensorSize"),               // 4
+    bare_des("FocalPlaneXSize"),          // 5
+    bare_des("FocalPlaneYSize"),          // 6
+    bare_des("FocalPlaneResolutionUnit"), // 7
+    bare_des("FocalPlaneXResolution"),    // 8
+    bare_des("FocalPlaneYResolution"),    // 9
+    bare_des("ExifImageWidth"),           // 10
+    bare_des("ExifImageHeight"),          // 11
+    bare_des("CanonImageWidth"),          // 12
+    bare_des("CanonImageHeight"),         // 13
+    bare_des("ImageWidth"),               // 14
+    bare_des("ImageHeight"),              // 15
+    bare_des("Make"),                     // 16 (exifast extra: $$et{Make})
+  ],
+  derive: scale_factor_35efl,
+  print_conv: CompositePrintConv::ScaleFactor35efl,
+  priority: 1,
+  sort_key: "Composite-ScaleFactor35efl",
+};
+
+/// `Composite:FocalLength35efl` (Exif.pm:4804). `Require`s FocalLength (bare),
+/// `Desire`s `Composite:ScaleFactor35efl` (so it DEFERS until the scale factor
+/// is built — `Composite`-group input drives the fixpoint). Indices `2..=8` are
+/// exifast extras (`Make`/`FocalLengthIn35mmFormat`/`FocalPlaneXResolution`/
+/// `SensorSize`/`FocalPlaneDiagonal`/`FocalPlaneXSize`/`FocalPlaneYSize` — the
+/// full `CalcScaleFactor35efl` sensor set) for the Canon-deferred-ScaleFactor
+/// guard (see [`focal_length_35efl`]).
+#[cfg(feature = "exif")]
+const FOCAL_LENGTH_35EFL: CompositeDef = CompositeDef {
+  name: "FocalLength35efl",
+  inputs: &[
+    bare_req("FocalLength"),                 // 0
+    des(&["Composite"], "ScaleFactor35efl"), // 1
+    bare_des("Make"),                        // 2 (extra: $$et{Make})
+    bare_des("FocalLengthIn35mmFormat"),     // 3 (extra: the simple-path probe)
+    bare_des("FocalPlaneXResolution"),       // 4 (extra: sensor-data probe)
+    bare_des("SensorSize"),                  // 5 (extra: sensor-data probe)
+    bare_des("FocalPlaneDiagonal"),          // 6 (extra: sensor-data probe)
+    bare_des("FocalPlaneXSize"),             // 7 (extra: sensor-data probe)
+    bare_des("FocalPlaneYSize"),             // 8 (extra: sensor-data probe)
+  ],
+  derive: focal_length_35efl,
+  print_conv: CompositePrintConv::FocalLength35efl,
+  priority: 1,
+  sort_key: "Composite-FocalLength35efl",
+};
+
+/// `Composite:CircleOfConfusion` (Exif.pm:4845). `Require`s
+/// `Composite:ScaleFactor35efl` (defers until built).
+#[cfg(feature = "exif")]
+const CIRCLE_OF_CONFUSION: CompositeDef = CompositeDef {
+  name: "CircleOfConfusion",
+  inputs: &[req(&["Composite"], "ScaleFactor35efl")],
+  derive: circle_of_confusion,
+  print_conv: CompositePrintConv::CircleOfConfusion,
+  priority: 1,
+  sort_key: "Composite-CircleOfConfusion",
+};
+
+/// `Composite:HyperfocalDistance` (Exif.pm:4855). `Require`s FocalLength (bare),
+/// `Composite:Aperture`, `Composite:CircleOfConfusion` (the two composites defer
+/// it until they are built).
+#[cfg(feature = "exif")]
+const HYPERFOCAL_DISTANCE: CompositeDef = CompositeDef {
+  name: "HyperfocalDistance",
+  inputs: &[
+    bare_req("FocalLength"),
+    req(&["Composite"], "Aperture"),
+    req(&["Composite"], "CircleOfConfusion"),
+  ],
+  derive: hyperfocal_distance,
+  print_conv: CompositePrintConv::HyperfocalDistance,
+  priority: 1,
+  sort_key: "Composite-HyperfocalDistance",
+};
+
+/// `Composite:DOF` (Exif.pm:4870). `Require`s FocalLength (bare),
+/// `Composite:Aperture`, `Composite:CircleOfConfusion`; `Desire`s the focus-
+/// distance family (bare names).
+#[cfg(feature = "exif")]
+const DOF: CompositeDef = CompositeDef {
+  name: "DOF",
+  inputs: &[
+    bare_req("FocalLength"),
+    req(&["Composite"], "Aperture"),
+    req(&["Composite"], "CircleOfConfusion"),
+    bare_des("FocusDistance"),
+    bare_des("SubjectDistance"),
+    bare_des("ObjectDistance"),
+    bare_des("ApproximateFocusDistance"),
+    bare_des("FocusDistanceLower"),
+    bare_des("FocusDistanceUpper"),
+  ],
+  derive: dof,
+  print_conv: CompositePrintConv::Dof,
+  priority: 1,
+  sort_key: "Composite-DOF",
+};
+
+/// `Composite:FOV` (Exif.pm:4913). `Require`s FocalLength (bare),
+/// `Composite:ScaleFactor35efl`; `Desire`s FocusDistance (bare).
+#[cfg(feature = "exif")]
+const FOV: CompositeDef = CompositeDef {
+  name: "FOV",
+  inputs: &[
+    bare_req("FocalLength"),
+    req(&["Composite"], "ScaleFactor35efl"),
+    bare_des("FocusDistance"),
+  ],
+  derive: fov,
+  print_conv: CompositePrintConv::Fov,
+  priority: 1,
+  sort_key: "Composite-FOV",
+};
+
+/// `Composite:LightValue` (Exif.pm:4791). `Require`s `Composite:Aperture`,
+/// `Composite:ShutterSpeed`, ISO (bare). The ValueConv reads `$prt[2]` (ISO's
+/// PrintConv value), supplied to [`light_value`] via the `prts` array.
+#[cfg(feature = "exif")]
+const LIGHT_VALUE: CompositeDef = CompositeDef {
+  name: "LightValue",
+  inputs: &[
+    req(&["Composite"], "Aperture"),
+    req(&["Composite"], "ShutterSpeed"),
+    bare_req("ISO"),
+  ],
+  derive: light_value,
+  print_conv: CompositePrintConv::LightValue,
+  priority: 1,
+  sort_key: "Composite-LightValue",
+};
+
 /// The full registry of ported Composite defs, cfg-gated per input format. The
 /// engine sorts a working copy by [`CompositeDef::sort_key`] (ExifTool's
 /// prefixed-id order) before the fixpoint, so this declaration order is
@@ -1111,4 +1734,18 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   SUBSEC_CREATE_DATE,
   #[cfg(feature = "exif")]
   SUBSEC_MODIFY_DATE,
+  #[cfg(feature = "exif")]
+  SCALE_FACTOR_35EFL,
+  #[cfg(feature = "exif")]
+  FOCAL_LENGTH_35EFL,
+  #[cfg(feature = "exif")]
+  CIRCLE_OF_CONFUSION,
+  #[cfg(feature = "exif")]
+  HYPERFOCAL_DISTANCE,
+  #[cfg(feature = "exif")]
+  DOF,
+  #[cfg(feature = "exif")]
+  FOV,
+  #[cfg(feature = "exif")]
+  LIGHT_VALUE,
 ];

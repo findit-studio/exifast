@@ -91,5 +91,11 @@
   "JFIF:YResolution": 1,
   "Composite:Aperture": 1,
   "Composite:ImageSize": "1280 1024",
-  "Composite:Megapixels": 1.31072
+  "Composite:Megapixels": 1.31072,
+  "Composite:ScaleFactor35efl": 4.3956043956044,
+  "Composite:CircleOfConfusion": "0.00683552429306715",
+  "Composite:DOF": "3.54114619724571 8.50299940251809",
+  "Composite:FOV": 48.4555315645449,
+  "Composite:FocalLength35efl": 40,
+  "Composite:HyperfocalDistance": 12.114652285559
 }]

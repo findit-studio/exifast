@@ -108,9 +108,15 @@
   "Composite:Aperture": 2.8,
   "Composite:ImageSize": "4000 3000",
   "Composite:Megapixels": 12,
+  "Composite:ScaleFactor35efl": 5.54016620498615,
   "Composite:ShutterSpeed": 0.002546,
   "Composite:GPSAltitude": 109.786,
   "Composite:GPSLatitude": 32.4785966666667,
   "Composite:GPSLongitude": -90.2600013888889,
-  "Composite:GPSPosition": "32.4785966666667 -90.2600013888889"
+  "Composite:CircleOfConfusion": "0.00542335004351042",
+  "Composite:FOV": 83.9744959218556,
+  "Composite:FocalLength35efl": 20,
+  "Composite:GPSPosition": "32.4785966666667 -90.2600013888889",
+  "Composite:HyperfocalDistance": 0.858200446445604,
+  "Composite:LightValue": 11.5884055197633
 }]
