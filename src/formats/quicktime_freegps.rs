@@ -115,7 +115,7 @@ use crate::{
     gopro,
     quicktime_stream::{convert_lat_lon, join3, synth_gps_date_time},
   },
-  metadata::{GoProMeta, GpsSample, QuickTimeStreamMeta},
+  metadata::{GoProMeta, GpsSample, QuickTimeStreamMeta, TextExtras},
 };
 
 // ── conversion factors (QuickTimeStream.pl:73-75) ──────────────────────────
@@ -908,6 +908,10 @@ struct FreeGpsTags {
   spd: Option<f64>,
   trk: Option<f64>,
   accel: Option<(f64, f64, f64)>,
+  /// A pre-joined `Accelerometer` STRING — the Roadhawk 4-value
+  /// `"$1 $2 $3 $4"` (QuickTimeStream.pl:1266) the 3-tuple `accel` cannot hold.
+  /// Takes precedence over `accel` in [`Self::emit`] when set.
+  accel_str: Option<SmolStr>,
   user_label: Option<String>,
   /// `true` ⇒ lat/lon are already in decimal degrees (skip ConvertLatLon).
   ddd: bool,
@@ -919,6 +923,12 @@ struct FreeGpsTags {
   /// (QuickTimeStream.pl:2396) and the tail emits no `GPSDateTime` when `$yr`
   /// is undef, so the synthesized value is the only `GPSDateTime` for Type-19.
   synth_date_time: Option<SmolStr>,
+  /// The `Process_text` dashcam extras (`Text`/`GSensor`/`Car`/`Distance`/
+  /// `VerticalSpeed`/`FNumber`/`ExposureTime`/`ExposureCompensation`/`ISO`,
+  /// QuickTimeStream.pl:1213-1294 + the timed-text `Text` tag). Default-empty;
+  /// populated ONLY by the text-fallback branches, then moved onto the emitted
+  /// [`GpsSample`] when non-empty.
+  text_extras: TextExtras,
 }
 
 impl FreeGpsTags {
@@ -938,9 +948,11 @@ impl FreeGpsTags {
       spd: None,
       trk: None,
       accel: None,
+      accel_str: None,
       user_label: None,
       ddd: false,
       synth_date_time: None,
+      text_extras: TextExtras::default(),
     }
   }
   /// Common-tail emission — QuickTimeStream.pl:2455-2483. Validates month +
@@ -1013,8 +1025,17 @@ impl FreeGpsTags {
     if let Some(trk) = self.trk {
       sample.set_track(Some(trk));
     }
-    if let Some((x, y, z)) = self.accel {
+    if let Some(acc) = self.accel_str {
+      // The Roadhawk pre-joined 4-value string (QuickTimeStream.pl:1266).
+      sample.set_accelerometer(Some(acc));
+    } else if let Some((x, y, z)) = self.accel {
       sample.set_accelerometer(Some(SmolStr::from(join3(x, y, z))));
+    }
+    // The `Process_text` dashcam extras (`Text`/`GSensor`/`Car`/`Distance`/…) —
+    // attach the populated sub-struct so the SP3 emitter writes them under the
+    // sample's `Doc<N>` (QuickTimeStream.pl:1213-1294 + the wrapper's `Text`).
+    if !self.text_extras.is_empty() {
+      sample.set_text_extras(Some(self.text_extras));
     }
     // user_label — exiftool emits it as `UserLabel`, not part of the typed
     // GpsSample fields. The sample is recorded; we lose the label string by
@@ -2949,7 +2970,8 @@ pub fn dispatch_gpmd(
   }
   // gpmd_Rove — `^\0\0\xf2\xe1\xf0\xeeTT` (QuickTimeStream.pl:190).
   if data.get(0..8) == Some(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54][..]) {
-    process_text(data, out);
+    // The `gpmd` dispatch is NOT the timed-text wrapper, so no `Text => $buff`.
+    process_text(data, None, out);
     return GpmdDispatch::SelfContained;
   }
   // gpmd_FMAS — `^FMAS\0\0\0\0` (QuickTimeStream.pl:197).
@@ -2987,6 +3009,138 @@ fn detect_wolfbox(data: &[u8]) -> bool {
   false
 }
 
+// ─────────────────────────── timed-text wrapper ────────────────────────────
+
+/// The `text` / `sbtl` timed-text sample wrapper (QuickTimeStream.pl:1467-1516):
+/// `FoundSomething` (`ProcessSamples`:1473) has already opened the `Doc<N>` AND
+/// emitted this sample's `SampleTime`/`SampleDuration` (the caller owns the
+/// `open_doc`), UNCONDITIONALLY — BEFORE the `Process_text` decode, for EVERY
+/// `text` sample. So this prepares `$buff` + the `Text => $buff` / `$handled`
+/// decision and runs [`process_text`], then stamps the produced [`GpsSample`]
+/// with the enclosing `Track<N>` origin + sample timing (`stamp_gps_gpmd_from`)
+/// when a fix/Text row was emitted; when `Process_text` emitted NOTHING (a binary
+/// / `\0[^\0]` sample whose `Text` is gated and which matches no sentence — e.g.
+/// the Insta360 `.insv`'s 469 binary text samples), it records a
+/// [`crate::metadata::GpmdTimingOnly`] marker carrying the SAME doc + `Track<N>` +
+/// timing, so the `SampleTime`/`SampleDuration` `FoundSomething` already emitted
+/// still surfaces under its `Doc<N>` at `-G3` (and joins the `-G1` cross-sample
+/// min-doc scan). This is the `text`-path analogue of the `gpmd` matched-but-empty
+/// marker (`ProcessSamples`:2235-2242).
+///
+/// Faithful skeleton of the wrapper: skip when the buffer starts `$BEGIN`; strip
+/// a trailing `\0\0\0\x0cencd\0\0\x01\0` box; strip a leading 2-byte
+/// length-prefix when it equals `size - 2` (the CanonPowerShotN100 / chapter
+/// shape) — but `next if $size == 2` (a zero-length prefix) skips the `Text`
+/// store + `Process_text` decode entirely; then store `Text => $buff` (and mark
+/// handled) UNLESS the buffer holds a `\0[^\0]` byte pair. The E-PRANCE B47FS
+/// cipher (`^\0 … \x0a$`) and the Garmin `PNDM` binary path (QuickTimeStream.pl:
+/// 1486-1509) are separate camera variants, deferred (they need their own
+/// fixtures).
+///
+/// PER-TEXT-SAMPLE-TIMING GUARANTEE: `FoundSomething` (:1461) opens the `Doc<N>`
+/// + emits `SampleTime`/`SampleDuration` for EVERY `text` sample BEFORE any
+/// decode, so this function has NO early-return escape hatch — every exit (the
+/// size==2 `next`, the `$BEGIN` path, a plain-text store, a binary `\0[^\0]`
+/// gate, a matched sentence, an empty `Process_text`) flows through the single
+/// timing tail, which emits the sample's timing via either the produced GPS/Text
+/// rows or a [`crate::metadata::GpmdTimingOnly`] marker. No `text` sample can
+/// consume a `Doc<N>` without surfacing its timing.
+pub fn process_timed_text(
+  buff: &[u8],
+  track_index: u32,
+  doc: u32,
+  sample_time: Option<f64>,
+  sample_duration: Option<f64>,
+  out: &mut QuickTimeStreamMeta,
+) {
+  let gps_start = out.gps_sample_count();
+  // `unless ($buff =~ /^\$BEGIN/)` — a `$BEGIN…` sample is handled inside
+  // `Process_text`'s `$TAG` loop, not by this wrapper preamble.
+  let mut buf = buff;
+  let mut wrapper_text: Option<SmolStr> = None;
+  // ExifTool's `next if $size == 2` (QuickTimeStream.pl:1474) skips the `Text`
+  // store + the whole `Process_text` decode for a zero-length length-prefixed
+  // sample — but `FoundSomething` (:1461) ALREADY opened this sample's `Doc<N>`
+  // + emitted its `SampleTime`/`SampleDuration` ABOVE the `unless` block, so the
+  // `next` is NOT a "produce no timing" exit: the doc + timing survive. exifast
+  // emits that timing in the unified tail below (the caller opened `doc`), so a
+  // size==2 sample must SKIP the decode yet STILL fall through to the tail. Model
+  // the `next` as "skip decode", never as an early return — that is the escape
+  // hatch the per-text-sample-timing class fix closes.
+  let mut skip_decode = false;
+  if !buf.starts_with(b"$BEGIN") {
+    // `$buff =~ s/\0\0\0\x0cencd\0\0\x01\0$//` — drop a trailing `encd` box.
+    if let Some(stripped) =
+      buf.strip_suffix(&[0, 0, 0, 0x0c, b'e', b'n', b'c', b'd', 0, 0, 0x01, 0][..])
+    {
+      buf = stripped;
+    }
+    // `if $size >= 2 and unpack('n',$buff) == $size - 2 { $buff = substr($buff,2) }`
+    // — a 2-byte big-endian length prefix equal to the remaining length.
+    if buf.len() >= 2
+      && let (Some(hi), Some(lo)) = (buf.first(), buf.get(1))
+    {
+      let prefix = (u16::from(*hi) << 8) | u16::from(*lo);
+      if usize::from(prefix) == buf.len() - 2 {
+        if buf.len() == 2 {
+          // `next if $size == 2` — the zero-length prefix. Skip storing `Text`
+          // and skip `Process_text`, but fall through to the timing tail (the
+          // doc + `SampleTime`/`SampleDuration` were already emitted upstream).
+          skip_decode = true;
+        } else {
+          buf = buf.get(2..).unwrap_or(buf);
+        }
+      }
+    }
+    // `unless (defined $val or $buff =~ /\0[^\0]/) { HandleTag Text => $buff;
+    // $handled = 1 }` — store the whole buffer as `Text` when it has no
+    // NUL-followed-by-non-NUL pair (the E-PRANCE `$val` branch is deferred).
+    if !skip_decode
+      && !has_nul_then_nonnul(buf)
+      && let Ok(text) = core::str::from_utf8(buf)
+    {
+      wrapper_text = Some(SmolStr::from(text));
+    }
+  }
+  // `Process_text($et, \$buff, $tagTbl, $handled)` runs for every non-size==2
+  // sample (the `$BEGIN` path reaches it too). A size==2 `next` bypasses it.
+  if !skip_decode {
+    process_text(buf, wrapper_text, out);
+  }
+  // ── Unified timing tail — the per-text-sample-timing guarantee ──────────────
+  // EVERY exit of this function (size==2 skip, `$BEGIN`, plain-text stored,
+  // binary `\0[^\0]` gated, sentence matched, `Process_text` empty) reaches here
+  // with the caller's `doc` already opened. `FoundSomething` (QuickTimeStream.pl:
+  // 1461) fires its `SampleTime`/`SampleDuration` for EVERY `text` sample BEFORE
+  // any decode, so this sample's timing MUST surface under `doc` regardless of
+  // whether a fix decoded. Emit it via EXACTLY ONE of: stamping the GPS/Text rows
+  // `Process_text` produced, OR a `GpmdTimingOnly` marker when it produced none.
+  // There is NO early return above this point — no text sample can consume a
+  // `Doc<N>` without emitting its timing here.
+  if out.gps_sample_count() > gps_start {
+    // Stamp the enclosing `Track<N>` origin + the sample-table timing onto exactly
+    // the fix/Text row this sample produced (`FoundSomething` already opened `doc`).
+    out.stamp_gps_gpmd_from(gps_start, track_index, doc, sample_time, sample_duration);
+  } else {
+    // `Process_text` emitted nothing (a binary `\0[^\0]` sample whose `Text` is
+    // gated and which matches no sentence). `FoundSomething` (:1473) still emitted
+    // this sample's `SampleTime`/`SampleDuration` under `doc`, so record a
+    // [`crate::metadata::GpmdTimingOnly`] marker carrying the doc + `Track<N>` +
+    // timing — exactly the `gpmd` matched-but-empty path. Without it the consumed
+    // `Doc<N>` would carry no `Track<N>` timing row even though the oracle has one
+    // (the Insta360 `.insv`'s `Doc1..469:Track3:SampleTime`/`SampleDuration`).
+    out.push_gpmd_timing_only(crate::metadata::GpmdTimingOnly::new());
+    out.stamp_gpmd_timing_only_last(track_index, doc, sample_time, sample_duration);
+  }
+}
+
+/// `$buff =~ /\0[^\0]/` — true when a NUL byte is immediately followed by a
+/// non-NUL byte (the "this is binary, don't store as Text" gate,
+/// QuickTimeStream.pl:1510).
+fn has_nul_then_nonnul(b: &[u8]) -> bool {
+  b.windows(2).any(|w| matches!(w, [0, x] if *x != 0))
+}
+
 // ─────────────────────────── Process_text (Rove + general) ─────────────────
 
 /// `Process_text` (QuickTimeStream.pl:1053-1295) — faithful port of the
@@ -3000,8 +3154,20 @@ fn detect_wolfbox(data: &[u8]) -> bool {
 /// `data` is the sample bytes; the function inspects them for known
 /// markers and emits a [`GpsSample`] via the common [`FreeGpsTags::emit`]
 /// path when one or more known sentences match.
-pub fn process_text(data: &[u8], out: &mut QuickTimeStreamMeta) {
+///
+/// The raw-dispatch callers (Rove `gpmd`, `camm` `^X`) pass `wrapper_text =
+/// None`; the timed-text wrapper ([`process_timed_text`]) passes the
+/// `Text => $buff` value it already stored on the sample
+/// (QuickTimeStream.pl:1512) so it survives even when no sentence matches. The
+/// confirmed text-fallback variants (Mini 0806 / Roadhawk / Thinkware / DJI) all
+/// carry NO leading-`$` `$TAG` records, so they are decoded by the POST-loop
+/// branches below — the `unless $handled` in-loop `$tags{Text}` accumulation
+/// (QuickTimeStream.pl:1070/1111) never fires for them and is not ported.
+pub fn process_text(data: &[u8], wrapper_text: Option<SmolStr>, out: &mut QuickTimeStreamMeta) {
   let mut t = FreeGpsTags::new();
+  if let Some(txt) = wrapper_text {
+    t.text_extras.set_text(Some(txt));
+  }
   let mut emitted_via_text = false;
   // QuickTimeStream.pl:1066 `while ($$dataPt =~ /\$(\w+)([^\$\0]*)/g)` —
   // scan ASCII `$TAG...` sequences (terminated by next `$` or NUL).
@@ -3081,12 +3247,146 @@ pub fn process_text(data: &[u8], out: &mut QuickTimeStreamMeta) {
     }
     return;
   }
-  // The Mini 0806 / Roadhawk / DJI telemetry / Thinkware-NMEA branches are
-  // text-only fallbacks; their fingerprints are independent of the binary
-  // dashcam variants we wire up here. Faithful-port stubs follow the same
-  // ASCII flow path used by NMEA above and surface via [`FreeGpsTags::emit`].
-  // (See follow-up issue: less common Process_text fallbacks.)
-  let _ = data;
+  // ── The post-loop text-fallback branches (QuickTimeStream.pl:1213-1294) ──
+  // Reached only when the `$TAG` loop produced no fix AND the binary block did
+  // not match — exactly Perl's flow (the `%tags`/binary `return`s above are the
+  // early exits). `t` is otherwise empty here, so a fresh decode starts.
+
+  // DJI telemetry (QuickTimeStream.pl:1213-1230):
+  //   "F/3.5, SS 1000, ISO 100, EV 0, GPS (8.6499, 53.1665, 18), D 24.26m,
+  //    H 6.00m, H.S 2.10m/s, V.S 0.00m/s"
+  // The `GPS (lon, lat[, alt])` pair is `$1`=lon, `$2`=lat (the regex captures
+  // lon FIRST), both raw decimal degrees.
+  if let Some(dji) = parse_dji_telemetry(data) {
+    // `$$et{CreateDateAtEnd} = 1` (QuickTimeStream.pl:1217) is a file-flag for a
+    // creation-date-at-EOF hint; exifast's crafted fixture carries no such
+    // trailer and ExifTool emits no extra tag from it here — no-op.
+    t.lat = Some(dji.lat);
+    t.lon = Some(dji.lon);
+    t.ddd = true;
+    if let Some(alt) = dji.alt {
+      t.alt = Some(alt);
+    }
+    if let Some(spd) = dji.speed_kph {
+      t.spd = Some(spd);
+    }
+    let ex = &mut t.text_extras;
+    if let Some(d) = dji.distance {
+      ex.set_distance(Some(d));
+    }
+    if let Some(vs) = dji.vertical_speed {
+      ex.set_vertical_speed(Some(vs));
+    }
+    if let Some(fnum) = dji.fnumber {
+      ex.set_fnumber(Some(fnum));
+    }
+    if let Some(et) = dji.exposure_time_s {
+      ex.set_exposure_time_s(Some(et));
+    }
+    if let Some(ev) = dji.exposure_compensation {
+      ex.set_exposure_compensation(Some(ev));
+    }
+    if let Some(iso) = dji.iso {
+      ex.set_iso(Some(iso));
+    }
+    t.emit(out);
+    return;
+  }
+
+  // Mini 0806 dashcam GPS (QuickTimeStream.pl:1232-1248):
+  //   "A,270519,201555.000,3356.8925,N,08420.2071,W,000.0,331.0M,
+  //    +01.84,-09.80,-00.61;"
+  if let Some(mini) = parse_mini_0806(data) {
+    t.yr = Some(mini.yr);
+    t.mon = Some(mini.mon);
+    t.day = Some(mini.day);
+    t.hr = Some(mini.hr);
+    t.min = Some(mini.min);
+    t.sec = Some(mini.sec);
+    if let Some((lat, lat_ref)) = mini.lat {
+      t.lat = Some(lat);
+      t.lat_ref = Some(lat_ref);
+    }
+    if let Some((lon, lon_ref)) = mini.lon {
+      t.lon = Some(lon);
+      t.lon_ref = Some(lon_ref);
+    }
+    // Mini lat/lon are computed in decimal degrees with the sign already applied
+    // in the parse (`* ($ref eq 'S' ? -1 : 1)`), so ConvertLatLon is skipped and
+    // the ref is NOT re-applied — clear the ref after capturing the sign.
+    t.lat_ref = None;
+    t.lon_ref = None;
+    t.ddd = true;
+    if let Some(alt) = mini.alt {
+      t.alt = Some(alt);
+    }
+    if let Some(spd) = mini.speed {
+      t.spd = Some(spd);
+    }
+    if let Some(acc) = mini.accel_str {
+      t.accel_str = Some(acc);
+    }
+    t.emit(out);
+    return;
+  }
+
+  // Roadhawk (QuickTimeStream.pl:1250-1269): the `\*[0-9A-F]{2}~$` fingerprint
+  // selects a custom-substitution-encoded buffer that DECODES to an
+  // `X..Y..Z..G..$GPRMC,..` string; the decoded `$GPRMC` is then parsed by the
+  // NMEA-RMC branch below (Perl replaces `$$dataPt` and falls through).
+  let mut nmea_buf: Option<Vec<u8>> = None;
+  if let Some(decoded) = decode_roadhawk(data) {
+    // `$buff =~ /X(.*?)Y(.*?)Z(.*?)G(.*?)\$/` (QuickTimeStream.pl:1264): the
+    // decode "worked out" only when the X/Y/Z/G accelerometer prefix is present;
+    // capture the 4-value Accelerometer and adopt the decoded buffer for the
+    // NMEA-RMC parse (`$$dataPt = $buff`).
+    if let Some(acc) = roadhawk_accel(&decoded) {
+      t.accel_str = Some(acc);
+      nmea_buf = Some(decoded);
+    }
+  }
+  let nmea_data: &[u8] = nmea_buf.as_deref().unwrap_or(data);
+
+  // Thinkware / general NMEA-RMC (QuickTimeStream.pl:1271-1284):
+  //   "gsensori,4,512,-67,-12,100;GNRMC,161313.00,A,4529.87489,N,07337.01215,W,
+  //    6.225,35.34,310819,,,A*52;CAR,0,0,0,..."
+  // A `[A-Z]{2}RMC,..` (NO leading `$`) anywhere in the buffer, with day/mon/yr
+  // sanity checks. Roadhawk's decoded `$GPRMC` matches here too.
+  let mut matched = false;
+  if let Some(rmc) = parse_thinkware_rmc(nmea_data) {
+    t.yr = Some(rmc.yr);
+    t.mon = Some(rmc.mon);
+    t.day = Some(rmc.day);
+    t.hr = Some(rmc.hr);
+    t.min = Some(rmc.min);
+    t.sec = Some(rmc.sec);
+    t.lat = Some(rmc.lat);
+    t.lon = Some(rmc.lon);
+    t.ddd = true;
+    if let Some(spd) = rmc.spd {
+      t.spd = Some(spd);
+    }
+    if let Some(trk) = rmc.trk {
+      t.trk = Some(trk);
+    }
+    matched = true;
+  }
+  // `gsensori` / `CAR` extraction (QuickTimeStream.pl:1285-1286) — applied to
+  // the ORIGINAL buffer regardless of which branch matched.
+  if let Some(gs) = extract_after_marker(data, b"gsensori,") {
+    t.text_extras.set_gsensor(Some(gs));
+    matched = true;
+  }
+  if let Some(car) = extract_after_marker(data, b"CAR,") {
+    t.text_extras.set_car(Some(car));
+    matched = true;
+  }
+
+  // `if (%tags) HandleTextTags` (QuickTimeStream.pl:1288): emit when any branch
+  // populated a tag (the Roadhawk Accelerometer counts, as does a wrapper Text).
+  if matched || t.accel_str.is_some() || !t.text_extras.is_empty() {
+    t.emit(out);
+  }
 }
 
 /// Iterate `$TAG..[^$\0]*` records inside an ASCII haystack
@@ -3615,6 +3915,706 @@ fn parse_decimal(b: &[u8], p: &mut usize) -> Option<f64> {
     }
   }
   core::str::from_utf8(b.get(start..*p)?).ok()?.parse().ok()
+}
+
+// ─────────────────── Process_text fallbacks (DJI / Mini / Roadhawk / Thinkware)
+
+/// The DJI telemetry decode (QuickTimeStream.pl:1213-1230). `lat`/`lon` are raw
+/// decimal degrees; `speed_kph`/`distance` are already `× $mpsToKph`;
+/// `vertical_speed` keeps the RAW captured string.
+struct DjiTelemetry {
+  lat: f64,
+  lon: f64,
+  alt: Option<f64>,
+  speed_kph: Option<f64>,
+  distance: Option<f64>,
+  vertical_speed: Option<SmolStr>,
+  fnumber: Option<f64>,
+  exposure_time_s: Option<f64>,
+  exposure_compensation: Option<f64>,
+  iso: Option<SmolStr>,
+}
+
+/// Parse the DJI telemetry text (QuickTimeStream.pl:1216-1227). The `GPS
+/// (lon, lat[, alt])` pair is REQUIRED (`$1`=lon, `$2`=lat); every other field
+/// is an independent optional `if $$dataPt =~ /.../` match on the WHOLE buffer.
+fn parse_dji_telemetry(data: &[u8]) -> Option<DjiTelemetry> {
+  let s = core::str::from_utf8(data).ok()?;
+  // `GPS \(([-+]?\d*\.\d+),\s*([-+]?\d*\.\d+)` — lon then lat.
+  let gps_at = s.find("GPS (")?;
+  let after = s.get(gps_at + 5..)?;
+  let (lon, rest) = scan_signed_dotted(after)?;
+  let rest = rest.strip_prefix(',')?;
+  let rest = rest.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
+  let (lat, _) = scan_signed_dotted(rest)?;
+  Some(DjiTelemetry {
+    lat,
+    lon,
+    // `,\s*H\s+([-+]?\d+\.?\d*)m` — altitude from the H(eight) field.
+    alt: find_comma_field(s, b"H", |t| {
+      let (v, r) = scan_signed_int_optfrac(t)?;
+      r.strip_prefix('m').map(|_| v)
+    }),
+    // `,\s*H.S\s+([-+]?\d+\.?\d*)` — m/s, scaled to km/h (`.` matches any byte).
+    speed_kph: find_comma_field(s, b"H.S", |t| scan_signed_int_optfrac(t).map(|(v, _)| v))
+      .map(|v| v * MPS_TO_KPH),
+    // `,\s*D\s+(\d+\.?\d*)m` — distance (m/s reading) scaled to km/h.
+    distance: find_comma_field(s, b"D", |t| {
+      let (v, r) = scan_unsigned_int_optfrac(t)?;
+      r.strip_prefix('m').map(|_| v)
+    })
+    .map(|v| v * MPS_TO_KPH),
+    // `,\s*V.S\s+([-+]?\d+\.?\d*)` — the RAW captured string (rendered "$val m/s").
+    vertical_speed: find_comma_field(s, b"V.S", |t| {
+      scan_signed_int_optfrac_str(t).map(|(tok, _)| SmolStr::from(tok))
+    }),
+    // `\bF\/(\d+\.?\d*)` — f-number.
+    fnumber: find_fnumber_field(s, |t| scan_unsigned_int_optfrac(t).map(|(v, _)| v)),
+    // `\bSS\s+(\d+\.?\d*)` — exposure 1/SS.
+    exposure_time_s: find_word_field(s, b"SS", |t| scan_unsigned_int_optfrac(t).map(|(v, _)| v))
+      .and_then(|ss| (ss != 0.0).then_some(1.0 / ss)),
+    // `\bEV\s+([-+]?\d+\.?\d*)(\/\d+)?` — `$1 / ($2 || 1)`.
+    exposure_compensation: find_word_field(s, b"EV", |t| {
+      let (num, r) = scan_signed_int_optfrac(t)?;
+      // Optional `/\d+` denominator.
+      let denom = r
+        .strip_prefix('/')
+        .and_then(|d| scan_unsigned_int(d).map(|(v, _)| v))
+        .filter(|&d| d != 0.0)
+        .unwrap_or(1.0);
+      Some(num / denom)
+    }),
+    // `\bISO\s+(\d+\.?\d*)` — the RAW captured token.
+    iso: find_word_field(s, b"ISO", |t| {
+      scan_unsigned_int_optfrac_str(t).map(|(tok, _)| SmolStr::from(tok))
+    }),
+  })
+}
+
+/// The Mini 0806 decode (QuickTimeStream.pl:1232-1248).
+struct Mini0806 {
+  yr: i32,
+  mon: u32,
+  day: u32,
+  hr: u32,
+  min: u32,
+  sec: String,
+  lat: Option<(f64, char)>,
+  lon: Option<(f64, char)>,
+  alt: Option<f64>,
+  speed: Option<f64>,
+  /// The 3-value Accelerometer `"$a[9] $a[10] $a[11]"` — ExifTool joins the RAW
+  /// split tokens verbatim (`"+01.84 -09.80 -00.61"`, QuickTimeStream.pl:1245),
+  /// so this is a pre-joined string, not parsed floats.
+  accel_str: Option<SmolStr>,
+}
+
+/// Parse the Mini 0806 dashcam record (QuickTimeStream.pl:1234-1245):
+/// `^A,(\d{2})(\d{2})(\d{2}),(\d{2})(\d{2})(\d{2}(\.\d+)?)`, then lat/lon via
+/// later anchored sub-matches and alt/speed/accel from the comma split.
+fn parse_mini_0806(data: &[u8]) -> Option<Mini0806> {
+  let b = data;
+  // `^A,` — the fingerprint.
+  if b.get(0..2) != Some(b"A,".as_slice()) {
+    return None;
+  }
+  let mut p = 2usize;
+  // Date DDMMYY (2+2+2) — the regex is `(\d{2})(\d{2})(\d{2})` ⇒ $1=day, $2=mon,
+  // $3=yr; the date string is `"20$3:$2:$1"` (QuickTimeStream.pl:1235).
+  let day = parse_uint_fixed(b, &mut p, 2)?;
+  let mon = parse_uint_fixed(b, &mut p, 2)?;
+  let yr2 = parse_uint_fixed(b, &mut p, 2)?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  // Time HHMMSS(.sss) — `(\d{2})(\d{2})(\d{2}(\.\d+)?)`.
+  let hr = parse_uint_fixed(b, &mut p, 2)?;
+  let min = parse_uint_fixed(b, &mut p, 2)?;
+  let sec_start = p;
+  let _ = parse_uint_fixed(b, &mut p, 2)?;
+  if byte_at_eq(b, p, b'.') {
+    p += 1;
+    while digit_at(b, p) {
+      p += 1;
+    }
+  }
+  let sec = core::str::from_utf8(b.get(sec_start..p)?).ok()?.to_string();
+
+  // The whole-buffer text (the remaining matches are field-position sub-regexes).
+  let s = core::str::from_utf8(b).ok()?;
+  // Lat: `^A,.*?,.*?,(\d{2})(\d+\.\d+),([NS])` — the 3rd comma-field.
+  let lat = mini_field_after_commas(s, 3).and_then(|f| {
+    let (deg, min2, lref) = parse_mini_coord(f, 2)?;
+    Some((
+      (deg + min2 / 60.0) * if lref == 'S' { -1.0 } else { 1.0 },
+      lref,
+    ))
+  });
+  // Lon: `^A,.*?,.*?,.*?,.*?,(\d{3})(\d+\.\d+),([EW])` — the 5th comma-field.
+  let lon = mini_field_after_commas(s, 5).and_then(|f| {
+    let (deg, min2, lref) = parse_mini_coord(f, 3)?;
+    Some((
+      (deg + min2 / 60.0) * if lref == 'W' { -1.0 } else { 1.0 },
+      lref,
+    ))
+  });
+  // `@a = split ',', $$dataPt`; $a[7]=speed, $a[8]=altitude(strip M),
+  // $a[9..11]=accel (strip trailing `;`).
+  let a: Vec<&str> = s.split(',').collect();
+  let alt = a.get(8).and_then(|v| {
+    let stripped = v.strip_suffix('M')?;
+    stripped.parse::<f64>().ok()
+  });
+  // `$a[7] if $a[7] =~ /^\d+\.\d+$/`.
+  let speed = a
+    .get(7)
+    .filter(|v| is_plain_decimal(v))
+    .and_then(|v| v.parse::<f64>().ok());
+  // `Accelerometer = "$a[9] $a[10] $a[11]" if $a[11] and $a[11] =~ s/;\s*$//`
+  // (QuickTimeStream.pl:1245). The RAW split tokens are joined verbatim; the
+  // `s/;\s*$//` strips the trailing `;` (+ whitespace) from `$a[11]` in place and
+  // must SUCCEED. So a3 is the third field with its trailing `;…` removed.
+  let accel_str = match (a.get(9), a.get(10), a.get(11)) {
+    (Some(&a1), Some(&a2), Some(&a3)) if !a3.is_empty() => {
+      // `s/;\s*$//` — strip trailing whitespace then a single `;` then any
+      // whitespace BEFORE it (Perl `\s*$` is trailing whitespace, the `;` then
+      // precedes it). Require the substitution to match (a `;` present).
+      let a3_trimmed = a3.trim_end_matches([' ', '\t', '\n', '\r', '\x0c']);
+      let a3_no_semi = a3_trimmed.strip_suffix(';')?;
+      Some(SmolStr::from(alloc::format!("{a1} {a2} {a3_no_semi}")))
+    }
+    _ => None,
+  };
+  Some(Mini0806 {
+    yr: i32::try_from(yr2).ok()? + 2000,
+    mon,
+    day,
+    hr,
+    min,
+    sec,
+    lat,
+    lon,
+    alt,
+    speed,
+    accel_str,
+  })
+}
+
+/// The parsed NMEA-RMC fields (QuickTimeStream.pl:1274-1283), shared by the
+/// Thinkware path and the Roadhawk decoded `$GPRMC`. Decimal-degree lat/lon.
+struct NmeaRmc {
+  yr: i32,
+  mon: u32,
+  day: u32,
+  hr: u32,
+  min: u32,
+  sec: String,
+  lat: f64,
+  lon: f64,
+  spd: Option<f64>,
+  trk: Option<f64>,
+}
+
+/// Parse a `[A-Z]{2}RMC,...` sentence ANYWHERE in the buffer (NO leading `$`),
+/// with the day≤31 / mon≤12 / yr≤99 sanity checks (QuickTimeStream.pl:1274-1276).
+/// This is the Thinkware / general-NMEA-RMC POST-loop branch — distinct from the
+/// `$`-anchored [`parse_nmea_rmc`] used by the Type-2/7 freeGPS decoders (that
+/// one reads RAW decimal lat/lon; this one is the DDMM→decimal `($deg + $min/60)`
+/// conversion, like [`parse_text_rmc`]).
+fn parse_thinkware_rmc(data: &[u8]) -> Option<NmeaRmc> {
+  let s = core::str::from_utf8(data).ok()?;
+  let b = s.as_bytes();
+  // Scan for `[A-Z]{2}RMC,` and try to parse from there.
+  let mut i = 0usize;
+  while i + 6 <= b.len() {
+    let win = b.get(i..i + 6)?;
+    if win.first().is_some_and(u8::is_ascii_uppercase)
+      && win.get(1).is_some_and(u8::is_ascii_uppercase)
+      && win.get(2..6) == Some(b"RMC,".as_slice())
+      && let Some(rmc) = parse_nmea_rmc_body(b, i + 6)
+    {
+      return Some(rmc);
+    }
+    i += 1;
+  }
+  None
+}
+
+/// Parse the RMC body starting right after `XXRMC,` at `p`:
+/// `(\d{2})(\d{2})(\d+(\.\d*)?),A?,(\d*?)(\d{1,2}\.\d+),([NS]),(\d*?)
+/// (\d{1,2}\.\d+),([EW]),(\d*\.?\d*),(\d*\.?\d*),(\d{2})(\d{2})(\d+)` with the
+/// day/mon/yr sanity gate.
+fn parse_nmea_rmc_body(b: &[u8], mut p: usize) -> Option<NmeaRmc> {
+  let hr = parse_uint_fixed(b, &mut p, 2)?;
+  let min = parse_uint_fixed(b, &mut p, 2)?;
+  // Sec `\d+(\.\d*)?`. The Thinkware branch builds GPSDateTime via
+  // `sprintf('%.2d', $3)` (QuickTimeStream.pl:1279) — an INTEGER seconds (the
+  // fractional part of `13.00` is dropped by `%.2d`). Capture the integer-digit
+  // run for `sec`, then consume (but discard) any fractional digits so the field
+  // cursor advances past the whole `\d+(\.\d*)?` match.
+  let sec_start = p;
+  while digit_at(b, p) {
+    p += 1;
+  }
+  if p == sec_start {
+    return None;
+  }
+  let sec = core::str::from_utf8(b.get(sec_start..p)?).ok()?.to_string();
+  if byte_at_eq(b, p, b'.') {
+    p += 1;
+    while digit_at(b, p) {
+      p += 1;
+    }
+  }
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  // `A?,`.
+  if byte_at_eq(b, p, b'A') {
+    p += 1;
+  }
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let (lat_deg, lat_min) = read_dddmm(b, &mut p)?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let lat_sign = match b.get(p)? {
+    b'N' => 1.0,
+    b'S' => -1.0,
+    _ => return None,
+  };
+  p += 1;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let (lon_deg, lon_min) = read_dddmm(b, &mut p)?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let lon_sign = match b.get(p)? {
+    b'E' => 1.0,
+    b'W' => -1.0,
+    _ => return None,
+  };
+  p += 1;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let spd = parse_optional_decimal(b, &mut p)?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let trk = parse_optional_decimal(b, &mut p)?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  // Date DDMMYY — `(\d{2})(\d{2})(\d+)` ⇒ $13=day, $14=mon, $15=yr.
+  let day = parse_uint_fixed(b, &mut p, 2)?;
+  let mon = parse_uint_fixed(b, &mut p, 2)?;
+  let yr_start = p;
+  while digit_at(b, p) {
+    p += 1;
+  }
+  if p - yr_start < 1 {
+    return None;
+  }
+  let yr2: i32 = core::str::from_utf8(b.get(yr_start..(yr_start + 2).min(p))?)
+    .ok()?
+    .parse()
+    .ok()?;
+  // Sanity checks: day≤31, mon≤12, yr2≤99 (QuickTimeStream.pl:1276).
+  if day > 31 || mon > 12 || yr2 > 99 {
+    return None;
+  }
+  let yr = yr2 + if yr2 >= 70 { 1900 } else { 2000 };
+  Some(NmeaRmc {
+    yr,
+    mon,
+    day,
+    hr,
+    min,
+    sec,
+    lat: (lat_deg + lat_min / 60.0) * lat_sign,
+    lon: (lon_deg + lon_min / 60.0) * lon_sign,
+    spd: spd.map(|v| v * KNOTS_TO_KPH),
+    trk,
+  })
+}
+
+/// The Roadhawk custom-substitution decode table (QuickTimeStream.pl:1257):
+/// `'-I8XQWRVNZOYPUTA0B1C2SJ9K.L,M$D3E4F5G6H7'`. Each input byte `c` with
+/// `n = c - 43 >= 0` maps to `DECODE[n]` (when in range); other bytes pass
+/// through unchanged.
+const ROADHAWK_DECODE: &[u8] = b"-I8XQWRVNZOYPUTA0B1C2SJ9K.L,M$D3E4F5G6H7";
+
+/// Decode a Roadhawk buffer (QuickTimeStream.pl:1255-1263): the fingerprint
+/// `\*[0-9A-F]{2}~$` (a `*` + 2 hex digits + `~` at the very END), then strip
+/// the trailing 4 bytes and run the substitution map. Returns the decoded bytes
+/// (or `None` when the fingerprint is absent).
+fn decode_roadhawk(data: &[u8]) -> Option<Vec<u8>> {
+  // `\*[0-9A-F]{2}~$` — the last 4 bytes are `*`, hex, hex, `~`.
+  let n = data.len();
+  if n < 4 {
+    return None;
+  }
+  let tail = data.get(n - 4..n)?;
+  // `[0-9A-F]` — uppercase hex only (Perl's character class).
+  let is_hex_upper = |c: &u8| c.is_ascii_digit() || (b'A'..=b'F').contains(c);
+  if tail.first() != Some(&b'*')
+    || tail.get(3) != Some(&b'~')
+    || !tail.get(1..3)?.iter().all(is_hex_upper)
+  {
+    return None;
+  }
+  // `substr($$dataPt, 0, -4)` — everything but the trailing 4 bytes.
+  let body = data.get(..n - 4)?;
+  let decoded: Vec<u8> = body
+    .iter()
+    .map(|&c| {
+      // `$n = $_ - 43; $_ = $decode[$n] if $n >= 0 and defined $decode[$n]`.
+      c.checked_sub(43)
+        .and_then(|n| ROADHAWK_DECODE.get(n as usize).copied())
+        .unwrap_or(c)
+    })
+    .collect();
+  Some(decoded)
+}
+
+/// `$buff =~ /X(.*?)Y(.*?)Z(.*?)G(.*?)\$/` (QuickTimeStream.pl:1264): pull the
+/// 4-value Accelerometer `"$1 $2 $3 $4"` from a decoded Roadhawk buffer. The
+/// captures are NON-greedy up to the next literal, ending at the `$` (of
+/// `$GPRMC`). Returns the space-joined string when the prefix is present.
+fn roadhawk_accel(decoded: &[u8]) -> Option<SmolStr> {
+  let s = core::str::from_utf8(decoded).ok()?;
+  let after_x = s.get(s.find('X')? + 1..)?;
+  let (a, after_y) = after_x.split_once('Y')?;
+  let (b, after_z) = after_y.split_once('Z')?;
+  let (c, after_g) = after_z.split_once('G')?;
+  let (d, _) = after_g.split_once('$')?;
+  let mut out = String::with_capacity(a.len() + b.len() + c.len() + d.len() + 3);
+  out.push_str(a);
+  out.push(' ');
+  out.push_str(b);
+  out.push(' ');
+  out.push_str(c);
+  out.push(' ');
+  out.push_str(d);
+  Some(SmolStr::from(out))
+}
+
+/// `\bMARKER(.*?)(;|$)` (QuickTimeStream.pl:1285-1286) — the capture between a
+/// literal marker and the next `;` (or end of buffer). Used for `gsensori,` →
+/// `GSensor` and `CAR,` → `Car`. The marker here INCLUDES the trailing `,` of
+/// the Perl literal so the capture starts at the value. Returns `None` when the
+/// marker is absent.
+fn extract_after_marker(data: &[u8], marker: &[u8]) -> Option<SmolStr> {
+  let s = core::str::from_utf8(data).ok()?;
+  let m = core::str::from_utf8(marker).ok()?;
+  let start = s.find(m)? + m.len();
+  let rest = s.get(start..)?;
+  let end = rest.find(';').unwrap_or(rest.len());
+  Some(SmolStr::from(rest.get(..end)?))
+}
+
+// ── small scan helpers for the DJI free-form text ────────────────────────────
+
+/// `[-+]?\d*\.\d+` — an optionally-signed number with a REQUIRED decimal point
+/// and ≥1 fractional digit (`8.6499`, `.5`, `-12.0`). Returns `(value, rest)`.
+fn scan_signed_dotted(s: &str) -> Option<(f64, &str)> {
+  let b = s.as_bytes();
+  let mut p = 0usize;
+  if matches!(b.first(), Some(b'+' | b'-')) {
+    p += 1;
+  }
+  while b.get(p).is_some_and(u8::is_ascii_digit) {
+    p += 1;
+  }
+  if b.get(p) != Some(&b'.') {
+    return None;
+  }
+  p += 1;
+  let frac_start = p;
+  while b.get(p).is_some_and(u8::is_ascii_digit) {
+    p += 1;
+  }
+  if p == frac_start {
+    return None;
+  }
+  let v: f64 = s.get(..p)?.parse().ok()?;
+  Some((v, s.get(p..)?))
+}
+
+/// `[-+]?\d+\.?\d*` — a signed integer with an OPTIONAL fractional part.
+/// Returns `(value, rest)`.
+fn scan_signed_int_optfrac(s: &str) -> Option<(f64, &str)> {
+  let (tok, rest) = scan_signed_int_optfrac_str(s)?;
+  Some((tok.parse().ok()?, rest))
+}
+
+/// As [`scan_signed_int_optfrac`] but returns the RAW token (for tags whose
+/// PrintConv interpolates `"$val"` verbatim — `VerticalSpeed`).
+fn scan_signed_int_optfrac_str(s: &str) -> Option<(&str, &str)> {
+  let b = s.as_bytes();
+  let mut p = 0usize;
+  if matches!(b.first(), Some(b'+' | b'-')) {
+    p += 1;
+  }
+  let int_start = p;
+  while b.get(p).is_some_and(u8::is_ascii_digit) {
+    p += 1;
+  }
+  if p == int_start {
+    return None;
+  }
+  if b.get(p) == Some(&b'.') {
+    p += 1;
+    while b.get(p).is_some_and(u8::is_ascii_digit) {
+      p += 1;
+    }
+  }
+  Some((s.get(..p)?, s.get(p..)?))
+}
+
+/// `\d+\.?\d*` — an UNSIGNED integer with an OPTIONAL fractional part.
+fn scan_unsigned_int_optfrac(s: &str) -> Option<(f64, &str)> {
+  let (tok, rest) = scan_unsigned_int_optfrac_str(s)?;
+  Some((tok.parse().ok()?, rest))
+}
+
+/// As [`scan_unsigned_int_optfrac`] but returns the RAW token (`ISO`).
+fn scan_unsigned_int_optfrac_str(s: &str) -> Option<(&str, &str)> {
+  let b = s.as_bytes();
+  let mut p = 0usize;
+  let int_start = p;
+  while b.get(p).is_some_and(u8::is_ascii_digit) {
+    p += 1;
+  }
+  if p == int_start {
+    return None;
+  }
+  if b.get(p) == Some(&b'.') {
+    p += 1;
+    while b.get(p).is_some_and(u8::is_ascii_digit) {
+      p += 1;
+    }
+  }
+  Some((s.get(..p)?, s.get(p..)?))
+}
+
+/// `\d+` — a bare unsigned integer. Returns `(value, rest)`.
+fn scan_unsigned_int(s: &str) -> Option<(f64, &str)> {
+  let b = s.as_bytes();
+  let mut p = 0usize;
+  while b.get(p).is_some_and(u8::is_ascii_digit) {
+    p += 1;
+  }
+  if p == 0 {
+    return None;
+  }
+  Some((s.get(..p)?.parse().ok()?, s.get(p..)?))
+}
+
+/// `\s` (Perl) — ASCII whitespace `[ \t\n\r\f]`. Rust's [`u8::is_ascii_whitespace`]
+/// is the same set (space, tab, LF, FF, CR), matching the DJI regexes' `\s`.
+fn is_ws(b: u8) -> bool {
+  b.is_ascii_whitespace()
+}
+
+/// `\w` (Perl) — `[A-Za-z0-9_]`, used for the `\b` word-boundary in `\bF\/` /
+/// `\bSS` / `\bEV` / `\bISO`.
+fn is_word(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Try to match `marker` at byte offset `p` of `b`, where a `.` byte in `marker`
+/// matches ANY single byte (mirroring the regex `.` in `H.S` / `V.S`). Returns
+/// the offset just past the marker on success.
+fn match_marker(b: &[u8], p: usize, marker: &[u8]) -> Option<usize> {
+  let mut i = p;
+  for &m in marker {
+    let c = *b.get(i)?;
+    if m != b'.' && m != c {
+      return None;
+    }
+    i += 1;
+  }
+  Some(i)
+}
+
+/// Mirror `,\s*<marker>\s+` (the DJI `GPSAltitude`/`GPSSpeed`/`Distance`/
+/// `VerticalSpeed` field prefixes `,\s*H\s+` / `,\s*H.S\s+` / `,\s*D\s+` /
+/// `,\s*V.S\s+`). Scans EVERY `,`, skips `\s*`, matches `<marker>` (with `.` =
+/// any byte), then requires `\s+`; on the first full match runs `f` on the text
+/// AFTER the whitespace and returns its result. Whitespace-tolerant: handles no
+/// space after the comma, multiple spaces, and tabs — unlike the old fixed `", H "`
+/// literals (which required exactly one space on each side, silently losing the
+/// field on valid non-canonical spacing).
+fn find_comma_field<T>(s: &str, marker: &[u8], mut f: impl FnMut(&str) -> Option<T>) -> Option<T> {
+  let b = s.as_bytes();
+  let mut from = 0usize;
+  while let Some(rel) = s.get(from..)?.find(',') {
+    let comma = from + rel;
+    from = comma + 1;
+    // `,` then `\s*`.
+    let mut p = comma + 1;
+    while b.get(p).copied().is_some_and(is_ws) {
+      p += 1;
+    }
+    // `<marker>` (with `.` = any byte).
+    let Some(after_marker) = match_marker(b, p, marker) else {
+      continue;
+    };
+    // `\s+` — at least one whitespace byte.
+    let mut q = after_marker;
+    while b.get(q).copied().is_some_and(is_ws) {
+      q += 1;
+    }
+    if q == after_marker {
+      continue; // `\s+` requires ≥1.
+    }
+    if let Some(v) = f(s.get(q..)?) {
+      return Some(v);
+    }
+  }
+  None
+}
+
+/// Mirror `\b<marker>\s+` (the DJI `ExposureTime`/`ExposureCompensation`/`ISO`
+/// prefixes `\bSS\s+` / `\bEV\s+` / `\bISO\s+`). Scans for `<marker>` at a `\w`
+/// word boundary (the preceding byte is start-of-string or a non-`\w`), requires
+/// a trailing `\s+`, then runs `f` on the text after the whitespace. Whitespace-
+/// tolerant (multi-space / tab after the marker), unlike the old `"SS "` literals.
+fn find_word_field<T>(s: &str, marker: &[u8], mut f: impl FnMut(&str) -> Option<T>) -> Option<T> {
+  let b = s.as_bytes();
+  let Some(&first) = marker.first() else {
+    return None;
+  };
+  let mut from = 0usize;
+  while let Some(rel) = s.get(from..)?.bytes().position(|c| c == first) {
+    let at = from + rel;
+    from = at + 1;
+    // `\b` — the byte before `marker` must be a non-`\w` (or start-of-string).
+    if at > 0 && b.get(at - 1).copied().is_some_and(is_word) {
+      continue;
+    }
+    let Some(after_marker) = match_marker(b, at, marker) else {
+      continue;
+    };
+    // `\s+`.
+    let mut q = after_marker;
+    while b.get(q).copied().is_some_and(is_ws) {
+      q += 1;
+    }
+    if q == after_marker {
+      continue;
+    }
+    if let Some(v) = f(s.get(q..)?) {
+      return Some(v);
+    }
+  }
+  None
+}
+
+/// Mirror `\bF\/` (the DJI `FNumber` prefix). Scans for `F/` at a `\w` word
+/// boundary (the `F` preceded by start-of-string or a non-`\w`); the capture
+/// starts immediately after the `/` (NO trailing whitespace in the regex). Runs
+/// `f` on the text after `F/`.
+fn find_fnumber_field<T>(s: &str, mut f: impl FnMut(&str) -> Option<T>) -> Option<T> {
+  let b = s.as_bytes();
+  let mut from = 0usize;
+  while let Some(rel) = s.get(from..)?.find("F/") {
+    let at = from + rel;
+    from = at + 1;
+    if at > 0 && b.get(at - 1).copied().is_some_and(is_word) {
+      continue; // `\b` — `F` must be at a word boundary.
+    }
+    if let Some(v) = f(s.get(at + 2..)?) {
+      return Some(v);
+    }
+  }
+  None
+}
+
+/// The `n`-th comma-delimited field of a `^A,...` Mini record (1-based; field 0
+/// is `A`). Returns the field text (without the leading comma), or `None` when
+/// there are fewer than `n+1` fields. The Perl `.*?` lazy hops are exactly
+/// "skip `n` commas then read up to the value".
+fn mini_field_after_commas(s: &str, n: usize) -> Option<&str> {
+  let mut start = 0usize;
+  for _ in 0..n {
+    let rel = s.get(start..)?.find(',')?;
+    start += rel + 1;
+  }
+  s.get(start..)
+}
+
+/// Parse the Mini lat/lon `(\d{deg})(\d+\.\d+),([NSEW])` head of a field:
+/// `deg_digits` fixed integer degrees, then `\d+\.\d+` decimal minutes, then a
+/// comma and a hemisphere letter. Returns `(deg, decimal_minutes, ref)`.
+fn parse_mini_coord(field: &str, deg_digits: usize) -> Option<(f64, f64, char)> {
+  let b = field.as_bytes();
+  let mut p = 0usize;
+  let deg = parse_uint_fixed(b, &mut p, deg_digits)? as f64;
+  // `\d+\.\d+` decimal minutes.
+  let min_start = p;
+  while digit_at(b, p) {
+    p += 1;
+  }
+  if !byte_at_eq(b, p, b'.') || p == min_start {
+    return None;
+  }
+  p += 1;
+  let frac_start = p;
+  while digit_at(b, p) {
+    p += 1;
+  }
+  if p == frac_start {
+    return None;
+  }
+  let min: f64 = core::str::from_utf8(b.get(min_start..p)?)
+    .ok()?
+    .parse()
+    .ok()?;
+  if !byte_at_eq(b, p, b',') {
+    return None;
+  }
+  p += 1;
+  let r = match b.get(p)? {
+    b'N' => 'N',
+    b'S' => 'S',
+    b'E' => 'E',
+    b'W' => 'W',
+    _ => return None,
+  };
+  Some((deg, min, r))
+}
+
+/// `^\d+\.\d+$` — a whole string that is a plain unsigned decimal (Mini speed
+/// gate, QuickTimeStream.pl:1244).
+fn is_plain_decimal(s: &str) -> bool {
+  let b = s.as_bytes();
+  let dot = match s.find('.') {
+    Some(d) => d,
+    None => return false,
+  };
+  !b.is_empty()
+    && dot > 0
+    && dot < b.len() - 1
+    && b
+      .iter()
+      .enumerate()
+      .all(|(i, &c)| i == dot || c.is_ascii_digit())
 }
 
 /// Decode the BlueSkySea / Ambarella A12 XOR-0xAA enciphered binary block
@@ -5456,7 +6456,7 @@ mod tests {
     // Lat = (53 + 30.6683/60) = 53.5111... ; Lon = -(6 + 41.9749/60) = -6.69958...
     let raw = b"$GPRMC,082138.0,A,5330.6683,N,00641.9749,W,012.5,87.86,050213,002.1,A";
     let mut out = QuickTimeStreamMeta::new();
-    process_text(raw, &mut out);
+    process_text(raw, None, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     let s = &out.gps_samples()[0];
     assert!((s.latitude().unwrap() - 53.51113).abs() < 1e-4);
@@ -5472,7 +6472,7 @@ mod tests {
     // QuickTimeStream.pl:1084-1092 — GPGGA sentence with altitude.
     let raw = b"$GPGGA,123456.0,4721.35197,N,00830.80859,E,1,08,1.2,123.4,M,0.0,M,,";
     let mut out = QuickTimeStreamMeta::new();
-    process_text(raw, &mut out);
+    process_text(raw, None, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     let s = &out.gps_samples()[0];
     assert!((s.altitude_m().unwrap() - 123.4).abs() < 1e-4);
@@ -5485,7 +6485,7 @@ mod tests {
     // QuickTimeStream.pl:1094-1098 — `$G:2025-01-15 12:34:56-N47.628-W008.514-S25`.
     let raw = b"$G:2025-01-15 12:34:56-N47.628421-W008.513889-S25";
     let mut out = QuickTimeStreamMeta::new();
-    process_text(raw, &mut out);
+    process_text(raw, None, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     let s = &out.gps_samples()[0];
     assert!((s.latitude().unwrap() - 47.628421).abs() < 1e-5);
@@ -5499,7 +6499,7 @@ mod tests {
     // Truncated mid-sentence — must not produce a GPS fix.
     let raw = b"$GPRMC,082138.0,A,5330.6683,N";
     let mut out = QuickTimeStreamMeta::new();
-    process_text(raw, &mut out);
+    process_text(raw, None, &mut out);
     assert!(out.gps_samples().is_empty());
   }
 
@@ -5508,7 +6508,7 @@ mod tests {
     // Garbage data — must not panic; ideally produces no sample.
     let raw = b"$GPRMC,XXXX,YYY,ZZZZ";
     let mut out = QuickTimeStreamMeta::new();
-    process_text(raw, &mut out);
+    process_text(raw, None, &mut out);
     // (the fixed-width hr/min parse will fail on `XXXX`; nothing emitted.)
     assert!(out.gps_samples().is_empty());
   }
@@ -5544,7 +6544,7 @@ mod tests {
       data[0x3e + i] = c ^ 0xaa;
     }
     let mut out = QuickTimeStreamMeta::new();
-    process_text(&data, &mut out);
+    process_text(&data, None, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     let s = &out.gps_samples()[0];
     assert!(s.date_time().unwrap().contains("2019:08:20 07:51:57"));
@@ -5552,6 +6552,115 @@ mod tests {
     assert!((s.longitude().unwrap() - (2.0 + 197769.0 / 600000.0)).abs() < 1e-4);
     assert_eq!(s.altitude_m(), Some(31.0));
     assert_eq!(s.speed_kph(), Some(45.0));
+  }
+
+  // ─── Process_text fallbacks (Mini / Roadhawk / Thinkware / DJI) ────────
+
+  #[test]
+  fn process_text_mini_0806_decoded() {
+    // QuickTimeStream.pl:1232-1248. `A,DDMMYY,HHMMSS.sss,DDMM.MMMM,N,DDDMM.MMMM,
+    // W,speed,altM,accX,accY,accZ;`.
+    let raw = b"A,270519,201555.000,3356.8925,N,08420.2071,W,000.0,331.0M,+01.84,-09.80,-00.61;\n";
+    let mut out = QuickTimeStreamMeta::new();
+    process_text(raw, None, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Mini fix");
+    let s = &out.gps_samples()[0];
+    // (33 + 56.8925/60) N, -(84 + 20.2071/60) W.
+    assert!((s.latitude().unwrap() - (33.0 + 56.8925 / 60.0)).abs() < 1e-6);
+    assert!((s.longitude().unwrap() + (84.0 + 20.2071 / 60.0)).abs() < 1e-6);
+    assert_eq!(s.date_time().as_deref(), Some("2019:05:27 20:15:55.000Z"));
+    assert_eq!(s.altitude_m(), Some(331.0));
+    assert_eq!(s.speed_kph(), Some(0.0));
+    // Accelerometer keeps the RAW split tokens (NOT parsed floats).
+    assert_eq!(s.accelerometer(), Some("+01.84 -09.80 -00.61"));
+  }
+
+  #[test]
+  fn process_text_roadhawk_decoded() {
+    // QuickTimeStream.pl:1250-1269 — the substitution-encoded buffer (the
+    // verbatim bundled example) decodes to `X..Y..Z..G..$GPRMC,..`.
+    let raw = b".;;;;D?JL;6+;;;D;R?;4;;;;DBB;;O;;;=D;L;;HO71G>F;-?=J-F:FNJJ;\
+DPP-JF3F;;PL=DBRLBF0F;=?DNF-RD-PF;N;?=JF;;?D=F:*6F~";
+    let mut out = QuickTimeStreamMeta::new();
+    process_text(raw, None, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Roadhawk fix");
+    let s = &out.gps_samples()[0];
+    // Decoded `$GPRMC,082138,A,5330.6683,N,00641.9749,W,012.5,87.86,050213,..`.
+    assert!((s.latitude().unwrap() - (53.0 + 30.6683 / 60.0)).abs() < 1e-5);
+    assert!((s.longitude().unwrap() + (6.0 + 41.9749 / 60.0)).abs() < 1e-5);
+    assert_eq!(s.date_time().as_deref(), Some("2013:02:05 08:21:38Z"));
+    assert!((s.speed_kph().unwrap() - 23.15).abs() < 1e-4);
+    assert_eq!(s.track(), Some(87.86));
+    assert_eq!(
+      s.accelerometer(),
+      Some("0000.2340 -000.0720 0000.9900 0001.0400")
+    );
+  }
+
+  #[test]
+  fn process_text_thinkware_decoded() {
+    // QuickTimeStream.pl:1271-1286 — `gsensori,..;GNRMC,..;CAR,..` (no leading
+    // `$`). GPSDateTime seconds are INTEGER (`%.2d` drops the `.00`).
+    let raw = b"gsensori,4,512,-67,-12,100;GNRMC,161313.00,A,4529.87489,N,07337.01215,W,\
+6.225,35.34,310819,,,A*52;CAR,0,0,0,0.0,0,0,0,0,0,0,0,0";
+    let mut out = QuickTimeStreamMeta::new();
+    process_text(raw, None, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Thinkware fix");
+    let s = &out.gps_samples()[0];
+    assert!((s.latitude().unwrap() - (45.0 + 29.87489 / 60.0)).abs() < 1e-6);
+    assert!((s.longitude().unwrap() + (73.0 + 37.01215 / 60.0)).abs() < 1e-6);
+    assert_eq!(s.date_time().as_deref(), Some("2019:08:31 16:13:13Z"));
+    // 6.225 knots * 1.852 = 11.5287.
+    assert!((s.speed_kph().unwrap() - 11.5287).abs() < 1e-4);
+    assert_eq!(s.track(), Some(35.34));
+    let ex = s.text_extras().expect("text extras");
+    assert_eq!(ex.gsensor(), Some("4,512,-67,-12,100"));
+    assert_eq!(ex.car(), Some("0,0,0,0.0,0,0,0,0,0,0,0,0"));
+  }
+
+  #[test]
+  fn process_text_dji_telemetry_decoded() {
+    // QuickTimeStream.pl:1213-1230 — `GPS (lon, lat, alt)` is lon-then-lat;
+    // altitude from H, speed from H.S, distance from D.
+    let raw = b"F/3.5, SS 1000, ISO 100, EV 0, GPS (8.6499, 53.1665, 18), \
+D 24.26m, H 6.00m, H.S 2.10m/s, V.S 0.00m/s \n";
+    let mut out = QuickTimeStreamMeta::new();
+    process_text(raw, None, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one DJI fix");
+    let s = &out.gps_samples()[0];
+    // lat = $2 = 53.1665, lon = $1 = 8.6499 (decimal degrees, no ConvertLatLon).
+    assert!((s.latitude().unwrap() - 53.1665).abs() < 1e-6);
+    assert!((s.longitude().unwrap() - 8.6499).abs() < 1e-6);
+    assert_eq!(s.altitude_m(), Some(6.0)); // H 6.00m
+    // 2.10 m/s * 3.6 = 7.56 km/h.
+    assert!((s.speed_kph().unwrap() - 7.56).abs() < 1e-6);
+    let ex = s.text_extras().expect("text extras");
+    // Distance 24.26 m/s * 3.6 = 87.336 (km/h, ExifTool's mis-named field).
+    assert!((ex.distance().unwrap() - 87.336).abs() < 1e-6);
+    assert_eq!(ex.vertical_speed(), Some("0.00")); // raw, rendered "$val m/s"
+    assert_eq!(ex.fnumber(), Some(3.5));
+    assert_eq!(ex.exposure_time_s(), Some(1.0 / 1000.0));
+    assert_eq!(ex.exposure_compensation(), Some(0.0));
+    assert_eq!(ex.iso(), Some("100"));
+  }
+
+  #[test]
+  fn process_timed_text_stores_text_and_stamps_track() {
+    // The timed-text wrapper stores `Text => $buff` (a plain-ASCII sample with no
+    // `\0[^\0]`) and stamps the produced fix with the enclosing `Track<N>`.
+    let raw = b"A,270519,201555.000,3356.8925,N,08420.2071,W,000.0,331.0M,+01.84,-09.80,-00.61;\n";
+    let mut out = QuickTimeStreamMeta::new();
+    let doc = out.open_doc();
+    process_timed_text(raw, 1, doc, Some(0.0), Some(1.0), &mut out);
+    assert_eq!(out.gps_samples().len(), 1);
+    let s = &out.gps_samples()[0];
+    assert_eq!(
+      s.text_extras().and_then(|e| e.text()),
+      Some(core::str::from_utf8(raw).unwrap())
+    );
+    assert_eq!(s.sample_time(), Some(0.0));
+    assert_eq!(s.sample_duration(), Some(1.0));
+    assert_eq!(s.doc(), Some(doc));
   }
 
   // ─── ProcessFMAS (Vantrue N2S) ────────────────────────────────────────
@@ -5910,5 +7019,101 @@ mod tests {
     let recs: Vec<_> = DollarRecords::new(s).collect();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].0, "GPRMC");
+  }
+
+  /// Assert every DJI telemetry field decoded from `buf` matches the canonical
+  /// `QuickTime_text_dji_telemetry.mov` values (GPS 8.6499/53.1665, alt 6,
+  /// speed 2.10 m/s → 7.56 km/h, distance 24.26 m/s → 87.336 km/h, V.S "0.00",
+  /// F/3.5, SS 1000 → 1/1000 s, EV 0, ISO "100"). Shared by the canonical and
+  /// the non-canonical-spacing cases so a spacing variant must produce the SAME
+  /// fields — never silently drop one (the #104 finding-3 class).
+  fn assert_dji_canonical_fields(buf: &str) {
+    let dji = parse_dji_telemetry(buf.as_bytes()).expect("DJI telemetry parses");
+    assert!((dji.lon - 8.6499).abs() < 1e-9, "lon");
+    assert!((dji.lat - 53.1665).abs() < 1e-9, "lat");
+    assert!((dji.alt.expect("alt") - 6.0).abs() < 1e-9, "alt");
+    assert!(
+      (dji.speed_kph.expect("speed") - 2.10 * MPS_TO_KPH).abs() < 1e-9,
+      "speed"
+    );
+    assert!(
+      (dji.distance.expect("distance") - 24.26 * MPS_TO_KPH).abs() < 1e-9,
+      "distance"
+    );
+    assert_eq!(
+      dji.vertical_speed.as_deref(),
+      Some("0.00"),
+      "vertical_speed"
+    );
+    assert!(
+      (dji.fnumber.expect("fnumber") - 3.5).abs() < 1e-9,
+      "fnumber"
+    );
+    assert!(
+      (dji.exposure_time_s.expect("exposure_time") - 1.0 / 1000.0).abs() < 1e-12,
+      "exposure_time"
+    );
+    assert!(
+      (dji.exposure_compensation.expect("ev") - 0.0).abs() < 1e-12,
+      "exposure_compensation"
+    );
+    assert_eq!(dji.iso.as_deref(), Some("100"), "iso");
+  }
+
+  #[test]
+  fn parse_dji_telemetry_canonical_spacing() {
+    // The exact `QuickTime_text_dji_telemetry.mov` Text payload (one space after
+    // each comma / field letter).
+    assert_dji_canonical_fields(
+      "F/3.5, SS 1000, ISO 100, EV 0, GPS (8.6499, 53.1665, 18), D 24.26m, \
+       H 6.00m, H.S 2.10m/s, V.S 0.00m/s \n",
+    );
+  }
+
+  /// #104 finding-3: ExifTool's DJI regexes use `,\s*` / `\s+`, so valid
+  /// telemetry with NO space after a comma, MULTIPLE spaces, or TABs must still
+  /// extract every field. The old fixed-literal scans (`", H "`, `"SS "`, …)
+  /// required exactly one space and SILENTLY dropped altitude/speed/distance/
+  /// camera settings on this input.
+  #[test]
+  fn parse_dji_telemetry_non_canonical_spacing() {
+    // No space after the comma before H/H.S/D/V.S; a TAB after SS; DOUBLE spaces
+    // after F/-less markers (ISO/EV) and after the field letters; a tab inside
+    // the lon/lat `\s*`. Every field must still decode to the canonical values.
+    assert_dji_canonical_fields(
+      "F/3.5,SS\t1000, ISO  100, EV  0, GPS (8.6499,\t53.1665, 18),D 24.26m,\
+       H  6.00m,H.S\t2.10m/s,V.S  0.00m/s \n",
+    );
+  }
+
+  /// `\s+` is REQUIRED after the comma-field marker (`,\s*H\s+`): `,H6.00m` with
+  /// NO whitespace between `H` and the digits must NOT match (faithful to the
+  /// regex), so altitude is absent — while the GPS fix still decodes.
+  #[test]
+  fn parse_dji_telemetry_requires_whitespace_after_marker() {
+    let dji = parse_dji_telemetry(b"GPS (8.6499, 53.1665, 18),H6.00m, H.S 2.10m/s")
+      .expect("GPS fix still parses");
+    assert!(dji.alt.is_none(), "no \\s+ after H ⇒ altitude not captured");
+    // The well-formed `H.S 2.10` still decodes (the scanner is per-field).
+    assert!(
+      (dji.speed_kph.expect("speed") - 2.10 * MPS_TO_KPH).abs() < 1e-9,
+      "speed still captured"
+    );
+  }
+
+  /// The `\b` word boundary on `\bSS` / `\bISO`: a marker embedded INSIDE a word
+  /// (`xSS`, `xISO`) must NOT match (no boundary), so the field is absent.
+  #[test]
+  fn parse_dji_telemetry_word_boundary_blocks_embedded_marker() {
+    let dji = parse_dji_telemetry(b"GPS (8.6499, 53.1665, 18), xSS 1000, fooISO 100")
+      .expect("GPS fix parses");
+    assert!(
+      dji.exposure_time_s.is_none(),
+      "`xSS` is not at a word boundary ⇒ no ExposureTime"
+    );
+    assert!(
+      dji.iso.is_none(),
+      "`fooISO` is not at a word boundary ⇒ no ISO"
+    );
   }
 }

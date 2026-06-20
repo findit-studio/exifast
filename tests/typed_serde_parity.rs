@@ -737,7 +737,26 @@ const NOT_ACTIVE: &[&str] = &[
 /// GPS and the `Doc<N>` timing are `-ee`-only, pinned in
 /// `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the unported
 /// timed-GPS deferral, excluded at regen.
-const EXPECTED_ACTIVE_FIXTURES: usize = 544;
+/// 544 → 548 after #104/#102 (the four `Process_text` dashcam text-GPS
+/// fixtures): `QuickTime_text_mini0806.mov` (Mini 0806), `_roadhawk.mov`
+/// (Roadhawk), `_thinkware.mov` (Thinkware) and `_dji_telemetry.mov` (DJI
+/// telemetry) — single `text`-HandlerType timed-text samples. Each pairs `.json`
+/// + `.n.json` and is FULLY byte-exact at no-`ee` (the only timed tags there are
+/// the structural `Track1:HandlerType`/`OtherFormat` + the `[minor]`
+/// `Track1:Warning`; the decoded GPS + text extras are `-ee`-only, pinned in
+/// `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the unported
+/// timed-GPS deferral, excluded at regen.
+/// 548 → 549 after the #104 R2 structural fix `QuickTime_text_empty_then_valid.mov`:
+/// a two-sample `text` stream — a ZERO-LENGTH length-prefixed sample (the `next if
+/// $size == 2` shape) followed by a valid Mini-0806 sample — pinning the
+/// per-text-sample-timing class close. `FoundSomething` opens `Doc1` for the empty
+/// sample BEFORE the `next` / `Process_text`, so the valid sample is `Doc2` and
+/// `-ee -G1` keeps the FIRST (empty) sample's `SampleTime "0 s"`. Pairs `.json` +
+/// `.n.json` and is FULLY byte-exact at no-`ee` (only `Track1:HandlerType`/
+/// `OtherFormat` + the `[minor]` `Track1:Warning`; the `Doc<N>` timing is `-ee`-only,
+/// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
+/// unported timed-GPS deferral, excluded at regen.
+const EXPECTED_ACTIVE_FIXTURES: usize = 549;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

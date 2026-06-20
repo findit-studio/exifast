@@ -83,6 +83,174 @@ impl GpsOrigin {
   }
 }
 
+/// The non-GPS-fix tags a `Process_text` dashcam variant (Mini 0806 / Roadhawk
+/// / Thinkware / DJI telemetry — QuickTimeStream.pl:1213-1294) `HandleTag`s
+/// alongside the GPS columns, plus the timed-text `Text` tag the wrapper stores
+/// (QuickTimeStream.pl:1512). These ride the same per-sample `Doc<N>` as the
+/// fix; carried in a boxed sub-struct so the common [`GpsSample`] stays lean
+/// (only the text path ever allocates one).
+///
+/// Each value is post-ValueConv: `distance_m` is already `× $mpsToKph` (km/h —
+/// ExifTool's `Distance` is mis-named, the value is the m/s reading scaled by
+/// 3.6, QuickTimeStream.pl:1222); `fnumber` / `exposure_time_s` /
+/// `exposure_compensation` are the raw numeric inputs the Exif PrintConvs
+/// format; `iso` / `vertical_speed` keep ExifTool's RAW captured token (the
+/// table entries are bare / `"$val m/s"`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct TextExtras {
+  /// `Text` (QuickTimeStream.pl:1512) — the raw sample buffer the timed-text
+  /// wrapper stores verbatim.
+  text: Option<SmolStr>,
+  /// `GSensor` (QuickTimeStream.pl:1285) — the raw `gsensori,...` capture.
+  gsensor: Option<SmolStr>,
+  /// `Car` (QuickTimeStream.pl:1286) — the raw `CAR,...` capture.
+  car: Option<SmolStr>,
+  /// `Distance` (QuickTimeStream.pl:1222) — the m/s reading `× $mpsToKph`,
+  /// rendered `"$val m"`.
+  distance: Option<f64>,
+  /// `VerticalSpeed` (QuickTimeStream.pl:1223) — ExifTool's RAW captured string
+  /// (no arithmetic), rendered `"$val m/s"`.
+  vertical_speed: Option<SmolStr>,
+  /// `FNumber` (QuickTimeStream.pl:1224) — `PrintFNumber($val)` at `-j`.
+  fnumber: Option<f64>,
+  /// `ExposureTime` (QuickTimeStream.pl:1225) — `1 / SS`, `PrintExposureTime`.
+  exposure_time_s: Option<f64>,
+  /// `ExposureCompensation` (QuickTimeStream.pl:1226) — `EV / (denom||1)`,
+  /// `PrintFraction`.
+  exposure_compensation: Option<f64>,
+  /// `ISO` (QuickTimeStream.pl:1227) — the RAW captured token (bare table
+  /// entry).
+  iso: Option<SmolStr>,
+}
+
+impl TextExtras {
+  /// `true` when no extra is populated (so the emitter can drop the boxed
+  /// sub-struct entirely rather than attach an all-`None` one).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn is_empty(&self) -> bool {
+    self.text.is_none()
+      && self.gsensor.is_none()
+      && self.car.is_none()
+      && self.distance.is_none()
+      && self.vertical_speed.is_none()
+      && self.fnumber.is_none()
+      && self.exposure_time_s.is_none()
+      && self.exposure_compensation.is_none()
+      && self.iso.is_none()
+  }
+
+  /// `Text` — the raw sample buffer.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn text(&self) -> Option<&str> {
+    self.text.as_deref()
+  }
+  /// `GSensor` — the raw `gsensori,...` capture.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn gsensor(&self) -> Option<&str> {
+    self.gsensor.as_deref()
+  }
+  /// `Car` — the raw `CAR,...` capture.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn car(&self) -> Option<&str> {
+    self.car.as_deref()
+  }
+  /// `Distance` (km/h-scaled metres, rendered `"$val m"`).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn distance(&self) -> Option<f64> {
+    self.distance
+  }
+  /// `VerticalSpeed` — the raw captured string (rendered `"$val m/s"`).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn vertical_speed(&self) -> Option<&str> {
+    self.vertical_speed.as_deref()
+  }
+  /// `FNumber` raw numeric input.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn fnumber(&self) -> Option<f64> {
+    self.fnumber
+  }
+  /// `ExposureTime` seconds (`1 / SS`).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn exposure_time_s(&self) -> Option<f64> {
+    self.exposure_time_s
+  }
+  /// `ExposureCompensation` raw numeric input.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn exposure_compensation(&self) -> Option<f64> {
+    self.exposure_compensation
+  }
+  /// `ISO` — the raw captured token.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn iso(&self) -> Option<&str> {
+    self.iso.as_deref()
+  }
+
+  /// Assign `Text`.
+  #[inline(always)]
+  pub(crate) fn set_text(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.text = v;
+    self
+  }
+  /// Assign `GSensor`.
+  #[inline(always)]
+  pub(crate) fn set_gsensor(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.gsensor = v;
+    self
+  }
+  /// Assign `Car`.
+  #[inline(always)]
+  pub(crate) fn set_car(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.car = v;
+    self
+  }
+  /// Assign `Distance` (km/h-scaled metres).
+  #[inline(always)]
+  pub(crate) const fn set_distance(&mut self, v: Option<f64>) -> &mut Self {
+    self.distance = v;
+    self
+  }
+  /// Assign `VerticalSpeed` (raw captured string).
+  #[inline(always)]
+  pub(crate) fn set_vertical_speed(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.vertical_speed = v;
+    self
+  }
+  /// Assign `FNumber`.
+  #[inline(always)]
+  pub(crate) const fn set_fnumber(&mut self, v: Option<f64>) -> &mut Self {
+    self.fnumber = v;
+    self
+  }
+  /// Assign `ExposureTime` (seconds).
+  #[inline(always)]
+  pub(crate) const fn set_exposure_time_s(&mut self, v: Option<f64>) -> &mut Self {
+    self.exposure_time_s = v;
+    self
+  }
+  /// Assign `ExposureCompensation`.
+  #[inline(always)]
+  pub(crate) const fn set_exposure_compensation(&mut self, v: Option<f64>) -> &mut Self {
+    self.exposure_compensation = v;
+    self
+  }
+  /// Assign `ISO` (raw captured token).
+  #[inline(always)]
+  pub(crate) fn set_iso(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.iso = v;
+    self
+  }
+}
+
 /// One timed GPS / sensor fix decoded from a video metadata sample — the
 /// typed mirror of the per-`Doc<N>` tag group ExifTool's `FoundSomething`
 /// opens for each sample (QuickTimeStream.pl:967-973). Every field is
@@ -164,6 +332,12 @@ pub struct GpsSample {
   /// record 0 for the no-`ee` truncate-to-first decision — distinct from this
   /// global `Doc<N>` number.
   doc: Option<u32>,
+  /// The `Process_text` dashcam extras (`Text`/`GSensor`/`Car`/`Distance`/
+  /// `VerticalSpeed`/`FNumber`/`ExposureTime`/`ExposureCompensation`/`ISO`) the
+  /// Mini 0806 / Roadhawk / Thinkware / DJI-telemetry branches emit alongside
+  /// the GPS columns (QuickTimeStream.pl:1213-1294). `None` for every other
+  /// source — boxed so a non-text sample carries only a null pointer.
+  text_extras: Option<alloc::boxed::Box<TextExtras>>,
 }
 
 impl GpsSample {
@@ -187,6 +361,7 @@ impl GpsSample {
       origin: None,
       magic_box_record_index: None,
       doc: None,
+      text_extras: None,
     }
   }
 
@@ -320,6 +495,7 @@ impl GpsSample {
       && self.date_time.is_none()
       && self.accelerometer.is_none()
       && self.time_code.is_none()
+      && self.text_extras.is_none()
   }
 
   /// `true` when the sample carries a GPS coordinate pair.
@@ -436,6 +612,21 @@ impl GpsSample {
   #[inline(always)]
   pub(crate) const fn set_doc(&mut self, v: Option<u32>) -> &mut Self {
     self.doc = v;
+    self
+  }
+
+  /// The `Process_text` dashcam extras, or `None` for every non-text source.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn text_extras(&self) -> Option<&TextExtras> {
+    self.text_extras.as_deref()
+  }
+
+  /// Attach the `Process_text` extras (boxing the populated sub-struct), or
+  /// clear them when `None`.
+  #[inline(always)]
+  pub(crate) fn set_text_extras(&mut self, v: Option<TextExtras>) -> &mut Self {
+    self.text_extras = v.map(alloc::boxed::Box::new);
     self
   }
 }
@@ -747,12 +938,21 @@ pub struct QuickTimeStreamMeta {
   /// file the ordinal equals the old per-source numbering, so the byte-exact
   /// goldens are unchanged.
   doc_counter: u32,
-  /// TIMING-ONLY markers — one per `gpmd` sample whose self-contained dashcam
-  /// variant (FMAS / Wolfbox / Rove `Process_text`) MATCHED its `Condition` but
-  /// whose process-proc decoded NO fix (a too-short / malformed sample).
-  /// ExifTool's `FoundSomething` opens a `Doc<N>` + emits that sample's
-  /// `SampleTime`/`SampleDuration` regardless (QuickTimeStream.pl:1567-1571), so
-  /// the marker carries the timing into the `-G1` cross-sample min-doc scan
+  /// TIMING-ONLY markers — one per timed sample that consumed a `Doc<N>` but
+  /// produced no stored row, so its `SampleTime`/`SampleDuration` would otherwise
+  /// have no record to ride on. Two producers, both `FoundSomething`-driven:
+  ///   * a `gpmd` sample whose self-contained dashcam variant (FMAS / Wolfbox /
+  ///     Rove `Process_text`) MATCHED its `Condition` but whose process-proc
+  ///     decoded NO fix (a too-short / malformed sample, QuickTimeStream.pl:
+  ///     1567-1571);
+  ///   * a `text` sample whose `Process_text` emitted NOTHING — a binary
+  ///     `\0[^\0]` sample whose `Text` is gated and which matches no sentence
+  ///     (e.g. the Insta360 `.insv`'s 469 binary `Track3` text samples). ExifTool
+  ///     runs `FoundSomething` for EVERY `text` sample BEFORE `Process_text`
+  ///     (QuickTimeStream.pl:1473), so the timing is emitted regardless.
+  /// In both cases `FoundSomething` opens the `Doc<N>` + emits that sample's
+  /// `SampleTime`/`SampleDuration`, so the marker carries the timing into the
+  /// `-G1` cross-sample min-doc scan
   /// ([`crate::formats::quicktime::gpmd_gps_min_doc_timing`]) and the `-G3`
   /// per-`Doc<N>` emission, and consumes the doc ordinal so a following VALID
   /// sample is renumbered to the next `Doc<N>`. See [`GpmdTimingOnly`].
@@ -991,11 +1191,15 @@ impl QuickTimeStreamMeta {
     self.gpmd_timing_only.as_slice()
   }
 
-  /// Push a `gpmd` TIMING-ONLY marker (an unstamped [`GpmdTimingOnly`]). The
-  /// walker calls this only after a self-contained `gpmd` variant matched its
-  /// `Condition` (`dispatch_gpmd` returned [`crate::formats::quicktime_freegps::
-  /// GpmdDispatch::SelfContained`]) yet appended no `GpsSample`, then stamps it
-  /// via [`Self::stamp_gpmd_timing_only_last`]. Mirrors the camm
+  /// Push a TIMING-ONLY marker (an unstamped [`GpmdTimingOnly`]). The walker
+  /// calls this when a timed sample consumed a `Doc<N>` but appended no
+  /// `GpsSample` / `Text` row, then stamps it via
+  /// [`Self::stamp_gpmd_timing_only_last`]. Two callers: a self-contained `gpmd`
+  /// variant whose `Condition` matched (`dispatch_gpmd` returned
+  /// [`crate::formats::quicktime_freegps::GpmdDispatch::SelfContained`]) yet
+  /// decoded nothing, and a `text` sample whose `Process_text` emitted nothing
+  /// (the binary-text path, [`crate::formats::quicktime_freegps::
+  /// process_timed_text`]). Mirrors the camm
   /// [`crate::metadata::CammMeta::push_timing_only`] precedent.
   pub(crate) fn push_gpmd_timing_only(&mut self, marker: GpmdTimingOnly) -> &mut Self {
     self.gpmd_timing_only.push(marker);

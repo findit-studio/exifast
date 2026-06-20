@@ -188,6 +188,9 @@ case "$FIX" in
   QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
   QuickTime_fmas_n2s.mov | QuickTime_wolfbox_redtiger_f9.mov | \
   QuickTime_fmas_empty_then_valid.mov | \
+  QuickTime_text_mini0806.mov | QuickTime_text_roadhawk.mov | \
+  QuickTime_text_thinkware.mov | QuickTime_text_dji_telemetry.mov | \
+  QuickTime_text_empty_then_valid.mov | \
   MPEG2_TS_pruveeo_d90.ts)
     EXCLUDE_ARR+=(-x Composite:GPSPosition) ;;
   # `QuickTime_mebx_gps.mov`: a crafted single-`mebx`-GPS fixture — bundled builds
@@ -342,4 +345,17 @@ if [ -n "${EE:-}" ]; then
   ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -ee        "$FIX" ) > "$OUT_EE"
   ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -ee -G3:1 "$FIX" ) > "$OUT_EE_G3"
   echo "wrote $OUT_EE and $OUT_EE_G3"
+fi
+
+# --- EE + `-n` (numeric / no-PrintConv) timed-metadata oracle golden ---------
+# Opt-in via `EE_N=1` (SEPARATE from `EE=1` so a plain EE regen does not mint an
+# `<fix>.ee.n.json` for every EE fixture — only the fixtures whose test pins the
+# `-ee -n` axis carry one). Writes `<fix>.ee.n.json` (`-ee -n`, the family-1
+# `-G1` axis from COMMON). This pins the tags whose `%QuickTime::Stream` PrintConv
+# is DISABLED under `-n` — e.g. the DJI `Distance` (`"$val m"` → raw `87.336`) and
+# `VerticalSpeed` (`"$val m/s"` → raw `0.00`) — distinct from the `-j` `.ee.json`.
+if [ -n "${EE_N:-}" ]; then
+  OUT_EE_N="$OUTDIR/$FIX.ee.n.json"
+  ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -ee -n "$FIX" ) > "$OUT_EE_N"
+  echo "wrote $OUT_EE_N"
 fi

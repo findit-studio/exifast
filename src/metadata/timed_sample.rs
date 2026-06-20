@@ -152,10 +152,16 @@ impl TimedSample for GpsSample {
   }
   // `gsen`/`3gf` records carry an `Accelerometer` / `TimeCode` but NO
   // coordinate pair; `Process_gsen`/`Process_3gf` still `++DOC_COUNT` +
-  // `HandleTag` them, so a sensor-only `GpsSample` is emittable.
+  // `HandleTag` them, so a sensor-only `GpsSample` is emittable. A `text`-handler
+  // sample likewise emits a `Text` (+ other) row with no coordinates (the
+  // timed-text wrapper `FoundSomething` opens a `Doc<N>` per sample,
+  // QuickTimeStream.pl:1473/1512), so a text-extras-only sample is emittable too.
   #[inline(always)]
   fn has_emittable_data(&self) -> bool {
-    self.has_coordinates() || self.accelerometer().is_some() || self.time_code().is_some()
+    self.has_coordinates()
+      || self.accelerometer().is_some()
+      || self.time_code().is_some()
+      || self.text_extras().is_some()
   }
   #[inline(always)]
   fn emits_without_ee(&self) -> bool {

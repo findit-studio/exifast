@@ -91,8 +91,8 @@ pub use quicktime::{
 pub use quicktime_brand::{
   Cr3Block, Cr3CmtKind, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta,
 };
-pub(crate) use quicktime_stream::GpsOrigin;
 pub use quicktime_stream::{GpmdTimingOnly, GpsSample, MebxSample, QuickTimeStreamMeta};
+pub(crate) use quicktime_stream::{GpsOrigin, TextExtras};
 pub use sony_rtmd::{
   NumericRead, SonyRtmdCameraSnapshot, SonyRtmdCoord, SonyRtmdGpsSample, SonyRtmdMeta,
   SonyRtmdSample,

@@ -7751,6 +7751,128 @@ impl crate::emit::Taggable for Meta<'_> {
             false,
           ));
         }
+        // The `Process_text` dashcam extras (Mini 0806 / Roadhawk / Thinkware /
+        // DJI telemetry, QuickTimeStream.pl:1213-1294 + the timed-text `Text`).
+        // Each maps to its `%QuickTime::Stream` table entry's PrintConv; the
+        // numeric-shaped strings (`FNumber`/`ExposureCompensation`/`ISO`) emit as
+        // BARE JSON numbers via `EscapeJSON` (oracle `FNumber 3.5`, `ISO 100`).
+        if let Some(extras) = s.text_extras() {
+          // `Text` (:667) — a `Groups 2 Other` string, no conv. Verbatim.
+          if let Some(text) = extras.text() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Text".into(),
+              TagValue::Str(text.into()),
+              false,
+            ));
+          }
+          // `GSensor` (:155) / `Car` (:156) — bare strings, no conv.
+          if let Some(gs) = extras.gsensor() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "GSensor".into(),
+              TagValue::Str(gs.into()),
+              false,
+            ));
+          }
+          if let Some(car) = extras.car() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Car".into(),
+              TagValue::Str(car.into()),
+              false,
+            ));
+          }
+          // `Distance` (:137) `PrintConv => '"$val m"'` — `$val` already `×
+          // $mpsToKph` (the float stringifies via Perl's `%.15g`, e.g. `87.336`).
+          // Under `-n` the PrintConv is DISABLED, so the raw scaled f64 is emitted
+          // (a bare JSON number, `87.336`); under `-j` the `" m"` suffix applies.
+          // (Branch like `FNumber`/`ExposureTime` below — the table entry carries
+          // NO ValueConv, so the `-n` value is the raw ValueConv'd scalar.)
+          if let Some(d) = extras.distance() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Distance".into(),
+              if print_conv {
+                TagValue::Str(std::format!("{} m", crate::value::format_g(d, 15)).into())
+              } else {
+                TagValue::F64(d)
+              },
+              false,
+            ));
+          }
+          // `VerticalSpeed` (:138) `PrintConv => '"$val m/s"'` — `$val` is the RAW
+          // captured token verbatim (no arithmetic), e.g. `"0.00"`. Under `-n` the
+          // PrintConv is DISABLED, so the raw token is emitted with NO `" m/s"`
+          // suffix as a `TagValue::Str`; the terminal `EscapeJSON` number gate
+          // ([`crate::value::escape_json_is_number`]) renders the numeric-looking
+          // token as a BARE JSON number (`0.00`), matching the `-ee -n` oracle —
+          // exactly the `ISO` raw-token path below. Under `-j` the `" m/s"` suffix
+          // applies (`"0.00 m/s"`).
+          if let Some(vs) = extras.vertical_speed() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "VerticalSpeed".into(),
+              if print_conv {
+                TagValue::Str(std::format!("{vs} m/s").into())
+              } else {
+                TagValue::Str(vs.into())
+              },
+              false,
+            ));
+          }
+          // `FNumber` (:140) `PrintFNumber` at `-j`, the raw F64 at `-n`.
+          if let Some(f) = extras.fnumber() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "FNumber".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_fnumber(f).into())
+              } else {
+                TagValue::F64(f)
+              },
+              false,
+            ));
+          }
+          // `ExposureTime` (:141) `PrintExposureTime` at `-j` (`"1/1000"`), raw at
+          // `-n`.
+          if let Some(et) = extras.exposure_time_s() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ExposureTime".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_exposure_time(et).into())
+              } else {
+                TagValue::F64(et)
+              },
+              false,
+            ));
+          }
+          // `ExposureCompensation` (:142) `PrintFraction` at `-j` (`0` → `"0"` →
+          // bare `0`), raw at `-n`.
+          if let Some(ev) = extras.exposure_compensation() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ExposureCompensation".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_fraction(ev).into())
+              } else {
+                TagValue::F64(ev)
+              },
+              false,
+            ));
+          }
+          // `ISO` (:143) — bare table entry: the RAW captured token, emitted as a
+          // BARE number via `EscapeJSON` (oracle `ISO 100`), in both modes.
+          if let Some(iso) = extras.iso() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ISO".into(),
+              TagValue::Str(iso.into()),
+              false,
+            ));
+          }
+        }
       },
       &mut tags,
     );
