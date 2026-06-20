@@ -4092,18 +4092,28 @@ const INSTA360_DOC_OFFSET: u64 = 0;
 //       ExifTool — and a duplicate `Doc<N>:Insta360:*` key on EITHER side now
 //       fails the cardinality check (it is no longer collapsed pre-compare).
 //
-// The committed golden (`…ee.g3.insta360.json`) carries ExifTool's RAW
-// `Doc<N>:Insta360:*` keys (`Doc470..Doc21616`), so both sides go through the
-// identical filter + renumber (the golden with offset 0). It is NOT produced by
-// `gen_golden.sh` (whose raw `.ee.g3.json` also carries the un-extracted `Track3`
-// text-track samples at `Doc1..Doc469`); regenerate it by filtering that oracle
-// to the Insta360 records, preserving the raw doc numbers:
-//   ( cd tests/fixtures && LC_ALL=C TZ=UTC perl "$EXIFTOOL" -j -G3:1 -struct \
-//       -api QuickTimeUTC=1 --FileName --Directory --FileSize --FileModifyDate \
-//       --FileAccessDate --FileInodeChangeDate --FilePermissions -ee \
-//       QuickTime_insta360_real.insv ) \
-//     | jq -c '[ .[0] | with_entries(select(.key | test("^Doc[0-9]+:Insta360:"))) ]' \
-//     > tests/golden/QuickTime_insta360_real.insv.ee.g3.insta360.json
+// The oracle is the RAW `-ee -G3:1` golden `gen_golden.sh` already writes
+// (`…insv.ee.g3.json`, line 346: `perl "$EXIFTOOL" … -ee -G3:1 > $OUT_EE_G3`),
+// filtered IN-PROCESS by the DUPLICATE-PRESERVING `insta360_doc_entries`
+// (`OrderedEntries`) — NOT a separately-committed pre-filtered subset (#279).
+//
+// REGENERATION (deterministic + duplicate-preserving): re-run `gen_golden.sh`
+//   EE=1 EXCLUDE="…" tools/gen_golden.sh QuickTime_insta360_real.insv
+// and the `.ee.g3.json` rewrites byte-stable (`LC_ALL=C TZ=UTC perl exiftool`
+// emits its tag stream verbatim — no jq re-materialization). The earlier path
+// piped this oracle through `jq -c '[ .[0] | with_entries(select(…)) ]'` into a
+// `…ee.g3.insta360.json` golden, which was NOT deterministic: jq's `from_entries`
+// (and its very object PARSE) keeps only the LAST of any duplicate key, so a
+// future ExifTool emitting a repeated `Doc<N>:Insta360:*` tag would silently
+// collapse to one entry BEFORE the golden was written — masking the `%noDups`
+// regression class the in-test multiset compare exists to catch — and jq also
+// mangled the verbatim numeric lexemes (`545172.930` → `545172.93`). Filtering
+// the raw oracle here instead keeps every duplicate (and the verbatim token),
+// and the duplicate protection is now structural on BOTH the in-test AND the
+// oracle-refresh paths. `insta360_doc_entries` drops every non-`Doc<N>:Insta360:*`
+// key (the `Doc1..469:Track3:*` text-track timing rows STAGE 3 pins, plus the
+// family-1 identity/Parameters/Warning), so feeding it the full raw oracle yields
+// exactly the Insta360 record stream.
 #[test]
 fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   let data = fixture("QuickTime_insta360_real.insv");
@@ -4111,7 +4121,12 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
     .with_extract_embedded(true)
     .with_group3(true);
   let got_raw = extract_info_with_options("QuickTime_insta360_real.insv", &data, true, opts);
-  let want_raw = golden("QuickTime_insta360_real.insv.ee.g3.insta360.json");
+  // The single RAW `-ee -G3:1` oracle (`gen_golden.sh` output) — duplicate-keys
+  // and verbatim tokens intact; STAGE 1/2 filter its `Doc<N>:Insta360:*` records,
+  // STAGE 3 its `Doc<N>:Track3:*` timing rows, both via `insta360_doc_entries` /
+  // `track3_timing_entries` (duplicate-preserving), so neither stage depends on a
+  // jq-derived pre-filtered golden.
+  let want_raw = golden("QuickTime_insta360_real.insv.ee.g3.json");
 
   // Filter to `Doc<N>:Insta360:*` records via the DUPLICATE-PRESERVING ordered
   // parse; renumber the exifast side UP by the offset so both carry `Doc470..`.
@@ -4128,8 +4143,8 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   assert_eq!(
     (oracle_first, oracle_last, oracle_count),
     (470, 21616, 21147),
-    "raw-doc oracle golden must run exactly Doc470..Doc21616 (21 147 records); \
-     a manually-regenerated golden with a gap / wrong start fails here"
+    "raw-doc oracle (.ee.g3.json) must run exactly Doc470..Doc21616 (21 147 \
+     records); a regenerated oracle with a gap / wrong start fails here"
   );
   assert_eq!(
     (got_first, got_last, got_count),
@@ -4156,7 +4171,7 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   if let Err(e) = json_equivalent_strict(&got, &want) {
     panic!(
       "QuickTime_insta360_real.insv (-ee -G3, Insta360 record stream, \
-       renumbered) vs QuickTime_insta360_real.insv.ee.g3.insta360.json: {}",
+       renumbered) vs QuickTime_insta360_real.insv.ee.g3.json: {}",
       e.message()
     );
   }
@@ -4165,14 +4180,13 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   // 469 BINARY text samples (Track3) decode to no `Text`/GPS, so `FoundSomething`
   // (QuickTimeStream.pl:1473) emits ONLY their `Doc<N>:Track3:SampleTime` /
   // `SampleDuration` — which the `text`-path matched-but-empty marker now
-  // reproduces. Pin those rows byte-exact vs the UNCHANGED RAW `.ee.g3.json`
-  // oracle (the same file `gen_golden.sh` writes — it carries the `Track3` rows
-  // at `Doc1..Doc469`). The stream filter above drops every non-`Insta360`
-  // `Doc<N>` group, so without this stage the 469×2 timing rows would be
-  // UNVERIFIED (the original masking).
-  let want_raw_full = golden("QuickTime_insta360_real.insv.ee.g3.json");
+  // reproduces. Pin those rows byte-exact vs the RAW `.ee.g3.json` oracle (the
+  // same `want_raw` STAGE 1/2 filter — `gen_golden.sh` writes it carrying the
+  // `Track3` rows at `Doc1..Doc469`). The stream filter above drops every
+  // non-`Insta360` `Doc<N>` group, so without this stage the 469×2 timing rows
+  // would be UNVERIFIED (the original masking).
   let got_t3 = track3_timing_entries(&got_raw);
-  let want_t3 = track3_timing_entries(&want_raw_full);
+  let want_t3 = track3_timing_entries(&want_raw);
   assert_eq!(
     want_t3.len(),
     469 * 2,
@@ -4241,6 +4255,59 @@ fn insta360_full_stream_rejects_duplicate_doc_key() {
     "the failure must be the object-key MULTISET check (the structural \
      duplicate-key guard), got: {}",
     msg.message()
+  );
+}
+
+// The SYMMETRIC half of the #279 fix: a DUPLICATE `Doc<N>:Insta360:*` key on the
+// ORACLE (golden) side must SURVIVE the in-process filter and stay significant —
+// the protection now covers the oracle-refresh path, not just the exifast side.
+// The old regeneration piped the raw oracle through `jq … with_entries(…)`, whose
+// `from_entries` (and jq's object PARSE itself) keeps only the LAST of a repeated
+// key, so a golden-side duplicate would have been COLLAPSED before the file was
+// written; the in-test negative `insta360_full_stream_rejects_duplicate_doc_key`
+// only exercised an exifast-side dup, leaving the oracle path unguarded.
+// `insta360_doc_entries` filters the raw `.ee.g3.json` oracle directly via the
+// duplicate-preserving `OrderedEntries`, so a golden-side repeat is KEPT — proven
+// here by feeding the comparator a golden with a duplicated record and a clean
+// (single-record) exifast side: the parse keeps both golden copies and the strict
+// multiset compare FAILS the cardinality, exactly as it must against a faithful
+// duplicate-preserving oracle (it would have read EQUAL through the jq path).
+#[test]
+fn insta360_full_stream_oracle_duplicate_doc_key_is_significant() {
+  // Oracle side: the SAME record emitted TWICE (what a future `%noDups`-emitting
+  // ExifTool could write into the raw `.ee.g3.json` oracle; `gen_golden.sh` writes
+  // perl's stdout verbatim, so both copies land on disk — no jq collapse).
+  let want_raw =
+    r#"[{"Doc470:Insta360:TimeCode":534773.966,"Doc470:Insta360:TimeCode":534773.966}]"#;
+  // exifast side: ONE clean record (the non-duplicated truth).
+  let got_raw = r#"[{"Doc470:Insta360:TimeCode":534773.966}]"#;
+
+  let (got_entries, _got_docs) = insta360_doc_entries(got_raw, "got", 0);
+  let (want_entries, want_docs) = insta360_doc_entries(want_raw, "oracle", 0);
+
+  // The duplicate-preserving filter must KEEP both ORACLE copies — the jq
+  // `with_entries` refresh path would have collapsed them to one here, masking
+  // the divergence and making the comparison read EQUAL.
+  assert_eq!(
+    want_docs.len(),
+    2,
+    "duplicate-preserving filter must keep BOTH oracle Doc470 entries (the old jq \
+     `with_entries` refresh path would have collapsed them to 1)"
+  );
+
+  let got = insta360_entries_to_document(&got_entries);
+  let want = insta360_entries_to_document(&want_entries);
+  let res = json_equivalent_strict(&got, &want);
+  assert!(
+    res.is_err(),
+    "a duplicate Doc470:Insta360:TimeCode on the ORACLE side MUST stay significant \
+     and fail the strict comparison against a non-duplicated exifast side, not be \
+     silently collapsed by the refresh path"
+  );
+  assert!(
+    res.unwrap_err().message().contains("multiset differs"),
+    "the failure must be the object-key MULTISET check (the structural \
+     duplicate-key guard on the oracle side)"
   );
 }
 
