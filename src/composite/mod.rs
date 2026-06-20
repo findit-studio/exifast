@@ -20,7 +20,9 @@
 //! pass ignoring `Inhibit`-on-Composite (the `$allBuilt` flag) and then warns
 //! `Circular dependency in Composite tags`. The defs are walked in
 //! prefixed-id sort order (`Module-Name`) so the build is deterministic
-//! regardless of registry order.
+//! regardless of registry order. `GPSPosition` (`Composite-GPSPosition`)
+//! `Require`s `Composite:GPSLatitude`/`Composite:GPSLongitude` (`GPS-…`), so it
+//! defers to a later pass — exercising the fixpoint on a real def.
 //!
 //! ## Input model — presence vs value
 //!
@@ -33,38 +35,45 @@
 //! carrying the ingredient's RAW (post-`ValueConv`) [`TagValue`], or `Missing`
 //! — and the build loop keys Inhibit/Require/Desire on `is_present()`, NOT on
 //! numeric coercibility. So a present-but-non-numeric ingredient (a STRING —
-//! GPS refs `N`/`S`/`E`/`W`, `DateStamp`, `TimeStamp`, the ingredients the GPS /
-//! EXIF / datetime defs added by later #133 PRs read) is correctly seen as
+//! GPS refs `N`/`S`/`E`/`W`, `DateStamp`, `TimeStamp`) is correctly seen as
 //! PRESENT, and a string `Inhibitor` correctly suppresses. Each
 //! [`CompositeDef::derive`](table::CompositeDef) then does its OWN coercion: the
-//! Duration defs coerce numeric and apply the Perl-truthy `&&` guard on the raw
-//! value; future string defs read the string directly. This keeps ONE input
-//! model general for PRs 2-5.
+//! Duration defs coerce numeric and apply the Perl-truthy `&&` guard; the GPS
+//! defs read the string/decimal ingredients directly.
 //!
-//! ## Inputs resolve from the RAW value, independent of `-j`/`-n`
+//! ## Two resolution views — `$val[i]` (ValueConv) and `$prt[i]` (PrintConv)
 //!
-//! ExifTool's `BuildCompositeTags` reads each input's ValueConv value for
-//! `$val[i]` (`GetValue($tag, 'ValueConv')`, ExifTool.pm:4112) REGARDLESS of the
-//! requested output conversion — the composite's own `RawConv`/`ValueConv` runs
-//! on the machine value, never the printed form. exifast mirrors this: under
-//! `-n` the emitted sink already holds the raw ValueConv values, so it is its
-//! own resolution view; under `-j` the sink holds PrintConv strings, so the
-//! caller re-emits the Meta in ValueConv mode into a separate `raw_view` and the
-//! engine resolves inputs (and Composite-dependencies) from THAT, while each
-//! composite's RENDERED (`-j`) value still lands in the output sink. (A
-//! composite's PrintConv form `$prt[i]`, needed by e.g. `GPSPosition`'s
-//! PrintConv in a later #133 PR, is not wired yet — no PR-1 composite reads it;
-//! it slots in as a parallel per-input lookup.)
+//! ExifTool's `BuildCompositeTags` builds BOTH a `@val` array (each input's
+//! ValueConv value, `GetValue($tag, 'ValueConv')`, ExifTool.pm:4112) AND a
+//! `@prt` array (each input's PrintConv value, ExifTool.pm:4116). A Composite's
+//! `RawConv`/`ValueConv` reads `$val[i]`; its `PrintConv` may read `$prt[i]`
+//! (`GPSPosition`'s PrintConv is the literal `"$prt[0], $prt[1]"`;
+//! `GPSAltitude`'s reads `$prt[1]`). exifast carries BOTH per input, in both
+//! modes, by resolving from TWO views:
+//!
+//! * the **ValueConv view** — the emitted tag set in `-n` mode (raw ValueConv
+//!   values) — supplies `$val[i]`;
+//! * the **PrintConv view** — the emitted tag set in `-j` mode (PrintConv
+//!   strings) — supplies `$prt[i]`.
+//!
+//! Under `-n` the active `out` sink already holds the ValueConv values, so it
+//! IS the ValueConv view, and the caller re-emits a throwaway PrintConv view for
+//! `$prt[i]`. Under `-j` the active `out` sink holds the PrintConv strings, so
+//! it IS the PrintConv view, and the caller re-emits a throwaway ValueConv view
+//! for `$val[i]`. Either way the engine populates BOTH views with each built
+//! composite (its ValueConv form into the ValueConv view, its PrintConv form
+//! into the PrintConv view) so a composite-on-composite (`GPSPosition`) reads a
+//! faithful `$val[i]` AND `$prt[i]` of its ingredient composites — and because
+//! `out` is one of the two views, the composite's output value for the active
+//! mode lands in `out` automatically.
 
 pub mod convs;
 mod table;
 
 #[cfg(feature = "alloc")]
-use crate::tagmap::TagMap;
-#[cfg(feature = "alloc")]
 use crate::value::TagValue;
 #[cfg(feature = "alloc")]
-use table::{CompositeDef, CompositePrintConv, CompositeValue, REGISTRY};
+use table::{CompositeDef, CompositeValue, REGISTRY};
 
 /// A dedup sink the Composite engine reads inputs from and appends results to.
 /// Implemented by [`TagMap`](crate::tagmap::TagMap) (the JSON / golden path) and
@@ -75,23 +84,21 @@ trait CompositeSink {
   /// The LAST-emitted Main-document value whose family-1 group is in `groups`
   /// (or ANY group when `groups` is empty) and whose name is `name`, as a
   /// [`CompositeValue`] carrying the RAW stored [`TagValue`]
-  /// ([`Present`](CompositeValue::Present)) — NOT pre-coerced. The engine
-  /// invokes this on the ValueConv RESOLUTION view (under `-n` the emitted sink
-  /// itself; under `-j` a separate ValueConv re-emission), so the returned value
-  /// is the faithful `$val[i]` regardless of the output mode. A `Missing` result
-  /// means no such tag was extracted (`!defined $val[i]`); a present value of
-  /// ANY shape (numeric or string) is [`Present`](CompositeValue::Present), so
-  /// `Inhibit`/`Require`/`Desire` resolve on presence and each def performs its
-  /// own coercion.
+  /// ([`Present`](CompositeValue::Present)). Invoked on whichever view supplies
+  /// the requested form (the ValueConv view for `$val[i]`, the PrintConv view
+  /// for `$prt[i]`). A `Missing` result means no such tag was extracted
+  /// (`!defined`); a present value of ANY shape is
+  /// [`Present`](CompositeValue::Present), so `Inhibit`/`Require`/`Desire`
+  /// resolve on presence and each def performs its own coercion.
   fn resolve(&self, groups: &[&str], name: &str) -> CompositeValue;
   /// Is a `Composite:<name>` already present?
   fn has_composite(&self, name: &str) -> bool;
-  /// Append a built `Composite:<name>` (at Main, ExifTool default `Priority`).
-  fn append(&mut self, name: &'static str, value: TagValue);
+  /// Append a built `Composite:<name>` (at Main, with ExifTool `Priority`).
+  fn append(&mut self, name: &'static str, priority: u8, value: TagValue);
 }
 
 #[cfg(feature = "alloc")]
-impl CompositeSink for TagMap {
+impl CompositeSink for crate::tagmap::TagMap {
   fn resolve(&self, groups: &[&str], name: &str) -> CompositeValue {
     let group_ok = |g: &str| groups.is_empty() || groups.contains(&g);
     // Reverse scan for the LAST match (entries are in first-occurrence order;
@@ -113,8 +120,8 @@ impl CompositeSink for TagMap {
       .iter()
       .any(|(_doc, _sub, fam1, n, _pri, _val)| fam1.as_str() == "Composite" && n.as_str() == name)
   }
-  fn append(&mut self, name: &'static str, value: TagValue) {
-    let _ = self.write_value_doc(0, 0, "Composite", name, 1, value);
+  fn append(&mut self, name: &'static str, priority: u8, value: TagValue) {
+    let _ = self.write_value_doc(0, 0, "Composite", name, priority, value);
   }
 }
 
@@ -139,7 +146,7 @@ impl CompositeSink for std::vec::Vec<crate::value::Tag> {
       .iter()
       .any(|t| t.group_ref().family1() == "Composite" && t.name() == name)
   }
-  fn append(&mut self, name: &'static str, value: TagValue) {
+  fn append(&mut self, name: &'static str, _priority: u8, value: TagValue) {
     self.push(crate::value::Tag::new(
       crate::value::Group::new("Composite", "Composite"),
       name,
@@ -154,107 +161,119 @@ fn t_value(t: &crate::value::Tag) -> &TagValue {
   t.value_ref()
 }
 
+/// A [`TagValue`] in Perl string context — what `$val[i]` / `$prt[i]` becomes
+/// when a Composite's ValueConv/PrintConv interpolates it. A `Str` is borrowed;
+/// the numeric scalars stringify with Perl's default NV / integer rule (so a
+/// GPS decimal `$val` interpolates as `48.85815`, matching ExifTool's
+/// `"$val[0] $val[1]"`); other shapes render via their textual form.
+#[cfg(feature = "alloc")]
+pub(crate) fn value_text(v: &TagValue) -> std::borrow::Cow<'_, str> {
+  use std::borrow::Cow;
+  match v {
+    TagValue::Str(s) => Cow::Borrowed(s.as_str()),
+    TagValue::I64(n) => Cow::Owned(n.to_string()),
+    TagValue::U64(n) => Cow::Owned(n.to_string()),
+    // Perl's default NV stringification (`%.15g`) — the form a decimal GPS
+    // coordinate interpolates as inside `"$val[0] $val[1]"`.
+    TagValue::F64(x) => Cow::Owned(crate::value::format_g(*x, 15)),
+    TagValue::Bool(b) => Cow::Borrowed(if *b { "1" } else { "" }),
+    other => Cow::Owned(std::format!("{other:?}")),
+  }
+}
+
 /// Build every registered Composite tag into `out` (the post-`run_emission`
 /// pass). `mode` is the active OUTPUT conversion mode (`-j` ⇒ PrintConv, `-n`
-/// ⇒ ValueConv); `raw` is the SAME Meta re-emitted in ValueConv mode (`-n`),
-/// supplied so the engine resolves each input from its post-ValueConv (raw)
-/// value REGARDLESS of `mode` — ExifTool's `BuildCompositeTags`/`GetValue`
-/// reads `$val[i]` as the input's ValueConv value, not the printed form
-/// (ExifTool.pm:4044-4112). `None` ⇒ resolve from `out` itself (the `-n` path,
-/// where the emitted values already ARE the raw ValueConv values, so a separate
-/// pass is redundant). `doc_count` is the highest family-3 sub-document index
-/// present (reserved for `SubDoc` composites — none of the registered Duration
-/// defs is `SubDoc`, so they build at Main only regardless, ExifTool.pm:3999).
+/// ⇒ ValueConv); `other_view` is the SAME Meta re-emitted in the OPPOSITE mode,
+/// supplied so the engine has BOTH a ValueConv view (`$val[i]`) and a PrintConv
+/// view (`$prt[i]`) regardless of `mode` — under `-n`, `out` is the ValueConv
+/// view and `other_view` is the PrintConv re-emission; under `-j`, `out` is the
+/// PrintConv view and `other_view` is the ValueConv re-emission. `None` is
+/// permitted ONLY when the defs read neither the opposite-mode view NOR a
+/// composite dependency (the legacy single-sink Duration path); the registered
+/// GPS defs always require `other_view`. `doc_count` is reserved for `SubDoc`
+/// composites (the stills GPS defs build at Main only, `doc_count == 0`).
 #[cfg(feature = "alloc")]
 pub(crate) fn build_composites(
-  out: &mut TagMap,
-  raw: Option<&mut TagMap>,
+  out: &mut crate::tagmap::TagMap,
+  other_view: Option<&mut crate::tagmap::TagMap>,
   mode: crate::emit::ConvMode,
   doc_count: u32,
 ) {
   let _ = doc_count; // reserved for SubDoc composites (later #133 PRs)
-  build_into(REGISTRY, out, raw, mode);
+  build_into(REGISTRY, out, other_view, mode);
 }
 
 /// Build every registered Composite tag into the
 /// [`iter_tags`](crate::format_parser::AnyMeta::iter_tags) `Tag` `Vec` (the
 /// public generic-extraction path), so it yields the same `Composite:*` set the
-/// JSON path does. `raw` is the SAME tag stream re-collected in ValueConv mode
-/// (the input-resolution source; see [`build_composites`]); `None` on the `-n`
-/// path where `tags` already holds the raw values.
+/// JSON path does. `other_view` is the SAME tag stream re-collected in the
+/// OPPOSITE mode (the `$prt[i]`/`$val[i]` source; see [`build_composites`]).
 #[cfg(feature = "alloc")]
 pub(crate) fn build_composites_into_tags(
   tags: &mut std::vec::Vec<crate::value::Tag>,
-  raw: Option<&mut std::vec::Vec<crate::value::Tag>>,
+  other_view: Option<&mut std::vec::Vec<crate::value::Tag>>,
   mode: crate::emit::ConvMode,
 ) {
-  build_into(REGISTRY, tags, raw, mode);
+  build_into(REGISTRY, tags, other_view, mode);
 }
 
 /// Drive the ExifTool `BuildCompositeTags` fixpoint over `defs`.
 ///
-/// Inputs are resolved from the RAW (post-ValueConv) value of each ingredient,
-/// independent of the active output `mode`: this is ExifTool's `$val[i]`
-/// (`GetValue($tag, 'ValueConv')`, ExifTool.pm:4112), so a composite's own
-/// `RawConv`/`ValueConv` always runs on the faithful machine value (a GPS ref
-/// `"N"`/`"S"`, a decimal coordinate, a `DateStamp`) — never the printed form.
-/// (A composite's PrintConv form `$prt[i]`, needed by e.g. `GPSPosition`'s
-/// PrintConv in a LATER #133 PR, is not wired yet because no PR-1 composite —
-/// `Duration` — reads it; it slots in as a second per-input lookup.)
+/// `out` is the view for the active output `mode`; `other_view` is the opposite-
+/// mode re-emission. The engine binds them to a `(val_view, prt_view)` pair (in
+/// `-n`, `out` is the ValueConv view and `other_view` the PrintConv view; in
+/// `-j`, vice versa), resolves each input's `$val[i]` from `val_view` and
+/// `$prt[i]` from `prt_view`, runs the def's derivation over `$val[]`, and
+/// appends each built composite's ValueConv form to `val_view` and PrintConv
+/// form to `prt_view` — so a composite-on-composite (`GPSPosition`) reads a
+/// faithful `$val[i]`/`$prt[i]` of its ingredients, and the composite's output
+/// for `mode` lands in `out` (which is one of the two views).
 ///
-/// `resolve_src` is the raw view to read inputs + composite-dependencies from
-/// AND to append each built composite's RAW value to (so a composite that
-/// `Require`s another `Composite:*` sees its raw value in the fixpoint). When
-/// `None`, the active `out` sink IS the raw view (the `-n` path), so the engine
-/// reads + appends there directly. The RENDERED composite (for `mode`) is
-/// always appended to `out`. Split out so the oracle tests can pass synthetic
-/// def lists, and generic over the sink so the TagMap and `Vec<Tag>` paths
-/// share ONE engine.
+/// When `other_view` is `None` (the legacy single-sink Duration path, used by
+/// the oracle tests and the `-n` build when no def reads `$prt`), `out` is BOTH
+/// views: the engine resolves and appends through it alone, rendering the
+/// composite once for `mode`. Byte-identical to the pre-`$prt` engine for any
+/// def whose PrintConv ignores `$prt`.
 #[cfg(feature = "alloc")]
 fn build_into<S: CompositeSink>(
   defs: &[CompositeDef],
   out: &mut S,
-  resolve_src: Option<&mut S>,
+  other_view: Option<&mut S>,
   mode: crate::emit::ConvMode,
 ) {
-  match resolve_src {
-    // `-j` (PrintConv): inputs + composite-dependencies resolve from the SEPARATE
-    // raw ValueConv view. Each built composite's RAW value is appended back into
-    // that view (so a Composite-requires-Composite chain reads faithful `$val[i]`
-    // in the fixpoint), while its RENDERED (`-j`) value is mirrored into `out`.
-    Some(raw_view) => run_fixpoint(defs, raw_view, |view, name, raw, pc| {
-      view.append(
-        name,
-        render_value(pc, raw, crate::emit::ConvMode::ValueConv),
-      );
-      out.append(name, render_value(pc, raw, mode));
-    }),
-    // `-n` (ValueConv) and the synthetic-map oracle/differential tests: `out` is
-    // itself the resolution view (its values are already the raw ValueConv form
-    // in `-n`; in the test maps they ARE the ingredients), so resolution reads
-    // `out` directly and the composite is appended there ONCE, rendered for the
-    // active `mode`. Under `-n` that rendered value is the raw value, so a
-    // dependent composite still resolves a faithful `$val[i]`. Byte-identical to
-    // the pre-#133-round-3 single-sink engine.
-    None => run_fixpoint(defs, out, |view, name, raw, pc| {
-      view.append(name, render_value(pc, raw, mode));
-    }),
+  use crate::emit::ConvMode;
+  match other_view {
+    Some(other) => {
+      // Bind (val_view, prt_view) by mode. `out` is whichever view holds the
+      // active mode's form; `other` is the opposite-mode re-emission.
+      let (val_view, prt_view): (&mut S, &mut S) = match mode {
+        ConvMode::ValueConv => (out, other), // out = ValueConv view
+        ConvMode::PrintConv => (other, out), // out = PrintConv view
+      };
+      run_fixpoint(defs, val_view, Some(prt_view), mode);
+    }
+    // No `$prt` source: `out` is its own sole view (the ValueConv values in `-n`,
+    // the synthetic oracle maps). A `$prt`-reading PrintConv sees `None` prt
+    // elements; the Duration defs (the only `None`-path callers) ignore `$prt`.
+    None => run_fixpoint(defs, out, None, mode),
   }
 }
 
-/// The ExifTool `BuildCompositeTags` fixpoint over `defs`, reading inputs (and
-/// Composite-dependencies) from `resolve_view`. For each built composite,
-/// `place_built(resolve_view, name, raw, print_conv)` is invoked to (1) make the
-/// composite visible in `resolve_view` for any dependent composite's `$val[i]`
-/// and (2) emit its output value — the `-j` arm appends the RAW value to the
-/// raw view AND mirrors the rendered value to the output sink; the `-n`/test arm
-/// appends the mode-rendered value once to the single sink.
+/// The ExifTool `BuildCompositeTags` fixpoint over `defs`, resolving `$val[i]`
+/// from `val_view` and `$prt[i]` from `prt_view` (the SAME sink as `val_view`
+/// when `prt_view` is `None`). The Composite-dependency deferral (`not_built` /
+/// `has_composite`) keys on `val_view` (a dependency's `$val[i]` is what gates
+/// the build). For each built composite, both forms are appended: the ValueConv
+/// form to `val_view`, the PrintConv form to `prt_view` (or, when they coincide,
+/// the active-mode form once).
 #[cfg(feature = "alloc")]
 fn run_fixpoint<S: CompositeSink>(
   defs: &[CompositeDef],
-  resolve_view: &mut S,
-  mut place_built: impl FnMut(&mut S, &'static str, f64, CompositePrintConv),
+  val_view: &mut S,
+  mut prt_view: Option<&mut S>,
+  mode: crate::emit::ConvMode,
 ) {
+  use crate::emit::ConvMode;
   // Working order: a faithful prefixed-id sort (`Module-Name`). Stable sort so
   // equal keys keep registry order (ExifTool's keys are unique, so ties don't
   // occur in practice).
@@ -275,10 +294,12 @@ fn run_fixpoint<S: CompositeSink>(
     let pending_len = pending.len();
 
     'def: for def in pending.iter().copied() {
-      // Resolve each input index to a `CompositeValue` (PRESENCE + raw value),
-      // never pre-coercing. `Require`/`Desire`/`Inhibit` key on presence; the
-      // def's `derive` does its own coercion of the `Present` raw values.
-      let mut values: std::vec::Vec<CompositeValue> =
+      // Resolve each input index to its `$val[i]` ([`CompositeValue`], presence
+      // + raw value) AND its `$prt[i]` (the PrintConv-view value, `None` for an
+      // absent/`Missing` input). `Require`/`Desire`/`Inhibit` key on `$val[i]`
+      // presence; the def's `derive` reads `$val[]`; the PrintConv reads both.
+      let mut vals: std::vec::Vec<CompositeValue> = std::vec::Vec::with_capacity(def.inputs.len());
+      let mut prts: std::vec::Vec<Option<TagValue>> =
         std::vec::Vec::with_capacity(def.inputs.len());
       let mut suppress = false; // an Inhibit input was present
       let mut require_missing = false;
@@ -287,7 +308,7 @@ fn run_fixpoint<S: CompositeSink>(
         // Composite-dependency deferral (ExifTool.pm:4044-4052): an input that
         // references a `Composite:Name` not yet built defers this def — UNLESS
         // it is an Inhibit and we are in the final `$allBuilt` pass.
-        if references_unbuilt_composite(input, &not_built, resolve_view) {
+        if references_unbuilt_composite(input, &not_built, val_view) {
           let defer = !(input.kind.is_inhibit() && all_built);
           if defer {
             deferred.push(def);
@@ -295,7 +316,7 @@ fn run_fixpoint<S: CompositeSink>(
           }
         }
 
-        let resolved = resolve_view.resolve(input.groups, input.name);
+        let resolved = val_view.resolve(input.groups, input.name);
         if resolved.is_present() {
           if input.kind.is_inhibit() {
             // ExifTool.pm:4078-4081 `$found = 0; last` — a PRESENT inhibitor of
@@ -303,7 +324,14 @@ fn run_fixpoint<S: CompositeSink>(
             suppress = true;
             break;
           }
-          values.push(resolved);
+          // The matching `$prt[i]` from the PrintConv view (the SAME sink as
+          // `val_view` when `prt_view` is `None`).
+          let prt = match prt_view.as_deref() {
+            Some(pv) => pv.resolve(input.groups, input.name),
+            None => val_view.resolve(input.groups, input.name),
+          };
+          prts.push(prt.value().cloned());
+          vals.push(resolved);
         } else {
           if input.kind.is_require() {
             // ExifTool.pm:4084-4087 `$found = 0; last` — required & missing.
@@ -311,7 +339,8 @@ fn run_fixpoint<S: CompositeSink>(
             break;
           }
           // Desire / Inhibit absent ⇒ undef element, keep going.
-          values.push(CompositeValue::Missing);
+          prts.push(None);
+          vals.push(CompositeValue::Missing);
         }
       }
 
@@ -321,12 +350,37 @@ fn run_fixpoint<S: CompositeSink>(
         continue;
       }
 
-      // All inputs resolved: run the derivation. The arm-specific `place_built`
-      // makes the composite visible in `resolve_view` (for a dependent
-      // composite's `$val[i]`) AND emits its output value (see `build_into`).
+      // All inputs resolved: run the derivation (`$val` from `$val[]`).
       not_built.remove(def.name);
-      if let Some(raw) = (def.derive)(&values) {
-        place_built(resolve_view, def.name, raw, def.print_conv);
+      if let Some(raw) = (def.derive)(&vals) {
+        // Append the ValueConv form to `val_view` and the PrintConv form to
+        // `prt_view`, so a dependent composite reads both. When the two views
+        // coincide (`None` prt_view), append the active-mode form once.
+        match prt_view.as_deref_mut() {
+          Some(prt) => {
+            val_view.append(
+              def.name,
+              def.priority,
+              def
+                .print_conv
+                .render(&raw, &vals, &prts, ConvMode::ValueConv),
+            );
+            prt.append(
+              def.name,
+              def.priority,
+              def
+                .print_conv
+                .render(&raw, &vals, &prts, ConvMode::PrintConv),
+            );
+          }
+          None => {
+            val_view.append(
+              def.name,
+              def.priority,
+              def.print_conv.render(&raw, &vals, &prts, mode),
+            );
+          }
+        }
       }
       // `None` ⇒ the `… ? … : undef` guard fired; nothing emitted, but the
       // composite is settled (already removed from `not_built`).
@@ -340,8 +394,8 @@ fn run_fixpoint<S: CompositeSink>(
       if all_built {
         // ExifTool warns `Circular dependency in Composite tags` and stops.
         // exifast has no doc-level warning channel for this synthetic case
-        // (the registered Duration defs never cycle); drop the unbuildable
-        // deferred defs and stop.
+        // (the registered defs never cycle); drop the unbuildable deferred defs
+        // and stop.
         break;
       }
       all_built = true; // one more pass, ignoring Inhibit-on-Composite
@@ -368,14 +422,6 @@ fn references_unbuilt_composite<S: CompositeSink>(
     return false;
   }
   not_built.contains(input.name)
-}
-
-/// Render the derived raw value for the def's PrintConv + the active mode.
-#[cfg(feature = "alloc")]
-fn render_value(pc: CompositePrintConv, raw: f64, mode: crate::emit::ConvMode) -> TagValue {
-  match pc {
-    CompositePrintConv::ConvertDuration => convs::duration_value(raw, mode),
-  }
 }
 
 #[cfg(test)]

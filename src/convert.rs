@@ -315,7 +315,8 @@ fn is_int(s: &str) -> bool {
 }
 
 /// Faithful transliteration of ExifTool `sub IsFloat($)`
-/// (`ExifTool.pm:5936-5942`):
+/// (`ExifTool.pm:5947-5953`) — the float predicate AND the in-place `tr/,/./`
+/// translation, exposed as the value the caller must coerce:
 ///
 /// ```perl
 /// return 1 if $_[0] =~ /^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee]([+-]?\d+))?$/;
@@ -328,21 +329,34 @@ fn is_int(s: &str) -> bool {
 /// Two anchored, whole-string forms (NO leading/trailing whitespace, NO hex):
 /// an optional sign, then either a dot-decimal float (`12.5`, `.5`, `3.`,
 /// `+3`, `1e3`) OR a single comma-decimal float (`12,5`, `,5` — at most one
-/// comma per the `(,\d*)?` group). On the comma branch the caller's value is
-/// rewritten `,`→`.` (the Perl `tr` mutates `$_[0]`), so we return the
-/// already-translated owned string alongside the boolean. The caller uses the
-/// returned string for the subsequent numeric coercion.
+/// comma per the `(,\d*)?` group).
 ///
-/// Returns `(matched, value_to_coerce)`:
-/// - `matched == false` ⇒ NOT a float; `value_to_coerce` is the input
-///   unchanged (the caller's `return $val unless IsFloat($val)`).
-/// - `matched == true` ⇒ a float; `value_to_coerce` is the input with a sole
-///   comma (if any) translated to a dot — a clean dot-decimal numeric string.
+/// Returns `Some(value_to_coerce)` when `s` is a float — the input with a sole
+/// comma decimal (if any) translated to a dot, a clean dot-decimal string the
+/// caller must feed into its subsequent numeric coercion (e.g.
+/// [`perl_str_to_f64`]). Returns `None` when `s` is not a float (the
+/// `... unless IsFloat ...` guard fires; the original value is untouched).
+///
+/// Returning the NORMALIZED value is load-bearing, not cosmetic: ExifTool's
+/// `tr/,/./` mutates `$_[0]` IN PLACE, so every later numeric use of the same
+/// scalar sees the translated value — `Composite:GPSAltitude` re-coerces it in
+/// both its ValueConv (`-abs($val[$_])`) and PrintConv (`int($val[$_]*10)/10`)
+/// (GPS.pm:414/421), and the `ImageSize` / `DOF` composites (PRs 3-4) likewise
+/// ingest decimal strings. A caller that discarded it would coerce `12,5` as
+/// `12` (the comma terminates the Perl numeric prefix) instead of `12.5`. This
+/// is the shared comma-normalization class; obtain the value here once and pass
+/// it on (mirroring Perl's single mutated `$val[$_]`).
 ///
 /// Bundled-Perl oracle (verified 2026-05-22 via `Image::ExifTool::IsFloat`):
 /// `"12.5"`/`".5"`/`"3."`/`"+3"`/`"1e3"`/`"-2.5"` → matched; `"12,5"`/`",5"`
 /// → matched + translated to `"12.5"`/`".5"`; `"  12.5"`/`"12.5 "`/`"0x10"`/
 /// `"12abc"`/`""`/`"1e"`/`"1,5,6"`/`"inf"`/`"nan"` → NOT matched.
+#[cfg(feature = "alloc")]
+pub(crate) fn is_float_norm(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+  let (matched, value) = is_float(s);
+  matched.then_some(value)
+}
+
 fn is_float(s: &str) -> (bool, std::borrow::Cow<'_, str>) {
   use std::borrow::Cow;
   // Dot-decimal branch (ExifTool.pm:5937) — `(?=\d|\.\d)` requires the

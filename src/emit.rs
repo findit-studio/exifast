@@ -49,6 +49,19 @@ impl ConvMode {
       ConvMode::ValueConv
     }
   }
+
+  /// The OPPOSITE conversion mode. Used by the Composite engine, which needs
+  /// both a ValueConv view (`$val[i]`) and a PrintConv view (`$prt[i]`): the
+  /// active-output mode's view is the emitted set, and the opposite-mode
+  /// re-emission supplies the other view (see [`crate::composite`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn flipped(self) -> Self {
+    match self {
+      ConvMode::PrintConv => ConvMode::ValueConv,
+      ConvMode::ValueConv => ConvMode::PrintConv,
+    }
+  }
 }
 
 /// Options that shape a [`Taggable::tags`] emission: the conv mode (`-j`/`-n`),

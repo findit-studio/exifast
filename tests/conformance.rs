@@ -1057,9 +1057,11 @@ fn m2ts_h264_mdpm_multiframe_noee_conformance() {
   // `tests/timed_metadata_conformance.rs::m2ts_h264_mdpm_ee_byte_exact`.
   //
   // Goldens are bundled `perl exiftool -j -G1 -struct` with `System:*` +
-  // `Composite:*` stripped (the M2TS precedent — the Composite engine is a
-  // deferred Phase-2 forward item; the bundled output synthesizes
-  // `Composite:GPSLatitude`/`Longitude`/`Position` from the H.264/GPS values).
+  // `Composite:*` stripped. Bundled synthesizes `Composite:GPSLatitude`/
+  // `Longitude`/`Position` from the H.264/GPS values, but the M2TS GPS is TIMED
+  // (per-PES sub-document) — its faithful Composites are the SubDoc / `Doc<N>`
+  // axis #133 PR 5 adds, so exifast DEFERS them here (`AnyMeta::M2ts` ⇒
+  // `defers_composites`); the GPS stills got their Composites in #133 PR 2.
   check("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.json", true);
   check("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.n.json", false);
 }
@@ -9094,16 +9096,19 @@ fn makernotes_dji_phantom4_conformance() {
   // `CameraRoll` (-29.80 / -7.80 / +0.00) gimbal angles. The standard EXIF GPS
   // IFD is ALSO byte-exact (exifast emits the GPS IFD directly): `GPSLatitude`
   // = 32 deg 28' 42.95" N, `GPSLongitude` = 90 deg 15' 36.01" W, `GPSAltitude`
-  // = 109.786 m — these are the raw GPS IFD tags, NOT the `Composite:GPS*`
-  // synthesis (which exifast cannot emit). All 83 shared tags match for BOTH
-  // the `-j` PrintConv and `-n` numeric snapshots.
+  // = 109.786 m — the raw GPS IFD tags. The ported GPS `Composite:*`
+  // (`GPSLatitude`/`Longitude`/`Altitude`/`Position`, #133 PR 2) are ALSO
+  // retained and byte-exact. All shared tags match for BOTH the `-j` PrintConv
+  // and `-n` numeric snapshots.
   //
   // The goldens are generated with `gen_golden.sh EXCLUDE="…"` dropping the
   // tags exifast does NOT emit — every exclusion is a documented, NON-DJI-
   // MakerNote-path deferral (none masks a DJI faithfulness gap):
-  //   -x Composite:all   — exifast has no EXIF Composite subsystem (this drops
-  //                        the `Composite:GPS{Latitude,Longitude,Altitude,
-  //                        Position}` synthesis; the RAW GPS IFD above is kept).
+  //   -x Composite:{Aperture,CircleOfConfusion,FOV,FocalLength35efl,
+  //                 HyperfocalDistance,ImageSize,LightValue,Megapixels,
+  //                 ScaleFactor35efl,ShutterSpeed}
+  //                      — the still-deferred EXIF/lens Composite subsystem (a
+  //                        later #133 PR); the GPS Composites above ARE kept.
   //   -x XMP:all         — the XMP-drone-dji / XMP-crs / XMP-tiff / … packet is
   //                        not ported (no XMP subsystem).
   //   -x IFD1:ThumbnailImage — the embedded-thumbnail binary placeholder is a
@@ -9588,7 +9593,10 @@ fn gps_conformance() {
   //   - GPSDateStamp ExifDate (Exif.pm:6068-6076)
   //   - GPSAltitude `"$val m"` + GPSAltitudeRef hash
   // Goldens: bundled `perl exiftool -j -G1 -struct` (`-n` too), `System:*`
-  // + `Composite:*` stripped uniformly.
+  // stripped. The five ported GPS `Composite:*` (`GPSLatitude`/`Longitude`/
+  // `Altitude`/`DateTime`/`Position`, #133 PR 2) ARE retained — this fixture
+  // carries ONLY GPS Composites, so no `Composite:*` exclusion is needed
+  // (`tools/gen_golden.sh` default path).
   check("ExifGPS.tif", "ExifGPS.tif.json", true);
   check("ExifGPS.tif", "ExifGPS.tif.n.json", false);
 }
@@ -9616,8 +9624,13 @@ fn jpeg_exif_gps_conformance() {
   // timestamp/mapdatum/versionid), plus IFD0/ExifIFD/IFD1 + File:ExifByteOrder
   // and the File:* JPEG triplet.
   //
-  // Goldens are bundled `tools/gen_golden.sh` output with `System:*` +
-  // `Composite:*` stripped uniformly (every format conformance does this).
+  // Goldens are bundled `tools/gen_golden.sh` output with `System:*` stripped.
+  // The ported GPS `Composite:*` (`GPSLatitude`/`Longitude`/`Position`, #133 PR
+  // 2) ARE retained (this file has GPS lat/lon but no altitude/datestamp, so
+  // those two GPS Composites do not build); the still-deferred camera
+  // Composites (`Aperture`/`ImageSize`/`Megapixels`/`ShutterSpeed`/
+  // `FocalLength35efl`, a later #133 PR) are excluded by name in
+  // `tools/gen_golden.sh`, alongside the JPEG-port-deferred IPTC/thumbnail.
   // The `SOF` size tags (`File:ImageWidth`/`ImageHeight`/`BitsPerSample`/
   // `ColorComponents`/`EncodingProcess`/`YCbCrSubSampling`,
   // ExifTool.pm:7419-7462) are NOW EMITTED (#261) — this file's
@@ -10594,6 +10607,12 @@ fn xmp_projects_gps_altitude_signed_by_ref() {
   assert_eq!(agps.altitude_m(), Some(35.0));
 }
 
+// The `Composite:GPSAltitude` def `Desire`s the XMP altitude/ref pair
+// (GPS.pm:406), so exifast emits `Composite:GPSAltitude` from the embedded
+// `XMP-exif:GPSAltitude`/`…Ref` here — byte-matching bundled (`-j` `35 m Below/
+// Above Sea Level`, `-n` `-35`/`35`). The XMP-only ref Composites bundled ALSO
+// synthesizes (`GPSLatitudeRef`/`GPSLongitudeRef`/`GPSPosition`) are NOT ported,
+// so they stay excluded (`tools/gen_golden.sh` drops just those three).
 #[test]
 fn xmp_gps_belowsea_conformance() {
   check("XMP_gps_belowsea.xmp", "XMP_gps_belowsea.xmp.json", true);
