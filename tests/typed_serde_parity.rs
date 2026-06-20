@@ -702,7 +702,12 @@ const NOT_ACTIVE: &[&str] = &[
 /// timed GPS / DateTimeOriginal). Its no-`ee` `.json`/`.n.json` carry only the
 /// FIRST frame's MDPM (the `GotNAL06` latch suppresses later SEI at no-`ee`),
 /// byte-exact (M2TS/H264/GPS, Composite-excluded).
-const EXPECTED_ACTIVE_FIXTURES: usize = 538;
+/// 538 → 539 after `QuickTime_stsd_fixed_field_bleed.mov` (#302) activated — the
+/// crafted 3-entry `vide` `stsd` whose non-last entry's `BitDepth` bleeds into
+/// the next entry's bytes (`Track1:BitDepth 48879`), pinning the faithful
+/// whole-box ProcessHybrid fixed-field read. Its `.json`/`.n.json`
+/// (QuickTime, `System:*`/`Composite:*` excluded) are byte-exact.
+const EXPECTED_ACTIVE_FIXTURES: usize = 539;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
