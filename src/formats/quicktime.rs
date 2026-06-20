@@ -2210,94 +2210,147 @@ fn decode_hdlr_description(payload: &[u8]) -> Option<String> {
   decode_qt_handler_string(raw)
 }
 
+/// The ProcessHybrid + ProcessBinaryData fixed-field read window for ONE `stsd`
+/// sample-description entry, faithful to ExifTool's two-stage size dance over the
+/// WHOLE `stsd` box. `payload` is the `stsd` box body, `dir_start` the entry's
+/// absolute offset within it (its `$$dirInfo{DirStart}`, QuickTime.pm:9644),
+/// `entry` the entry slice and `child_pos` the entry-relative `ProcessHybrid`
+/// boundary (or `None`).
+///
+///  * `ProcessSampleDesc` sets `$$dirInfo{DirLen} = $size` (the entry's declared
+///    size) per entry (QuickTime.pm:9645).
+///  * `ProcessHybrid`, when it finds a child boundary, OVERWRITES
+///    `$$dirInfo{DirLen} = $pos` with the child atom's ABSOLUTE box position
+///    (`dir_start + child_pos`, QuickTime.pm:9680) — note this is an absolute
+///    offset, NOT a length; the no-child case leaves `DirLen` as the entry's
+///    relative size.
+///  * `ProcessBinaryData` then clamps `$size = $$dirInfo{DirLen}` by
+///    `$maxLen = dataLen - dirStart` (the rest of the WHOLE box from this entry,
+///    ExifTool.pm:9882/9889): `$size = min(DirLen, payload.len() - dir_start)`.
+///
+/// A fixed field at entry-relative offset `off` is then read at the ABSOLUTE box
+/// position `payload[dir_start + off ..]` while `off < $size` (ExifTool.pm:9954
+/// `next if $entry >= $size`). Because `$size` is compared against the
+/// entry-RELATIVE `off` but `DirLen` is the entry's ABSOLUTE child boundary, a
+/// NON-LAST entry (`dir_start > 8`) whose child boundary exceeds its own extent
+/// gets `$size > entry.len()`, so a field past the entry end is STILL read — it
+/// BLEEDS into the following entries' bytes (`substr($$dataPt, $entry+$dirStart,
+/// …)`). Verified byte-exact against bundled ExifTool 13.59 (a non-last `vide`
+/// entry's `BitDepth` reads the next entry's bytes — see
+/// `QuickTime_stsd_fixed_field_bleed.mov` and
+/// `walk_trak_vide_nonlast_entry_fixed_field_bleeds_into_next`). The FIRST entry
+/// (`dir_start == 8`, single-entry box) coincides with the entry-bounded read
+/// (`$size <= entry.len()`), so a well-formed `stsd` never bleeds.
+fn stsd_fixed_field_size(
+  payload: &[u8],
+  dir_start: usize,
+  entry: &[u8],
+  child_pos: Option<usize>,
+) -> usize {
+  // `$$dirInfo{DirLen}`: the absolute child boundary if ProcessHybrid found one,
+  // else the entry's declared (relative) size.
+  let dir_len = match child_pos {
+    Some(cp) => dir_start.saturating_add(cp),
+    None => entry.len(),
+  };
+  // `$maxLen = dataLen - dirStart`; `for_each_stsd_entry` guarantees
+  // `dir_start <= payload.len()`, so the subtraction never wraps.
+  let max_len = payload.len().saturating_sub(dir_start);
+  dir_len.min(max_len)
+}
+
+/// Read an `int16u` fixed field at entry-relative offset `off` over the WHOLE
+/// `stsd` box (the faithful bleed: `substr($$dataPt, off + dir_start, 2)`).
+/// `Some` iff the whole field fits the window (`off + 2 <= size`, ExifTool's
+/// `next if $entry >= $size` plus ReadValue's `int($more/$len) < 1 ⇒ undef`).
+fn read_stsd_u16(payload: &[u8], dir_start: usize, size: usize, off: usize) -> Option<u16> {
+  (off.checked_add(2)? <= size).then(|| be_u16(payload, dir_start.checked_add(off)?))?
+}
+
+/// Read a `fixed32u`/`int32u` fixed field at entry-relative offset `off` over the
+/// WHOLE `stsd` box (`substr($$dataPt, off + dir_start, 4)`); `Some` iff
+/// `off + 4 <= size`.
+fn read_stsd_u32(payload: &[u8], dir_start: usize, size: usize, off: usize) -> Option<u32> {
+  (off.checked_add(4)? <= size).then(|| be_u32(payload, dir_start.checked_add(off)?))?
+}
+
+/// Read a `string[count]` fixed field at entry-relative offset `off` over the
+/// WHOLE `stsd` box. ExifTool reads `min(count, $size - off)` bytes (ReadValue
+/// shortens the count to the available window) starting at `off + dir_start`, so
+/// `Some(slice)` iff `off < size` (`$more > 0`); the returned slice is the raw
+/// `substr` window (caller applies the field's NUL/Pascal RawConv).
+fn read_stsd_str<'a>(
+  payload: &'a [u8],
+  dir_start: usize,
+  size: usize,
+  off: usize,
+  count: usize,
+) -> Option<&'a [u8]> {
+  if off >= size {
+    return None;
+  }
+  let avail = size - off; // `$more = $size - $entry`, > 0 here
+  let want = count.min(avail);
+  let start = dir_start.checked_add(off)?;
+  let end = start.checked_add(want)?;
+  payload.get(start..end)
+}
+
 /// Decode ONE `stsd` sample-description entry's `vide`-track
 /// `%QuickTime::VisualSampleDesc` binary fields (QuickTime.pm:7585-7647,
 /// `ProcessHybrid` + `FORMAT => 'int16u'` ⇒ key `N` is byte `2*N`). Offsets are
 /// relative to the sample entry start (the `[size:4]` field), so CompressorID
-/// (key 2 ⇒ byte 4) IS the format 4cc. A field whose offset overruns the entry
-/// is left `None` (ExifTool stops at `$entry >= $size`). The caller folds every
+/// (key 2 ⇒ byte 4) IS the format 4cc. Each fixed field is read over the WHOLE
+/// `stsd` box (`payload`) within the [`stsd_fixed_field_size`] window — so a
+/// non-last entry can BLEED past its own extent exactly as ExifTool does — and a
+/// field whose offset overruns the window is left `None`. The caller folds every
 /// entry with [`VisualSampleDesc::merge_from`] (per-tag last-wins). The
 /// `colr`/`pasp`/`btrt` child atoms are then walked via
 /// [`decode_visual_child_atoms`] (the other children — `avcC`/`clap`/`fiel`/… —
 /// are still deferred).
-fn decode_visual_sample_desc(entry: &[u8], dir_start: usize) -> VisualSampleDesc {
+fn decode_visual_sample_desc(payload: &[u8], dir_start: usize, entry: &[u8]) -> VisualSampleDesc {
   let mut v = VisualSampleDesc::new();
   // The ProcessHybrid child boundary, located ONCE and reused for the child-atom
   // walk (no double scan).
   let child_pos = find_hybrid_child_pos(entry);
-  // ExifTool's ProcessHybrid sets `$$dirInfo{DirLen} = $pos` (QuickTime.pm:9680)
-  // when a child boundary is found, where `$pos` is the child atom's ABSOLUTE
-  // position within the `stsd` box (`dir_start + childPos`, the entry's offset in
-  // the box plus the entry-relative boundary). ProcessBinaryData then reads a
-  // fixed field at entry-relative offset `entry` only while `entry < DirLen`
-  // (ExifTool.pm:9935-9966 `next if $entry >= $size` / `last if $more <= 0`). So
-  // the read limit applied to the per-field entry-relative offset is the absolute
-  // `dir_start + childPos`, NOT the entry-relative `childPos` alone. A field whose
-  // offset is at/beyond that cutoff is NOT decoded.
-  //
-  // FAITHFUL for the FIRST entry (`dir_start == 8`): the boundary chain ends at
-  // the entry end, so the minimal 8-byte child forces `childPos <= entry.len() -
-  // 8`, hence `cutoff = 8 + childPos <= entry.len()` and every read at offset
-  // `< cutoff` stays inside this entry slice (no byte-bleed). A crafted entry with
-  // an EARLY child boundary therefore omits the fixed fields past the cutoff
-  // (verified against bundled ExifTool 13.59 — see
-  // `walk_trak_vide_early_child_boundary_cuts_fixed_fields`). DEFERRED (#302): a
-  // 2nd+ entry has `dir_start > 8`, so a field whose offset is `< cutoff` but
-  // `>= entry.len()` would, in ExifTool, read into the NEXT entry's bytes
-  // (`substr($$dataPt, $entry + $dirStart, ...)` over the WHOLE box) — that
-  // cross-entry byte-bleed needs the whole `stsd` payload threaded, not this
-  // per-entry slice, and is left as a documented follow-up.
-  let within = |off: usize| child_pos.is_none_or(|cp| off < dir_start + cp);
+  // ProcessBinaryData fixed-field read window over the WHOLE `stsd` box (see
+  // [`stsd_fixed_field_size`]): IMPLEMENTED #302 — the fields are read at
+  // `payload[dir_start + off ..]`, so a non-last entry whose child boundary
+  // exceeds its extent reads PAST the entry into the following entries' bytes.
+  let size = stsd_fixed_field_size(payload, dir_start, entry, child_pos);
   // CompressorID (key 2 ⇒ byte 4, string[4]): the codec 4cc, verbatim. The
   // `string[4]` would NUL-truncate, but a real 4cc has no NUL; keep the lossy
-  // 4 chars to mirror ExifTool's `Get*`-then-string read.
-  if within(4)
-    && let Some(raw) = entry.get(4..8)
-  {
+  // chars to mirror ExifTool's `Get*`-then-string read.
+  if let Some(raw) = read_stsd_str(payload, dir_start, size, 4, 4) {
     v.set_compressor_id(Some(String::from_utf8_lossy(raw).into_owned()));
   }
   // VendorID (key 10 ⇒ byte 20, string[4], RawConv `length $val ? $val :
   // undef`): NUL-truncate then drop an empty (all-zero) value.
-  if within(20)
-    && let Some(raw) = entry.get(20..24)
-  {
+  if let Some(raw) = read_stsd_str(payload, dir_start, size, 20, 4) {
     let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     if let Some(trimmed) = raw.get(..nul).filter(|t| !t.is_empty()) {
       v.set_vendor_id(Some(String::from_utf8_lossy(trimmed).into_owned()));
     }
   }
   // SourceImageWidth/Height (keys 16/17 ⇒ bytes 32/34, int16u).
-  if within(32) {
-    v.set_source_image_width(be_u16(entry, 32));
-  }
-  if within(34) {
-    v.set_source_image_height(be_u16(entry, 34));
-  }
+  v.set_source_image_width(read_stsd_u16(payload, dir_start, size, 32));
+  v.set_source_image_height(read_stsd_u16(payload, dir_start, size, 34));
   // XResolution/YResolution (keys 18/20 ⇒ bytes 36/40, fixed32u).
-  if within(36) {
-    v.set_x_resolution(be_u32(entry, 36).map(get_fixed32u));
-  }
-  if within(40) {
-    v.set_y_resolution(be_u32(entry, 40).map(get_fixed32u));
-  }
+  v.set_x_resolution(read_stsd_u32(payload, dir_start, size, 36).map(get_fixed32u));
+  v.set_y_resolution(read_stsd_u32(payload, dir_start, size, 40).map(get_fixed32u));
   // CompressorName (key 25 ⇒ byte 50, string[32]) through the Pascal/C-string
-  // RawConv (ExifTool reads 32 bytes then NUL-truncates; the helper takes the
-  // shorter of the slice and the NUL position).
-  if within(50)
-    && let Some(raw) = entry.get(50..)
-  {
-    // `string[32]` reads at most 32 bytes; the shared decoder truncates at the
-    // first NUL within that window.
-    let field = raw.get(..32).unwrap_or(raw);
+  // RawConv (ExifTool reads at most 32 bytes — fewer when the window is shorter —
+  // then NUL-truncates; the helper takes the shorter of the slice and the NUL).
+  if let Some(field) = read_stsd_str(payload, dir_start, size, 50, 32) {
     v.set_compressor_name(decode_qt_handler_string(field));
   }
   // BitDepth (key 41 ⇒ byte 82, int16u).
-  if within(82) {
-    v.set_bit_depth(be_u16(entry, 82));
-  }
+  v.set_bit_depth(read_stsd_u16(payload, dir_start, size, 82));
   // Child atoms (colr/pasp/btrt) after the fixed visual fields, at the
   // `ProcessHybrid` boundary (QuickTime.pm:7585 PROCESS_PROC + 9660). Phase 2.
-  // The boundary located above is reused (not recomputed).
+  // The boundary located above is reused (not recomputed). The child-atom SCAN
+  // stays bounded to the entry slice (ExifTool bounds it too, QuickTime.pm:9645
+  // `$end = $dirStart + $dirLen`); only the fixed-field reads above bleed.
   decode_visual_child_atoms(entry, child_pos, &mut v);
   v
 }
@@ -2306,29 +2359,26 @@ fn decode_visual_sample_desc(entry: &[u8], dir_start: usize) -> VisualSampleDesc
 /// `%QuickTime::AudioSampleDesc` binary fields (QuickTime.pm:7498-7530,
 /// `ProcessHybrid`; the table has no explicit `FORMAT`, so the default `int8u`
 /// ⇒ key `N` is byte `N`). `AudioFormat` (key 4 ⇒ byte 4) is the codec 4cc.
-/// The caller folds every entry with [`AudioSampleDesc::merge_from`] (per-tag
-/// last-wins). The `btrt` child atom is then walked via
-/// [`decode_audio_child_atoms`] (the other children — `wave`/`chan`/`esds`/… —
-/// are still deferred).
-fn decode_audio_sample_desc(entry: &[u8], dir_start: usize) -> AudioSampleDesc {
+/// Each fixed field is read over the WHOLE `stsd` box (`payload`) within the
+/// [`stsd_fixed_field_size`] window, so a non-last entry can BLEED past its own
+/// extent exactly as ExifTool does. The caller folds every entry with
+/// [`AudioSampleDesc::merge_from`] (per-tag last-wins). The `btrt` child atom is
+/// then walked via [`decode_audio_child_atoms`] (the other children —
+/// `wave`/`chan`/`esds`/… — are still deferred).
+fn decode_audio_sample_desc(payload: &[u8], dir_start: usize, entry: &[u8]) -> AudioSampleDesc {
   let mut a = AudioSampleDesc::new();
   // The ProcessHybrid child boundary, located ONCE and reused for the child walk
   // (no double scan).
   let child_pos = find_hybrid_child_pos(entry);
-  // Same absolute fixed-field cutoff as the visual decoder: ExifTool sets
-  // `$$dirInfo{DirLen} = $pos` = the child atom's ABSOLUTE box position
-  // (`dir_start + childPos`, QuickTime.pm:9680) and ProcessBinaryData reads a
-  // field at entry-relative offset `off` only while `off < DirLen`. FAITHFUL for
-  // the FIRST entry (`dir_start == 8`, `cutoff <= entry.len()`, no bleed);
-  // the 2nd+ entry cross-entry byte-bleed is DEFERRED (#302) — see the
-  // `decode_visual_sample_desc` note.
-  let within = |off: usize| child_pos.is_none_or(|cp| off < dir_start + cp);
+  // Same whole-box fixed-field window as the visual decoder (IMPLEMENTED #302):
+  // `$size = min(DirLen, payload.len() - dir_start)`; the fields are read at
+  // `payload[dir_start + off ..]` so a non-last entry bleeds into the following
+  // entries' bytes (see [`stsd_fixed_field_size`]).
+  let size = stsd_fixed_field_size(payload, dir_start, entry, child_pos);
   // AudioFormat (key 4 ⇒ byte 4, undef[4]): RawConv stashes `$$self{AudioFormat}`
   // and returns `undef` unless the 4cc matches `/^[\w ]{4}$/i`.
   let mut fmt: Option<String> = None;
-  if within(4)
-    && let Some(raw) = entry.get(4..8)
-  {
+  if let Some(raw) = read_stsd_str(payload, dir_start, size, 4, 4) {
     let is_word_space = raw
       .iter()
       .all(|&b| b == b' ' || b == b'_' || b.is_ascii_alphanumeric());
@@ -2339,30 +2389,25 @@ fn decode_audio_sample_desc(entry: &[u8], dir_start: usize) -> AudioSampleDesc {
     }
   }
   // AudioVendorID (key 20 ⇒ byte 20, undef[4], Condition `AudioFormat ne
-  // "mp4s"`, RawConv all-zero ⇒ undef): the shared `%vendorID` PrintConv.
-  if within(20)
-    && fmt.as_deref() != Some("mp4s")
-    && let Some(raw) = entry.get(20..24)
+  // "mp4s"`, RawConv all-zero ⇒ undef): the shared `%vendorID` PrintConv. As an
+  // `undef[4]` it is NOT NUL-truncated — the all-zero check uses the raw window.
+  if fmt.as_deref() != Some("mp4s")
+    && let Some(raw) = read_stsd_str(payload, dir_start, size, 20, 4)
     && raw != [0, 0, 0, 0]
   {
     a.set_vendor_id(Some(String::from_utf8_lossy(raw).into_owned()));
   }
   // AudioChannels (key 24 ⇒ byte 24, int16u), AudioBitsPerSample (key 26 ⇒ byte
   // 26, int16u) — emitted even when zero (no RawConv).
-  if within(24) {
-    a.set_channels(be_u16(entry, 24));
-  }
-  if within(26) {
-    a.set_bits_per_sample(be_u16(entry, 26));
-  }
+  a.set_channels(read_stsd_u16(payload, dir_start, size, 24));
+  a.set_bits_per_sample(read_stsd_u16(payload, dir_start, size, 26));
   // AudioSampleRate (key 32 ⇒ byte 32, fixed32u).
-  if within(32) {
-    a.set_sample_rate(be_u32(entry, 32).map(get_fixed32u));
-  }
+  a.set_sample_rate(read_stsd_u32(payload, dir_start, size, 32).map(get_fixed32u));
   // Child atoms after the fixed audio fields, at the `ProcessHybrid` boundary
   // (QuickTime.pm:7498 PROCESS_PROC + 9660). The audio table lists `btrt` but
   // NOT `colr`/`pasp`, so only `btrt` is decoded here. Phase 2. The boundary
-  // located above is reused (not recomputed).
+  // located above is reused (not recomputed). The child-atom SCAN stays bounded
+  // to the entry slice (ExifTool bounds it too); only the fixed-field reads bleed.
   decode_audio_child_atoms(entry, child_pos, &mut a);
   a
 }
@@ -3308,7 +3353,7 @@ fn walk_trak_threaded(
                             SampleDescRoute::Visual => {
                               let mut acc = track.visual_sample_desc().cloned();
                               for_each_stsd_entry(sbody, |dir_start, entry| {
-                                let v = decode_visual_sample_desc(entry, dir_start);
+                                let v = decode_visual_sample_desc(sbody, dir_start, entry);
                                 match &mut acc {
                                   Some(a) => a.merge_from(v),
                                   None => acc = Some(v),
@@ -3321,7 +3366,7 @@ fn walk_trak_threaded(
                             SampleDescRoute::Audio => {
                               let mut acc = track.audio_sample_desc().cloned();
                               for_each_stsd_entry(sbody, |dir_start, entry| {
-                                let a = decode_audio_sample_desc(entry, dir_start);
+                                let a = decode_audio_sample_desc(sbody, dir_start, entry);
                                 match &mut acc {
                                   Some(prev) => prev.merge_from(a),
                                   None => acc = Some(a),
@@ -21765,16 +21810,20 @@ mod tests {
     assert_eq!(bt.average_bitrate(), Some(112_575));
   }
 
-  /// **Codex R2 — ProcessHybrid fixed-field cutoff (first entry).** ExifTool
-  /// sets `$$dirInfo{DirLen} = $pos` = the child atom's ABSOLUTE box position
-  /// when a `vide` sample entry has an EARLY child boundary (QuickTime.pm:9680),
-  /// and ProcessBinaryData reads a fixed field at entry-relative offset `off`
-  /// only while `off < DirLen`. The first entry's `dir_start` is 8, so a child
-  /// boundary at entry-relative offset 16 ⇒ cutoff 24: CompressorID (4) and
-  /// VendorID (20) are decoded (and VendorID reads the child `btrt` 4cc, the
-  /// faithful byte-bleed ExifTool itself exhibits), but SourceImageWidth/Height
-  /// (32/34), X/YResolution (36/40), CompressorName (50) and BitDepth (82) are
-  /// all at/beyond the cutoff and are OMITTED. The child `btrt` still decodes.
+  /// **ProcessHybrid fixed-field window — FIRST entry (the no-bleed coincidence).**
+  /// The fixed fields are read over the whole `stsd` box within
+  /// `$size = min(DirLen, payload.len() - dir_start)` (see
+  /// [`stsd_fixed_field_size`]). For the FIRST entry (`dir_start == 8`,
+  /// single-entry box) the window coincides with the entry-bounded read, so an
+  /// EARLY child boundary at entry-relative offset 16 ⇒ `$size == 24`:
+  /// CompressorID (4) and VendorID (20) are decoded (and VendorID at 20 reads the
+  /// child `btrt` 4cc at entry-relative 20..24, a WITHIN-entry bleed ExifTool
+  /// itself exhibits), but SourceImageWidth/Height (32/34), X/YResolution
+  /// (36/40), CompressorName (50) and BitDepth (82) are all at/beyond the window
+  /// and are OMITTED. The child `btrt` still decodes. The CROSS-entry bleed (a
+  /// NON-last entry reading into the following entry's bytes) is exercised by
+  /// `walk_trak_vide_nonlast_entry_fixed_field_bleeds_into_next`; the first entry
+  /// never bleeds because `$size <= entry.len()` here.
   ///
   /// Ground-truth from bundled ExifTool 13.59 on these exact bytes (`/tmp`
   /// crafted MP4): `CompressorID avc1`, `VendorID "Unknown (btrt)"` (raw `btrt`),
@@ -21832,16 +21881,96 @@ mod tests {
     assert_eq!(bt.average_bitrate(), Some(2222));
   }
 
-  /// **Codex R2 — ProcessHybrid fixed-field cutoff (first `soun` entry).** Same
-  /// absolute `dir_start + childPos` cutoff on the audio sample description. A
-  /// `mp4a` entry with the child boundary at entry-relative offset 16 ⇒ cutoff
-  /// 24: AudioFormat (4) and AudioVendorID (20, reading the child `btrt` 4cc) are
-  /// decoded, but AudioChannels (24), AudioBitsPerSample (26) and AudioSampleRate
-  /// (32) are at/beyond the cutoff and OMITTED. Ground-truth from bundled
-  /// ExifTool 13.59 on these exact bytes: `AudioFormat mp4a`,
-  /// `AudioVendorID "Unknown (btrt)"`, `BufferSize 0`, `MaxBitrate 600`,
-  /// `AverageBitrate 700`, and NO AudioChannels / AudioBitsPerSample /
-  /// AudioSampleRate.
+  /// **#302 — cross-entry fixed-field BLEED (a NON-LAST `vide` entry reads the
+  /// FOLLOWING entry's bytes).** ExifTool reads each %VisualSampleDesc fixed
+  /// field over the WHOLE `stsd` box at `substr($$dataPt, off + dirStart, ...)`
+  /// within `$size = min(DirLen, dataLen - dirStart)` where `DirLen` is the
+  /// ProcessHybrid child boundary as an ABSOLUTE box offset (QuickTime.pm:9680).
+  /// For a NON-LAST entry (`dirStart > 8`) whose child boundary exceeds its own
+  /// extent, `$size > entry.len()`, so a fixed field past the entry end is STILL
+  /// read — it bleeds into the next entry's bytes.
+  ///
+  /// `stsd` body layout (after the 8-byte `[v/f][count]` header): entry1 `avc1`
+  /// (full, 86B) @ box-offset 8; entry2 `hvc1` (short, 36B, one 20-byte child ⇒
+  /// child boundary at entry-relative 16) @ box-offset 94; entry3 `avc3` (64B) @
+  /// box-offset 130; total 194. entry2: `DirLen = 94 + 16 = 110`,
+  /// `maxLen = 194 - 94 = 100`, `$size = 100`; its `BitDepth` (entry-relative 82,
+  /// `82 + 2 <= 100`) reads `payload[94+82 .. 94+84] = payload[176..178]`, which
+  /// lands INSIDE entry3 (box [130,194)) at entry3-relative 46 — `0xBEEF` is
+  /// planted there. entry3's own `BitDepth` (82) is past its 64-byte extent and
+  /// is omitted, so the LAST-WINS `BitDepth` is entry2's bled `0xBEEF = 48879`.
+  /// Ground-truth = bundled ExifTool 13.59 on these exact bytes
+  /// (`QuickTime_stsd_fixed_field_bleed.mov`): `Track1:BitDepth 48879`,
+  /// `CompressorID avc3`, `CompressorName CompA`, `VendorID "Unknown (glbl)"`
+  /// (entry2's child-header 4cc), `SourceImageWidth/Height 200`,
+  /// `XResolution/YResolution 72`.
+  #[test]
+  fn walk_trak_vide_nonlast_entry_fixed_field_bleeds_into_next() {
+    // entry1: full avc1 (86B) — supplies CompressorName "CompA".
+    let e1 = vide_entry(b"avc1", 100, 100, b"CompA", 24, 86);
+    // entry2: SHORT hvc1 (16-byte fixed prefix + a 20-byte `glbl` child) ⇒ the
+    // ProcessHybrid boundary is entry-relative 16, so its fixed fields past 16
+    // are read over the whole box up to maxLen.
+    let mut e2_fixed = vec![0u8; 16];
+    wr(&mut e2_fixed, 4, b"hvc1");
+    let e2 = entry_with_children(&e2_fixed, &[atom(b"glbl", &[0u8; 12])]);
+    assert_eq!(e2.len(), 36, "entry2 is 36 bytes");
+    assert_eq!(
+      find_hybrid_child_pos(&e2),
+      Some(16),
+      "the single 20-byte glbl child ⇒ boundary at entry-relative offset 16"
+    );
+    // entry3: 64B avc3 with 0xBEEF at entry-relative offset 46 (= box offset
+    // 176), exactly where entry2's bled BitDepth lands.
+    let mut e3 = vide_entry(b"avc3", 200, 200, b"", 48, 64);
+    wr(&mut e3, 46, &[0xBE, 0xEF]);
+    let stsd = stsd_box(&[e1, e2, e3]);
+    // Sanity: the stsd box BODY (after `[size:4][type:4]`) is 194 bytes and the
+    // entries sit at the box-relative offsets the bleed arithmetic assumes.
+    assert_eq!(stsd.len(), 8 + 194, "stsd atom = header + 194-byte body");
+
+    let payload = trak_payload_with_stsd(b"vide", &stsd);
+    let track = walk_trak(1, &payload, Some(600));
+    let v = track.visual_sample_desc().expect("vide sample desc");
+    // THE BLEED: entry2's BitDepth read entry3's planted 0xBEEF = 48879.
+    assert_eq!(
+      v.bit_depth(),
+      Some(0xBEEF),
+      "non-last entry2 BitDepth (rel 82) bled into entry3's bytes"
+    );
+    // entry2's VendorID (rel 20) read its own child `glbl` header 4cc.
+    assert_eq!(
+      v.vendor_id(),
+      Some("glbl"),
+      "entry2 VendorID read the glbl 4cc"
+    );
+    // Last-wins / retained fields, matching the bundled oracle.
+    assert_eq!(
+      v.compressor_id(),
+      Some("avc3"),
+      "entry3 (last) CompressorID"
+    );
+    assert_eq!(
+      v.compressor_name(),
+      Some("CompA"),
+      "entry1 CompressorName retained (no later entry sets it)"
+    );
+    assert_eq!(v.source_image_width(), Some(200), "entry3 width");
+    assert_eq!(v.source_image_height(), Some(200), "entry3 height");
+    assert_eq!(v.x_resolution(), Some(72.0), "entry3 XResolution");
+    assert_eq!(v.y_resolution(), Some(72.0), "entry3 YResolution");
+  }
+
+  /// **ProcessHybrid fixed-field window — FIRST `soun` entry (no-bleed).** Same
+  /// whole-box `$size = min(DirLen, payload.len() - dir_start)` window on the
+  /// audio sample description. A `mp4a` first entry with the child boundary at
+  /// entry-relative offset 16 ⇒ `$size == 24`: AudioFormat (4) and AudioVendorID
+  /// (20, reading the child `btrt` 4cc within the entry) are decoded, but
+  /// AudioChannels (24), AudioBitsPerSample (26) and AudioSampleRate (32) are
+  /// at/beyond the window and OMITTED. Ground-truth from bundled ExifTool 13.59
+  /// on these exact bytes: `AudioFormat mp4a`, `AudioVendorID "Unknown (btrt)"`,
+  /// `BufferSize 0`, `MaxBitrate 600`, `AverageBitrate 700`, and NO AudioChannels
+  /// / AudioBitsPerSample / AudioSampleRate.
   #[test]
   fn walk_trak_soun_early_child_boundary_cuts_fixed_fields() {
     let mut fixed = vec![0u8; 16];
@@ -22672,16 +22801,23 @@ mod tests {
   /// in-range count (`\x03abc`) clamps to "abc".
   #[test]
   fn decode_visual_sample_desc_short_counted_compressor_name() {
+    // A single-entry `stsd` box body (`[v/f:4][count:4]` header then the entry at
+    // `dir_start == 8`) so the whole-box fixed-field reads see the entry in place.
+    let in_stsd = |e: &[u8]| {
+      let mut p = vec![0u8; 8];
+      p.extend_from_slice(e);
+      p
+    };
     // CompressorName field = `\x05abc` (5 > 3 follow) ⇒ C string `\x05abc`.
     let mut e = vide_entry(b"avc1", 320, 240, b"", 24, 86);
     wr(&mut e, 50, b"\x05abc");
-    let v = decode_visual_sample_desc(&e, 8);
+    let v = decode_visual_sample_desc(&in_stsd(&e), 8, &e);
     assert_eq!(v.compressor_name(), Some("\u{5}abc"));
 
     // CompressorName field = `\x03abc` (3 < 4) ⇒ counted ⇒ "abc".
     let mut e2 = vide_entry(b"avc1", 320, 240, b"", 24, 86);
     wr(&mut e2, 50, b"\x03abc");
-    let v2 = decode_visual_sample_desc(&e2, 8);
+    let v2 = decode_visual_sample_desc(&in_stsd(&e2), 8, &e2);
     assert_eq!(v2.compressor_name(), Some("abc"));
   }
 

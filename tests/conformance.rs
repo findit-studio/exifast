@@ -471,6 +471,35 @@ fn quicktime_v1_tkhd_conformance() {
 }
 
 #[test]
+fn quicktime_stsd_fixed_field_bleed_conformance() {
+  // #302: the faithful whole-box fixed-field BLEED for a NON-LAST `stsd`
+  // sample-description entry. ExifTool reads each %VisualSampleDesc fixed field
+  // at `substr($$dataPt, off + dirStart, ...)` within
+  // `$size = min(DirLen, dataLen - dirStart)` where `DirLen` is the ProcessHybrid
+  // child boundary (an ABSOLUTE box offset, QuickTime.pm:9680). The synthetic
+  // `QuickTime_stsd_fixed_field_bleed.mov` has a 3-entry `vide` `stsd` whose
+  // middle entry (a short `hvc1` with an early child boundary, `dirStart` 94 ⇒
+  // `$size` 100) reads its `BitDepth` (entry-relative 82) PAST its 36-byte extent
+  // into the third entry's bytes — `0xBEEF` is planted there ⇒
+  // `Track1:BitDepth 48879`. Its `VendorID` (rel 20) likewise reads the entry's
+  // own child `glbl` 4cc. Goldens are bundled `perl exiftool -j -G1 -struct -api
+  // QuickTimeUTC=1` (`System:*`/`Composite:*` excluded per the Phase-2 forward
+  // item, MOV precedent). See
+  // `tools/gen_quicktime_stsd_bleed_fixture.py` and the unit test
+  // `walk_trak_vide_nonlast_entry_fixed_field_bleeds_into_next`.
+  check(
+    "QuickTime_stsd_fixed_field_bleed.mov",
+    "QuickTime_stsd_fixed_field_bleed.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_stsd_fixed_field_bleed.mov",
+    "QuickTime_stsd_fixed_field_bleed.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_moov_order_conformance() {
   // PR #38 Codex R1/F4 (REFUTED): a SYNTHETIC `.mov` whose `trak` precedes
   // `mvhd` inside `moov`. The `TrackDuration` durationInfo is a ValueConv
