@@ -112,6 +112,19 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
+  // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
+  // bundled goldens for the #173 MakerNote conditional branches, but their
+  // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
+  // not yet emit the full ~245-tag MakerNote set bundled does (it emits ~118),
+  // so they are NOT byte-exact-active. Accept-deferred here until the Pentax port
+  // is extended (see #311). #318 added them but missed this NOT_ACTIVE entry,
+  // leaving main red on the auto-discovered active-fixture parity check.
+  "JPEG_pentax_k1.jpg",
+  "JPEG_pentax_k3.jpg",
+  "JPEG_pentax_k5_ii.jpg",
+  "JPEG_pentax_k70.jpg",
+  "JPEG_pentax_kp.jpg",
+  "JPEG_pentax_ks2.jpg",
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
@@ -756,7 +769,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// `OtherFormat` + the `[minor]` `Track1:Warning`; the `Doc<N>` timing is `-ee`-only,
 /// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
 /// unported timed-GPS deferral, excluded at regen.
-const EXPECTED_ACTIVE_FIXTURES: usize = 555;
+const EXPECTED_ACTIVE_FIXTURES: usize = 549;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
