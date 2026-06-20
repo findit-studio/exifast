@@ -136,8 +136,15 @@
   "Composite:Aperture": 4.0,
   "Composite:ImageSize": "8x8",
   "Composite:Megapixels": 0.000064,
+  "Composite:ScaleFactor35efl": 1.5,
   "Composite:ShutterSpeed": "1/125",
   "Composite:SubSecCreateDate": "2005:03:18 02:55:18.16",
   "Composite:SubSecDateTimeOriginal": "2005:03:18 02:55:18.16",
-  "Composite:SubSecModifyDate": "2005:03:18 02:55:18.16"
+  "Composite:SubSecModifyDate": "2005:03:18 02:55:18.16",
+  "Composite:CircleOfConfusion": "0.020 mm",
+  "Composite:DOF": "0.03 m (0.69 - 0.72 m)",
+  "Composite:FOV": "25.1 deg (0.32 m)",
+  "Composite:FocalLength35efl": "50.0 mm (35 mm equivalent: 75.0 mm)",
+  "Composite:HyperfocalDistance": "31.20 m",
+  "Composite:LightValue": 8.0
 }]

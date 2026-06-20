@@ -8,5 +8,6 @@
   "XMP-exif:FocalLength": "+50/1",
   "XMP-exif:ApertureValue": 2,
   "XMP-exif:BrightnessValue": -0.333333333333333,
-  "Composite:Aperture": 2
+  "Composite:Aperture": 2,
+  "Composite:FocalLength35efl": 50
 }]

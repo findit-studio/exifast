@@ -204,5 +204,11 @@
   "Composite:Aperture": 13,
   "Composite:ImageSize": "8 8",
   "Composite:Megapixels": 6.4e-05,
-  "Composite:ShutterSpeed": 0.01
+  "Composite:ScaleFactor35efl": 1.5,
+  "Composite:ShutterSpeed": 0.01,
+  "Composite:CircleOfConfusion": 0.0200308404192444,
+  "Composite:FOV": 100.388942610382,
+  "Composite:FocalLength35efl": 15,
+  "Composite:HyperfocalDistance": 0.384023212771312,
+  "Composite:LightValue": 14.0447356260569
 }]

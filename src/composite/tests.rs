@@ -49,7 +49,7 @@ const fn inh(group: &'static [&'static str], name: &'static str) -> CompositeInp
 }
 
 /// Sum the present inputs (a stand-in derivation; `Missing`/non-numeric ⇒ 0).
-fn sum_inputs(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn sum_inputs(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   Some(CompositeRaw::Num(
     v.iter().map(|x| x.coerce_numeric().unwrap_or(0.0)).sum(),
   ))
@@ -170,7 +170,7 @@ fn desire_present_nonnumeric_string_reaches_derive() {
   // Finding-1: a present-but-non-numeric (string) Desire reaches `derive` as a
   // `Present(Str)` element (so future GPS/EXIF/datetime defs can read strings),
   // NOT as a `Missing`. The derive here asserts the raw value it was handed.
-  fn assert_first_is_str(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  fn assert_first_is_str(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
     assert_eq!(
       v.first().and_then(CompositeValue::value),
       Some(&TagValue::Str("N".into())),
@@ -291,7 +291,7 @@ fn last_emitted_duplicate_wins_across_group_set() {
 }
 
 /// A derivation that always aborts (the `… ? … : undef` guard).
-fn always_none(_v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn always_none(_v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   None
 }
 
@@ -314,7 +314,7 @@ fn derive_returning_none_emits_nothing() {
 }
 
 /// A derivation yielding input 0's numeric coercion verbatim.
-fn first_input(v: &[CompositeValue]) -> Option<CompositeRaw> {
+fn first_input(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
   Some(CompositeRaw::Num(v.first()?.coerce_numeric()?))
 }
 
@@ -1202,5 +1202,339 @@ mod exif {
     let n = composite(&val, "ShutterSpeed").expect("ShutterSpeed built (-n)");
     assert_eq!(n, TagValue::Str("-0.0".into()));
     assert_eq!(emit(&n), "-0.0", "bundled emits literal `-0.0`");
+  }
+
+  // The NikonD2Hs lens-input set (bundled-ExifTool 13.59): the simple
+  // `$foc35/$focal` ScaleFactor path (75/50 = 1.5) plus the inputs that drive the
+  // whole chain. A bare `ExifIFD:FocalLength` of 50 AND a later `Nikon:FocalLength`
+  // of 50.4 (the bare-name precedence probe).
+  fn nikon_lens_inputs() -> Vec<(&'static str, &'static str, TagValue)> {
+    vec![
+      ("ExifIFD", "FocalLength", TagValue::F64(50.0)),
+      ("ExifIFD", "FocalLengthIn35mmFormat", TagValue::F64(75.0)),
+      ("ExifIFD", "FNumber", TagValue::F64(4.0)),
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.008)),
+      ("ExifIFD", "ISO", TagValue::U64(800)),
+      ("Nikon", "FocusDistance", TagValue::F64(0.707945784384138)),
+      // The MakerNote FocalLength duplicate — exifast must NOT pick this for the
+      // bare-name `FocalLength` inputs (ExifTool's priority dir is the EXIF IFD).
+      ("Nikon", "FocalLength", TagValue::F64(50.4)),
+    ]
+  }
+
+  #[test]
+  fn lens_chain_full_resolves_through_multi_pass_fixpoint() {
+    // The full NikonD2Hs lens chain builds via the registry fixpoint:
+    //   ScaleFactor35efl (1.5) → CircleOfConfusion → {Hyperfocal, DOF, FOV}
+    //   FocalLength35efl (needs ScaleFactor), LightValue (needs Aperture+Shutter).
+    // `-j` (PrintConv) pinned to bundled.
+    let entries = nikon_lens_inputs();
+    let mut prt = map_with(&entries);
+    let mut val = map_with(&entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    // `emit` is `serde_json::to_string`: a numeric-looking PrintConv string is
+    // emitted BARE by the JSON gate (`1.5`, `8.0`); a unit-bearing one is QUOTED.
+    let g = |n: &str| composite(&prt, n).map(|v| emit(&v));
+    assert_eq!(g("ScaleFactor35efl").as_deref(), Some("1.5"));
+    assert_eq!(g("CircleOfConfusion").as_deref(), Some("\"0.020 mm\""));
+    assert_eq!(g("HyperfocalDistance").as_deref(), Some("\"31.20 m\""));
+    assert_eq!(g("DOF").as_deref(), Some("\"0.03 m (0.69 - 0.72 m)\""));
+    assert_eq!(g("FOV").as_deref(), Some("\"25.1 deg (0.32 m)\""));
+    assert_eq!(
+      g("FocalLength35efl").as_deref(),
+      Some("\"50.0 mm (35 mm equivalent: 75.0 mm)\""),
+      "the bare `FocalLength` resolves to the EXIF 50, NOT the MakerNote 50.4"
+    );
+    assert_eq!(g("LightValue").as_deref(), Some("8.0"));
+  }
+
+  #[test]
+  fn lens_chain_n_mode_value_conv_forms() {
+    // The `-n` (ValueConv) forms — full-precision scalars, the space-joined
+    // DOF/FOV strings, and the `%.15g`-quoted CircleOfConfusion (Nikon CoC has 16
+    // fraction digits ⇒ a BARE number; DJI's 17 would quote — see the helper test).
+    let entries = nikon_lens_inputs();
+    let mut val = map_with(&entries);
+    let mut prt = map_with(&entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "ScaleFactor35efl"),
+      Some(TagValue::F64(1.5))
+    );
+    assert_eq!(
+      composite(&val, "FocalLength35efl"),
+      Some(TagValue::F64(75.0))
+    );
+    assert_eq!(
+      composite(&val, "DOF"),
+      Some(TagValue::Str("0.693325809394639 0.723195615956146".into()))
+    );
+    assert_eq!(
+      composite(&val, "FOV"),
+      Some(TagValue::Str("25.1479641359127 0.315813976504386".into()))
+    );
+    // CircleOfConfusion -n = the full f64; emit() routes it through the JSON gate
+    // (16 fraction digits ⇒ bare number).
+    assert_eq!(
+      composite(&val, "CircleOfConfusion")
+        .map(|v| emit(&v))
+        .as_deref(),
+      Some("0.0200308404192444")
+    );
+    assert_eq!(
+      composite(&val, "LightValue").map(|v| emit(&v)).as_deref(),
+      Some("7.96578428466209")
+    );
+  }
+
+  #[test]
+  fn focal_length_35efl_falls_back_to_focal_only_without_scale_factor() {
+    // ExifGPS.jpg: FocalLength=0, no FocalLengthIn35mmFormat ⇒ ScaleFactor NOT
+    // built; FocalLength35efl Requires FocalLength (0) + Desires ScaleFactor
+    // (Missing) ⇒ `(0||0)*(undef||1)` = 0 ⇒ "0.0 mm".
+    let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FocalLength", TagValue::F64(0.0))];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "FocalLength35efl")
+        .map(|v| emit(&v))
+        .as_deref(),
+      Some("\"0.0 mm\"")
+    );
+    assert!(
+      composite(&prt, "ScaleFactor35efl").is_none(),
+      "no ScaleFactor without FocalLengthIn35mmFormat or sensor data"
+    );
+  }
+
+  #[test]
+  fn scale_factor_canon_branch_defers_focal_length_falls_through() {
+    // Exif.tif: Make=Canon, FocalLength=50, no FocalLengthIn35mmFormat ⇒ the Canon
+    // `CalcSensorDiag` branch (unported) ⇒ ScaleFactor35efl DEFERRED (not built).
+    // FocalLength35efl then builds focal-only ("50.0 mm"), and LightValue builds.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("IFD0", "Make", TagValue::Str("Canon".into())),
+      ("ExifIFD", "FocalLength", TagValue::F64(50.0)),
+      ("ExifIFD", "FNumber", TagValue::F64(8.0)),
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.005)),
+      ("ExifIFD", "ISO", TagValue::U64(100)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "ScaleFactor35efl").is_none(),
+      "the Canon branch defers ScaleFactor35efl (unported CalcSensorDiag)"
+    );
+    assert_eq!(
+      composite(&prt, "FocalLength35efl")
+        .map(|v| emit(&v))
+        .as_deref(),
+      Some("\"50.0 mm\""),
+      "FocalLength35efl falls through to the focal-only PrintConv branch"
+    );
+    // No ScaleFactor ⇒ no CircleOfConfusion ⇒ no Hyperfocal/DOF/FOV.
+    assert!(composite(&prt, "CircleOfConfusion").is_none());
+    assert!(composite(&prt, "FOV").is_none());
+    // LightValue is independent of ScaleFactor (Aperture+ShutterSpeed+ISO).
+    assert!(composite(&prt, "LightValue").is_some());
+  }
+
+  #[test]
+  fn focal_length_35efl_defers_when_canon_scale_factor_would_use_sensor_branch() {
+    // XMP.xmp: Make=Canon, FocalLength=5.8, NO FocalLengthIn35mmFormat, but
+    // FocalPlaneXResolution IS present ⇒ ExifTool's Canon `CalcSensorDiag` branch
+    // builds a ScaleFactor (6.08) the post-pass can't reach. exifast DEFERS the
+    // whole chain — including FocalLength35efl (which would otherwise emit the
+    // WRONG focal-only "5.8 mm" vs bundled's "5.8 mm (35 mm equivalent: 35.3 mm)").
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("XMP-tiff", "Make", TagValue::Str("Canon".into())),
+      ("XMP-exif", "FocalLength", TagValue::F64(5.8)),
+      (
+        "XMP-exif",
+        "FocalPlaneXResolution",
+        TagValue::F64(10142.8571428571),
+      ),
+      ("XMP-exif", "FocalPlaneResolutionUnit", TagValue::U64(2)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "ScaleFactor35efl").is_none(),
+      "Canon branch defers ScaleFactor (generic would give a WRONG 12.17)"
+    );
+    assert!(
+      composite(&prt, "FocalLength35efl").is_none(),
+      "FocalLength35efl ALSO defers (the Canon ScaleFactor it needs is unported)"
+    );
+    assert!(composite(&prt, "CircleOfConfusion").is_none());
+    assert!(composite(&prt, "FOV").is_none());
+  }
+
+  #[test]
+  fn light_value_reads_iso_print_conv_view() {
+    // `Composite:LightValue` ValueConv uses `$prt[2]` (ISO's PrintConv value), not
+    // `$val[2]`. Build with an ISO whose ValueConv and PrintConv DIFFER: the raw
+    // ValueConv `6` (a Pentax-style raw) but the PrintConv `100`. LightValue must
+    // use 100. (Two views: ISO emits 6 into `val`, 100 into `prt`.)
+    let val_entries: &[(&str, &str, TagValue)] = &[
+      ("ExifIFD", "FNumber", TagValue::F64(13.0)),
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.01)),
+      ("ExifIFD", "ISO", TagValue::U64(6)), // ValueConv view
+    ];
+    let prt_entries: &[(&str, &str, TagValue)] = &[
+      ("ExifIFD", "FNumber", TagValue::F64(13.0)),
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.01)),
+      ("ExifIFD", "ISO", TagValue::U64(100)), // PrintConv view
+    ];
+    let mut val = map_with(val_entries);
+    let mut prt = map_with(prt_entries);
+    // Active mode `-j`: `out` = prt, the other view = val.
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    // LV = log(13^2*100/(0.01*100))/log(2) = 14.0447356260569 ⇒ "%.1f" = "14.0".
+    assert_eq!(
+      composite(&prt, "LightValue").map(|v| emit(&v)).as_deref(),
+      Some("14.0"),
+      "LightValue uses ISO's PrintConv view (100), not the raw ValueConv (6)"
+    );
+  }
+
+  #[test]
+  fn dof_non_numeric_focus_distance_falls_back_post_tofloat() {
+    // ExifTool's DOF runs `ToFloat(@val)` BEFORE the `defined $d` checks, so a
+    // present-but-NON-NUMERIC FocusDistance is `undef` and falls through to
+    // SubjectDistance/ObjectDistance/ApproximateFocusDistance — it does NOT map to
+    // 0 → the `1e10` infinity sentinel. Here FocusDistance="unknown" (undef post
+    // ToFloat) + SubjectDistance=0.707945784384138 ⇒ the SAME DOF the Nikon golden
+    // gets from a numeric FocusDistance of that value ("0.03 m (0.69 - 0.72 m)").
+    // (The pre-fix raw-presence check would take the `1e10` branch ⇒ the inf form.)
+    let mut entries = nikon_lens_inputs();
+    entries.retain(|(_, n, _)| *n != "FocusDistance");
+    entries.push(("Nikon", "FocusDistance", TagValue::Str("unknown".into())));
+    entries.push((
+      "ExifIFD",
+      "SubjectDistance",
+      TagValue::F64(0.707945784384138),
+    ));
+    let mut prt = map_with(&entries);
+    let mut val = map_with(&entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "DOF").map(|v| emit(&v)).as_deref(),
+      Some("\"0.03 m (0.69 - 0.72 m)\""),
+      "a non-numeric FocusDistance is undef post-ToFloat ⇒ uses SubjectDistance, \
+       NOT the 1e10 infinity sentinel"
+    );
+  }
+
+  #[test]
+  fn dof_present_non_float_bounds_yield_undef() {
+    // The lower/upper fallback averages `($val[7] + $val[8]) / 2` ONLY when BOTH
+    // are defined POST-ToFloat. A non-numeric FocusDistanceLower is undef ⇒
+    // `defined $val[7]` is false ⇒ `return undef` (the composite is NOT built from
+    // averaging a present-non-float bound as 0). No FocusDistance/Subject/Object/
+    // Approximate present, so the lower/upper branch is the only path.
+    let mut entries = nikon_lens_inputs();
+    entries.retain(|(_, n, _)| *n != "FocusDistance");
+    entries.push(("Nikon", "FocusDistanceLower", TagValue::Str("n/a".into())));
+    entries.push(("Nikon", "FocusDistanceUpper", TagValue::F64(1.0)));
+    let mut prt = map_with(&entries);
+    let mut val = map_with(&entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "DOF").is_none(),
+      "a present-non-float FocusDistanceLower is undef post-ToFloat ⇒ DOF is undef"
+    );
+  }
+
+  #[test]
+  fn focal_length_35efl_defers_for_canon_focal_plane_xy_size_only() {
+    // A Canon body with ONLY FocalPlaneXSize/FocalPlaneYSize (no FocalPlaneX-
+    // Resolution / SensorSize / FocalPlaneDiagonal) still reaches ExifTool's
+    // `CalcScaleFactor35efl` FocalPlaneX/YSize aspect-ratio `$diag` path (a
+    // ScaleFactor exifast can't compute) ⇒ FocalLength35efl must DEFER, not emit
+    // the WRONG focal-only form. (The pre-fix guard probed only XResolution/
+    // SensorSize/FocalPlaneDiagonal, so it MISSED this and emitted "5.8 mm".)
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("IFD0", "Make", TagValue::Str("Canon".into())),
+      ("ExifIFD", "FocalLength", TagValue::F64(5.8)),
+      ("ExifIFD", "FocalPlaneXSize", TagValue::F64(6.16)),
+      ("ExifIFD", "FocalPlaneYSize", TagValue::F64(4.62)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "FocalLength35efl").is_none(),
+      "Canon + only FocalPlaneX/YSize ⇒ FocalLength35efl defers (NOT focal-only)"
+    );
+  }
+
+  #[test]
+  fn focal_length_35efl_defers_for_canon_present_but_falsy_foc35() {
+    // A Canon body whose FocalLengthIn35mmFormat is PRESENT but FALSY (0) — so
+    // ExifTool's simple `$foc35/$focal` ScaleFactor path does NOT fire (`return
+    // $foc35/$focal if $focal and $foc35`, Exif.pm:5462, gated on the POST-ToFloat
+    // TRUTHY foc35) — and FocalPlaneXResolution IS present ⇒ the Canon
+    // `CalcSensorDiag` branch still BUILDS a ScaleFactor exifast can't reach. So
+    // FocalLength35efl must DEFER, not emit the wrong focal-only "5.8 mm". (The
+    // pre-fix guard keyed `no_foc35` off mere PRESENCE, so a present `0` made
+    // `no_foc35` false and the deferral was skipped ⇒ wrong focal-only emission.)
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("IFD0", "Make", TagValue::Str("Canon".into())),
+      ("ExifIFD", "FocalLength", TagValue::F64(5.8)),
+      ("ExifIFD", "FocalLengthIn35mmFormat", TagValue::U64(0)),
+      (
+        "ExifIFD",
+        "FocalPlaneXResolution",
+        TagValue::F64(10142.8571428571),
+      ),
+      ("ExifIFD", "FocalPlaneResolutionUnit", TagValue::U64(2)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "FocalLength35efl").is_none(),
+      "Canon + present-but-falsy FocalLengthIn35mmFormat=0 + sensor data ⇒ \
+       FocalLength35efl defers (the simple path is gated on a TRUTHY foc35)"
+    );
+  }
+
+  #[test]
+  fn focal_length_35efl_defers_for_canon_falsy_focal_but_truthy_foc35() {
+    // A Canon body whose FocalLength is PRESENT but FALSY (0) WHILE
+    // FocalLengthIn35mmFormat is TRUTHY (50) — so ExifTool's simple
+    // `$foc35/$focal` ScaleFactor path does NOT fire (`return $foc35/$focal if
+    // $focal and $foc35`, Exif.pm:5460, requires BOTH operands post-ToFloat
+    // truthy; a falsy `$focal` fails the `and`) — and FocalPlaneXResolution IS
+    // present ⇒ the Canon `CalcSensorDiag` branch still BUILDS a ScaleFactor
+    // exifast can't reach. So FocalLength35efl must DEFER, not emit the wrong
+    // focal-only value. (A guard checking only the foc35 operand would see a
+    // truthy foc35, conclude the simple path fired, and skip the deferral — the
+    // exact gap fixed by extending the predicate to BOTH operands of
+    // `$focal and $foc35`.)
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("IFD0", "Make", TagValue::Str("Canon".into())),
+      ("ExifIFD", "FocalLength", TagValue::F64(0.0)),
+      ("ExifIFD", "FocalLengthIn35mmFormat", TagValue::U64(50)),
+      (
+        "ExifIFD",
+        "FocalPlaneXResolution",
+        TagValue::F64(10142.8571428571),
+      ),
+      ("ExifIFD", "FocalPlaneResolutionUnit", TagValue::U64(2)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert!(
+      composite(&prt, "FocalLength35efl").is_none(),
+      "Canon + present-but-falsy FocalLength=0 + truthy FocalLengthIn35mmFormat \
+       + sensor data ⇒ FocalLength35efl defers (the simple path needs BOTH \
+       `$focal` AND `$foc35` truthy)"
+    );
   }
 }

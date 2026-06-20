@@ -82,19 +82,27 @@ case "$FIX" in
   XMP_gps_abovesea.xmp | XMP_gps_belowsea.xmp)
     EXCLUDE_ARR+=(-x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
                   -x Composite:GPSPosition) ;;
-  # XMP_rational_plus.xmp (#133 PR 3): exifast builds the ported `Composite:
+  # XMP_rational_plus.xmp (#133 PR 4): exifast builds the ported `Composite:
   # Aperture` from the embedded `XMP-exif:FNumber` (XMP is allow-listed — a single
-  # Main document); the unported `Composite:FocalLength35efl` (lens, PR 4) is
-  # dropped by name. Must precede the generic `XMP*` arm (first match wins).
+  # Main document) AND now `Composite:FocalLength35efl` from `XMP-exif:FocalLength`
+  # ("50.0 mm" → `ToFloat` prefix 50 → "50.0 mm"; no ScaleFactor, so the focal-only
+  # PrintConv branch). No lens exclusion left. Must precede the generic `XMP*` arm.
   XMP_rational_plus.xmp)
-    EXCLUDE_ARR+=(-x Composite:FocalLength35efl) ;;
-  # XMP.xmp (#133 PR 3): exifast builds the ported Tier-A `Composite:ImageSize`/
+    : ;;
+  # XMP.xmp (#133 PR 3/4): exifast builds the ported Tier-A `Composite:ImageSize`/
   # `Megapixels` (from the bare-name `XMP-tiff:ImageWidth`/`Height`) + `Aperture`/
   # `ShutterSpeed` (from `XMP-exif:FNumber`/`ExposureTime`). It does NOT build the
   # GPS-coordinate composites (the `Composite:GPSLatitude`/`Longitude` defs
   # require the family-0 `GPS` group, not `XMP-exif`), so there are none here.
-  # Drop only the unported lens/MakerNote Composites by name (NOT `Composite:all`,
-  # which the generic `XMP*` arm applies). Must precede the generic `XMP*` arm.
+  # The lens chain stays EXCLUDED (PR 4): this fixture's `Make=Canon` AND its
+  # bundled `Composite:ScaleFactor35efl` (6.0836…) is computed via the Canon
+  # `CalcSensorDiag` branch (Exif.pm:5464 — CalcSensorDiag returns 7.112 from the
+  # Canon FocalPlaneX/YResolution rationals `2272000/224`, `1704000/168`), which
+  # the composite post-pass cannot reach (no `TAG_EXTRA{Rational}` handle); the
+  # generic path would give a WRONG 12.17. So `ScaleFactor35efl` is DEFERRED and
+  # its derived composites (`CircleOfConfusion`/`FOV`/`FocalLength35efl`/
+  # `HyperfocalDistance`) stay excluded with it. Drop only the unported lens/
+  # MakerNote Composites by name (NOT `Composite:all`). Precede the generic `XMP*`.
   XMP.xmp)
     EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl -x Composite:Flash \
                   -x Composite:CircleOfConfusion -x Composite:FOV \
@@ -119,49 +127,54 @@ case "$FIX" in
   # config property atoms for `HEIF`/`AVIF`). `ExifGPS.tif` carries only GPS
   # Composites + no deferred segments → default path (no arm).
   ExifGPS.jpg)
-    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest -x IFD1:ThumbnailImage \
-                  -x Composite:FocalLength35efl) ;;
+    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest -x IFD1:ThumbnailImage) ;;
+  # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
+  # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). Only the
+  # non-Composite port deferrals remain.
   DJIPhantom4.jpg)
-    EXCLUDE_ARR+=(-x XMP:all -x IFD1:ThumbnailImage \
-                  -x Composite:CircleOfConfusion -x Composite:FOV \
-                  -x Composite:FocalLength35efl -x Composite:HyperfocalDistance \
-                  -x Composite:LightValue -x Composite:ScaleFactor35efl) ;;
+    EXCLUDE_ARR+=(-x XMP:all -x IFD1:ThumbnailImage) ;;
   # NEW PR-3 arms (these relied on a regen-time `EXCLUDE` env before — now baked
   # in so `tools/gen_golden.sh <fix>` reproduces them with no env). Each drops
   # only the unported lens/MakerNote Composites by name.
   # NikonD2Hs also drops the non-Composite `PreviewIFD:all` / `IFD1:ThumbnailImage`
   # / `ExifIFD:CFAPattern` the port defers (these were in its `EXCLUDE` env).
+  # PR 4: the full lens chain now builds (NIKON, NOT Canon — the simple
+  # `$foc35/$focal` ScaleFactor path: 75/50 = 1.5). The MakerNote-derived
+  # Composites (BlueBalance/RedBalance/AutoFocus/LensID/LensSpec) + the non-
+  # Composite port deferrals remain.
   NikonD2Hs.jpg)
     EXCLUDE_ARR+=(-x PreviewIFD:all -x IFD1:ThumbnailImage -x ExifIFD:CFAPattern \
                   -x Composite:BlueBalance -x Composite:RedBalance \
-                  -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec \
-                  -x Composite:ScaleFactor35efl -x Composite:CircleOfConfusion \
-                  -x Composite:DOF -x Composite:FOV -x Composite:FocalLength35efl \
-                  -x Composite:HyperfocalDistance -x Composite:LightValue) ;;
+                  -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec) ;;
   # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
   # extraction, unported) + `IFD1:ThumbnailImage` + `PrintIM:PrintIMVersion`
   # (the same gaps the Nikon golden excludes) — all were in its `EXCLUDE` env.
+  # PR 4: the full lens chain now builds (PENTAX, NOT Canon — the simple
+  # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). The MakerNote `Composite:
+  # LensID` + the non-Composite port deferrals remain.
   Pentax.jpg)
     EXCLUDE_ARR+=(-x Pentax:PreviewImageStart -x Pentax:PreviewImage \
                   -x IFD1:ThumbnailImage -x PrintIM:PrintIMVersion \
-                  -x Composite:LensID -x Composite:ScaleFactor35efl \
-                  -x Composite:CircleOfConfusion -x Composite:FOV \
-                  -x Composite:FocalLength35efl -x Composite:HyperfocalDistance \
-                  -x Composite:LightValue) ;;
+                  -x Composite:LensID) ;;
   # DJI_Matrice30T also drops `IFD1:ThumbnailImage` (was in its `EXCLUDE` env).
+  # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
+  # `$foc35/$focal` ScaleFactor path: 40/9.1 = 4.3956043956044). No
+  # `Composite:LightValue` (its ISO/aperture combo yields no LV in bundled).
   DJI_Matrice30T.jpg)
-    EXCLUDE_ARR+=(-x IFD1:ThumbnailImage \
-                  -x Composite:ScaleFactor35efl -x Composite:CircleOfConfusion \
-                  -x Composite:DOF -x Composite:FOV -x Composite:FocalLength35efl \
-                  -x Composite:HyperfocalDistance) ;;
+    EXCLUDE_ARR+=(-x IFD1:ThumbnailImage) ;;
   # The synthesized standalone-EXIF fixtures (#133 PR 3): exifast builds the
   # ported Tier-A Composites (Exif.tif → Aperture/ShutterSpeed; Exif_trailing_
   # space.tif → SubSecDateTimeOriginal) — EXIF is allow-listed. They KEEP those
   # and drop the unported lens Composites by name (Exif.tif's FocalLength35efl/
   # LightValue/LensID). `System:all` (the former env exclusion) is preserved.
+  # PR 4: exifast now builds `Composite:FocalLength35efl` ("50.0 mm" — focal-only,
+  # no ScaleFactor) and `Composite:LightValue` (11.3) for this Canon TIFF. Its
+  # `Composite:ScaleFactor35efl` is NOT built (Make=Canon, no FocalLengthIn35mm
+  # format, and the Canon `CalcSensorDiag` branch is unported + bundled emits
+  # none anyway — no FocalPlane resolution), so no ScaleFactor-derived composites
+  # exist to exclude. Only the unported MakerNote `Composite:LensID` is dropped.
   Exif.tif)
-    EXCLUDE_ARR+=(-x System:all -x Composite:FocalLength35efl \
-                  -x Composite:LightValue -x Composite:LensID) ;;
+    EXCLUDE_ARR+=(-x System:all -x Composite:LensID) ;;
   Exif_trailing_space.tif)
     EXCLUDE_ARR+=(-x System:all) ;;
   # HEIF/AVIF stills: fold the documented codec-config `EXCLUDE` env into the arm
@@ -184,6 +197,25 @@ case "$FIX" in
                   -x PixelAspectRatio -x ImageSpatialExtent -x ImagePixelDepth \
                   -x AV1ConfigurationVersion -x ChromaFormat \
                   -x ChromaSamplePosition) ;;
+  # SamsungNX500.srw (#133 PR 4): exifast now builds the ported EXIF + lens
+  # Composite chain (`Aperture`/`ShutterSpeed`/`ScaleFactor35efl` [SAMSUNG, NOT
+  # Canon — the simple `$foc35/$focal` path: 69/45 = 1.5] / `CircleOfConfusion`/
+  # `FOV`/`FocalLength35efl`/`HyperfocalDistance`/`LightValue`). Dropped by name:
+  #  * the MakerNote-derived Composites (`LensID`/`WB_RGGBLevels`/`RedBalance`/
+  #    `BlueBalance`/`CFAPattern`), unported;
+  #  * `ImageSize`/`Megapixels` — their `Require`d `ImageWidth`/`ImageHeight` live
+  #    in the SRW `SubIFD1` (`6496x4336`), which exifast DEFERS (`-x SubIFD1:all`),
+  #    so exifast has no bare `ImageWidth` to build them (it carries only
+  #    `ExifIFD:ExifImageWidth`, a `Desire`). A documented sub-IFD deferral.
+  # (NOT `-x Composite:all`, which the conformance `EXCLUDE` env previously used.)
+  # The non-Composite SRW/PreviewIFD sub-IFD deferrals (`PreviewIFD:all`/
+  # `SubIFD:all`/`SubIFD1:all`) are retained.
+  SamsungNX500.srw)
+    EXCLUDE_ARR+=(-x PreviewIFD:all -x SubIFD:all -x SubIFD1:all \
+                  -x Composite:LensID -x Composite:WB_RGGBLevels \
+                  -x Composite:RedBalance -x Composite:BlueBalance \
+                  -x Composite:CFAPattern -x Composite:ImageSize \
+                  -x Composite:Megapixels) ;;
   # The crafted CR2 ImageSize-deferral fixture (#133 Finding 2): a CR2 whose
   # `Composite:ImageSize` would (faithfully) use `ExifImageWidth`/`Height` via
   # the `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/` branch (Exif.pm:

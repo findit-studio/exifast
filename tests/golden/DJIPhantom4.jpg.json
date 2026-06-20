@@ -108,9 +108,15 @@
   "Composite:Aperture": 2.8,
   "Composite:ImageSize": "4000x3000",
   "Composite:Megapixels": 12.0,
+  "Composite:ScaleFactor35efl": 5.5,
   "Composite:ShutterSpeed": "1/393",
   "Composite:GPSAltitude": "109.7 m Above Sea Level",
   "Composite:GPSLatitude": "32 deg 28' 42.95\" N",
   "Composite:GPSLongitude": "90 deg 15' 36.01\" W",
-  "Composite:GPSPosition": "32 deg 28' 42.95\" N, 90 deg 15' 36.01\" W"
+  "Composite:CircleOfConfusion": "0.005 mm",
+  "Composite:FOV": "84.0 deg",
+  "Composite:FocalLength35efl": "3.6 mm (35 mm equivalent: 20.0 mm)",
+  "Composite:GPSPosition": "32 deg 28' 42.95\" N, 90 deg 15' 36.01\" W",
+  "Composite:HyperfocalDistance": "0.86 m",
+  "Composite:LightValue": 11.6
 }]
