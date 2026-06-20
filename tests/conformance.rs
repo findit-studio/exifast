@@ -10933,3 +10933,51 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
     false,
   );
 }
+
+// #311 — Pentax K-1 MakerNote conditional branches
+#[test]
+#[ignore]
+fn jpeg_pentax_k1_conformance() {
+    check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.json", true);
+    check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.n.json", false);
+}
+
+// #311 — Pentax K-3 MakerNote (FlashExposureComp count-2, AFPointsInFocus)
+#[test]
+#[ignore]
+fn jpeg_pentax_k3_conformance() {
+    check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.json", true);
+    check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.n.json", false);
+}
+
+// #311 — Pentax K-5 II MakerNote (AFPointSelected count-2, AFPointSelected 2)
+#[test]
+#[ignore]
+fn jpeg_pentax_k5_ii_conformance() {
+    check("JPEG_pentax_k5_ii.jpg", "JPEG_pentax_k5_ii.jpg.json", true);
+    check("JPEG_pentax_k5_ii.jpg", "JPEG_pentax_k5_ii.jpg.n.json", false);
+}
+
+// #311 — Pentax KP MakerNote (AFPointSelected, BatteryVoltage)
+#[test]
+#[ignore]
+fn jpeg_pentax_kp_conformance() {
+    check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.json", true);
+    check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.n.json", false);
+}
+
+// #311 — Pentax K-70 MakerNote (AFPointSelected, BatteryVoltage)
+#[test]
+#[ignore]
+fn jpeg_pentax_k70_conformance() {
+    check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.json", true);
+    check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.n.json", false);
+}
+
+// #311 — Pentax K-S2 MakerNote (AFPointSelected, AFPointsInFocus)
+#[test]
+#[ignore]
+fn jpeg_pentax_ks2_conformance() {
+    check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
+    check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
+}
