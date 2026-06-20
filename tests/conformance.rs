@@ -1921,14 +1921,18 @@ fn avif_brand_conformance() {
   // CompatibleBrands [avif, mif1, miaf, MA1B], File:ImageWidth 1204,
   // File:ImageHeight 800, Meta:PrimaryItemReference 1.
   //
-  // EXCLUDE (gen_golden.sh): `-x System:all -x Composite:all -x HandlerType
-  // -x HandlerDescription -x PixelAspectRatio -x ImageSpatialExtent
-  // -x ImagePixelDepth -x AV1ConfigurationVersion -x ChromaFormat
-  // -x ChromaSamplePosition`. The AVIF has only a file-`meta` `pict` handler
-  // (no `trak`), so the bare `-x HandlerType`/`HandlerDescription` are
-  // collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
-  // unsupported codec-config / spatial-extent fields. The brand routing +
-  // `pitm` + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  // EXCLUDE (now baked into the `gen_golden.sh AVIF_sample.avif` arm): `-x
+  // System:all -x HandlerType -x HandlerDescription -x PixelAspectRatio
+  // -x ImageSpatialExtent -x ImagePixelDepth -x AV1ConfigurationVersion
+  // -x ChromaFormat -x ChromaSamplePosition`. The AVIF has only a file-`meta`
+  // `pict` handler (no `trak`), so the bare `-x HandlerType`/`HandlerDescription`
+  // are collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
+  // unsupported codec-config / spatial-extent fields. The brand routing + `pitm`
+  // + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  // `Composite:all` is NO LONGER excluded: an `image/*` QuickTime is allow-listed
+  // (#133 PR 3), so exifast now builds the ported `Composite:ImageSize`
+  // ("1204x800") + `Composite:Megapixels` (0.963) from the primary dimensions,
+  // and they are KEPT in the golden (AVIF emits no unported Composite).
   check("AVIF_sample.avif", "AVIF_sample.avif.json", true);
   check("AVIF_sample.avif", "AVIF_sample.avif.n.json", false);
 }
@@ -1944,14 +1948,18 @@ fn heic_msf1_brand_conformance() {
   // `mdhd`/`hdlr` core atoms the port decodes byte-exact (CreateDate,
   // TrackID 1003, Track1:ImageWidth 1280, Track1:HandlerType "Picture", …).
   //
-  // EXCLUDE: `-x System:all -x Composite:all -x Copy1:HandlerType
-  // -x ImageSpatialExtent` + the `hvcC` HEVC sample-description config block
-  // (`HEVCConfigurationVersion`,
+  // EXCLUDE (now baked into the `gen_golden.sh HEIF_C001_msf1.heic` arm): `-x
+  // System:all -x Copy1:HandlerType -x ImageSpatialExtent` + the `hvcC` HEVC
+  // sample-description config block (`HEVCConfigurationVersion`,
   // `GeneralProfileSpace`/`GeneralTierFlag`/`GeneralProfileIDC`,
   // `GenProfileCompatibilityFlags`, `ConstraintIndicatorFlags`,
   // `GeneralLevelIDC`, `MinSpatialSegmentationIDC`, `ParallelismType`,
   // `ChromaFormat`, `BitDepthLuma`/`BitDepthChroma`, `AverageFrameRate`/
-  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`). The `pict`
+  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`) — PLUS the
+  // unported `-x Composite:AvgBitrate`. `Composite:all` is NO LONGER excluded:
+  // an `image/*` QuickTime is allow-listed (#133 PR 3), so exifast now builds +
+  // KEEPS the ported `Composite:ImageSize` ("1280x720") + `Composite:Megapixels`
+  // (0.922). The `pict`
   // track is a non-`vide`/`soun`/`meta` handler, so the phase-1 port (#100)
   // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1"; the phase-4 port adds
   // the `vmhd` `GraphicsMode`/`OpColor` — all three now RETAINED byte-exact.
@@ -8301,10 +8309,12 @@ fn exif_conformance() {
   //     `%.1f mm` FocalLength; ShutterSpeedValue APEX ValueConv;
   //     ApertureValue APEX; ExifVersion `undef`-as-ASCII
   //   - File:ExifByteOrder (ExifTool.pm:8691)
-  // Goldens: bundled `perl exiftool -j -G1 -struct` with `System:*` +
-  // `Composite:*` stripped uniformly (matching every other format
-  // conformance — composite-tag system is deferred per
-  // `[[exifast-phase2-forward-items]]`).
+  // Goldens: bundled `perl exiftool -j -G1 -struct` with `System:*` stripped,
+  // KEEPING the ported Tier-A EXIF Composites `Aperture` (4.0) + `ShutterSpeed`
+  // (1/160) which exifast now builds (#133 PR 3 — EXIF is allow-listed), and
+  // dropping only the still-unported lens Composites by name
+  // (`FocalLength35efl`/`LightValue`/`LensID`, #133 PR 4). The `gen_golden.sh
+  // Exif.tif` arm bakes this in.
   check("Exif.tif", "Exif.tif.json", true);
   check("Exif.tif", "Exif.tif.n.json", false);
 }
@@ -9322,6 +9332,55 @@ fn exif_pagecount_suppressed_for_tiff_subtypes() {
   }
 }
 #[test]
+fn composite_deferred_for_cr2_raw_imagesize_subtype() {
+  // #133 Finding 2: a CR2 (TIFF-base Canon RAW) whose IFD0 `ImageWidth`/`Height`
+  // DIFFER from the ExifIFD's `ExifImageWidth`/`Height`. Bundled ExifTool's
+  // `Composite:ImageSize` (Exif.pm:4759) takes its `$$self{TIFF_TYPE} =~
+  // /^(CR2|Canon 1D RAW|IIQ|EIP)$/` branch and emits `ExifImageWidth x Height`
+  // (`"200x160"`), NOT `ImageWidth x Height` (`"100x80"`). The composite
+  // post-pass has no `TIFF_TYPE` handle (`File:FileType` is finalized at the
+  // JSON-orchestration layer, after `serialize_tags`), so exifast DEFERS all
+  // composites for those RAW subtypes (`runs_composites` → false via
+  // `exif_file_type_is_raw_imagesize_subtype`) rather than emit the WRONG
+  // `ImageWidth`-based size. The golden is generated `-x Composite:all` (the
+  // documented deferral), so the byte-exact `check` already proves NO Composite
+  // is emitted; the explicit asserts below make the intent unmissable — in
+  // particular that the WRONG `"100x80"` is never produced.
+  check("CR2_imagesize.cr2", "CR2_imagesize.cr2.json", true);
+  check("CR2_imagesize.cr2", "CR2_imagesize.cr2.n.json", false);
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/CR2_imagesize.cr2"))
+    .expect("read CR2_imagesize.cr2");
+  for print_on in [true, false] {
+    let got = extract_info("CR2_imagesize.cr2", &data, print_on);
+    // File:FileType MUST be CR2 (the `CR\x02\0` magic) — the gate's predicate.
+    assert!(
+      got.contains("\"File:FileType\":\"CR2\""),
+      "fixture must finalize as CR2 (print_conv={print_on}): {got}",
+    );
+    // The whole Composite subsystem is deferred for the CR2 subtype.
+    assert!(
+      !got.contains("\"Composite:ImageSize\""),
+      "CR2 must NOT emit Composite:ImageSize (print_conv={print_on}): {got}",
+    );
+    assert!(
+      !got.contains("\"Composite:Megapixels\""),
+      "CR2 must NOT emit Composite:Megapixels (print_conv={print_on}): {got}",
+    );
+    // Crucially, the WRONG `ImageWidth`-based size must never appear.
+    assert!(
+      !got.contains("100x80") && !got.contains("100 80"),
+      "CR2 must NOT emit the ImageWidth-based size (print_conv={print_on}): {got}",
+    );
+    // The raw IFD tags ARE still extracted (only the composite pass is gated).
+    assert!(
+      got.contains("\"ExifIFD:ExifImageWidth\""),
+      "CR2 IFD tags must still be extracted (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
 fn exif_numeric_emission_json_token_type() {
   // PR #36 Codex R18/F1 — Exif/GPS numeric values must be emitted as bare
   // JSON NUMBER tokens, not quoted strings. The conformance `check`s above
@@ -9422,9 +9481,11 @@ fn exif_trailing_space_conformance() {
   // Without the trim the port would index space-padded duplicates (`"Canon   "`
   // vs `"Canon"`) — a camera/software facet split. Synthetic standalone TIFF
   // `tools/gen_exif_fixtures.py::make_exif_trailing_space_tif`. Goldens:
-  // bundled `perl exiftool -j -G1 -struct` (`-n` too), `System:*` +
-  // `Composite:*` stripped uniformly. Verified vs bundled `perl exiftool`
-  // 2026-05-22.
+  // bundled `perl exiftool -j -G1 -struct` (`-n` too), `System:*` stripped,
+  // KEEPING the ported `Composite:SubSecDateTimeOriginal` ("2021:08:14
+  // 16:45:09.45") which exifast now builds from `DateTimeOriginal` +
+  // `SubSecTimeOriginal` (#133 PR 3 — EXIF is allow-listed). Verified vs bundled
+  // `perl exiftool`.
   check(
     "Exif_trailing_space.tif",
     "Exif_trailing_space.tif.json",
@@ -10343,6 +10404,10 @@ fn xmp_plus_signed_rational_not_converted_conformance() {
   //   `exif:FocalLength=+50/1`       → `-n` "+50/1" `-j` "50.0 mm" (FocalMm)
   //   `exif:ApertureValue=+2/1`      → `-n` 2  `-j` 2.0 (sqrt(2)**2, Fixed1)
   //   `exif:BrightnessValue=-1/3`    → -0.333333333333333 (valid: converts)
+  // Golden also KEEPS the ported `Composite:Aperture` (2.0, from `XMP-exif:
+  // FNumber`) which exifast now builds (#133 PR 3 — XMP is allow-listed); its
+  // `gen_golden.sh` arm drops only the unported `Composite:FocalLength35efl`
+  // (NOT the generic `XMP*` `Composite:all`).
   check("XMP_rational_plus.xmp", "XMP_rational_plus.xmp.json", true);
   check(
     "XMP_rational_plus.xmp",

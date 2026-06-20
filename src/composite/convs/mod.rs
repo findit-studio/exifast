@@ -16,6 +16,7 @@
 //! keep their signatures.
 
 pub(crate) mod datetime;
+pub(crate) mod exif;
 pub(crate) mod gps;
 
 #[cfg(feature = "alloc")]

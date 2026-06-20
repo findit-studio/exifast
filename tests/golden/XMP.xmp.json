@@ -68,5 +68,9 @@
   "XMP-dc:Subject": ["test1","&-&amp;-&"],
   "XMP-photoshop:ColorMode": "RGB",
   "XMP-photoshop:ICCProfileName": "sRGB IEC61966-2.1",
-  "XMP-photoshop:History": ""
+  "XMP-photoshop:History": "",
+  "Composite:Aperture": 2.8,
+  "Composite:ImageSize": "1136x852",
+  "Composite:Megapixels": 0.968,
+  "Composite:ShutterSpeed": 0.4
 }]

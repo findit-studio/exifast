@@ -269,3 +269,50 @@ fn flac_iter_tags_carries_engine_composite_duration() {
     dur_n.value_ref()
   );
 }
+
+/// The Option-A allow-list (`AnyMeta::runs_composites`): the EXIF Composite
+/// post-pass runs ONLY for the ported still paths. A `video/*` QuickTime carries
+/// `Track1:ImageWidth`/`ImageHeight` but is DEFERRED (its timed Composites land
+/// on the `Doc<N>` axis a later #133 PR adds), so it must NOT build
+/// `Composite:ImageSize` from those bare-name dimensions. An EXIF still (and an
+/// `image/*` QuickTime) DOES build it. This pins the inversion from the prior
+/// deny-list — without the allow-list the bare `ImageWidth` would synthesize
+/// `Composite:ImageSize` for every video/container format.
+#[test]
+fn allow_list_video_quicktime_does_not_build_image_size() {
+  let has_image_size = |meta: &AnyMeta<'_>| {
+    meta
+      .iter_tags(ConvMode::PrintConv)
+      .any(|t| t.group_ref().family1() == "Composite" && t.name() == "ImageSize")
+  };
+
+  // A `video/quicktime` MOV with Track1:ImageWidth=1920 — NOT allow-listed.
+  let mov = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/QuickTime_sp1.mov"
+  ))
+  .unwrap();
+  let mov_meta = exifast::parse_bytes(&mov).expect("MOV recognized");
+  assert!(
+    matches!(mov_meta, AnyMeta::QuickTime(_)),
+    "got {mov_meta:?}"
+  );
+  assert!(
+    !has_image_size(&mov_meta),
+    "a video/* QuickTime must NOT build Composite:ImageSize (deferred); the \
+     allow-list leaked"
+  );
+
+  // An EXIF still WITH dimensions DOES build it (the allow-list runs EXIF).
+  let tif = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/NikonD2Hs.jpg"
+  ))
+  .unwrap();
+  let tif_meta = exifast::parse_bytes(&tif).expect("JPEG recognized");
+  assert!(matches!(tif_meta, AnyMeta::Exif(_)), "got {tif_meta:?}");
+  assert!(
+    has_image_size(&tif_meta),
+    "an EXIF still must build Composite:ImageSize (allow-listed)"
+  );
+}

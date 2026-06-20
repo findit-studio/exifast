@@ -45,5 +45,7 @@
   "Track1:HandlerType": "Picture",
   "Track1:GraphicsMode": "srcCopy",
   "Track1:OpColor": "0 0 0",
-  "Track1:OtherFormat": "hvc1"
+  "Track1:OtherFormat": "hvc1",
+  "Composite:ImageSize": "1280x720",
+  "Composite:Megapixels": 0.922
 }]
