@@ -2536,14 +2536,7 @@ mod subdoc {
         1,
         TagValue::Str("South".into()),
       ),
-      (
-        1,
-        "GoPro",
-        "Track1",
-        "GPSLongitude",
-        0,
-        TagValue::F64(22.0),
-      ),
+      (1, "GoPro", "Track1", "GPSLongitude", 0, TagValue::F64(22.0)),
       (
         1,
         "GoPro",
