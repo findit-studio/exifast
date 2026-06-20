@@ -83,143 +83,23 @@ const APE_GROUP0: &str = "APE";
 // ConvertDuration — PrintConv (ExifTool.pm:6866-6884)
 // =============================================================================
 
-/// Faithful port of `sub ConvertDuration` (ExifTool.pm:6866-6884). Used by
-/// both APE Main `DURATION` (PrintConv) and the local Composite `Duration`
-/// (PrintConv). Operates on the post-ValueConv numeric value.
+/// `sub ConvertDuration` (ExifTool.pm:6877-6895) applied to a [`TagValue`],
+/// used by APE Main `DURATION` (PrintConv) on the post-ValueConv value.
 ///
-/// IsFloat gate (ExifTool.pm `sub IsFloat`) rejects non-numeric values ⇒ they
-/// pass through unchanged. Integer-valued strings/numbers DO satisfy IsFloat
-/// (its regex accepts bare `\d+` with no fraction).
+/// The numeric formatting is the single canonical
+/// [`crate::composite::convs::convert_duration`] (the APE Composite Duration
+/// that used to share this is now built by the generic engine). This wrapper
+/// keeps the ExifTool `IsFloat` gate (ExifTool.pm:6879 `return $time unless
+/// IsFloat($time)`): a non-numeric value (e.g. `"abc"`, or a non-finite f64
+/// that stringifies to `Inf`/`NaN` and fails the IsFloat regex) passes through
+/// UNCHANGED; an integer-valued string/number satisfies IsFloat and is
+/// formatted.
 fn convert_duration(v: &TagValue) -> TagValue {
-  // ExifTool.pm:6869 `return $time unless IsFloat($time);`
+  // ExifTool.pm:6879 `return $time unless IsFloat($time);`
   let Some(time) = as_perl_float(v) else {
     return v.clone();
   };
-  // ExifTool.pm:6870 `return '0 s' if $time == 0;`
-  if time == 0.0 {
-    return TagValue::Str("0 s".into());
-  }
-  // ExifTool.pm:6871 `my $sign = ($time > 0 ? '' : (($time = -$time), '-'));`
-  let (sign, mut time) = if time > 0.0 { ("", time) } else { ("-", -time) };
-  // ExifTool.pm:6872 `return sprintf("$sign%.2f s", $time) if $time < 30;`
-  if time < 30.0 {
-    return TagValue::Str(format!("{sign}{time:.2} s").into());
-  }
-  // ExifTool.pm:6873 `$time += 0.5;` (round to nearest second).
-  time += 0.5;
-  // ExifTool.pm:6874-6877:
-  //   my $h = int($time / 3600);  $time -= $h * 3600;
-  //   my $m = int($time / 60);    $time -= $m * 60;
-  //
-  // Codex r10 finding: Perl `int(f64)` truncates the FLOAT toward zero
-  // but keeps the result as Perl NV (f64) when the value exceeds the IV
-  // range. `$h -= $d*24` runs on the NV; `"$d days "` interpolation
-  // stringifies the NV (`%.15g` for very large values, exact decimal for
-  // those within IV range). Naively casting `time/3600.0 as i64`
-  // saturates at i64::MAX (≈ 9.2e18) and produces a garbage h:m:s for
-  // `time > i64::MAX * 3600` (≈ 3.3e22). Match Perl faithfully:
-  //   - Keep h/m/s as f64 for the arithmetic.
-  //   - Use `f64::trunc` for Perl's `int()` (truncate toward zero).
-  //   - Format the days carve-out's `$d` via `perl_nv_str` (Perl NV
-  //     stringify — exact decimal up to i64::MAX, else `%.15g`).
-  let h_f = (time / 3600.0).trunc();
-  time -= h_f * 3600.0;
-  let m_f = (time / 60.0).trunc();
-  time -= m_f * 60.0;
-  let s_f = time.trunc();
-  // ExifTool.pm:6878-6882 days carve-out (`$h > 24`).
-  if h_f > 24.0 {
-    let d_f = (h_f / 24.0).trunc();
-    let h_remainder = h_f - d_f * 24.0;
-    return TagValue::Str(
-      format!(
-        "{sign}{d} days {h}:{m}:{s}",
-        d = perl_nv_str(d_f),
-        h = perl_nv_str(h_remainder),
-        m = perl_int_str_padded(m_f, 2),
-        s = perl_int_str_padded(s_f, 2),
-      )
-      .into(),
-    );
-  }
-  // ExifTool.pm:6883 final sprintf.
-  TagValue::Str(
-    format!(
-      "{sign}{h}:{m}:{s}",
-      h = perl_nv_str(h_f),
-      m = perl_int_str_padded(m_f, 2),
-      s = perl_int_str_padded(s_f, 2),
-    )
-    .into(),
-  )
-}
-
-/// Left-pad `n` with leading zeros to `width` when the number is a
-/// non-negative integer that fits in i64 (e.g. `5` → `"05"` at width 2).
-/// For ConvertDuration's minutes/seconds (always in [0, 60)) this is the
-/// in-range path; out-of-range values (impossible for m/s after
-/// `time -= h*3600` etc., but defensive against synthetic input) fall
-/// back to plain [`perl_nv_str`].
-fn perl_int_str_padded(n: f64, width: usize) -> String {
-  if n.is_finite() && (0.0..i64::MAX as f64).contains(&n) && n == n.trunc() {
-    let iv = n as i64;
-    format!("{iv:0width$}")
-  } else {
-    perl_nv_str(n)
-  }
-}
-
-/// Perl default NV (number-value-in-string-context) stringification.
-/// Equivalent to `sprintf("%.15g", $nv)` for finite values (Perl uses 15
-/// significant figures by default). Special values are spelled `Inf` /
-/// `-Inf` / `NaN`.
-///
-/// **Integer carve-out (Codex r11 finding).** Perl's `int()` returns
-/// IV/UV-aware integers; stringification preserves the exact decimal as
-/// long as the value fits Perl's UV (u64). Empirically against Perl 5:
-///   - `int(1e19) ⇒ "10000000000000000000"` (decimal, > i64::MAX)
-///   - `int(1.5e19) ⇒ "15000000000000000000"` (decimal)
-///   - `int(u64::MAX as f64) ⇒ "18446744073709551615"` (decimal)
-///   - `int(1.84467440737096e19) ⇒ "1.84467440737096e+19"` (above u64,
-///     scientific)
-///
-/// We therefore preserve decimal for ANY integer-valued f64 that fits
-/// either `i64` (signed range, negatives covered) OR `u64` (positive
-/// range up to u64::MAX). Above that ⇒ `%.15g`.
-fn perl_nv_str(n: f64) -> String {
-  if n.is_nan() {
-    return "NaN".to_string();
-  }
-  if n.is_infinite() {
-    return if n.is_sign_negative() { "-Inf" } else { "Inf" }.to_string();
-  }
-  // Signed-integer carve-out: any integer-valued f64 in [i64::MIN, i64::MAX].
-  // Codex r12 finding: `i64::MAX as f64` actually equals 2^63 (not 2^63-1)
-  // because i64::MAX is not exactly representable in f64; the cast rounds
-  // UP to the next representable f64 value. So `n = 9223372036854775808.0`
-  // (exactly 2^63) passes the inclusive `(i64::MIN as f64..=i64::MAX as
-  // f64).contains` check, but `n as i64` then saturates to i64::MAX
-  // (9223372036854775807), losing exactly one. Perl uses the UV path here
-  // and emits the full `9223372036854775808` decimal. Faithful fix: split
-  // the signed/unsigned carve-outs at the exact f64 power-of-two boundary
-  // 2^63 (signed: n < 2^63; unsigned: 2^63 <= n < 2^64).
-  let two63 = (1u128 << 63) as f64; // exactly 9223372036854775808.0
-  let two64 = (1u128 << 64) as f64; // exactly 18446744073709551616.0
-  // Signed-integer carve-out: integer-valued f64 in [i64::MIN, 2^63),
-  // EXCLUDING 2^63 because `n as i64` would saturate to i64::MAX = 2^63-1.
-  if n == n.trunc() && n >= i64::MIN as f64 && n < two63 {
-    let iv = n as i64;
-    return iv.to_string();
-  }
-  // Unsigned-integer carve-out (Codex r11 + r12): positive integer-valued
-  // f64 in [2^63, 2^64). `n as u64` saturates to u64::MAX for `n >= 2^64`,
-  // so the strict upper bound is exactly `2^64`. The f64 values exactly
-  // at 2^63 and just below 2^64 are both correctly representable as u64.
-  if n == n.trunc() && n >= two63 && n < two64 {
-    let uv = n as u64;
-    return uv.to_string();
-  }
-  crate::value::format_g(n, 15)
+  TagValue::Str(crate::composite::convs::convert_duration(time).into())
 }
 
 /// Perl `IsFloat`-gated coercion (ExifTool.pm `sub IsFloat`):
@@ -728,40 +608,13 @@ fn process_ape_binary_data(
 }
 
 // =============================================================================
-// Perl boolean truthiness (Codex r10 finding for Composite RawConv guard)
+// Perl boolean truthiness (the `if ($val)` RawConv guard)
 // =============================================================================
 
-/// Perl boolean context (`if ($val)`) for a `TagValue`. Faithful semantics
-/// (verified empirically against Perl 5):
-///   - `Str(s)`: TRUE iff `s` is non-empty AND not the exact literal `"0"`.
-///     So `"0E0"`, `"0.0"`, `"00"`, `"+0"`, `" 0"`, `"0abc"` are all TRUE.
-///   - `I64(n)`: TRUE iff `n != 0`.
-///   - `F64(x)`: TRUE iff `x != 0.0` (NaN compares unequal to 0.0 in
-///     IEEE, so NaN is reported as TRUE — faithful: Perl NaN is truthy).
-///   - `Bool(b)`: TRUE iff `b` (direct Perl-bool mapping).
-///   - `Bytes(b)`: TRUE iff `!b.is_empty()` AND `b != [b'0']`
-///     (byte-faithful to the string rule).
-///   - `Rational(n,d)`: TRUE iff `n != 0` (Perl scalar stringifies; 0/X
-///     evaluates to "0" which is falsey).
-///   - `List(_)`: list-context truthiness in Perl is the count, but here
-///     `$val[N]` deref'd from `@val` returns a scalar; this can't be a
-///     `List` realistically. Conservative: TRUE iff non-empty.
-fn perl_boolean_truthy(v: &TagValue) -> bool {
-  match v {
-    TagValue::Str(s) => !s.is_empty() && s.as_str() != "0",
-    TagValue::I64(n) => *n != 0,
-    TagValue::U64(n) => *n != 0,
-    #[allow(clippy::float_cmp)]
-    TagValue::F64(x) => *x != 0.0,
-    TagValue::Bool(b) => *b,
-    TagValue::Bytes(b) => !b.is_empty() && b.as_slice() != b"0",
-    TagValue::Rational(r) => r.numerator() != 0,
-    TagValue::List(l) => !l.is_empty(),
-    // `Map` (XMP structured value) never reaches an APE boolean conv;
-    // a non-empty struct is truthy by the same count semantics as List.
-    TagValue::Map(m) => !m.is_empty(),
-  }
-}
+// The faithful Perl-boolean predicate now lives in `crate::convert` (the
+// Composite engine's per-def guards share it). Re-exported here so the APE
+// Composite arithmetic + its unit test keep referring to it unqualified.
+pub(crate) use crate::convert::perl_boolean_truthy;
 
 // =============================================================================
 // %APE::Main tag dictionary (APE.pm:21-42)
@@ -829,165 +682,23 @@ fn ape_duration_value_conv(v: &TagValue) -> TagValue {
   TagValue::F64(scaled)
 }
 
-/// Perl numeric coercion (leading-prefix scan) returning `f64`. Faithful
-/// to Perl's `0 + $str` rule for any APE tag value passed through a
-/// numeric ValueConv:
+/// Perl numeric coercion (leading-prefix scan) returning `f64`, faithful to
+/// Perl's `0 + $str` rule for any APE tag value passed through a numeric
+/// ValueConv (the `DURATION` field arrives as a MakeTag string).
 ///
-/// Step 1 — skip optional ASCII whitespace.
-/// Step 2a — match the special tokens `[+-]?(Inf(inity)?|NaN)`
-/// case-insensitively FIRST (Perl numeric context accepts these; Codex r6
-/// finding 2). A successful match returns `f64::INFINITY`,
-/// `f64::NEG_INFINITY`, or `f64::NAN`.
-/// Step 2b — otherwise match `[+-]?(\d+(\.\d*)?|\.\d+)([Ee][+-]?\d+)?`
-/// greedily from the start.
-/// Step 3 — if neither matches, return `0.0` (Perl `"abc" + 0 == 0`).
-/// Step 4 — else parse the captured prefix as `f64`; overflow (e.g.
-/// `1e309`) naturally yields `f64::INFINITY`, matching Perl.
-///
-/// This is local to APE because the engine's `convert::perl_numeric_coerce`
-/// returns `u64` (BITMASK semantics); DURATION needs signed/float coercion.
-/// (Engine-tier promotion is the right move once a second format consumer
-/// arrives.)
+/// Now a thin alias over the shared engine helper
+/// [`crate::convert::perl_str_to_f64`]: the dual-sign + inter-sign-whitespace
+/// coercion this function pioneered (`"+ 20000000"`, `"++20000000"`, `"+-20"`,
+/// `"--20"`, the `"+- 20"` reject) was promoted INTO that shared helper so the
+/// Composite engine and APE share ONE implementation (the Composite GPS / EXIF
+/// defs added by later #133 PRs feed it string ingredients too). The APE oracle
+/// tests below now exercise the shared impl as a regression guard. The shared
+/// helper additionally recognises the legacy MSVCRT `1.#INF` / `1.#IND`
+/// spellings (a strict superset never reached by an APE DURATION wire value, so
+/// the four APE composite goldens stay byte-identical).
+#[inline]
 fn perl_numeric_coerce_f64(s: &str) -> f64 {
-  // Checked-indexing (Phase C S2): every `bytes[i]` had a preceding
-  // `i < bytes.len()` guard and `&bytes[i..]` always has `i <= len` (i only
-  // advances past a `.get`-checked byte), so the `.get()` forms below read the
-  // same bytes and take the same branches ⇒ byte-identical.
-  let bytes = s.as_bytes();
-  let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
-  let mut i = 0;
-  // 1. Leading ASCII whitespace.
-  while bytes.get(i).copied().is_some_and(is_ws) {
-    i += 1;
-  }
-  // 2. Optional dual-sign parsing (Codex r7 finding). Perl's numeric
-  // context accepts up to TWO sign characters with one whitespace block
-  // between them, with NO whitespace permitted after the second sign.
-  // Empirically verified against Perl 5:
-  //   "+ 20000000"   → 20000000 (sign1, ws, no sign2, digits)
-  //   "+-20000000"   → -20000000 (sign1, sign2 adjacent, digits)
-  //   "--20000000"   → 20000000  (multiplicative: -×- = +)
-  //   "-+Inf"        → -Inf
-  //   "++Inf"        → Inf
-  //   "+ +20"        → 20 (sign1 + ws + sign2 + digits)
-  //   "+ +Inf"       → not tested but presumed Inf by same rule
-  //   "+-20"         → -20 (sign1, sign2 adjacent)
-  //   "+- 20"        → 0  (sign1 + sign2 + ws + digits — REJECTED:
-  //                       ws not allowed after sign2)
-  //   "-  -  20"     → 0  (same: sign2 followed by ws → reject)
-  //   "+--20000000"  → 0  (three signs)
-  //   "+- +20"       → not parseable per pattern
-  //   "   20"        → 20 (no sign at all)
-  // Algorithm: track effective sign = product of any signs seen.
-  let mut neg = false;
-  let mut sign_count = 0u8;
-  // Sign 1.
-  if let Some(&sign1) = bytes.get(i)
-    && (sign1 == b'+' || sign1 == b'-')
-  {
-    if sign1 == b'-' {
-      neg = !neg;
-    }
-    i += 1;
-    sign_count = 1;
-    // Optional whitespace between sign 1 and sign 2 / digits.
-    while bytes.get(i).copied().is_some_and(is_ws) {
-      i += 1;
-    }
-    // Sign 2 (no whitespace after this sign).
-    if let Some(&sign2) = bytes.get(i)
-      && (sign2 == b'+' || sign2 == b'-')
-    {
-      if sign2 == b'-' {
-        neg = !neg;
-      }
-      i += 1;
-      sign_count = 2;
-    }
-  }
-  // After sign 2, if there's another sign character OR whitespace, Perl
-  // rejects the whole prefix. (Empirically: "+--20" / "-+ 20" / "+- 20"
-  // all return 0.)
-  if sign_count == 2
-    && bytes
-      .get(i)
-      .is_some_and(|&b| b == b'+' || b == b'-' || is_ws(b))
-  {
-    return 0.0;
-  }
-  // 3. Special tokens Inf/Infinity/NaN (Codex r6 + r7). Case-insensitive
-  // ASCII; PREFIX scan — `"InfX" + 0` is still Inf.
-  let starts_with_ci = |rest: &[u8], lit: &[u8]| -> bool {
-    rest.get(..lit.len()).is_some_and(|head| {
-      head
-        .iter()
-        .zip(lit.iter())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
-  };
-  let tail = bytes.get(i..).unwrap_or(&[]);
-  // Match "Infinity" first (longest), then "Inf", then "NaN".
-  if starts_with_ci(tail, b"Infinity") || starts_with_ci(tail, b"Inf") {
-    return if neg {
-      f64::NEG_INFINITY
-    } else {
-      f64::INFINITY
-    };
-  }
-  if starts_with_ci(tail, b"NaN") {
-    // Perl NaN has no sign distinction in stringification ("NaN" not
-    // "-NaN"), so we ignore `neg` here.
-    return f64::NAN;
-  }
-  // 4. Finite numeric prefix: `\d+(\.\d*)?` or `\.\d+`, optional exponent.
-  // The sign characters were already consumed above; we now parse digits
-  // only, manually wrapping the sign into the parsed value.
-  let num_start = i;
-  let digits_before_dot_start = i;
-  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-    i += 1;
-  }
-  let had_int_digits = i > digits_before_dot_start;
-  if bytes.get(i) == Some(&b'.') {
-    i += 1;
-    let frac_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    let had_frac_digits = i > frac_start;
-    if !had_int_digits && !had_frac_digits {
-      // Just a lone `.` with no digits ⇒ no numeric prefix.
-      return 0.0;
-    }
-  } else if !had_int_digits {
-    // No leading digits and no `.\d+` form ⇒ no numeric prefix.
-    return 0.0;
-  }
-  // Optional exponent.
-  let pre_exp = i;
-  if matches!(bytes.get(i), Some(b'E' | b'e')) {
-    i += 1;
-    if matches!(bytes.get(i), Some(b'+' | b'-')) {
-      i += 1;
-    }
-    let exp_digits_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    if i == exp_digits_start {
-      // `E` with no following digits ⇒ Perl's prefix scan rejects the `E`
-      // (the regex requires `\d+` after `[Ee][+-]?`), so the prefix
-      // terminates BEFORE the `E`. Faithful: drop back to `pre_exp`.
-      i = pre_exp;
-    }
-  }
-  // Parse the matched numeric prefix as positive, then apply the sign.
-  // `s.get(num_start..i)` is `Some` (num_start <= i <= len) ⇒ byte-identical.
-  let mag = s
-    .get(num_start..i)
-    .and_then(|t| t.parse::<f64>().ok())
-    .unwrap_or(0.0);
-  if neg { -mag } else { mag }
+  crate::convert::perl_str_to_f64(s)
 }
 
 // APE.pm:29
@@ -2278,30 +1989,11 @@ impl crate::emit::Taggable for Meta<'_> {
       tags.push(EmittedTag::new(ape(), t.name().into(), value, false));
     }
 
-    // (3) Intra-APE Composite:Duration (APE.pm:83-92). Family-1 group
-    // `"Composite"`. Mirrors `sink_composite_duration`: a finite f64 gets
-    // `ConvertDuration` under `-j` (a `TagValue::Str`) and the raw f64 under
-    // `-n`; a non-finite value is stored as `Str` ("Inf"/"-Inf"/"NaN") and
-    // emitted verbatim in both modes via `emitted_tag_value`.
-    if let Some(comp) = &self.composite_duration {
-      let composite = || Group::new("Composite", "Composite");
-      let value = match comp {
-        TagValue::F64(dur) => {
-          if print_conv {
-            emitted_tag_value(&convert_duration(&TagValue::F64(*dur)))
-          } else {
-            TagValue::F64(*dur)
-          }
-        }
-        other => emitted_tag_value(other),
-      };
-      tags.push(EmittedTag::new(
-        composite(),
-        "Duration".into(),
-        value,
-        false,
-      ));
-    }
+    // Composite:Duration (APE.pm:83-92) is no longer emitted inline: the
+    // generic Composite engine (`crate::composite`) derives it from the emitted
+    // `APE:`/`MAC:` SampleRate/TotalFrames/BlocksPerFrame/FinalFrameBlocks tags
+    // as a post-`run_emission` pass. The typed `composite_duration` field is
+    // retained — it backs the cross-format `duration()` MediaInfo projection.
 
     tags.into_iter()
   }
@@ -3804,12 +3496,162 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
       &mut tm,
     );
+    // The generic Composite engine (post-`run_emission` pass) derives Duration
+    // from the emitted ingredients.
+    crate::composite::build_composites(&mut tm, None, ConvMode::PrintConv, 0);
     // Composite:Duration MUST be present (14.71 s — same arithmetic + PrintConv
     // as the standalone APE_spaced_composite fixture).
     assert_eq!(
       tm.get("Composite", "Duration"),
       Some(&TagValue::Str("14.71 s".into()))
     );
+  }
+
+  /// Migration safety net (old ≡ new): the engine-derived `Composite:Duration`
+  /// equals the value the retained typed compute (`composite_duration_ref` —
+  /// the former inline path) would have emitted. The typed value is the RAW
+  /// f64 (`-n`); `-j` is its canonical ConvertDuration.
+  #[test]
+  fn composite_duration_engine_matches_typed_compute() {
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/APE.ape",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read APE.ape fixture");
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
+    let Some(TagValue::F64(secs)) = meta.composite_duration_ref() else {
+      panic!("APE.ape has a finite typed composite duration");
+    };
+    let secs = *secs;
+
+    let mut w = TagMap::new();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
+    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    assert_eq!(
+      w.get("Composite", "Duration"),
+      Some(&TagValue::Str(
+        crate::composite::convs::convert_duration(secs).into()
+      ))
+    );
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
+    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == secs));
+  }
+
+  /// Finding-2 regression (Perl-truthiness on the RAW value, extending the
+  /// old ≡ new differential to the STRING-ZERO edge). APE main tags can supply
+  /// `TotalFrames`/`SampleRate` as MakeTag strings; a zero-SHAPED string like
+  /// `"0.0"` / `"0E0"` is Perl-TRUTHY (non-empty AND not the literal `"0"`), so
+  /// APE.pm:90's `($val[0] && $val[1])` guard PASSES and the duration IS
+  /// computed — even though the string coerces to numeric `0.0`. The retained
+  /// typed compute (`composite_duration_from_header_and_main`) and the generic
+  /// engine must agree, and both must produce a value (not `undef`).
+  #[test]
+  fn composite_duration_string_zero_total_frames_is_perl_truthy() {
+    fn mt(name: &str, value: TagValue) -> MainTag {
+      MainTag {
+        name: name.into(),
+        value,
+      }
+    }
+    // SampleRate numeric, TotalFrames a zero-shaped STRING (Perl-truthy), the
+    // other two numeric. Both coerce TotalFrames → 0.0, so the arithmetic is
+    // ((0-1)*73728 + 42662)/48000 = -0.647… s (finite, negative).
+    for tf_str in ["0.0", "0E0", "00"] {
+      let main_tags = vec![
+        mt("SampleRate", TagValue::I64(48000)),
+        mt("TotalFrames", TagValue::Str(tf_str.into())),
+        mt("BlocksPerFrame", TagValue::I64(73728)),
+        mt("FinalFrameBlocks", TagValue::I64(42662)),
+      ];
+      // OLD path (retained typed compute) — the RAW f64 (the sink applies
+      // PrintConv later). Perl-truthy ⇒ it COMPUTES (not undef).
+      let Some(TagValue::F64(old_raw)) = composite_duration_from_header_and_main(&None, &main_tags)
+      else {
+        panic!("string-truthy TotalFrames {tf_str:?} must COMPUTE (Perl-truthy), not undef");
+      };
+      // The string `"0.0"`/`"0E0"`/`"00"` coerces numeric to 0.0, so the
+      // arithmetic is ((0-1)*73728 + 42662)/48000 = -0.647… (finite, negative).
+      let expected = ((0.0_f64 - 1.0) * 73728.0 + 42662.0) / 48000.0;
+      assert!(
+        (old_raw - expected).abs() < 1e-9,
+        "old raw {old_raw} != {expected}"
+      );
+
+      // NEW engine fed the SAME ingredients via a TagMap (family-1 `APE`,
+      // satisfying the `{APE, MAC}` Require set). PrintConv ⇒ ConvertDuration of
+      // the old raw; ValueConv ⇒ the old raw verbatim. old ≡ new on BOTH axes.
+      let mut w = TagMap::new();
+      for t in &main_tags {
+        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+      }
+      crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+      assert_eq!(
+        w.get("Composite", "Duration"),
+        Some(&TagValue::Str(
+          crate::composite::convs::convert_duration(old_raw).into()
+        )),
+        "engine PrintConv ≢ old typed compute for TotalFrames {tf_str:?}"
+      );
+
+      let mut wn = TagMap::new();
+      for t in &main_tags {
+        let _ = wn.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+      }
+      crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+      assert!(
+        matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if (*x - old_raw).abs() < 1e-12),
+        "engine ValueConv ≢ old raw for TotalFrames {tf_str:?}"
+      );
+    }
+  }
+
+  /// Finding-2 (the falsy side): a TRUE zero — the literal string `"0"`, or a
+  /// numeric `0` — is Perl-FALSY, so the `&&` guard fires and NO composite is
+  /// built. Pins the boundary the truthiness fix must NOT cross.
+  #[test]
+  fn composite_duration_literal_zero_total_frames_is_falsy() {
+    fn mt(name: &str, value: TagValue) -> MainTag {
+      MainTag {
+        name: name.into(),
+        value,
+      }
+    }
+    for tf in [
+      TagValue::Str("0".into()),
+      TagValue::I64(0),
+      TagValue::F64(0.0),
+    ] {
+      let main_tags = vec![
+        mt("SampleRate", TagValue::I64(48000)),
+        mt("TotalFrames", tf.clone()),
+        mt("BlocksPerFrame", TagValue::I64(73728)),
+        mt("FinalFrameBlocks", TagValue::I64(42662)),
+      ];
+      let old = composite_duration_from_header_and_main(&None, &main_tags);
+      assert!(old.is_none(), "falsy TotalFrames {tf:?} must NOT compute");
+
+      let mut w = TagMap::new();
+      for t in &main_tags {
+        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+      }
+      crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+      assert_eq!(
+        w.get("Composite", "Duration"),
+        None,
+        "engine: falsy TotalFrames {tf:?} must NOT compute"
+      );
+    }
   }
 
   // APE.pm:172: `$buff =~ /^APETAGEX/ or return 1` — no trailer at EOF ⇒
@@ -3842,83 +3684,6 @@ mod tests {
   // and_main`), covered by `APE_dup_override`/`APE_spaced_composite`
   // conformance + `process_trailer_only_emits_composite_when_ingredients_in_
   // trailer` above. Cross-format ingredient injection is a deferred item.
-
-  // Codex r10 finding: ConvertDuration must handle huge finite values
-  // by keeping the arithmetic in f64 (NV-style) and stringifying the
-  // out-of-IV components via Perl's default NV stringify (`%.15g`).
-  // perl_nv_str / perl_int_str_padded are the helpers; tests below pin
-  // the empirically-verified Perl behaviour.
-  #[test]
-  fn perl_nv_str_matches_perl_default_stringify() {
-    // Finite integers in safe IV range ⇒ exact decimal (matches Perl
-    // `print 1e10 . "\n"` ⇒ `10000000000`).
-    assert_eq!(perl_nv_str(0.0), "0");
-    assert_eq!(perl_nv_str(42.0), "42");
-    assert_eq!(perl_nv_str(1.0e10), "10000000000");
-    assert_eq!(perl_nv_str(1.0e15), "1000000000000000");
-    // Negative integer in safe IV range.
-    assert_eq!(perl_nv_str(-42.0), "-42");
-    // Outside IV range ⇒ Perl `%.15g` (e.g. `1e25/24/3600` ≈ 1.157e+20).
-    assert_eq!(perl_nv_str(1.0e25 / 24.0 / 3600.0), "1.15740740740741e+20");
-    assert_eq!(perl_nv_str(1.0e25), "1e+25");
-    // Fractional values use `%.15g`.
-    assert_eq!(perl_nv_str(2.5), "2.5");
-    // Special values.
-    assert_eq!(perl_nv_str(f64::INFINITY), "Inf");
-    assert_eq!(perl_nv_str(f64::NEG_INFINITY), "-Inf");
-    assert_eq!(perl_nv_str(f64::NAN), "NaN");
-    // Codex r11 finding: positive integer-valued f64 in
-    // (i64::MAX, u64::MAX] must stringify as DECIMAL (Perl's UV path),
-    // NOT scientific. Boundary cases empirically verified against
-    // Perl 5:
-    //   int(1e19) ⇒ "10000000000000000000"
-    //   int(1.5e19) ⇒ "15000000000000000000"
-    //   int(2^64-2048) ⇒ "18446744073709549568" (largest representable
-    //     f64 below 2^64)
-    //   int(2^64) ⇒ "1.84467440737096e+19" (next representable f64,
-    //     scientific because > u64::MAX)
-    assert_eq!(perl_nv_str(1.0e19), "10000000000000000000");
-    assert_eq!(perl_nv_str(1.5e19), "15000000000000000000");
-    // 2^64 - 2048 = 18446744073709549568 (representable in f64).
-    assert_eq!(perl_nv_str(18446744073709549568.0), "18446744073709549568");
-    // 2^64 (the f64 representation of u64::MAX+1) ⇒ scientific.
-    // Note: `18446744073709551616.0_f64 == u64::MAX as f64` in Rust.
-    let two64 = (1u128 << 64) as f64;
-    assert_eq!(perl_nv_str(two64), "1.84467440737096e+19");
-    // The duration helper's worst-case path: 8.64e23 → days = 1e19.
-    // perl_nv_str(1e19) → "10000000000000000000" (decimal).
-    let days_at_864e23 = (8.64e23_f64 / 3600.0 / 24.0).trunc();
-    // Expected exact value (matches Perl `int(8.64e23/86400)`):
-    assert_eq!(perl_nv_str(days_at_864e23), "10000000000000002048");
-    // Codex r12 finding: `i64::MAX as f64` actually equals 2^63 because
-    // i64::MAX (2^63 - 1) is not exactly representable in f64; the cast
-    // rounds UP. So `n = 9223372036854775808.0` (exactly 2^63) must
-    // stringify via the UV path as `"9223372036854775808"`, NOT via the
-    // signed path's saturating `"9223372036854775807"`. Boundary
-    // verified against Perl 5: `int(9223372036854775808.0) ⇒
-    // "9223372036854775808"`. Largest representable f64 strictly below
-    // 2^63 is `2^63 - 1024 = 9223372036854774784.0`.
-    let two63 = (1u128 << 63) as f64;
-    assert_eq!(perl_nv_str(two63), "9223372036854775808");
-    // 2^63 - 1024 (representable as f64) goes via signed path.
-    assert_eq!(perl_nv_str(9223372036854774784.0), "9223372036854774784");
-  }
-
-  #[test]
-  fn perl_int_str_padded_in_range_pads_with_zeros() {
-    // ConvertDuration's m/s values are always in [0, 60) when reached
-    // via the normal path, so `%02d` zero-pads exactly.
-    assert_eq!(perl_int_str_padded(0.0, 2), "00");
-    assert_eq!(perl_int_str_padded(5.0, 2), "05");
-    assert_eq!(perl_int_str_padded(59.0, 2), "59");
-    // Boundary: i64::MAX as f64 is in-range — emits exact decimal padded
-    // (though the value vastly exceeds width=2, format! just emits the
-    // full number).
-    assert_eq!(perl_int_str_padded(100.0, 2), "100");
-    // Out-of-range or fractional ⇒ fall through to perl_nv_str.
-    assert_eq!(perl_int_str_padded(f64::INFINITY, 2), "Inf");
-    assert_eq!(perl_int_str_padded(1.5, 2), "1.5");
-  }
 
   // Codex r11 finding: Perl boolean truthiness for `if ($val[0] &&
   // $val[1])` in the Composite Duration RawConv must use STRING-truthy
