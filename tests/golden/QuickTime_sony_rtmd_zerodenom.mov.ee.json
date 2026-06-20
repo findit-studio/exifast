@@ -42,5 +42,7 @@
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
   "Track1:FrameRate": 0.00,
-  "Track1:ExposureTime": "undef"
+  "Track1:ExposureTime": "undef",
+  "Composite:ShutterSpeed": "undef",
+  "Composite:AvgBitrate": "416 bps"
 }]

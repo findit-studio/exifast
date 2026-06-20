@@ -3303,11 +3303,11 @@ mod tests {
     let desc_idx = tm
       .entries()
       .iter()
-      .position(|(_, _, g, n, _, _)| g == "APE" && n == "CoverArtFrontDesc");
+      .position(|(_, _, g, n, _, _, _)| g == "APE" && n == "CoverArtFrontDesc");
     let cover_idx = tm
       .entries()
       .iter()
-      .position(|(_, _, g, n, _, _)| g == "APE" && n == "CoverArtFront");
+      .position(|(_, _, g, n, _, _, _)| g == "APE" && n == "CoverArtFront");
     assert!(desc_idx < cover_idx);
   }
 
@@ -3440,7 +3440,7 @@ mod tests {
     let names: Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(_, _, g, n, _, _)| (g == "APE").then_some(n.as_str()))
+      .filter_map(|(_, _, g, n, _, _, _)| (g == "APE").then_some(n.as_str()))
       .collect();
     assert_eq!(names, &["Title", "Artist"]);
     assert_eq!(
@@ -3498,7 +3498,13 @@ mod tests {
     );
     // The generic Composite engine (post-`run_emission` pass) derives Duration
     // from the emitted ingredients.
-    crate::composite::build_composites(&mut tm, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut tm,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     // Composite:Duration MUST be present (14.71 s — same arithmetic + PrintConv
     // as the standalone APE_spaced_composite fixture).
     assert_eq!(
@@ -3531,7 +3537,13 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
       &mut w,
     );
-    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get("Composite", "Duration"),
       Some(&TagValue::Str(
@@ -3544,7 +3556,13 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
       &mut wn,
     );
-    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    crate::composite::build_composites(
+      &mut wn,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == secs));
   }
 
@@ -3593,9 +3611,15 @@ mod tests {
       // the old raw; ValueConv ⇒ the old raw verbatim. old ≡ new on BOTH axes.
       let mut w = TagMap::new();
       for t in &main_tags {
-        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
-      crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+      crate::composite::build_composites(
+        &mut w,
+        None,
+        ConvMode::PrintConv,
+        0,
+        &crate::composite::CompositeContext::new(None, None),
+      );
       assert_eq!(
         w.get("Composite", "Duration"),
         Some(&TagValue::Str(
@@ -3606,9 +3630,15 @@ mod tests {
 
       let mut wn = TagMap::new();
       for t in &main_tags {
-        let _ = wn.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+        let _ = wn.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
-      crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+      crate::composite::build_composites(
+        &mut wn,
+        None,
+        ConvMode::ValueConv,
+        0,
+        &crate::composite::CompositeContext::new(None, None),
+      );
       assert!(
         matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if (*x - old_raw).abs() < 1e-12),
         "engine ValueConv ≢ old raw for TotalFrames {tf_str:?}"
@@ -3643,9 +3673,15 @@ mod tests {
 
       let mut w = TagMap::new();
       for t in &main_tags {
-        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone());
+        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
-      crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+      crate::composite::build_composites(
+        &mut w,
+        None,
+        ConvMode::PrintConv,
+        0,
+        &crate::composite::CompositeContext::new(None, None),
+      );
       assert_eq!(
         w.get("Composite", "Duration"),
         None,

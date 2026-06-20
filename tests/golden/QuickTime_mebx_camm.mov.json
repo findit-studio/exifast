@@ -55,5 +55,6 @@
   "Track2:MediaDuration": "2.00 s",
   "Track2:HandlerClass": "Media Handler",
   "Track2:HandlerType": "NRT Metadata",
-  "Track2:MetaFormat": "camm"
+  "Track2:MetaFormat": "camm",
+  "Composite:AvgBitrate": "272 bps"
 }]

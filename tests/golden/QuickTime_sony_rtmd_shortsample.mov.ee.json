@@ -51,5 +51,9 @@
   "Track1:WhiteBalance": "Unknown (0)",
   "Track1:DateTime": "2024:01:07 11:19:15",
   "Track1:PitchRollYaw": "13091 4386 13124 100 -200 300",
-  "Track1:Accelerometer": "13091 4386 13124 -50 16384 -1"
+  "Track1:Accelerometer": "13091 4386 13124 -50 16384 -1",
+  "Composite:Aperture": 4.0,
+  "Composite:ShutterSpeed": "1/60",
+  "Composite:AvgBitrate": "604 bps",
+  "Composite:LightValue": 5.9
 }]

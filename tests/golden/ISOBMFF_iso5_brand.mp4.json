@@ -43,5 +43,7 @@
   "Track1:Warning": "[minor] The ExtractEmbedded option may find more tags in the media data",
   "Track1:HandlerType": "Text",
   "Track1:HandlerDescription": "nhml@GPAC0.5.1-DEV-rev5339",
-  "Track1:OtherFormat": "depi"
+  "Track1:OtherFormat": "depi",
+  "Composite:ImageSize": "320x240",
+  "Composite:Megapixels": 0.077
 }]

@@ -95,5 +95,9 @@
   "Track3:HandlerType": "meta",
   "Track3:HandlerDescription": "Timed Metadata Media Handler",
   "Track3:MetaFormat": "rtmd",
-  "Track3:TrackProperty": "16 0 0"
+  "Track3:TrackProperty": "16 0 0",
+  "Composite:ImageSize": "3840 2160",
+  "Composite:Megapixels": 8.2944,
+  "Composite:AvgBitrate": 90022,
+  "Composite:Rotation": 0
 }]

@@ -43,5 +43,8 @@
   "Track1:HandlerType": "Video Track",
   "GoPro:DeviceName": "Hero8 Black",
   "GoPro:FirmwareVersion": "HD8.01.02.51.00",
-  "GoPro:CameraSerialNumber": "C3221324545448"
+  "GoPro:CameraSerialNumber": "C3221324545448",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:Rotation": 0
 }]

@@ -2201,7 +2201,13 @@ mod tests {
     // -j: run_emission emits the AIFF inputs, then build_composites derives the
     // ConvertDuration string under the Composite (-G1) group.
     let mut w = emit_into_tagmap(&meta, ConvMode::PrintConv);
-    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some("2.00 s".to_string())
@@ -2211,7 +2217,13 @@ mod tests {
     // -n: finite f64 ⇒ bare number (serializer renders 2.0 as `2`); assert
     // the variant carried is F64 so the bare-number gate applies.
     let mut w = emit_into_tagmap(&meta, ConvMode::ValueConv);
-    crate::composite::build_composites(&mut w, None, ConvMode::ValueConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(w.get("Composite", "Duration"), Some(&TagValue::F64(2.0)));
   }
 
@@ -2231,14 +2243,26 @@ mod tests {
 
     // -j: engine string == canonical ConvertDuration of the typed value.
     let mut w = emit_into_tagmap(&meta, ConvMode::PrintConv);
-    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some(crate::composite::convs::convert_duration(secs))
     );
     // -n: engine bare f64 == the typed value.
     let mut wn = emit_into_tagmap(&meta, ConvMode::ValueConv);
-    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    crate::composite::build_composites(
+      &mut wn,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(wn.get("Composite", "Duration"), Some(&TagValue::F64(secs)));
   }
 

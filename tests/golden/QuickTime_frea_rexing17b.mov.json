@@ -26,5 +26,6 @@
   "Kodak:Duration": "1:02:05",
   "Kodak:KodakVersion": "3.01.054",
   "Kodak:ThumbnailImage": "(Binary data 40 bytes, use -b option to extract)",
-  "Kodak:PreviewImage": "(Binary data 60 bytes, use -b option to extract)"
+  "Kodak:PreviewImage": "(Binary data 60 bytes, use -b option to extract)",
+  "Composite:AvgBitrate": "262 kbps"
 }]

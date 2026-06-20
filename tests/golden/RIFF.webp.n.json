@@ -20,5 +20,7 @@
   "IFD0:Artist": "me",
   "IFD0:YCbCrPositioning": 1,
   "XMP-x:XMPToolkit": "Image::ExifTool 12.46",
-  "XMP-dc:Subject": ["test"]
+  "XMP-dc:Subject": ["test"],
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
 }]

@@ -16,5 +16,7 @@
   "DV:Colorimetry": "4:2:0",
   "DV:AudioChannels": 4,
   "DV:AudioSampleRate": 32000,
-  "DV:AudioBitsPerSample": 12
+  "DV:AudioBitsPerSample": 12,
+  "Composite:ImageSize": "720 576",
+  "Composite:Megapixels": 0.41472
 }]

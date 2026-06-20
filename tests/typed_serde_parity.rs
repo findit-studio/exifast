@@ -713,7 +713,14 @@ const NOT_ACTIVE: &[&str] = &[
 /// RAW subtypes (the `Composite:ImageSize` `TIFF_TYPE` branch is unavailable to
 /// the post-pass), so its `.json`/`.n.json` (`System:*`/`Composite:*` excluded)
 /// are byte-exact with NO Composite.
-const EXPECTED_ACTIVE_FIXTURES: usize = 540;
+///
+/// 540 → 541 after #133 PR 5 (full video Composite activation): the timed
+/// fixture `QuickTime_gps0_oor0.mov` gained the `.n.json` it was missing (every
+/// other gps0/camm/sony_rtmd timed fixture already had one), so it now pairs
+/// `.json` + `.n.json` and enters the active set like its siblings — byte-exact
+/// (its `Composite:GPSPosition` is the unported timed-GPS deferral, excluded at
+/// regen, so the typed-serde path matches the writer + golden).
+const EXPECTED_ACTIVE_FIXTURES: usize = 541;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

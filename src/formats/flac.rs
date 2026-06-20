@@ -2366,7 +2366,7 @@ mod tests {
     let names: Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(_, _, g, n, _, _)| (g == "FLAC").then_some(n.as_str()))
+      .filter_map(|(_, _, g, n, _, _, _)| (g == "FLAC").then_some(n.as_str()))
       .filter(|n| n.starts_with("Picture"))
       .collect();
     assert_eq!(
@@ -2733,7 +2733,13 @@ mod tests {
     );
     // The generic Composite engine (post-`run_emission` pass) derives Duration
     // from the emitted FLAC:SampleRate + FLAC:TotalSamples.
-    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some("0:00:30".to_string())
@@ -2744,7 +2750,13 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
       &mut wn,
     );
-    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    crate::composite::build_composites(
+      &mut wn,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == 30.0));
   }
 
@@ -2764,7 +2776,13 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
       &mut w,
     );
-    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some(crate::composite::convs::convert_duration(secs))
@@ -2775,7 +2793,13 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
       &mut wn,
     );
-    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    crate::composite::build_composites(
+      &mut wn,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == secs));
   }
 
@@ -2813,7 +2837,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(_, _, g, n, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
+        .any(|(_, _, g, n, _, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 tags present in the engine output"
     );
   }

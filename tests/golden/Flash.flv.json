@@ -44,5 +44,7 @@
   "Flash:AudioSampleRate": 11025,
   "Flash:AudioBitsPerSample": 16,
   "Flash:AudioChannels": "1 (mono)",
-  "Flash:VideoEncoding": "On2 VP6"
+  "Flash:VideoEncoding": "On2 VP6",
+  "Composite:ImageSize": "320x240",
+  "Composite:Megapixels": 0.077
 }]

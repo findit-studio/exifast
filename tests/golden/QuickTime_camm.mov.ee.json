@@ -51,5 +51,6 @@
   "Track1:GPSVelocityEast": 0.25,
   "Track1:GPSVelocityNorth": -0.5,
   "Track1:GPSVelocityUp": 0.100000001490116,
-  "Track1:GPSSpeedAccuracy": 0.400000005960464
+  "Track1:GPSSpeedAccuracy": 0.400000005960464,
+  "Composite:AvgBitrate": "309 bps"
 }]

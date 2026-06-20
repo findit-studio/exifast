@@ -43,5 +43,6 @@
   "Track1:MetaFormat": "mebx",
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
-  "Track1:GPSCoordinates": 123456
+  "Track1:GPSCoordinates": 123456,
+  "Composite:AvgBitrate": "96 bps"
 }]

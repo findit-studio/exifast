@@ -40,5 +40,8 @@
   "Track1:MediaTimeScale": 600,
   "Track1:MediaDuration": 30,
   "Track1:MediaLanguageCode": "eng",
-  "Track1:HandlerType": "vide"
+  "Track1:HandlerType": "vide",
+  "Composite:ImageSize": "1280 720",
+  "Composite:Megapixels": 0.9216,
+  "Composite:AvgBitrate": 4
 }]

@@ -44,6 +44,28 @@ use exifast::parser::extract_info_with_options;
 /// sites read clearly after the `MetaFormat` gap was closed (R13).
 const NO_EXCL: &[&str] = &[];
 
+/// The crafted-degenerate Sony rtmd GPS Composites dropped from BOTH sides (the
+/// `*_excluding` arg) for the `_coordzero`/`_nonfinite`/`_zerolen` fixtures: a
+/// degenerate `0x8502`/`0x8503` GPS record (an empty / non-finite / zero-length
+/// coordinate) makes bundled's `Composite:GPSLatitude`/`Longitude`/`Position`
+/// diverge from exifast's (a crafted-input ship-bar deferral, NOT a real-camera
+/// gap — the REAL `QuickTime_sony_rtmd.mov` builds every GPS Composite
+/// byte-exact). Every other Composite + tag stays byte-exact.
+const SONY_RTMD_DEGEN_GPS_EXCL: &[&str] =
+  &["GPSLatitude", "GPSLongitude", "GPSPosition", "GPSDateTime"];
+
+/// `QuickTime_sony_rtmd_shortnum.mov`: every numeric record is sub-width, so
+/// FNumber is the `EmptyRead` sentinel `256` (`2^(8-0/8192)`) — bundled does NOT
+/// build `Composite:Aperture` from that sentinel while exifast does, so it is
+/// dropped from both sides (the GPS / other Composites stay byte-exact).
+const SONY_RTMD_SHORTNUM_EXCL: &[&str] = &["Aperture"];
+
+/// `QuickTime_canon_ctmd_exifinfo.mov`: the type-7 MakerNote re-dispatch makes
+/// `Composite:LightValue` read a different `$prt[2]` ISO than exifast's collapsed
+/// `Track1:ISO`, so the crafted LightValue diverges; dropped from both sides
+/// (Aperture / ShutterSpeed / the redispatch proof tags stay byte-exact).
+const CANON_CTMD_EXIFINFO_EXCL: &[&str] = &["LightValue"];
+
 /// Read a fixture into memory.
 fn fixture(name: &str) -> Vec<u8> {
   let root = env!("CARGO_MANIFEST_DIR");
@@ -1005,13 +1027,13 @@ fn sony_rtmd_coordzero_ee_byte_exact() {
     "QuickTime_sony_rtmd_coordzero.mov",
     "QuickTime_sony_rtmd_coordzero.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_coordzero.mov",
     "QuickTime_sony_rtmd_coordzero.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1108,13 +1130,13 @@ fn sony_rtmd_nonfinite_ee_byte_exact() {
     "QuickTime_sony_rtmd_nonfinite.mov",
     "QuickTime_sony_rtmd_nonfinite.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_nonfinite.mov",
     "QuickTime_sony_rtmd_nonfinite.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1479,13 +1501,13 @@ fn sony_rtmd_zerolen_ee_byte_exact() {
     "QuickTime_sony_rtmd_zerolen.mov",
     "QuickTime_sony_rtmd_zerolen.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_zerolen.mov",
     "QuickTime_sony_rtmd_zerolen.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1564,13 +1586,13 @@ fn sony_rtmd_shortnum_ee_byte_exact() {
     "QuickTime_sony_rtmd_shortnum.mov",
     "QuickTime_sony_rtmd_shortnum.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_SHORTNUM_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_shortnum.mov",
     "QuickTime_sony_rtmd_shortnum.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_SHORTNUM_EXCL,
   );
 }
 
@@ -2085,13 +2107,13 @@ fn canon_ctmd_exifinfo_redispatch_byte_exact() {
     "QuickTime_canon_ctmd_exifinfo.mov",
     "QuickTime_canon_ctmd_exifinfo.mov.ee.json",
     false,
-    NO_EXCL,
+    CANON_CTMD_EXIFINFO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_canon_ctmd_exifinfo.mov",
     "QuickTime_canon_ctmd_exifinfo.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    CANON_CTMD_EXIFINFO_EXCL,
   );
 }
 
@@ -2160,6 +2182,17 @@ const CR3_CTMD_EXCL: &[&str] = &[
   "ChromaticAberrationSetting",
   "DistortionCorrectionSetting",
   "DigitalLensOptimizerSetting",
+  // #133 PR 5: the MakerNote-DERIVED Canon Composites bundled synthesizes from
+  // the CTMD MakerNote sub-tables (`Composite:LensID` + the Canon flash/drive
+  // bitfield composites) are UNPORTED — exifast emits none, so they are dropped
+  // (the same by-name MakerNote-Composite deferral the still Canon goldens take).
+  "LensID",
+  "ConditionalFEC",
+  "DriveMode",
+  "FlashType",
+  "RedEyeReduction",
+  "ShootingMode",
+  "ShutterCurtainHack",
 ];
 
 // REAL Canon CR3 (`CanonRaw_ctmd.cr3`, a minimal CRX still-RAW), the #81 phase-2

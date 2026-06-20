@@ -102,5 +102,8 @@
   "Pentax:ProductionCode": 2.3,
   "Pentax:InternalSerialNumber": 8007725,
   "Pentax:WBShiftAB": 0,
-  "Pentax:WBShiftGM": 0
+  "Pentax:WBShiftGM": 0,
+  "Composite:ImageSize": "1280 720",
+  "Composite:Megapixels": 0.9216,
+  "Composite:Duration": 24.9996
 }]

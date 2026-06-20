@@ -11,5 +11,7 @@
   "RIFF:VP8Version": "0 (bicubic reconstruction, normal loop)",
   "RIFF:HorizontalScale": 0,
   "RIFF:VerticalScale": 0,
-  "XMP-x:XMPToolkit": "TKx"
+  "XMP-x:XMPToolkit": "TKx",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
 }]

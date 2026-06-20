@@ -143,5 +143,17 @@
   "Track1:DistortionCorrectionSetting": 0,
   "Track1:DigitalLensOptimizerSetting": 0,
   "Track1:VignettingCorrVersion": 32,
-  "ExifIFD:SceneCaptureType": 0
+  "ExifIFD:SceneCaptureType": 0,
+  "Composite:ConditionalFEC": 0,
+  "Composite:DriveMode": 2,
+  "Composite:FlashType": 0,
+  "Composite:RedEyeReduction": 0,
+  "Composite:ShootingMode": 3,
+  "Composite:ShutterCurtainHack": 0,
+  "Composite:Aperture": 3.5,
+  "Composite:LensID": 4153,
+  "Composite:ShutterSpeed": 0.0125,
+  "Composite:AvgBitrate": 26544,
+  "Composite:LightValue": 2.93663793900257,
+  "Composite:FocalLength35efl": 15
 }]

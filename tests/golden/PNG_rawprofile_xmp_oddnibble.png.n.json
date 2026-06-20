@@ -16,5 +16,7 @@
   "XMP-dc:Creator": ["Ansel Adams"],
   "XMP-dc:Title": "Moonrise",
   "XMP-xmp:CreatorTool": "exifast raw-profile demo",
-  "XMP-exif:DateTimeOriginal": "2024:01:15 10:30:00+00:00"
+  "XMP-exif:DateTimeOriginal": "2024:01:15 10:30:00+00:00",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
 }]

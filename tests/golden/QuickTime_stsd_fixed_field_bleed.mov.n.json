@@ -48,5 +48,6 @@
   "Track1:SourceImageHeight": 200,
   "Track1:XResolution": 72,
   "Track1:YResolution": 72,
-  "Track1:VideoFrameRate": 1
+  "Track1:VideoFrameRate": 1,
+  "Composite:AvgBitrate": 8
 }]

@@ -14,5 +14,7 @@
   "IFD0:Artist": "AA",
   "IFD0:Make": "MK",
   "XMP-x:XMPToolkit": "TK1",
-  "XMP-dc:Creator": ["CC"]
+  "XMP-dc:Creator": ["CC"],
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
 }]

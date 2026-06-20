@@ -65,5 +65,9 @@
   "UserData:Title": "Test Clip",
   "UserData:ContentCreateDate": "2024:01:02 03:04:05+00:00",
   "UserData:GPSCoordinates": "37.3318 -122.0312 10.5",
-  "UserData:Comment": "A comment"
+  "UserData:Comment": "A comment",
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736,
+  "Composite:AvgBitrate": 4,
+  "Composite:Rotation": 0
 }]

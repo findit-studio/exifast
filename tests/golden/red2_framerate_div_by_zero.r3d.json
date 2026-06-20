@@ -7,5 +7,7 @@
   "File:MIMEType": "video/x-red-r3d",
   "Red:RedcodeVersion": 2,
   "Red:ImageWidth": 1920,
-  "Red:ImageHeight": 1080
+  "Red:ImageHeight": 1080,
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1
 }]

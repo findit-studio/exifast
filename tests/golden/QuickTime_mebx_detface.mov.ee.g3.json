@@ -45,5 +45,6 @@
   "Doc1:Track1:DetectedFaceBounds": "0.765432 -2.345678 0.33 0.44 0.55 0.66 0.77 0.88",
   "Doc1:Track1:DetectedFaceID": 1002,
   "Doc1:Track1:DetectedFaceRollAngle": -3,
-  "Doc1:Track1:DetectedFaceYawAngle": 45
+  "Doc1:Track1:DetectedFaceYawAngle": 45,
+  "Composite:AvgBitrate": "1.54 kbps"
 }]

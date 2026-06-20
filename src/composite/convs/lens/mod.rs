@@ -86,6 +86,13 @@ pub(crate) fn to_float(v: &CompositeValue) -> Option<f64> {
     // A non-finite f64 fails `ToFloat`'s float regex (its `Inf`/`NaN` spelling) ⇒
     // `undef`; a finite f64 is `%.15g`-reparsed.
     TagValue::F64(x) => x.is_finite().then(|| reparse_15g(*x)),
+    // A raw `Rational` ingredient `ToFloat`s through its ExifTool ValueConv
+    // STRING (`Rational::exiftool_val_str` — the `%g`-rounded quotient, or
+    // `"inf"`/`"undef"` for a zero denominator): a Canon CTMD `Track1:FocalLength`
+    // kept as `Rational(15/1)` `ToFloat`s to `15.0`, while a zero-denominator one
+    // hits `ToFloat`'s `"inf"`/`"undef"`-is-non-float path ⇒ `None` — the same
+    // as if the rational had ValueConv'd to a scalar/string first.
+    TagValue::Rational(r) => to_float_str(&r.exiftool_val_str()),
     TagValue::Str(s) => to_float_str(s),
     _ => None,
   }

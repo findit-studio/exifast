@@ -44,5 +44,6 @@
   "Track1:Warning": "Unknown camm record type 0",
   "Track1:GPSLatitude": "47 deg 37' 42.32\" N",
   "Track1:GPSLongitude": "122 deg 9' 54.06\" W",
-  "Track1:GPSAltitude": "123 m"
+  "Track1:GPSAltitude": "123 m",
+  "Composite:AvgBitrate": "176 bps"
 }]

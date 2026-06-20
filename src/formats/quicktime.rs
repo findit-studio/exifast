@@ -7843,14 +7843,20 @@ impl crate::emit::Taggable for Meta<'_> {
           }
           // Accumulate this record's tags with WITHIN-doc last-wins by
           // `(family1, name)` (the records of one timed sample all share that
-          // sample's `Track<N>`, so this matches the cross-doc collapse key).
+          // sample's `Track<N>`, so this matches the cross-doc collapse key),
+          // through the SHARED [`crate::tagmap::emitted_dedup_override`] the final
+          // sinks use. `mebx` rows are all `Priority => 1` and never `Warning`/
+          // `Error`, so this is the same last-wins as before — routed through the
+          // shared rule so no per-`Doc` collapse can diverge by construction.
           for tag in mebx_scratch.drain(..) {
             let key = (
               smol_str::SmolStr::new(tag.tag().group_ref().family1()),
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -7927,10 +7933,17 @@ impl crate::emit::Taggable for Meta<'_> {
           let t = sample.track_index();
           if t == 0 { 1 } else { t }
         });
+        // The Sony rtmd tags come from `%Image::ExifTool::Sony::rtmd`, whose
+        // module gives them family-0 `Sony` (ExifTool `-G0:1` ⇒ `[Sony:Track1]`,
+        // Sony.pm:10727) — NOT `QuickTime`. The `-G1`/`-G3:1` golden keys show
+        // family-1 (`Track1`/`Doc1:Track1`), so family-0 is invisible to them;
+        // it is LOAD-BEARING only for the family-0-qualified `Sony:` SubDoc GPS
+        // Composites (Sony.pm:10929), which match `Sony` but not the GoPro/camm/
+        // mebx tracks (family-0 `QuickTime`/`GoPro`). See `sony_req`.
         let group = if g3 {
-          Group::with_doc("QuickTime", track.as_str(), doc_n)
+          Group::with_doc("Sony", track.as_str(), doc_n)
         } else {
-          Group::new("QuickTime", track.as_str())
+          Group::new("Sony", track.as_str())
         };
         sony_scratch.clear();
         // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
@@ -8242,13 +8255,20 @@ impl crate::emit::Taggable for Meta<'_> {
             flush_doc(&mut doc_vals, &mut sony_committed, &mut tags);
             cur_doc = Some(doc_n);
           }
+          // Within-doc last-wins through the SHARED
+          // [`crate::tagmap::emitted_dedup_override`] the final sinks use. Sony
+          // rtmd rows are all `Priority => 1` and never `Warning`/`Error`, so the
+          // surviving value is unchanged from the prior unconditional last-wins —
+          // routed through the shared rule so no per-`Doc` collapse can diverge.
           for tag in sony_scratch.drain(..) {
             let key = (
               smol_str::SmolStr::new(tag.tag().group_ref().family1()),
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -8419,14 +8439,19 @@ impl crate::emit::Taggable for Meta<'_> {
         if g3 {
           // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
           // `ctmd_scratch` carry one doc. Collapse the within-sample `(family1,
-          // name)` duplicates HONORING `Priority => N` BEFORE appending: a later
-          // same-key row overrides the earlier ONLY when its priority is
-          // non-zero AND `>=` the stored one (`ExifTool.pm:9544-9560`), keeping
-          // the priority-winner at the EARLIER row's position. This is what
-          // makes the re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority =>
-          // 0`, emitted after the type-5 payload) NOT clobber this sample's
-          // `ExposureInfo` `FNumber` (`Priority => 1`) — matching bundled
-          // (`Doc<N>:Track<N>:FNumber` = the ExposureInfo value).
+          // name)` duplicates HONORING `Priority => N` BEFORE appending, via the
+          // SHARED [`crate::tagmap::emitted_dedup_override`] the `TagMap` /
+          // `collect_deduped_tags` sinks also use: a later same-key row overrides
+          // the earlier ONLY when the shared rule says so (`ExifTool.pm:9544-9560`
+          // — non-zero effective priority `>=` the stored one), keeping the
+          // priority-winner at the EARLIER row's position. This is what makes the
+          // re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority => 0`, emitted
+          // after the type-5 payload) NOT clobber this sample's `ExposureInfo`
+          // `FNumber` (`Priority => 1`) — matching bundled (`Doc<N>:Track<N>:
+          // FNumber` = the ExposureInfo value). Routing through the shared helper
+          // (vs the old hard-coded `priority()` test) also makes a CTMD scratch
+          // `Warning`/`Error` first-win by NAME (effective-priority-0), exactly
+          // as the final sinks do — no path can diverge by construction.
           let mut g3_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
             std::vec::Vec::new();
           for tag in ctmd_scratch.drain(..) {
@@ -8435,7 +8460,7 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = g3_vals.iter_mut().find(|(k, _)| *k == key) {
-              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
                 slot.1 = tag;
               }
             } else {
@@ -8454,13 +8479,16 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              // Within-sample last-wins, HONORING `Priority => N`: a later
+              // Within-sample last-wins, HONORING `Priority => N` via the SHARED
+              // [`crate::tagmap::emitted_dedup_override`] (the same rule the
+              // `TagMap` / `collect_deduped_tags` sinks apply): a later
               // same-`(family1, name)` row overrides the stored value ONLY when
-              // its priority is non-zero AND `>=` the stored one
-              // (`ExifTool.pm:9544-9560`). So the `ShotInfo` `Track<N>:FNumber`
-              // (`Priority => 0`) leaves the earlier `ExposureInfo` `FNumber`
-              // (`Priority => 1`) in place — the `-G1` half of the CTMD fix.
-              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+              // the shared rule says so (`ExifTool.pm:9544-9560`). So the
+              // `ShotInfo` `Track<N>:FNumber` (`Priority => 0`) leaves the earlier
+              // `ExposureInfo` `FNumber` (`Priority => 1`) in place — the `-G1`
+              // half of the CTMD fix — and a CTMD scratch `Warning`/`Error`
+              // first-wins by NAME, with no path able to diverge by construction.
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
                 slot.1 = tag;
               }
             } else {
@@ -9309,7 +9337,11 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       // accumulating this sample's packets. Consecutive samples that share a
       // `doc_n` (two camm5 packets in one camm sample) accumulate into the SAME
       // document buffer, so a later packet's value overwrites the earlier
-      // (within-doc last-wins).
+      // (within-doc last-wins) — through the SHARED
+      // [`crate::tagmap::emitted_dedup_override`] the final sinks use. camm rows
+      // are all `Priority => 1` and never `Warning`/`Error`, so the survivor is
+      // unchanged; routing through the shared rule keeps every per-`Doc` collapse
+      // non-divergent by construction.
       if cur_doc != Some(doc_n) {
         flush_doc(&mut doc_vals, &mut committed, out);
         cur_doc = Some(doc_n);
@@ -9320,7 +9352,9 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
           smol_str::SmolStr::new(tag.tag().name()),
         );
         if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-          slot.1 = tag;
+          if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+            slot.1 = tag;
+          }
         } else {
           doc_vals.push((key, tag));
         }
@@ -11810,13 +11844,20 @@ fn emit_camm_motion<T>(
         flush_doc(&mut doc_vals, &mut committed, out);
         cur_doc = Some(doc_n);
       }
+      // Within-doc last-wins through the SHARED
+      // [`crate::tagmap::emitted_dedup_override`] the final sinks use. The motion
+      // payload rows are all `Priority => 1` and never `Warning`/`Error`, so the
+      // survivor is unchanged from the prior unconditional last-wins — routed
+      // through the shared rule so no per-`Doc` collapse can diverge.
       for tag in scratch.drain(..) {
         let key = (
           smol_str::SmolStr::new(tag.tag().group_ref().family1()),
           smol_str::SmolStr::new(tag.tag().name()),
         );
         if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-          slot.1 = tag;
+          if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+            slot.1 = tag;
+          }
         } else {
           doc_vals.push((key, tag));
         }
@@ -12638,9 +12679,16 @@ fn emit_gopro_doc<F: FnMut(&str, &str) -> bool>(
         smol_str::SmolStr::new(tag.tag().name()),
       );
       if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-        // Repeated key WITHIN this document: overwrite (last-wins) only when this
-        // document owns the key's primary; otherwise keep the first occurrence.
-        if !committed.contains(&key) {
+        // Repeated key WITHIN this document: overwrite only when this document
+        // OWNS the key's primary (the `committed` cross-document FIRST-document-
+        // wins ownership — a genuinely different axis from priority); otherwise
+        // keep the first occurrence. The WITHIN-doc replace, gated by that
+        // ownership, is the SHARED [`crate::tagmap::emitted_dedup_override`]
+        // last-wins the final sinks use (GoPro `STRM` rows are all `Priority => 1`
+        // and never `Warning`/`Error`, so the survivor is unchanged) — routed
+        // through the shared rule so the within-doc collapse cannot diverge, while
+        // the `committed` ownership gate stays as the document-level model.
+        if !committed.contains(&key) && crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
           slot.1 = tag;
         }
       } else {

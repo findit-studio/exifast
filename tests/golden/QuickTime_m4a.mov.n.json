@@ -38,5 +38,6 @@
   "Track1:MediaTimeScale": 44100,
   "Track1:MediaDuration": 0.408163265306122,
   "Track1:MediaLanguageCode": "eng",
-  "Track1:HandlerType": "soun"
+  "Track1:HandlerType": "soun",
+  "Composite:AvgBitrate": 4
 }]

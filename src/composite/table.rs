@@ -51,6 +51,71 @@
 
 use crate::value::TagValue;
 
+/// Format-state scalars the post-pass threads into the derivations that read
+/// ExifTool object state instead of (only) their declared `Require`/`Desire`
+/// inputs — the `$$self{…}` reads inside a Composite's RawConv/ValueConv.
+///
+/// `Composite:AvgBitrate` (QuickTime.pm:8649) divides its `Duration` input by
+/// `$$self{TimeScale}` and reads the SUM of every `MediaDataSize` (the
+/// `NextTagKey` loop) — neither is a plain resolved input (the dedup-collapsing
+/// `TagMap` keeps only one `MediaDataSize`, and `TimeScale` is the movie scalar,
+/// not the per-input value). `Composite:Rotation` (QuickTime.pm:8646) calls
+/// `CalcRotation($self)`, which scans the WHOLE emitted tag set for the `vide`
+/// HandlerType track's MatrixStructure — a pure function of the final tags,
+/// pre-computed once by the caller. exifast threads all three as context rather
+/// than reaching back into the (being-mutated) sink from inside a derive.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CompositeContext {
+  /// The SUM of every `mdat` payload size (`AvgBitrate`'s `$val[0]` after the
+  /// `NextTagKey` loop, QuickTime.pm:8654-8660). `None` ⇒ no `mdat`.
+  pub(crate) media_data_total: Option<u64>,
+  /// The pre-computed `CalcRotation($self)` result (QuickTime.pm:8797) — the
+  /// `vide`-track rotation angle in degrees, or `None` when there is no video
+  /// track / matrix (then `Composite:Rotation`'s ValueConv is `undef`).
+  pub(crate) rotation: Option<f64>,
+}
+
+impl CompositeContext {
+  /// A context from the two pre-extracted scalars (the summed `MediaDataSize`
+  /// total for `AvgBitrate`, and the pre-computed `CalcRotation` angle). The
+  /// non-QuickTime / no-`mdat` / no-video cases pass `None`s. (`AvgBitrate` does
+  /// NOT divide by `$$self{TimeScale}` — see [`avg_bitrate`] — so the TimeScale
+  /// is not threaded.)
+  #[cfg(feature = "alloc")]
+  pub(crate) const fn new(media_data_total: Option<u64>, rotation: Option<f64>) -> Self {
+    Self {
+      media_data_total,
+      rotation,
+    }
+  }
+}
+
+/// A Composite def's `SubDoc` flag (ExifTool `SubDoc => 1` / `SubDoc => [1,3]`,
+/// GPS.pm:357 / 408). A SubDoc def is built once at Main (`DOC_NUM` 0) AND once
+/// per sub-document `Doc<N>` (ExifTool.pm:4001-4147), each resolving its inputs
+/// within that document's family-3 group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubDoc {
+  /// Not a SubDoc def — built at the Main document only (every non-GPS def, plus
+  /// `GPSPosition`, which is `Main`-only — Exif.pm:5271 has no `SubDoc`).
+  No,
+  /// `SubDoc => 1` — built for ALL sub-documents (`GPSLatitude`/`GPSLongitude`/
+  /// `GPSDateTime`). The per-document `for (;;)` loop attempts every `Doc<N>`
+  /// once at least one `Require`d input exists in that document.
+  All,
+  /// `SubDoc => [1,3]` (`GPSAltitude`, GPS.pm:408) — built per sub-document only
+  /// when one of the listed (1-based) `Desire` indices has a chance to exist.
+  /// The probe set; the indices select which `Desire`s gate the per-doc attempt.
+  Indices(&'static [usize]),
+}
+
+impl SubDoc {
+  /// Does this def build per sub-document at all?
+  pub(crate) const fn is_sub_doc(self) -> bool {
+    !matches!(self, SubDoc::No)
+  }
+}
+
 /// A Composite tag's `ValueConv`/`RawConv` result — the Perl scalar `$val` the
 /// def derives, which may be NUMERIC (Duration seconds, a GPS decimal degree)
 /// or a STRING (`GPSDateTime`'s `"$datestamp $timestampZ"`, `GPSPosition`'s
@@ -141,6 +206,14 @@ impl CompositeValue {
       TagValue::U64(n) => Some(*n as f64),
       TagValue::F64(x) => Some(*x),
       TagValue::Str(s) => Some(crate::convert::perl_str_to_f64(s)),
+      // A `Rational` ingredient's ValueConv value IS its ExifTool ValueConv
+      // STRING — the `%g`-rounded quotient for a finite rational, or the literal
+      // `"inf"`/`"undef"` for a zero denominator (`Rational::exiftool_val_str`,
+      // ExifTool's `GetRational`). Coercing THAT (not the raw `num/den`) keeps a
+      // Sony rtmd `ExposureTime` kept as `Rational(1/60)` reading `0.01666…`
+      // while a zero-denominator `ExposureTime` reads the faithful `"undef"`/
+      // `"inf"` Perl-numeric coercion (NOT a raw `NaN`/`inf` divide).
+      TagValue::Rational(r) => Some(crate::convert::perl_str_to_f64(&r.exiftool_val_str())),
       _ => None,
     }
   }
@@ -178,7 +251,25 @@ impl CompositeValue {
   /// byte-identically.
   pub(crate) fn selected_scalar(&self) -> Option<TagValue> {
     let v = self.value()?;
-    self.coerce_numeric().map(|_| v.clone())
+    // The selected operand is handed on as its VALUECONV value. For an
+    // already-ValueConv'd scalar (numeric / `Str`) that IS the stored value, so
+    // it passes through verbatim. A raw `Rational` (a Sony rtmd `ExposureTime`
+    // kept as `Rational(1/60)` at `-n`) is handed on as its ExifTool ValueConv:
+    // a FINITE rational becomes its `num/den` FLOAT (so the `-n`
+    // `Composite:ShutterSpeed` is the seconds number matching bundled
+    // `0.01666…`, AND a dependent `LightValue` reads the seconds float, not the
+    // `"1/60"` rational text); a ZERO-DENOMINATOR rational becomes its
+    // `"undef"`/`"inf"` ValueConv STRING (`Rational::exiftool_val_str`), which
+    // `PrintExposureTime`/`PrintFNumber` pass through verbatim (matching bundled
+    // `Composite:ShutterSpeed "undef"`, not a raw `NaN`).
+    match v {
+      TagValue::Rational(r) => Some(if r.denominator() == 0 {
+        TagValue::Str(r.exiftool_val_str().into())
+      } else {
+        TagValue::F64(r.numerator() as f64 / r.denominator() as f64)
+      }),
+      _ => self.coerce_numeric().map(|_| v.clone()),
+    }
   }
 }
 
@@ -268,6 +359,14 @@ pub(crate) enum CompositePrintConv {
   /// the 1-decimal string under `-j` (emitted as a BARE number by the gate, e.g.
   /// `8.0`); the bare numeric `$val` under `-n` (e.g. `7.96578428466209`).
   LightValue,
+  /// `Composite:AvgBitrate` PrintConv (`ConvertBitrate($val)`, QuickTime.pm:8649)
+  /// — the unit-scaled `"<n> <unit>"` string under `-j` (e.g. `25.2 Mbps`); the
+  /// bare numeric bps `$val` (the RawConv's `int(...)`) under `-n`.
+  AvgBitrate,
+  /// `Composite:Rotation` (QuickTime.pm:8646) — the ValueConv `CalcRotation`
+  /// degrees, identity PrintConv (no PrintConv on the def), so BOTH modes emit
+  /// the bare numeric angle (`0`/`90`/`180`/`270`).
+  Rotation,
 }
 
 impl CompositePrintConv {
@@ -529,6 +628,22 @@ impl CompositePrintConv {
           ConvMode::PrintConv => TagValue::Str(std::format!("{n:.1}").into()),
         }
       }
+      CompositePrintConv::AvgBitrate => {
+        // `$val` is the integer bps (`Num`). `-n` the bare f64; `-j`
+        // `ConvertBitrate($val)` — the unit-scaled string.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::video::convert_bitrate(n).into())
+          }
+        }
+      }
+      CompositePrintConv::Rotation => {
+        // No PrintConv on the def (identity), so BOTH modes emit the bare angle.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        TagValue::F64(n)
+      }
     }
   }
 }
@@ -546,6 +661,13 @@ pub(crate) struct CompositeInput {
   /// group that shares the ExifTool family-0 group (see the module note); a
   /// bare-name requirement uses an empty slice (matches any group).
   pub(crate) groups: &'static [&'static str],
+  /// A family-0 qualifier (ExifTool's `GroupMatches` over family-0). `Some(g0)`
+  /// requires the resolved entry's family-0 to be `g0` — `Sony:GPSLatitude`
+  /// (Sony.pm:10929) is `group0 = Some("Sony")`, so it matches a Sony rtmd GPS
+  /// tag (family-0 `Sony`) but not a GoPro one (family-0 `GoPro`). `None` is the
+  /// ordinary family-1-only match (every pre-existing input). Family-1 and
+  /// family-0 constraints AND together when both are set.
+  pub(crate) group0: Option<&'static str>,
   /// The tag name to resolve (e.g. `"SampleRate"`).
   pub(crate) name: &'static str,
 }
@@ -577,6 +699,13 @@ impl InputKind {
   }
 }
 
+/// A [`CompositeDef`]'s `RawConv`/`ValueConv` derivation: the resolved input
+/// `$val[]` ([`CompositeValue`]) + `$prt[]` (`Option<TagValue>`, the PrintConv
+/// view) + the format-state [`CompositeContext`], to the composite's raw value
+/// [`CompositeRaw`] (`None` ⇒ the `… ? … : undef` guard, no composite).
+pub(crate) type DeriveFn =
+  fn(&[CompositeValue], &[Option<TagValue>], &CompositeContext) -> Option<CompositeRaw>;
+
 /// A ported Composite tag: the inputs (index = slice position), the derivation
 /// that computes the raw value, and the print-conversion.
 ///
@@ -600,10 +729,14 @@ pub(crate) struct CompositeDef {
   pub(crate) inputs: &'static [CompositeInput],
   /// The def's `RawConv`/`ValueConv` arithmetic over the resolved inputs
   /// (`$val[]`) and their PrintConv-view counterparts (`$prt[]`, read only by
-  /// the defs whose ValueConv interpolates a `$prt[i]`).
-  pub(crate) derive: fn(&[CompositeValue], &[Option<TagValue>]) -> Option<CompositeRaw>,
+  /// the defs whose ValueConv interpolates a `$prt[i]`), plus the format-state
+  /// [`CompositeContext`] (the `$$self{…}` reads — `AvgBitrate`'s MediaDataSize
+  /// sum, `Rotation`'s pre-computed angle).
+  pub(crate) derive: DeriveFn,
   /// The def's `PrintConv`.
   pub(crate) print_conv: CompositePrintConv,
+  /// The def's `SubDoc` flag (built per `Doc<N>` when set, ExifTool.pm:4001).
+  pub(crate) sub_doc: SubDoc,
   /// ExifTool `Priority => N` (default `1`). `GPSPosition` is `Priority => 0`
   /// (never overrides a duplicate); the others use the default `1`. Threaded
   /// into [`crate::tagmap::TagMap`]'s duplicate-override rule on append.
@@ -621,6 +754,7 @@ const fn ape_req(name: &'static str) -> CompositeInput {
   CompositeInput {
     kind: InputKind::Require,
     groups: &["APE", "MAC"],
+    group0: None,
     name,
   }
 }
@@ -631,6 +765,7 @@ const fn req(group: &'static [&'static str], name: &'static str) -> CompositeInp
   CompositeInput {
     kind: InputKind::Require,
     groups: group,
+    group0: None,
     name,
   }
 }
@@ -640,6 +775,38 @@ const fn des(group: &'static [&'static str], name: &'static str) -> CompositeInp
   CompositeInput {
     kind: InputKind::Desire,
     groups: group,
+    group0: None,
+    name,
+  }
+}
+
+/// `Require`d input qualified by family-0 `"Sony"` (ExifTool's `Require =>
+/// 'Sony:GPSLatitude'`, Sony.pm:10929) — matches a Sony rtmd timed-GPS tag
+/// (family-0 `Sony`, family-1 the per-sample `Track<N>`) in ANY family-1 group,
+/// but NOT a GoPro / camm / mebx tag of the same name (different family-0). The
+/// family-1 set is empty (any), the family-0 qualifier does the discrimination.
+#[cfg(feature = "quicktime")]
+const fn sony_req(name: &'static str) -> CompositeInput {
+  CompositeInput {
+    kind: InputKind::Require,
+    groups: &[],
+    group0: Some("Sony"),
+    name,
+  }
+}
+
+/// `Require`d input qualified by family-0 `"QuickTime"` (ExifTool's `Require =>
+/// 'QuickTime:HandlerType'`, QuickTime.pm:8639) — matches a TRACK-level
+/// QuickTime tag (`HandlerType`/`MatrixStructure` carry family-0 `QuickTime`,
+/// family-1 `Track<N>`) as well as a movie-level one. The plain family-1 `req`
+/// would only match a movie-level `QuickTime:`-family-1 tag, missing the
+/// per-track `Track<N>:HandlerType` the `Composite:Rotation` build gate needs.
+#[cfg(feature = "quicktime")]
+const fn qt_req(name: &'static str) -> CompositeInput {
+  CompositeInput {
+    kind: InputKind::Require,
+    groups: &[],
+    group0: Some("QuickTime"),
     name,
   }
 }
@@ -661,6 +828,7 @@ const fn bare_req(name: &'static str) -> CompositeInput {
   CompositeInput {
     kind: InputKind::Require,
     groups: &[],
+    group0: None,
     name,
   }
 }
@@ -671,6 +839,7 @@ const fn bare_des(name: &'static str) -> CompositeInput {
   CompositeInput {
     kind: InputKind::Desire,
     groups: &[],
+    group0: None,
     name,
   }
 }
@@ -684,7 +853,11 @@ const fn bare_des(name: &'static str) -> CompositeInput {
 /// a numeric/`Bytes` zero are falsy). The arithmetic itself then coerces every
 /// ingredient via Perl numeric coercion.
 #[cfg(feature = "ape")]
-fn ape_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn ape_duration(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let tf_raw = v.get(1)?;
   // `$val[0] && $val[1]` — Perl-boolean on the RAW values (string-truthy).
@@ -702,7 +875,11 @@ fn ape_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Comp
 /// `$val[0]`=SampleRate, `[1]`=TotalSamples. The `and` guard is Perl-truthy on
 /// the RAW ingredients (string-truthy), then the arithmetic coerces numeric.
 #[cfg(feature = "flac")]
-fn flac_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn flac_duration(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let total_raw = v.get(1)?;
   if !sr_raw.is_truthy() || !total_raw.is_truthy() {
@@ -717,7 +894,11 @@ fn flac_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Com
 /// `$val[0]`=SampleRate, `[1]`=NumSampleFrames. The `and` guard is Perl-truthy
 /// on the RAW ingredients (string-truthy), then the arithmetic coerces numeric.
 #[cfg(feature = "aiff")]
-fn aiff_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn aiff_duration(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let sr_raw = v.first()?;
   let frames_raw = v.get(1)?;
   if !sr_raw.is_truthy() || !frames_raw.is_truthy() {
@@ -732,7 +913,11 @@ fn aiff_duration(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Com
 /// $val[0]`. `$val[0]`=GPS:GPSLatitude (decimal degrees), `[1]`=GPSLatitudeRef
 /// (`"N"`/`"S"`). The ref is case-insensitively `^S` ⇒ negate.
 #[cfg(feature = "exif")]
-fn gps_latitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn gps_latitude(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let lat = v.first()?.coerce_numeric()?;
   let ref_s = v.get(1)?.as_text()?;
   Some(CompositeRaw::Num(if ref_starts_with(&ref_s, b'S') {
@@ -745,7 +930,11 @@ fn gps_latitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Comp
 /// `Composite:GPSLongitude` ValueConv (GPS.pm:399) `$val[1] =~ /^W/i ? -$val[0]
 /// : $val[0]`.
 #[cfg(feature = "exif")]
-fn gps_longitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn gps_longitude(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let lon = v.first()?.coerce_numeric()?;
   let ref_s = v.get(1)?.as_text()?;
   Some(CompositeRaw::Num(if ref_starts_with(&ref_s, b'W') {
@@ -762,7 +951,11 @@ fn gps_longitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Com
 /// : $val[$_] } return undef`. Inputs: 0=GPS:GPSAltitude, 1=GPS:GPSAltitudeRef,
 /// 2=XMP:GPSAltitude, 3=XMP:GPSAltitudeRef.
 #[cfg(feature = "exif")]
-fn gps_altitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn gps_altitude(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   // RawConv: require a ref (`$val[1]` OR `$val[3]` defined).
   let have_ref = v.get(1).is_some_and(CompositeValue::is_present)
     || v.get(3).is_some_and(CompositeValue::is_present);
@@ -802,7 +995,11 @@ fn gps_altitude(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Comp
 /// `Composite:GPSDateTime` ValueConv (GPS.pm:361) `"$val[0] $val[1]Z"`.
 /// `$val[0]`=GPS:GPSDateStamp, `[1]`=GPS:GPSTimeStamp (both ValueConv strings).
 #[cfg(feature = "exif")]
-fn gps_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn gps_datetime(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let date = v.first()?.as_text()?;
   let time = v.get(1)?.as_text()?;
   Some(CompositeRaw::Text(std::format!("{date} {time}Z")))
@@ -812,7 +1009,11 @@ fn gps_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Comp
 /// length($val[1])) ? "$val[0] $val[1]" : undef`. `$val[0]`=Composite:GPSLatitude
 /// (decimal), `[1]`=Composite:GPSLongitude (decimal) — both string-context.
 #[cfg(feature = "exif")]
-fn gps_position(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn gps_position(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let lat = v
     .first()
     .and_then(CompositeValue::as_text)
@@ -860,7 +1061,11 @@ fn ref_starts_with(s: &str, c: u8) -> bool {
 /// CR2/Canon 1D RAW/IIQ/EIP). A future port that threads `TIFF_TYPE` into the
 /// post-pass can add it.
 #[cfg(feature = "exif")]
-fn image_size(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn image_size(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   // `return $val[4] if $val[4]` — a present + Perl-truthy RawImageCroppedSize is
   // already a `"WxH"` string; use it verbatim.
   if let Some(cropped) = v.get(4)
@@ -886,7 +1091,11 @@ fn image_size(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Compos
 /// `Composite:ImageSize` ValueConv string (`"W H"`); the two `\d+` runs are the
 /// dimensions, their product over a million is the megapixel count (`Num`).
 #[cfg(feature = "exif")]
-fn megapixels(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn megapixels(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let size = v.first()?.as_text()?;
   // `($val =~ /\d+/g)` — every maximal ASCII-digit run, in order.
   let mut digits = size
@@ -923,7 +1132,11 @@ fn megapixels(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Compos
 /// coerces numerically (a non-numeric BulbDuration is not `> 0`), but the
 /// SELECTED value remains `$val[2]`'s raw scalar.
 #[cfg(feature = "exif")]
-fn shutter_speed(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn shutter_speed(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   // `($val[2] and $val[2]>0)` — BulbDuration present + Perl-truthy AND
   // numerically positive ⇒ it wins (selected VERBATIM, not the coerced number).
   if let Some(b) = v.get(2)
@@ -953,7 +1166,11 @@ fn shutter_speed(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Com
 /// coerced to `0`. Truthiness is the RAW Perl-boolean (a wire `"0.0"` is
 /// truthy, picked, then `PrintFNumber` passes it through since it is non-float).
 #[cfg(feature = "exif")]
-fn aperture(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn aperture(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   // `$val[0] || $val[1]` — first Perl-truthy operand, selected VERBATIM.
   if let Some(f) = v.first()
     && f.is_truthy()
@@ -974,7 +1191,11 @@ fn aperture(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Composit
 /// [`crate::composite::convs::datetime::sub_sec_assemble`] (the regex-faithful
 /// assembly); `None` ⇒ neither a usable sub-second nor an offset ⇒ not built.
 #[cfg(feature = "exif")]
-fn sub_sec_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn sub_sec_datetime(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   let date = v.first()?.as_text()?;
   let sub_sec = v.get(1).and_then(CompositeValue::as_text);
   let offset = v.get(2).and_then(CompositeValue::as_text);
@@ -990,7 +1211,11 @@ fn sub_sec_datetime(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<
 /// [`crate::composite::convs::lens::calc_scale_factor_35efl`] (the generic path);
 /// the Canon branch is DEFERRED (returns `None`, no `ScaleFactor35efl` emitted).
 #[cfg(feature = "exif")]
-fn scale_factor_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn scale_factor_35efl(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::{
     ScaleFactorInputs, ScaleFactorOutcome, calc_scale_factor_35efl,
   };
@@ -1053,7 +1278,11 @@ fn scale_factor_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Optio
 /// generic-`$diag` sensor set, so the Canon-deferral guard matches every source
 /// ExifTool could compute a ScaleFactor from).
 #[cfg(feature = "exif")]
-fn focal_length_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn focal_length_35efl(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::to_float;
   // The Canon-deferred-ScaleFactor guard: ScaleFactor absent (`$val[1]` Missing)
   // BUT ExifTool's Canon branch would have built one ⇒ defer (the focal-only
@@ -1118,7 +1347,11 @@ fn focal_length_35efl(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Optio
 /// applies. (At 15 sig figs the CoC bytes are identical either way, but the
 /// raw read is faithful to the ValueConv.)
 #[cfg(feature = "exif")]
-fn circle_of_confusion(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn circle_of_confusion(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::frame_diag_35mm;
   let sf = v.first()?.coerce_numeric()?;
   Some(CompositeRaw::Num(frame_diag_35mm() / (sf * 1440.0)))
@@ -1137,7 +1370,11 @@ fn circle_of_confusion(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Opti
 /// `'inf'` is returned (a `Text` raw, rendered as `"inf"`/`"Inf m"`); otherwise
 /// `focal^2 / (aperture * CoC * 1000)`.
 #[cfg(feature = "exif")]
-fn hyperfocal_distance(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn hyperfocal_distance(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::to_float;
   // `ToFloat(@val)` — a non-`ToFloat` input becomes undef; the formula then sees
   // `0`-or-undef as falsy. (`$val[i] || 0` is implicit in the `unless`/product.)
@@ -1178,7 +1415,11 @@ fn hyperfocal_distance(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Opti
 /// `[8]`=FocusDistanceUpper (Desire). The result is the space-joined `"<near>
 /// <far>"` (each Perl-NV-stringified), or `"0"` when focal/CoC is falsy.
 #[cfg(feature = "exif")]
-fn dof(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn dof(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::to_float;
   use crate::composite::convs::perl_nv_str;
   // `ToFloat(@val)` runs FIRST, mutating EVERY `$val[i]` to its float (or undef)
@@ -1274,7 +1515,11 @@ fn dof(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw>
 // change the angle in the 6th significant figure.
 #[allow(clippy::approx_constant)]
 #[cfg(feature = "exif")]
-fn fov(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn fov(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::to_float;
   use crate::composite::convs::perl_nv_str;
   let focal = v.first().and_then(to_float).unwrap_or(0.0);
@@ -1315,7 +1560,11 @@ fn fov(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw>
 /// [`crate::composite::convs::lens::calculate_lv`] (the log2 LV formula); `None`
 /// ⇒ a non-positive/non-float input ⇒ not built.
 #[cfg(feature = "exif")]
-fn light_value(v: &[CompositeValue], prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn light_value(
+  v: &[CompositeValue],
+  prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   use crate::composite::convs::lens::calculate_lv;
   // `$val[0]` Aperture, `$val[1]` ShutterSpeed (ValueConv views), `$prt[2]` the
   // ISO PRINTCONV value (Exif.pm:4801 uses `$prt[2]`, not `$val[2]`).
@@ -1324,6 +1573,141 @@ fn light_value(v: &[CompositeValue], prts: &[Option<TagValue>]) -> Option<Compos
   let iso_prt = prts.get(2)?.as_ref()?;
   let iso_text = crate::composite::value_text(iso_prt);
   calculate_lv(&aperture, &shutter, &iso_text).map(CompositeRaw::Num)
+}
+
+/// `Composite:AvgBitrate` RawConv (QuickTime.pm:8649-8662):
+///
+/// ```perl
+/// return undef unless $val[1];
+/// $val[1] /= $$self{TimeScale} if $$self{TimeScale};
+/// my $key = 'MediaDataSize';
+/// my $size = $val[0];
+/// for (;;) {
+///     $key = $self->NextTagKey($key) or last;
+///     $size += $self->GetValue($key, 'ValueConv');
+/// }
+/// return int($size * 8 / $val[1] + 0.5);
+/// ```
+///
+/// `$val[0]` = `QuickTime:MediaDataSize` (Require), `$val[1]` = `QuickTime:
+/// Duration` (Require) — the EMITTED Duration value (`-n`).
+///
+/// **The `MediaDataSize` sum** the post-pass threads via [`CompositeContext`]:
+/// the `NextTagKey('MediaDataSize')`-summed total (`ctx.media_data_total`),
+/// since the dedup-collapsing `TagMap` keeps only ONE `MediaDataSize` (the
+/// visible last-wins tag) — so the summed total is pre-computed by the QuickTime
+/// parser and threaded. (HEIF has 3 `mdat` boxes summing to 1 004 715 bytes.)
+///
+/// **No TimeScale divide.** ExifTool's RawConv has `$val[1] /= $$self{TimeScale}
+/// if $$self{TimeScale}` — but `$val[1]` is the `QuickTime::Duration` ValueConv
+/// value (`%durationInfo` `$$self{TimeScale} ? $val/$$self{TimeScale} : $val`),
+/// which is ALREADY the seconds form, and ground-truthing the bundled output
+/// shows the net result is `int($size*8 / Duration_emitted + 0.5)` with NO
+/// further divide: camm `116*8/3 = 309`, blackvue `188848920*8/60 = 25.2 Mbps`,
+/// zerotimescale `16*8/1200 = 0` (TimeScale 0 ⇒ Duration is the raw count 1200,
+/// used directly). exifast's emitted `QuickTime:Duration` (`-n`) IS that same
+/// `$val[1]` value, so the faithful port reads it directly.
+#[cfg(feature = "quicktime")]
+fn avg_bitrate(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `return undef unless $val[1]` — Duration present + Perl-truthy.
+  let dur = v.get(1)?;
+  if !dur.is_truthy() {
+    return None;
+  }
+  let duration = dur.coerce_numeric()?;
+  if duration == 0.0 {
+    // `return undef unless $val[1]` already guarded a Perl-falsy Duration; a
+    // non-zero-but-numerically-zero edge would divide-by-zero, so guard it too.
+    return None;
+  }
+  // `my $size = $val[0]; for (;;) { ... $size += GetValue($key,'ValueConv'); }`
+  // — the SUM of every MediaDataSize. The parser pre-summed all `mdat` sizes
+  // into `ctx.media_data_total`; prefer it (it IS the `$val[0] + Σ rest`). Fall
+  // back to the single resolved `$val[0]` if the total is somehow absent.
+  let size = match ctx.media_data_total {
+    Some(total) => total as f64,
+    None => v.first()?.coerce_numeric()?,
+  };
+  // `return int($size * 8 / $val[1] + 0.5)` — Perl `int` truncates toward zero;
+  // the `+ 0.5` rounds the non-negative bitrate to nearest.
+  Some(CompositeRaw::Num((size * 8.0 / duration + 0.5).trunc()))
+}
+
+/// `Composite:Rotation` ValueConv `CalcRotation($self)` (QuickTime.pm:8646). The
+/// angle is a PURE function of the final emitted tag set (the `vide` Handler
+/// track's MatrixStructure), so the post-pass pre-computes it into
+/// [`CompositeContext::rotation`] (see [`crate::composite::calc_rotation`]) and
+/// this derive merely surfaces it. The `Require`d `MatrixStructure` +
+/// `HandlerType` inputs gate the BUILD (ExifTool only attempts the composite
+/// when both exist); `ctx.rotation` then supplies the value (or `None` ⇒ the
+/// ValueConv returned `undef`, no composite).
+#[cfg(feature = "quicktime")]
+fn rotation(
+  _v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  ctx.rotation.map(CompositeRaw::Num)
+}
+
+/// `Composite:Duration` (RIFF) RawConv `CalcDuration($self, @val)`
+/// (RIFF.pm:1645-1693), single-document path (the AVI fixtures are not
+/// multi-stream, so `DOC_COUNT` is 0 and the SubDoc loop runs once):
+///
+/// ```perl
+/// my $dur1;
+/// $dur1 = $val[1] / $val[0] if $val[0];
+/// if ($val[2] and $val[3]) {
+///     my $dur2 = $val[3] / $val[2];
+///     my $rat = $dur1 / $dur2;
+///     $dur1 = $dur2 if $rat > 1.9 and $rat < 3.1;
+/// }
+/// $totalDuration += $dur1 if defined $dur1;
+/// ```
+///
+/// `$val[0]` = RIFF:FrameRate, `[1]` = RIFF:FrameCount (Require); `[2]` =
+/// VideoFrameRate, `[3]` = VideoFrameCount (Desire). `dur1 = FrameCount /
+/// FrameRate`; if BOTH video-stream values are truthy and their `dur2` ratio is
+/// 1.9–3.1× `dur1`, the (multi-track-corrected) `dur2` replaces it.
+#[cfg(feature = "riff")]
+fn riff_duration(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$dur1 = $val[1] / $val[0] if $val[0]` — FrameCount / FrameRate, only when
+  // FrameRate is Perl-truthy. A falsy/absent FrameRate ⇒ `$dur1` undef ⇒ the
+  // `$totalDuration += $dur1 if defined` adds nothing ⇒ Duration 0 (built).
+  let frame_rate = v.first()?.coerce_numeric()?;
+  let mut dur1 = if frame_rate != 0.0 {
+    Some(v.get(1)?.coerce_numeric()? / frame_rate)
+  } else {
+    None
+  };
+  // `if ($val[2] and $val[3]) { my $dur2 = $val[3]/$val[2]; ... }` — the
+  // video-stream override (Perl-truthy VideoFrameRate AND VideoFrameCount).
+  let vfr = v.get(2).and_then(CompositeValue::coerce_numeric);
+  let vfc = v.get(3).and_then(CompositeValue::coerce_numeric);
+  if let (Some(vfr), Some(vfc)) = (vfr, vfc)
+    && vfr != 0.0
+    && vfc != 0.0
+    && let Some(d1) = dur1
+  {
+    let dur2 = vfc / vfr;
+    // `my $rat = $dur1 / $dur2; $dur1 = $dur2 if $rat > 1.9 and $rat < 3.1`.
+    if dur2 != 0.0 {
+      let rat = d1 / dur2;
+      if rat > 1.9 && rat < 3.1 {
+        dur1 = Some(dur2);
+      }
+    }
+  }
+  // `$totalDuration += $dur1 if defined $dur1` (single doc) — undef ⇒ 0.
+  Some(CompositeRaw::Num(dur1.unwrap_or(0.0)))
 }
 
 /// APE `Duration` (APE.pm:83-92). Registered only when the `ape` feature is on.
@@ -1338,6 +1722,7 @@ const APE_DURATION: CompositeDef = CompositeDef {
   ],
   derive: ape_duration,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "APE-Duration",
 };
@@ -1350,6 +1735,7 @@ const FLAC_DURATION: CompositeDef = CompositeDef {
   inputs: &[req(&["FLAC"], "SampleRate"), req(&["FLAC"], "TotalSamples")],
   derive: flac_duration,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "FLAC-Duration",
 };
@@ -1365,6 +1751,7 @@ const AIFF_DURATION: CompositeDef = CompositeDef {
   ],
   derive: aiff_duration,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "AIFF-Duration",
 };
@@ -1381,7 +1768,8 @@ const GPS_LATITUDE: CompositeDef = CompositeDef {
   ],
   derive: gps_latitude,
   print_conv: CompositePrintConv::GpsCoordinate('N'),
-  priority: 1, // GPS.pm: Avoid sets Priority 0, then `Priority => 1` restores it.
+  sub_doc: SubDoc::All, // GPS.pm:369 `SubDoc => 1` — built per Doc<N>.
+  priority: 1,          // GPS.pm: Avoid sets Priority 0, then `Priority => 1` restores it.
   sort_key: "GPS-GPSLatitude",
 };
 
@@ -1395,6 +1783,7 @@ const GPS_LONGITUDE: CompositeDef = CompositeDef {
   ],
   derive: gps_longitude,
   print_conv: CompositePrintConv::GpsCoordinate('E'),
+  sub_doc: SubDoc::All, // GPS.pm:386 `SubDoc => 1`.
   priority: 1,
   sort_key: "GPS-GPSLongitude",
 };
@@ -1412,6 +1801,9 @@ const GPS_ALTITUDE: CompositeDef = CompositeDef {
   ],
   derive: gps_altitude,
   print_conv: CompositePrintConv::GpsAltitude,
+  // GPS.pm:408 `SubDoc => [1,3]` — build per Doc<N> only when Desire index 1
+  // (GPS:GPSAltitudeRef) or 3 (XMP:GPSAltitudeRef) has a chance to exist.
+  sub_doc: SubDoc::Indices(&[1, 3]),
   priority: 1,
   sort_key: "GPS-GPSAltitude",
 };
@@ -1423,6 +1815,7 @@ const GPS_DATETIME: CompositeDef = CompositeDef {
   inputs: &[req(&["GPS"], "GPSDateStamp"), req(&["GPS"], "GPSTimeStamp")],
   derive: gps_datetime,
   print_conv: CompositePrintConv::GpsDateTime,
+  sub_doc: SubDoc::All, // GPS.pm:357 `SubDoc => 1`.
   priority: 1,
   sort_key: "GPS-GPSDateTime",
 };
@@ -1439,6 +1832,7 @@ const GPS_POSITION: CompositeDef = CompositeDef {
   ],
   derive: gps_position,
   print_conv: CompositePrintConv::GpsPosition,
+  sub_doc: SubDoc::No,
   priority: 0,
   // Exif.pm's prefix is `Composite` (Exif::Composite uses the default `Image-
   // ExifTool` prefix → `Composite-GPSPosition`). The cross-module GPS defs sort
@@ -1461,6 +1855,7 @@ const IMAGE_SIZE: CompositeDef = CompositeDef {
   ],
   derive: image_size,
   print_conv: CompositePrintConv::ImageSize,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-ImageSize",
 };
@@ -1473,6 +1868,7 @@ const MEGAPIXELS: CompositeDef = CompositeDef {
   inputs: &[req(&["Composite"], "ImageSize")],
   derive: megapixels,
   print_conv: CompositePrintConv::Megapixels,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-Megapixels",
 };
@@ -1490,6 +1886,7 @@ const SHUTTER_SPEED: CompositeDef = CompositeDef {
   ],
   derive: shutter_speed,
   print_conv: CompositePrintConv::ShutterSpeed,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-ShutterSpeed",
 };
@@ -1502,6 +1899,7 @@ const APERTURE: CompositeDef = CompositeDef {
   inputs: &[bare_des("FNumber"), bare_des("ApertureValue")],
   derive: aperture,
   print_conv: CompositePrintConv::Aperture,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-Aperture",
 };
@@ -1519,6 +1917,7 @@ const SUBSEC_DATETIME_ORIGINAL: CompositeDef = CompositeDef {
   ],
   derive: sub_sec_datetime,
   print_conv: CompositePrintConv::SubSecDateTime,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-SubSecDateTimeOriginal",
 };
@@ -1535,6 +1934,7 @@ const SUBSEC_CREATE_DATE: CompositeDef = CompositeDef {
   ],
   derive: sub_sec_datetime,
   print_conv: CompositePrintConv::SubSecDateTime,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-SubSecCreateDate",
 };
@@ -1551,6 +1951,7 @@ const SUBSEC_MODIFY_DATE: CompositeDef = CompositeDef {
   ],
   derive: sub_sec_datetime,
   print_conv: CompositePrintConv::SubSecDateTime,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-SubSecModifyDate",
 };
@@ -1583,6 +1984,7 @@ const SCALE_FACTOR_35EFL: CompositeDef = CompositeDef {
   ],
   derive: scale_factor_35efl,
   print_conv: CompositePrintConv::ScaleFactor35efl,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-ScaleFactor35efl",
 };
@@ -1610,6 +2012,7 @@ const FOCAL_LENGTH_35EFL: CompositeDef = CompositeDef {
   ],
   derive: focal_length_35efl,
   print_conv: CompositePrintConv::FocalLength35efl,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-FocalLength35efl",
 };
@@ -1622,6 +2025,7 @@ const CIRCLE_OF_CONFUSION: CompositeDef = CompositeDef {
   inputs: &[req(&["Composite"], "ScaleFactor35efl")],
   derive: circle_of_confusion,
   print_conv: CompositePrintConv::CircleOfConfusion,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-CircleOfConfusion",
 };
@@ -1639,6 +2043,7 @@ const HYPERFOCAL_DISTANCE: CompositeDef = CompositeDef {
   ],
   derive: hyperfocal_distance,
   print_conv: CompositePrintConv::HyperfocalDistance,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-HyperfocalDistance",
 };
@@ -1662,6 +2067,7 @@ const DOF: CompositeDef = CompositeDef {
   ],
   derive: dof,
   print_conv: CompositePrintConv::Dof,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-DOF",
 };
@@ -1678,6 +2084,7 @@ const FOV: CompositeDef = CompositeDef {
   ],
   derive: fov,
   print_conv: CompositePrintConv::Fov,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-FOV",
 };
@@ -1695,8 +2102,114 @@ const LIGHT_VALUE: CompositeDef = CompositeDef {
   ],
   derive: light_value,
   print_conv: CompositePrintConv::LightValue,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "Composite-LightValue",
+};
+
+/// `Composite:AvgBitrate` (QuickTime.pm:8649). `Require`s `QuickTime:
+/// MediaDataSize` + `QuickTime:Duration`. `Priority => 0` (lets the
+/// `QuickTime::AvgBitrate` track tag take precedence when both exist). The
+/// RawConv's `$$self{TimeScale}` + `NextTagKey('MediaDataSize')`-sum are
+/// threaded via [`CompositeContext`].
+#[cfg(feature = "quicktime")]
+const AVG_BITRATE: CompositeDef = CompositeDef {
+  name: "AvgBitrate",
+  inputs: &[
+    req(&["QuickTime"], "MediaDataSize"),
+    req(&["QuickTime"], "Duration"),
+  ],
+  derive: avg_bitrate,
+  print_conv: CompositePrintConv::AvgBitrate,
+  sub_doc: SubDoc::No,
+  // QuickTime.pm:8650 `Priority => 0` — never overrides a duplicate.
+  priority: 0,
+  sort_key: "QuickTime-AvgBitrate",
+};
+
+/// `Composite:Rotation` (QuickTime.pm:8646). `Require`s `QuickTime:
+/// MatrixStructure` + `QuickTime:HandlerType` (the BUILD gate — both must
+/// exist); the value is `CalcRotation($self)`, the `vide`-track matrix angle,
+/// pre-computed into [`CompositeContext::rotation`].
+#[cfg(feature = "quicktime")]
+const ROTATION: CompositeDef = CompositeDef {
+  name: "Rotation",
+  inputs: &[
+    // `QuickTime:MatrixStructure`/`HandlerType` are TRACK-level (family-0
+    // `QuickTime`, family-1 `Track<N>`) — a family-0-qualified match, not the
+    // movie-level family-1 `QuickTime` one (which `HandlerType` never carries).
+    qt_req("MatrixStructure"),
+    qt_req("HandlerType"),
+  ],
+  derive: rotation,
+  print_conv: CompositePrintConv::Rotation,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "QuickTime-Rotation",
+};
+
+/// `Sony:Composite:GPSDateTime` (Sony.pm:10929). Group2 `Time`. The Sony rtmd
+/// timed-GPS analogue of `GPS:Composite:GPSDateTime`: `Require`s the family-0-
+/// qualified `Sony:GPSDateStamp` + `Sony:GPSTimeStamp` (the per-sample rtmd GPS
+/// tags), so it builds a `Doc<N>:Composite:GPSDateTime` ONLY for a Sony rtmd
+/// (family-0 `Sony`), NOT GoPro/camm/mebx. `SubDoc => 1` ⇒ per `Doc<N>`.
+#[cfg(feature = "quicktime")]
+const SONY_GPS_DATETIME: CompositeDef = CompositeDef {
+  name: "GPSDateTime",
+  inputs: &[sony_req("GPSDateStamp"), sony_req("GPSTimeStamp")],
+  derive: gps_datetime,
+  print_conv: CompositePrintConv::GpsDateTime,
+  sub_doc: SubDoc::All, // Sony.pm:10931 `SubDoc => 1`.
+  priority: 1,
+  // Sony's prefix is `Image::ExifTool::Sony`, so the Composite id sorts as
+  // `Sony-GPSDateTime` — AFTER the cross-module `GPS-…` defs.
+  sort_key: "Sony-GPSDateTime",
+};
+
+/// `Sony:Composite:GPSLatitude` (Sony.pm:10940). Group2 `Location`. `Require`s
+/// `Sony:GPSLatitude` + `Sony:GPSLatitudeRef` (family-0 `Sony`); the ValueConv
+/// is the same `^S`-negates rule as the GPS def. Builds per `Doc<N>` for Sony.
+#[cfg(feature = "quicktime")]
+const SONY_GPS_LATITUDE: CompositeDef = CompositeDef {
+  name: "GPSLatitude",
+  inputs: &[sony_req("GPSLatitude"), sony_req("GPSLatitudeRef")],
+  derive: gps_latitude,
+  print_conv: CompositePrintConv::GpsCoordinate('N'),
+  sub_doc: SubDoc::All, // Sony.pm:10941 `SubDoc => 1`.
+  priority: 1,
+  sort_key: "Sony-GPSLatitude",
+};
+
+/// `Sony:Composite:GPSLongitude` (Sony.pm:10950). Group2 `Location`. `Require`s
+/// `Sony:GPSLongitude` + `Sony:GPSLongitudeRef` (family-0 `Sony`); `^W` negates.
+#[cfg(feature = "quicktime")]
+const SONY_GPS_LONGITUDE: CompositeDef = CompositeDef {
+  name: "GPSLongitude",
+  inputs: &[sony_req("GPSLongitude"), sony_req("GPSLongitudeRef")],
+  derive: gps_longitude,
+  print_conv: CompositePrintConv::GpsCoordinate('E'),
+  sub_doc: SubDoc::All, // Sony.pm:10951 `SubDoc => 1`.
+  priority: 1,
+  sort_key: "Sony-GPSLongitude",
+};
+
+/// `Composite:Duration` (RIFF/AVI, RIFF.pm:1549). `Require`s `RIFF:FrameRate` +
+/// `RIFF:FrameCount`, `Desire`s `VideoFrameRate` + `VideoFrameCount` (bare).
+/// `CalcDuration` single-document path (the AVI fixtures are not multi-stream).
+#[cfg(feature = "riff")]
+const RIFF_DURATION: CompositeDef = CompositeDef {
+  name: "Duration",
+  inputs: &[
+    req(&["RIFF"], "FrameRate"),
+    req(&["RIFF"], "FrameCount"),
+    des(&[], "VideoFrameRate"),
+    des(&[], "VideoFrameCount"),
+  ],
+  derive: riff_duration,
+  print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "RIFF-Duration",
 };
 
 /// The full registry of ported Composite defs, cfg-gated per input format. The
@@ -1748,4 +2261,16 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   FOV,
   #[cfg(feature = "exif")]
   LIGHT_VALUE,
+  #[cfg(feature = "quicktime")]
+  AVG_BITRATE,
+  #[cfg(feature = "quicktime")]
+  ROTATION,
+  #[cfg(feature = "quicktime")]
+  SONY_GPS_DATETIME,
+  #[cfg(feature = "quicktime")]
+  SONY_GPS_LATITUDE,
+  #[cfg(feature = "quicktime")]
+  SONY_GPS_LONGITUDE,
+  #[cfg(feature = "riff")]
+  RIFF_DURATION,
 ];

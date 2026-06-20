@@ -41,5 +41,6 @@
   "Track1:MetaFormat": "camm",
   "Doc1:Track1:SampleTime": "0 s",
   "Doc1:Track1:SampleDuration": "1.00 s",
-  "Doc1:Track1:Warning": "Truncated camm record 5"
+  "Doc1:Track1:Warning": "Truncated camm record 5",
+  "Composite:AvgBitrate": "160 bps"
 }]

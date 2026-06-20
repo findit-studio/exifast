@@ -49,5 +49,10 @@
   "Doc1:Track1:GPSLongitudeRef": "East",
   "Doc1:Track1:GPSLongitude": "122 deg 9' 54.00\"",
   "Doc1:Track1:GPSStatus": "Unknown (?)",
-  "Doc1:Track1:GPSMapDatum": "WG?S"
+  "Doc1:Track1:GPSMapDatum": "WG?S",
+  "Composite:Aperture": 4.0,
+  "Composite:AvgBitrate": "1.02 kbps",
+  "Composite:GPSPosition": "47 deg 37' 42.30\" N, 122 deg 9' 54.00\" E",
+  "Doc1:Composite:GPSLatitude": "47 deg 37' 42.30\" N",
+  "Doc1:Composite:GPSLongitude": "122 deg 9' 54.00\" E"
 }]

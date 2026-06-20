@@ -42,5 +42,6 @@
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
   "Track1:TimeStamp": "2018:02:21 12:08:56.21",
-  "Track1:Warning": "[minor] Invalid size (4294967296) for MakerNotes tag 0x0007 CanonFirmwareVersion"
+  "Track1:Warning": "[minor] Invalid size (4294967296) for MakerNotes tag 0x0007 CanonFirmwareVersion",
+  "Composite:AvgBitrate": "624 bps"
 }]

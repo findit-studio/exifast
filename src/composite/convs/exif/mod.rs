@@ -205,14 +205,30 @@ fn classify_operand(val: &crate::value::TagValue) -> OperandValue {
     TagValue::I64(n) => OperandValue::Number(*n as f64),
     TagValue::U64(n) => OperandValue::Number(*n as f64),
     TagValue::F64(x) => OperandValue::Number(*x),
-    TagValue::Str(s) => match crate::convert::is_float_norm(s) {
-      Some(norm) => OperandValue::Float {
-        value: crate::convert::perl_str_to_f64(&norm),
-        norm: norm.into_owned(),
-      },
-      None => OperandValue::Passthrough(s.to_string()),
-    },
+    // A `Rational` operand is classified by its ExifTool ValueConv STRING
+    // (`Rational::exiftool_val_str`) exactly as a `Str` operand: a finite
+    // rational's `%g` quotient `IsFloat`-formats (a Sony rtmd `ExposureTime`
+    // `Rational(1/60)` → `"1/60"`), a zero-denominator `"inf"`/`"undef"` is the
+    // non-`IsFloat` `Passthrough` (`PrintExposureTime`/`PrintFNumber` return it
+    // verbatim). (`selected_scalar` usually pre-resolves a `Rational` to its
+    // float/`"undef"` form, so this arm is the direct-classify safety net.)
+    TagValue::Rational(r) => classify_str(&r.exiftool_val_str()),
+    TagValue::Str(s) => classify_str(s),
     other => OperandValue::Passthrough(crate::composite::value_text(other).into_owned()),
+  }
+}
+
+/// Classify a string operand by `IsFloat` (the shared `Str`/`Rational` path):
+/// an `IsFloat` string is a [`Float`](OperandValue::Float) carrying its
+/// normalized value, a non-`IsFloat` one is a verbatim
+/// [`Passthrough`](OperandValue::Passthrough).
+fn classify_str(s: &str) -> OperandValue {
+  match crate::convert::is_float_norm(s) {
+    Some(norm) => OperandValue::Float {
+      value: crate::convert::perl_str_to_f64(&norm),
+      norm: norm.into_owned(),
+    },
+    None => OperandValue::Passthrough(s.to_string()),
   }
 }
 

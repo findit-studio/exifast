@@ -40,5 +40,6 @@
   "Track1:HandlerClass": "Media Handler",
   "Track1:Warning": "[minor] The ExtractEmbedded option may find more tags in the media data",
   "Track1:HandlerType": "NRT Metadata",
-  "Track1:MetaFormat": "mebx"
+  "Track1:MetaFormat": "mebx",
+  "Composite:AvgBitrate": "1.54 kbps"
 }]

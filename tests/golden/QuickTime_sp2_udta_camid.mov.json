@@ -48,5 +48,9 @@
   "UserData:FirmwareVersion": "Firmware 1.0.1",
   "UserData:CameraID": "CAM-IDENT-001",
   "UserData:Copyright": "(C) 2024 Acme Studios",
-  "UserData:DateTimeOriginal": "2024:03:04 05:06:07+00:00"
+  "UserData:DateTimeOriginal": "2024:03:04 05:06:07+00:00",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]

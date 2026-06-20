@@ -94,5 +94,9 @@
   "Track3:GenGraphicsMode": "ditherCopy",
   "Track3:GenOpColor": "32768 32768 32768",
   "Track3:GenBalance": 0,
-  "Track3:OtherFormat": "text"
+  "Track3:OtherFormat": "text",
+  "Composite:ImageSize": "768x384",
+  "Composite:Megapixels": 0.295,
+  "Composite:AvgBitrate": "2.79 kbps",
+  "Composite:Rotation": 0
 }]

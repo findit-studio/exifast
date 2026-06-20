@@ -55,5 +55,6 @@
   "Track2:MediaDuration": 1,
   "Track2:HandlerClass": "mhlr",
   "Track2:HandlerType": "meta",
-  "Track2:MetaFormat": "mebx"
+  "Track2:MetaFormat": "mebx",
+  "Composite:AvgBitrate": 192
 }]

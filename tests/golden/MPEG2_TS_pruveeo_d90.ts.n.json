@@ -9,5 +9,7 @@
   "M2TS:AudioStreamType": 15,
   "M2TS:Duration": 7.437,
   "H264:ImageWidth": 1920,
-  "H264:ImageHeight": 1080
+  "H264:ImageHeight": 1080,
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736
 }]

@@ -43,5 +43,9 @@
   "Track1:MediaLanguageCode": "und",
   "Track1:HandlerClass": "Media Handler",
   "Track1:HandlerType": "Video Track",
-  "Keys:Make": 300
+  "Keys:Make": 300,
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]
