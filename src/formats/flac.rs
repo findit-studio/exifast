@@ -1615,7 +1615,6 @@ impl crate::emit::Taggable for Meta<'_> {
     // Picture → "FLAC"; Vorbis.pm comments → "Vorbis"; Composite → "Composite".
     let flac_group = || Group::new("FLAC", "FLAC");
     let vorbis_group = || Group::new("Vorbis", "Vorbis");
-    let composite_group = || Group::new("Composite", "Composite");
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
 
     let mut tags: Vec<EmittedTag> = Vec::new();
@@ -1794,24 +1793,9 @@ impl crate::emit::Taggable for Meta<'_> {
       push_picture_tags(&mut tags, p, print_conv);
     }
 
-    // -- Composite:Duration (FLAC.pm:137-149) -----------------------------
-    if let Some(d) = self.duration() {
-      let secs = d.as_secs_f64();
-      let value = if print_conv {
-        // ConvertDuration (the retired `write_fmt` → `TagValue::Str`).
-        let mut s = String::new();
-        let _ = write_convert_duration(&mut s, secs);
-        TagValue::Str(s.into())
-      } else {
-        TagValue::F64(secs)
-      };
-      tags.push(EmittedTag::new(
-        composite_group(),
-        "Duration".into(),
-        value,
-        false,
-      ));
-    }
+    // Composite:Duration (FLAC.pm:137-149) is no longer emitted inline: the
+    // generic Composite engine (`crate::composite`) derives it from the emitted
+    // `FLAC:SampleRate` + `FLAC:TotalSamples` as a post-`run_emission` pass.
 
     tags.into_iter()
   }
@@ -1927,37 +1911,6 @@ impl crate::metadata::Project for Meta<'_> {
     media.media_mut().update_duration(self.duration());
     media
   }
-}
-
-/// Format-into-writer port of `Image::ExifTool::ConvertDuration`
-/// (ExifTool.pm:6866-6884). Writes directly into a [`core::fmt::Write`]
-/// sink — no intermediate `String` allocation.
-pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
-  w: &mut W,
-  time: f64,
-) -> core::fmt::Result {
-  if !time.is_finite() {
-    return write!(w, "{time}");
-  }
-  if time == 0.0 {
-    return w.write_str("0 s");
-  }
-  let (sign, mut t) = if time > 0.0 { ("", time) } else { ("-", -time) };
-  if t < 30.0 {
-    return write!(w, "{sign}{t:.2} s");
-  }
-  t += 0.5;
-  let mut h: i64 = (t / 3600.0) as i64;
-  t -= (h as f64) * 3600.0;
-  let m: i64 = (t / 60.0) as i64;
-  t -= (m as f64) * 60.0;
-  let s_int: i64 = t as i64;
-  if h > 24 {
-    let d = h / 24;
-    h -= d * 24;
-    return write!(w, "{sign}{d} days {h}:{m:02}:{s_int:02}");
-  }
-  write!(w, "{sign}{h}:{m:02}:{s_int:02}")
 }
 
 // ===========================================================================
@@ -2537,9 +2490,8 @@ mod tests {
   // ---------- ConvertDuration oracle table -------------------------------
 
   fn fmt_duration(t: f64) -> String {
-    let mut s = String::new();
-    write_convert_duration(&mut s, t).unwrap();
-    s
+    // The canonical `ConvertDuration` (the FLAC-local copy was folded into it).
+    crate::composite::convs::convert_duration(t)
   }
 
   #[test]
@@ -2730,9 +2682,11 @@ mod tests {
     assert_eq!(wn.get_str("FLAC", "PictureType"), Some("3".to_string()));
   }
 
-  /// Group identity: StreamInfo + Picture tags carry family-0/1 `"FLAC"`,
-  /// Vorbis comments `"Vorbis"`, and `Composite:Duration` `"Composite"`
-  /// (each sub-table group0 == group1). Every tag is known ⇒ `!unknown`.
+  /// Group identity: StreamInfo + Picture tags carry family-0/1 `"FLAC"` and
+  /// Vorbis comments `"Vorbis"` (each sub-table group0 == group1); every tag is
+  /// known ⇒ `!unknown`. `Composite:Duration` is NOT part of this stream — the
+  /// generic Composite engine appends it as a separate post-`run_emission` pass
+  /// (asserted by `taggable_emits_composite_duration` + the golden).
   #[test]
   fn taggable_group_family0_and_family1_per_subtable() {
     let data = fixture("FLAC_duration.flac");
@@ -2744,22 +2698,24 @@ mod tests {
     assert!(!tags.is_empty());
     let mut saw_flac = false;
     let mut saw_vorbis = false;
-    let mut saw_composite = false;
     for t in &tags {
       let g = t.tag().group_ref();
       // family-0 always equals family-1 across FLAC's sub-tables.
       assert_eq!(g.family0(), g.family1(), "tag {}", t.tag().name());
       assert!(!t.unknown());
+      assert_ne!(
+        t.tag().name(),
+        "Duration",
+        "Composite:Duration must come from the engine, not the FLAC tag stream"
+      );
       match g.family1() {
         "FLAC" => saw_flac = true,
         "Vorbis" => saw_vorbis = true,
-        "Composite" => saw_composite = true,
         other => panic!("unexpected FLAC group {other:?} for {}", t.tag().name()),
       }
     }
     assert!(saw_flac, "StreamInfo FLAC:* tags present");
     assert!(saw_vorbis, "Vorbis:* tags present");
-    assert!(saw_composite, "Composite:Duration present");
   }
 
   /// `Composite:Duration` (FLAC.pm:137-149): `-j` is `ConvertDuration`
@@ -2775,6 +2731,9 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
       &mut w,
     );
+    // The generic Composite engine (post-`run_emission` pass) derives Duration
+    // from the emitted FLAC:SampleRate + FLAC:TotalSamples.
+    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some("0:00:30".to_string())
@@ -2785,7 +2744,39 @@ mod tests {
       crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
       &mut wn,
     );
+    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
     assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == 30.0));
+  }
+
+  /// Migration safety net (old ≡ new): the engine-derived `Composite:Duration`
+  /// equals the value the retained typed compute (`duration()` — the former
+  /// inline path) would have emitted, for both modes.
+  #[test]
+  fn composite_duration_engine_matches_typed_compute() {
+    let data = fixture("FLAC_duration.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
+    let secs = meta.duration().expect("typed duration").as_secs_f64();
+
+    let mut w = TagMap::new();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
+    crate::composite::build_composites(&mut w, None, ConvMode::PrintConv, 0);
+    assert_eq!(
+      w.get_str("Composite", "Duration"),
+      Some(crate::composite::convs::convert_duration(secs))
+    );
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
+    crate::composite::build_composites(&mut wn, None, ConvMode::ValueConv, 0);
+    assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == secs));
   }
 
   /// An ID3-prefixed FLAC (the `FLAC_id3_prefix.flac` fixture) splices the

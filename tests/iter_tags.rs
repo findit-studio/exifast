@@ -226,3 +226,46 @@ fn chained_id3v1_iter_tags_family0_is_id3() {
     );
   }
 }
+
+/// `iter_tags` (the public generic-extraction L4 API) yields the engine-built
+/// `Composite:Duration` too — the same `Composite:*` set the JSON path produces.
+/// FLAC_duration.flac: family-0/1 `Composite`, value `"0:00:30"` under `-j`, and
+/// (as the post-pass append) the LAST tag in the stream.
+#[cfg(feature = "flac")]
+#[test]
+fn flac_iter_tags_carries_engine_composite_duration() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/FLAC_duration.flac"
+  ))
+  .unwrap();
+  let meta = exifast::parse_bytes(&data).expect("FLAC recognized");
+
+  let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
+  let dur = tags
+    .iter()
+    .find(|t| t.group_ref().family1() == "Composite" && t.name() == "Duration")
+    .expect("iter_tags must yield the engine-built Composite:Duration");
+  assert_eq!(dur.group_ref().family0(), "Composite");
+  assert!(
+    matches!(dur.value_ref(), exifast::TagValue::Str(s) if s == "0:00:30"),
+    "got {:?}",
+    dur.value_ref()
+  );
+  // The composite is appended last (positional last-ness).
+  let last = tags.last().expect("non-empty");
+  assert_eq!(last.name(), "Duration");
+  assert_eq!(last.group_ref().family1(), "Composite");
+
+  // -n: the raw f64 (30.0).
+  let raw: Vec<exifast::Tag> = meta.iter_tags(ConvMode::ValueConv).collect();
+  let dur_n = raw
+    .iter()
+    .find(|t| t.group_ref().family1() == "Composite" && t.name() == "Duration")
+    .expect("Composite:Duration under -n");
+  assert!(
+    matches!(dur_n.value_ref(), exifast::TagValue::F64(x) if (*x - 30.0).abs() < 1e-9),
+    "got {:?}",
+    dur_n.value_ref()
+  );
+}

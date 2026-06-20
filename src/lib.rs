@@ -84,6 +84,12 @@ extern crate std;
 pub mod bitstream;
 pub mod charset;
 pub mod convert;
+// The generic ExifTool Composite-tag engine (`BuildCompositeTags`): a
+// standalone post-`run_emission` pass that derives `Composite:*` tags from the
+// final emitted tag set. `alloc`-gated to match `tagmap` (the engine's sink);
+// the canonical `ConvertDuration` (`composite::convs`) is the single source the
+// cross-format duration callers alias.
+pub mod composite;
 pub mod datetime;
 // The format-agnostic emission framework (`Taggable` + the `run_emission`
 // engine + `ConvMode`/`EmittedTag`): the single place the cross-cutting

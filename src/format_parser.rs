@@ -700,27 +700,17 @@ impl AnyMeta<'_> {
     }
   }
 
-  /// The format tag stream as [`value::Tag`](crate::value::Tag)s
-  /// (golden-pattern **L4**) — the public, no-JSON generic-extraction API.
-  /// Yields the Unknown-gated, de-duplicated tag set carrying the full
-  /// [`Group`](crate::value::Group) (family-0 + family-1). Diagnostics
-  /// (`ExifTool:Warning` / `ExifTool:Error`) are NOT included — they are a
-  /// separate channel surfaced by the JSON path (and the engine-orchestration
-  /// tags `SourceFile` / `File:FileType` / version are added by
-  /// [`crate::parser::extract_info`], not here).
-  ///
-  /// This yields the same tag set the JSON path produces (same keys, same
-  /// values, same dedup) MINUS those diagnostics + orchestration tags, but it
-  /// carries family-0 too (which the `-G1` JSON key drops). `mode` selects
-  /// PrintConv (`-j`) vs ValueConv (`-n`) values.
-  #[must_use = "iter_tags yields the tag stream lazily; consume the iterator"]
-  pub fn iter_tags(
-    &self,
-    mode: crate::emit::ConvMode,
-  ) -> impl Iterator<Item = crate::value::Tag> + '_ {
-    // The generic-extraction path is the `-G1` default with `-ee` off — this
-    // option-free tag iterator is the faithful baseline; the `-ee`/`-G3`-aware
-    // render path is [`Rendered::new_with_options`] (driven by `ParseOptions`).
+  /// Collect this Meta's `-G1`/`-ee`-off [`Taggable`](crate::emit::Taggable)
+  /// stream into a deduped [`Tag`](crate::value::Tag) `Vec` for the given
+  /// `mode`, applying the SAME cross-cutting rules
+  /// [`run_emission`](crate::emit::run_emission) does — Unknown-suppression
+  /// (`ExifTool.pm:9179`) then the faithful `(family1, name)` last-wins-in-place
+  /// dedup (with the priority-0 `Warning`/`Error` first-wins exception,
+  /// `ExifTool.pm:9544-9560`). Shared by [`iter_tags`](Self::iter_tags) (the
+  /// public output) and the Composite engine's ValueConv resolution view, so
+  /// both observe an identical pre-composite tag set.
+  #[cfg(feature = "alloc")]
+  fn collect_deduped_tags(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::value::Tag> {
     let opts = crate::emit::EmitOptions::g1(mode, false);
     let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
     for e in self.collect_emitted(opts) {
@@ -747,6 +737,49 @@ impl AnyMeta<'_> {
         out.push(tag);
       }
     }
+    out
+  }
+
+  /// The format tag stream as [`value::Tag`](crate::value::Tag)s
+  /// (golden-pattern **L4**) — the public, no-JSON generic-extraction API.
+  /// Yields the Unknown-gated, de-duplicated tag set carrying the full
+  /// [`Group`](crate::value::Group) (family-0 + family-1). Diagnostics
+  /// (`ExifTool:Warning` / `ExifTool:Error`) are NOT included — they are a
+  /// separate channel surfaced by the JSON path (and the engine-orchestration
+  /// tags `SourceFile` / `File:FileType` / version are added by
+  /// [`crate::parser::extract_info`], not here).
+  ///
+  /// This yields the same tag set the JSON path produces (same keys, same
+  /// values, same dedup) MINUS those diagnostics + orchestration tags, but it
+  /// carries family-0 too (which the `-G1` JSON key drops). `mode` selects
+  /// PrintConv (`-j`) vs ValueConv (`-n`) values.
+  #[must_use = "iter_tags yields the tag stream lazily; consume the iterator"]
+  pub fn iter_tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::value::Tag> + '_ {
+    // The generic-extraction path is the `-G1` default with `-ee` off — this
+    // option-free tag iterator is the faithful baseline; the `-ee`/`-G3`-aware
+    // render path is [`Rendered::new_with_options`] (driven by `ParseOptions`).
+    let mut out = self.collect_deduped_tags(mode);
+    // Composite tags (ExifTool.pm:4577 — built after extraction). The same
+    // standalone post-pass the JSON path runs, over the deduped `Tag` Vec, so
+    // this generic-extraction API yields the same `Composite:*` set. Appended
+    // last (preserves their positional last-ness, matching the JSON path).
+    //
+    // Inputs resolve from each ingredient's ValueConv (raw) value REGARDLESS of
+    // `mode` (ExifTool.pm:4112), mirroring the JSON path: under `-n`, `out`
+    // already holds raw values (its own resolution view, `None`); under `-j`, we
+    // re-collect the SAME stream in ValueConv mode into `raw_view` and resolve
+    // inputs from it while the composite's rendered value lands in `out`.
+    let mut raw_view;
+    let resolve_src = if mode == crate::emit::ConvMode::PrintConv {
+      raw_view = self.collect_deduped_tags(crate::emit::ConvMode::ValueConv);
+      Some(&mut raw_view)
+    } else {
+      None
+    };
+    crate::composite::build_composites_into_tags(&mut out, resolve_src, mode);
     out.into_iter()
   }
 
@@ -783,12 +816,42 @@ impl AnyMeta<'_> {
     group_mode: crate::serialize_key::GroupMode,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    let opts = crate::emit::EmitOptions::with_group_mode(
-      crate::emit::ConvMode::from_print_conv(print_conv),
-      extract_embedded,
-      group_mode,
-    );
+    let mode = crate::emit::ConvMode::from_print_conv(print_conv);
+    let opts = crate::emit::EmitOptions::with_group_mode(mode, extract_embedded, group_mode);
     crate::emit::run_emission(self, opts, out);
+    // ExifTool builds Composite tags AFTER all format extraction completes
+    // (ExifTool.pm:4577, inside ExtractInfo). The standalone post-pass reads the
+    // FINAL emitted tag set and APPENDS each surviving `Composite:*` (so its
+    // positional last-ness is preserved). Always-on (Composite default ON,
+    // ExifTool.pm:1125). `doc_count` is the highest family-3 sub-document index
+    // present (reserved for `SubDoc` composites; the Duration defs build at Main
+    // only).
+    let doc_count = out.entries().iter().map(|e| e.0).max().unwrap_or(0);
+    // ExifTool resolves a composite's inputs from each ingredient's ValueConv
+    // (raw) value — `GetValue($tag, 'ValueConv')`, ExifTool.pm:4112 — REGARDLESS
+    // of the `-j`/`-n` output mode. Under `-n` the emitted `out` already holds
+    // those raw values, so it is its own resolution view. Under `-j` the emitted
+    // values are PrintConv strings, so we re-emit the SAME Meta in ValueConv mode
+    // into a throwaway `raw_view` (identical tag set + dedup; only the rendered
+    // values differ) and resolve inputs from it, while the composite's RENDERED
+    // (`-j`) value still lands in `out`. (Duration's ingredients have no
+    // PrintConv, so raw == rendered and the goldens are unchanged; the GPS /
+    // datetime composites of later #133 PRs are the ones that genuinely need the
+    // raw `"N"`/`"S"` / decimal-coordinate inputs.)
+    let mut raw_view;
+    let resolve_src = if print_conv {
+      raw_view = crate::tagmap::TagMap::new();
+      let raw_opts = crate::emit::EmitOptions::with_group_mode(
+        crate::emit::ConvMode::ValueConv,
+        extract_embedded,
+        group_mode,
+      );
+      crate::emit::run_emission(self, raw_opts, &mut raw_view);
+      Some(&mut raw_view)
+    } else {
+      None
+    };
+    crate::composite::build_composites(out, resolve_src, mode, doc_count);
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }

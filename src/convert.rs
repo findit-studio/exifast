@@ -433,7 +433,13 @@ fn matches_float_shape(s: &str, sep: u8) -> bool {
 ///     (`1` or `1.`, not `1.0` / `01.`) followed by `#` then a case-insensitive
 ///     `INF` / `IND` / `NAN` / `QNAN` / `SNAN` prefix → `Inf` / `NaN`
 ///     (sign carries for `INF`: `-1.#INF` → `-Inf`). `1.#IN` / `1.#I` (no full
-///     keyword) fall back to the finite mantissa `1`.
+///     keyword) fall back to the finite mantissa `1`. Recognition of this
+///     spelling is GATED on a tight sign-form (`Perl_grok_infnan`): a single
+///     directly-adjacent sign or a `+`-led adjacent dual sign fires
+///     (`++1.#INF` → `Inf`, `+-1.#INF` → `-Inf`), but inter-sign / post-sign
+///     whitespace or a `-`-led dual sign breaks it and the value falls through
+///     to the finite scan `1.` → `1` with the product sign (`+ 1.#INF` → `1`,
+///     `-+1.#INF` → `-1`, `--1.#IND` → `1`).
 ///
 /// Leading junk before `inf`/`nan` is NOT a numeric prefix (`xinf`/`12inf` →
 /// `0` / `12`, matching the finite rule), and a partial keyword (`in`, `na`,
@@ -455,7 +461,8 @@ fn matches_float_shape(s: &str, sep: u8) -> bool {
 /// `".5"` → `0.5`; `"3."` → `3.0`; `"+3.5"` → `3.5`; `"-2"` → `-2.0`;
 /// `"abc"`/`""`/`"  "`/`"0x10"` → `0.0`; `"inf"`/`"Infinity"`/`"+inf"` → `Inf`;
 /// `"-inf"`/`"-1.#INF"` → `-Inf`; `"nan"`/`"NaN"`/`"1.#IND"`/`"-nan"` → `NaN`.
-#[allow(dead_code)] // Used by `feature = "flash"`; unused under feature-pruned builds without it.
+
+#[allow(dead_code)] // Used by `feature = "flash"` + `feature = "ape"` + the Composite engine; pruned otherwise.
 pub fn perl_str_to_f64(s: &str) -> f64 {
   let bytes = s.as_bytes();
   let mut i = 0;
@@ -464,12 +471,48 @@ pub fn perl_str_to_f64(s: &str) -> f64 {
   while matches!(bytes.get(i), Some(b) if b.is_ascii_whitespace()) {
     i += 1;
   }
-  let prefix_start = i;
-  // Optional sign (captured for the non-finite spellings — `-inf` carries the
-  // sign onto `Inf`; `nan`/`-nan` are unsigned `NaN`).
-  let negative = bytes.get(i) == Some(&b'-');
+  // Optional dual-sign parsing. Perl's numeric context accepts up to TWO sign
+  // characters with one whitespace block permitted between them (NOT after the
+  // second sign), the effective sign being the PRODUCT of the signs seen
+  // (oracle, verified against Perl 5 — APE Composite `Duration` ingredients
+  // arrive as MakeTag strings that hit exactly this path):
+  //   "+ 20000000" → 20000000   "++20000000" → 20000000   "+-20" → -20
+  //   "--20"       → 20          "-+Inf"      → -Inf        "++Inf" → Inf
+  //   "+ +20"      → 20          "+- 20"      → 0 (ws after sign2 ⇒ reject)
+  //   "+--20"      → 0 (three signs)          "-  -  20"   → 0 (ws after sign2)
+  // A bare lone sign is settled below by the `i == mantissa_start` no-magnitude
+  // guard (`mantissa_start` is the post-sign position).
+  let mut negative = false;
+  let mut sign_count = 0u8;
+  // Track two sign-form facts that gate the MSVCRT `1.#…` branch below: whether
+  // sign 1 is `-`, and whether any whitespace was skipped between sign 1 and the
+  // magnitude. The MSVCRT non-finite spelling is recognised by Perl only for a
+  // tight sign-form (oracle below); these record the two breaking conditions.
+  let mut sign1_minus = false;
+  let mut inter_sign_ws = false;
   if matches!(bytes.get(i), Some(b'+' | b'-')) {
+    sign1_minus = bytes.get(i) == Some(&b'-');
+    negative ^= sign1_minus;
     i += 1;
+    sign_count = 1;
+    // Optional whitespace between sign 1 and sign 2 / the magnitude.
+    while matches!(bytes.get(i), Some(b) if b.is_ascii_whitespace()) {
+      i += 1;
+      inter_sign_ws = true;
+    }
+    // Sign 2 (no whitespace permitted after it).
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
+      negative ^= bytes.get(i) == Some(&b'-');
+      i += 1;
+      sign_count = 2;
+    }
+  }
+  // After a second sign, a further sign OR whitespace rejects the whole prefix
+  // (Perl: "+--20" / "-+ 20" / "+- 20" → 0).
+  if sign_count == 2
+    && matches!(bytes.get(i), Some(b) if *b == b'+' || *b == b'-' || b.is_ascii_whitespace())
+  {
+    return 0.0;
   }
   // IEEE non-finite spellings — checked AFTER the sign, BEFORE the digit grammar
   // (a leading digit means a finite mantissa, so `inf`/`nan` can only begin the
@@ -509,7 +552,18 @@ pub fn perl_str_to_f64(s: &str) -> f64 {
   // `[mantissa_start..i]` are `"1"` or `"1."` (so `1.0` / `01.` / `2.` do NOT
   // qualify; oracle: `1.0#INF` → 1, `2.#INF` → 2). The `#` then a keyword
   // prefix selects Inf/NaN; `INF` honours the sign, the NaN keywords drop it.
-  if bytes.get(i) == Some(&b'#') {
+  //
+  // The MSVCRT spelling is recognised by Perl only under a TIGHT sign-form
+  // (`Perl_grok_infnan` runs on the post-`my_atof`-sign run with no whitespace).
+  // Oracle 2026-06-19 (`$s + 0`): a single sign directly adjacent fires
+  // (`-1.#INF` → -Inf), and a `+`-led dual sign fires (`++1.#INF` → Inf,
+  // `+-1.#INF` → -Inf). It does NOT fire when whitespace separates the sign(s)
+  // from the magnitude (`+ 1.#INF` → 1, `+ -1.#INF` → -1), nor for a `-`-led
+  // dual sign (`-+1.#INF` → -1, `--1.#IND` → 1); those fall through to the
+  // finite mantissa scan (`1.` → 1) and carry the product sign. Encode the two
+  // breaking conditions directly.
+  let msvcrt_allowed = !(inter_sign_ws || (sign1_minus && sign_count == 2));
+  if msvcrt_allowed && bytes.get(i) == Some(&b'#') {
     let mantissa = &bytes[mantissa_start..i];
     if mantissa == b"1" || mantissa == b"1." {
       let kw = &bytes[i + 1..];
@@ -546,15 +600,60 @@ pub fn perl_str_to_f64(s: &str) -> f64 {
       i = j;
     }
   }
-  // No numeric prefix (only whitespace, a lone sign, or junk) ⇒ Perl yields 0.
-  if i == prefix_start || i == mantissa_start {
+  // No magnitude consumed (only whitespace, a lone/dual sign, or junk) ⇒ Perl
+  // yields 0. `mantissa_start` is positioned AFTER any sign(s), so this guard
+  // also covers the bare-sign case (`"+"`, `"--"` → 0).
+  if i == mantissa_start {
     return 0.0;
   }
-  // The prefix is a clean numeric form Rust's `f64` parser accepts (it handles
-  // `"3."`, `".5"`, `"+3"`, `"1e3"`). On the rare overflow-to-inf parse, Perl
-  // would likewise carry ±Inf, so the parsed value is faithful; the unreachable
-  // `Err` arm (the prefix is always well-formed) falls back to 0.
-  s[prefix_start..i].parse::<f64>().unwrap_or(0.0)
+  // Parse the MAGNITUDE prefix `[mantissa_start..i]` (signs already consumed
+  // above), then apply the product sign. The slice is a clean unsigned numeric
+  // form Rust's `f64` parser accepts (`"3."`, `".5"`, `"1e3"`); parsing the
+  // magnitude (not the signed slice) is what lets the dual-sign forms
+  // (`"--20"`, `"+-20"`) carry their effective sign. On the rare
+  // overflow-to-inf parse Perl likewise carries ±Inf; the unreachable `Err`
+  // arm (the magnitude is always well-formed) falls back to 0.
+  let mag = s
+    .get(mantissa_start..i)
+    .and_then(|t| t.parse::<f64>().ok())
+    .unwrap_or(0.0);
+  if negative { -mag } else { mag }
+}
+
+/// Perl boolean context (`if ($val)`) for a [`TagValue`]. Faithful semantics
+/// (verified empirically against Perl 5):
+///   - `Str(s)`: TRUE iff `s` is non-empty AND not the exact literal `"0"`.
+///     So `"0E0"`, `"0.0"`, `"00"`, `"+0"`, `" 0"`, `"0abc"` are all TRUE.
+///   - `I64(n)` / `U64(n)`: TRUE iff `n != 0`.
+///   - `F64(x)`: TRUE iff `x != 0.0` (NaN compares unequal to 0.0 in IEEE, so
+///     NaN is reported as TRUE — faithful: Perl NaN is truthy).
+///   - `Bool(b)`: direct Perl-bool mapping.
+///   - `Bytes(b)`: TRUE iff `!b.is_empty()` AND `b != [b'0']` (byte-faithful to
+///     the string rule).
+///   - `Rational(n,d)`: TRUE iff `n != 0` (Perl scalar stringifies; `0/X`
+///     evaluates to `"0"`, which is falsey).
+///   - `List(_)` / `Map(_)`: list/hash-context truthiness in Perl is the count;
+///     conservative: TRUE iff non-empty (a `$val[N]` deref'd from `@val` is a
+///     scalar in practice, so this case does not arise for a Composite input).
+///
+/// This is the predicate ExifTool's `($val[0] && $val[1])`-style RawConv guards
+/// evaluate (the APE / FLAC / AIFF Composite Duration guards): it runs on the
+/// RAW ingredient value — a wire-format string `"0.0"` is TRUTHY, unlike a
+/// numeric-coerced `0.0`.
+#[allow(dead_code)] // Used by `feature = "ape"` + the Composite engine; pruned otherwise.
+pub(crate) fn perl_boolean_truthy(v: &TagValue) -> bool {
+  match v {
+    TagValue::Str(s) => !s.is_empty() && s.as_str() != "0",
+    TagValue::I64(n) => *n != 0,
+    TagValue::U64(n) => *n != 0,
+    #[allow(clippy::float_cmp)]
+    TagValue::F64(x) => *x != 0.0,
+    TagValue::Bool(b) => *b,
+    TagValue::Bytes(b) => !b.is_empty() && b.as_slice() != b"0",
+    TagValue::Rational(r) => r.numerator() != 0,
+    TagValue::List(l) => !l.is_empty(),
+    TagValue::Map(m) => !m.is_empty(),
+  }
 }
 
 /// Case-insensitive ASCII prefix test: does `hay` begin with `needle` (which
@@ -880,32 +979,12 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
   w: &mut W,
   time: f64,
 ) -> core::fmt::Result {
-  // ExifTool.pm:6869 `return $time unless IsFloat($time)`. As in
-  // `write_convert_bitrate`, `IsFloat` rejects a stringified non-finite, so the
-  // value passes through verbatim and stringifies to Perl's titlecase
-  // `Inf`/`-Inf`/`NaN` (via `perl_nonfinite_str`), not Rust's lowercase `{}`.
-  if !time.is_finite() {
-    return w.write_str(crate::value::perl_nonfinite_str(time).unwrap_or("NaN"));
-  }
-  if time == 0.0 {
-    return w.write_str("0 s"); // ExifTool.pm:6870
-  }
-  let (sign, mut t) = if time > 0.0 { ("", time) } else { ("-", -time) }; // ExifTool.pm:6871
-  if t < 30.0 {
-    return write!(w, "{sign}{t:.2} s"); // ExifTool.pm:6872
-  }
-  t += 0.5; // ExifTool.pm:6873 round to nearest second
-  let mut h: i64 = (t / 3600.0) as i64;
-  t -= (h as f64) * 3600.0;
-  let m: i64 = (t / 60.0) as i64;
-  t -= (m as f64) * 60.0;
-  let s_int: i64 = t as i64;
-  if h > 24 {
-    let d = h / 24;
-    h -= d * 24;
-    return write!(w, "{sign}{d} days {h}:{m:02}:{s_int:02}");
-  }
-  write!(w, "{sign}{h}:{m:02}:{s_int:02}")
+  // Thin alias over the single canonical `ConvertDuration` (`composite::convs`).
+  // The streaming `Write` shape is kept for the Real/MXF/MOI/M2TS/Flash/FLAC
+  // callers; the canonical is byte-identical to the former inline impl for all
+  // finite/normal durations and strictly more faithful at extreme magnitudes
+  // (Perl-NV days/hours stringification instead of a saturating `as i64`).
+  w.write_str(&crate::composite::convs::convert_duration(time))
 }
 
 /// `ConvertDuration($val)` applied to a STRING-typed value, honouring the
@@ -2570,6 +2649,123 @@ mod tests {
       ("1.#IN", Finite(1.0)),
       ("1.#I", Finite(1.0)),
       ("#INF", Finite(0.0)),
+    ];
+    for &(s, want) in cases {
+      let got = perl_str_to_f64(s);
+      match want {
+        PosInf => assert!(
+          got.is_infinite() && got.is_sign_positive(),
+          "perl_str_to_f64({s:?}) = {got}, want +Inf"
+        ),
+        NegInf => assert!(
+          got.is_infinite() && got.is_sign_negative(),
+          "perl_str_to_f64({s:?}) = {got}, want -Inf"
+        ),
+        Nan => assert!(got.is_nan(), "perl_str_to_f64({s:?}) = {got}, want NaN"),
+        Finite(w) => assert!(
+          (got - w).abs() < 1e-12 || (got == 0.0 && w == 0.0),
+          "perl_str_to_f64({s:?}) = {got}, want {w}"
+        ),
+      }
+    }
+  }
+
+  // Perl numeric context accepts up to TWO sign characters (with one whitespace
+  // block permitted between sign 1 and sign 2, but NONE after sign 2), the
+  // effective sign being the product. Promoted INTO this shared helper from the
+  // former APE-local `perl_numeric_coerce_f64` so the Composite engine + APE
+  // share ONE coercion (oracle verified vs Perl 5). The non-finite + MSVCRT
+  // forms above still hold under dual signs (`++Inf`/`-+Inf`/`+ Inf`).
+  #[test]
+  fn perl_str_to_f64_dual_sign_and_inter_sign_whitespace() {
+    use NonFinite::{Finite, NegInf, PosInf};
+    let cases: &[(&str, NonFinite)] = &[
+      // Single sign with leading / inter-sign whitespace.
+      (" +44100", Finite(44100.0)),
+      ("+ 20000000", Finite(20_000_000.0)),
+      ("-  20", Finite(-20.0)),
+      ("   20", Finite(20.0)),
+      // Dual sign — product rule.
+      ("++1000", Finite(1000.0)),
+      ("+-20000000", Finite(-20_000_000.0)),
+      ("--20000000", Finite(20_000_000.0)),
+      ("-+20", Finite(-20.0)),
+      ("+ +20", Finite(20.0)),
+      ("- +5", Finite(-5.0)),
+      ("-  +20", Finite(-20.0)),
+      ("+ -20", Finite(-20.0)),
+      // Dual sign onto non-finite spellings.
+      ("++Inf", PosInf),
+      ("-+Inf", NegInf),
+      ("+ Inf", PosInf),
+      // Rejected: whitespace after sign 2, or a third sign ⇒ 0.
+      ("+- 20", Finite(0.0)),
+      ("-- 20", Finite(0.0)),
+      ("-+ 20", Finite(0.0)),
+      ("-  -  20", Finite(0.0)),
+      ("+--20000000", Finite(0.0)),
+      ("+ - 20", Finite(0.0)),
+      // Bare / dangling signs ⇒ 0.
+      ("+", Finite(0.0)),
+      ("-", Finite(0.0)),
+      ("--", Finite(0.0)),
+    ];
+    for &(s, want) in cases {
+      let got = perl_str_to_f64(s);
+      match want {
+        PosInf => assert!(
+          got.is_infinite() && got.is_sign_positive(),
+          "perl_str_to_f64({s:?}) = {got}, want +Inf"
+        ),
+        NegInf => assert!(
+          got.is_infinite() && got.is_sign_negative(),
+          "perl_str_to_f64({s:?}) = {got}, want -Inf"
+        ),
+        NonFinite::Nan => unreachable!(),
+        Finite(w) => assert!(
+          (got - w).abs() < 1e-12 || (got == 0.0 && w == 0.0),
+          "perl_str_to_f64({s:?}) = {got}, want {w}"
+        ),
+      }
+    }
+  }
+
+  // The MSVCRT `1.#…` spelling crossed with sign-whitespace and dual signs.
+  // Perl's `Perl_grok_infnan` recognises the spelling only for a single
+  // directly-adjacent sign or a `+`-led adjacent dual sign; inter-sign / post-
+  // sign whitespace and a `-`-led dual sign break recognition, so the value
+  // falls through to the finite mantissa scan (`1.` → 1) and carries the
+  // product sign — turning what looked non-finite into a finite ±1. Oracle
+  // 2026-06-19 (`no warnings "numeric"; $s + 0`).
+  #[test]
+  fn perl_str_to_f64_msvcrt_spelling_sign_forms() {
+    use NonFinite::{Finite, Nan, NegInf, PosInf};
+    let cases: &[(&str, NonFinite)] = &[
+      // Still recognised: bare / single adjacent sign / `+`-led adjacent dual.
+      ("1.#INF", PosInf),
+      ("-1.#INF", NegInf),
+      ("+1.#INF", PosInf),
+      ("1.#IND", Nan),
+      ("-1.#IND", Nan),
+      ("++1.#INF", PosInf),
+      ("+-1.#INF", NegInf),
+      ("++1.#IND", Nan),
+      ("+-1.#IND", Nan),
+      // Inter-sign / post-sign whitespace ⇒ NOT recognised ⇒ finite ±1.
+      ("+ 1.#INF", Finite(1.0)),
+      ("- 1.#INF", Finite(-1.0)),
+      ("+ 1.#IND", Finite(1.0)),
+      ("- 1.#IND", Finite(-1.0)),
+      ("+ -1.#INF", Finite(-1.0)),
+      ("- +1.#INF", Finite(-1.0)),
+      ("+ +1.#INF", Finite(1.0)),
+      ("- -1.#INF", Finite(1.0)),
+      ("+ -1.#IND", Finite(-1.0)),
+      // `-`-led adjacent dual sign ⇒ NOT recognised ⇒ finite ±1 (product sign).
+      ("-+1.#INF", Finite(-1.0)),
+      ("--1.#INF", Finite(1.0)),
+      ("-+1.#IND", Finite(-1.0)),
+      ("--1.#IND", Finite(1.0)),
     ];
     for &(s, want) in cases {
       let got = perl_str_to_f64(s);
