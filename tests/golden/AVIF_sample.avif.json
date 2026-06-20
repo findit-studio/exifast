@@ -11,5 +11,7 @@
   "QuickTime:CompatibleBrands": ["avif","mif1","miaf","MA1B"],
   "QuickTime:MediaDataSize": 82715,
   "QuickTime:MediaDataOffset": 325,
-  "Meta:PrimaryItemReference": 1
+  "Meta:PrimaryItemReference": 1,
+  "Composite:ImageSize": "1204x800",
+  "Composite:Megapixels": 0.963
 }]

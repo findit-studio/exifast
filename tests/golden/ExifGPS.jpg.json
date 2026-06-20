@@ -61,6 +61,10 @@
   "IFD1:ResolutionUnit": "inches",
   "IFD1:ThumbnailOffset": 1050,
   "IFD1:ThumbnailLength": 28,
+  "Composite:Aperture": 0.64,
+  "Composite:ImageSize": "120x80",
+  "Composite:Megapixels": 0.010,
+  "Composite:ShutterSpeed": "1/724",
   "Composite:GPSLatitude": "54 deg 59' 22.80\" N",
   "Composite:GPSLongitude": "1 deg 54' 51.00\" W",
   "Composite:GPSPosition": "54 deg 59' 22.80\" N, 1 deg 54' 51.00\" W"

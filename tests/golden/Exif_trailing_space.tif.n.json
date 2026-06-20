@@ -12,5 +12,6 @@
   "ExifIFD:DateTimeOriginal": "2021:08:14 16:45:09",
   "ExifIFD:SubSecTime": 123,
   "ExifIFD:SubSecTimeOriginal": 45,
-  "ExifIFD:SubSecTimeDigitized": 70
+  "ExifIFD:SubSecTimeDigitized": 70,
+  "Composite:SubSecDateTimeOriginal": "2021:08:14 16:45:09.45"
 }]

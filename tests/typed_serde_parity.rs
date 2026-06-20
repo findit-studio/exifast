@@ -707,7 +707,13 @@ const NOT_ACTIVE: &[&str] = &[
 /// the next entry's bytes (`Track1:BitDepth 48879`), pinning the faithful
 /// whole-box ProcessHybrid fixed-field read. Its `.json`/`.n.json`
 /// (QuickTime, `System:*`/`Composite:*` excluded) are byte-exact.
-const EXPECTED_ACTIVE_FIXTURES: usize = 539;
+/// 539 → 540 after `CR2_imagesize.cr2` (#133 Finding 2) activated — the crafted
+/// CR2 (TIFF-base Canon RAW) whose IFD0 `ImageWidth` differs from
+/// `ExifImageWidth`. exifast DEFERS all composites for the CR2/IIQ/EIP/Canon-1D-
+/// RAW subtypes (the `Composite:ImageSize` `TIFF_TYPE` branch is unavailable to
+/// the post-pass), so its `.json`/`.n.json` (`System:*`/`Composite:*` excluded)
+/// are byte-exact with NO Composite.
+const EXPECTED_ACTIVE_FIXTURES: usize = 540;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

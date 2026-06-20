@@ -200,5 +200,9 @@
   "IFD1:YResolution": 72,
   "IFD1:ResolutionUnit": 2,
   "IFD1:ThumbnailOffset": 2418,
-  "IFD1:ThumbnailLength": 28
+  "IFD1:ThumbnailLength": 28,
+  "Composite:Aperture": 13,
+  "Composite:ImageSize": "8 8",
+  "Composite:Megapixels": 6.4e-05,
+  "Composite:ShutterSpeed": 0.01
 }]

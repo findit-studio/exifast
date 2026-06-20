@@ -132,5 +132,12 @@
   "IFD1:ResolutionUnit": "inches",
   "IFD1:ThumbnailOffset": 3202,
   "IFD1:ThumbnailLength": 28,
-  "IFD1:YCbCrPositioning": "Co-sited"
+  "IFD1:YCbCrPositioning": "Co-sited",
+  "Composite:Aperture": 4.0,
+  "Composite:ImageSize": "8x8",
+  "Composite:Megapixels": 0.000064,
+  "Composite:ShutterSpeed": "1/125",
+  "Composite:SubSecCreateDate": "2005:03:18 02:55:18.16",
+  "Composite:SubSecDateTimeOriginal": "2005:03:18 02:55:18.16",
+  "Composite:SubSecModifyDate": "2005:03:18 02:55:18.16"
 }]

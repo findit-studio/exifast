@@ -82,38 +82,118 @@ case "$FIX" in
   XMP_gps_abovesea.xmp | XMP_gps_belowsea.xmp)
     EXCLUDE_ARR+=(-x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
                   -x Composite:GPSPosition) ;;
+  # XMP_rational_plus.xmp (#133 PR 3): exifast builds the ported `Composite:
+  # Aperture` from the embedded `XMP-exif:FNumber` (XMP is allow-listed — a single
+  # Main document); the unported `Composite:FocalLength35efl` (lens, PR 4) is
+  # dropped by name. Must precede the generic `XMP*` arm (first match wins).
+  XMP_rational_plus.xmp)
+    EXCLUDE_ARR+=(-x Composite:FocalLength35efl) ;;
+  # XMP.xmp (#133 PR 3): exifast builds the ported Tier-A `Composite:ImageSize`/
+  # `Megapixels` (from the bare-name `XMP-tiff:ImageWidth`/`Height`) + `Aperture`/
+  # `ShutterSpeed` (from `XMP-exif:FNumber`/`ExposureTime`). It does NOT build the
+  # GPS-coordinate composites (the `Composite:GPSLatitude`/`Longitude` defs
+  # require the family-0 `GPS` group, not `XMP-exif`), so there are none here.
+  # Drop only the unported lens/MakerNote Composites by name (NOT `Composite:all`,
+  # which the generic `XMP*` arm applies). Must precede the generic `XMP*` arm.
+  XMP.xmp)
+    EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl -x Composite:Flash \
+                  -x Composite:CircleOfConfusion -x Composite:FOV \
+                  -x Composite:FocalLength35efl -x Composite:HyperfocalDistance) ;;
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
   # The PNG raw-profile fixtures (#179) carry the engine-synthesized
   # `Composite:ImageSize`/`Megapixels` (from the IHDR dimensions) that the PNG
   # port does not emit (it has no Composite subsystem). Drop Composite so the
   # decoded profile content (`XMP-*`) is what the golden compares.
   PNG_rawprofile_*) EXCLUDE_ARR+=(-x Composite:all) ;;
-  # The GPS-bearing stills (#133 PR 2): exifast emits the ported GPS Composites
-  # (`Composite:GPSLatitude`/`GPSLongitude`/`GPSAltitude`/`GPSDateTime`/
-  # `GPSPosition`, GPS.pm/Exif.pm) but NOT the still-deferred camera composites
-  # (`Aperture`/`ImageSize`/`Megapixels`/`ShutterSpeed`/`FocalLength35efl`/
-  # `CircleOfConfusion`/`FOV`/`HyperfocalDistance`/`LightValue`/
-  # `ScaleFactor35efl` — the EXIF/lens Composite subsystem, a later #133 PR). So
-  # these goldens KEEP the GPS Composites and drop ONLY the unported ones by
-  # name (NOT `Composite:all`), byte-matching exifast — PLUS the same non-GPS
-  # JPEG-port deferrals these goldens already excluded (the APP13 Photoshop/IPTC
-  # segment + `IFD1:ThumbnailImage` binary body for `ExifGPS.jpg`; the embedded
-  # `XMP:*` + `IFD1:ThumbnailImage` for `DJIPhantom4.jpg`), so the GPS
-  # Composites are the ONLY net change vs the pre-#133 goldens. `ExifGPS.tif`
-  # carries ONLY GPS Composites and no deferred segments, so it needs no
-  # exclusion at all (default path).
+  # The EXIF / still-QuickTime fixtures (#133 PR 3): exifast emits the ported
+  # Tier-A EXIF Composites (`ImageSize`/`Megapixels`/`ShutterSpeed`/`Aperture`/
+  # `SubSecDateTimeOriginal`/`SubSecCreateDate`/`SubSecModifyDate`, Exif.pm) plus
+  # the PR-2 GPS Composites, but NOT the still-deferred LENS/MakerNote composites
+  # (`FocalLength35efl`/`CircleOfConfusion`/`FOV`/`HyperfocalDistance`/`DOF`/
+  # `LightValue`/`ScaleFactor35efl` — the lens subsystem, #133 PR 4 — and the
+  # MakerNote-derived `LensID`/`LensSpec`/`AutoFocus`/`RedBalance`/`BlueBalance`/
+  # `AvgBitrate`). So these goldens KEEP the ported Composites and drop ONLY the
+  # unported ones BY NAME (never `Composite:all`), byte-matching exifast — PLUS
+  # any non-Composite port deferrals each golden already excluded (the IPTC/
+  # Thumbnail/XMP JPEG segments for `ExifGPS.jpg`/`DJIPhantom4.jpg`; the codec-
+  # config property atoms for `HEIF`/`AVIF`). `ExifGPS.tif` carries only GPS
+  # Composites + no deferred segments → default path (no arm).
   ExifGPS.jpg)
     EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest -x IFD1:ThumbnailImage \
-                  -x Composite:Aperture -x Composite:ImageSize \
-                  -x Composite:Megapixels -x Composite:ShutterSpeed \
                   -x Composite:FocalLength35efl) ;;
   DJIPhantom4.jpg)
     EXCLUDE_ARR+=(-x XMP:all -x IFD1:ThumbnailImage \
-                  -x Composite:Aperture -x Composite:CircleOfConfusion \
-                  -x Composite:FOV -x Composite:FocalLength35efl \
-                  -x Composite:HyperfocalDistance -x Composite:ImageSize \
-                  -x Composite:LightValue -x Composite:Megapixels \
-                  -x Composite:ScaleFactor35efl -x Composite:ShutterSpeed) ;;
+                  -x Composite:CircleOfConfusion -x Composite:FOV \
+                  -x Composite:FocalLength35efl -x Composite:HyperfocalDistance \
+                  -x Composite:LightValue -x Composite:ScaleFactor35efl) ;;
+  # NEW PR-3 arms (these relied on a regen-time `EXCLUDE` env before — now baked
+  # in so `tools/gen_golden.sh <fix>` reproduces them with no env). Each drops
+  # only the unported lens/MakerNote Composites by name.
+  # NikonD2Hs also drops the non-Composite `PreviewIFD:all` / `IFD1:ThumbnailImage`
+  # / `ExifIFD:CFAPattern` the port defers (these were in its `EXCLUDE` env).
+  NikonD2Hs.jpg)
+    EXCLUDE_ARR+=(-x PreviewIFD:all -x IFD1:ThumbnailImage -x ExifIFD:CFAPattern \
+                  -x Composite:BlueBalance -x Composite:RedBalance \
+                  -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec \
+                  -x Composite:ScaleFactor35efl -x Composite:CircleOfConfusion \
+                  -x Composite:DOF -x Composite:FOV -x Composite:FocalLength35efl \
+                  -x Composite:HyperfocalDistance -x Composite:LightValue) ;;
+  # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
+  # extraction, unported) + `IFD1:ThumbnailImage` + `PrintIM:PrintIMVersion`
+  # (the same gaps the Nikon golden excludes) — all were in its `EXCLUDE` env.
+  Pentax.jpg)
+    EXCLUDE_ARR+=(-x Pentax:PreviewImageStart -x Pentax:PreviewImage \
+                  -x IFD1:ThumbnailImage -x PrintIM:PrintIMVersion \
+                  -x Composite:LensID -x Composite:ScaleFactor35efl \
+                  -x Composite:CircleOfConfusion -x Composite:FOV \
+                  -x Composite:FocalLength35efl -x Composite:HyperfocalDistance \
+                  -x Composite:LightValue) ;;
+  # DJI_Matrice30T also drops `IFD1:ThumbnailImage` (was in its `EXCLUDE` env).
+  DJI_Matrice30T.jpg)
+    EXCLUDE_ARR+=(-x IFD1:ThumbnailImage \
+                  -x Composite:ScaleFactor35efl -x Composite:CircleOfConfusion \
+                  -x Composite:DOF -x Composite:FOV -x Composite:FocalLength35efl \
+                  -x Composite:HyperfocalDistance) ;;
+  # The synthesized standalone-EXIF fixtures (#133 PR 3): exifast builds the
+  # ported Tier-A Composites (Exif.tif → Aperture/ShutterSpeed; Exif_trailing_
+  # space.tif → SubSecDateTimeOriginal) — EXIF is allow-listed. They KEEP those
+  # and drop the unported lens Composites by name (Exif.tif's FocalLength35efl/
+  # LightValue/LensID). `System:all` (the former env exclusion) is preserved.
+  Exif.tif)
+    EXCLUDE_ARR+=(-x System:all -x Composite:FocalLength35efl \
+                  -x Composite:LightValue -x Composite:LensID) ;;
+  Exif_trailing_space.tif)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # HEIF/AVIF stills: fold the documented codec-config `EXCLUDE` env into the arm
+  # (so it is reproducible) and replace the former `-x Composite:all` with the
+  # specific unported-Composite drops. AVIF emits only the ported ImageSize +
+  # Megapixels (no Composite drop needed); HEIC also emits `Composite:AvgBitrate`
+  # (the `mdat`-bitrate composite, unported) which is dropped.
+  HEIF_C001_msf1.heic)
+    EXCLUDE_ARR+=(-x System:all -x Copy1:HandlerType -x ImageSpatialExtent \
+                  -x HEVCConfigurationVersion -x GeneralProfileSpace \
+                  -x GeneralTierFlag -x GeneralProfileIDC \
+                  -x GenProfileCompatibilityFlags -x ConstraintIndicatorFlags \
+                  -x GeneralLevelIDC -x MinSpatialSegmentationIDC \
+                  -x ParallelismType -x ChromaFormat -x BitDepthLuma \
+                  -x BitDepthChroma -x AverageFrameRate -x ConstantFrameRate \
+                  -x NumTemporalLayers -x TemporalIDNested \
+                  -x Composite:AvgBitrate) ;;
+  AVIF_sample.avif)
+    EXCLUDE_ARR+=(-x System:all -x HandlerType -x HandlerDescription \
+                  -x PixelAspectRatio -x ImageSpatialExtent -x ImagePixelDepth \
+                  -x AV1ConfigurationVersion -x ChromaFormat \
+                  -x ChromaSamplePosition) ;;
+  # The crafted CR2 ImageSize-deferral fixture (#133 Finding 2): a CR2 whose
+  # `Composite:ImageSize` would (faithfully) use `ExifImageWidth`/`Height` via
+  # the `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/` branch (Exif.pm:
+  # 4759). exifast's Composite post-pass has no `TIFF_TYPE` handle, so it DEFERS
+  # ALL composites for those RAW subtypes (option b) rather than emit a wrong
+  # `ImageWidth`-based size. Drop `Composite:all` so the golden matches exifast's
+  # (Composite-less) output; the test asserts NO `Composite:ImageSize` is built.
+  # `System:all` excludes the filesystem tags as for the other synthetic TIFFs.
+  CR2_imagesize.cr2)
+    EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
 esac
 
 # Run from the fixtures dir and pass only the basename so the embedded

@@ -266,8 +266,25 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // faithful cost (these tags are byte-identical to bundled ExifTool), NOT a
     // redundant clone — the names are `SmolStr::new_static` and the dimension
     // values are integer `TagValue`s (no heap), the only heap touch being the Vec
-    // growth. Ceilings raised to (395, 528).
-    "MakerNotes_Apple.jpg" => (395, 528), // measured (384, 520) — #261 SOF tags
+    // growth.
+    //
+    // RE-BASELINED for #133 PR 3 (Tier-A EXIF Composites): the JSON render path's
+    // Composite post-pass now BUILDS Apple's full ported Composite set — the PR-2
+    // GPS quintet (GPSLatitude/Longitude/Altitude/DateTime/Position) PLUS the new
+    // Tier-A `Aperture`/`ImageSize`/`Megapixels`/`ShutterSpeed`/`SubSecCreateDate`/
+    // `SubSecDateTimeOriginal` (Apple carries FNumber/dimensions/DateTimeOriginal/
+    // SubSecTime). Each built composite renders a value + appends to BOTH the
+    // ValueConv and PrintConv views, and the `BuildCompositeTags` fixpoint
+    // allocates a per-def `$val[]`/`$prt[]` pair on each pass over the now-15-entry
+    // registry (Megapixels defers on `Composite:ImageSize`, forcing a 2nd pass), so
+    // `-j` rises 384 → 699 and `-n` 520 → 790. This is the INTENDED cost of
+    // building the newly-ported composites (the output is conformance- + typed-
+    // serde-pinned byte-exact), NOT a redundant clone or double decode — the
+    // `media_metadata` typed path is UNCHANGED (152 < 165) since it never runs the
+    // Composite post-pass. (A future engine-perf PR could reuse the per-pass
+    // `$val[]`/`$prt[]` scratch Vecs to shave the fixpoint overhead.) Ceilings
+    // raised to (770, 860).
+    "MakerNotes_Apple.jpg" => (770, 860), // measured (699, 790) — #133 PR 3 composites
     "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
     "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
     "Real.ra" => (100, 100),              // measured (88, 87)

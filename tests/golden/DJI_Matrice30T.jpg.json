@@ -88,5 +88,8 @@
   "JFIF:JFIFVersion": 1.02,
   "JFIF:ResolutionUnit": "None",
   "JFIF:XResolution": 1,
-  "JFIF:YResolution": 1
+  "JFIF:YResolution": 1,
+  "Composite:Aperture": 1.0,
+  "Composite:ImageSize": "1280x1024",
+  "Composite:Megapixels": 1.3
 }]

@@ -772,39 +772,80 @@ impl AnyMeta<'_> {
     // (`GPSPosition`'s PrintConv reads `$prt[i]`). `out` is the active-mode view;
     // we re-collect the SAME stream in the OPPOSITE mode for the other view.
     let mut other_view = self.collect_deduped_tags(mode.flipped());
-    if !self.defers_composites() {
+    if self.runs_composites() {
       crate::composite::build_composites_into_tags(&mut out, Some(&mut other_view), mode);
     }
     out.into_iter()
   }
 
-  /// Does this `AnyMeta` DEFER the Composite post-pass to a later #133 PR?
+  /// Does this `AnyMeta` RUN the Composite post-pass in THIS #133 PR?
   ///
-  /// The GPS Composites are `SubDoc => 1` (GPS.pm/Exif.pm — generate for every
-  /// sub-document). For a STILL (a single Main document) they build at Main, and
-  /// #133 PR 2 ports them there. For the TIMED / video formats the GPS lives in
-  /// per-sample sub-documents (`Doc<N>`), so the faithful build requires the
-  /// SubDoc / `Doc<N>` Composite axis that #133 PR 5 adds — and bundled's
-  /// per-frame `Doc<N>:GPSLatitude`/`…Position` are exactly that axis. Until
-  /// then these formats keep their Composites EXCLUDED (the M2TS/QuickTime
-  /// golden precedent), so the post-pass is skipped:
+  /// An ALLOW-LIST: the post-pass runs only for the `AnyMeta` variants whose
+  /// ported Composite path is faithful at the single-Main-document axis this PR
+  /// builds. Everything else DEFERS — its Composites either live on the per-
+  /// sample `Doc<N>` axis #133 PR 5 adds (the timed / video GPS), or are
+  /// camera/lens composites no PR has ported yet. Bundled excludes Composite for
+  /// every deferred format's golden (the established M2TS/QuickTime precedent),
+  /// so skipping the pass keeps them byte-identical.
   ///
-  /// * `M2ts` — the AVCHD H.264 PES GPS is timed; bundled builds `Doc<N>` GPS
-  ///   Composites under `-ee` (and a Main set from the first frame), the PR-5
-  ///   SubDoc shape. (Its non-GPS goldens stay byte-identical.)
-  /// * `H264` — engine-only: a raw `.h264` is `Unknown file type`, so bundled
-  ///   NEVER reaches `BuildCompositeTags` for it (its GPS only becomes a
-  ///   Composite through the M2TS file pipeline, as a timed `Doc<N>` sample).
+  /// The reason this is an allow-list and not the prior deny-list: this PR adds
+  /// `Composite:ImageSize`/`Megapixels`, whose `Require`d `ImageWidth`/
+  /// `ImageHeight` are BARE-NAME (any-group) inputs present in nearly every
+  /// format (QuickTime/Matroska/RIFF/Red/… all emit `ImageWidth`). A deny-list
+  /// would build `ImageSize` for all of them, diverging from their (Composite-
+  /// excluded) goldens. Restricting to the ported still-image + audio paths
+  /// keeps the deferred formats untouched.
   ///
-  /// Every still / single-document format (TIFF/JPEG EXIF, XMP, the audio
-  /// Durations) returns `false` and builds its Composites in this PR.
+  /// Runs for:
+  /// * `Exif` — TIFF/JPEG EXIF stills (the EXIF + GPS Composite subsystem, a
+  ///   single Main document).
+  /// * `Xmp` — an XMP sidecar / packet, a single Main document. PR 2 builds its
+  ///   GPS Composites from the embedded `XMP-exif:GPS*` (`Composite:GPSAltitude`,
+  ///   golden-pinned); this PR adds its `XMP-tiff:ImageWidth`/`XMP-exif:FNumber`/
+  ///   … Tier-A Composites. (Its `XMP-exif:DateTimeOriginal` is NOT family-0
+  ///   `EXIF`, so the `EXIF:`-keyed SubSec composites do not build for it,
+  ///   matching bundled.)
+  /// * `QuickTime` IFF its `MIMEType` is `image/*` — the HEIF/HEIC/AVIF stills
+  ///   (`mime()`); a `video/*` QuickTime (MOV/MP4/M4V/iso5/CR3/…) defers its
+  ///   timed GPS Composites to PR 5. This arm is a RUNTIME mime check, so the
+  ///   predicate is not `const`.
+  /// * `Ape` / `Flac` / `Aiff` — the audio `Composite:Duration` path (PR 1).
+  ///
+  /// Everything else defers: QuickTime `video/*`, Matroska, R3d, Dv, Flv, Riff
+  /// (avi + webp), Png, M2ts, H264, and the remaining audio/container formats
+  /// (none of which has a ported Main-document Composite).
   #[cfg(feature = "alloc")]
-  const fn defers_composites(&self) -> bool {
+  fn runs_composites(&self) -> bool {
     match self {
-      #[cfg(feature = "m2ts")]
-      AnyMeta::M2ts(_) => true,
-      #[cfg(feature = "h264")]
-      AnyMeta::H264(_) => true,
+      // EXIF TIFF/JPEG stills run — EXCEPT the Canon/Phase-One TIFF-base RAW
+      // subtypes (CR2 / Canon 1D RAW / IIQ / EIP). `Composite:ImageSize`
+      // (Exif.pm:4757) takes a `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|
+      // EIP)$/`-gated branch using `ExifImageWidth`/`ExifImageHeight` for those
+      // — but the composite post-pass has NO `TIFF_TYPE` handle (`File:FileType`
+      // is finalized at the JSON-orchestration layer, AFTER `serialize_tags`,
+      // and is absent from the `iter_tags` path), so it cannot honour that
+      // branch and would instead fall through to `ImageWidth`/`ImageHeight` —
+      // the WRONG `ImageSize` (poisoning `Megapixels`). Until the subtype is
+      // threaded into the post-pass (the faithful option (a)), DEFER all
+      // composites for those RAW subtypes (a documented deferral, like the
+      // video deferral), so exifast emits NO `Composite:ImageSize`/`Megapixels`
+      // rather than a wrong one. The finalized FileType is reconstructed from
+      // the `ExifMeta`'s own content signals (`is_cr2_magic`/`has_dng_version`)
+      // + its threaded ext/parent name (`file_type`) — see
+      // [`exif_file_type_is_raw_imagesize_subtype`].
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) => !exif_file_type_is_raw_imagesize_subtype(m),
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(_) => true,
+      // HEIF/HEIC/AVIF stills run; video QuickTime defers (timed GPS → PR 5).
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => m.mime().starts_with("image/"),
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(_) => true,
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(_) => true,
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(_) => true,
       _ => false,
     }
   }
@@ -862,9 +903,11 @@ impl AnyMeta<'_> {
     // (identical tag set + dedup; only the rendered values differ) for the other
     // view. (Duration's ingredients have no PrintConv difference, so its goldens
     // are unchanged; the GPS composites genuinely need the raw `"N"`/`"S"` /
-    // decimal `$val[i]` AND the DMS `$prt[i]`.) Skipped for the timed/video
-    // formats whose GPS Composites defer to #133 PR 5 (`defers_composites`).
-    if !self.defers_composites() {
+    // decimal `$val[i]` AND the DMS `$prt[i]`.) Run ONLY for the allow-listed
+    // ported paths (EXIF stills, image/* QuickTime, the audio Durations); the
+    // deferred timed/video/container formats keep their Composite-excluded
+    // goldens byte-identical (`runs_composites`).
+    if self.runs_composites() {
       let doc_count = out.entries().iter().map(|e| e.0).max().unwrap_or(0);
       let mut other_view = crate::tagmap::TagMap::new();
       let other_opts =
@@ -875,6 +918,45 @@ impl AnyMeta<'_> {
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }
+}
+
+/// Is this `ExifMeta`'s FINALIZED `File:FileType` one of the Canon/Phase-One
+/// TIFF-base RAW subtypes whose `Composite:ImageSize` branch (Exif.pm:4759
+/// `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/`) the composite post-pass
+/// cannot honour (it has no `TIFF_TYPE` handle)? Those defer ALL composites (see
+/// [`AnyMeta::runs_composites`]).
+///
+/// Reconstructs the finalized `$$self{FileType}` from the `ExifMeta`'s own
+/// signals, mirroring [`crate::parser::tiff_finalize_file_type_with_content`]:
+///
+/// * [`ExifMeta::file_type`](crate::exif::ExifMeta::file_type) is the
+///   ext/parent-finalized name the engine threads in (`finalized_tiff_file_type`
+///   — already `"IIQ"`/`"EIP"`/`"CR2"`/… for those extensions, `None` for an
+///   embedded JPEG/PNG/RIFF block);
+/// * the CR2 byte-8 magic ([`is_cr2_magic`](crate::exif::ExifMeta::is_cr2_magic))
+///   forces `CR2` regardless of extension (a CR2 body renamed `.dng`/`.nef`);
+/// * a TRUTHY `DNGVersion` ([`has_dng_version`](crate::exif::ExifMeta::
+///   has_dng_version)) then `OverrideFileType('DNG')` (Exif `TIFF_TYPE` becomes
+///   `DNG`, NOT a RAW-ImageSize subtype) — the standalone base type is always
+///   `"TIFF"`, and the `$$self{FileType} !~ /^(DNG|GPR)$/` guard mirrors
+///   bundled. So a CR2-with-DNGVersion finalizes to `DNG` and composites RUN.
+///
+/// An embedded block (`file_type() == None`, both content signals false) is
+/// never a RAW subtype ⇒ `false` (JPEG/PNG/RIFF EXIF still run composites).
+#[cfg(all(feature = "alloc", feature = "exif"))]
+fn exif_file_type_is_raw_imagesize_subtype(m: &crate::exif::ExifMeta<'_>) -> bool {
+  // CR2 magic wins over the extension-derived name (ExifTool.pm:8636-8641).
+  let mut ft = if m.is_cr2_magic() {
+    "CR2"
+  } else {
+    m.file_type().unwrap_or("")
+  };
+  // `DNGVersion` override (ExifTool.pm:8763-8765): standalone base is `"TIFF"`;
+  // the override fires unless the name is already `DNG`/`GPR`.
+  if m.has_dng_version() && !matches!(ft, "DNG" | "GPR") {
+    ft = "DNG";
+  }
+  matches!(ft, "CR2" | "Canon 1D RAW" | "IIQ" | "EIP")
 }
 
 #[cfg(feature = "alloc")]

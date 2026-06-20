@@ -62,15 +62,29 @@ pub(crate) enum CompositeRaw {
   Num(f64),
   /// A string `$val` (e.g. `"2021:08:14 16:45:09Z"`, `"48.85815 2.3489"`).
   Text(std::string::String),
+  /// A `$val` that is a SELECTED ingredient scalar passed through UNCHANGED —
+  /// `Composite:ShutterSpeed`/`Aperture` (Exif.pm:4778/4789) whose ValueConv
+  /// merely PICKS one of its operands (`($val[2] and $val[2]>0) ? $val[2] :
+  /// (defined($val[0]) ? $val[0] : $val[1])`, `$val[0] || $val[1]`) and hands
+  /// it to `PrintExposureTime`/`PrintFNumber`. Those helpers return the operand
+  /// VERBATIM when `IsFloat` fails (Exif.pm:5704/5719), so a present-but-non-
+  /// float ingredient (a zero-denominator rational that ValueConv'd to
+  /// `"undef"`, or any non-`IsFloat` text) must reach the PrintConv as its
+  /// ORIGINAL [`TagValue`] — NOT numerically coerced to `0`. Carrying the raw
+  /// scalar (rather than an `f64`) preserves the genuinely-numeric path
+  /// byte-identically (a numeric ingredient is an `F64`/`I64`/`U64` ⇒ same
+  /// `-n` number, same `IsFloat`-formatted `-j`) while making the non-float
+  /// edge a faithful passthrough.
+  Scalar(TagValue),
 }
 
 impl CompositeRaw {
   /// The numeric `$val` if [`Num`](Self::Num) (for a numeric PrintConv such as
-  /// `ConvertDuration` / `ToDMS`); `None` for a [`Text`](Self::Text) raw.
+  /// `ConvertDuration` / `ToDMS`); `None` otherwise.
   pub(crate) fn as_num(&self) -> Option<f64> {
     match self {
       CompositeRaw::Num(x) => Some(*x),
-      CompositeRaw::Text(_) => None,
+      CompositeRaw::Text(_) | CompositeRaw::Scalar(_) => None,
     }
   }
 }
@@ -139,6 +153,28 @@ impl CompositeValue {
       .value()
       .is_some_and(crate::convert::perl_boolean_truthy)
   }
+  /// The SELECTED operand as a passthrough scalar for `Composite:ShutterSpeed`/
+  /// `Aperture` — the raw [`TagValue`] cloned, but ONLY for an operand the prior
+  /// `coerce_numeric` path would have BUILT from (a numeric scalar OR a
+  /// [`Str`](TagValue::Str)). A non-coercible operand (a [`Rational`](TagValue::
+  /// Rational) / [`Bytes`](TagValue::Bytes) / [`Bool`](TagValue::Bool)) yields
+  /// `None`, so the def returns `None` and the composite is NOT built — exactly
+  /// the build-vs-suppress decision the pre-passthrough `coerce_numeric()?`
+  /// produced (`coerce_numeric` returns `None` only for those non-scalar
+  /// shapes). This keeps every current golden byte-identical: a numeric operand
+  /// renders the same number, and the ONLY behavior change is that a present
+  /// non-`IsFloat` STRING operand (a zero-denominator rational that ValueConv'd
+  /// to `"undef"`) is now carried through (the passthrough fix) instead of being
+  /// coerced to `0`. Restricting to `coerce_numeric`-eligible operands (rather
+  /// than every present value) deliberately leaves the `Rational`-operand case
+  /// suppressed: building it faithfully needs the bare-name group precedence
+  /// (ExifTool picks `EXIF:FNumber` over a later `Samsung:FNumber`) plus a
+  /// `Rational` coercion — a separate pre-existing gap whose only golden
+  /// (`SamsungNX500.srw`, generated `-x Composite:all`) is outside this fix.
+  pub(crate) fn selected_scalar(&self) -> Option<TagValue> {
+    let v = self.value()?;
+    self.coerce_numeric().map(|_| v.clone())
+  }
 }
 
 /// How a [`CompositeDef`] turns its resolved raw value into the stored
@@ -171,6 +207,29 @@ pub(crate) enum CompositePrintConv {
   /// under `-j` the two ingredient DMS strings joined by `", "`; under `-n` the
   /// ValueConv string `$val` (`"$val[0] $val[1]"`).
   GpsPosition,
+  /// `Composite:ImageSize` PrintConv (Exif.pm:4766 `$val =~ tr/ /x/; $val`) —
+  /// the ValueConv string `$val` (a `Text` raw `"W H"`) with its single space
+  /// replaced by `x` under `-j` (`"8x8"`); the bare space-joined `$val` under
+  /// `-n` (`"8 8"`).
+  ImageSize,
+  /// `Composite:Megapixels` PrintConv (Exif.pm:4769 `sprintf("%.*f",
+  /// ($val >= 1 ? 1 : ($val >= 0.001 ? 3 : 6)), $val)`) — a magnitude-dependent
+  /// fixed-decimal string under `-j` (`>= 1` ⇒ 1 dp, `>= 0.001` ⇒ 3 dp, else
+  /// 6 dp); the bare numeric `$val` under `-n`.
+  Megapixels,
+  /// `Composite:ShutterSpeed` PrintConv (`Image::ExifTool::Exif::
+  /// PrintExposureTime($val)`, Exif.pm:4779) — the `1/N` fraction / decimal
+  /// string under `-j`; the bare numeric `$val` (seconds) under `-n`.
+  ShutterSpeed,
+  /// `Composite:Aperture` PrintConv (`Image::ExifTool::Exif::PrintFNumber($val)`,
+  /// Exif.pm:4790) — the 1-or-2-decimal f-number string under `-j`; the bare
+  /// numeric `$val` under `-n`.
+  Aperture,
+  /// The shared `%subSecConv` PrintConv (`$self->ConvertDateTime($val)`,
+  /// Exif.pm:4740) for `Composite:SubSecDateTimeOriginal`/`SubSecCreateDate`/
+  /// `SubSecModifyDate` — the identity at exifast's option set, in BOTH modes
+  /// (the RawConv-assembled `Text` string).
+  SubSecDateTime,
 }
 
 impl CompositePrintConv {
@@ -277,6 +336,71 @@ impl CompositePrintConv {
           TagValue::Str(std::format!("{p0}, {p1}").into())
         }
       },
+      CompositePrintConv::ImageSize => {
+        // `$val` is the ValueConv `Text` (`"W H"`). Under `-n` the bare string;
+        // under `-j` the `tr/ /x/` (every space → `x`).
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => TagValue::Str(s.replace(' ', "x").into()),
+        }
+      }
+      CompositePrintConv::Megapixels => {
+        // `$val` is the megapixel count (`Num`). Under `-n` the bare f64; under
+        // `-j` the magnitude-keyed `sprintf("%.*f", prec, $val)`.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::exif::print_megapixels(n).into())
+          }
+        }
+      }
+      CompositePrintConv::ShutterSpeed => {
+        // `$val` is the SELECTED operand (its ValueConv value), passed through
+        // verbatim ([`CompositeRaw::Scalar`]). Under `-n` ExifTool emits that
+        // operand value unchanged; under `-j` it runs `PrintExposureTime($val)`,
+        // which IsFloat-gates (a non-float operand passes through, NOT coerced
+        // to 0). The operand value is the operand's stored `-n` `TagValue`.
+        let CompositeRaw::Scalar(operand) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => operand.clone(),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::exif::print_exposure_time_scalar(operand).into())
+          }
+        }
+      }
+      CompositePrintConv::Aperture => {
+        // `$val` is the SELECTED f-number operand, passed through verbatim. Under
+        // `-n` the operand value unchanged; under `-j` `PrintFNumber($val)` with
+        // its IsFloat-gate (non-float / non-positive ⇒ passthrough).
+        let CompositeRaw::Scalar(operand) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => operand.clone(),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::exif::print_fnumber_scalar(operand).into())
+          }
+        }
+      }
+      CompositePrintConv::SubSecDateTime => {
+        // `$val` is the RawConv-assembled `Text`; ConvertDateTime is the identity
+        // at exifast's option set, so both modes emit it unchanged.
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::datetime::convert_date_time(s).into())
+          }
+        }
+      }
     }
   }
 }
@@ -381,6 +505,37 @@ const fn des(group: &'static [&'static str], name: &'static str) -> CompositeInp
   CompositeInput {
     kind: InputKind::Desire,
     groups: group,
+    name,
+  }
+}
+
+/// The family-1 groups an ExifTool `EXIF:<Name>` requirement expands to. ExifTool
+/// matches `EXIF:` via family-0 `EXIF` (every EXIF IFD); the SubSec composites'
+/// date inputs (`DateTimeOriginal`/`CreateDate`/`SubSecTime…`/`OffsetTime…` in
+/// `ExifIFD`, `ModifyDate` in `IFD0`/`IFD1`) live in these IFDs. Restricting to
+/// the EXIF IFD set keeps `EXIF:CreateDate` from matching an `XMP-xmp:CreateDate`
+/// / `QuickTime:CreateDate` / `RIFF:…` of the same name (a real collision —
+/// those groups carry the same tag names but are NOT family-0 `EXIF`).
+#[cfg(feature = "exif")]
+const EXIF_IFDS: &[&str] = &["ExifIFD", "IFD0", "IFD1"];
+
+/// A bare-name (group-less) `Require`d input — ExifTool's `Require => 'ImageWidth'`
+/// with no `Group:` prefix, matching the tag in ANY group (the empty slice).
+#[cfg(feature = "exif")]
+const fn bare_req(name: &'static str) -> CompositeInput {
+  CompositeInput {
+    kind: InputKind::Require,
+    groups: &[],
+    name,
+  }
+}
+
+/// A bare-name (group-less) `Desire`d input (ExifTool `Desire => 'ExifImageWidth'`).
+#[cfg(feature = "exif")]
+const fn bare_des(name: &'static str) -> CompositeInput {
+  CompositeInput {
+    kind: InputKind::Desire,
+    groups: &[],
     name,
   }
 }
@@ -548,6 +703,150 @@ fn ref_starts_with(s: &str, c: u8) -> bool {
     .is_some_and(|b| b.eq_ignore_ascii_case(&c))
 }
 
+/// `Composite:ImageSize` ValueConv (Exif.pm:4757-4762):
+///
+/// ```perl
+/// return $val[4] if $val[4];                            # RawImageCroppedSize
+/// return "$val[2] $val[3]" if $val[2] and $val[3] and
+///         $$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/;
+/// return "$val[0] $val[1]" if IsFloat($val[0]) and IsFloat($val[1]);
+/// return undef;
+/// ```
+///
+/// `$val[0]`=ImageWidth, `[1]`=ImageHeight, `[2]`=ExifImageWidth,
+/// `[3]`=ExifImageHeight, `[4]`=RawImageCroppedSize. The result is a `Text`
+/// `"W H"` (the PrintConv `tr/ /x/` later makes it `"WxH"`).
+///
+/// The `$val[2] $val[3]` branch is gated on `$$self{TIFF_TYPE}` being one of the
+/// Canon/Phase-One TIFF-base RAW types. The Composite engine reads the FINAL
+/// emitted tag set and has no `TIFF_TYPE` handle, so that branch is NOT taken
+/// here — which is exact for every format the allow-list runs composites for
+/// (EXIF JPEG/TIFF + still QuickTime + the audio Durations are never
+/// CR2/Canon 1D RAW/IIQ/EIP). A future port that threads `TIFF_TYPE` into the
+/// post-pass can add it.
+#[cfg(feature = "exif")]
+fn image_size(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  // `return $val[4] if $val[4]` — a present + Perl-truthy RawImageCroppedSize is
+  // already a `"WxH"` string; use it verbatim.
+  if let Some(cropped) = v.get(4)
+    && cropped.is_truthy()
+  {
+    return Some(CompositeRaw::Text(cropped.as_text()?.into_owned()));
+  }
+  // The `$val[2] $val[3]` Canon/Phase-One RAW branch needs `$$self{TIFF_TYPE}`,
+  // which the post-pass does not carry (see the doc note); skipped.
+  //
+  // `return "$val[0] $val[1]" if IsFloat($val[0]) and IsFloat($val[1])`. The
+  // `$val[i]` interpolated is the ValueConv value (IsFloat-normalized in place,
+  // so a comma decimal would be the translated form).
+  let w_text = v.first()?.as_text()?;
+  let h_text = v.get(1)?.as_text()?;
+  let w_norm = crate::convert::is_float_norm(&w_text)?;
+  let h_norm = crate::convert::is_float_norm(&h_text)?;
+  Some(CompositeRaw::Text(std::format!("{w_norm} {h_norm}")))
+}
+
+/// `Composite:Megapixels` ValueConv (Exif.pm:4768):
+/// `my @d = ($val =~ /\d+/g); $d[0] * $d[1] / 1000000`. `$val` is the
+/// `Composite:ImageSize` ValueConv string (`"W H"`); the two `\d+` runs are the
+/// dimensions, their product over a million is the megapixel count (`Num`).
+#[cfg(feature = "exif")]
+fn megapixels(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  let size = v.first()?.as_text()?;
+  // `($val =~ /\d+/g)` — every maximal ASCII-digit run, in order.
+  let mut digits = size
+    .as_bytes()
+    .split(|b| !b.is_ascii_digit())
+    .filter(|run| !run.is_empty())
+    .map(|run| {
+      // Each run is ASCII digits; parse as f64 (a very wide dimension still
+      // fits f64 exactly up to 2^53, far beyond any pixel count).
+      std::str::from_utf8(run)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+    });
+  // `$d[0] * $d[1]` — a missing element is Perl `undef` ⇒ `0` in the product.
+  let d0 = digits.next().unwrap_or(0.0);
+  let d1 = digits.next().unwrap_or(0.0);
+  Some(CompositeRaw::Num(d0 * d1 / 1_000_000.0))
+}
+
+/// `Composite:ShutterSpeed` ValueConv (Exif.pm:4778):
+/// `($val[2] and $val[2]>0) ? $val[2] : (defined($val[0]) ? $val[0] : $val[1])`.
+/// `$val[0]`=ExposureTime, `[1]`=ShutterSpeedValue, `[2]`=BulbDuration. A
+/// positive BulbDuration wins; else ExposureTime if defined; else
+/// ShutterSpeedValue.
+///
+/// The ValueConv merely SELECTS one operand — it does NOT coerce it. The chosen
+/// value is the operand's ORIGINAL scalar, handed verbatim to
+/// `PrintExposureTime` (the PrintConv), which passes a non-`IsFloat` operand
+/// through unchanged (Exif.pm:5704). So a present-but-non-float ExposureTime /
+/// ShutterSpeedValue (a zero-denominator rational that ValueConv'd to `"undef"`)
+/// must be carried as its raw [`TagValue`] ([`CompositeRaw::Scalar`]), NOT
+/// numerically coerced to `0`. The BulbDuration GUARD (`$val[2]>0`) still
+/// coerces numerically (a non-numeric BulbDuration is not `> 0`), but the
+/// SELECTED value remains `$val[2]`'s raw scalar.
+#[cfg(feature = "exif")]
+fn shutter_speed(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  // `($val[2] and $val[2]>0)` — BulbDuration present + Perl-truthy AND
+  // numerically positive ⇒ it wins (selected VERBATIM, not the coerced number).
+  if let Some(b) = v.get(2)
+    && b.is_truthy()
+    && b.coerce_numeric().is_some_and(|bn| bn > 0.0)
+  {
+    return Some(CompositeRaw::Scalar(b.selected_scalar()?));
+  }
+  // `defined($val[0]) ? $val[0] : $val[1]` — select the operand, pass through.
+  let chosen = match v.first() {
+    Some(cv) if cv.is_present() => cv,
+    _ => v.get(1)?,
+  };
+  Some(CompositeRaw::Scalar(chosen.selected_scalar()?))
+}
+
+/// `Composite:Aperture` RawConv + ValueConv (Exif.pm:4788-4789):
+/// RawConv `($val[0] || $val[1]) ? $val : undef`, ValueConv `$val[0] || $val[1]`.
+/// `$val[0]`=FNumber, `[1]`=ApertureValue. The first Perl-truthy of the two is
+/// the f-number; if NEITHER is truthy the composite is not built.
+///
+/// Like `ShutterSpeed`, the ValueConv only SELECTS an operand (the `||` picks
+/// the first truthy one); `PrintFNumber` (the PrintConv) passes a non-`IsFloat`
+/// operand through unchanged (Exif.pm:5719). So the chosen operand is carried as
+/// its raw [`TagValue`] ([`CompositeRaw::Scalar`]) — a present-but-non-float
+/// FNumber / ApertureValue (a zero-denominator rational ⇒ `"undef"`) is NOT
+/// coerced to `0`. Truthiness is the RAW Perl-boolean (a wire `"0.0"` is
+/// truthy, picked, then `PrintFNumber` passes it through since it is non-float).
+#[cfg(feature = "exif")]
+fn aperture(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  // `$val[0] || $val[1]` — first Perl-truthy operand, selected VERBATIM.
+  if let Some(f) = v.first()
+    && f.is_truthy()
+  {
+    return Some(CompositeRaw::Scalar(f.selected_scalar()?));
+  }
+  let av = v.get(1)?;
+  if av.is_truthy() {
+    return Some(CompositeRaw::Scalar(av.selected_scalar()?));
+  }
+  // `($val[0] || $val[1]) ? $val : undef` — neither truthy ⇒ undef.
+  None
+}
+
+/// The shared `%subSecConv` derivation (Exif.pm:4726) for the three SubSec
+/// composites. `$val[0]`=base DateTime (Require), `[1]`=SubSecTime (Desire),
+/// `[2]`=OffsetTime (Desire). Delegates to
+/// [`crate::composite::convs::datetime::sub_sec_assemble`] (the regex-faithful
+/// assembly); `None` ⇒ neither a usable sub-second nor an offset ⇒ not built.
+#[cfg(feature = "exif")]
+fn sub_sec_datetime(v: &[CompositeValue]) -> Option<CompositeRaw> {
+  let date = v.first()?.as_text()?;
+  let sub_sec = v.get(1).and_then(CompositeValue::as_text);
+  let offset = v.get(2).and_then(CompositeValue::as_text);
+  crate::composite::convs::datetime::sub_sec_assemble(&date, sub_sec.as_deref(), offset.as_deref())
+    .map(CompositeRaw::Text)
+}
+
 /// APE `Duration` (APE.pm:83-92). Registered only when the `ape` feature is on.
 #[cfg(feature = "ape")]
 const APE_DURATION: CompositeDef = CompositeDef {
@@ -668,6 +967,115 @@ const GPS_POSITION: CompositeDef = CompositeDef {
   sort_key: "Composite-GPSPosition",
 };
 
+/// `Composite:ImageSize` (Exif.pm:4747). `Require`s ImageWidth + ImageHeight
+/// (bare names, any group — ExifTool resolves the group-less tags), `Desire`s
+/// ExifImageWidth/Height + RawImageCroppedSize.
+#[cfg(feature = "exif")]
+const IMAGE_SIZE: CompositeDef = CompositeDef {
+  name: "ImageSize",
+  inputs: &[
+    bare_req("ImageWidth"),
+    bare_req("ImageHeight"),
+    bare_des("ExifImageWidth"),
+    bare_des("ExifImageHeight"),
+    bare_des("RawImageCroppedSize"),
+  ],
+  derive: image_size,
+  print_conv: CompositePrintConv::ImageSize,
+  priority: 1,
+  sort_key: "Composite-ImageSize",
+};
+
+/// `Composite:Megapixels` (Exif.pm:4767). `Require`s `Composite:ImageSize` — the
+/// composite-on-composite fixpoint (it defers until ImageSize is built).
+#[cfg(feature = "exif")]
+const MEGAPIXELS: CompositeDef = CompositeDef {
+  name: "Megapixels",
+  inputs: &[req(&["Composite"], "ImageSize")],
+  derive: megapixels,
+  print_conv: CompositePrintConv::Megapixels,
+  priority: 1,
+  sort_key: "Composite-Megapixels",
+};
+
+/// `Composite:ShutterSpeed` (Exif.pm:4773). `Desire`s ExposureTime /
+/// ShutterSpeedValue / BulbDuration (bare names — these EXIF tags resolve
+/// group-lessly in ExifTool).
+#[cfg(feature = "exif")]
+const SHUTTER_SPEED: CompositeDef = CompositeDef {
+  name: "ShutterSpeed",
+  inputs: &[
+    bare_des("ExposureTime"),
+    bare_des("ShutterSpeedValue"),
+    bare_des("BulbDuration"),
+  ],
+  derive: shutter_speed,
+  print_conv: CompositePrintConv::ShutterSpeed,
+  priority: 1,
+  sort_key: "Composite-ShutterSpeed",
+};
+
+/// `Composite:Aperture` (Exif.pm:4782). `Desire`s FNumber / ApertureValue. The
+/// RawConv `($val[0]||$val[1]) ? $val : undef` is folded into [`aperture`].
+#[cfg(feature = "exif")]
+const APERTURE: CompositeDef = CompositeDef {
+  name: "Aperture",
+  inputs: &[bare_des("FNumber"), bare_des("ApertureValue")],
+  derive: aperture,
+  print_conv: CompositePrintConv::Aperture,
+  priority: 1,
+  sort_key: "Composite-Aperture",
+};
+
+/// `Composite:SubSecDateTimeOriginal` (Exif.pm:5164). `Require`s
+/// `EXIF:DateTimeOriginal`, `Desire`s `EXIF:SubSecTimeOriginal` +
+/// `EXIF:OffsetTimeOriginal`; the shared `%subSecConv` assembles the result.
+#[cfg(feature = "exif")]
+const SUBSEC_DATETIME_ORIGINAL: CompositeDef = CompositeDef {
+  name: "SubSecDateTimeOriginal",
+  inputs: &[
+    req(EXIF_IFDS, "DateTimeOriginal"),
+    des(EXIF_IFDS, "SubSecTimeOriginal"),
+    des(EXIF_IFDS, "OffsetTimeOriginal"),
+  ],
+  derive: sub_sec_datetime,
+  print_conv: CompositePrintConv::SubSecDateTime,
+  priority: 1,
+  sort_key: "Composite-SubSecDateTimeOriginal",
+};
+
+/// `Composite:SubSecCreateDate` (Exif.pm:5183). `Require`s `EXIF:CreateDate`,
+/// `Desire`s `EXIF:SubSecTimeDigitized` + `EXIF:OffsetTimeDigitized`.
+#[cfg(feature = "exif")]
+const SUBSEC_CREATE_DATE: CompositeDef = CompositeDef {
+  name: "SubSecCreateDate",
+  inputs: &[
+    req(EXIF_IFDS, "CreateDate"),
+    des(EXIF_IFDS, "SubSecTimeDigitized"),
+    des(EXIF_IFDS, "OffsetTimeDigitized"),
+  ],
+  derive: sub_sec_datetime,
+  print_conv: CompositePrintConv::SubSecDateTime,
+  priority: 1,
+  sort_key: "Composite-SubSecCreateDate",
+};
+
+/// `Composite:SubSecModifyDate` (Exif.pm:5202). `Require`s `EXIF:ModifyDate`,
+/// `Desire`s `EXIF:SubSecTime` + `EXIF:OffsetTime`.
+#[cfg(feature = "exif")]
+const SUBSEC_MODIFY_DATE: CompositeDef = CompositeDef {
+  name: "SubSecModifyDate",
+  inputs: &[
+    req(EXIF_IFDS, "ModifyDate"),
+    des(EXIF_IFDS, "SubSecTime"),
+    des(EXIF_IFDS, "OffsetTime"),
+  ],
+  derive: sub_sec_datetime,
+  print_conv: CompositePrintConv::SubSecDateTime,
+  priority: 1,
+  sort_key: "Composite-SubSecModifyDate",
+};
+
 /// The full registry of ported Composite defs, cfg-gated per input format. The
 /// engine sorts a working copy by [`CompositeDef::sort_key`] (ExifTool's
 /// prefixed-id order) before the fixpoint, so this declaration order is
@@ -689,4 +1097,18 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   GPS_DATETIME,
   #[cfg(feature = "exif")]
   GPS_POSITION,
+  #[cfg(feature = "exif")]
+  IMAGE_SIZE,
+  #[cfg(feature = "exif")]
+  MEGAPIXELS,
+  #[cfg(feature = "exif")]
+  SHUTTER_SPEED,
+  #[cfg(feature = "exif")]
+  APERTURE,
+  #[cfg(feature = "exif")]
+  SUBSEC_DATETIME_ORIGINAL,
+  #[cfg(feature = "exif")]
+  SUBSEC_CREATE_DATE,
+  #[cfg(feature = "exif")]
+  SUBSEC_MODIFY_DATE,
 ];

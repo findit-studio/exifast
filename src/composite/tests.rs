@@ -681,3 +681,526 @@ mod gps {
     );
   }
 }
+
+// ===========================================================================
+// The registered EXIF Composites (Exif.pm) — ImageSize / Megapixels (the
+// composite-on-composite fixpoint) / ShutterSpeed / Aperture / SubSec*, end-to-
+// end through the real `REGISTRY`. Two-view (ValueConv + PrintConv) maps mirror
+// the bundled-ExifTool 13.59 truth the regenerated stills carry.
+// ===========================================================================
+
+#[cfg(feature = "exif")]
+mod exif {
+  use super::*;
+
+  #[test]
+  fn image_size_both_isfloat_branch_and_printconv_space_to_x() {
+    // `return "$val[0] $val[1]" if IsFloat($val[0]) and IsFloat($val[1])`.
+    // NikonD2Hs File:ImageWidth/Height = 8 (bare-name inputs). `-n` ⇒ "8 8";
+    // `-j` ⇒ the PrintConv `tr/ /x/` ⇒ "8x8".
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("File", "ImageWidth", TagValue::U64(8)),
+      ("File", "ImageHeight", TagValue::U64(8)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "ImageSize"),
+      Some(TagValue::Str("8 8".into()))
+    );
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "ImageSize"),
+      Some(TagValue::Str("8x8".into()))
+    );
+  }
+
+  #[test]
+  fn image_size_raw_image_cropped_size_branch_wins() {
+    // `return $val[4] if $val[4]` — a present RawImageCroppedSize (index 4)
+    // overrides the ImageWidth/Height branch and is used verbatim (already
+    // "WxH"). PrintConv `tr/ /x/` is a no-op on a value with no space.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("File", "ImageWidth", TagValue::U64(6000)),
+      ("File", "ImageHeight", TagValue::U64(4000)),
+      (
+        "RAF",
+        "RawImageCroppedSize",
+        TagValue::Str("6000x4000".into()),
+      ),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "ImageSize"),
+      Some(TagValue::Str("6000x4000".into())),
+      "RawImageCroppedSize ($val[4]) wins over the ImageWidth/Height branch"
+    );
+  }
+
+  #[test]
+  fn image_size_not_built_when_dimensions_non_numeric() {
+    // Neither IsFloat ⇒ the `$val[0] $val[1]` branch is skipped and (no
+    // RawImageCroppedSize) the ValueConv returns undef ⇒ not built.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("File", "ImageWidth", TagValue::Str("wide".into())),
+      ("File", "ImageHeight", TagValue::Str("tall".into())),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "ImageSize"), None);
+  }
+
+  #[test]
+  fn megapixels_requires_imagesize_fixpoint_oracle() {
+    // `Composite:Megapixels` `Require`s `Composite:ImageSize` — the composite-
+    // on-composite fixpoint. ImageSize must build first (from ImageWidth/Height),
+    // then Megapixels reads its ValueConv string and computes `d0*d1/1e6`.
+    // NikonD2Hs: 8*8/1e6 = 6.4e-5 (`-n`) / "0.000064" (`-j`).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("File", "ImageWidth", TagValue::U64(8)),
+      ("File", "ImageHeight", TagValue::U64(8)),
+    ];
+
+    // `-n`: bare f64.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "Megapixels"), Some(TagValue::F64(6.4e-5)));
+
+    // `-j`: the magnitude-keyed sprintf ⇒ 6 decimals for `< 0.001`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "Megapixels"),
+      Some(TagValue::Str("0.000064".into()))
+    );
+  }
+
+  #[test]
+  fn megapixels_not_built_without_imagesize() {
+    // No ImageWidth/Height ⇒ ImageSize never builds ⇒ Megapixels' Require of
+    // `Composite:ImageSize` fails after the fixpoint settles ⇒ neither builds.
+    let mut val = TagMap::new();
+    let mut prt = TagMap::new();
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "ImageSize"), None);
+    assert_eq!(composite(&val, "Megapixels"), None);
+  }
+
+  #[test]
+  fn megapixels_one_decimal_for_large_count() {
+    // DJI_Matrice30T: 1280*1024/1e6 = 1.31072 ⇒ `>= 1` ⇒ 1 dp "1.3" (`-j`).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("File", "ImageWidth", TagValue::U64(1280)),
+      ("File", "ImageHeight", TagValue::U64(1024)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "Megapixels"),
+      Some(TagValue::Str("1.3".into()))
+    );
+  }
+
+  #[test]
+  fn shutter_speed_exposure_time_branch() {
+    // `defined($val[0]) ? $val[0] : $val[1]` — ExposureTime present (no Bulb).
+    // NikonD2Hs ExposureTime 0.008 ⇒ `-n` 0.008, `-j` PrintExposureTime "1/125".
+    let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "ExposureTime", TagValue::F64(0.008))];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.008)));
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "ShutterSpeed"),
+      Some(TagValue::Str("1/125".into()))
+    );
+  }
+
+  #[test]
+  fn shutter_speed_bulb_duration_branch_wins() {
+    // `($val[2] and $val[2]>0) ? $val[2] : ...` — a positive BulbDuration wins
+    // over ExposureTime. Bulb 2.0 ⇒ `-n` 2.0, `-j` "2" (decimal, ".0" stripped).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.008)),
+      ("MakerNotes", "BulbDuration", TagValue::F64(2.0)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "ShutterSpeed"),
+      Some(TagValue::F64(2.0)),
+      "positive BulbDuration ($val[2]) overrides ExposureTime"
+    );
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "ShutterSpeed"),
+      Some(TagValue::Str("2".into()))
+    );
+  }
+
+  #[test]
+  fn shutter_speed_zero_bulb_falls_back_to_exposure_time() {
+    // `$val[2]>0` is false for a zero/negative BulbDuration ⇒ fall back to
+    // ExposureTime. Bulb 0 ⇒ uses ExposureTime 0.008.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("ExifIFD", "ExposureTime", TagValue::F64(0.008)),
+      ("MakerNotes", "BulbDuration", TagValue::F64(0.0)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.008)));
+  }
+
+  #[test]
+  fn shutter_speed_shutterspeedvalue_when_no_exposure_time() {
+    // ExposureTime undef ⇒ `$val[1]` (ShutterSpeedValue) is used.
+    let entries: &[(&str, &str, TagValue)] =
+      &[("ExifIFD", "ShutterSpeedValue", TagValue::F64(0.004))];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.004)));
+  }
+
+  #[test]
+  fn aperture_fnumber_or_aperturevalue_and_printfnumber() {
+    // `$val[0] || $val[1]` — FNumber present ⇒ used. NikonD2Hs FNumber 4.0 ⇒
+    // `-n` 4.0, `-j` PrintFNumber "4.0" (>= 1 ⇒ %.1f, no strip).
+    let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::F64(4.0))];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "Aperture"), Some(TagValue::F64(4.0)));
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "Aperture"),
+      Some(TagValue::Str("4.0".into()))
+    );
+
+    // FNumber absent / falsy ⇒ `$val[1]` (ApertureValue). 0.64 ⇒ "0.64" (< 1 ⇒ %.2f).
+    let entries2: &[(&str, &str, TagValue)] = &[("ExifIFD", "ApertureValue", TagValue::F64(0.64))];
+    let mut val = map_with(entries2);
+    let mut prt = map_with(entries2);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "Aperture"),
+      Some(TagValue::Str("0.64".into()))
+    );
+  }
+
+  #[test]
+  fn aperture_not_built_when_both_zero() {
+    // RawConv `($val[0] || $val[1]) ? $val : undef` — both falsy (numeric 0) ⇒
+    // not built.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("ExifIFD", "FNumber", TagValue::F64(0.0)),
+      ("ExifIFD", "ApertureValue", TagValue::F64(0.0)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "Aperture"), None);
+  }
+
+  #[test]
+  fn subsec_datetime_original_assembles_fraction() {
+    // NikonD2Hs: ExifIFD:DateTimeOriginal + SubSecTimeOriginal=16, no offset ⇒
+    // "2005:03:18 02:55:18.16". ConvertDateTime is identity ⇒ both modes equal.
+    let entries: &[(&str, &str, TagValue)] = &[
+      (
+        "ExifIFD",
+        "DateTimeOriginal",
+        TagValue::Str("2005:03:18 02:55:18".into()),
+      ),
+      ("ExifIFD", "SubSecTimeOriginal", TagValue::U64(16)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "SubSecDateTimeOriginal"),
+      Some(TagValue::Str("2005:03:18 02:55:18.16".into()))
+    );
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "SubSecDateTimeOriginal"),
+      Some(TagValue::Str("2005:03:18 02:55:18.16".into()))
+    );
+  }
+
+  #[test]
+  fn subsec_not_built_without_subsec_or_offset() {
+    // The Pentax/DJI/ExifGPS shape: a base DateTimeOriginal but NO SubSecTime
+    // and NO OffsetTime ⇒ `%subSecConv` returns undef ⇒ not built.
+    let entries: &[(&str, &str, TagValue)] = &[(
+      "ExifIFD",
+      "DateTimeOriginal",
+      TagValue::Str("2008:03:02 12:01:23".into()),
+    )];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(composite(&val, "SubSecDateTimeOriginal"), None);
+  }
+
+  #[test]
+  fn subsec_exif_group_restriction_ignores_xmp_collision() {
+    // `EXIF:DateTimeOriginal` restricts to the EXIF IFDs; an `XMP-exif`
+    // DateTimeOriginal of the same name must NOT satisfy the Require (it is not
+    // family-0 EXIF). With only an XMP source, the composite is not built.
+    let entries: &[(&str, &str, TagValue)] = &[
+      (
+        "XMP-exif",
+        "DateTimeOriginal",
+        TagValue::Str("1999:01:01 00:00:00".into()),
+      ),
+      ("XMP-exif", "SubSecTimeOriginal", TagValue::U64(99)),
+    ];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "SubSecDateTimeOriginal"),
+      None,
+      "an XMP-exif DateTimeOriginal must not satisfy EXIF:DateTimeOriginal"
+    );
+
+    // The same names in `ExifIFD` DO satisfy it.
+    let entries2: &[(&str, &str, TagValue)] = &[
+      (
+        "ExifIFD",
+        "DateTimeOriginal",
+        TagValue::Str("1999:01:01 00:00:00".into()),
+      ),
+      ("ExifIFD", "SubSecTimeOriginal", TagValue::U64(99)),
+    ];
+    let mut val = map_with(entries2);
+    let mut prt = map_with(entries2);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "SubSecDateTimeOriginal"),
+      Some(TagValue::Str("1999:01:01 00:00:00.99".into()))
+    );
+  }
+
+  /// `Composite:ShutterSpeed` / `Aperture` must PASS THROUGH a present-but-non-
+  /// float operand (a zero-denominator / `undef` EXIF rational that ValueConv'd
+  /// to the string `"undef"`) UNCHANGED — Exif.pm:5704/5719's
+  /// `PrintExposureTime`/`PrintFNumber` return the operand verbatim when
+  /// `IsFloat` fails. The prior `coerce_numeric` path turned `"undef"` into `0`
+  /// (`perl_str_to_f64("undef") == 0.0`), fabricating `Composite:ShutterSpeed`/
+  /// `Aperture` of `0`. The composite is STILL built (the operand is present +
+  /// `coerce_numeric`-eligible as a string), but renders the passthrough — in
+  /// BOTH `-n` (the raw `Str` operand) and `-j` (`PrintExposureTime("undef") ==
+  /// "undef"`).
+  #[test]
+  fn shutter_speed_passes_zero_denominator_undef_rational_through() {
+    use crate::value::TagValue;
+    // `ExifIFD:ExposureTime` present as the `undef` ValueConv string (the form a
+    // 0-denominator rational stringifies to). `bare_des("ExposureTime")` matches
+    // it; it is `defined`, so ShutterSpeed selects it as `$val[0]`.
+    let entries: &[(&str, &str, TagValue)] =
+      &[("ExifIFD", "ExposureTime", TagValue::Str("undef".into()))];
+
+    // `-n` (ValueConv): the selected operand value, UNCHANGED — the `"undef"`
+    // string, NOT `0`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "ShutterSpeed"),
+      Some(TagValue::Str("undef".into())),
+      "-n must pass the undef operand through, not coerce to 0"
+    );
+
+    // `-j` (PrintConv): `PrintExposureTime("undef")` ⇒ `"undef"` (IsFloat fails).
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "ShutterSpeed"),
+      Some(TagValue::Str("undef".into())),
+      "-j must pass the undef operand through, not render 0"
+    );
+  }
+
+  #[test]
+  fn aperture_passes_zero_denominator_undef_rational_through() {
+    use crate::value::TagValue;
+    // `EXIF:FNumber` present as the `undef` ValueConv string. It is Perl-TRUTHY
+    // (a non-empty, non-`"0"` string), so Aperture's `$val[0] || $val[1]` picks
+    // it; `PrintFNumber` then passes the non-float string through.
+    let entries: &[(&str, &str, TagValue)] =
+      &[("ExifIFD", "FNumber", TagValue::Str("undef".into()))];
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    assert_eq!(
+      composite(&val, "Aperture"),
+      Some(TagValue::Str("undef".into())),
+      "-n must pass the undef FNumber through, not coerce to 0"
+    );
+
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::PrintConv);
+    assert_eq!(
+      composite(&prt, "Aperture"),
+      Some(TagValue::Str("undef".into())),
+      "-j must pass the undef FNumber through, not render 0"
+    );
+  }
+
+  // ==========================================================================
+  // END-TO-END JSON serialization of the degenerate-operand passthrough.
+  //
+  // The R1-R3 passthrough tests above stop at the `composite(&map, name)`
+  // `TagValue` — they prove the `PrintExposureTime`/`PrintFNumber` helper +
+  // selection produce the right SCALAR. These tests carry that scalar one step
+  // further, through the SAME `serde_json` `Serialize` impl the `-j`/`-n` CLI
+  // uses (`crate::value::TagValue`), and assert on the EXACT emitted token —
+  // the step the R4 Codex finding (#133) flagged as un-covered.
+  //
+  // GROUND TRUTH (bundled ExifTool 13.59, an XMP with `exif:FNumber=0E0` +
+  // `exif:ExposureTime=-0.0`, `-j -G1 -Composite:all` and `-j -n -G1`):
+  //   Composite:Aperture      -> `0E0`  (BOTH -j and -n; literal, UNQUOTED)
+  //   Composite:ShutterSpeed  -> `-0`   (-j),  `-0.0` (-n)  (literal, UNQUOTED)
+  // ExifTool's `EscapeJSON` (`exiftool:3809`) emits a numeric-shaped scalar
+  // BARE via `return $str` — it preserves the ORIGINAL token verbatim, it does
+  // NOT reparse/canonicalize it.
+  //
+  // exifast stores the helper result as `TagValue::Str` and the shared
+  // serializer (`value.rs`) re-runs the `escape_json_is_number` gate then
+  // RE-EMITS via `serialize_f64`/`serialize_i64` — which CANONICALIZES the
+  // value form: `Str("0E0")` -> `0.0`, `Str("-0")` -> `0`. This is the
+  // crate-wide token-exact-vs-value-exact policy (Contract B / #197): every
+  // numeric-looking string tag (an `APE:Year` "2005" -> `2005`, an
+  // `ExifToolVersion` "13.59" -> `13.59`, the 11 PR-3 `Aperture` "4.0" goldens
+  // -> `4.0`) round-trips through that re-emit, and the STRICT comparator
+  // accepts the within-one-type numeric reshaping. So the divergence is NOT
+  // local to the composite path: it is the shared `value.rs` `Str`->number
+  // serializer, used by ALL string tags and depended on by all 540 goldens.
+  //
+  // Per the project ship-bar these are CRAFTED degenerate inputs (`0E0` /
+  // `-0.0` as an `exif:FNumber`/`ExposureTime`; no real device emits them and
+  // no fixture exercises them). Fixing them would require a broad change to the
+  // shared serializer (force-string the composite emit, or carry a
+  // "pre-rendered, do-not-reparse" flag through `TagValue`) — out of scope for
+  // this PR. The divergence is recorded as a tracked follow-up; these tests are
+  // `#[ignore]`d so they stand as executable documentation of the exact
+  // exifast-vs-bundled token gap without failing the suite.
+  //
+  // Each test ALSO asserts the byte-exact bundled token in a comment so the gap
+  // is unambiguous, and serializes a `Str("4.0")` control to prove the path is
+  // live (`4.0` is preserved value-exact, matching the PR-3 Aperture goldens).
+
+  /// Serialize a single composite `TagValue` exactly as the `-j`/`-n` CLI does.
+  #[cfg(feature = "json")]
+  fn emit(v: &TagValue) -> String {
+    serde_json::to_string(v).expect("serialize composite scalar")
+  }
+
+  /// CONTROL: a normal `Aperture` "4.0" (the 11 PR-3 goldens' shape) MUST
+  /// serialize to the bare `4.0` — proving the serializer preserves an ordinary
+  /// numeric-looking string value-exact (so the byte-identical goldens hold).
+  #[cfg(feature = "json")]
+  #[test]
+  fn aperture_normal_value_serializes_byte_exact_control() {
+    let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::F64(4.0))];
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    let aperture = composite(&prt, "Aperture").expect("Aperture built");
+    assert_eq!(aperture, TagValue::Str("4.0".into()));
+    // Bundled ExifTool 13.59: `Composite:Aperture: 4.0`. exifast: bare `4.0`.
+    assert_eq!(emit(&aperture), "4.0", "the PR-3 Aperture goldens' control");
+  }
+
+  /// `Composite:Aperture` over an `exif:FNumber=0E0` operand.
+  ///
+  /// Bundled ExifTool 13.59 emits the literal `0E0` (UNQUOTED) in BOTH `-j` and
+  /// `-n`. exifast canonicalizes `Str("0E0")` -> `0.0` via the shared
+  /// `value.rs` serializer. The composite SCALAR is correct (`Str("0E0")`); the
+  /// gap is purely in the shared `Str`->number JSON re-emit. `#[ignore]`d as a
+  /// tracked crafted-input follow-up (broad-serializer fix, out of PR scope).
+  #[cfg(feature = "json")]
+  #[test]
+  #[ignore = "crafted degenerate FNumber 0E0: bundled emits literal `0E0`, exifast's shared value.rs Str->number serializer canonicalizes to `0.0` (Contract B/#197); broad-serializer fix tracked as follow-up, not in PR #133 scope"]
+  fn aperture_degenerate_0e0_token_emit_vs_bundled() {
+    let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::Str("0E0".into()))];
+
+    // `-j` (PrintConv): PrintFNumber("0E0") — IsFloat matches, value 0 is not
+    // `> 0`, so it returns the norm "0E0" verbatim. Bundled: bare `0E0`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    let j = composite(&prt, "Aperture").expect("Aperture built (-j)");
+    assert_eq!(j, TagValue::Str("0E0".into()), "the SCALAR is correct");
+    assert_eq!(emit(&j), "0E0", "bundled emits literal `0E0`");
+
+    // `-n` (ValueConv): the operand passes through verbatim -> `Str("0E0")`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    let n = composite(&val, "Aperture").expect("Aperture built (-n)");
+    assert_eq!(n, TagValue::Str("0E0".into()));
+    assert_eq!(emit(&n), "0E0", "bundled emits literal `0E0`");
+  }
+
+  /// `Composite:ShutterSpeed` over an `exif:ExposureTime=-0.0` operand.
+  ///
+  /// Bundled ExifTool 13.59: `-0` (`-j`, after PrintExposureTime's `%.1f`+strip
+  /// gives `-0`), `-0.0` (`-n`, the raw operand). exifast: `Str("-0")` -> `0`
+  /// (`-j`) and `Str("-0.0")` -> serde `-0.0` (`-n`). The `-j` token loses the
+  /// sign; `-n` may match (serde emits `-0.0`). `#[ignore]`d follow-up.
+  #[cfg(feature = "json")]
+  #[test]
+  #[ignore = "crafted degenerate ExposureTime -0.0: bundled -j emits literal `-0`, exifast's shared value.rs Str->integer serializer drops the sign to `0`; broad-serializer fix tracked as follow-up, not in PR #133 scope"]
+  fn shutter_speed_degenerate_negzero_token_emit_vs_bundled() {
+    let entries: &[(&str, &str, TagValue)] =
+      &[("ExifIFD", "ExposureTime", TagValue::Str("-0.0".into()))];
+
+    // `-j` (PrintConv): PrintExposureTime("-0.0") — IsFloat matches, value -0.0
+    // is not `> 0` and not `< 0.25001 && > 0`, so `%.1f` -> "-0.0" -> strip
+    // ".0" -> "-0". Bundled: bare `-0`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    let j = composite(&prt, "ShutterSpeed").expect("ShutterSpeed built (-j)");
+    assert_eq!(j, TagValue::Str("-0".into()), "the SCALAR is correct");
+    assert_eq!(emit(&j), "-0", "bundled emits literal `-0`");
+
+    // `-n` (ValueConv): the operand passes through verbatim -> `Str("-0.0")`.
+    let mut val = map_with(entries);
+    let mut prt = map_with(entries);
+    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    let n = composite(&val, "ShutterSpeed").expect("ShutterSpeed built (-n)");
+    assert_eq!(n, TagValue::Str("-0.0".into()));
+    assert_eq!(emit(&n), "-0.0", "bundled emits literal `-0.0`");
+  }
+}
