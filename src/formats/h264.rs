@@ -1049,14 +1049,21 @@ pub struct H264Entry {
   name: SmolStr,
   priority: H264Priority,
   value: H264Value,
+  /// The family-3 sub-document index (`$$et{DOC_NUM}`, H264.pm:1082): `0` =
+  /// Main (the SPS image-size, the FIRST user-data SEI's MDPM, every binary
+  /// subdirectory tag). At `-ee` the MDPM of the (N+1)th user-data SEI is
+  /// stamped `doc = N` so it renders under `Doc<N>` (the per-frame AVCHD timed
+  /// axis). Always `0` at no-`ee` (only the first SEI is processed).
+  doc: u32,
 }
 
 impl H264Entry {
   /// Build a family-1 `H264`-group entry at the engine-default (`Normal`)
-  /// priority — the default for SPS image-size and every binary subdirectory
-  /// tag. The MDPM tags route through [`H264Entry::with_group_priority`] so the
-  /// GPS block (Codex R5 F1) lands in `GPS` and `0xa8 WhiteBalance` keeps its
-  /// `Priority => 0`.
+  /// priority in the Main document (`doc == 0`) — the default for SPS image-size
+  /// and every binary subdirectory tag. The MDPM tags route through
+  /// [`H264Entry::with_group_priority`] so the GPS block (Codex R5 F1) lands in
+  /// `GPS` and `0xa8 WhiteBalance` keeps its `Priority => 0`; per-frame `-ee`
+  /// MDPM tags get their `Doc<N>` stamp via [`H264Entry::set_doc`].
   #[must_use]
   #[inline(always)]
   fn h264(name: SmolStr, value: H264Value) -> Self {
@@ -1065,13 +1072,16 @@ impl H264Entry {
       name,
       priority: H264Priority::Normal,
       value,
+      doc: 0,
     }
   }
   /// Build an entry in an explicit family-1 group AND priority — the path every
   /// MDPM tag takes (threading `def.group` + `def.priority`), so the top-level
   /// `0xa8 WhiteBalance` (`Priority => 0`, H264.pm:215) lands as
   /// [`H264Priority::Low`] and does not overwrite a higher-priority same-name
-  /// tag (the Camera1 `WhiteBalance`, H264.pm:460-470).
+  /// tag (the Camera1 `WhiteBalance`, H264.pm:460-470). The entry starts in the
+  /// Main document; [`emit_mdpm`] re-stamps it with the SEI's `Doc<N>` via
+  /// [`H264Entry::set_doc`].
   #[must_use]
   #[inline(always)]
   fn with_group_priority(
@@ -1085,6 +1095,7 @@ impl H264Entry {
       name,
       priority,
       value,
+      doc: 0,
     }
   }
   /// The family-1 group this tag resolves to (`H264`, or `GPS` for the MDPM
@@ -1093,6 +1104,20 @@ impl H264Entry {
   #[inline(always)]
   pub const fn group(&self) -> H264Group {
     self.group
+  }
+  /// The family-3 sub-document index (`$$et{DOC_NUM}`, H264.pm:1082): `0` =
+  /// Main; `N` for the Nth per-frame `-ee` MDPM block (`Doc<N>`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn doc(&self) -> u32 {
+    self.doc
+  }
+  /// Stamp this entry's family-3 sub-document index (the SEI frame's `DOC_NUM`,
+  /// H264.pm:1082). Used by [`emit_mdpm`] to place a per-frame `-ee` MDPM tag
+  /// under `Doc<N>`.
+  #[inline(always)]
+  fn set_doc(&mut self, doc: u32) {
+    self.doc = doc;
   }
   /// This tag's `FoundTag` priority (ExifTool.pm:9458). `Normal` for every
   /// H264 tag except the top-level MDPM `0xa8 WhiteBalance` (`Priority => 0`,
@@ -1267,7 +1292,10 @@ impl FormatParser for ProcessH264 {
   type Context<'a> = &'a [u8];
 
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    parse_inner(data, &mut H264FrameState::new())
+    // Single-frame standalone parse — a fresh `$$et` (`got_nal06_count == 0`),
+    // so the first user-data SEI is always processed (the Main document) and the
+    // `-ee` later-frame gate is irrelevant; pass `extract_embedded = false`.
+    parse_inner(data, &mut H264FrameState::new(), false)
   }
 }
 
@@ -1286,7 +1314,7 @@ impl FormatParser for ProcessH264 {
 /// [`parse_borrowed_stateful`] instead.
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<H264Meta<'_>> {
-  parse_inner(data, &mut H264FrameState::new())
+  parse_inner(data, &mut H264FrameState::new(), false)
 }
 
 /// `$$et`-resident H.264 NAL latches that persist across the (up to two)
@@ -1301,15 +1329,29 @@ pub fn parse_borrowed(data: &[u8]) -> Option<H264Meta<'_>> {
 /// (H264.pm:1100-1104) faithfully suppresses the second frame's duplicate SPS
 /// (Codex M2TS finding #6) instead of letting a stateless re-parse overwrite
 /// the first frame's `ImageWidth`/`ImageHeight`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct H264FrameState {
   /// `$$et{GotNAL07}` (H264.pm:1093) — an SPS (0x07) has been parsed once;
   /// every later SPS NAL is skipped (`next if $$et{GotNAL07}`).
   got_nal07: bool,
-  /// `$$et{GotNAL06}` (H264.pm:1079/1088) — an SEI (0x06) carrying user data
-  /// has been processed; without `ExtractEmbedded` every later SEI is skipped
-  /// (`next unless $et->Options('ExtractEmbedded')`).
-  got_nal06: bool,
+  /// `$$et{GotNAL06}` (H264.pm:1079/1088) — the COUNT of SEI (0x06) units that
+  /// carried user data, `($$et{GotNAL06}||0)+1` per processed user-data SEI.
+  /// `0` ⇒ none yet (the first user-data SEI is the Main document); after the
+  /// Nth, the value is `N`. Without `ExtractEmbedded`, once it is non-zero every
+  /// later SEI is skipped (`if ($$et{GotNAL06}) { next unless ExtractEmbedded }`,
+  /// H264.pm:1079-1082). At `-ee` the count instead drives the per-frame
+  /// sub-document axis: the (N+1)th user-data SEI stamps `DOC_NUM =
+  /// $$et{GotNAL06}` = N (H264.pm:1082), so its MDPM tags land under `Doc<N>`.
+  got_nal06_count: u32,
+  /// `$$et{Make}` (H264.pm:530) — the manufacturer string the `0xe0` MakeModel
+  /// `RawConv` (`convMake{$val} || "Unknown"`) stores on the ExifTool object. It
+  /// is NEVER reset between frames, so the MDPM `Condition`s on later tags
+  /// (`0xe1 RecInfo`/`0xe4 Model`/`0xee FrameInfo`, `$$self{Make} eq "…"`,
+  /// H264.pm:396/405/417) consult the `Make` set by an EARLIER frame. At `-ee`
+  /// a frame whose first MDPM block set `0xe0`, then a later frame that omits
+  /// `0xe0` but emits a `Make`-gated record, still passes the gate (the latch
+  /// makes the cross-frame `$$et{Make}` sticky exactly as bundled does).
+  make: Option<SmolStr>,
 }
 
 impl H264FrameState {
@@ -1319,7 +1361,8 @@ impl H264FrameState {
   pub const fn new() -> Self {
     Self {
       got_nal07: false,
-      got_nal06: false,
+      got_nal06_count: 0,
+      make: None,
     }
   }
 }
@@ -1329,12 +1372,20 @@ impl H264FrameState {
 /// across calls (H264.pm:1032-1104). Returns `None` on a buffer with no NAL
 /// start code (reject), else `Some(meta)` for that frame. See
 /// [`H264FrameState`].
+///
+/// `extract_embedded` is ExifTool's `-ee` (`$$et{OPTIONS}{ExtractEmbedded}`,
+/// H264.pm:1081): at `-ee` a LATER user-data SEI (one past the first) is still
+/// processed — its MDPM tags emitted under the per-frame `Doc<N>` sub-document
+/// axis (`DOC_NUM = $$et{GotNAL06}`, H264.pm:1082) — instead of being suppressed
+/// by the `GotNAL06` latch. At no-`ee` the latch suppresses every SEI after the
+/// first (byte-identical to the prior behavior).
 #[must_use]
 pub fn parse_borrowed_stateful<'a>(
   data: &'a [u8],
   state: &mut H264FrameState,
+  extract_embedded: bool,
 ) -> Option<H264Meta<'a>> {
-  parse_inner(data, state)
+  parse_inner(data, state, extract_embedded)
 }
 
 /// Inner parser body. `None` ⇒ no NAL start code anywhere (reject); else
@@ -1342,7 +1393,16 @@ pub fn parse_borrowed_stateful<'a>(
 /// `GotNAL06`/`GotNAL07` latches (H264.pm:1079/1093) IN and OUT so a caller
 /// parsing successive frames on one `$$et` (the M2TS demuxer) suppresses a
 /// duplicate SPS / already-consumed SEI exactly as bundled does.
-fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Meta<'a>> {
+///
+/// `extract_embedded` (ExifTool `-ee`, H264.pm:1081) gates the per-frame later
+/// SEI/MDPM processing: at `-ee` a user-data SEI past the first is decoded under
+/// the `Doc<N>` axis (`DOC_NUM = $$et{GotNAL06}`, H264.pm:1082); at no-`ee` the
+/// `GotNAL06` latch suppresses it (byte-identical to the no-`ee` behavior).
+fn parse_inner<'a>(
+  data: &'a [u8],
+  state: &mut H264FrameState,
+  extract_embedded: bool,
+) -> Option<H264Meta<'a>> {
   // Reject buffers with no NAL start code at all — they are not an H.264
   // stream. (`ParseH264Video` would just walk off the end producing
   // nothing; we surface that as `Ok(None)` so a dispatcher can move on.)
@@ -1351,7 +1411,14 @@ fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Met
   }
 
   let mut entries: Vec<H264Entry> = Vec::new();
-  let mut make: Option<SmolStr> = None;
+  // `make` is SEEDED from the persistent `$$et{Make}` (H264.pm:530) and written
+  // back at the end — ExifTool never resets `$$self{Make}` between frames, so a
+  // later frame's MDPM `Condition`s (`0xe1 RecInfo`/`0xe4 Model`/`0xee
+  // FrameInfo`, `$$self{Make} eq "…"`, H264.pm:396/405/417) consult the `Make`
+  // an EARLIER frame's `0xe0 MakeModel` set. (At `-ee` a stream that sets the
+  // make once and later emits a make-gated record without repeating `0xe0`
+  // still passes the gate.) A standalone parse seeds `None` (fresh `$$et`).
+  let mut make: Option<SmolStr> = state.make.clone();
   let mut warnings: Vec<SmolStr> = Vec::new();
   // `got_sps`/`got_nal06` are seeded from the persistent `$$et` latches and
   // written back at the end, so a second frame on the same `$$et` skips an SPS
@@ -1360,7 +1427,7 @@ fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Met
   // value `ParseH264Video` returns and the M2TS extra-frame contract reads — so
   // it is a fresh local, distinct from the persistent `GotNAL06` skip gate.
   let mut got_sps = state.got_nal07; // H264.pm:1093 `$$et{GotNAL07}`
-  let mut got_nal06 = state.got_nal06; // H264.pm:1079/1088 `$$et{GotNAL06}`
+  let mut got_nal06_count = state.got_nal06_count; // H264.pm:1079/1088 `$$et{GotNAL06}`
   let mut found_user_data = false; // H264.pm:1039 `my $foundUserData`
 
   // H264.pm:1042-1099 — walk NAL units. `cursor` is the offset of the byte
@@ -1411,19 +1478,32 @@ fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Met
 
     match nal_type {
       0x06 => {
-        // H264.pm:1077-1088 — SEI. Without `ExtractEmbedded`, once an SEI has
-        // carried user data (`$$et{GotNAL06}`, persistent) every later SEI is
-        // skipped (`if ($$et{GotNAL06}) { next unless ExtractEmbedded }`) — this
-        // gate is per-FILE, so a second frame on the same `$$et` whose first
-        // frame already found the MDPM never re-processes its SEI.
-        if got_nal06 {
-          continue;
-        }
+        // H264.pm:1077-1088 — SEI. Once an SEI has carried user data
+        // (`$$et{GotNAL06}`, persistent across frames), the handling forks on
+        // `ExtractEmbedded` (`if ($$et{GotNAL06}) { next unless ExtractEmbedded;
+        // $$et{DOC_NUM} = $$et{GotNAL06} }`, H264.pm:1079-1082):
+        //   * no-`ee` ⇒ skip every later SEI (`next`). This gate is per-FILE, so a
+        //     second frame on the same `$$et` whose first frame already found the
+        //     MDPM never re-processes its SEI (byte-identical to the no-`ee`
+        //     baseline).
+        //   * `-ee` ⇒ STILL process it, under the per-frame sub-document axis
+        //     `DOC_NUM = $$et{GotNAL06}` (the running user-data-SEI count). The
+        //     first user-data SEI is the Main document (`doc == 0`); the Nth
+        //     (N≥2) lands its MDPM tags under `Doc<N-1>` so the AVCHD timed GPS /
+        //     DateTimeOriginal / exposure of LATER frames is extracted.
+        let doc = if got_nal06_count > 0 {
+          if !extract_embedded {
+            continue;
+          }
+          got_nal06_count // H264.pm:1082 `$$et{DOC_NUM} = $$et{GotNAL06}`
+        } else {
+          0 // first user-data SEI ⇒ Main document
+        };
         // `$foundUserData = ProcessSEI(...)`; `next unless $foundUserData`; then
         // `$$et{GotNAL06} = ($$et{GotNAL06}||0)+1` (H264.pm:1084-1088).
-        if process_sei(&rbsp, &mut entries, &mut make, &mut warnings) {
+        if process_sei(&rbsp, doc, &mut entries, &mut make, &mut warnings) {
           found_user_data = true;
-          got_nal06 = true;
+          got_nal06_count = got_nal06_count.saturating_add(1);
         }
       }
       0x07 => {
@@ -1448,9 +1528,13 @@ fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Met
   }
 
   // Write the persistent latches back to `$$et` (H264.pm:1088/1094) so the
-  // NEXT frame on this object suppresses a duplicate SPS / consumed SEI.
+  // NEXT frame on this object suppresses a duplicate SPS / consumed SEI and
+  // (at `-ee`) continues the per-frame `DOC_NUM` count. `Make` (H264.pm:530) is
+  // likewise sticky: a `0xe0 MakeModel` decoded this frame persists so a later
+  // frame's `$$self{Make}` `Condition`s consult it.
   state.got_nal07 = got_sps;
-  state.got_nal06 = got_nal06;
+  state.got_nal06_count = got_nal06_count;
+  state.make = make.clone();
 
   Some(H264Meta {
     entries,
@@ -1559,8 +1643,13 @@ fn unescape_rbsp(body: &[u8]) -> Cow<'_, [u8]> {
 /// payload type 5 (user data unregistered); when found, checks for the MDPM
 /// UUID and decodes the MDPM records. Returns `true` iff an MDPM block was
 /// processed (Perl `return 1` after handling type 5).
+///
+/// `doc` is the family-3 sub-document index every emitted MDPM tag is stamped
+/// with (`$$et{DOC_NUM}`, H264.pm:1082): `0` for the first user-data SEI (the
+/// Main document), `N` for the (N+1)th at `-ee` (the per-frame `Doc<N>` axis).
 fn process_sei(
   rbsp: &[u8],
+  doc: u32,
   entries: &mut Vec<H264Entry>,
   make: &mut Option<SmolStr>,
   warnings: &mut Vec<SmolStr>,
@@ -1735,7 +1824,7 @@ fn process_sei(
         last_tag += 1;
         combine -= 1;
       }
-      emit_mdpm(def, &buff, entries, make);
+      emit_mdpm(def, doc, &buff, entries, make);
     }
     // H264.pm:1022 — advance past this record.
     pos += 5;
@@ -1744,8 +1833,42 @@ fn process_sei(
   true
 }
 
-/// Render one matched MDPM tag's `buff` bytes into [`H264Entry`] values.
-fn emit_mdpm(def: &MdpmTag, buff: &[u8], entries: &mut Vec<H264Entry>, make: &mut Option<SmolStr>) {
+/// Render one matched MDPM tag's `buff` bytes into [`H264Entry`] values, each
+/// stamped with the family-3 sub-document index `doc` (`$$et{DOC_NUM}`,
+/// H264.pm:1082): `0` for the Main document, `N` for the per-frame `-ee`
+/// `Doc<N>`. The entry builders default `doc == 0`; this re-stamps every entry
+/// the call pushed (covering the binary-subdirectory tags routed through
+/// [`process_subdir`] uniformly).
+fn emit_mdpm(
+  def: &MdpmTag,
+  doc: u32,
+  buff: &[u8],
+  entries: &mut Vec<H264Entry>,
+  make: &mut Option<SmolStr>,
+) {
+  let start = entries.len();
+  emit_mdpm_inner(def, buff, entries, make);
+  if doc != 0 {
+    // `start <= entries.len()`, so the range is valid; only the entries this
+    // call appended are re-stamped (the Main-document tags pushed earlier keep
+    // `doc == 0`).
+    if let Some(pushed) = entries.get_mut(start..) {
+      for e in pushed {
+        e.set_doc(doc);
+      }
+    }
+  }
+}
+
+/// The decode/render body of [`emit_mdpm`] — pushes one matched MDPM tag's
+/// values (all at the default `doc == 0`); the wrapper re-stamps them with the
+/// SEI's `Doc<N>`.
+fn emit_mdpm_inner(
+  def: &MdpmTag,
+  buff: &[u8],
+  entries: &mut Vec<H264Entry>,
+  make: &mut Option<SmolStr>,
+) {
   match def.kind {
     MdpmKind::TimeCode => {
       // H264.pm:90 — `sprintf("%.2x:%.2x:%.2x:%.2x", reverse unpack("C*",$val))`.
@@ -3081,17 +3204,46 @@ impl crate::emit::Taggable for H264Meta<'_> {
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    // The family-3 doc axis is rendered ONLY at `-ee -G3` (H264.pm:1082); at
+    // `-G1` (and any no-`ee` render) it collapses, exactly as ExifTool's `%noDups`
+    // does for a per-frame timed sub-document. Note no-`ee` never produces a
+    // doc>0 entry anyway (the `GotNAL06` latch suppresses later SEI), so the
+    // collapse only matters at `-ee -G1`.
+    let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+    // `-G1` across-doc FIRST-wins collapse state, keyed by `(family1, name)`: a
+    // LATER frame's `Doc<N>` MDPM tag (e.g. frame 2's `GPS:GPSLatitude`) drops in
+    // favour of the FIRST document's value (frame 1), the same first-fix-wins the
+    // LIGOGPS / mebx timed sources show at `-ee -G1`. Unused at `-G3` (every
+    // `Doc<N>` row emits verbatim, the flat `TagMap` sink keying on the doc).
+    let mut committed: Vec<(H264Group, SmolStr)> = Vec::new();
     let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
     for (idx, entry) in self.entries.iter().enumerate() {
       // Skip an entry that a higher-priority — or equal-priority-but-later —
-      // same-`group:name` entry outranks (the relegated duplicate copy, dropped
-      // by the default render). `0xa8 WhiteBalance` (`Priority => 0`) loses to
-      // an earlier Camera1 `WhiteBalance`; equal priorities keep last-wins.
+      // same-`(doc, group, name)` entry outranks (the relegated duplicate copy,
+      // dropped by the default render). `0xa8 WhiteBalance` (`Priority => 0`)
+      // loses to an earlier Camera1 `WhiteBalance`; equal priorities keep
+      // last-wins. The dedup is per-doc so a per-frame `Doc<N>` tag survives.
       if !self.is_visible_winner(idx, entry) {
         continue;
       }
-      // family0 "H264" (table group0); family1 = the per-entry group.
-      let group = Group::new("H264", entry.group().as_str());
+      // `-G1` across-doc FIRST-wins: a later frame's `Doc<N>` tag whose
+      // `(family1, name)` already emitted (from an earlier document) is dropped.
+      if !g3 {
+        let key = (entry.group(), SmolStr::new(entry.name()));
+        if committed.contains(&key) {
+          continue;
+        }
+        committed.push(key);
+      }
+      // family0 "H264" (table group0); family1 = the per-entry group; family3 =
+      // the per-frame `-ee` sub-document (`Doc<N>`, `0` = Main, rendered only at
+      // `-G3`). `with_doc` with `doc == 0` is identical to `new`, so the no-`ee`
+      // / first-frame path is byte-identical (H264.pm:1082 `$$et{DOC_NUM}`).
+      let group = if g3 {
+        Group::with_doc("H264", entry.group().as_str(), entry.doc())
+      } else {
+        Group::new("H264", entry.group().as_str())
+      };
       let name = entry.name();
       let value = match entry.value_ref() {
         H264Value::U64(n) => TagValue::U64(*n),
@@ -3143,8 +3295,14 @@ impl H264Meta<'_> {
     let group = entry.group();
     let name = entry.name();
     let prio = entry.priority();
+    let doc = entry.doc();
     !self.entries.iter().enumerate().any(|(j, other)| {
       j != idx
+        // The priority/last-wins collapse is per `(doc, group, name)`: a
+        // per-frame `-ee` `Doc<N>` tag is a DISTINCT `FoundTag` identity from
+        // the same `group:name` in another document (TagMap keys on the doc
+        // too), so it must not be deduped against it (H264.pm:1082 `DOC_NUM`).
+        && other.doc() == doc
         && other.group() == group
         && other.name() == name
         && match other.priority().cmp(&prio) {
@@ -3444,6 +3602,79 @@ mod tests {
     stream.extend_from_slice(&escape_rbsp(&sei));
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
     stream
+  }
+
+  // === Cross-frame `$$self{Make}` persistence (H264.pm:530) ===
+
+  #[test]
+  fn make_persists_across_frames_gating_a_later_conditional_record() {
+    // ExifTool stores `$$self{Make}` on the `$$et` object from the `0xe0`
+    // MakeModel `RawConv` (H264.pm:530) and NEVER resets it between frames, so a
+    // later frame's `$$self{Make} eq "…"` `Condition`s (`0xe1 RecInfo`/`0xe4
+    // Model`/`0xee FrameInfo`, H264.pm:396/405/417) consult the make an EARLIER
+    // frame set. At `-ee` the demuxer processes later SEIs, so a stream that sets
+    // `0xe0` MakeModel in FRAME 1's MDPM and emits a make-gated record in FRAME
+    // 2's MDPM WITHOUT repeating `0xe0` must still produce that record.
+    //
+    // FRAME 1: `0xe0` MakeModel word0 = 0x0108 ⇒ Sony (H264.pm:38 `%convMake`).
+    let frame1 = mdpm_stream(&[0xe0, 0x01, 0x08, 0x00, 0x00]);
+    // FRAME 2: `0xe4` Model (Sony-only, `Condition => '$$self{Make} eq "Sony"'`,
+    // H264.pm:405) carrying the ASCII bytes "ABCD" — and NO `0xe0` record. Its
+    // `Combine => 2` only absorbs a consecutive `0xe5`; there is none, so the
+    // four data bytes are the whole Model string.
+    let frame2 = mdpm_stream(&[0xe4, b'A', b'B', b'C', b'D']);
+
+    // One shared `$$et` (`H264FrameState`) threaded across the two frames, `-ee`
+    // ON (the demuxer would process the later SEI under `Doc<N>`).
+    let mut state = H264FrameState::new();
+    let m1 = parse_borrowed_stateful(&frame1, &mut state, true).expect("frame 1");
+    assert_eq!(
+      m1.make(),
+      Some("Sony"),
+      "frame 1's 0xe0 MakeModel sets the make"
+    );
+    // The latch must now carry the make for the NEXT frame.
+    assert_eq!(
+      state.make.as_deref(),
+      Some("Sony"),
+      "the persistent `$$et{{Make}}` latch holds the make after frame 1"
+    );
+
+    let m2 = parse_borrowed_stateful(&frame2, &mut state, true).expect("frame 2");
+    // The persisted Sony make gated frame 2's `0xe4` Model — it IS emitted, even
+    // though frame 2 carried no `0xe0`.
+    let model = m2
+      .entries()
+      .iter()
+      .find(|e| e.name() == "Model")
+      .expect("frame 2's Sony-only Model must be emitted via the persisted Make");
+    if let H264Value::Text(t) = model.value_ref() {
+      assert_eq!(t.numeric(), "ABCD");
+    } else {
+      panic!("Model must be a Text value");
+    }
+    // Frame 2 is the SECOND user-data SEI on this `$$et`, so at `-ee` its MDPM
+    // tags land under `Doc1` (`$$et{DOC_NUM} = $$et{GotNAL06}` = 1, H264.pm:1082).
+    assert_eq!(model.doc(), 1, "frame 2's record is the Doc1 sub-document");
+    // The make remains sticky for any further frame.
+    assert_eq!(state.make.as_deref(), Some("Sony"));
+  }
+
+  #[test]
+  fn later_conditional_record_is_dropped_without_a_persisted_make() {
+    // Negative control proving the gate is REAL, not unconditional: the SAME
+    // frame-2 stream parsed against a FRESH `$$et` (no earlier `0xe0`) leaves
+    // `$$self{Make}` unset, so `0xe4` Model's `Condition => '$$self{Make} eq
+    // "Sony"'` (H264.pm:405) fails and the record is skipped.
+    let frame2 = mdpm_stream(&[0xe4, b'A', b'B', b'C', b'D']);
+    let mut state = H264FrameState::new();
+    let m = parse_borrowed_stateful(&frame2, &mut state, true).expect("frame 2");
+    assert!(
+      m.entries().iter().all(|e| e.name() != "Model"),
+      "with no persisted Make, the Sony-only Model record must be skipped, got {:?}",
+      m.entries()
+    );
+    assert!(state.make.is_none(), "no make was ever set");
   }
 
   // === Codex R15 F1 — FoundTag Priority (0xa8 WhiteBalance) ===
@@ -4164,9 +4395,9 @@ mod tests {
     let mut entries: Vec<H264Entry> = Vec::new();
     let mut make: Option<SmolStr> = None;
     let tc = mdpm_tag(0x13).unwrap();
-    emit_mdpm(tc, &[0x01], &mut entries, &mut make);
+    emit_mdpm(tc, 0, &[0x01], &mut entries, &mut make);
     let dt = mdpm_tag(0x18).unwrap();
-    emit_mdpm(dt, &[0x80, 0x20, 0x13, 0x05], &mut entries, &mut make);
+    emit_mdpm(dt, 0, &[0x80, 0x20, 0x13, 0x05], &mut entries, &mut make);
     assert_eq!(entries.len(), 2, "both short records must emit a tag");
     let tc_entry = entries.iter().find(|e| e.name() == "TimeCode").unwrap();
     let dt_entry = entries
