@@ -40,5 +40,8 @@
   "Track1:MediaTimeScale": 30000,
   "Track1:MediaDuration": "2.00 s",
   "Track1:MediaLanguageCode": "eng",
-  "Track1:HandlerType": "Video Track"
+  "Track1:HandlerType": "Video Track",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:Rotation": 0
 }]

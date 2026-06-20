@@ -46,5 +46,7 @@
   "Doc2:Track1:SampleTime": "1.00 s",
   "Doc2:Track1:SampleDuration": "1.00 s",
   "Doc2:Track1:FrameRate": "Inf",
-  "Doc2:Track1:ExposureTime": "inf"
+  "Doc2:Track1:ExposureTime": "inf",
+  "Composite:ShutterSpeed": "undef",
+  "Composite:AvgBitrate": "416 bps"
 }]

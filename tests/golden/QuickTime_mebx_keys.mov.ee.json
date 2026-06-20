@@ -43,5 +43,6 @@
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
   "Track1:SceneIlluminance": 1234,
-  "Track1:TestFooBar": "hi"
+  "Track1:TestFooBar": "hi",
+  "Composite:AvgBitrate": "176 bps"
 }]

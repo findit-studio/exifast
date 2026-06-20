@@ -54,5 +54,6 @@
   "Doc1:Track1:CameraTemperature": "30 C",
   "Doc1:Track1:FlashGuideNumber": 0,
   "Doc1:Track1:FlashExposureComp": 0,
-  "Doc1:ExifIFD:Model": "Canon EOS R5"
+  "Doc1:ExifIFD:Model": "Canon EOS R5",
+  "Composite:AvgBitrate": "1.46 kbps"
 }]

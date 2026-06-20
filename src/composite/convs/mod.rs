@@ -19,6 +19,7 @@ pub(crate) mod datetime;
 pub(crate) mod exif;
 pub(crate) mod gps;
 pub(crate) mod lens;
+pub(crate) mod video;
 
 #[cfg(feature = "alloc")]
 use crate::value::TagValue;

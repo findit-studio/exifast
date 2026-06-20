@@ -284,10 +284,26 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // Composite post-pass. (A future engine-perf PR could reuse the per-pass
     // `$val[]`/`$prt[]` scratch Vecs to shave the fixpoint overhead.) Ceilings
     // raised to (770, 860).
-    "MakerNotes_Apple.jpg" => (770, 860), // measured (699, 790) — #133 PR 3 composites
+    // RE-BASELINED for #133 PR 5 (full video Composite activation): the TagMap
+    // now carries each entry's family-0 group (an extra inline `SmolStr` per
+    // insert) so the Composite engine can resolve a family-0-qualified
+    // ingredient (`Sony:GPSLatitude`). The Composite re-emission inserts every
+    // tag into BOTH the ValueConv and PrintConv views, so the per-entry family-0
+    // clone is paid twice over the now-large Apple tag+composite set: `-j` 699 →
+    // 835, `-n` 790 → 956. A faithful, necessary metadata carry (PART A — it is
+    // what enables the Sony SubDoc GPS Composites), NOT a redundant clone; the
+    // `media_metadata` typed path is UNCHANGED (152) since it never runs the
+    // Composite post-pass. Ceilings raised to (870, 990).
+    "MakerNotes_Apple.jpg" => (870, 990), // measured (835, 956) — #133 PR 5 family-0 carry
     "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
-    "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
-    "Real.ra" => (100, 100),              // measured (88, 87)
+    // RE-BASELINED for #133 PR 5: a `video/*` QuickTime now RUNS the Composite
+    // post-pass (the full-video flip), building `Composite:AvgBitrate`/`ImageSize`/
+    // `Megapixels`/`Rotation` + re-emitting the opposite view — `-j` 135 → 195,
+    // `-n` 137 → 213. The intended cost of the newly-built video composites (the
+    // `Composite:GPSPosition` is the unported timed-GPS deferral), NOT a redundant
+    // clone. Ceilings raised to (210, 230).
+    "QuickTime_frea_rexing17b.mov" => (210, 230), // measured (195, 213) — #133 PR 5 video composites
+    "Real.ra" => (100, 100),                      // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }
 }

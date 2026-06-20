@@ -46,5 +46,6 @@
   "Doc1:Track1:GPSAltitude": "123 m",
   "Doc2:Track1:SampleTime": "1.00 s",
   "Doc2:Track1:SampleDuration": "1.00 s",
-  "Doc2:Track1:Warning": "Unknown camm record type 0"
+  "Doc2:Track1:Warning": "Unknown camm record type 0",
+  "Composite:AvgBitrate": "176 bps"
 }]

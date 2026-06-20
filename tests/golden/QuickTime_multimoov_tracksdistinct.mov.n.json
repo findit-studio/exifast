@@ -40,5 +40,9 @@
   "Track1:MediaTimeScale": 90000,
   "Track1:MediaDuration": 2,
   "Track1:MediaLanguageCode": "und",
-  "Track1:HandlerType": "vide"
+  "Track1:HandlerType": "vide",
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736,
+  "Composite:AvgBitrate": 64,
+  "Composite:Rotation": 0
 }]

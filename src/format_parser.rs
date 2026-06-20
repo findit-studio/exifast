@@ -704,40 +704,60 @@ impl AnyMeta<'_> {
   /// stream into a deduped [`Tag`](crate::value::Tag) `Vec` for the given
   /// `mode`, applying the SAME cross-cutting rules
   /// [`run_emission`](crate::emit::run_emission) does — Unknown-suppression
-  /// (`ExifTool.pm:9179`) then the faithful `(family1, name)` last-wins-in-place
-  /// dedup (with the priority-0 `Warning`/`Error` first-wins exception,
-  /// `ExifTool.pm:9544-9560`). Shared by [`iter_tags`](Self::iter_tags) (the
+  /// (`ExifTool.pm:9179`) then the priority-aware `(family1, name)` dedup
+  /// (`ExifTool.pm:9544-9560`). Shared by [`iter_tags`](Self::iter_tags) (the
   /// public output) and the Composite engine's ValueConv resolution view, so
   /// both observe an identical pre-composite tag set.
+  ///
+  /// The dedup decision is the SHARED [`crate::tagmap::dedup_override`] +
+  /// [`crate::tagmap::effective_priority`] predicate
+  /// [`crate::tagmap::TagMap::insert`] (the JSON / golden sink) also calls, so
+  /// the two sinks CANNOT diverge: a duplicate REPLACES the surviving slot (the
+  /// winner's whole `Tag` — value + family-0 + group) AND its stored effective
+  /// priority IFF the duplicate's effective priority is non-zero AND `>=` the
+  /// stored one. A `Priority => 0` duplicate (`Warning`/`Error`, or a
+  /// `VP8`/`VP8L` `ImageWidth` behind a `VP8X` canvas) never overrides ⇒
+  /// first-wins; an ordinary `Priority => 1` tag last-wins (`1 >= 1`).
+  /// First-occurrence POSITION is always preserved.
   #[cfg(feature = "alloc")]
   fn collect_deduped_tags(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::value::Tag> {
     let opts = crate::emit::EmitOptions::g1(mode, false);
-    let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
+    // Each slot carries its surviving entry's EFFECTIVE priority alongside the
+    // `Tag`, exactly as [`crate::tagmap::TagMap`] stores it, so a later
+    // duplicate is compared against the value that currently occupies the slot.
+    let mut out: std::vec::Vec<(crate::value::Tag, u8)> = std::vec::Vec::new();
     for e in self.collect_emitted(opts) {
       // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
       // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
       if e.unknown() {
         continue;
       }
+      let priority = e.priority();
       let tag = e.into_tag();
-      // Faithful last-wins-IN-PLACE dedup on the (family1, name) key — the
-      // same identity the `TagMap` sink dedups on (keeps first-occurrence
-      // POSITION, latest value wins). Linear scan (no_std + alloc clean; tag
-      // counts are small). EXCEPTION: the priority-0 `Warning`/`Error`
-      // pseudo-tags are FIRST-wins (a duplicate never overrides — ExifTool
-      // .pm:9544-9560 / 5404-5417), mirroring [`crate::tagmap::TagMap::insert`].
-      if let Some(slot) = out
-        .iter_mut()
-        .find(|t| t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name())
-      {
-        if tag.name() != "Warning" && tag.name() != "Error" {
-          *slot = tag;
+      // Priority-aware dedup on the (family1, name) key — the SAME identity AND
+      // the SAME override decision the `TagMap` sink applies (keeps
+      // first-occurrence POSITION). Linear scan (no_std + alloc clean; tag
+      // counts are small). The effective priority forces `Warning`/`Error` to
+      // `0`; the shared [`crate::tagmap::dedup_override`] predicate then makes
+      // them (and any other priority-0 tag, e.g. a `VP8`/`VP8L` `ImageWidth`
+      // behind a `VP8X` canvas) first-wins, while an ordinary `Priority => 1`
+      // duplicate last-wins — bit-for-bit identical to
+      // [`crate::tagmap::TagMap::insert`].
+      let effective = crate::tagmap::effective_priority(tag.name(), priority);
+      if let Some(slot) = out.iter_mut().find(|(t, _p)| {
+        t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name()
+      }) {
+        if crate::tagmap::dedup_override(effective, slot.1) {
+          // The winner's WHOLE tag (value + family-0 + the full group) replaces
+          // the slot, and its effective priority becomes the new stored one —
+          // mirroring `TagMap::insert`'s `(priority, value, family0)` co-update.
+          *slot = (tag, effective);
         }
       } else {
-        out.push(tag);
+        out.push((tag, effective));
       }
     }
-    out
+    out.into_iter().map(|(t, _p)| t).collect()
   }
 
   /// The format tag stream as [`value::Tag`](crate::value::Tag)s
@@ -773,47 +793,64 @@ impl AnyMeta<'_> {
     // we re-collect the SAME stream in the OPPOSITE mode for the other view.
     let mut other_view = self.collect_deduped_tags(mode.flipped());
     if self.runs_composites() {
-      crate::composite::build_composites_into_tags(&mut out, Some(&mut other_view), mode);
+      let doc_count = out.iter().map(|t| t.group_ref().doc()).max().unwrap_or(0);
+      let mdat_total = self.composite_media_data_total();
+      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType.
+      let value_view: &std::vec::Vec<crate::value::Tag> = match mode {
+        crate::emit::ConvMode::ValueConv => &out,
+        crate::emit::ConvMode::PrintConv => &other_view,
+      };
+      let rotation = crate::composite::calc_rotation_from(
+        value_view
+          .iter()
+          .map(|t| (t.group_ref().family1(), t.name(), t.value_ref())),
+      );
+      let ctx = crate::composite::CompositeContext::new(mdat_total, rotation);
+      crate::composite::build_composites_into_tags(
+        &mut out,
+        Some(&mut other_view),
+        mode,
+        doc_count,
+        &ctx,
+      );
     }
     out.into_iter()
   }
 
-  /// Does this `AnyMeta` RUN the Composite post-pass in THIS #133 PR?
+  /// Does this `AnyMeta` RUN the Composite post-pass?
   ///
-  /// An ALLOW-LIST: the post-pass runs only for the `AnyMeta` variants whose
-  /// ported Composite path is faithful at the single-Main-document axis this PR
-  /// builds. Everything else DEFERS — its Composites either live on the per-
-  /// sample `Doc<N>` axis #133 PR 5 adds (the timed / video GPS), or are
-  /// camera/lens composites no PR has ported yet. Bundled excludes Composite for
-  /// every deferred format's golden (the established M2TS/QuickTime precedent),
-  /// so skipping the pass keeps them byte-identical.
+  /// An ALLOW-LIST of the `AnyMeta` variants whose ported Composite path is
+  /// faithful (#133 PR 5 — FULL video activation). The post-pass is a generic
+  /// `BuildCompositeTags` fixpoint; the allow-list gates WHICH formats run it so
+  /// a not-yet-covered format keeps its (Composite-excluded) golden untouched.
   ///
-  /// The reason this is an allow-list and not the prior deny-list: this PR adds
-  /// `Composite:ImageSize`/`Megapixels`, whose `Require`d `ImageWidth`/
-  /// `ImageHeight` are BARE-NAME (any-group) inputs present in nearly every
-  /// format (QuickTime/Matroska/RIFF/Red/… all emit `ImageWidth`). A deny-list
-  /// would build `ImageSize` for all of them, diverging from their (Composite-
-  /// excluded) goldens. Restricting to the ported still-image + audio paths
-  /// keeps the deferred formats untouched.
+  /// The reason this is an allow-list and not a blanket "all formats run": the
+  /// remaining audio/container formats (Mxf / Real / Ogg / Mpc / Wv / Dsf / Mp3
+  /// / Mpeg / Plist / Jp2 / Crw / Moi / Aac / Audible …) have NO Composite tag
+  /// in their bundled output (or one this port has not ported), so their goldens
+  /// are generated with `-x Composite:all`; running the pass for them would
+  /// build `Composite:ImageSize`/`Megapixels` from a bare `ImageWidth` and
+  /// diverge. The allow-list is every format whose video/still goldens HAVE been
+  /// regenerated WITH composites.
   ///
   /// Runs for:
-  /// * `Exif` — TIFF/JPEG EXIF stills (the EXIF + GPS Composite subsystem, a
-  ///   single Main document).
-  /// * `Xmp` — an XMP sidecar / packet, a single Main document. PR 2 builds its
-  ///   GPS Composites from the embedded `XMP-exif:GPS*` (`Composite:GPSAltitude`,
-  ///   golden-pinned); this PR adds its `XMP-tiff:ImageWidth`/`XMP-exif:FNumber`/
-  ///   … Tier-A Composites. (Its `XMP-exif:DateTimeOriginal` is NOT family-0
-  ///   `EXIF`, so the `EXIF:`-keyed SubSec composites do not build for it,
-  ///   matching bundled.)
-  /// * `QuickTime` IFF its `MIMEType` is `image/*` — the HEIF/HEIC/AVIF stills
-  ///   (`mime()`); a `video/*` QuickTime (MOV/MP4/M4V/iso5/CR3/…) defers its
-  ///   timed GPS Composites to PR 5. This arm is a RUNTIME mime check, so the
-  ///   predicate is not `const`.
-  /// * `Ape` / `Flac` / `Aiff` — the audio `Composite:Duration` path (PR 1).
+  /// * `Exif` — TIFF/JPEG EXIF stills (the EXIF + GPS + lens Composite
+  ///   subsystem), EXCEPT the Canon/Phase-One TIFF-base RAW subtypes (see the
+  ///   `Exif` arm).
+  /// * `Xmp` — an XMP sidecar / packet (the Tier-A + GPS-altitude Composites).
+  /// * `QuickTime` — stills (HEIF/HEIC/AVIF) AND video (MOV/MP4/M4V/iso5/CR3/…):
+  ///   `AvgBitrate` + `Rotation` + `ImageSize`/`Megapixels` at Main, plus the
+  ///   per-`Doc<N>` GPS SubDoc composites — the Sony rtmd `Doc<N>:Composite:GPS*`
+  ///   (built from the family-0-qualified `Sony:` inputs, which the TagMap now
+  ///   carries), the GoPro/camm Main `GPSPosition` (cross-doc base-key), etc.
+  /// * `M2ts` / `H264` — the AVCHD H.264/MDPM `Doc<N>` GPS + `ImageSize`/
+  ///   `Megapixels`/`AvgBitrate` from the H.264 dimensions.
+  /// * `Matroska` / `Riff` (avi + webp) / `R3d` / `Dv` / `Flv` — the container
+  ///   `ImageSize`/`Megapixels`/`Duration`/`Rotation` composites.
+  /// * `Png` — `Composite:ImageSize`/`Megapixels` from the IHDR dimensions.
+  /// * `Ape` / `Flac` / `Aiff` — the audio `Composite:Duration` path.
   ///
-  /// Everything else defers: QuickTime `video/*`, Matroska, R3d, Dv, Flv, Riff
-  /// (avi + webp), Png, M2ts, H264, and the remaining audio/container formats
-  /// (none of which has a ported Main-document Composite).
+  /// Everything else (the remaining audio/container formats above) defers.
   #[cfg(feature = "alloc")]
   fn runs_composites(&self) -> bool {
     match self {
@@ -827,19 +864,44 @@ impl AnyMeta<'_> {
       // branch and would instead fall through to `ImageWidth`/`ImageHeight` —
       // the WRONG `ImageSize` (poisoning `Megapixels`). Until the subtype is
       // threaded into the post-pass (the faithful option (a)), DEFER all
-      // composites for those RAW subtypes (a documented deferral, like the
-      // video deferral), so exifast emits NO `Composite:ImageSize`/`Megapixels`
-      // rather than a wrong one. The finalized FileType is reconstructed from
-      // the `ExifMeta`'s own content signals (`is_cr2_magic`/`has_dng_version`)
-      // + its threaded ext/parent name (`file_type`) — see
-      // [`exif_file_type_is_raw_imagesize_subtype`].
+      // composites for those RAW subtypes (a documented deferral), so exifast
+      // emits NO `Composite:ImageSize`/`Megapixels` rather than a wrong one.
       #[cfg(feature = "exif")]
       AnyMeta::Exif(m) => !exif_file_type_is_raw_imagesize_subtype(m),
       #[cfg(feature = "xmp")]
       AnyMeta::Xmp(_) => true,
-      // HEIF/HEIC/AVIF stills run; video QuickTime defers (timed GPS → PR 5).
+      // QuickTime — stills (HEIF/HEIC/AVIF) AND video. #133 PR 5: AvgBitrate +
+      // Rotation + ImageSize/Megapixels at Main, plus the per-`Doc<N>` GPS SubDoc
+      // composites. The Sony rtmd `Doc<N>:Composite:GPS*` build from the
+      // family-0-qualified `Sony:` inputs the TagMap now carries (PART A); GoPro/
+      // camm/mebx (family-0 `GoPro`/…) do NOT match the Sony defs, so they get
+      // only the Main cross-doc `GPSPosition`, matching bundled.
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => m.mime().starts_with("image/"),
+      AnyMeta::QuickTime(_) => true,
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(_) => true,
+      // H264 is ENGINE-ONLY (no file type): a standalone `.h264` is reached only
+      // via `parse_h264` (the bare `ParseH264Video` callback), whose reference
+      // golden is a bare-parser capture with NO composites (ExifTool builds
+      // Composites at the `BuildCompositeTags` level, never in a format parser).
+      // When H264 is wrapped in M2TS, the `M2ts` arm (above) runs the pass over
+      // the spliced H264 tags — so M2TS still gets `Composite:ShutterSpeed`/
+      // `ImageSize`/… faithfully. So H264 itself does NOT run the pass (flipping
+      // it would emit composites the bare-parser reference lacks).
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(_) => false,
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(_) => true,
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(_) => true,
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(_) => true,
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(_) => true,
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(_) => true,
+      #[cfg(feature = "png")]
+      AnyMeta::Png(_) => true,
       #[cfg(feature = "ape")]
       AnyMeta::Ape(_) => true,
       #[cfg(feature = "flac")]
@@ -913,10 +975,35 @@ impl AnyMeta<'_> {
       let other_opts =
         crate::emit::EmitOptions::with_group_mode(mode.flipped(), extract_embedded, group_mode);
       crate::emit::run_emission(self, other_opts, &mut other_view);
-      crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count);
+      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType +
+      // MatrixStructure (ExifTool tests the raw 4cc): `out` under `-n`, else the
+      // opposite-mode re-emission.
+      let mdat_total = self.composite_media_data_total();
+      let ctx = {
+        let value_view = match mode {
+          crate::emit::ConvMode::ValueConv => &*out,
+          crate::emit::ConvMode::PrintConv => &other_view,
+        };
+        crate::composite::make_context(mdat_total, value_view)
+      };
+      crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count, &ctx);
     }
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
+  }
+
+  /// The summed `MediaDataSize` total the Composite post-pass threads into
+  /// `Composite:AvgBitrate` (the `NextTagKey('MediaDataSize')` sum,
+  /// QuickTime.pm:8654-8660; the dedup-collapsing `TagMap` keeps only one
+  /// `MediaDataSize` tag). Only QuickTime carries it; every other Meta returns
+  /// `None`.
+  #[cfg(feature = "alloc")]
+  fn composite_media_data_total(&self) -> Option<u64> {
+    match self {
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => m.quicktime().media_data_total(),
+      _ => None,
+    }
   }
 }
 
@@ -1922,7 +2009,7 @@ const _: () = {
       // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
       let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (doc, doc_sub, group, name, _priority, value) in entries {
+      for (doc, doc_sub, group, name, _priority, value, _family0) in entries {
         crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, group_mode);
         map.serialize_entry(key.as_str(), value)?;
       }

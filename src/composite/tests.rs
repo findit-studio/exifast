@@ -8,7 +8,8 @@
 #![cfg(feature = "alloc")]
 
 use super::table::{
-  CompositeDef, CompositeInput, CompositePrintConv, CompositeRaw, CompositeValue, InputKind,
+  CompositeContext, CompositeDef, CompositeInput, CompositePrintConv, CompositeRaw, CompositeValue,
+  InputKind, SubDoc,
 };
 use super::*;
 use crate::emit::ConvMode;
@@ -21,11 +22,18 @@ const GX: &[&str] = &["X"];
 const GP_Q: &[&str] = &["P", "Q"];
 const GCOMPOSITE: &[&str] = &["Composite"];
 
+/// The default (empty) context for the synthetic oracle tests — no format-state
+/// reads (`AvgBitrate`/`Rotation` are not exercised by the synthetic defs).
+fn ctx0() -> CompositeContext {
+  CompositeContext::new(None, None)
+}
+
 /// A synthetic `Require`d input on `group`.
 const fn req(group: &'static [&'static str], name: &'static str) -> CompositeInput {
   CompositeInput {
     kind: InputKind::Require,
     groups: group,
+    group0: None,
     name,
   }
 }
@@ -35,6 +43,7 @@ const fn des(group: &'static [&'static str], name: &'static str) -> CompositeInp
   CompositeInput {
     kind: InputKind::Desire,
     groups: group,
+    group0: None,
     name,
   }
 }
@@ -44,12 +53,17 @@ const fn inh(group: &'static [&'static str], name: &'static str) -> CompositeInp
   CompositeInput {
     kind: InputKind::Inhibit,
     groups: group,
+    group0: None,
     name,
   }
 }
 
 /// Sum the present inputs (a stand-in derivation; `Missing`/non-numeric ⇒ 0).
-fn sum_inputs(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn sum_inputs(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   Some(CompositeRaw::Num(
     v.iter().map(|x| x.coerce_numeric().unwrap_or(0.0)).sum(),
   ))
@@ -59,7 +73,7 @@ fn sum_inputs(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<Compos
 fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
   let mut m = TagMap::new();
   for (g, n, v) in entries {
-    let _ = m.write_value_doc(0, 0, g, n, 1, v.clone());
+    let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
   }
   m
 }
@@ -74,6 +88,7 @@ const SUM_AB: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A"), req(GX, "B")],
   derive: sum_inputs,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "X-Sum",
 };
@@ -81,7 +96,7 @@ const SUM_AB: CompositeDef = CompositeDef {
 #[test]
 fn require_present_builds() {
   let mut m = map_with(&[("X", "A", TagValue::I64(40)), ("X", "B", TagValue::I64(20))]);
-  build_into(&[SUM_AB], &mut m, None, ConvMode::ValueConv);
+  build_into(&[SUM_AB], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   // 40 + 20 = 60 seconds, ValueConv ⇒ bare f64.
   assert_eq!(composite(&m, "Sum"), Some(TagValue::F64(60.0)));
 }
@@ -90,7 +105,7 @@ fn require_present_builds() {
 fn require_missing_aborts() {
   // B is absent ⇒ Require miss ⇒ no composite.
   let mut m = map_with(&[("X", "A", TagValue::I64(40))]);
-  build_into(&[SUM_AB], &mut m, None, ConvMode::ValueConv);
+  build_into(&[SUM_AB], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), None);
 }
 
@@ -101,12 +116,13 @@ fn desire_absent_still_builds_with_undef_element() {
     inputs: &[req(GX, "A"), des(GX, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Sum",
   };
   // B (Desire) absent ⇒ element None (counted as 0) but the composite builds.
   let mut m = map_with(&[("X", "A", TagValue::I64(40))]);
-  build_into(&[DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), Some(TagValue::F64(40.0)));
 }
 
@@ -117,6 +133,7 @@ fn inhibit_present_suppresses() {
     inputs: &[req(GX, "A"), inh(GX, "Block")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Sum",
   };
@@ -125,12 +142,12 @@ fn inhibit_present_suppresses() {
     ("X", "A", TagValue::I64(40)),
     ("X", "Block", TagValue::I64(1)),
   ]);
-  build_into(&[DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), None);
 
   // Without the Inhibit tag, it builds.
   let mut m2 = map_with(&[("X", "A", TagValue::I64(40))]);
-  build_into(&[DEF], &mut m2, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m2, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m2, "Sum"), Some(TagValue::F64(40.0)));
 }
 
@@ -145,6 +162,7 @@ fn inhibit_present_nonnumeric_string_suppresses() {
     inputs: &[req(GX, "A"), inh(GX, "Block")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Sum",
   };
@@ -153,7 +171,7 @@ fn inhibit_present_nonnumeric_string_suppresses() {
     ("X", "A", TagValue::I64(40)),
     ("X", "Block", TagValue::Str("present".into())),
   ]);
-  build_into(&[DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), None);
 
   // Even an empty string is PRESENT (ExifTool: `defined ""` is true) ⇒ suppresses.
@@ -161,7 +179,7 @@ fn inhibit_present_nonnumeric_string_suppresses() {
     ("X", "A", TagValue::I64(40)),
     ("X", "Block", TagValue::Str("".into())),
   ]);
-  build_into(&[DEF], &mut m2, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m2, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m2, "Sum"), None);
 }
 
@@ -170,7 +188,11 @@ fn desire_present_nonnumeric_string_reaches_derive() {
   // Finding-1: a present-but-non-numeric (string) Desire reaches `derive` as a
   // `Present(Str)` element (so future GPS/EXIF/datetime defs can read strings),
   // NOT as a `Missing`. The derive here asserts the raw value it was handed.
-  fn assert_first_is_str(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+  fn assert_first_is_str(
+    v: &[CompositeValue],
+    _prts: &[Option<TagValue>],
+    _ctx: &CompositeContext,
+  ) -> Option<CompositeRaw> {
     assert_eq!(
       v.first().and_then(CompositeValue::value),
       Some(&TagValue::Str("N".into())),
@@ -184,11 +206,12 @@ fn desire_present_nonnumeric_string_reaches_derive() {
     inputs: &[des(GX, "Ref")],
     derive: assert_first_is_str,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Dur",
   };
   let mut m = map_with(&[("X", "Ref", TagValue::Str("N".into()))]);
-  build_into(&[DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   // 1.0 s ⇒ ValueConv bare f64; proves the derive ran (the asserts inside fired).
   assert_eq!(composite(&m, "Dur"), Some(TagValue::F64(1.0)));
 }
@@ -202,6 +225,7 @@ fn composite_requires_composite_deferred_then_built() {
     inputs: &[req(GX, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Inner",
   };
@@ -210,11 +234,19 @@ fn composite_requires_composite_deferred_then_built() {
     inputs: &[req(GCOMPOSITE, "Inner"), req(GX, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Outer",
   };
   let mut m = map_with(&[("X", "A", TagValue::I64(10)), ("X", "B", TagValue::I64(5))]);
-  build_into(&[OUTER, INNER], &mut m, None, ConvMode::ValueConv);
+  build_into(
+    &[OUTER, INNER],
+    &mut m,
+    None,
+    ConvMode::ValueConv,
+    0,
+    &ctx0(),
+  );
   assert_eq!(composite(&m, "Inner"), Some(TagValue::F64(10.0)));
   // Outer = Composite:Inner (10) + X:B (5) = 15.
   assert_eq!(composite(&m, "Outer"), Some(TagValue::F64(15.0)));
@@ -229,6 +261,7 @@ fn composite_requires_composite_in_reverse_sort_order() {
     inputs: &[req(GX, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "Z-Inner", // sorts AFTER Outer
   };
@@ -237,11 +270,19 @@ fn composite_requires_composite_in_reverse_sort_order() {
     inputs: &[req(GCOMPOSITE, "Inner")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "A-Outer", // sorts BEFORE Inner ⇒ attempted first ⇒ defers
   };
   let mut m = map_with(&[("X", "A", TagValue::I64(7))]);
-  build_into(&[INNER, OUTER], &mut m, None, ConvMode::ValueConv);
+  build_into(
+    &[INNER, OUTER],
+    &mut m,
+    None,
+    ConvMode::ValueConv,
+    0,
+    &ctx0(),
+  );
   assert_eq!(composite(&m, "Inner"), Some(TagValue::F64(7.0)));
   assert_eq!(composite(&m, "Outer"), Some(TagValue::F64(7.0)));
 }
@@ -256,6 +297,7 @@ fn circular_dependency_does_not_loop() {
     inputs: &[req(GCOMPOSITE, "B")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "M-A",
   };
@@ -264,11 +306,12 @@ fn circular_dependency_does_not_loop() {
     inputs: &[req(GCOMPOSITE, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "M-B",
   };
   let mut m = TagMap::new();
-  build_into(&[A, B], &mut m, None, ConvMode::ValueConv);
+  build_into(&[A, B], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "A"), None);
   assert_eq!(composite(&m, "B"), None);
 }
@@ -282,16 +325,21 @@ fn last_emitted_duplicate_wins_across_group_set() {
     inputs: &[req(GP_Q, "A")],
     derive: sum_inputs,
     print_conv: CompositePrintConv::ConvertDuration,
+    sub_doc: SubDoc::No,
     priority: 1,
     sort_key: "X-Sum",
   };
   let mut m = map_with(&[("P", "A", TagValue::I64(1)), ("Q", "A", TagValue::I64(99))]);
-  build_into(&[DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), Some(TagValue::F64(99.0)));
 }
 
 /// A derivation that always aborts (the `… ? … : undef` guard).
-fn always_none(_v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn always_none(
+  _v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   None
 }
 
@@ -300,6 +348,7 @@ const NONE_DEF: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A")],
   derive: always_none,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "X-Sum",
 };
@@ -309,12 +358,16 @@ fn derive_returning_none_emits_nothing() {
   // The `… ? … : undef` guard: a derivation returning None settles the def
   // without emitting (no panic, no spurious tag).
   let mut m = map_with(&[("X", "A", TagValue::I64(5))]);
-  build_into(&[NONE_DEF], &mut m, None, ConvMode::ValueConv);
+  build_into(&[NONE_DEF], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(composite(&m, "Sum"), None);
 }
 
 /// A derivation yielding input 0's numeric coercion verbatim.
-fn first_input(v: &[CompositeValue], _prts: &[Option<TagValue>]) -> Option<CompositeRaw> {
+fn first_input(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
   Some(CompositeRaw::Num(v.first()?.coerce_numeric()?))
 }
 
@@ -323,6 +376,7 @@ const DUR_DEF: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A")],
   derive: first_input,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "X-Dur",
 };
@@ -335,7 +389,7 @@ fn composite_appended_after_format_tags_keeps_last_position() {
     ("X", "A", TagValue::I64(30)),
     ("X", "Z", TagValue::Str("tail".into())),
   ]);
-  build_into(&[DUR_DEF], &mut m, None, ConvMode::PrintConv);
+  build_into(&[DUR_DEF], &mut m, None, ConvMode::PrintConv, 0, &ctx0());
   let last = m.entries().last().expect("non-empty");
   assert_eq!(last.2.as_str(), "Composite");
   assert_eq!(last.3.as_str(), "Dur");
@@ -354,6 +408,7 @@ const PROBE_DEF: CompositeDef = CompositeDef {
   // ValueConv output ⇒ a bare f64, so the resolved-then-coerced value is read
   // back directly (no ConvertDuration formatting to decode).
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "X-Probe",
 };
@@ -372,7 +427,14 @@ fn input_resolves_from_raw_value_not_printconv_in_both_modes() {
   // `-n` (ValueConv): the single `out` sink holds the raw value (its own
   // resolution view). The composite must read 42.0.
   let mut out_n = map_with(&[("X", "A", TagValue::I64(42))]);
-  build_into(&[PROBE_DEF], &mut out_n, None, ConvMode::ValueConv);
+  build_into(
+    &[PROBE_DEF],
+    &mut out_n,
+    None,
+    ConvMode::ValueConv,
+    0,
+    &ctx0(),
+  );
   assert_eq!(
     composite(&out_n, "Probe"),
     Some(TagValue::F64(42.0)),
@@ -391,6 +453,8 @@ fn input_resolves_from_raw_value_not_printconv_in_both_modes() {
     &mut out_j,
     Some(&mut raw_view),
     ConvMode::PrintConv,
+    0,
+    &ctx0(),
   );
   // 42 s ⇒ ConvertDuration "0:00:42" under `-j` — proving the input was the raw
   // 42 (a leaked `Str("North")` ⇒ 0.0 ⇒ ConvertDuration "0 s").
@@ -410,6 +474,7 @@ const SIGNED_SUM: CompositeDef = CompositeDef {
   inputs: &[req(GX, "A"), req(GX, "B")],
   derive: sum_inputs,
   print_conv: CompositePrintConv::ConvertDuration,
+  sub_doc: SubDoc::No,
   priority: 1,
   sort_key: "X-Sum",
 };
@@ -427,7 +492,7 @@ fn signed_and_whitespace_string_ingredients_coerce_via_shared_perl_rule() {
     ("X", "A", TagValue::Str(" +44100".into())),
     ("X", "B", TagValue::Str("++1000".into())),
   ]);
-  build_into(&[SIGNED_SUM], &mut m, None, ConvMode::ValueConv);
+  build_into(&[SIGNED_SUM], &mut m, None, ConvMode::ValueConv, 0, &ctx0());
   assert_eq!(
     composite(&m, "Sum"),
     Some(TagValue::F64(45100.0)),
@@ -440,7 +505,14 @@ fn signed_and_whitespace_string_ingredients_coerce_via_shared_perl_rule() {
     ("X", "A", TagValue::Str("+-20".into())),
     ("X", "B", TagValue::Str("- +5".into())),
   ]);
-  build_into(&[SIGNED_SUM], &mut m2, None, ConvMode::ValueConv);
+  build_into(
+    &[SIGNED_SUM],
+    &mut m2,
+    None,
+    ConvMode::ValueConv,
+    0,
+    &ctx0(),
+  );
   assert_eq!(composite(&m2, "Sum"), Some(TagValue::F64(-25.0)));
 
   // A REJECTED dual-sign form (ws after sign 2: `"+- 20"` → 0) coerces to 0,
@@ -449,7 +521,14 @@ fn signed_and_whitespace_string_ingredients_coerce_via_shared_perl_rule() {
     ("X", "A", TagValue::Str("+- 20".into())),
     ("X", "B", TagValue::Str("100".into())),
   ]);
-  build_into(&[SIGNED_SUM], &mut m3, None, ConvMode::ValueConv);
+  build_into(
+    &[SIGNED_SUM],
+    &mut m3,
+    None,
+    ConvMode::ValueConv,
+    0,
+    &ctx0(),
+  );
   assert_eq!(composite(&m3, "Sum"), Some(TagValue::F64(100.0)));
 }
 
@@ -509,7 +588,14 @@ mod gps {
     // `-j`: `out` = the PrintConv view, `other` = the ValueConv view. Byte-exact
     // against bundled `ExifGPS.tif` `Composite:*`.
     let (mut val, mut prt) = exifgps_views();
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "GPSLatitude"),
       Some(TagValue::Str("48 deg 51' 29.34\" N".into()))
@@ -541,7 +627,14 @@ mod gps {
     // `-n`: `out` = the ValueConv view, `other` = the PrintConv view. Byte-exact
     // against bundled `ExifGPS.tif` `-n` `Composite:*`.
     let (mut val, mut prt) = exifgps_views();
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "GPSLatitude"),
       Some(TagValue::F64(48.85815))
@@ -573,7 +666,14 @@ mod gps {
     ];
     let mut out = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut out,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&out, "GPSLatitude"),
       Some(TagValue::F64(-48.85815)),
@@ -593,7 +693,14 @@ mod gps {
     // two ingredient Composites are not yet built ⇒ it DEFERS, then builds in a
     // later pass once they exist (the composite-on-composite fixpoint).
     let (mut val, mut prt) = exifgps_views();
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     // Built only because the deferral resolved Composite:GPSLatitude/Longitude.
     assert_eq!(
       composite(&val, "GPSPosition"),
@@ -611,7 +718,14 @@ mod gps {
     ];
     let mut out = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut out,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&out, "GPSLatitude"),
       Some(TagValue::F64(48.85815))
@@ -628,7 +742,14 @@ mod gps {
       &[("GPS", "GPSTimeStamp", TagValue::Str("16:45:09".into()))];
     let mut out = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut out,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&out, "GPSDateTime"), None);
   }
 
@@ -639,7 +760,14 @@ mod gps {
     let entries: &[(&str, &str, TagValue)] = &[("GPS", "GPSAltitude", TagValue::F64(35.0))];
     let mut out = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut out, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut out,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&out, "GPSAltitude"), None);
   }
 
@@ -667,14 +795,28 @@ mod gps {
     // `-n` (ValueConv): the normalized `12.5`, not `12`.
     let mut val = map_with(val_entries);
     let mut prt = map_with(prt_entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "GPSAltitude"), Some(TagValue::F64(12.5)));
 
     // `-j` (PrintConv): `(int($val[0]*10)/10) m $prt[1]` over the normalized
     // value ⇒ `12.5 m Above Sea Level`, not `12 m …`.
     let mut val = map_with(val_entries);
     let mut prt = map_with(prt_entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "GPSAltitude"),
       Some(TagValue::Str("12.5 m Above Sea Level".into()))
@@ -704,7 +846,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "ImageSize"),
       Some(TagValue::Str("8 8".into()))
@@ -712,7 +861,14 @@ mod exif {
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "ImageSize"),
       Some(TagValue::Str("8x8".into()))
@@ -735,7 +891,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "ImageSize"),
       Some(TagValue::Str("6000x4000".into())),
@@ -753,7 +916,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "ImageSize"), None);
   }
 
@@ -771,13 +941,27 @@ mod exif {
     // `-n`: bare f64.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "Megapixels"), Some(TagValue::F64(6.4e-5)));
 
     // `-j`: the magnitude-keyed sprintf ⇒ 6 decimals for `< 0.001`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "Megapixels"),
       Some(TagValue::Str("0.000064".into()))
@@ -790,7 +974,14 @@ mod exif {
     // `Composite:ImageSize` fails after the fixpoint settles ⇒ neither builds.
     let mut val = TagMap::new();
     let mut prt = TagMap::new();
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "ImageSize"), None);
     assert_eq!(composite(&val, "Megapixels"), None);
   }
@@ -804,7 +995,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "Megapixels"),
       Some(TagValue::Str("1.3".into()))
@@ -818,12 +1016,26 @@ mod exif {
     let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "ExposureTime", TagValue::F64(0.008))];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.008)));
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "ShutterSpeed"),
       Some(TagValue::Str("1/125".into()))
@@ -840,7 +1052,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "ShutterSpeed"),
       Some(TagValue::F64(2.0)),
@@ -849,7 +1068,14 @@ mod exif {
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "ShutterSpeed"),
       Some(TagValue::Str("2".into()))
@@ -866,7 +1092,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.008)));
   }
 
@@ -877,7 +1110,14 @@ mod exif {
       &[("ExifIFD", "ShutterSpeedValue", TagValue::F64(0.004))];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "ShutterSpeed"), Some(TagValue::F64(0.004)));
   }
 
@@ -888,12 +1128,26 @@ mod exif {
     let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::F64(4.0))];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "Aperture"), Some(TagValue::F64(4.0)));
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "Aperture"),
       Some(TagValue::Str("4.0".into()))
@@ -903,7 +1157,14 @@ mod exif {
     let entries2: &[(&str, &str, TagValue)] = &[("ExifIFD", "ApertureValue", TagValue::F64(0.64))];
     let mut val = map_with(entries2);
     let mut prt = map_with(entries2);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "Aperture"),
       Some(TagValue::Str("0.64".into()))
@@ -920,7 +1181,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "Aperture"), None);
   }
 
@@ -938,14 +1206,28 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "SubSecDateTimeOriginal"),
       Some(TagValue::Str("2005:03:18 02:55:18.16".into()))
     );
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "SubSecDateTimeOriginal"),
       Some(TagValue::Str("2005:03:18 02:55:18.16".into()))
@@ -963,7 +1245,14 @@ mod exif {
     )];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(composite(&val, "SubSecDateTimeOriginal"), None);
   }
 
@@ -982,7 +1271,14 @@ mod exif {
     ];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "SubSecDateTimeOriginal"),
       None,
@@ -1000,7 +1296,14 @@ mod exif {
     ];
     let mut val = map_with(entries2);
     let mut prt = map_with(entries2);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "SubSecDateTimeOriginal"),
       Some(TagValue::Str("1999:01:01 00:00:00.99".into()))
@@ -1030,7 +1333,14 @@ mod exif {
     // string, NOT `0`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "ShutterSpeed"),
       Some(TagValue::Str("undef".into())),
@@ -1040,7 +1350,14 @@ mod exif {
     // `-j` (PrintConv): `PrintExposureTime("undef")` ⇒ `"undef"` (IsFloat fails).
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "ShutterSpeed"),
       Some(TagValue::Str("undef".into())),
@@ -1059,7 +1376,14 @@ mod exif {
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "Aperture"),
       Some(TagValue::Str("undef".into())),
@@ -1068,7 +1392,14 @@ mod exif {
 
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "Aperture"),
       Some(TagValue::Str("undef".into())),
@@ -1134,7 +1465,14 @@ mod exif {
     let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::F64(4.0))];
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     let aperture = composite(&prt, "Aperture").expect("Aperture built");
     assert_eq!(aperture, TagValue::Str("4.0".into()));
     // Bundled ExifTool 13.59: `Composite:Aperture: 4.0`. exifast: bare `4.0`.
@@ -1158,7 +1496,14 @@ mod exif {
     // `> 0`, so it returns the norm "0E0" verbatim. Bundled: bare `0E0`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     let j = composite(&prt, "Aperture").expect("Aperture built (-j)");
     assert_eq!(j, TagValue::Str("0E0".into()), "the SCALAR is correct");
     assert_eq!(emit(&j), "0E0", "bundled emits literal `0E0`");
@@ -1166,7 +1511,14 @@ mod exif {
     // `-n` (ValueConv): the operand passes through verbatim -> `Str("0E0")`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     let n = composite(&val, "Aperture").expect("Aperture built (-n)");
     assert_eq!(n, TagValue::Str("0E0".into()));
     assert_eq!(emit(&n), "0E0", "bundled emits literal `0E0`");
@@ -1190,7 +1542,14 @@ mod exif {
     // ".0" -> "-0". Bundled: bare `-0`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     let j = composite(&prt, "ShutterSpeed").expect("ShutterSpeed built (-j)");
     assert_eq!(j, TagValue::Str("-0".into()), "the SCALAR is correct");
     assert_eq!(emit(&j), "-0", "bundled emits literal `-0`");
@@ -1198,7 +1557,14 @@ mod exif {
     // `-n` (ValueConv): the operand passes through verbatim -> `Str("-0.0")`.
     let mut val = map_with(entries);
     let mut prt = map_with(entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     let n = composite(&val, "ShutterSpeed").expect("ShutterSpeed built (-n)");
     assert_eq!(n, TagValue::Str("-0.0".into()));
     assert_eq!(emit(&n), "-0.0", "bundled emits literal `-0.0`");
@@ -1231,7 +1597,14 @@ mod exif {
     let entries = nikon_lens_inputs();
     let mut prt = map_with(&entries);
     let mut val = map_with(&entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     // `emit` is `serde_json::to_string`: a numeric-looking PrintConv string is
     // emitted BARE by the JSON gate (`1.5`, `8.0`); a unit-bearing one is QUOTED.
     let g = |n: &str| composite(&prt, n).map(|v| emit(&v));
@@ -1256,7 +1629,14 @@ mod exif {
     let entries = nikon_lens_inputs();
     let mut val = map_with(&entries);
     let mut prt = map_with(&entries);
-    build_into(REGISTRY, &mut val, Some(&mut prt), ConvMode::ValueConv);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&val, "ScaleFactor35efl"),
       Some(TagValue::F64(1.5))
@@ -1295,7 +1675,14 @@ mod exif {
     let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FocalLength", TagValue::F64(0.0))];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "FocalLength35efl")
         .map(|v| emit(&v))
@@ -1322,7 +1709,14 @@ mod exif {
     ];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "ScaleFactor35efl").is_none(),
       "the Canon branch defers ScaleFactor35efl (unported CalcSensorDiag)"
@@ -1360,7 +1754,14 @@ mod exif {
     ];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "ScaleFactor35efl").is_none(),
       "Canon branch defers ScaleFactor (generic would give a WRONG 12.17)"
@@ -1392,7 +1793,14 @@ mod exif {
     let mut val = map_with(val_entries);
     let mut prt = map_with(prt_entries);
     // Active mode `-j`: `out` = prt, the other view = val.
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     // LV = log(13^2*100/(0.01*100))/log(2) = 14.0447356260569 ⇒ "%.1f" = "14.0".
     assert_eq!(
       composite(&prt, "LightValue").map(|v| emit(&v)).as_deref(),
@@ -1420,7 +1828,14 @@ mod exif {
     ));
     let mut prt = map_with(&entries);
     let mut val = map_with(&entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert_eq!(
       composite(&prt, "DOF").map(|v| emit(&v)).as_deref(),
       Some("\"0.03 m (0.69 - 0.72 m)\""),
@@ -1442,7 +1857,14 @@ mod exif {
     entries.push(("Nikon", "FocusDistanceUpper", TagValue::F64(1.0)));
     let mut prt = map_with(&entries);
     let mut val = map_with(&entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "DOF").is_none(),
       "a present-non-float FocusDistanceLower is undef post-ToFloat ⇒ DOF is undef"
@@ -1465,7 +1887,14 @@ mod exif {
     ];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "FocalLength35efl").is_none(),
       "Canon + only FocalPlaneX/YSize ⇒ FocalLength35efl defers (NOT focal-only)"
@@ -1495,7 +1924,14 @@ mod exif {
     ];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "FocalLength35efl").is_none(),
       "Canon + present-but-falsy FocalLengthIn35mmFormat=0 + sensor data ⇒ \
@@ -1529,12 +1965,924 @@ mod exif {
     ];
     let mut prt = map_with(entries);
     let mut val = map_with(entries);
-    build_into(REGISTRY, &mut prt, Some(&mut val), ConvMode::PrintConv);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
     assert!(
       composite(&prt, "FocalLength35efl").is_none(),
       "Canon + present-but-falsy FocalLength=0 + truthy FocalLengthIn35mmFormat \
        + sensor data ⇒ FocalLength35efl defers (the simple path needs BOTH \
        `$focal` AND `$foc35` truthy)"
     );
+  }
+}
+
+// ===========================================================================
+// #133 PR 5 — the SubDoc per-`Doc<N>` fixpoint, the cross-document (`DocScope::
+// Main` fallback) resolution, and the QuickTime video defs (AvgBitrate /
+// Rotation / RIFF Duration). The video allow-list flip is gated on the Sony
+// SubDoc architecture decision, so these exercise the ENGINE directly over
+// hand-built multi-document TagMaps (the M2TS/HEIF/rove conformance goldens pin
+// the end-to-end byte-exactness once the flip lands).
+// ===========================================================================
+
+#[cfg(feature = "exif")]
+mod subdoc {
+  use super::*;
+
+  /// Build a TagMap with `(doc, group, name, value)` entries (the family-3
+  /// sub-document axis the SubDoc resolution keys on).
+  fn map_with_docs(entries: &[(u32, &str, &str, TagValue)]) -> TagMap {
+    let mut m = TagMap::new();
+    for (doc, g, n, v) in entries {
+      let _ = m.write_value_doc(*doc, 0, g, n, 1, v.clone(), g);
+    }
+    m
+  }
+
+  /// The composite value at a specific family-3 `doc`.
+  fn composite_at(m: &TagMap, doc: u32, name: &str) -> Option<TagValue> {
+    m.entries()
+      .iter()
+      .find(|(d, _s, g, n, _p, _v, _)| *d == doc && g.as_str() == "Composite" && n.as_str() == name)
+      .map(|(_d, _s, _g, _n, _p, v, _)| v.clone())
+  }
+
+  #[test]
+  fn subdoc_gps_builds_per_document_m2ts_shape() {
+    // The M2TS_h264_mdpm shape: Main `GPS:` coords (48/11) AND a `Doc1:GPS:`
+    // sample (49/12). `Composite:GPSLatitude`/`GPSLongitude` (SubDoc) must build
+    // at BOTH Main AND Doc1; `Composite:GPSPosition` (NOT SubDoc) builds at Main
+    // only (from the Main composites). Byte-exact vs bundled (the earlier oracle
+    // run: Main 48 N / 11 E + Position, Doc1 49 N / 12 E, NO Doc1 Position).
+    let entries: &[(u32, &str, &str, TagValue)] = &[
+      (0, "GPS", "GPSLatitude", TagValue::F64(48.0)),
+      (0, "GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+      (0, "GPS", "GPSLongitude", TagValue::F64(11.0)),
+      (0, "GPS", "GPSLongitudeRef", TagValue::Str("E".into())),
+      (1, "GPS", "GPSLatitude", TagValue::F64(49.0)),
+      (1, "GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+      (1, "GPS", "GPSLongitude", TagValue::F64(12.0)),
+      (1, "GPS", "GPSLongitudeRef", TagValue::Str("E".into())),
+    ];
+    let mut prt = map_with_docs(entries);
+    let mut valv = map_with_docs(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1, // doc_count = 1
+      &ctx0(),
+    );
+    // Main composites (the DMS PrintConv strings).
+    assert_eq!(
+      composite_at(&prt, 0, "GPSLatitude"),
+      Some(TagValue::Str("48 deg 0' 0.00\" N".into()))
+    );
+    assert_eq!(
+      composite_at(&prt, 0, "GPSLongitude"),
+      Some(TagValue::Str("11 deg 0' 0.00\" E".into()))
+    );
+    assert_eq!(
+      composite_at(&prt, 0, "GPSPosition"),
+      Some(TagValue::Str(
+        "48 deg 0' 0.00\" N, 11 deg 0' 0.00\" E".into()
+      ))
+    );
+    // Per-document Doc1 composites (built from the Doc1 GPS sample).
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLatitude"),
+      Some(TagValue::Str("49 deg 0' 0.00\" N".into()))
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLongitude"),
+      Some(TagValue::Str("12 deg 0' 0.00\" E".into()))
+    );
+    // `GPSPosition` is NOT SubDoc ⇒ no Doc1 Position (matches bundled).
+    assert_eq!(composite_at(&prt, 1, "GPSPosition"), None);
+  }
+
+  #[test]
+  fn subdoc_only_builds_for_documents_with_the_ingredient() {
+    // A Doc1 GPS sample but NO Doc2 GPS ⇒ Doc1 builds, Doc2 does not (the
+    // per-document `sub_doc_has_chance` gate skips a doc with no Require'd tag).
+    let entries: &[(u32, &str, &str, TagValue)] = &[
+      (1, "GPS", "GPSLatitude", TagValue::F64(49.0)),
+      (1, "GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+      (1, "GPS", "GPSLongitude", TagValue::F64(12.0)),
+      (1, "GPS", "GPSLongitudeRef", TagValue::Str("E".into())),
+    ];
+    let mut prt = map_with_docs(entries);
+    let mut valv = map_with_docs(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      2,
+      &ctx0(),
+    );
+    assert!(composite_at(&prt, 1, "GPSLatitude").is_some());
+    assert_eq!(composite_at(&prt, 2, "GPSLatitude"), None);
+    // No Main GPS ⇒ no Main composite (and GPSPosition needs the Main ones).
+    assert_eq!(composite_at(&prt, 0, "GPSLatitude"), None);
+  }
+
+  #[test]
+  fn gps_position_cross_doc_fallback_uses_doc1_when_no_main() {
+    // The Main-`GPSPosition` cross-document `DocScope::Main` fallback: NO Main
+    // `Composite:GPSLatitude`/`Longitude`, but Doc1 has them (built by the SubDoc
+    // pass). `Composite:GPSPosition` (Main, non-SubDoc) resolves
+    // `Composite:GPSLatitude` across docs ⇒ finds the Doc1 ones ⇒ builds a MAIN
+    // `Composite:GPSPosition`. (The Sony rtmd source-tag family-0 `Sony` path is
+    // exercised separately in `sony_subdoc_gps_*`; here a `GPS`-group Doc1 sample
+    // drives the same cross-doc fixpoint.)
+    let entries: &[(u32, &str, &str, TagValue)] = &[
+      (1, "GPS", "GPSLatitude", TagValue::F64(47.628418)),
+      (1, "GPS", "GPSLatitudeRef", TagValue::Str("N".into())),
+      (1, "GPS", "GPSLongitude", TagValue::F64(122.165)),
+      (1, "GPS", "GPSLongitudeRef", TagValue::Str("W".into())),
+    ];
+    let mut prt = map_with_docs(entries);
+    let mut valv = map_with_docs(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1,
+      &ctx0(),
+    );
+    // The Doc1 composites built.
+    assert!(composite_at(&prt, 1, "GPSLatitude").is_some());
+    // The MAIN GPSPosition built via the cross-doc fallback (reads the Doc1
+    // Composite:GPSLatitude/Longitude).
+    let pos = composite_at(&prt, 0, "GPSPosition");
+    assert!(
+      pos.is_some(),
+      "Main GPSPosition must build from the Doc1 composites (cross-doc fallback)"
+    );
+  }
+
+  /// Build a TagMap with `(doc, family0, family1, name, value)` entries — the
+  /// family-0-qualified axis the Sony SubDoc GPS defs (`Sony:GPSLatitude`,
+  /// Sony.pm:10929) resolve on. A Sony rtmd GPS tag is family-0 `Sony`,
+  /// family-1 the per-sample `Track<N>`. Every entry takes ExifTool's default
+  /// `Priority => 1`; use [`map_with_docs_g0_p`] for the priority-aware
+  /// duplicate-override parity tests.
+  #[cfg(feature = "quicktime")]
+  fn map_with_docs_g0(entries: &[(u32, &str, &str, &str, TagValue)]) -> TagMap {
+    let mut m = TagMap::new();
+    for (doc, g0, g1, n, v) in entries {
+      let _ = m.write_value_doc(*doc, 0, g1, n, 1, v.clone(), g0);
+    }
+    m
+  }
+
+  /// Build a TagMap with `(doc, family0, family1, name, priority, value)`
+  /// entries — the priority-aware variant of [`map_with_docs_g0`] for the
+  /// two-sink duplicate-override parity tests. The explicit `priority` exercises
+  /// ExifTool's general duplicate rule (`ExifTool.pm:9544-9560`) through the real
+  /// [`crate::tagmap::TagMap::insert`] path: ordinary tags pass `1`, a
+  /// `Priority => 0` duplicate (which never overrides) passes `0`, a
+  /// higher-priority survivor passes `2`.
+  #[cfg(feature = "quicktime")]
+  fn map_with_docs_g0_p(entries: &[(u32, &str, &str, &str, u8, TagValue)]) -> TagMap {
+    let mut m = TagMap::new();
+    for (doc, g0, g1, n, p, v) in entries {
+      let _ = m.write_value_doc(*doc, 0, g1, n, *p, v.clone(), g0);
+    }
+    m
+  }
+
+  /// PART A + B: the family-0-qualified Sony SubDoc GPS defs build a
+  /// `Doc<N>:Composite:GPS*` from Sony rtmd's family-0 `Sony` GPS source tags
+  /// (family-1 `Track1`) — the family-0 carry on the TagMap entry is what lets
+  /// `Sony:GPSLatitude` match. Ground-truth (bundled `-ee -G3:1`
+  /// `QuickTime_sony_rtmd.mov`): Doc1 Composite GPSDateTime/GPSLatitude/
+  /// GPSLongitude at 47°37'42.30"N / 122°9'54.00"W.
+  #[cfg(feature = "quicktime")]
+  #[test]
+  fn sony_subdoc_gps_builds_from_family0_sony_inputs() {
+    // Sony rtmd Doc1 GPS sample: family-0 `Sony`, family-1 `Track1`.
+    let entries: &[(u32, &str, &str, &str, TagValue)] = &[
+      (1, "Sony", "Track1", "GPSLatitude", TagValue::F64(47.628418)),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLatitudeRef",
+        TagValue::Str("North".into()),
+      ),
+      (1, "Sony", "Track1", "GPSLongitude", TagValue::F64(122.165)),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLongitudeRef",
+        TagValue::Str("West".into()),
+      ),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSDateStamp",
+        TagValue::Str("2024:01:07".into()),
+      ),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSTimeStamp",
+        TagValue::Str("11:19:15".into()),
+      ),
+    ];
+    let mut prt = map_with_docs_g0(entries);
+    let mut valv = map_with_docs_g0(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1,
+      &ctx0(),
+    );
+    // Doc1 Composite GPS* built (the `^S`/`^W` negate via "North"/"West").
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLatitude"),
+      Some(TagValue::Str("47 deg 37' 42.30\" N".into()))
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLongitude"),
+      Some(TagValue::Str("122 deg 9' 54.00\" W".into()))
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSDateTime"),
+      Some(TagValue::Str("2024:01:07 11:19:15Z".into()))
+    );
+  }
+
+  /// PART B negative: a GoPro Doc1 GPS sample (family-0 `GoPro`, family-1
+  /// `Track4`) does NOT match the `Sony:`-qualified defs ⇒ NO
+  /// `Doc<N>:Composite:GPS*` from them. Ground-truth (bundled `-ee -G3:1`
+  /// `QuickTime_gopro_hero8_gpmf.mp4`): no `Doc1:Composite:GPS*` — its per-doc
+  /// GPS is the gpmf `Doc1:Track4:GPSLatitude` only. (The Main cross-doc
+  /// `GPSPosition` from the gpmf GPS-group tags is a separate path.)
+  #[cfg(feature = "quicktime")]
+  #[test]
+  fn gopro_subdoc_gps_does_not_match_sony_defs() {
+    // GoPro gpmf Doc1 GPS sample: family-0 `GoPro` (NOT `Sony`).
+    let entries: &[(u32, &str, &str, &str, TagValue)] = &[
+      (1, "GoPro", "Track4", "GPSLatitude", TagValue::F64(42.02662)),
+      (
+        1,
+        "GoPro",
+        "Track4",
+        "GPSLatitudeRef",
+        TagValue::Str("North".into()),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track4",
+        "GPSLongitude",
+        TagValue::F64(-129.294),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track4",
+        "GPSLongitudeRef",
+        TagValue::Str("West".into()),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track4",
+        "GPSDateStamp",
+        TagValue::Str("2019:01:01".into()),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track4",
+        "GPSTimeStamp",
+        TagValue::Str("00:00:00".into()),
+      ),
+    ];
+    let mut prt = map_with_docs_g0(entries);
+    let mut valv = map_with_docs_g0(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1,
+      &ctx0(),
+    );
+    // The Sony SubDoc defs require family-0 `Sony`; GoPro's family-0 is `GoPro`,
+    // so NO Doc1 Composite GPS* is built from them.
+    assert_eq!(composite_at(&prt, 1, "GPSLatitude"), None);
+    assert_eq!(composite_at(&prt, 1, "GPSLongitude"), None);
+    assert_eq!(composite_at(&prt, 1, "GPSDateTime"), None);
+  }
+
+  /// Build the deduped [`Tag`](crate::value::Tag) `Vec` from a raw
+  /// `(doc, family0, family1, name, priority, value)` stream with the EXACT rule
+  /// [`collect_deduped_tags`](crate::format_parser::AnyMeta) applies: the
+  /// SHARED [`crate::tagmap::dedup_override`] +
+  /// [`crate::tagmap::effective_priority`] predicate (so a duplicate REPLACES
+  /// the surviving slot — the winner's whole tag, family-0 included, AND its
+  /// stored effective priority — IFF its effective priority is non-zero AND
+  /// `>=` the stored one; a `Priority => 0` duplicate never overrides). This is
+  /// the SAME predicate the `TagMap` sink uses, so feeding the SAME stream into
+  /// both lets us assert the two sinks agree across every priority case. The
+  /// post-dedup `Vec` is what the `CompositeSink for Vec<Tag>` impl resolves
+  /// over.
+  #[cfg(feature = "quicktime")]
+  fn vec_deduped_g0(
+    entries: &[(u32, &str, &str, &str, u8, TagValue)],
+  ) -> std::vec::Vec<crate::value::Tag> {
+    let mut out: std::vec::Vec<(crate::value::Tag, u8)> = std::vec::Vec::new();
+    for (doc, g0, g1, n, p, v) in entries {
+      let tag =
+        crate::value::Tag::new(crate::value::Group::with_doc(*g0, *g1, *doc), *n, v.clone());
+      let effective = crate::tagmap::effective_priority(n, *p);
+      if let Some(slot) = out.iter_mut().find(|(t, _p)| {
+        t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name()
+      }) {
+        if crate::tagmap::dedup_override(effective, slot.1) {
+          // The winner's whole tag (with its family-0) replaces the slot, and
+          // its effective priority becomes the new stored one — the Vec-sink
+          // semantics `collect_deduped_tags` (and the `TagMap` fix) apply.
+          *slot = (tag, effective);
+        }
+      } else {
+        out.push((tag, effective));
+      }
+    }
+    out.into_iter().map(|(t, _p)| t).collect()
+  }
+
+  /// TWO-SINK PARITY (the #133 finding): a MIXED-family-0 duplicate — same
+  /// `(doc, family1, name)` but family-0 `GoPro` FIRST then family-0 `Sony`
+  /// SECOND (Sony wins the priority-1 last-wins) — must resolve IDENTICALLY
+  /// through the `TagMap` sink and the `Tag`-`Vec` sink. The surviving entry's
+  /// family-0 is the WINNER's (`Sony`), so a `Sony:`-qualified Composite input
+  /// MATCHES and a `GoPro:`-qualified one does NOT — from BOTH sinks. Before the
+  /// fix the `TagMap` override kept the FIRST (`GoPro`) family-0 while the `Vec`
+  /// sink (`*slot = tag`) kept the winner's (`Sony`), so the two sinks DISAGREED
+  /// on this group-0-qualified resolution under the same input order. This is
+  /// reachable on the video path: track-scoped timed emitters distinguish
+  /// Sony/QuickTime/GoPro family-0 while SHARING a `Track<N>` family-1 name.
+  #[cfg(feature = "quicktime")]
+  #[test]
+  fn mixed_family0_duplicate_resolves_identically_in_both_sinks() {
+    // Doc1, family-1 `Track1`: a GoPro-family-0 sample is OVERRIDDEN by a later
+    // Sony-family-0 sample of the same `(doc, family1, name)`. Sony's values are
+    // the survivors (last-wins). Both lat + ref carry the mixed-family-0 dup so
+    // the Sony `GPSLatitude` composite has its two Sony-qualified ingredients.
+    let stream: &[(u32, &str, &str, &str, u8, TagValue)] = &[
+      (1, "GoPro", "Track1", "GPSLatitude", 1, TagValue::F64(11.0)),
+      (
+        1,
+        "GoPro",
+        "Track1",
+        "GPSLatitudeRef",
+        1,
+        TagValue::Str("South".into()),
+      ),
+      // Sony duplicates WIN (priority 1 >= 1, last-wins) — value AND family-0.
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLatitude",
+        1,
+        TagValue::F64(47.628418),
+      ),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLatitudeRef",
+        1,
+        TagValue::Str("North".into()),
+      ),
+    ];
+
+    // ---- Sink A: TagMap (real `write_value_doc` -> `insert` dedup path). ----
+    let map = map_with_docs_g0_p(stream);
+    // The duplicate collapsed to ONE entry per `(doc, family1, name)`.
+    assert_eq!(
+      map
+        .entries()
+        .iter()
+        .filter(|(d, _s, _g1, n, _p, _v, _f0)| *d == 1 && n.as_str() == "GPSLatitude")
+        .count(),
+      1,
+      "mixed-family-0 duplicate must collapse to one entry"
+    );
+
+    // ---- Sink B: the deduped `Tag` `Vec` (same stream, `*slot = tag`). ----
+    let vec = vec_deduped_g0(stream);
+
+    // PARITY at the resolve level (DocScope::Exact(1), the SubDoc per-doc axis):
+    // the surviving family-0 is the WINNER's (`Sony`), so a `Sony:`-qualified
+    // input matches and a `GoPro:`-qualified one does NOT — from BOTH sinks.
+    for (label, present, missing) in [
+      (
+        "Sony matches the winner / GoPro (the loser) does not — TagMap",
+        map.resolve(&[], Some("Sony"), "GPSLatitude", DocScope::Exact(1)),
+        map.resolve(&[], Some("GoPro"), "GPSLatitude", DocScope::Exact(1)),
+      ),
+      (
+        "Sony matches the winner / GoPro (the loser) does not — Vec<Tag>",
+        vec.resolve(&[], Some("Sony"), "GPSLatitude", DocScope::Exact(1)),
+        vec.resolve(&[], Some("GoPro"), "GPSLatitude", DocScope::Exact(1)),
+      ),
+    ] {
+      assert!(present.is_present(), "{label}: winner Sony must match");
+      assert!(
+        !missing.is_present(),
+        "{label}: loser GoPro must NOT match the survivor"
+      );
+      // The matched value is the Sony survivor (47.628418), not the GoPro 11.0.
+      assert_eq!(
+        present.value(),
+        Some(&TagValue::F64(47.628418)),
+        "{label}: the survivor's VALUE is the winner's too"
+      );
+    }
+    // The ref resolves to the Sony survivor ("North") in both sinks as well.
+    assert_eq!(
+      map
+        .resolve(&[], Some("Sony"), "GPSLatitudeRef", DocScope::Exact(1))
+        .value(),
+      Some(&TagValue::Str("North".into()))
+    );
+    assert_eq!(
+      vec
+        .resolve(&[], Some("Sony"), "GPSLatitudeRef", DocScope::Exact(1))
+        .value(),
+      Some(&TagValue::Str("North".into()))
+    );
+
+    // END-TO-END: the Sony SubDoc `Composite:GPSLatitude` (family-0-qualified)
+    // BUILDS at Doc1 from the SURVIVING Sony-family-0 ingredients (lat 47.628418
+    // + ref "North" ⇒ +lat ⇒ 47°37'42.30" N). This only happens because the fix
+    // carried the winner's family-0 through the TagMap override — with the stale
+    // (`GoPro`) family-0 the `sony_req("GPSLatitude")` input would NOT match and
+    // no composite would build. Ground-truth matches the Sony rtmd Doc1 GPS.
+    let mut prt = map_with_docs_g0_p(stream);
+    let mut valv = map_with_docs_g0_p(stream);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1,
+      &ctx0(),
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLatitude"),
+      Some(TagValue::Str("47 deg 37' 42.30\" N".into())),
+      "Sony Doc1 Composite:GPSLatitude must build from the surviving Sony family-0 ingredients"
+    );
+  }
+
+  /// TWO-SINK PARITY — the LOWER / priority-0 duplicate that LOSES (the #133
+  /// terminal-parity close). The R1 test above covers priority-1 last-wins; this
+  /// covers the OTHER two branches of [`crate::tagmap::dedup_override`]:
+  ///
+  /// 1. A `Priority => 0` duplicate (`new_effective == 0`) — the VP8/VP8L
+  ///    `ImageWidth`-behind-a-`VP8X`-canvas shape (RIFF.pm:1301/1312/1329/1340)
+  ///    AND the `Warning`/`Error` pseudo-tags: it NEVER overrides ⇒ first-wins.
+  /// 2. A strictly-LOWER non-zero priority (`new_effective < stored`, here `1`
+  ///    after a `2`) — `1 >= 2` is false ⇒ the higher-priority FIRST entry wins.
+  ///
+  /// In BOTH the SURVIVOR is the FIRST (higher-priority) entry, whose VALUE and
+  /// family-0 must be what BOTH sinks resolve — the `TagMap` (JSON / golden) sink
+  /// and the `Tag`-`Vec` (`iter_tags` / Composite) sink. Before this fix the `Vec`
+  /// sink did an UNCONDITIONAL `*slot = tag` on every non-`Warning`/`Error`
+  /// duplicate, so a priority-0 / lower-priority loser would LAST-win in the `Vec`
+  /// path while FIRST-winning in `TagMap` — diverging value AND family-0. Both
+  /// shapes are reachable on the video path (track-scoped Sony/QuickTime/GoPro
+  /// family-0 sharing a `Track<N>` family-1; the RIFF WEBP priority-0 dims).
+  /// Combined with the R1 priority-1 test, parity now holds across ALL three
+  /// cases: higher-wins, equal-last-wins, lower/zero-loses.
+  #[cfg(feature = "quicktime")]
+  #[test]
+  fn lower_and_zero_priority_loser_resolves_identically_in_both_sinks() {
+    // Doc1, family-1 `Track1`. The WINNER is family-0 `Sony` (so the Sony SubDoc
+    // GPS composite defs, which `Require` `Sony:`-qualified inputs, fire); the
+    // LOSER is family-0 `GoPro`:
+    //  - `GPSLatitude`: a HIGHER-priority (2) Sony entry FIRST, then a LOWER (1)
+    //    GoPro duplicate that LOSES (`1 >= 2` false) — Sony survives.
+    //  - `GPSLongitude`: a default-priority (1) Sony entry FIRST, then a
+    //    `Priority => 0` GoPro duplicate that LOSES (never overrides) — Sony
+    //    survives. This is the VP8/VP8L-`ImageWidth`-behind-`VP8X` shape.
+    // Both source tags carry their `*Ref` so the Sony-family-0 composite builds
+    // from the SURVIVING Sony ingredients (and a GoPro-qualified one cannot).
+    let stream: &[(u32, &str, &str, &str, u8, TagValue)] = &[
+      // GPSLatitude: Sony priority-2 FIRST (survives the lower GoPro dup).
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLatitude",
+        2,
+        TagValue::F64(47.628418),
+      ),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLatitudeRef",
+        2,
+        TagValue::Str("North".into()),
+      ),
+      // GPSLongitude: Sony priority-1 FIRST (survives the priority-0 GoPro dup).
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLongitude",
+        1,
+        TagValue::F64(122.165),
+      ),
+      (
+        1,
+        "Sony",
+        "Track1",
+        "GPSLongitudeRef",
+        1,
+        TagValue::Str("West".into()),
+      ),
+      // LOSERS — same `(doc, family1, name)`, mixed family-0 `GoPro`:
+      //  lower-priority (1 < 2) ⇒ never wins; priority-0 ⇒ never wins.
+      (1, "GoPro", "Track1", "GPSLatitude", 1, TagValue::F64(11.0)),
+      (
+        1,
+        "GoPro",
+        "Track1",
+        "GPSLatitudeRef",
+        1,
+        TagValue::Str("South".into()),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track1",
+        "GPSLongitude",
+        0,
+        TagValue::F64(22.0),
+      ),
+      (
+        1,
+        "GoPro",
+        "Track1",
+        "GPSLongitudeRef",
+        0,
+        TagValue::Str("East".into()),
+      ),
+    ];
+
+    // ---- Sink A: TagMap; Sink B: the deduped `Tag` `Vec` (SAME stream). ----
+    let map = map_with_docs_g0_p(stream);
+    let vec = vec_deduped_g0(stream);
+
+    // Each `(doc, family1, name)` collapsed to ONE entry in the TagMap sink.
+    for name in ["GPSLatitude", "GPSLongitude"] {
+      assert_eq!(
+        map
+          .entries()
+          .iter()
+          .filter(|(d, _s, _g1, n, _p, _v, _f0)| *d == 1 && n.as_str() == name)
+          .count(),
+        1,
+        "the {name} loser duplicate must collapse to one entry"
+      );
+    }
+
+    // PARITY at the resolve level (DocScope::Exact(1)): the surviving family-0 is
+    // the WINNER's (`Sony`, the higher / non-zero-priority FIRST entry), so a
+    // `Sony:`-qualified input matches and the `GoPro:` loser does NOT — from BOTH
+    // sinks, for BOTH the lower-priority (GPSLatitude) and priority-0
+    // (GPSLongitude) loss. The matched VALUE is the Sony survivor's, never the
+    // GoPro loser's.
+    for (name, winner_val) in [
+      ("GPSLatitude", TagValue::F64(47.628418)),
+      ("GPSLongitude", TagValue::F64(122.165)),
+    ] {
+      for (label, sink_present, sink_missing) in [
+        (
+          "TagMap",
+          map.resolve(&[], Some("Sony"), name, DocScope::Exact(1)),
+          map.resolve(&[], Some("GoPro"), name, DocScope::Exact(1)),
+        ),
+        (
+          "Vec<Tag>",
+          vec.resolve(&[], Some("Sony"), name, DocScope::Exact(1)),
+          vec.resolve(&[], Some("GoPro"), name, DocScope::Exact(1)),
+        ),
+      ] {
+        assert!(
+          sink_present.is_present(),
+          "{label}: winner Sony must match {name}"
+        );
+        assert!(
+          !sink_missing.is_present(),
+          "{label}: loser GoPro must NOT match the {name} survivor"
+        );
+        assert_eq!(
+          sink_present.value(),
+          Some(&winner_val),
+          "{label}: the surviving {name} VALUE is the winner's (Sony), not the GoPro loser's"
+        );
+      }
+    }
+
+    // END-TO-END: the Sony SubDoc `Composite:GPSLatitude`/`GPSLongitude`
+    // (family-0-qualified) BUILD at Doc1 from the SURVIVING Sony family-0
+    // ingredients — proving the `Vec` and `TagMap` sinks present an IDENTICAL
+    // family-0-qualified ingredient set after a lower/zero-priority loss. (With
+    // the old unconditional `*slot = tag` the `Vec` path would have surfaced the
+    // GoPro loser's value+family-0 here.)
+    let mut prt = map_with_docs_g0_p(stream);
+    let mut valv = map_with_docs_g0_p(stream);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut valv),
+      ConvMode::PrintConv,
+      1,
+      &ctx0(),
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLatitude"),
+      Some(TagValue::Str("47 deg 37' 42.30\" N".into())),
+      "Doc1 Composite:GPSLatitude must build from the surviving Sony (priority-2) ingredients"
+    );
+    assert_eq!(
+      composite_at(&prt, 1, "GPSLongitude"),
+      Some(TagValue::Str("122 deg 9' 54.00\" W".into())),
+      "Doc1 Composite:GPSLongitude must build from the surviving Sony (priority-1) ingredients, \
+       not the priority-0 GoPro loser"
+    );
+  }
+}
+
+#[cfg(feature = "quicktime")]
+mod video_defs {
+  use super::super::table::CompositeContext;
+  use super::*;
+
+  fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
+    let mut m = TagMap::new();
+    for (g, n, v) in entries {
+      let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
+    }
+    m
+  }
+  fn composite(m: &TagMap, name: &str) -> Option<TagValue> {
+    m.get("Composite", name).cloned()
+  }
+
+  #[test]
+  fn avg_bitrate_sums_all_mdat_via_context() {
+    // The HEIF shape: a single VISIBLE `MediaDataSize` (8) but the threaded
+    // `media_data_total` is the SUM of all three `mdat` (1 004 715). Duration
+    // 0.16 s ⇒ int(1004715*8 / 0.16 + 0.5) = 50 235 750 bps ⇒ "50.2 Mbps".
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("QuickTime", "MediaDataSize", TagValue::U64(8)),
+      ("QuickTime", "Duration", TagValue::F64(0.16)),
+    ];
+    let ctx = CompositeContext::new(Some(1_004_715), None);
+
+    // `-j`: ConvertBitrate ⇒ "50.2 Mbps".
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(
+      composite(&prt, "AvgBitrate"),
+      Some(TagValue::Str("50.2 Mbps".into()))
+    );
+    // `-n`: the bare integer bps.
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(
+      composite(&val, "AvgBitrate"),
+      Some(TagValue::F64(50_235_750.0))
+    );
+  }
+
+  #[test]
+  fn avg_bitrate_no_timescale_divide_camm_shape() {
+    // camm: MediaDataSize 116, Duration 3 s ⇒ int(116*8/3 + 0.5) = 309 ⇒
+    // "309 bps". NO TimeScale divide (the ground-truthed behavior).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("QuickTime", "MediaDataSize", TagValue::U64(116)),
+      ("QuickTime", "Duration", TagValue::F64(3.0)),
+    ];
+    let ctx = CompositeContext::new(Some(116), None);
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(
+      composite(&prt, "AvgBitrate"),
+      Some(TagValue::Str("309 bps".into()))
+    );
+  }
+
+  #[test]
+  fn avg_bitrate_not_built_without_duration() {
+    // `return undef unless $val[1]` — a zero/absent Duration ⇒ no AvgBitrate.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("QuickTime", "MediaDataSize", TagValue::U64(100)),
+      ("QuickTime", "Duration", TagValue::F64(0.0)),
+    ];
+    let ctx = CompositeContext::new(Some(100), None);
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(composite(&prt, "AvgBitrate"), None);
+  }
+
+  #[test]
+  fn rotation_reads_precomputed_context_angle() {
+    // `Composite:Rotation` requires `QuickTime:MatrixStructure` + `HandlerType`
+    // (the build gate); the value is the pre-computed `ctx.rotation`. Identity
+    // matrix ⇒ 0 (both modes emit the bare angle).
+    let entries: &[(&str, &str, TagValue)] = &[
+      (
+        "QuickTime",
+        "MatrixStructure",
+        TagValue::Str("1 0 0 0 1 0 0 0 1".into()),
+      ),
+      ("QuickTime", "HandlerType", TagValue::Str("vide".into())),
+    ];
+    let ctx = CompositeContext::new(None, Some(0.0));
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(composite(&prt, "Rotation"), Some(TagValue::F64(0.0)));
+  }
+
+  #[test]
+  fn rotation_not_built_when_inputs_missing_or_angle_none() {
+    // No MatrixStructure ⇒ the Require fails ⇒ no Rotation, even with a ctx angle.
+    let entries: &[(&str, &str, TagValue)] =
+      &[("QuickTime", "HandlerType", TagValue::Str("vide".into()))];
+    let ctx = CompositeContext::new(None, Some(90.0));
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx,
+    );
+    assert_eq!(composite(&prt, "Rotation"), None);
+
+    // Inputs present but `ctx.rotation` None (no video track) ⇒ the ValueConv is
+    // `undef` ⇒ no Rotation.
+    let entries2: &[(&str, &str, TagValue)] = &[
+      (
+        "QuickTime",
+        "MatrixStructure",
+        TagValue::Str("0 0 0 0 0 0 0 0 0".into()),
+      ),
+      ("QuickTime", "HandlerType", TagValue::Str("soun".into())),
+    ];
+    let ctx2 = CompositeContext::new(None, None);
+    let mut prt = map_with(entries2);
+    let mut val = map_with(entries2);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx2,
+    );
+    assert_eq!(composite(&prt, "Rotation"), None);
+  }
+}
+
+#[cfg(feature = "riff")]
+mod riff_duration {
+  use super::*;
+
+  fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
+    let mut m = TagMap::new();
+    for (g, n, v) in entries {
+      let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
+    }
+    m
+  }
+  fn composite(m: &TagMap, name: &str) -> Option<TagValue> {
+    m.get("Composite", name).cloned()
+  }
+
+  #[test]
+  fn riff_duration_frame_count_over_rate() {
+    // Pentax.avi: FrameRate 24, FrameCount 600 ⇒ 25 s. VideoFrameRate/Count are
+    // equal (ratio 1.0, not in 1.9..3.1) ⇒ dur1 kept. `-j` ConvertDuration.
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("RIFF", "FrameRate", TagValue::U64(24)),
+      ("RIFF", "FrameCount", TagValue::U64(600)),
+      ("RIFF", "VideoFrameRate", TagValue::U64(24)),
+      ("RIFF", "VideoFrameCount", TagValue::U64(600)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
+    // 25 s ⇒ ">= 30"? no, < 30 ⇒ "25.00 s".
+    assert_eq!(
+      composite(&prt, "Duration"),
+      Some(TagValue::Str("25.00 s".into()))
+    );
+  }
+
+  #[test]
+  fn riff_duration_video_stream_override_when_2_to_3x() {
+    // The header-FrameCount-too-long case: FrameRate 15, FrameCount 700 ⇒ dur1
+    // 46.67 s; VideoFrameRate 15, VideoFrameCount 233 ⇒ dur2 15.53 s; ratio
+    // 46.67/15.53 = 3.0 (in 1.9..3.1) ⇒ dur2 wins (15.53 s).
+    let entries: &[(&str, &str, TagValue)] = &[
+      ("RIFF", "FrameRate", TagValue::U64(15)),
+      ("RIFF", "FrameCount", TagValue::U64(700)),
+      ("RIFF", "VideoFrameRate", TagValue::U64(15)),
+      ("RIFF", "VideoFrameCount", TagValue::U64(233)),
+    ];
+    let mut prt = map_with(entries);
+    let mut val = map_with(entries);
+    build_into(
+      REGISTRY,
+      &mut val,
+      Some(&mut prt),
+      ConvMode::ValueConv,
+      0,
+      &ctx0(),
+    );
+    // `-n` bare seconds = 233/15 = 15.5333...
+    let d = composite(&val, "Duration").unwrap();
+    if let TagValue::F64(x) = d {
+      assert!((x - 233.0 / 15.0).abs() < 1e-9, "got {x}");
+    } else {
+      panic!("expected F64, got {d:?}");
+    }
   }
 }

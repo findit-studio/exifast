@@ -51,5 +51,6 @@
   "Doc4:Track1:SampleTime": "3.00 s",
   "Doc4:Track1:SampleDuration": "1.00 s",
   "Doc4:Track1:PixelExposureTime": "8 ms",
-  "Doc4:Track1:RollingShutterSkewTime": "1.5 ms"
+  "Doc4:Track1:RollingShutterSkewTime": "1.5 ms",
+  "Composite:AvgBitrate": "120 bps"
 }]

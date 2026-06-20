@@ -55,5 +55,9 @@
   "Track2:MediaTimeScale": 44100,
   "Track2:MediaDuration": "0:00:30",
   "Track2:MediaLanguageCode": "eng",
-  "Track2:HandlerType": "Audio Track"
+  "Track2:HandlerType": "Audio Track",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "4 bps",
+  "Composite:Rotation": 0
 }]

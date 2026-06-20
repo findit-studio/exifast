@@ -50,5 +50,9 @@
   "UserData:LensSerialNumber": "LNS-998877",
   "UserData:FieldOfView": "Wide",
   "UserData:SerialNumberHash": "0011deadbeef",
-  "UserData:MediaUID": "cafef00d1234"
+  "UserData:MediaUID": "cafef00d1234",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]

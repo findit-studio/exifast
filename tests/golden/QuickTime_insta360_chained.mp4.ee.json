@@ -37,5 +37,6 @@
   "Insta360:SerialNumber": "IXSE123ABC456",
   "Insta360:Model": "Insta360 X3",
   "Insta360:Firmware": "1.0.07",
-  "Insta360:Parameters": "2 6 5760 2880"
+  "Insta360:Parameters": "2 6 5760 2880",
+  "Composite:ShutterSpeed": "1/125"
 }]

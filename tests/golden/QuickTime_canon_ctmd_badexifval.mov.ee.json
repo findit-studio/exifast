@@ -44,5 +44,6 @@
   "Track1:TimeStamp": "2018:02:21 12:08:56.21",
   "Track1:ExifByteOrder": "Little-endian (Intel, II)",
   "Track1:Warning": "Bad offset for ExifIFD Make",
-  "ExifIFD:Software": "SW"
+  "ExifIFD:Software": "SW",
+  "Composite:AvgBitrate": "720 bps"
 }]

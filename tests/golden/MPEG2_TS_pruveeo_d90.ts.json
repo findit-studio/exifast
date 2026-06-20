@@ -9,5 +9,7 @@
   "M2TS:AudioStreamType": "MPEG-2 AAC Audio",
   "M2TS:Duration": "7.44 s",
   "H264:ImageWidth": 1920,
-  "H264:ImageHeight": 1080
+  "H264:ImageHeight": 1080,
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1
 }]

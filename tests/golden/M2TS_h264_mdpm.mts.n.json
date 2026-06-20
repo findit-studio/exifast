@@ -13,5 +13,10 @@
   "GPS:GPSLatitude": 48,
   "GPS:GPSLongitudeRef": "E",
   "GPS:GPSLongitude": 11,
-  "M2TS:Duration": 0.0333666666666667
+  "M2TS:Duration": 0.0333666666666667,
+  "Composite:ImageSize": "1920 1088",
+  "Composite:Megapixels": 2.08896,
+  "Composite:GPSLatitude": 48,
+  "Composite:GPSLongitude": 11,
+  "Composite:GPSPosition": "48 11"
 }]

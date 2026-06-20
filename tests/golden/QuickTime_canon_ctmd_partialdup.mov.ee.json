@@ -44,5 +44,9 @@
   "Track1:TimeStamp": "2018:02:21 12:08:56.21",
   "Track1:ISO": 12800,
   "Track1:ExposureTime": "1/250",
-  "Track1:FNumber": 5.6
+  "Track1:FNumber": 5.6,
+  "Composite:Aperture": 5.6,
+  "Composite:ShutterSpeed": "1/250",
+  "Composite:AvgBitrate": "704 bps",
+  "Composite:LightValue": 5.9
 }]

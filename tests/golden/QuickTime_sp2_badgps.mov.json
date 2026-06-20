@@ -70,5 +70,9 @@
   "Keys:Model": "iPhone 15 Pro Max",
   "Keys:Software": 17.3,
   "Keys:CreationDate": "2024:06:07 08:09:10+00:00",
-  "Keys:GPSCoordinates": "48 deg 51' 30.24\" N, 2 deg 17' 40.20\" E, 35 m Above Sea Level"
+  "Keys:GPSCoordinates": "48 deg 51' 30.24\" N, 2 deg 17' 40.20\" E, 35 m Above Sea Level",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "4 bps",
+  "Composite:Rotation": 0
 }]

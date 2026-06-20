@@ -45,5 +45,6 @@
   "Track1:Acceleration": "0.00999999977648258 0.0199999995529652 9.8100004196167",
   "Track1:MagneticField": "30.5 -15.25 45",
   "Track1:PixelExposureTime": "8 ms",
-  "Track1:RollingShutterSkewTime": "1.5 ms"
+  "Track1:RollingShutterSkewTime": "1.5 ms",
+  "Composite:AvgBitrate": "120 bps"
 }]

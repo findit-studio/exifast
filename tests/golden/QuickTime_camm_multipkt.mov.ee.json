@@ -43,5 +43,6 @@
   "Track1:SampleDuration": "1.00 s",
   "Track1:GPSLatitude": "40 deg 0' 0.00\" N",
   "Track1:GPSLongitude": "50 deg 0' 0.00\" E",
-  "Track1:GPSAltitude": "60 m"
+  "Track1:GPSAltitude": "60 m",
+  "Composite:AvgBitrate": "336 bps"
 }]

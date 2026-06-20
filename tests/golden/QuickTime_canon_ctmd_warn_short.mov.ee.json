@@ -41,5 +41,6 @@
   "Track1:MetaFormat": "CTMD",
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
-  "Track1:Warning": "Short CTMD record"
+  "Track1:Warning": "Short CTMD record",
+  "Composite:AvgBitrate": "80 bps"
 }]

@@ -36,5 +36,8 @@
   "RIFF:AvgBytesPerSec": 11024,
   "RIFF:BitsPerSample": 8,
   "RIFF:DateTimeOriginal": "2003:03:10 15:04:43",
-  "RIFF:Software": "CanonMVI01"
+  "RIFF:Software": "CanonMVI01",
+  "Composite:ImageSize": "320x240",
+  "Composite:Megapixels": 0.077,
+  "Composite:Duration": "15.53 s"
 }]

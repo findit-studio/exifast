@@ -38,5 +38,6 @@
   "Track1:MediaDuration": "1.00 s",
   "Track1:HandlerClass": "Media Handler",
   "Track1:HandlerType": "NRT Metadata",
-  "Track1:MetaFormat": "camm"
+  "Track1:MetaFormat": "camm",
+  "Composite:AvgBitrate": "128 bps"
 }]

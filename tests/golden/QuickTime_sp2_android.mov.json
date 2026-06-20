@@ -45,5 +45,9 @@
   "UserData:Make": "motorola",
   "Keys:AndroidVersion": 13,
   "Keys:AndroidMake": "Google",
-  "Keys:AndroidModel": "Pixel 8 Pro"
+  "Keys:AndroidModel": "Pixel 8 Pro",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]

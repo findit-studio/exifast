@@ -41,5 +41,6 @@
   "Track1:MetaFormat": "camm",
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
-  "Track1:Warning": "Unknown camm record type 0"
+  "Track1:Warning": "Unknown camm record type 0",
+  "Composite:AvgBitrate": "128 bps"
 }]

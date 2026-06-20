@@ -42,5 +42,6 @@
   "Doc1:Track1:SampleTime": "0 s",
   "Doc1:Track1:SampleDuration": "1.00 s",
   "Doc1:Track1:TimeStamp": "2018:02:21 12:08:56.21",
-  "Doc1:Track1:Warning": "[minor] Suspicious MakerNotes offset for CanonFirmwareVersion"
+  "Doc1:Track1:Warning": "[minor] Suspicious MakerNotes offset for CanonFirmwareVersion",
+  "Composite:AvgBitrate": "544 bps"
 }]

@@ -1735,7 +1735,7 @@ mod tests {
     let tm = emit_into_tagmap(&meta, true);
     tm.entries()
       .iter()
-      .filter_map(|(_, _, g, n, _, v)| (g == "Audible").then(|| (n.to_string(), v.clone())))
+      .filter_map(|(_, _, g, n, _, v, _)| (g == "Audible").then(|| (n.to_string(), v.clone())))
       .collect()
   }
 

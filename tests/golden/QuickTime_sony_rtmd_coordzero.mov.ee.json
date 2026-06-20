@@ -61,5 +61,13 @@
   "Track1:GPSStatus": "Measurement Active",
   "Track1:GPSMeasureMode": "3-Dimensional Measurement",
   "Track1:GPSMapDatum": "WGS-84",
-  "Track1:GPSDateStamp": "2024:01:07"
+  "Track1:GPSDateStamp": "2024:01:07",
+  "Composite:Aperture": 4.0,
+  "Composite:ShutterSpeed": "1/60",
+  "Composite:AvgBitrate": "2.29 kbps",
+  "Composite:GPSDateTime": "2024:01:07 11:19:15Z",
+  "Composite:GPSLatitude": "",
+  "Composite:GPSLongitude": "122 deg 9' 54.00\" W",
+  "Composite:GPSPosition": ", 122 deg 9' 54.00\" W",
+  "Composite:LightValue": 6.9
 }]

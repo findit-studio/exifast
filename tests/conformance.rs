@@ -1955,11 +1955,13 @@ fn heic_msf1_brand_conformance() {
   // `GenProfileCompatibilityFlags`, `ConstraintIndicatorFlags`,
   // `GeneralLevelIDC`, `MinSpatialSegmentationIDC`, `ParallelismType`,
   // `ChromaFormat`, `BitDepthLuma`/`BitDepthChroma`, `AverageFrameRate`/
-  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`) — PLUS the
-  // unported `-x Composite:AvgBitrate`. `Composite:all` is NO LONGER excluded:
-  // an `image/*` QuickTime is allow-listed (#133 PR 3), so exifast now builds +
-  // KEEPS the ported `Composite:ImageSize` ("1280x720") + `Composite:Megapixels`
-  // (0.922). The `pict`
+  // `ConstantFrameRate`, `NumTemporalLayers`, `TemporalIDNested`). `Composite:
+  // AvgBitrate` is NO LONGER excluded (#133 PR 5: it is now the ported `mdat`-
+  // bitrate composite — the SUM of all three `mdat` sizes / Duration, "50.2
+  // Mbps"), and neither is `Composite:all`: an `image/*` QuickTime is
+  // allow-listed (#133 PR 3), so exifast now builds + KEEPS the ported
+  // `Composite:ImageSize` ("1280x720") + `Composite:Megapixels` (0.922) +
+  // `Composite:AvgBitrate` ("50.2 Mbps"). The `pict`
   // track is a non-`vide`/`soun`/`meta` handler, so the phase-1 port (#100)
   // emits its `stsd` 4cc as `Track1:OtherFormat` "hvc1"; the phase-4 port adds
   // the `vmhd` `GraphicsMode`/`OpColor` — all three now RETAINED byte-exact.

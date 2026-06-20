@@ -40,5 +40,9 @@
   "Track1:MediaTimeScale": 600,
   "Track1:MediaDuration": "0:00:30",
   "Track1:MediaLanguageCode": "ar",
-  "Track1:HandlerType": "Video Track"
+  "Track1:HandlerType": "Video Track",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "4 bps",
+  "Composite:Rotation": 0
 }]

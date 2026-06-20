@@ -108,11 +108,100 @@ case "$FIX" in
                   -x Composite:CircleOfConfusion -x Composite:FOV \
                   -x Composite:FocalLength35efl -x Composite:HyperfocalDistance) ;;
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
-  # The PNG raw-profile fixtures (#179) carry the engine-synthesized
-  # `Composite:ImageSize`/`Megapixels` (from the IHDR dimensions) that the PNG
-  # port does not emit (it has no Composite subsystem). Drop Composite so the
-  # decoded profile content (`XMP-*`) is what the golden compares.
-  PNG_rawprofile_*) EXCLUDE_ARR+=(-x Composite:all) ;;
+  # The PNG raw-profile fixtures (#179): #133 PR 5 flips PNG into the Composite
+  # allow-list, so exifast NOW emits `Composite:ImageSize`/`Megapixels` (from the
+  # IHDR dimensions), byte-matching bundled. They are no longer excluded — the
+  # decoded profile content (`XMP-*`) PLUS the two ported Composites are compared.
+  PNG_rawprofile_*) : ;;
+  # ── #133 PR 5 video/container Composite arms ─────────────────────────────────
+  # The full-video-activation fixtures keep their ported Composites
+  # (ImageSize/Megapixels/AvgBitrate/Rotation/Duration + the GPS-group SubDoc
+  # GPS) and drop ONLY the unported ones BY NAME (never `Composite:all`), plus
+  # the non-Composite port deferrals each golden already excluded before this PR.
+  #
+  # The UNPORTED Composites dropped here:
+  #  * the QuickTime `GPSCoordinates`-derived `Composite:GPSLatitude`/`Longitude`/
+  #    `GPSAltitude`/`GPSAltitudeRef` (+ the dependent `GPSPosition`) — a separate
+  #    QuickTime.pm:8668 Composite table (`Require => 'QuickTime:GPSCoordinates'`,
+  #    split " ") this PR does not port; exifast emits none, so they are dropped;
+  #  * MakerNote-derived `Composite:LensID` (Pentax AVI), `Composite:DateTimeOriginal`
+  #    (Red R3D) — unported MakerNote/format composites.
+  #
+  # `ISOBMFF_iso5_brand.mp4`: the `mvex/mehd` `MovieFragmentSequence` container
+  # tag stays unported; the ported `ImageSize`/`Megapixels` are kept.
+  ISOBMFF_iso5_brand.mp4) EXCLUDE_ARR+=(-x MovieFragmentSequence) ;;
+  # `Pentax.avi`: the Pentax-AVI MakerNote tail tags + `Composite:LensID` are
+  # unported (the AVI Pentax MakerNote subset); the ported ImageSize/Megapixels/
+  # Duration are kept.
+  Pentax.avi)
+    EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
+                  -x Pentax:Artist -x Pentax:Copyright -x Pentax:CrossProcess \
+                  -x Pentax:ExtenderStatus -x Pentax:FirmwareVersion -x Pentax:HighLowKeyAdj \
+                  -x Pentax:Hue -x Pentax:LevelIndicator -x Pentax:MonochromeFilterEffect \
+                  -x Pentax:MonochromeToning -x Pentax:SerialNumber) ;;
+  # `QuickTime_gopro_gpmf.mp4`: the QuickTime GPSCoordinates Composites (the
+  # `LocationInformation`-derived GPS) + the udta atoms this port does not decode
+  # (`ItemList:all` = ©too Encoder, `UserData:all` = LocationInformation) + the
+  # MOVIE-LEVEL `1QuickTime:HandlerType`/`HandlerVendorID` (the `1` prefix is
+  # ExifTool's family-1 qualifier — drops ONLY the moov-level "Metadata" handler
+  # exifast does not emit, KEEPING the `Track<N>:HandlerType` it does). The ported
+  # ImageSize/Megapixels/AvgBitrate/Rotation are kept.
+  QuickTime_gopro_gpmf.mp4)
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition \
+                  -x ItemList:all -x UserData:all \
+                  -x 1QuickTime:HandlerType -x 1QuickTime:HandlerVendorID) ;;
+  # The SP2 `Keys`/`UserData` GPSCoordinates fixtures: ExifTool's QuickTime
+  # GPSCoordinates Composites (GPSLatitude/Longitude/Altitude/AltitudeRef/Position)
+  # are unported; the ported ImageSize/Megapixels/AvgBitrate/Rotation are kept.
+  QuickTime_sp2.mov | QuickTime_sp2_badgps.mov | QuickTime_sp2_ilst_before_keys.mov | \
+  QuickTime_sp2_infgps.mov | QuickTime_sp2_iso6709long.mov | QuickTime_sp2_macroman.mov | \
+  QuickTime_sp2_meta_handlerclass.mov | QuickTime_sp2_keys_loc_binary.mov | \
+  QuickTime_sp2_keys_loc_numeric.mov)
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition) ;;
+  # `Red.r3d`: the unported `Composite:DateTimeOriginal` (Red's RawConv-assembled
+  # composite); the ported ImageSize/Megapixels are kept.
+  Red.r3d) EXCLUDE_ARR+=(-x Composite:DateTimeOriginal) ;;
+  # `RIFF.avi`: the AVI-embedded XMP packet is unported (the AVI `_PMX` chunk
+  # XMP decode); the ported Composites are kept.
+  RIFF.avi)
+    EXCLUDE_ARR+=(-x XMP-dc:Creator -x XMP-x:XMPToolkit -x XMP-xmp:MetadataDate \
+                  -x XMP-xmpDM:Album -x XMP-xmpDM:AltTapeName) ;;
+  # ── Timed-GPS `Composite:GPSPosition` deferral (camm / mebx / freeGPS / insta360
+  # / gopro gpmd) ──────────────────────────────────────────────────────────────
+  # These tracks emit their per-sample GPS as family-1 `Track<N>` / movie-level
+  # `QuickTime` tags (family-2 `Location`), NOT the family-1 `GPS` group the
+  # ported `%GPS::Composite` `GPSLatitude`/`GPSLongitude` SubDoc defs require — so
+  # exifast builds no per-doc `Composite:GPSLatitude`/`Longitude` for them, hence
+  # no Main `Composite:GPSPosition` (which `Require`s those). Bundled DOES
+  # synthesize `Composite:GPSPosition` for them (its GPS-group Composite matches
+  # the timed GPS via family-2 `Location`), an unported timed-GPS-Composite path.
+  # The Sony rtmd `Doc<N>:Composite:GPS*` (family-0 `Sony`) + the still/EXIF GPS
+  # Composites ARE ported; only this non-Sony timed/moov GPSPosition is dropped.
+  # The ported `AvgBitrate`/`ImageSize`/`Megapixels`/`Rotation` are kept.
+  QuickTime_camm.mov | QuickTime_camm_2track.mov | QuickTime_camm_gps_warn.mov | \
+  QuickTime_camm_motion_gps.mov | QuickTime_camm_multipkt.mov | QuickTime_camm_warn_gps.mov | \
+  QuickTime_frea_rexing17b.mov | QuickTime_gopro_hero8_gpmf.mp4 | QuickTime_gps0.mov | \
+  QuickTime_gps0_oor0.mov | QuickTime_gps_kenwood.mov | QuickTime_insta360.mp4 | \
+  QuickTime_insta360_badstride.mp4 | QuickTime_insta360_chained.mp4 | \
+  QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
+  MPEG2_TS_pruveeo_d90.ts)
+    EXCLUDE_ARR+=(-x Composite:GPSPosition) ;;
+  # `QuickTime_mebx_gps.mov`: a crafted single-`mebx`-GPS fixture — bundled builds
+  # the per-doc `Composite:GPSLatitude` (and no GPSPosition, a single coordinate);
+  # the unported timed `Composite:GPSLatitude`/`GPSLongitude` are dropped.
+  QuickTime_mebx_gps.mov)
+    EXCLUDE_ARR+=(-x Composite:GPSLatitude -x Composite:GPSLongitude) ;;
+  # `_multistsd`/`_multistsd8`: the sample decodes as the camm DECOY (family-1
+  # `Track1`, not the family-0 `Sony` rtmd), so its GPS is the unported timed-GPS
+  # path ⇒ no `Composite:GPSPosition` (same as the camm/mebx deferral above).
+  # (The crafted edges where exifast EMITS a diverging Composite —
+  # `_coordzero`/`_nonfinite`/`_zerolen`/`_shortnum` GPS+Aperture, the Canon
+  # `exifinfo` LightValue — are dropped from BOTH sides by the TEST's `excluded`
+  # arg, not here, since a golden-only `-x` would still leave exifast's extra.)
+  QuickTime_sony_rtmd_multistsd.mov | QuickTime_sony_rtmd_multistsd8.mov)
+    EXCLUDE_ARR+=(-x Composite:GPSPosition) ;;
   # The EXIF / still-QuickTime fixtures (#133 PR 3): exifast emits the ported
   # Tier-A EXIF Composites (`ImageSize`/`Megapixels`/`ShutterSpeed`/`Aperture`/
   # `SubSecDateTimeOriginal`/`SubSecCreateDate`/`SubSecModifyDate`, Exif.pm) plus
@@ -178,10 +267,11 @@ case "$FIX" in
   Exif_trailing_space.tif)
     EXCLUDE_ARR+=(-x System:all) ;;
   # HEIF/AVIF stills: fold the documented codec-config `EXCLUDE` env into the arm
-  # (so it is reproducible) and replace the former `-x Composite:all` with the
-  # specific unported-Composite drops. AVIF emits only the ported ImageSize +
-  # Megapixels (no Composite drop needed); HEIC also emits `Composite:AvgBitrate`
-  # (the `mdat`-bitrate composite, unported) which is dropped.
+  # (so it is reproducible). AVIF emits only the ported ImageSize + Megapixels;
+  # HEIC also emits the now-ported `Composite:AvgBitrate` (#133 PR 5 — the
+  # `mdat`-bitrate composite: the SUM of all three `mdat` sizes / Duration,
+  # `50.2 Mbps`), so it is NO LONGER excluded (the only remaining drops are the
+  # codec-config property atoms the port does not decode).
   HEIF_C001_msf1.heic)
     EXCLUDE_ARR+=(-x System:all -x Copy1:HandlerType -x ImageSpatialExtent \
                   -x HEVCConfigurationVersion -x GeneralProfileSpace \
@@ -190,8 +280,7 @@ case "$FIX" in
                   -x GeneralLevelIDC -x MinSpatialSegmentationIDC \
                   -x ParallelismType -x ChromaFormat -x BitDepthLuma \
                   -x BitDepthChroma -x AverageFrameRate -x ConstantFrameRate \
-                  -x NumTemporalLayers -x TemporalIDNested \
-                  -x Composite:AvgBitrate) ;;
+                  -x NumTemporalLayers -x TemporalIDNested) ;;
   AVIF_sample.avif)
     EXCLUDE_ARR+=(-x System:all -x HandlerType -x HandlerDescription \
                   -x PixelAspectRatio -x ImageSpatialExtent -x ImagePixelDepth \

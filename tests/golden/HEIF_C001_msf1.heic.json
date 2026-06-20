@@ -47,5 +47,6 @@
   "Track1:OpColor": "0 0 0",
   "Track1:OtherFormat": "hvc1",
   "Composite:ImageSize": "1280x720",
-  "Composite:Megapixels": 0.922
+  "Composite:Megapixels": 0.922,
+  "Composite:AvgBitrate": "50.2 Mbps"
 }]

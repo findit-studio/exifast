@@ -1028,9 +1028,11 @@ impl H264Group {
 /// is NOT overwritten by it. Every other H264 tag has no `Priority`/`PRIORITY`/
 /// `Avoid`, so it takes the engine's normal default. ExifTool compares
 /// priorities numerically (`$priority >= $oldPriority`, ExifTool.pm:9553) with
-/// an undefined/default priority acting as `1` and `Priority => 0` as `0`; the
-/// `Ord` derive (variants ordered `Low < Normal`) reproduces that comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// an undefined/default priority acting as `1` and `Priority => 0` as `0`;
+/// [`as_priority_u8`](Self::as_priority_u8) maps to that `u8`
+/// (`Low` ⇒ `0`, `Normal` ⇒ `1`) so the visible-winner selection compares
+/// through the SHARED [`crate::tagmap::effective_priority`] rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H264Priority {
   /// `Priority => 0` — a low-priority tag (H264.pm:215, only `0xa8`
   /// WhiteBalance). It never displaces a same-name `Normal` tag, and (ties
@@ -1039,6 +1041,21 @@ enum H264Priority {
   /// The engine default (undefined `Priority` ⇒ `1`, ExifTool.pm:9551). Every
   /// H264 tag except `0xa8` WhiteBalance.
   Normal,
+}
+
+impl H264Priority {
+  /// This priority as the `u8` ExifTool threads through `FoundTag`
+  /// (`ExifTool.pm:9553`): `Low` ⇒ `0`, `Normal` ⇒ `1`. Lets the visible-winner
+  /// comparison run through the SHARED [`crate::tagmap::effective_priority`] /
+  /// [`crate::tagmap::dedup_override`] rule the tag sinks use, so an H264
+  /// duplicate's override decision cannot diverge from them by construction.
+  #[inline]
+  const fn as_priority_u8(self) -> u8 {
+    match self {
+      Self::Low => 0,
+      Self::Normal => 1,
+    }
+  }
 }
 
 /// One emitted H.264 tag: a family-1 group, a tag name, a `FoundTag` priority,
@@ -3280,39 +3297,71 @@ impl crate::emit::Taggable for H264Meta<'_> {
 #[cfg(feature = "alloc")]
 impl H264Meta<'_> {
   /// `true` when `entry` (at extraction index `idx`) is the value the default
-  /// render shows for its `group:name` — i.e. no OTHER entry with the same
-  /// `group:name` outranks it. An entry is outranked by a peer with strictly
-  /// higher [`H264Priority`], or by an equal-priority peer at a LATER index
-  /// (ties → last-wins). This mirrors `FoundTag`'s priority comparison
-  /// (`$priority >= $oldPriority`, ExifTool.pm:9553) folded with the default
-  /// `Duplicates`-off one-per-name dedup (ExifTool.pm:5396-5404 / 5522-5538):
-  /// every loser becomes a `(N)` duplicate copy that the default `-j`/`-n`
-  /// output omits (Codex R15 F1). The only stream that exercises a non-tie here
-  /// is the `0xa8 WhiteBalance` (`Priority => 0`) vs an earlier Camera1
-  /// `WhiteBalance`; every other H264 tag is `Normal`, so this reduces to the
-  /// pre-existing last-wins for ordinary same-name duplicates.
+  /// render shows for its `(doc, group, name)` — i.e. it is the SURVIVOR of the
+  /// same left-to-right [`crate::tagmap::dedup_override`] fold the
+  /// [`crate::tagmap::TagMap`] (JSON / golden) and
+  /// [`collect_deduped_tags`](crate::format_parser::AnyMeta) (`iter_tags` /
+  /// Composite) sinks run over its duplicate group. Each loser becomes a `(N)`
+  /// duplicate copy the default `-j`/`-n` output omits (ExifTool.pm:5396-5404 /
+  /// 5522-5538). The only stream exercising a non-trivial decision here is the
+  /// `0xa8 WhiteBalance` (`Priority => 0`) vs an earlier Camera1 `WhiteBalance`;
+  /// every other H264 tag is `Normal`.
+  ///
+  /// The decision is the SHARED [`crate::tagmap::dedup_override`] predicate in
+  /// BOTH directions over the SHARED [`crate::tagmap::effective_priority`] (the
+  /// `u8` ExifTool threads, forcing a `Warning`/`Error` to `0` by NAME), so the
+  /// visible winner cannot diverge from the final sinks BY CONSTRUCTION — not
+  /// merely coincide. The sinks fold over the group in extraction order, each
+  /// later member replacing the running survivor iff
+  /// `dedup_override(eff(later), eff(survivor))`; `entry` is that final survivor
+  /// exactly when:
+  ///
+  /// * NO LATER peer `j > idx` displaces it —
+  ///   `!dedup_override(eff(j), eff(idx))` for every later same-key peer (a
+  ///   later peer wins only when its effective priority is non-zero AND `>=`
+  ///   this one's, i.e. last-wins among priority-≥1, never on a priority-0
+  ///   tie); and
+  /// * it BEATS every EARLIER peer `j < idx` it would meet in the slot —
+  ///   `dedup_override(eff(idx), eff(j))` for every earlier same-key peer
+  ///   (so a priority-0 `entry` loses to ANY earlier same-key peer ⇒ the FIRST
+  ///   of an all-priority-0 group survives; a priority-≥1 `entry` beats every
+  ///   earlier one).
+  ///
+  /// For the `{0, 1}` H264 priority domain this is bit-for-bit the prior
+  /// strictly-higher-wins / equal-later-wins behavior on every current fixture
+  /// (no same-doc same-name priority-0 duplicate exists), and additionally
+  /// pins the priority-0-tie edge to FIRST-wins — exactly as `dedup_override`
+  /// (a `Priority => 0` duplicate never overrides) makes the sinks behave, so a
+  /// future same-doc effective-priority-0 H264 duplicate can no longer diverge.
+  /// No H264 tag is named `Warning`/`Error`, so `effective_priority` is the
+  /// identity here (`Low` ⇒ `0`, `Normal` ⇒ `1`).
   fn is_visible_winner(&self, idx: usize, entry: &H264Entry) -> bool {
     let group = entry.group();
     let name = entry.name();
-    let prio = entry.priority();
+    // `entry`'s effective priority — the `u8` the shared fold compares.
+    let prio = crate::tagmap::effective_priority(name, entry.priority().as_priority_u8());
     let doc = entry.doc();
     !self.entries.iter().enumerate().any(|(j, other)| {
-      j != idx
-        // The priority/last-wins collapse is per `(doc, group, name)`: a
-        // per-frame `-ee` `Doc<N>` tag is a DISTINCT `FoundTag` identity from
-        // the same `group:name` in another document (TagMap keys on the doc
-        // too), so it must not be deduped against it (H264.pm:1082 `DOC_NUM`).
-        && other.doc() == doc
-        && other.group() == group
-        && other.name() == name
-        && match other.priority().cmp(&prio) {
-          // A strictly higher-priority peer always wins.
-          core::cmp::Ordering::Greater => true,
-          // Equal priority → the LATER entry wins (last-wins tie-break).
-          core::cmp::Ordering::Equal => j > idx,
-          // A lower-priority peer never displaces this entry.
-          core::cmp::Ordering::Less => false,
-        }
+      // The dedup is per `(doc, group, name)`: a per-frame `-ee` `Doc<N>` tag is
+      // a DISTINCT `FoundTag` identity from the same `group:name` in another
+      // document (the TagMap key carries the doc too), so it must not be deduped
+      // against it (H264.pm:1082 `DOC_NUM`).
+      if j == idx || other.doc() != doc || other.group() != group || other.name() != name {
+        return false;
+      }
+      let other_prio =
+        crate::tagmap::effective_priority(other.name(), other.priority().as_priority_u8());
+      // Drive the winner decision THROUGH the shared `dedup_override`, both
+      // directions, so it is the SAME survivor the sinks' streaming fold picks:
+      if j > idx {
+        // A LATER peer displaces `entry` iff it would override it in the slot.
+        crate::tagmap::dedup_override(other_prio, prio)
+      } else {
+        // An EARLIER peer survives against `entry` iff `entry` would NOT
+        // override it (a priority-0 `entry` loses to any earlier peer ⇒
+        // first-wins; otherwise last-/higher-wins).
+        !crate::tagmap::dedup_override(prio, other_prio)
+      }
     })
   }
 }
@@ -3738,7 +3787,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(_, _, _, n, _, _)| n.contains("WhiteBalance"))
+      .filter(|(_, _, _, n, _, _, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the priority winner is emitted");
   }
@@ -3780,6 +3829,71 @@ mod tests {
       Some("Hold"),
       "the higher-priority Normal WhiteBalance wins regardless of order"
     );
+  }
+
+  /// Two same-doc effective-priority-0 (`H264Priority::Low`) same-name entries:
+  /// the FIRST survives, NOT the later one. This is the by-construction edge the
+  /// shared [`crate::tagmap::dedup_override`] pins — a `Priority => 0` duplicate
+  /// NEVER overrides (`ExifTool.pm:9544-9560`), so `%noDups` keeps the
+  /// FIRST-extracted by file order (`ExifTool.pm:5404-5417`), i.e. first-wins.
+  /// The prior `Ordering::Equal => j > idx` tie-break resolved this LATER-wins,
+  /// diverging from the final tag sinks on a priority-0 tie; routing
+  /// [`is_visible_winner`] through `dedup_override` both directions closes it.
+  /// (MDPM tag ids are strictly ascending — H264.pm:988 — so this same-doc
+  /// priority-0 duplicate cannot arise from one real stream; built directly.)
+  #[test]
+  fn priority_zero_tie_first_same_doc_entry_wins() {
+    // Two `Priority => 0` (`Low`) `WhiteBalance` entries in the SAME document
+    // (`with_group_priority` starts at `doc == 0` for both), distinct values.
+    let meta = H264Meta {
+      entries: vec![
+        H264Entry::with_group_priority(
+          H264Group::H264,
+          H264Priority::Low,
+          SmolStr::new_static("WhiteBalance"),
+          H264Value::Text(TextValue::new("Auto", "0")),
+        ),
+        H264Entry::with_group_priority(
+          H264Group::H264,
+          H264Priority::Low,
+          SmolStr::new_static("WhiteBalance"),
+          H264Value::Text(TextValue::new("Hold", "1")),
+        ),
+      ],
+      make: None,
+      warnings: Vec::new(),
+      found_user_data: false,
+      _marker: core::marker::PhantomData,
+    };
+
+    // The FIRST entry (idx 0) is the visible winner; the later same-key
+    // priority-0 peer (idx 1) is NOT — `is_visible_winner` agrees with the
+    // first-wins `dedup_override` rule directly.
+    assert!(
+      meta.is_visible_winner(0, &meta.entries[0]),
+      "the FIRST priority-0 entry survives a same-doc priority-0 tie (first-wins)"
+    );
+    assert!(
+      !meta.is_visible_winner(1, &meta.entries[1]),
+      "the LATER priority-0 entry must NOT override the earlier one"
+    );
+
+    // And the final tag sink agrees BY CONSTRUCTION: the emitted (deduped)
+    // `H264:WhiteBalance` is the FIRST value ("Auto"), not the later "Hold".
+    let j = emit_into_tagmap(&meta, true);
+    assert_eq!(
+      j.get_str("H264", "WhiteBalance").as_deref(),
+      Some("Auto"),
+      "the visible WhiteBalance is the FIRST priority-0 value (first-wins), \
+       matching the final sink survivor"
+    );
+    // Exactly one survives (the loser is a dropped `(N)` duplicate copy).
+    let wb_keys = j
+      .entries()
+      .iter()
+      .filter(|(_, _, _, n, _, _, _)| n.contains("WhiteBalance"))
+      .count();
+    assert_eq!(wb_keys, 1, "only the first-wins survivor is emitted");
   }
 
   // === Codex R5 F1 — GPS family-1 group ===

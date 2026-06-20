@@ -43,5 +43,9 @@
   "Track1:MediaLanguageCode": "und",
   "Track1:HandlerClass": "Media Handler",
   "Track1:HandlerType": "Video Track",
-  "Keys:GPSCoordinates": "12 deg 18' 0.00\" N, 45 deg 36' 0.00\" E"
+  "Keys:GPSCoordinates": "12 deg 18' 0.00\" N, 45 deg 36' 0.00\" E",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]

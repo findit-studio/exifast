@@ -68,5 +68,6 @@
   "Doc2:Track1:OpticalZoomCode": 0,
   "Doc2:Track1:CameraTemperature": "72 C",
   "Doc2:Track1:FlashGuideNumber": 0,
-  "Doc2:Track1:FlashExposureComp": 0
+  "Doc2:Track1:FlashExposureComp": 0,
+  "Composite:AvgBitrate": "1 kbps"
 }]

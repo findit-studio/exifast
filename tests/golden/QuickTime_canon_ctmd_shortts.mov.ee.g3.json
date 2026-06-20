@@ -45,5 +45,6 @@
   "Doc1:Track1:TimeStamp": "2018:00:00 00:00:00.00",
   "Doc2:Track1:SampleTime": "1.00 s",
   "Doc2:Track1:SampleDuration": "1.00 s",
-  "Doc2:Track1:Warning": "RawConv TimeStamp: 'x' outside of string in unpack"
+  "Doc2:Track1:Warning": "RawConv TimeStamp: 'x' outside of string in unpack",
+  "Composite:AvgBitrate": "112 bps"
 }]
