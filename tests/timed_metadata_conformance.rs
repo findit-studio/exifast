@@ -269,6 +269,179 @@ fn gopro_hero8_gpmd_ee_byte_exact() {
   );
 }
 
+// ── Track<N>: gpmd dashcam variants (FMAS / Wolfbox — per-sample Track<N>) ───
+// The `gpmd` MetaFormat Condition cascade (QuickTimeStream.pl:181-212) routes
+// the self-contained dashcam variants to their `freeGPS` process-procs:
+// `^FMAS\0\0\0\0` → `ProcessFMAS` (Vantrue N2S, :3580), and `.{136}(0{16}[A-Z]{4}
+// |https://www.redtiger\0)` → `ProcessWolfbox` (Wolfbox G900 / Redtiger F9 4K,
+// :3615). UNLIKE the movie-level `moov`-`gps `-box / brute-force `mdat`-scan
+// freeGPS sources, these are `ProcessSamples`-dispatched per timed sample, so
+// ExifTool scopes the decoded GPS to the `gpmd` trak's `SET_GROUP1 = "Track1"`
+// and emits the sample-table `SampleTime`/`SampleDuration` (QuickTimeStream.pl:
+// 161-162) ahead of the fix. exifast stamps these fixes with `GpsOrigin::Gpmd`
+// so the SP3 emission lands under `Track1:` with the sample timing — every tag
+// (incl. `Track1:MetaFormat`, the stsd `gpmd` 4cc) compared byte-exact.
+//
+// The fixtures are HAND-CRAFTED minimal `.mov`s (`tools/gen_freegps_gpmd_fixture.py`)
+// — exifast has no real Vantrue N2S / Redtiger F9 4K clip (#100). The container
+// mirrors the crafted Sony rtmd / camm fixtures (a single-sample `meta`-handler
+// trak); only the stsd format code is `gpmd`. Verified bundled-decodable vs
+// ExifTool 13.59 (the FMAS fix lands at 47°37'42.00"N 8°30'6.00"E, the Wolfbox at
+// 47°37'42.32"N 8°22'30.46"E).
+
+#[test]
+fn fmas_n2s_gpmd_ee_byte_exact() {
+  // `-ee -G1`: the single `gpmd` sample's FMAS fix collapsed to `Track1:` (the
+  // doc axis collapsed) + the cross-sample min-doc `Track1:SampleTime`/
+  // `SampleDuration` — byte-exact.
+  check_ee(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the FMAS fix as its own `Doc1:Track1:…` with the sample's own
+  // SampleTime/SampleDuration — byte-exact.
+  check_ee(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn wolfbox_redtiger_f9_gpmd_ee_byte_exact() {
+  // `-ee -G1`: the single `gpmd` sample's Wolfbox fix (incl. `Track1:GPSAltitude`)
+  // collapsed to `Track1:` + the min-doc `Track1:SampleTime`/`SampleDuration` —
+  // byte-exact.
+  check_ee(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the Wolfbox fix as its own `Doc1:Track1:…` — byte-exact.
+  check_ee(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.ee.g3.json",
+    true,
+  );
+}
+
+// The no-`ee` default path: a `gpmd` trak is `meta`-handler ⇒ fully `-ee` gated,
+// so the only surfaced timed tag is the `Track1:Warning` ([minor] ExtractEmbedded
+// hint, QuickTime.pm `EEWarn`); NO GPS surfaces. Pins that the `gpmd`-variant GPS
+// emission is `-ee`-only (the same gate as camm / the GoPro gpmd), so a default
+// parse leaks no fix. Every tag (incl. `Track1:MetaFormat`) compared byte-exact.
+#[test]
+fn fmas_n2s_gpmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.json",
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn wolfbox_redtiger_f9_gpmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.json",
+    NO_EXCL,
+  );
+}
+
+// A two-sample `gpmd` stream where the FIRST sample MATCHES the FMAS `Condition`
+// (`^FMAS\0\0\0\0`, QuickTimeStream.pl:197) but `ProcessFMAS`'s stricter full
+// record regex FAILS (a 100-byte sample, no `SAMM`@80 / `A`@120), so it DECODES
+// NOTHING; the SECOND sample is a valid FMAS record. ExifTool fires
+// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}` + `SampleTime`/
+// `SampleDuration`, QuickTimeStream.pl:967-972) the moment `GetTagInfo` matches
+// the SHORT Condition (`ProcessSamples`:1567-1571), BEFORE — and independently
+// of — what `ProcessFMAS` decodes. So the matched-but-empty first sample STILL
+// opens a `Doc<N>` and emits its timing, which means the valid sample is
+// renumbered `Doc2` (NOT `Doc1`), and at `-G1` the single `Track1:SampleTime` is
+// the FIRST (empty) sample's `0 s`, not the valid sample's `1.00 s`. Verified
+// byte-exact vs bundled ExifTool 13.59 (the matched-empty sample's `Doc<N>` +
+// timing — the `gpmd` analogue of the camm timing-only marker; #100 follow-up).
+#[test]
+fn fmas_gpmd_matched_empty_then_valid_doc_renumber_byte_exact() {
+  // `-ee -G3:1`: the matched-empty sample is `Doc1:Track1:SampleTime "0 s"` (no
+  // GPS) and the valid FMAS fix is `Doc2:Track1:…` — proving the empty sample
+  // consumed `Doc1` so the valid one is `Doc2`. Byte-exact.
+  check_ee(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, and the single `Track1:SampleTime "0 s"`
+  // is the FIRST (min-`doc()` = `Doc1`, empty) sample's timing while the GPS
+  // columns come from the `Doc2` fix — byte-exact (the min-doc precompute
+  // includes the timing-only marker as a candidate).
+  check_ee(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `gpmd` trak is fully `-ee` gated, so only the
+  // structural `Track1:MetaFormat` + the `[minor]` EEWarn surface (no GPS, no
+  // SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the `gpmd` matched-empty-then-valid `-ee -G3`
+/// emission (the `#100` R2 Codex finding). [`json_equivalent_strict`] (used by
+/// [`check_ee`] above) compares object keys as an UNORDERED multiset, so it does
+/// NOT catch a wrong key ORDER — the `.ee.g3.json` golden on disk carries the
+/// correct bundled order yet a divergent emission order still passes it. This
+/// asserts directly on the RAW emitted document that the matched-empty sample's
+/// `Doc1:Track1:SampleTime`/`SampleDuration` are emitted BEFORE the valid fix's
+/// `Doc2:Track1:` rows — exactly ExifTool's `ProcessSamples` per-sample (=
+/// `Doc<N>`) emission order. Before the doc-merge fix the GPS fixes appended
+/// ahead of the timing-only markers, so `Doc2:` preceded `Doc1:` here while
+/// conformance stayed green.
+#[test]
+fn fmas_gpmd_matched_empty_then_valid_g3_emission_order() {
+  let data = fixture("QuickTime_fmas_empty_then_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_fmas_empty_then_valid.mov", &data, true, opts);
+
+  // The matched-empty sample (Doc1) carries ONLY SampleTime/SampleDuration; the
+  // valid FMAS fix (Doc2) carries SampleTime/SampleDuration + the GPS columns.
+  let doc1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present");
+  let doc1_dur = got
+    .find("\"Doc1:Track1:SampleDuration\"")
+    .expect("Doc1:Track1:SampleDuration present");
+  let doc2_time = got
+    .find("\"Doc2:Track1:SampleTime\"")
+    .expect("Doc2:Track1:SampleTime present");
+  let doc2_lat = got
+    .find("\"Doc2:Track1:GPSLatitude\"")
+    .expect("Doc2:Track1:GPSLatitude present");
+  let doc2_datetime = got
+    .find("\"Doc2:Track1:GPSDateTime\"")
+    .expect("Doc2:Track1:GPSDateTime present");
+
+  // Doc1's timing block must precede the ENTIRE Doc2 block (its timing AND its
+  // GPS rows) — ProcessSamples emits the empty sample fully before the valid one.
+  assert!(
+    doc1_time < doc2_time
+      && doc1_dur < doc2_time
+      && doc1_time < doc2_datetime
+      && doc1_time < doc2_lat,
+    "gpmd -ee -G3 emission order: Doc1 timing must precede the Doc2 fix \
+     (Doc1:SampleTime@{doc1_time}, Doc1:SampleDuration@{doc1_dur}, \
+     Doc2:SampleTime@{doc2_time}, Doc2:GPSDateTime@{doc2_datetime}, \
+     Doc2:GPSLatitude@{doc2_lat})\n--- got ---\n{got}"
+  );
+}
+
 // ── Track<N>: camm (Android CAMM — per-sample Track<N>, via track_index) ─────
 // SampleTime / SampleDuration ARE emitted (one per camm SAMPLE, off the
 // sample-table timing threaded onto each sample's records) and compared; every

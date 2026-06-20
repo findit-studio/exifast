@@ -7632,22 +7632,73 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── SP3 `gpmd` dashcam-variant cross-sample `-G1` SampleTime/SampleDuration ─
+    // At `-ee -G1` the single `Track<N>:SampleTime`/`SampleDuration` is the timing
+    // of that track's MINIMUM-`doc()` (FIRST) `gpmd` sample: ExifTool's
+    // `ProcessSamples` emits each sample's timing in sample order BEFORE
+    // dispatching its `freeGPS` process-proc, and `%noDups` is first-wins
+    // (QuickTimeStream.pl:1518-1523). The SP3 `emit_timed_samples` below emits its
+    // own per-`Doc<N>` SampleTime ONLY at `-G3` (its `-G1` internal collapse keeps
+    // the first DOC's GPS columns but ExifTool's per-sample timing precedes those),
+    // so — mirroring the camm precompute — emit the min-`doc()` timing per
+    // `Track<N>` HERE through the shared `first_seen` gate. ONLY `gpmd`-origin
+    // samples carry sample-table timing (the movie-level `moov`-`gps `/`mdat`-scan
+    // sources have none), so this leaves their goldens untouched. `-G1` only.
+    if opts.extract_embedded && !matches!(opts.group_mode, crate::serialize_key::GroupMode::G3) {
+      for (track, st, sd) in gpmd_gps_min_doc_timing(&self.stream) {
+        let group = Group::new("QuickTime", std::format!("Track{track}").as_str());
+        for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
+          if let Some(secs) = val
+            && first_seen(group.family1(), name)
+          {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+      }
+    }
+
     // ── SP3: embedded timed-metadata (QuickTimeStream) ─────────────────
     // ExifTool surfaces these per-sample tags ONLY under `-ee` (ExtractEmbedded)
     // and opens one `Doc<N>` sub-document per GPS fix (`$$et{DOC_NUM} =
     // ++$$et{DOC_COUNT}`, QuickTimeStream.pl:967-973). The shared
     // [`emit_timed_samples`] reproduces both: gated on `opts.extract_embedded`,
     // it emits every fix as a `Doc<N>` row at `-G3` and the first-fix-wins
-    // collapse at `-G1`. The SP3 stream is MOOV-level / freeGPS-scanned, so its
-    // family-1 group is `QuickTime` for every fix (oracle: `QuickTime:GPSLatitude`
-    // / `Doc1:QuickTime:GPSLatitude`). lat/lon → `GPS::ToDMS` at `-j`
-    // (QuickTimeStream.pl:116-117), altitude → the `+ 0` `%.4f` `" m"` PrintConv
-    // (:120), both raw `F64` at `-n`. GPSSpeed (km/h, the typed layer's
+    // collapse at `-G1`. Most SP3 fixes are MOOV-level / freeGPS-scanned, so the
+    // family-1 group is `QuickTime` (oracle: `QuickTime:GPSLatitude` /
+    // `Doc1:QuickTime:GPSLatitude`). The EXCEPTION is a `gpmd` MetaFormat dashcam
+    // variant (FMAS / Wolfbox / Rove) — `ProcessSamples`-dispatched, so ExifTool
+    // scopes it to the enclosing `trak`'s `SET_GROUP1 = "Track$num"`
+    // (QuickTime.pm:10353-10354): such a fix carries [`GpsOrigin::Gpmd`] and
+    // emits under `Track<N>:` (+ its sample-table `SampleTime`/`SampleDuration`,
+    // surfaced via the `sample_timing()` trait override). lat/lon → `GPS::ToDMS`
+    // at `-j` (QuickTimeStream.pl:116-117), altitude → the `+ 0` `%.4f` `" m"`
+    // PrintConv (:120), both raw `F64` at `-n`. GPSSpeed (km/h, the typed layer's
     // post-ValueConv value) and GPSTrack are the per-source columns; GPSDateTime
     // is the common ConvertDateTime string.
+    //
+    // Remember where these SP3 stream rows begin: the `gpmd` matched-but-empty
+    // [`GpmdTimingOnly`] markers below belong to the SAME per-sample
+    // `ProcessSamples` walk and must INTERLEAVE with the GPS fixes by `Doc<N>`
+    // (sample order), not append after them. ExifTool emits each sample's
+    // `SampleTime`/`SampleDuration` then its payload in sample order, so an
+    // empty-then-valid `gpmd` track yields `Doc1` timing BEFORE the `Doc2` fix
+    // (ground-truth `-ee -G3:1`). The conformance comparator is order-INSENSITIVE,
+    // so this ordering is locked by an explicit emission-order assertion in
+    // `tests/timed_metadata_conformance.rs` instead.
+    let gps_start = tags.len();
     emit_timed_samples(
       self.stream.gps_samples(),
-      |_s| Group::new("QuickTime", "QuickTime"),
+      |s| match s.origin() {
+        Some(crate::metadata::GpsOrigin::Gpmd { track }) => {
+          Group::new("QuickTime", std::format!("Track{track}").as_str())
+        }
+        _ => Group::new("QuickTime", "QuickTime"),
+      },
       opts,
       print_conv,
       // The SP3 stream carries no GPSMeasureMode column — never invoked.
@@ -7703,6 +7754,82 @@ impl crate::emit::Taggable for Meta<'_> {
       },
       &mut tags,
     );
+    // ── Unified `gpmd` doc-ordered emission (closes the gpmd-emission-order
+    //    class) ───────────────────────────────────────────────────────────────
+    // At `-ee -G3` EVERY `gpmd`-dispatched source emits IN-STREAM in sample (=
+    // `Doc<N>`) walk order — ExifTool's `ProcessSamples` walks the `gpmd` `stbl`
+    // once and emits each sample's rows the moment it is decoded. exifast decodes
+    // the three `gpmd`-dispatched kinds into SEPARATE typed sinks, so without
+    // re-ordering they would emit in SINK order, not walk order. The three kinds:
+    //   1. the SP3 GpsSamples with [`crate::metadata::GpsOrigin::Gpmd`] (the
+    //      self-contained FMAS / Wolfbox / Rove fixes — already in `tags` since
+    //      `gps_start`, emitted by `emit_timed_samples`),
+    //   2. the matched-empty [`GpmdTimingOnly`] markers (a Condition matched but
+    //      its process-proc decoded no fix — a `SampleTime`/`SampleDuration`-only
+    //      `Doc<N>`),
+    //   3. the `gpmd`-DISPATCHED LigoGPS records (the Kingslim arm's
+    //      `ProcessFreeGPS` → `ProcessLigoGPS` output, flagged
+    //      [`crate::metadata::LigoGpsSample::is_gpmd_dispatched`]) — NOT the
+    //      movie-level `moov`-`gps `-box / `mdat`-scan LigoGPS, NOR the
+    //      `udta`/trailer LigoGPS, which are NOT `ProcessSamples`-dispatched.
+    // Collect all three into ONE buffer and STABLE-SORT by `Doc<N>` so the merged
+    // stream matches ExifTool's per-sample walk order: each global `Doc<N>` is
+    // owned by exactly ONE sample (the shared `++DOC_COUNT` is bumped once per
+    // sample), so the stable sort keeps every sample's rows contiguous and orders
+    // the samples by their stamped doc — a Kingslim LigoGPS record and a matched-
+    // empty FMAS marker emit in their decoded doc order rather than in sink order
+    // (all LIGO rows after all markers). It is a NO-OP for a SINGLE-SOURCE `gpmd`
+    // track (the rows are already in `Doc<N>` order from their one sink) and for
+    // every non-`gpmd` file (no rows qualify), so the FMAS / Wolfbox /
+    // GoPro-fallback / `moov`-`gps ` / camm goldens are byte-identical. After this
+    // merge every `gpmd`-dispatched row passes through ONE doc-ordered stream — no
+    // pairwise source-vs-source ordering interaction remains.
+    //
+    // LIMITATION (a SEPARATE, pre-existing gap — NOT an ordering bug): the
+    // Kingslim arm does not yet emit the gpmd SAMPLE'S OWN
+    // `Track<N>:SampleTime`/`SampleDuration` timing doc that ExifTool opens (via
+    // `FoundSomething`) for the matched sample BEFORE `ProcessLigoGPS` opens the
+    // LigoGPS doc — so a real MIXED Kingslim+other-variant `gpmd` track is not yet
+    // doc-number byte-exact vs bundled (the LIGO doc is one lower than bundled,
+    // and the Kingslim sample timing row is absent). Closing that needs the
+    // Kingslim arm to allocate + emit a timing-only marker ahead of the LigoGPS
+    // decode (the doc-allocation refactor tracked for follow-up); no real device
+    // mixes `gpmd` variants in one track, so this is crafted-input-only.
+    //
+    // Gated on `-ee -G3` AND at least one `gpmd`-dispatched source (markers OR
+    // `gpmd` LigoGPS): at `-G1` the doc axis collapses (the markers emit nothing
+    // and the min-doc `SampleTime` precompute above owns the single timing); at
+    // no-`ee` nothing here surfaces.
+    let has_gpmd_ligogps = self
+      .ligogps
+      .samples()
+      .iter()
+      .any(crate::metadata::LigoGpsSample::is_gpmd_dispatched);
+    let unify_gpmd = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3)
+      && opts.extract_embedded
+      && (!self.stream.gpmd_timing_only().is_empty() || has_gpmd_ligogps);
+    if unify_gpmd {
+      // Kind 1 is already in `tags` from `gps_start`; pull it back out, append
+      // kinds 2 + 3, stable-sort the lot by `Doc<N>`, and re-append once.
+      let mut merged: std::vec::Vec<EmittedTag> = tags.split_off(gps_start);
+      emit_gpmd_timing_only(
+        self.stream.gpmd_timing_only(),
+        opts,
+        print_conv,
+        &mut merged,
+      );
+      emit_ligogps(
+        &self.ligogps,
+        opts,
+        print_conv,
+        LigoSelect::GpmdOnly,
+        &mut merged,
+      );
+      merged.sort_by_key(|t| t.tag().group_ref().doc());
+      tags.append(&mut merged);
+    } else {
+      emit_gpmd_timing_only(self.stream.gpmd_timing_only(), opts, print_conv, &mut tags);
+    }
     // No-`ee` DOCUMENT-level `EEWarn` (QuickTime.pm:9545-9549 `EEWarn` →
     // `Warn('The ExtractEmbedded option may find more tags in the media data',
     // 3)`): a TOP-LEVEL magic box (`gps0`/`gsen`/`3gf`) holding more than one
@@ -7734,7 +7861,26 @@ impl crate::emit::Taggable for Meta<'_> {
     // `LIGOGPSINFO` sample) emit through the `%QuickTime::Stream` table under the
     // family-1 `LIGO` group, one `Doc<N>` per record. `-ee`-gated. See
     // [`emit_ligogps`] for the per-record order + per-tag PrintConv.
-    emit_ligogps(&self.ligogps, opts, print_conv, &mut tags);
+    //
+    // When the unified `gpmd` merge ran (above), it already emitted the
+    // `gpmd`-dispatched LigoGPS records at their `Doc<N>` walk position, so this
+    // trailing block emits only the NON-`gpmd` records (movie-level
+    // `moov`-`gps `-box / `mdat`-scan + `udta`/trailer) to avoid double-emit.
+    // Otherwise (no unified merge — `-G1`, no-`ee`, or no `gpmd` source) this
+    // emits ALL records as before (at `-G1` they collapse first-wins; a pure
+    // single-source `gpmd`-LigoGPS track is unaffected — every record is
+    // `gpmd`-dispatched, so `All` and `NonGpmd` differ only when the merge ran).
+    emit_ligogps(
+      &self.ligogps,
+      opts,
+      print_conv,
+      if unify_gpmd {
+        LigoSelect::NonGpmd
+      } else {
+        LigoSelect::All
+      },
+      &mut tags,
+    );
 
     // The Apple `mebx` key/value pairs — ExifTool emits these per timed sample
     // under the enclosing `Track<N>` (family-1) at its `Doc<N>` (oracle:
@@ -9476,6 +9622,65 @@ fn camm_min_doc_timing(
     .collect()
 }
 
+/// Emit, at `-ee -G1`, ONE `Track<N>:SampleTime` + `Track<N>:SampleDuration` per
+/// `gpmd`-MetaFormat dashcam track from that track's MINIMUM-`doc()` (first)
+/// sample — the SP3 analogue of [`camm_min_doc_timing`]. Only a `gpmd` dashcam
+/// variant (FMAS / Wolfbox / Rove `Process_text`) carries the [`GpsOrigin::Gpmd`]
+/// origin plus the sample-table timing the walker stamped; the movie-level
+/// freeGPS fixes (the `moov`-`gps `-box and the brute-force `mdat` scan) have NO
+/// sample-table timing (they keep the trait default), so they contribute no
+/// candidate and their goldens are untouched. The `doc()` ordinal is GLOBAL and
+/// monotonic in walk order, so "smallest `doc()`" is exactly "first sample" for
+/// the track. Returns
+/// `(track_index, sample_time, sample_duration)` per track in ascending
+/// `track_index` order. At `-G3` this is NOT used (each `Doc<N>` carries its own
+/// sample's timing via the [`crate::metadata::TimedSample::sample_timing`] path).
+///
+/// The matched-but-empty self-contained samples ([`crate::metadata::
+/// GpmdTimingOnly`]) carry their own min-doc candidate timing — ExifTool's
+/// `FoundSomething` emitted their `SampleTime`/`SampleDuration` too (the
+/// Condition matched even though the process-proc decoded nothing) — so a track
+/// whose FIRST (smallest-`doc()`) sample is a matched-empty one owns the `-G1`
+/// `Track<N>:SampleTime` (ground-truth: empty FMAS at `Doc1` ⇒ `-G1` keeps the
+/// `0 s` timing while the GPS columns come from the later `Doc2` fix).
+#[cfg(feature = "alloc")]
+fn gpmd_gps_min_doc_timing(
+  stream: &crate::metadata::QuickTimeStreamMeta,
+) -> std::vec::Vec<(u32, Option<f64>, Option<f64>)> {
+  let mut per_track: std::vec::Vec<(u32, u32, Option<f64>, Option<f64>)> = std::vec::Vec::new();
+  let mut consider = |track: u32, doc: u32, st: Option<f64>, sd: Option<f64>| {
+    if let Some(slot) = per_track.iter_mut().find(|(t, ..)| *t == track) {
+      if doc < slot.1 {
+        *slot = (track, doc, st, sd);
+      }
+    } else {
+      per_track.push((track, doc, st, sd));
+    }
+  };
+  for s in stream.gps_samples() {
+    let Some(crate::metadata::GpsOrigin::Gpmd { track }) = s.origin() else {
+      continue;
+    };
+    // A `gpmd` fix always carries a stamped `doc()` (the dispatch opens one per
+    // sample); guard anyway so an unstamped one cannot establish the minimum.
+    let Some(doc) = s.doc() else { continue };
+    consider(track, doc, s.sample_time(), s.sample_duration());
+  }
+  // The matched-but-empty self-contained samples — same min-doc candidacy (their
+  // `FoundSomething` emitted `SampleTime`/`SampleDuration` too).
+  for m in stream.gpmd_timing_only() {
+    let (Some(track), Some(doc)) = (m.track_index(), m.doc()) else {
+      continue;
+    };
+    consider(track, doc, m.sample_time(), m.sample_duration());
+  }
+  per_track.sort_by_key(|(t, ..)| *t);
+  per_track
+    .into_iter()
+    .map(|(t, _doc, st, sd)| (t, st, sd))
+    .collect()
+}
+
 /// Emit the `ProcessCAMM` per-packet warnings (`Unknown camm record type N` /
 /// `Truncated camm record N`, QuickTimeStream.pl:3495-3496) as `Track<N>:Warning`
 /// tags. Both are plain `$et->Warn(msg)` (NO `ignorable` arg) ⇒ NO `[minor]`
@@ -10176,6 +10381,51 @@ fn emit_camm_timing_only(
   use crate::value::{Group, TagValue};
   // `-ee`-only (a camm `trak` source); and the timing emits ONLY at `-G3` (at
   // `-G1` the min-doc precompute owns it).
+  if !opts.extract_embedded || !matches!(opts.group_mode, GroupMode::G3) || markers.is_empty() {
+    return;
+  }
+  for m in markers {
+    let track = std::format!("Track{}", m.track_index().unwrap_or(1));
+    let group = Group::with_doc("QuickTime", track.as_str(), m.doc().unwrap_or(0));
+    for (val, name) in [
+      (m.sample_time(), "SampleTime"),
+      (m.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+  }
+}
+
+/// Emit the `Doc<N>:Track<N>:SampleTime`/`SampleDuration` of every `gpmd`
+/// matched-but-empty self-contained sample ([`crate::metadata::GpmdTimingOnly`]:
+/// a sample whose FMAS / Wolfbox / Rove `Condition` matched but whose
+/// process-proc decoded no fix). ExifTool's `FoundSomething` emitted that timing
+/// under the sample's `Doc<N>` (QuickTimeStream.pl:1567-1571) even though the
+/// process-proc stored nothing — ground-truth `-ee -G3:1`: a truncated
+/// `FMAS\0\0\0\0` sample followed by a valid one yields `Doc1:Track1:SampleTime`
+/// for the empty one, then the GPS at `Doc2`. `-ee`-gated (a `gpmd` handler
+/// `trak`). EMITTED ONLY at `-G3`: each marker writes its own `Doc<N>:Track<N>:`
+/// timing. At `-G1` the single `Track<N>:SampleTime` is the cross-sample
+/// MINIMUM-`doc()` sample's, owned by the [`gpmd_gps_min_doc_timing`] precompute
+/// at the call site (these markers are among its candidates), so this emitter
+/// pushes nothing at `-G1`. The camm [`emit_camm_timing_only`] analogue.
+#[cfg(feature = "alloc")]
+fn emit_gpmd_timing_only(
+  markers: &[crate::metadata::GpmdTimingOnly],
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
   if !opts.extract_embedded || !matches!(opts.group_mode, GroupMode::G3) || markers.is_empty() {
     return;
   }
@@ -11484,6 +11734,42 @@ fn parrot_emit_automation(
   }
 }
 
+/// Which LigoGPS records [`emit_ligogps`] should emit — the split that lets the
+/// QuickTime emitter route the `gpmd`-dispatched LigoGPS records (Kingslim arm)
+/// through the unified `gpmd` doc-ordered merge while the movie-level / `udta` /
+/// trailer records emit from the standalone trailing block.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LigoSelect {
+  /// Emit every record (the M2TS path — it has no `gpmd` MetaFormat tracks, so
+  /// all its LigoGPS records are non-gpmd and this is identical to
+  /// [`Self::NonGpmd`]).
+  All,
+  /// Emit only the records NOT produced by the `gpmd` Kingslim dispatch — the
+  /// movie-level `moov`-`gps `-box / brute-force `mdat`-scan binary records and
+  /// the `udta`/file-end-trailer records. The standalone trailing LigoGPS block
+  /// in the QuickTime emitter (after the unified `gpmd` merge).
+  NonGpmd,
+  /// Emit only the records produced by the `gpmd` Kingslim dispatch
+  /// ([`crate::metadata::LigoGpsSample::is_gpmd_dispatched`]) — pulled into the
+  /// QuickTime emitter's single `gpmd` doc-ordered merge.
+  GpmdOnly,
+}
+
+#[cfg(feature = "alloc")]
+impl LigoSelect {
+  /// `true` when `sample` passes this selection.
+  #[inline(always)]
+  #[must_use]
+  fn accepts(self, sample: &crate::metadata::LigoGpsSample) -> bool {
+    match self {
+      Self::All => true,
+      Self::NonGpmd => !sample.is_gpmd_dispatched(),
+      Self::GpmdOnly => sample.is_gpmd_dispatched(),
+    }
+  }
+}
+
 /// Emit the LigoGPS dashcam GPS samples (`ProcessLigoGPS` / `ProcessLigoJSON`,
 /// LigoGPS.pm) through the `tags()` engine. ExifTool routes these through the
 /// shared `%QuickTime::Stream` tag table (LigoGPS.pm passes the caller's
@@ -11532,6 +11818,7 @@ pub(crate) fn emit_ligogps(
   meta: &crate::metadata::LigoGpsMeta,
   opts: crate::emit::EmitOptions,
   print_conv: bool,
+  select: LigoSelect,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -11543,8 +11830,13 @@ pub(crate) fn emit_ligogps(
   // at no-`ee` ONLY the FIRST `udta`-JSON-sourced sample qualifies — track
   // whether it has been emitted yet. With `-ee` every sample qualifies. Bail
   // early when nothing can emit (the common no-`ee` non-`udta`-JSON case), so the
-  // hot path pays no dedup bookkeeping.
-  let has_first_udta_json = meta.samples().iter().any(|s| s.source().is_udta_json());
+  // hot path pays no dedup bookkeeping. (`gpmd`-dispatched records are always
+  // `Binary` source, so the `GpmdOnly` selection never has a no-`ee` udta-JSON
+  // record; the `select`-filtered `any` keeps the bail correct for every mode.)
+  let has_first_udta_json = meta
+    .samples()
+    .iter()
+    .any(|s| select.accepts(s) && s.source().is_udta_json());
   if !opts.extract_embedded && !has_first_udta_json {
     return;
   }
@@ -11566,7 +11858,7 @@ pub(crate) fn emit_ligogps(
   let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
   // FINDING 1 — has the no-`ee` first `udta`-JSON record been emitted?
   let mut emitted_no_ee_first = false;
-  for sample in meta.samples() {
+  for sample in meta.samples().iter().filter(|s| select.accepts(s)) {
     // FINDING 1 — skip samples that don't qualify under the current `-ee` state.
     if !opts.extract_embedded {
       // No-`ee`: emit ONLY the first `udta`-JSON record; skip the rest + all

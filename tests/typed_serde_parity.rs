@@ -720,7 +720,24 @@ const NOT_ACTIVE: &[&str] = &[
 /// `.json` + `.n.json` and enters the active set like its siblings — byte-exact
 /// (its `Composite:GPSPosition` is the unported timed-GPS deferral, excluded at
 /// regen, so the typed-serde path matches the writer + golden).
-const EXPECTED_ACTIVE_FIXTURES: usize = 541;
+/// 541 → 543 after #100 (FMAS / Wolfbox `gpmd` dashcam GPS fixtures): the two
+/// crafted `gpmd`-MetaFormat fixtures `QuickTime_fmas_n2s.mov` (Vantrue N2S) and
+/// `QuickTime_wolfbox_redtiger_f9.mov` (Redtiger F9 4K) pair `.json` + `.n.json`
+/// and are FULLY byte-exact at no-`ee` (the only timed tags there are
+/// `Track1:MetaFormat` + the `[minor]` `Track1:Warning`; the GPS is `-ee`-only,
+/// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
+/// unported timed-GPS deferral, excluded at regen, so the typed-serde path
+/// matches the writer + golden.
+/// 543 → 544 after the #100 follow-up `QuickTime_fmas_empty_then_valid.mov`: a
+/// two-sample `gpmd` stream (a matched-but-empty FMAS sample followed by a valid
+/// one) pinning the per-MATCHED-sample `Doc<N>`/timing — the matched-empty sample
+/// opens `Doc1` (so the valid one is `Doc2`) and `-ee -G1` keeps the FIRST
+/// sample's `SampleTime "0 s"`. Pairs `.json` + `.n.json` and is FULLY byte-exact
+/// at no-`ee` (only `Track1:MetaFormat` plus the `[minor]` `Track1:Warning`; the
+/// GPS and the `Doc<N>` timing are `-ee`-only, pinned in
+/// `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the unported
+/// timed-GPS deferral, excluded at regen.
+const EXPECTED_ACTIVE_FIXTURES: usize = 544;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

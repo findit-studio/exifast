@@ -2199,23 +2199,65 @@ fn decode_one_sample(
     // Condition cascade routes it to its process-proc HERE, during
     // `ProcessSamples`, not via the later `ScanMediaData` brute-force scan);
     // fall through to the GoPro KLV walker only when no signature matched.
-    if crate::formats::quicktime_freegps::dispatch_gpmd(buff, out, ligogps_out, free_gps_state) {
-      // A matched dashcam variant is NOT the GoPro GPMF path, so do not set the
-      // GoPro `FoundEmbedded` flag (return `false`). This matches bundled for
-      // Rove (`Process_text`), FMAS (`ProcessFMAS`) and Wolfbox
-      // (`ProcessWolfbox`) — none of those set `$$et{FoundEmbedded}`.
+    //
+    // Watermark the SP3 GPS vector BEFORE the dispatch: the self-contained
+    // dashcam variants reached via `out` (FMAS / Wolfbox / Rove `Process_text`)
+    // are `ProcessSamples`-dispatched, so ExifTool scopes each fix to this
+    // `trak`'s `SET_GROUP1 = "Track$num"` and opens ONE `Doc<N>` per timed
+    // sample with its `SampleTime`/`SampleDuration` (QuickTimeStream.pl:1517,
+    // 161-162) — UNLIKE the movie-level `moov`-`gps `-box / `mdat`-scan freeGPS
+    // paths. Stamp exactly the fixes this sample produced (below) with the
+    // global doc + `Track<N>` origin + the sample-table timing.
+    let gpmd_start = out.gps_sample_count();
+    match crate::formats::quicktime_freegps::dispatch_gpmd(buff, out, ligogps_out, free_gps_state) {
+      // A self-contained variant (FMAS / Wolfbox / Rove `Process_text`) matched
+      // its `Condition`. ExifTool's `FoundSomething` (`ProcessSamples`:1567-1571)
+      // opens ONE `Doc<N>` + emits this sample's `SampleTime`/`SampleDuration`
+      // the moment the Condition matched, BEFORE — and INDEPENDENTLY of — what
+      // the process-proc decodes. The Condition is a SHORT signature (e.g.
+      // `^FMAS\0\0\0\0`) while the process-proc validates the FULL record, so a
+      // matched-but-empty sample (too short / malformed) STILL consumes a
+      // `Doc<N>` and emits its timing. So: open the GLOBAL `Doc<N>` ONCE here
+      // (continuing the shared counter) regardless of whether a fix was appended.
+      // When the decode produced ≥1 `GpsSample`, stamp them with that doc +
+      // `Track<N>` origin + sample timing. When it produced NONE, record a
+      // [`crate::metadata::GpmdTimingOnly`] marker carrying the same doc +
+      // `Track<N>` + timing so the empty sample still (i) participates in the
+      // `-G1` cross-sample min-doc scan and (ii) emits its own `Doc<N>` timing at
+      // `-G3`, and a FOLLOWING valid sample is correctly renumbered to the next
+      // `Doc<N>` (ground-truth `-ee -G3:1`: empty FMAS = `Doc1`, valid FMAS =
+      // `Doc2`; `-G1` keeps the FIRST sample's `0 s` timing). This mirrors the
+      // camm timing-only marker precedent exactly (the camm arm below).
       //
-      // The Kingslim branch routes to GPSType-5 / `ProcessLigoGPS` (the
+      // A self-contained variant is NOT the GoPro GPMF path, so it does not set
+      // the GoPro `FoundEmbedded` flag — return `false`. (Rove / FMAS / Wolfbox
+      // process-procs do not set `$$et{FoundEmbedded}`.)
+      crate::formats::quicktime_freegps::GpmdDispatch::SelfContained => {
+        let gpmd_doc = out.open_doc();
+        if out.gps_sample_count() > gpmd_start {
+          out.stamp_gps_gpmd_from(gpmd_start, track_index, gpmd_doc, sample.time, sample.dur);
+        } else {
+          out.push_gpmd_timing_only(crate::metadata::GpmdTimingOnly::new());
+          out.stamp_gpmd_timing_only_last(track_index, gpmd_doc, sample.time, sample.dur);
+        }
+        return false;
+      }
+      // The Kingslim D4 arm routed to GPSType-5 / `ProcessLigoGPS` (the
       // `.{80}LIGOGPSINFO` arm, QuickTimeStream.pl:1843-1888) via
       // `process_free_gps`, which is the bundled `gpmd_Kingslim` process-proc
       // `ProcessFreeGPS` and sets `$$et{FoundEmbedded} = 1`
-      // (QuickTimeStream.pl:1650). The WALK-LEVEL `free_gps_state` is threaded
-      // into `dispatch_gpmd`, so that flag reaches `extract_stream` and
-      // suppresses the brute-force `mdat` re-scan (QuickTimeStream.pl:3689) — a
-      // real Kingslim file plus stray `freeGPS`-looking `mdat` bytes no longer
-      // double-emits. (The `return false` here is only the GoPro `FoundEmbedded`
-      // channel; the Kingslim `FoundEmbedded` rides `free_gps_state`.)
-      return false;
+      // (QuickTimeStream.pl:1650). It writes only to `ligogps_out`, which opens
+      // its OWN LigoGPS `Doc<N>` off the SHARED counter lazily at finalization —
+      // so the walker must NOT consume a second ordinal here (that would shift
+      // every later doc by one). The WALK-LEVEL `free_gps_state` carries the
+      // Kingslim `FoundEmbedded` to `extract_stream`, suppressing the brute-force
+      // `mdat` re-scan (QuickTimeStream.pl:3689); the `return false` here is only
+      // the GoPro `FoundEmbedded` channel.
+      crate::formats::quicktime_freegps::GpmdDispatch::Kingslim => {
+        return false;
+      }
+      // No variant matched — fall through to the `gpmd_GoPro` KLV walker below.
+      crate::formats::quicktime_freegps::GpmdDispatch::NoMatch => {}
     }
     // The `gpmd_GoPro` fallback — the KLV walker. Run it for EXTRACTION, but
     // the `FoundEmbedded` side-effect is decoupled from extraction success:

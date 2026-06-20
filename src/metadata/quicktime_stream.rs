@@ -59,6 +59,16 @@ pub(crate) enum GpsOrigin {
   Kenwood,
   /// The brute-force `mdat` `freeGPS ` scan (`ScanMediaData`) — `-ee` only.
   FreeGpsScan,
+  /// A `gpmd` MetaFormat sample track whose `Condition` matched a self-contained
+  /// dashcam variant — Kingslim / Rove / FMAS / Wolfbox (QuickTimeStream.pl:181-
+  /// 212). UNLIKE the other freeGPS origins (the `moov`-`gps `-box and the
+  /// brute-force `mdat` scan, both movie-level), these are dispatched by
+  /// `ProcessSamples` per timed sample, so ExifTool scopes them to the enclosing
+  /// `trak`'s `SET_GROUP1 = "Track$num"` (QuickTime.pm:10353-10354) and emits the
+  /// sample-table `SampleTime`/`SampleDuration` (QuickTimeStream.pl:161-162) ahead
+  /// of the fix — exactly the GoPro `gpmd` / `mebx` / `camm` shape. `track` is
+  /// that 1-based moov track number. `-ee` only.
+  Gpmd { track: u32 },
 }
 
 impl GpsOrigin {
@@ -568,6 +578,112 @@ impl MebxSample {
   }
 }
 
+/// A per-sample TIMING-ONLY marker for a `gpmd` MetaFormat sample whose
+/// self-contained dashcam variant MATCHED its `Condition` (FMAS / Wolfbox / Rove
+/// `Process_text`) but whose process-proc decoded NO fix (a too-short or
+/// otherwise malformed sample).
+///
+/// **Why this exists.** The `gpmd` Condition cascade (QuickTimeStream.pl:181-212)
+/// keys each self-contained variant on a SHORT leading-byte signature — FMAS on
+/// `^FMAS\0\0\0\0` (8 bytes), Wolfbox on `^.{136}(0{16}[A-Z]{4}|…redtiger\0)` —
+/// while the SubDirectory process-proc (`ProcessFMAS` / `ProcessWolfbox`) does a
+/// STRICTER full-record validation. So a sample that matches the signature but
+/// fails the stricter decode emits nothing. ExifTool nonetheless fires
+/// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}` + `HandleTag
+/// SampleTime`/`SampleDuration`, QuickTimeStream.pl:967-972) the moment
+/// `GetTagInfo` matches the Condition (`ProcessSamples`:1567-1571), BEFORE — and
+/// INDEPENDENTLY of — what the process-proc decodes. So a matched-but-empty
+/// sample STILL opens a `Doc<N>` and emits its `Doc<N>:Track<N>:SampleTime`/
+/// `SampleDuration` (ground-truth `-ee -G3:1`: a truncated `FMAS\0\0\0\0`
+/// followed by a valid FMAS sample yields `Doc1:Track1:SampleTime` for the empty
+/// one and the GPS at `Doc2`, and `-G1` keeps the FIRST sample's `0 s` timing).
+/// Without a stored marker that timing has no record to ride on, so the valid
+/// sample would be misnumbered `Doc1` and `-G1` would keep its timing instead of
+/// the first sample's. This marker carries exactly the empty sample's `Doc<N>` /
+/// `Track<N>` / `SampleTime` / `SampleDuration` so both the `-G1` min-doc scan
+/// and the `-G3` per-`Doc<N>` emission see it (the `gpmd` analogue of
+/// [`crate::metadata::CammTimingOnly`]).
+///
+/// **D8 compliance.** Fields are private; access via the accessors below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpmdTimingOnly {
+  /// The 1-based moov `Track<N>` index of the `gpmd` `trak` the sample belongs
+  /// to (`None` until the walker stamps it; defaults to `Track1` at emit time).
+  track_index: Option<u32>,
+  /// The GLOBAL `Doc<N>` ordinal (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`) this
+  /// matched-but-empty `gpmd` sample consumed — the same shared-counter `Doc<N>`
+  /// the sample's `open_doc` got. `None` until the walker stamps it.
+  doc: Option<u32>,
+  /// `SampleTime` (seconds) of this `gpmd` sample — the sample-table decode time
+  /// `FoundSomething` emits. `None` until the walker stamps it.
+  sample_time: Option<f64>,
+  /// `SampleDuration` (seconds) of this `gpmd` sample (paired with
+  /// [`Self::sample_time`]). `None` until the walker stamps it.
+  sample_duration: Option<f64>,
+}
+
+impl GpmdTimingOnly {
+  /// An unstamped marker (the walker stamps track/doc/timing after confirming a
+  /// self-contained `gpmd` variant matched but produced no fix).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn new() -> Self {
+    Self {
+      track_index: None,
+      doc: None,
+      sample_time: None,
+      sample_duration: None,
+    }
+  }
+
+  /// The 1-based moov `Track<N>` index of this sample's `gpmd` `trak`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> Option<u32> {
+    self.track_index
+  }
+
+  /// The GLOBAL `Doc<N>` ordinal this matched-but-empty `gpmd` sample consumed.
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc(&self) -> Option<u32> {
+    self.doc
+  }
+
+  /// `SampleTime` (seconds) of this `gpmd` sample, or `None` until the walker
+  /// stamps it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// `SampleDuration` (seconds) of this `gpmd` sample, or `None` until the walker
+  /// stamps it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
+
+  /// Stamp the `Track<N>` index, GLOBAL `Doc<N>` ordinal, and sample-table
+  /// `SampleTime` / `SampleDuration` (walker-only).
+  #[inline(always)]
+  pub(crate) const fn set_stamp(
+    &mut self,
+    track: u32,
+    doc: u32,
+    time: Option<f64>,
+    duration: Option<f64>,
+  ) -> &mut Self {
+    self.track_index = Some(track);
+    self.doc = Some(doc);
+    self.sample_time = time;
+    self.sample_duration = duration;
+    self
+  }
+}
+
 /// The typed result of QuickTimeStream timed-metadata extraction — the SP3
 /// mirror of every `%QuickTime::Stream` tag `ProcessSamples` /
 /// `Process_mebx` would emit for a video's metadata tracks.
@@ -631,6 +747,16 @@ pub struct QuickTimeStreamMeta {
   /// file the ordinal equals the old per-source numbering, so the byte-exact
   /// goldens are unchanged.
   doc_counter: u32,
+  /// TIMING-ONLY markers — one per `gpmd` sample whose self-contained dashcam
+  /// variant (FMAS / Wolfbox / Rove `Process_text`) MATCHED its `Condition` but
+  /// whose process-proc decoded NO fix (a too-short / malformed sample).
+  /// ExifTool's `FoundSomething` opens a `Doc<N>` + emits that sample's
+  /// `SampleTime`/`SampleDuration` regardless (QuickTimeStream.pl:1567-1571), so
+  /// the marker carries the timing into the `-G1` cross-sample min-doc scan
+  /// ([`crate::formats::quicktime::gpmd_gps_min_doc_timing`]) and the `-G3`
+  /// per-`Doc<N>` emission, and consumes the doc ordinal so a following VALID
+  /// sample is renumbered to the next `Doc<N>`. See [`GpmdTimingOnly`].
+  gpmd_timing_only: Vec<GpmdTimingOnly>,
 }
 
 impl QuickTimeStreamMeta {
@@ -644,6 +770,7 @@ impl QuickTimeStreamMeta {
       plist_subdir_tags: Vec::new(),
       magic_box_truncated_no_ee: false,
       doc_counter: 0,
+      gpmd_timing_only: Vec::new(),
     }
   }
 
@@ -816,6 +943,79 @@ impl QuickTimeStreamMeta {
       }
     }
     self.doc_counter = counter;
+  }
+
+  /// Stamp a `gpmd` MetaFormat sample track's just-decoded fixes (those at or
+  /// after `start`) with the per-sample document, `Track<N>` origin, and sample-
+  /// table timing — the `ProcessSamples` shape for the self-contained dashcam
+  /// variants (FMAS / Wolfbox / Rove `Process_text`). Each such `freeGPS`
+  /// process-proc appends ONE fix per timed sample, and ExifTool's
+  /// `FoundSomething` (ProcessSamples:1517) opens ONE `Doc<N>` for that sample
+  /// and emits its `SampleTime`/`SampleDuration` ahead of the fix, scoped to the
+  /// enclosing `trak`'s `SET_GROUP1 = "Track$num"`. Open the GLOBAL doc once
+  /// (caller passed it, continuing the shared counter), and write the doc +
+  /// [`GpsOrigin::Gpmd`] + sample timing onto every fix this call produced
+  /// (watermark-then-stamp, like [`Self::stamp_mebx_doc_from`]). Samples already
+  /// stamped (none in this path — `dispatch_gpmd` pushes bare fixes) are left
+  /// alone. The `doc` is shared across the (usually single) fixes of one sample,
+  /// matching `FoundSomething`'s one-doc-per-sample.
+  pub(crate) fn stamp_gps_gpmd_from(
+    &mut self,
+    start: usize,
+    track: u32,
+    doc: u32,
+    sample_time: Option<f64>,
+    sample_duration: Option<f64>,
+  ) {
+    if let Some(slice) = self.gps_samples.get_mut(start..) {
+      for s in slice {
+        s.set_origin(Some(GpsOrigin::Gpmd { track }));
+        if s.doc().is_none() {
+          s.set_doc(Some(doc));
+        }
+        if s.sample_time().is_none() {
+          s.set_sample_time(sample_time);
+        }
+        if s.sample_duration().is_none() {
+          s.set_sample_duration(sample_duration);
+        }
+      }
+    }
+  }
+
+  /// The TIMING-ONLY markers — one per matched-but-empty self-contained `gpmd`
+  /// sample (FMAS / Wolfbox / Rove). See [`GpmdTimingOnly`].
+  #[inline(always)]
+  #[must_use]
+  pub fn gpmd_timing_only(&self) -> &[GpmdTimingOnly] {
+    self.gpmd_timing_only.as_slice()
+  }
+
+  /// Push a `gpmd` TIMING-ONLY marker (an unstamped [`GpmdTimingOnly`]). The
+  /// walker calls this only after a self-contained `gpmd` variant matched its
+  /// `Condition` (`dispatch_gpmd` returned [`crate::formats::quicktime_freegps::
+  /// GpmdDispatch::SelfContained`]) yet appended no `GpsSample`, then stamps it
+  /// via [`Self::stamp_gpmd_timing_only_last`]. Mirrors the camm
+  /// [`crate::metadata::CammMeta::push_timing_only`] precedent.
+  pub(crate) fn push_gpmd_timing_only(&mut self, marker: GpmdTimingOnly) -> &mut Self {
+    self.gpmd_timing_only.push(marker);
+    self
+  }
+
+  /// Stamp the most-recently-pushed `gpmd` TIMING-ONLY marker with its sample's
+  /// `Track<N>` index, GLOBAL `Doc<N>` ordinal, and sample-table timing —
+  /// called immediately after [`Self::push_gpmd_timing_only`].
+  pub(crate) fn stamp_gpmd_timing_only_last(
+    &mut self,
+    track: u32,
+    doc: u32,
+    sample_time: Option<f64>,
+    sample_duration: Option<f64>,
+  ) -> &mut Self {
+    if let Some(m) = self.gpmd_timing_only.last_mut() {
+      m.set_stamp(track, doc, sample_time, sample_duration);
+    }
+    self
   }
 
   /// `true` when a top-level magic box (`gps0`/`gsen`/`3gf`) carried more than

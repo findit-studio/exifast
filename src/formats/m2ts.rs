@@ -2266,8 +2266,17 @@ impl crate::emit::Taggable for Meta<'_> {
     // ExtractEmbedded (these records live in the video PES, which the no-`ee`
     // run never extracts), so a default (no-`ee`) M2TS render emits NO `LIGO:*`
     // — matching the bundled `MPEG2_TS_pruveeo_d90.ts.json` no-`ee` golden.
+    // M2TS has no `gpmd` MetaFormat track, so none of its LigoGPS records are
+    // `gpmd`-dispatched; [`LigoSelect::All`] emits every record (identical to
+    // the pre-split behaviour).
     if !self.ligogps.is_empty() {
-      crate::formats::quicktime::emit_ligogps(&self.ligogps, opts, print_conv, &mut tags);
+      crate::formats::quicktime::emit_ligogps(
+        &self.ligogps,
+        opts,
+        print_conv,
+        crate::formats::quicktime::LigoSelect::All,
+        &mut tags,
+      );
     }
 
     tags.into_iter()
