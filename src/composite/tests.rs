@@ -1425,35 +1425,34 @@ mod exif {
   // BARE via `return $str` — it preserves the ORIGINAL token verbatim, it does
   // NOT reparse/canonicalize it.
   //
-  // exifast stores the helper result as `TagValue::Str` and the shared
-  // serializer (`value.rs`) re-runs the `escape_json_is_number` gate then
-  // RE-EMITS via `serialize_f64`/`serialize_i64` — which CANONICALIZES the
-  // value form: `Str("0E0")` -> `0.0`, `Str("-0")` -> `0`. This is the
-  // crate-wide token-exact-vs-value-exact policy (Contract B / #197): every
-  // numeric-looking string tag (an `APE:Year` "2005" -> `2005`, an
-  // `ExifToolVersion` "13.59" -> `13.59`, the 11 PR-3 `Aperture` "4.0" goldens
-  // -> `4.0`) round-trips through that re-emit, and the STRICT comparator
-  // accepts the within-one-type numeric reshaping. So the divergence is NOT
-  // local to the composite path: it is the shared `value.rs` `Str`->number
-  // serializer, used by ALL string tags and depended on by all 540 goldens.
+  // exifast stores the helper result as `TagValue::Str`, and the shared
+  // serializer (`value.rs`) re-runs the `escape_json_is_number` gate then emits
+  // the in-gate token VERBATIM (#321) — the EXACT source bytes, mirroring
+  // `EscapeJSON`'s `return $str`: `Str("0E0")` -> `0E0`, `Str("-0")` -> `-0`.
+  // (Before #321 it RE-EMITTED via `serialize_f64`/`serialize_i64`, which
+  // CANONICALIZED the value form: `0E0` -> `0.0`, `-0` -> `0`.) This is a
+  // crate-wide property (Contract B / #197 + #321): every numeric-looking string
+  // tag (an `APE:Year` "2005" -> `2005`, an `ExifToolVersion` "13.59" -> `13.59`,
+  // the 11 PR-3 `Aperture` "4.0" goldens -> `4.0`) flows through the SAME shared
+  // `value.rs` `Str`->number serializer. The fix is a NO-OP for every existing
+  // golden — their numeric-string tokens are all canonical-form already, so the
+  // verbatim form IS the byte they had — and the STRICT comparator additionally
+  // accepts any within-one-type numeric reshaping; ONLY a degenerate token (which
+  // no current golden carries) changes, to its bundled-faithful verbatim form.
   //
-  // Per the project ship-bar these are CRAFTED degenerate inputs (`0E0` /
-  // `-0.0` as an `exif:FNumber`/`ExposureTime`; no real device emits them and
-  // no fixture exercises them). Fixing them would require a broad change to the
-  // shared serializer (force-string the composite emit, or carry a
-  // "pre-rendered, do-not-reparse" flag through `TagValue`) — out of scope for
-  // this PR. The divergence is recorded as a tracked follow-up; these tests are
-  // `#[ignore]`d so they stand as executable documentation of the exact
-  // exifast-vs-bundled token gap without failing the suite.
-  //
-  // Each test ALSO asserts the byte-exact bundled token in a comment so the gap
-  // is unambiguous, and serializes a `Str("4.0")` control to prove the path is
-  // live (`4.0` is preserved value-exact, matching the PR-3 Aperture goldens).
+  // Each test ALSO asserts the byte-exact bundled token, and serializes a
+  // `Str("4.0")` control to prove the path is live (`4.0` is preserved
+  // byte-exact, matching the PR-3 Aperture goldens).
 
-  /// Serialize a single composite `TagValue` exactly as the `-j`/`-n` CLI does.
+  /// Serialize a single composite `TagValue` exactly as the `-j`/`-n` CLI does —
+  /// through the renderer wrapper [`crate::value::JsonTagValue`], the SAME path
+  /// the `Document` / `Rendered` serializers use, so the in-gate numeric string
+  /// token is emitted VERBATIM (`EscapeJSON` `return $str`, #321). A bare
+  /// `serde_json::to_string(v)` would hit the generic serializer-agnostic
+  /// `TagValue::Serialize` (which canonicalizes `0E0` -> `0.0`), NOT the CLI path.
   #[cfg(feature = "json")]
   fn emit(v: &TagValue) -> String {
-    serde_json::to_string(v).expect("serialize composite scalar")
+    serde_json::to_string(&crate::value::JsonTagValue(v)).expect("serialize composite scalar")
   }
 
   /// CONTROL: a normal `Aperture` "4.0" (the 11 PR-3 goldens' shape) MUST
@@ -1482,13 +1481,13 @@ mod exif {
   /// `Composite:Aperture` over an `exif:FNumber=0E0` operand.
   ///
   /// Bundled ExifTool 13.59 emits the literal `0E0` (UNQUOTED) in BOTH `-j` and
-  /// `-n`. exifast canonicalizes `Str("0E0")` -> `0.0` via the shared
-  /// `value.rs` serializer. The composite SCALAR is correct (`Str("0E0")`); the
-  /// gap is purely in the shared `Str`->number JSON re-emit. `#[ignore]`d as a
-  /// tracked crafted-input follow-up (broad-serializer fix, out of PR scope).
+  /// `-n` (`EscapeJSON`'s `return $str`, `XMPStruct.pl:176`). The shared
+  /// `value.rs` serializer now emits an in-gate numeric STRING token VERBATIM
+  /// (#321), so `Str("0E0")` -> `0E0` byte-identically (it no longer reparses to
+  /// the canonical `0.0`). The composite SCALAR was always correct (`Str("0E0")`);
+  /// this pins the now-faithful JSON re-emit.
   #[cfg(feature = "json")]
   #[test]
-  #[ignore = "crafted degenerate FNumber 0E0: bundled emits literal `0E0`, exifast's shared value.rs Str->number serializer canonicalizes to `0.0` (Contract B/#197); broad-serializer fix tracked as follow-up, not in PR #133 scope"]
   fn aperture_degenerate_0e0_token_emit_vs_bundled() {
     let entries: &[(&str, &str, TagValue)] = &[("ExifIFD", "FNumber", TagValue::Str("0E0".into()))];
 
@@ -1527,12 +1526,13 @@ mod exif {
   /// `Composite:ShutterSpeed` over an `exif:ExposureTime=-0.0` operand.
   ///
   /// Bundled ExifTool 13.59: `-0` (`-j`, after PrintExposureTime's `%.1f`+strip
-  /// gives `-0`), `-0.0` (`-n`, the raw operand). exifast: `Str("-0")` -> `0`
-  /// (`-j`) and `Str("-0.0")` -> serde `-0.0` (`-n`). The `-j` token loses the
-  /// sign; `-n` may match (serde emits `-0.0`). `#[ignore]`d follow-up.
+  /// gives `-0`), `-0.0` (`-n`, the raw operand) — both emitted VERBATIM by
+  /// `EscapeJSON`'s `return $str` (`XMPStruct.pl:176`). The shared `value.rs`
+  /// serializer now emits an in-gate numeric STRING token VERBATIM (#321), so
+  /// `Str("-0")` -> `-0` (it no longer reparses through `serialize_i64`, which
+  /// dropped the sign to `0`) and `Str("-0.0")` -> `-0.0`, both byte-identical.
   #[cfg(feature = "json")]
   #[test]
-  #[ignore = "crafted degenerate ExposureTime -0.0: bundled -j emits literal `-0`, exifast's shared value.rs Str->integer serializer drops the sign to `0`; broad-serializer fix tracked as follow-up, not in PR #133 scope"]
   fn shutter_speed_degenerate_negzero_token_emit_vs_bundled() {
     let entries: &[(&str, &str, TagValue)] =
       &[("ExifIFD", "ExposureTime", TagValue::Str("-0.0".into()))];
