@@ -59,7 +59,8 @@ pub use crw::{
 };
 pub use dji_protobuf::{DjiProtobufMeta, DjiTelemetrySample, DjiWarning, RationalValue};
 pub use domain::{
-  CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
+  CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, Orientation,
+  TrackKind,
 };
 pub use gopro::{
   GoProConv, GoProDocSample, GoProFdscSample, GoProGlpiSample, GoProGpsSample, GoProKbat,

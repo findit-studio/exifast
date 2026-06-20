@@ -44,10 +44,10 @@ pub trait Project {
 #[cfg(feature = "exif")]
 mod exif_impl {
   use super::Project;
-  use crate::exif::ExifMeta;
   use crate::exif::ifd::RawValue;
+  use crate::exif::{ExifMeta, IfdKind};
   use crate::metadata::domain::{
-    CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaMetadata,
+    CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaMetadata, Orientation,
   };
   use std::string::{String, ToString};
 
@@ -74,10 +74,12 @@ mod exif_impl {
     /// | `capture.exposure_time_s` | `ExposureTime` | — |
     /// | `capture.iso` | `ISO` | — |
     /// | `capture.f_number` | `FNumber` | — |
+    /// | `media.orientation` | `Orientation` (`0x0112`) | — |
     ///
-    /// The [`MediaInfo`](crate::metadata::MediaInfo) container domain stays
-    /// empty — a bare Exif/TIFF block carries no duration / track structure
-    /// (the QuickTime / container ports populate it and merge their camera
+    /// The [`MediaInfo`](crate::metadata::MediaInfo) container domain carries
+    /// only `orientation` here — a bare Exif/TIFF block has no duration /
+    /// track structure, but it does have the display `Orientation` (the
+    /// QuickTime / container ports populate the rest and merge these camera
     /// facts in via the embedded-Exif projection).
     fn project(&self) -> MediaMetadata {
       let exif = self.project_exif();
@@ -150,7 +152,36 @@ mod exif_impl {
         out.set_capture(capture);
       }
 
+      // ---- MediaInfo (orientation only) ------------------------------------
+      // A bare Exif/TIFF block has no duration / track structure, but it DOES
+      // carry the display `Orientation` (0x0112) — the one `MediaInfo` field a
+      // still contributes. A consumer orients a decoded thumbnail from it.
+      out.media_mut().update_orientation(self.orientation());
+
       out
+    }
+
+    /// The PRIMARY image's EXIF `Orientation` (`0x0112`) as a normalized
+    /// [`Orientation`], or `None` when IFD0 carries no valid `Orientation`.
+    ///
+    /// Resolution is restricted to **IFD0** (`tag_id == 0x0112` AND
+    /// [`ifd()`](crate::exif::ExifEntry::ifd) `== IfdKind::Ifd0`): the display
+    /// orientation `MediaInfo` reports is the PRIMARY image's. A thumbnail's
+    /// (IFD1) or a sub-IFD's (ExifIFD) `Orientation` must not populate it — a
+    /// by-name first-match across all emitted entries would otherwise let an
+    /// IFD1 `Orientation` leak into the primary frame's orientation (the
+    /// thumbnail-orientation hazard). The raw `1`–`8` is read directly (NOT
+    /// the PrintConv label).
+    fn orientation(&self) -> Option<Orientation> {
+      let raw = self
+        .entries()
+        .iter()
+        .find(|e| e.tag_id() == 0x0112 && e.ifd() == IfdKind::Ifd0)?
+        .value_ref()
+        .raw()
+        .first_i64()?;
+      let value = u8::try_from(raw).ok()?;
+      Orientation::from_exif_value(value)
     }
 
     /// The contribution from the typed vendor MakerNote, if one decoded.

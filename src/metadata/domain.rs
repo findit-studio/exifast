@@ -480,6 +480,136 @@ impl Default for CaptureSettings {
 }
 
 // ===========================================================================
+// Orientation
+// ===========================================================================
+
+/// The display orientation of a file's primary visual content, expressed as
+/// the EXIF `Orientation` model (`0x0112`): a value `1`–`8` encoding a
+/// rotation plus an optional mirror flip.
+///
+/// This is the single normalized orientation a consumer reads to orient a
+/// decoded-frame thumbnail without parsing tags. It unifies the two source
+/// encodings:
+///
+/// * **Stills** — the EXIF `Orientation` tag directly (its `1`–`8`).
+/// * **Video** — the QuickTime/RIFF display-matrix rotation (`0`/`90`/`180`/
+///   `270` clockwise), which has no mirror component, mapped into the
+///   rotation-only subset of the EXIF model (`0→1`, `90→6`, `180→3`,
+///   `270→8`).
+///
+/// # Operation-order contract — MIRROR FIRST
+///
+/// The two accessors decompose the orientation under one fixed order: a
+/// consumer applies the horizontal mirror ([`Self::mirrored`]) FIRST, THEN
+/// rotates clockwise by [`Self::rotation_degrees`]:
+///
+/// ```text
+/// if o.mirrored() { flip_horizontal(); }
+/// rotate_clockwise(o.rotation_degrees());
+/// ```
+///
+/// This matches the wording of ExifTool's reflected labels — "Mirror
+/// horizontal AND rotate N CW" — literally: the `(degrees, mirrored)` pair is
+/// the (rotate-after-mirror, mirror) factorization of the label, so the net
+/// pixel transform equals the label. The EXIF `1`–`8` ⇄ (clockwise degrees,
+/// mirrored) mapping under this contract is the standard one (TIFF 6.0 / EXIF
+/// 2.3); the `degrees CW` / `mirrored` columns are what the two accessors
+/// return and the rightmost column is ExifTool's `Orientation` PrintConv
+/// label (the canonical truth):
+///
+/// | EXIF | degrees CW | mirrored | ExifTool label | net transform |
+/// |---|---|---|---|---|
+/// | 1 | 0 | no | Horizontal (normal) | identity |
+/// | 2 | 0 | yes | Mirror horizontal | mirror horizontal |
+/// | 3 | 180 | no | Rotate 180 | rotate 180 |
+/// | 4 | 180 | yes | Mirror vertical | mirror vertical (mirror-h then 180) |
+/// | 5 | 270 | yes | Mirror horizontal and rotate 270 CW | transpose (main diagonal) |
+/// | 6 | 90 | no | Rotate 90 CW | rotate 90 CW |
+/// | 7 | 90 | yes | Mirror horizontal and rotate 90 CW | transverse (anti-diagonal) |
+/// | 8 | 270 | no | Rotate 270 CW | rotate 270 CW |
+///
+/// Note `5` and `7` are NOT interchangeable: `5` rotates `270` CW after the
+/// mirror (≡ transpose) and `7` rotates `90` CW (≡ transverse), tracking the
+/// "rotate 270/90 CW" wording of their respective labels. The reflected `2`/
+/// `4`/`5`/`7` are the [`Self::mirrored`] set; `4` ("Mirror vertical") is
+/// `mirror-h` then `180` CW, which equals a vertical mirror under this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Orientation(u8);
+
+impl Orientation {
+  /// Build from a raw EXIF `Orientation` value. Returns `None` for any value
+  /// outside the defined `1`–`8` range (`0` and out-of-range encodings are
+  /// not a valid orientation).
+  #[inline]
+  #[must_use]
+  pub const fn from_exif_value(value: u8) -> Option<Self> {
+    if value >= 1 && value <= 8 {
+      Some(Self(value))
+    } else {
+      None
+    }
+  }
+
+  /// Build from a video display-matrix rotation in clockwise degrees. Only
+  /// the four right-angle rotations a display matrix encodes are accepted
+  /// (`0`/`90`/`180`/`270`); they map to the un-mirrored EXIF subset
+  /// (`1`/`6`/`3`/`8`). Any other angle yields `None`.
+  #[inline]
+  #[must_use]
+  pub const fn from_video_degrees(degrees: u16) -> Option<Self> {
+    match degrees {
+      0 => Some(Self(1)),
+      90 => Some(Self(6)),
+      180 => Some(Self(3)),
+      270 => Some(Self(8)),
+      _ => None,
+    }
+  }
+
+  /// The raw EXIF `Orientation` value (`1`–`8`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn exif_value(self) -> u8 {
+    self.0
+  }
+
+  /// The clockwise rotation to apply, in degrees (`0`/`90`/`180`/`270`),
+  /// under the type's **mirror-first** contract: a consumer applies the
+  /// horizontal mirror ([`Self::mirrored`]) FIRST, THEN rotates by this many
+  /// degrees clockwise. The pair is chosen so that net transform reproduces
+  /// ExifTool's `Orientation` label exactly (see the type-level table) — e.g.
+  /// `5` = `mirror-h` then `270` CW (≡ transpose) and `7` = `mirror-h` then
+  /// `90` CW (≡ transverse); the two are NOT interchangeable.
+  #[inline]
+  #[must_use]
+  pub const fn rotation_degrees(self) -> u16 {
+    match self.0 {
+      3 | 4 => 180,
+      // `6` = "Rotate 90 CW"; `7` = "Mirror horizontal and rotate 90 CW"
+      // (mirror-first ⇒ transverse). Both rotate 90 CW.
+      6 | 7 => 90,
+      // `8` = "Rotate 270 CW"; `5` = "Mirror horizontal and rotate 270 CW"
+      // (mirror-first ⇒ transpose). Both rotate 270 CW.
+      5 | 8 => 270,
+      // 1 | 2 (and, defensively, any unconstructible value) — no rotation.
+      _ => 0,
+    }
+  }
+
+  /// `true` if the orientation includes a horizontal mirror flip (the
+  /// reflected EXIF values `2`/`4`/`5`/`7`). Under the type's **mirror-first**
+  /// contract this flip is applied BEFORE [`Self::rotation_degrees`]: a
+  /// consumer does `if mirrored() { flip_horizontal(); } rotate_cw(degrees)`.
+  /// (`4` = `mirror-h` then `180` CW ≡ mirror vertical; `5` ≡ transpose; `7`
+  /// ≡ transverse — all reproduce the ExifTool label under this order.)
+  #[inline]
+  #[must_use]
+  pub const fn mirrored(self) -> bool {
+    matches!(self.0, 2 | 4 | 5 | 7)
+  }
+}
+
+// ===========================================================================
 // MediaInfo
 // ===========================================================================
 
@@ -499,6 +629,10 @@ pub struct MediaInfo {
   /// The kinds of track the container holds (video / audio / …), in file
   /// order. Used by callers to answer "is this a video or an audio file?".
   track_kinds: Vec<TrackKind>,
+  /// Display orientation of the primary visual content (EXIF `Orientation`
+  /// for stills; the display-matrix rotation for video). `None` when the
+  /// source carries no orientation (or the default `1` was never written).
+  orientation: Option<Orientation>,
 }
 
 impl MediaInfo {
@@ -512,6 +646,7 @@ impl MediaInfo {
       height: None,
       created: None,
       track_kinds: Vec::new(),
+      orientation: None,
     }
   }
 
@@ -548,6 +683,16 @@ impl MediaInfo {
   #[must_use]
   pub fn track_kinds(&self) -> &[TrackKind] {
     self.track_kinds.as_slice()
+  }
+
+  /// Display orientation of the primary visual content — the EXIF
+  /// `Orientation` for stills, the display-matrix rotation for video. A
+  /// consumer reads this to orient a decoded-frame thumbnail without parsing
+  /// tags. `None` when the source carries no orientation.
+  #[inline(always)]
+  #[must_use]
+  pub const fn orientation(&self) -> Option<Orientation> {
+    self.orientation
   }
 
   /// `true` if the container carries at least one video track.
@@ -592,6 +737,13 @@ impl MediaInfo {
     self
   }
 
+  /// Assign the display orientation.
+  #[inline(always)]
+  pub const fn update_orientation(&mut self, v: Option<Orientation>) -> &mut Self {
+    self.orientation = v;
+    self
+  }
+
   /// Mutable access to the track-kind list (grow / shrink).
   #[inline(always)]
   pub const fn track_kinds_mut(&mut self) -> &mut Vec<TrackKind> {
@@ -607,6 +759,7 @@ impl MediaInfo {
     self.width = self.width.or(other.width);
     self.height = self.height.or(other.height);
     self.created = self.created.or(other.created);
+    self.orientation = self.orientation.or(other.orientation);
     if self.track_kinds.is_empty() {
       self.track_kinds = other.track_kinds;
     }
@@ -783,6 +936,14 @@ impl MediaMetadata {
       }
     }
 
+    // Display orientation from the primary VIDEO track's tkhd
+    // `MatrixStructure`. Mirrors ExifTool's `CalcRotation` (QuickTime.pm:8797):
+    // the first `vide`-handler track, its matrix angle via `GetRotationAngle`,
+    // mapped into the rotation-only EXIF subset (video matrices carry no
+    // mirror). `None` when there is no video track, no matrix, a degenerate
+    // matrix, or a non-right-angle rotation.
+    media.update_orientation(video_matrix_orientation(qt));
+
     Self {
       media,
       // SP2-SP4 / other formats fill these.
@@ -947,6 +1108,38 @@ fn duration_from_secs(secs: f64) -> Option<Duration> {
   Some(Duration::from_secs_f64(secs))
 }
 
+/// The display [`Orientation`] from the primary video track's tkhd
+/// `MatrixStructure`, mirroring ExifTool's `CalcRotation` (QuickTime.pm:8797):
+/// the FIRST `vide`-handler track, its matrix rotation via
+/// [`get_rotation_angle`](crate::composite::convs::video::get_rotation_angle),
+/// snapped to the nearest right angle and mapped into the rotation-only EXIF
+/// subset. `None` when there is no video track, no/degenerate matrix, or the
+/// angle is not (within rounding) one of `0`/`90`/`180`/`270`.
+#[cfg(feature = "alloc")]
+fn video_matrix_orientation(qt: &QuickTimeMeta) -> Option<Orientation> {
+  let track = qt
+    .tracks()
+    .iter()
+    .find(|t| t.handler().is_some_and(HandlerKind::is_video))?;
+  let angle = crate::composite::convs::video::get_rotation_angle(track.matrix_structure()?)?;
+  // `get_rotation_angle` already rounds to 3 decimals in [0, 360) and the
+  // cardinal rotations land EXACTLY (0/90/180/270 — the rounding absorbs the
+  // truncated-pi error; see its tests). Round to the nearest whole degree and
+  // accept ONLY a cardinal right angle (a skewed / non-90° matrix ⇒ `None`).
+  let degrees = (angle.round() as i64).rem_euclid(360);
+  Orientation::from_video_degrees(u16::try_from(degrees).ok()?)
+}
+
+/// Without `alloc`, [`get_rotation_angle`] (which parses the matrix string) is
+/// unavailable; a no-`alloc` build carries no orientation. (`from_quicktime`
+/// itself is only reachable with `alloc` — `QuickTimeMeta` is alloc-backed —
+/// so this arm exists purely to keep the module compiling under every feature
+/// permutation.)
+#[cfg(not(feature = "alloc"))]
+fn video_matrix_orientation(_qt: &QuickTimeMeta) -> Option<Orientation> {
+  None
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1089,5 +1282,256 @@ mod tests {
     let merged = base.merge(other);
     assert_eq!(merged.media().width(), Some(1920)); // self wins
     assert_eq!(merged.media().height(), Some(480)); // other fills the gap
+  }
+
+  #[test]
+  fn orientation_exif_value_to_degrees_and_mirror() {
+    // The full EXIF 1-8 model → (clockwise degrees, mirrored) under the
+    // MIRROR-FIRST contract (mirror, THEN rotate CW), the standard mapping
+    // (TIFF 6.0 / EXIF 2.3) whose net transform reproduces ExifTool's
+    // `Orientation` PrintConv label. NOTE 5 = (270, mirrored) and
+    // 7 = (90, mirrored): the "rotate 270/90 CW" of their labels — NOT
+    // swapped (the regression this guards).
+    let cases = [
+      (1, 0, false),   // Horizontal (normal)
+      (2, 0, true),    // Mirror horizontal
+      (3, 180, false), // Rotate 180
+      (4, 180, true),  // Mirror vertical (mirror-h then 180)
+      (5, 270, true),  // Mirror horizontal and rotate 270 CW (transpose)
+      (6, 90, false),  // Rotate 90 CW
+      (7, 90, true),   // Mirror horizontal and rotate 90 CW (transverse)
+      (8, 270, false), // Rotate 270 CW
+    ];
+    for (exif, degrees, mirrored) in cases {
+      let o = Orientation::from_exif_value(exif).expect("1-8 is a valid orientation");
+      assert_eq!(o.exif_value(), exif);
+      assert_eq!(o.rotation_degrees(), degrees, "degrees for EXIF {exif}");
+      assert_eq!(o.mirrored(), mirrored, "mirrored for EXIF {exif}");
+    }
+  }
+
+  /// Transform-composition proof: applying `mirrored()` + `rotation_degrees()`
+  /// under the documented MIRROR-FIRST contract produces, for EACH reflected
+  /// value (2/4/5/7), the SAME net pixel transform the ExifTool label names.
+  /// In particular it pins 5 (transpose) ≠ 7 (transverse) — the swap finding.
+  #[test]
+  fn orientation_mirror_variants_compose_to_their_label() {
+    // A corner-tracking model on a wider-than-tall image (W=4, H=2): map the
+    // four stored corners through `flip_h` (mirror-first) then `rotate N CW`,
+    // and compare against the corner map each label describes directly. We
+    // tag corners TL/TR/BL/BR so a swap of 5↔7 is detectable (they send TL to
+    // different places).
+    const W: i32 = 4;
+    const H: i32 = 2;
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct P {
+      x: i32,
+      y: i32,
+    }
+    /// A net pixel transform expressed as a corner map (a label's ground truth).
+    type LabelFn = fn(P) -> P;
+    let corners = [
+      P { x: 0, y: 0 },         // TL
+      P { x: W - 1, y: 0 },     // TR
+      P { x: 0, y: H - 1 },     // BL
+      P { x: W - 1, y: H - 1 }, // BR
+    ];
+
+    // The contract: mirror-h first (on the W×H stored image), then rotate CW.
+    // `flip_h`: x -> W-1-x. `rot90cw` on a w×h image: (x,y) -> (h-1-y, x).
+    // `rot180`: (x,y) -> (w-1-x, h-1-y). `rot270cw`: (x,y) -> (y, w-1-x).
+    fn apply(p: P, mirrored: bool, degrees: u16) -> P {
+      let P { mut x, y } = p;
+      // After an optional horizontal mirror the working width stays W, height H.
+      if mirrored {
+        x = W - 1 - x;
+      }
+      let (w, h) = (W, H);
+      match degrees {
+        0 => P { x, y },
+        90 => P { x: h - 1 - y, y: x },
+        180 => P {
+          x: w - 1 - x,
+          y: h - 1 - y,
+        },
+        270 => P { x: y, y: w - 1 - x },
+        d => panic!("unexpected rotation {d}"),
+      }
+    }
+
+    // Ground-truth net transforms named by the label, expressed directly.
+    fn mirror_h(p: P) -> P {
+      P {
+        x: W - 1 - p.x,
+        y: p.y,
+      }
+    }
+    fn mirror_v(p: P) -> P {
+      P {
+        x: p.x,
+        y: H - 1 - p.y,
+      }
+    }
+    fn transpose(p: P) -> P {
+      P { x: p.y, y: p.x } // reflect across the main diagonal
+    }
+    fn transverse(p: P) -> P {
+      // reflect across the anti-diagonal (on the W×H image)
+      P {
+        x: H - 1 - p.y,
+        y: W - 1 - p.x,
+      }
+    }
+
+    // (exif, label-transform) for every REFLECTED orientation.
+    let label: [(u8, LabelFn); 4] = [
+      (2, mirror_h),
+      (4, mirror_v),
+      (5, transpose),
+      (7, transverse),
+    ];
+    for (exif, label_fn) in label {
+      let o = Orientation::from_exif_value(exif).unwrap();
+      for &c in &corners {
+        assert_eq!(
+          apply(c, o.mirrored(), o.rotation_degrees()),
+          label_fn(c),
+          "EXIF {exif}: mirror-first composition must equal its label transform at {c:?}"
+        );
+      }
+    }
+
+    // Explicitly assert 5 and 7 are NOT swapped: they send the same corner to
+    // DIFFERENT places (transpose vs transverse), so a swap would be caught.
+    let o5 = Orientation::from_exif_value(5).unwrap();
+    let o7 = Orientation::from_exif_value(7).unwrap();
+    assert_eq!(o5.rotation_degrees(), 270, "5 rotates 270 CW (transpose)");
+    assert_eq!(o7.rotation_degrees(), 90, "7 rotates 90 CW (transverse)");
+    let tl = corners[0];
+    assert_ne!(
+      apply(tl, o5.mirrored(), o5.rotation_degrees()),
+      apply(tl, o7.mirrored(), o7.rotation_degrees()),
+      "5 (transpose) and 7 (transverse) must NOT map TL identically"
+    );
+  }
+
+  #[test]
+  fn orientation_from_exif_value_rejects_out_of_range() {
+    assert!(Orientation::from_exif_value(0).is_none());
+    assert!(Orientation::from_exif_value(9).is_none());
+    assert!(Orientation::from_exif_value(u8::MAX).is_none());
+  }
+
+  #[test]
+  fn orientation_from_video_degrees_maps_rotation_subset() {
+    // The four cardinal video matrix rotations → the un-mirrored EXIF subset.
+    assert_eq!(
+      Orientation::from_video_degrees(0).map(|o| o.exif_value()),
+      Some(1)
+    );
+    assert_eq!(
+      Orientation::from_video_degrees(90).map(|o| o.exif_value()),
+      Some(6)
+    );
+    assert_eq!(
+      Orientation::from_video_degrees(180).map(|o| o.exif_value()),
+      Some(3)
+    );
+    assert_eq!(
+      Orientation::from_video_degrees(270).map(|o| o.exif_value()),
+      Some(8)
+    );
+    // A video rotation is never mirrored.
+    for deg in [0, 90, 180, 270] {
+      assert!(!Orientation::from_video_degrees(deg).unwrap().mirrored());
+    }
+    // A non-cardinal angle has no orientation.
+    assert!(Orientation::from_video_degrees(45).is_none());
+    assert!(Orientation::from_video_degrees(360).is_none());
+  }
+
+  #[test]
+  fn from_quicktime_projects_video_matrix_orientation() {
+    let mut qt = QuickTimeMeta::new();
+    // A video track with a 90° CW display matrix (`[0 1; -1 0]` ⇒ atan2(1,0)).
+    let mut video = MediaTrack::new();
+    video.set_handler(HandlerKind::Video);
+    video.set_image_width(Some(1920));
+    video.set_image_height(Some(1080));
+    video.set_matrix_structure(Some("0 1 0 -1 0 0 0 0 1".to_string()));
+    qt.push_track(video);
+
+    let projected = MediaMetadata::from_quicktime(&qt);
+    let o = projected
+      .media()
+      .orientation()
+      .expect("the video matrix encodes a 90° rotation");
+    assert_eq!(o.rotation_degrees(), 90);
+    assert_eq!(o.exif_value(), 6); // Rotate 90 CW
+    assert!(!o.mirrored());
+  }
+
+  #[test]
+  fn from_quicktime_no_matrix_is_no_orientation() {
+    // A video track with no MatrixStructure ⇒ no orientation (not the
+    // default 1). A degenerate all-zero matrix is likewise `None`.
+    let mut qt = QuickTimeMeta::new();
+    let mut video = MediaTrack::new();
+    video.set_handler(HandlerKind::Video);
+    qt.push_track(video);
+    assert!(
+      MediaMetadata::from_quicktime(&qt)
+        .media()
+        .orientation()
+        .is_none()
+    );
+
+    let mut qt2 = QuickTimeMeta::new();
+    let mut v2 = MediaTrack::new();
+    v2.set_handler(HandlerKind::Video);
+    v2.set_matrix_structure(Some("0 0 0 0 0 0 0 0 0".to_string()));
+    qt2.push_track(v2);
+    assert!(
+      MediaMetadata::from_quicktime(&qt2)
+        .media()
+        .orientation()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn from_quicktime_identity_matrix_is_orientation_1() {
+    // The identity matrix ⇒ 0° ⇒ EXIF 1 (Horizontal/normal), NOT `None`.
+    let mut qt = QuickTimeMeta::new();
+    let mut video = MediaTrack::new();
+    video.set_handler(HandlerKind::Video);
+    video.set_matrix_structure(Some("1 0 0 0 1 0 0 0 1".to_string()));
+    qt.push_track(video);
+    let o = MediaMetadata::from_quicktime(&qt)
+      .media()
+      .orientation()
+      .expect("identity ⇒ orientation 1");
+    assert_eq!(o.exif_value(), 1);
+    assert_eq!(o.rotation_degrees(), 0);
+  }
+
+  #[test]
+  fn media_info_orientation_merge_self_wins_other_fills() {
+    // self has orientation, other a different one ⇒ self wins.
+    let mut base = MediaInfo::new();
+    base.update_orientation(Orientation::from_exif_value(6));
+    let mut other = MediaInfo::new();
+    other.update_orientation(Orientation::from_exif_value(3));
+    let merged = base.merge(other);
+    assert_eq!(merged.orientation().map(|o| o.exif_value()), Some(6));
+
+    // self None, other Some ⇒ other fills the gap.
+    let base2 = MediaInfo::new();
+    let mut other2 = MediaInfo::new();
+    other2.update_orientation(Orientation::from_exif_value(8));
+    assert_eq!(
+      base2.merge(other2).orientation().map(|o| o.exif_value()),
+      Some(8)
+    );
   }
 }
