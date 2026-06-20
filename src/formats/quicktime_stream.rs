@@ -2564,6 +2564,33 @@ fn decode_one_sample(
   // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
   // EMPTY-HandlerType `moov`-level box ([`process_moov_gps_box`]), not a track.
   //
+  // The timed-text path (QuickTimeStream.pl:1467-1516) — a `text` HandlerType
+  // sample (ExifTool's `$type eq 'text'`). `FoundSomething` opens ONE `Doc<N>`
+  // per sample + emits its `SampleTime`/`SampleDuration` (independent of whether
+  // a sentence decodes — a plain-text sample still emits a `Text` row); then
+  // `Process_text` decodes the dashcam GPS / camera extras (Mini 0806 / Roadhawk
+  // / Thinkware / DJI telemetry). Open the GLOBAL doc here (continuing the shared
+  // counter), run the wrapper, and let it stamp the produced fix with this
+  // `trak`'s `Track<N>` + the sample-table timing. Returns `false`: the text path
+  // does NOT set the GoPro `FoundEmbedded` flag (only `ProcessGoPro` / a `gps `
+  // -box decode do), so it must not suppress the brute-force `mdat` scan.
+  //
+  // NOTE: only the `text` HandlerType reaches here (the Garmin `sbtl`+`tx3g`
+  // `^..PNDM` sub-case, QuickTimeStream.pl:1469, is a separate binary path,
+  // deferred). The `metaFormat` 4cc is the stsd code (`text`); the dispatch is
+  // by HandlerType, faithful to ExifTool's `$type` test.
+  if &track.handler == b"text" {
+    let doc = out.open_doc();
+    crate::formats::quicktime_freegps::process_timed_text(
+      buff,
+      track_index,
+      doc,
+      sample.time,
+      sample.dur,
+      out,
+    );
+    return false;
+  }
   // `tx3g` / …:
   // DEFERRED — these re-dispatch into other ExifTool modules or the 850-line
   // ProcessFreeGPS. See module docs + docs/tracking.md. An unrecognized

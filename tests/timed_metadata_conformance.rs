@@ -125,6 +125,28 @@ fn check_ee(fixture_name: &str, golden_name: &str, g3: bool) {
   }
 }
 
+/// Render `fixture` at `-ee -n` (`-G1`, PrintConv DISABLED) and compare
+/// TOKEN-EXACT to `golden_name`. The `-n` axis pins the tags whose
+/// `%QuickTime::Stream` PrintConv is dropped under `-n` — e.g. the DJI
+/// `Distance` (`"$val m"` → raw `87.336`) and `VerticalSpeed` (`"$val m/s"` →
+/// raw `0.00`) — which the `-j` `.ee.json`/`.ee.g3.json` goldens cannot catch
+/// (they exercise only the PrintConv'd string form). The third
+/// `extract_info_with_options` arg is the PrintConv toggle (`false` = `-n`).
+fn check_ee_n(fixture_name: &str, golden_name: &str) {
+  let data = fixture(fixture_name);
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options(fixture_name, &data, false, opts);
+  let want = golden(golden_name);
+  if let Err(e) = json_equivalent_strict(&got, &want) {
+    panic!(
+      "{fixture_name} (-ee -n) vs {golden_name}: {}\n--- got ---\n{got}\n--- want ---\n{want}",
+      e.message()
+    );
+  }
+}
+
 /// Strip a set of keys from every object in a `-j -G1`/`-G3` document so a
 /// structurally-absent field (one exifast cannot yet produce) does not fail the
 /// otherwise byte-exact comparison. The keys are matched against the FULL JSON
@@ -331,6 +353,180 @@ fn wolfbox_redtiger_f9_gpmd_ee_byte_exact() {
 // hint, QuickTime.pm `EEWarn`); NO GPS surfaces. Pins that the `gpmd`-variant GPS
 // emission is `-ee`-only (the same gate as camm / the GoPro gpmd), so a default
 // parse leaks no fix. Every tag (incl. `Track1:MetaFormat`) compared byte-exact.
+// The four Process_text dashcam fixtures (#104 / #102) — single `text`-handler
+// timed-text samples whose ASCII bytes carry one vendor's Process_text
+// fingerprint (QuickTimeStream.pl:1213-1294). ExifTool routes a `text`
+// HandlerType sample to `Process_text` (:1467-1516), emitting the decoded GPS +
+// the non-GPS extras (`Text`/`GSensor`/`Car`/`Distance`/`VerticalSpeed`/
+// `FNumber`/`ExposureTime`/`ExposureCompensation`/`ISO`) under `Track1:` with the
+// sample-table timing, `-ee` only. Verified bundled-decodable vs ExifTool 13.59.
+#[test]
+fn text_mini0806_ee_byte_exact() {
+  // Mini 0806: `^A,DDMMYY,HHMMSS.sss,…` → 33°56'53.55"N 84°20'12.43"W,
+  // 2019:05:27 20:15:55.000, alt 331 m, speed 0, Accelerometer.
+  check_ee(
+    "QuickTime_text_mini0806.mov",
+    "QuickTime_text_mini0806.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_mini0806.mov",
+    "QuickTime_text_mini0806.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_roadhawk_ee_byte_exact() {
+  // Roadhawk: the `*HH~`-terminated substitution-encoded buffer → a decoded
+  // `$GPRMC` (53°30'40.10"N 6°41'58.49"W, 2013:02:05 08:21:38, speed 23.15,
+  // track 87.86) + the 4-value Accelerometer.
+  check_ee(
+    "QuickTime_text_roadhawk.mov",
+    "QuickTime_text_roadhawk.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_roadhawk.mov",
+    "QuickTime_text_roadhawk.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_thinkware_ee_byte_exact() {
+  // Thinkware: `gsensori,…;GNRMC,…;CAR,…` → 45°29'52.49"N 73°37'0.73"W,
+  // 2019:08:31 16:13:13, speed 11.5287, track 35.34, GSensor + Car.
+  check_ee(
+    "QuickTime_text_thinkware.mov",
+    "QuickTime_text_thinkware.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_thinkware.mov",
+    "QuickTime_text_thinkware.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_dji_telemetry_ee_byte_exact() {
+  // DJI telemetry: `F/3.5, SS 1000, …, GPS (lon, lat, alt), D …, H …, H.S …,
+  // V.S …` → 53°9'59.40"N 8°38'59.64"E, alt 6 m, speed 7.56, Distance/FNumber/
+  // ExposureTime/ExposureCompensation/ISO/VerticalSpeed.
+  check_ee(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -n` (#104 finding-2): under `-n` the `Distance` (`"$val m"`) and
+  // `VerticalSpeed` (`"$val m/s"`) PrintConvs are DISABLED, so `Distance` is the
+  // raw scaled number (`87.336`, not `"87.336 m"`) and `VerticalSpeed` is the raw
+  // token (`0.00`, not `"0.00 m/s"`). The `-j` goldens above only exercise the
+  // suffixed string form, so this `-n` golden is what pins the numeric branch.
+  check_ee_n(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.n.json",
+  );
+}
+
+// A two-sample `text`-handler track: a ZERO-LENGTH length-prefixed sample (the
+// `next if $size == 2` shape — a 2-byte big-endian prefix `\0\0` equal to
+// `size - 2 == 0`) FOLLOWED BY a valid Mini-0806 sample. ExifTool's
+// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}` + `SampleTime`/
+// `SampleDuration`, QuickTimeStream.pl:1461) fires for EVERY `text` sample
+// BEFORE the `unless ($buff =~ /^\$BEGIN/)` block — so BEFORE the `next if
+// $size == 2` AND before `Process_text`. The empty sample therefore STILL opens
+// `Doc1` and emits its timing (no `Text`, no GPS — the `next` skips the `Text`
+// store + decode), so the valid Mini-0806 fix is renumbered `Doc2` (NOT `Doc1`),
+// and at `-ee -G1` the single `Track1:SampleTime` is the FIRST (empty) sample's
+// `0 s`. This pins the size==2 escape-hatch close of the per-text-sample-timing
+// class (#104 R2): the third occurrence after #100 (gpmd matched-empty) and
+// #104 R1 (binary `\0[^\0]` empty), now the size==2 wrapper case. Verified
+// byte-exact vs bundled ExifTool 13.59.
+#[test]
+fn text_empty_size2_then_valid_doc_renumber_byte_exact() {
+  // `-ee -G3:1`: the empty size==2 sample is `Doc1:Track1:SampleTime "0 s"` +
+  // `SampleDuration "1.00 s"` (NO Text / NO GPS), and the valid Mini-0806 fix is
+  // `Doc2:Track1:…` — proving the empty sample consumed `Doc1` so the valid one
+  // is `Doc2`. Byte-exact.
+  check_ee(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, and the single `Track1:SampleTime "0 s"`
+  // is the FIRST (min-`doc()` = `Doc1`, empty) sample's timing while the GPS +
+  // `Text` columns come from the `Doc2` fix — byte-exact (the timing-only marker
+  // is a candidate in the min-doc precompute).
+  check_ee(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `text` trak is fully `-ee` gated, so only the
+  // structural `Track1:HandlerType`/`OtherFormat` + the `[minor]` EEWarn surface
+  // (no GPS, no Text, no SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the size==2 empty-then-valid `text` `-ee -G3`
+/// emission (the per-text-sample-timing class close). [`json_equivalent_strict`]
+/// compares object keys as an UNORDERED multiset, so it does NOT catch a wrong
+/// key ORDER — the `.ee.g3.json` golden carries the correct bundled order yet a
+/// divergent emission order still passes it. This asserts directly on the RAW
+/// emitted document that the empty sample's `Doc1:Track1:SampleTime`/
+/// `SampleDuration` are emitted BEFORE the valid fix's `Doc2:Track1:` rows —
+/// exactly ExifTool's `ProcessSamples` per-sample (= `Doc<N>`) emission order. A
+/// size==2 early-return (the bug) would drop `Doc1` timing entirely, so this
+/// also guards against the escape hatch reopening.
+#[test]
+fn text_empty_size2_then_valid_g3_emission_order() {
+  let data = fixture("QuickTime_text_empty_then_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_text_empty_then_valid.mov", &data, true, opts);
+
+  // The empty size==2 sample (Doc1) carries ONLY SampleTime/SampleDuration; the
+  // valid Mini-0806 fix (Doc2) carries SampleTime/SampleDuration + Text + GPS.
+  let doc1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the empty size==2 sample's timing)");
+  let doc1_dur = got
+    .find("\"Doc1:Track1:SampleDuration\"")
+    .expect("Doc1:Track1:SampleDuration present");
+  let doc2_time = got
+    .find("\"Doc2:Track1:SampleTime\"")
+    .expect("Doc2:Track1:SampleTime present");
+  let doc2_text = got
+    .find("\"Doc2:Track1:Text\"")
+    .expect("Doc2:Track1:Text present");
+  let doc2_lat = got
+    .find("\"Doc2:Track1:GPSLatitude\"")
+    .expect("Doc2:Track1:GPSLatitude present");
+
+  // Doc1's timing block must precede the ENTIRE Doc2 block (its timing AND its
+  // Text/GPS rows) — ProcessSamples emits the empty sample fully before the
+  // valid one. The empty sample must NOT be missing (the size==2 escape hatch).
+  assert!(
+    doc1_time < doc2_time && doc1_dur < doc2_time && doc1_time < doc2_text && doc1_time < doc2_lat,
+    "text size==2 -ee -G3 emission order: Doc1 timing must precede the Doc2 fix \
+     (Doc1:SampleTime@{doc1_time}, Doc1:SampleDuration@{doc1_dur}, \
+     Doc2:SampleTime@{doc2_time}, Doc2:Text@{doc2_text}, \
+     Doc2:GPSLatitude@{doc2_lat})\n--- got ---\n{got}"
+  );
+}
+
 #[test]
 fn fmas_n2s_gpmd_noee_warning_byte_exact() {
   check_noee_excluding(
@@ -3762,6 +3958,46 @@ fn insta360_doc_entries(
   (entries, docs)
 }
 
+/// Filter a `-ee -G3:1 -j` document to its `Doc<N>:Track3:SampleTime` /
+/// `Doc<N>:Track3:SampleDuration` rows (the timed-`text` track's per-sample
+/// timing), preserving DUPLICATE keys + source order. These are the rows
+/// `FoundSomething` (QuickTimeStream.pl:1473) emits for EVERY `text` sample
+/// BEFORE `Process_text` — including the Insta360 `.insv`'s 469 BINARY text
+/// samples that decode to no `Text`/GPS (so the timing is the ONLY thing they
+/// emit). Their absence was the #104 masking finding: the dispatch opened the
+/// 469 `Doc<N>` (shifting the Insta360 records to `Doc470..`) but emitted no
+/// `Track3:SampleTime`/`SampleDuration`, so the oracle's `Doc1..469:Track3:*`
+/// timing was missing yet UNCHECKED (the stream test filtered `Insta360:*`
+/// only). The `text`-path [`crate::metadata::GpmdTimingOnly`] marker now emits
+/// them; this filter pins them byte-exact vs the UNCHANGED `.ee.g3.json` oracle.
+/// Returns the ordered `(full-key, raw-value-text)` pairs (duplicates kept).
+fn track3_timing_entries(doc: &str) -> Vec<(String, String)> {
+  let arr: Vec<&serde_json::value::RawValue> =
+    serde_json::from_str(doc).expect("valid -ee -G3 JSON document (single-object array)");
+  let first = arr
+    .first()
+    .expect("-ee -G3 document is a single-object array");
+  let OrderedEntries(pairs) =
+    serde_json::from_str(first.get()).expect("-ee -G3 first element is a JSON object");
+  let mut entries: Vec<(String, String)> = Vec::new();
+  for (k, v) in pairs {
+    let Some(rest) = k.strip_prefix("Doc") else {
+      continue;
+    };
+    let Some((num, name)) = rest.split_once(':') else {
+      continue;
+    };
+    if name != "Track3:SampleTime" && name != "Track3:SampleDuration" {
+      continue;
+    }
+    if num.parse::<u64>().is_err() {
+      continue;
+    }
+    entries.push((k.clone(), v.get().trim().to_string()));
+  }
+  entries
+}
+
 /// The `(first, last, distinct)` doc span of an Insta360 record stream's per-entry
 /// doc numbers (`insta360_doc_entries`'s second return, duplicates kept),
 /// asserting CONTIGUITY (an unbroken `Doc{first}..Doc{last}` run over the DISTINCT
@@ -3811,11 +4047,14 @@ fn insta360_entries_to_document(entries: &[(String, String)]) -> String {
 }
 
 /// The constant Insta360 `Doc<N>` offset: ExifTool numbers the trailer records
-/// `Doc470..` because the un-extracted 469-sample timed-`text` track occupies
-/// `Doc1..Doc469`; exifast (not extracting that track) emits the SAME records at
-/// `Doc1..`. STAGE 1 re-derives and asserts this offset from the raw doc numbers;
-/// STAGE 2 renumbers the exifast side UP by it so both sides share `Doc470..`.
-const INSTA360_DOC_OFFSET: u64 = 469;
+/// `Doc470..` because the 469-sample timed-`text` track (Track3) occupies
+/// `Doc1..Doc469` — `FoundSomething` opens a `Doc<N>` per text sample even though
+/// `Process_text` extracts nothing from them (they are binary, so no `Text` /
+/// GPS). Since #104/#102 wired the `text`-HandlerType dispatch, exifast now opens
+/// those same 469 docs, so its Insta360 records START at `Doc470` — ABSOLUTELY
+/// matching the oracle, so the offset is now ZERO. STAGE 1 re-derives + asserts
+/// it from the raw doc numbers (both sides `Doc470..`).
+const INSTA360_DOC_OFFSET: u64 = 0;
 
 // ── Insta360 OneRS REAL `.insv` — FULL `-ee -G3` timed-record stream ─────────
 // Pins the ENTIRE Insta360 timed-record stream the `-ee -G1` view collapses:
@@ -3894,15 +4133,17 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   );
   assert_eq!(
     (got_first, got_last, got_count),
-    (1, 21147, 21147),
-    "exifast -ee -G3 Insta360 records must run exactly Doc1..Doc21147 (21 147 \
-     records); a doc-shifted run (e.g. Doc2..Doc21148) fails here"
+    (470, 21616, 21147),
+    "exifast -ee -G3 Insta360 records must run exactly Doc470..Doc21616 (21 147 \
+     records); since the `text`-track dispatch (#104) opens the 469 Track3 docs, \
+     exifast now matches the oracle's ABSOLUTE numbering — a doc-shifted run fails"
   );
   assert_eq!(
     oracle_first - got_first,
     INSTA360_DOC_OFFSET,
-    "the constant Insta360 doc offset (un-extracted 469-sample text track) must \
-     be exactly 469: oracle_first {oracle_first} - got_first {got_first}"
+    "the Insta360 doc offset is now ZERO (exifast opens the 469-sample text-track \
+     docs too, matching the oracle): oracle_first {oracle_first} - got_first \
+     {got_first}"
   );
 
   // STAGE 2 — re-serialize both renumbered streams to RAW single-object-array
@@ -3916,6 +4157,38 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
     panic!(
       "QuickTime_insta360_real.insv (-ee -G3, Insta360 record stream, \
        renumbered) vs QuickTime_insta360_real.insv.ee.g3.insta360.json: {}",
+      e.message()
+    );
+  }
+
+  // STAGE 3 — the timed-`text` track timing (#104 finding-1 unmasking). The
+  // 469 BINARY text samples (Track3) decode to no `Text`/GPS, so `FoundSomething`
+  // (QuickTimeStream.pl:1473) emits ONLY their `Doc<N>:Track3:SampleTime` /
+  // `SampleDuration` — which the `text`-path matched-but-empty marker now
+  // reproduces. Pin those rows byte-exact vs the UNCHANGED RAW `.ee.g3.json`
+  // oracle (the same file `gen_golden.sh` writes — it carries the `Track3` rows
+  // at `Doc1..Doc469`). The stream filter above drops every non-`Insta360`
+  // `Doc<N>` group, so without this stage the 469×2 timing rows would be
+  // UNVERIFIED (the original masking).
+  let want_raw_full = golden("QuickTime_insta360_real.insv.ee.g3.json");
+  let got_t3 = track3_timing_entries(&got_raw);
+  let want_t3 = track3_timing_entries(&want_raw_full);
+  assert_eq!(
+    want_t3.len(),
+    469 * 2,
+    "the .ee.g3.json oracle must carry 469 Doc<N>:Track3:SampleTime + 469 \
+     SampleDuration rows (the 469 binary text samples' FoundSomething timing)"
+  );
+  // The `Track3` timing rows ride `Doc1..Doc469` on BOTH sides (exifast opens the
+  // same docs; offset 0), so compare verbatim — no renumber. The
+  // duplicate-preserving re-serialize + strict comparator pins the count, the
+  // full `Doc<N>` key set, AND every `SampleTime`/`SampleDuration` value.
+  let got_t3_doc = insta360_entries_to_document(&got_t3);
+  let want_t3_doc = insta360_entries_to_document(&want_t3);
+  if let Err(e) = json_equivalent_strict(&got_t3_doc, &want_t3_doc) {
+    panic!(
+      "QuickTime_insta360_real.insv (-ee -G3, Track3 text-track timing, \
+       Doc1..Doc469) vs QuickTime_insta360_real.insv.ee.g3.json: {}",
       e.message()
     );
   }

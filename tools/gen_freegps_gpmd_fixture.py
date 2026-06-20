@@ -27,6 +27,7 @@ After running, regenerate the goldens with bundled ExifTool 13.59:
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_wolfbox_redtiger_f9.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_fmas_empty_then_valid.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_gpmd_kingslim_fmas_mixed.mov
+  EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_text_empty_then_valid.mov
 """
 import os
 import struct
@@ -39,12 +40,17 @@ def atom(typ: bytes, body: bytes) -> bytes:
     return struct.pack(">I", len(body) + 8) + typ + body
 
 
-def build_gpmd_mov(samples) -> bytes:
-    """Minimal `.mov`: ftyp / mdat(samples) / moov(mvhd + trak[gpmd meta]).
+def build_gpmd_mov(samples, fmt: bytes = b"gpmd", handler: bytes = b"meta") -> bytes:
+    """Minimal `.mov`: ftyp / mdat(samples) / moov(mvhd + trak[<handler> <fmt>]).
 
     Identical to `gen_sony_rtmd_fixture.py:build_rtmd_mov` except the stsd 4-byte
-    format code is `gpmd` (the rtmd generator uses `rtmd`); the `meta` handler,
-    `nmhd` minf, and the single-chunk N-sample stbl are unchanged.
+    format code is `fmt` (`gpmd` by default; the rtmd generator uses `rtmd`) and
+    the hdlr HandlerType is `handler` (`meta` by default). The Process_text
+    dashcam fixtures pass `fmt=b"text"`, `handler=b"text"` — ExifTool's
+    `ProcessSamples` routes a `text` HandlerType sample to `Process_text`
+    (QuickTimeStream.pl:1467-1516), emitting the decoded GPS + the `Text` tag
+    under `Track1:` with the sample-table `SampleTime`/`SampleDuration`, under
+    `-ee` only. The `nmhd` minf and the single-chunk N-sample stbl are unchanged.
     """
     # ftyp 'qt  '.
     ftyp = atom(b"ftyp", b"qt  " + struct.pack(">I", 0))
@@ -66,11 +72,11 @@ def build_gpmd_mov(samples) -> bytes:
         + b"\x00" * 80                  # rest (rate/volume/matrix/…)
     )
 
-    # hdlr: mhlr / meta (the meta_handler the gpmd stsd dispatches through).
+    # hdlr: mhlr / <handler> (the HandlerType the stsd dispatches through).
     hdlr_body = (
         b"\x00\x00\x00\x00"  # version+flags
         + b"mhlr"            # pre_defined
-        + b"meta"            # handler_type
+        + handler           # handler_type
         + b"\x00" * 12       # reserved
         + b"\x00"            # name (empty)
     )
@@ -84,8 +90,8 @@ def build_gpmd_mov(samples) -> bytes:
         + b"\x00" * 4  # language+quality
     )
 
-    # stsd: 1 entry whose 4-byte format code is `gpmd`.
-    stsd_entry = struct.pack(">I", 16) + b"gpmd" + b"\x00" * 6 + struct.pack(">H", 1)
+    # stsd: 1 entry whose 4-byte format code is `fmt`.
+    stsd_entry = struct.pack(">I", 16) + fmt + b"\x00" * 6 + struct.pack(">H", 1)
     stsd_body = b"\x00\x00\x00\x00" + struct.pack(">I", 1) + stsd_entry
 
     # stts: one run of N samples, delta=1000 each.
@@ -268,6 +274,73 @@ def wolfbox_sample() -> bytes:
     return bytes(d)
 
 
+# ── Process_text dashcam variants (text-handler timed-text samples) ──────────
+# Each is a plain-ASCII timed-text sample whose bytes carry one vendor's
+# Process_text fingerprint (QuickTimeStream.pl:1213-1294). They are modeled on
+# the gpmd builder above but with a `text` HandlerType + `text` stsd 4cc, so
+# ExifTool routes them to `Process_text`. The exact ground-truth GPS each yields
+# (bundled ExifTool 13.59, `-ee -G3:1`) is in the test docs.
+
+
+def mini_0806_sample() -> bytes:
+    """Mini 0806 dashcam (QuickTimeStream.pl:1232-1248): `^A,DDMMYY,HHMMSS.sss,
+    DDMM.MMMM,N/S,DDDMM.MMMM,E/W,speed,altM,accX,accY,accZ;`. Lands at
+    33 deg 56' 53.55" N, 84 deg 20' 12.43" W, 2019:05:27 20:15:55.000, alt 331 m,
+    speed 0, Accelerometer "+01.84 -09.80 -00.61"."""
+    return b"A,270519,201555.000,3356.8925,N,08420.2071,W,000.0,331.0M,+01.84,-09.80,-00.61;\n"
+
+
+def roadhawk_sample() -> bytes:
+    """Roadhawk (QuickTimeStream.pl:1250-1269): the custom-substitution-encoded
+    buffer ending `*HH~` (the verbatim bundled example) that decodes to
+    `X0000.2340Y-000.0720Z0000.9900G0001.0400$GPRMC,082138,A,5330.6683,N,
+    00641.9749,W,012.5,87.86,050213,002.1,A`. Lands at 53 deg 30' 40.10" N,
+    6 deg 41' 58.49" W, 2013:02:05 08:21:38, speed 23.15, track 87.86,
+    Accelerometer "0000.2340 -000.0720 0000.9900 0001.0400"."""
+    return (
+        b".;;;;D?JL;6+;;;D;R?;4;;;;DBB;;O;;;=D;L;;HO71G>F;-?=J-F:FNJJ;"
+        b"DPP-JF3F;;PL=DBRLBF0F;=?DNF-RD-PF;N;?=JF;;?D=F:*6F~"
+    )
+
+
+def thinkware_sample() -> bytes:
+    """Thinkware (QuickTimeStream.pl:1271-1286): `gsensori,...;<XX>RMC,...;CAR,
+    ...` — a `GNRMC` (no leading `$`) with the day/mon/yr sanity gate, plus the
+    `gsensori` → GSensor and `CAR` → Car extras. Lands at 45 deg 29' 52.49" N,
+    73 deg 37' 0.73" W, 2019:08:31 16:13:13, speed 11.5287, track 35.34,
+    GSensor "4,512,-67,-12,100", Car "0,0,0,0.0,0,0,0,0,0,0,0,0"."""
+    return (
+        b"gsensori,4,512,-67,-12,100;GNRMC,161313.00,A,4529.87489,N,07337.01215,W,"
+        b"6.225,35.34,310819,,,A*52;CAR,0,0,0,0.0,0,0,0,0,0,0,0,0"
+    )
+
+
+def dji_telemetry_sample() -> bytes:
+    """DJI telemetry (QuickTimeStream.pl:1213-1230): `F/<fn>, SS <ss>, ISO <iso>,
+    EV <ev>, GPS (lon, lat, alt), D <d>m, H <h>m, H.S <hs>m/s, V.S <vs>m/s`.
+    `GPS (lon, lat` is lon-then-lat; altitude is the H(eight), speed the H.S,
+    distance the D field. Lands at 53 deg 9' 59.40" N, 8 deg 38' 59.64" E,
+    GPSAltitude 6 m, speed 7.56 (2.10 m/s × 3.6), Distance "87.336 m"
+    (24.26 × 3.6), FNumber 3.5, ExposureTime "1/1000", ExposureCompensation 0,
+    ISO 100, VerticalSpeed "0.00 m/s"."""
+    return (
+        b"F/3.5, SS 1000, ISO 100, EV 0, GPS (8.6499, 53.1665, 18), "
+        b"D 24.26m, H 6.00m, H.S 2.10m/s, V.S 0.00m/s \n"
+    )
+
+
+def empty_length_prefix_sample() -> bytes:
+    """A zero-length length-prefixed `text` sample — the `next if $size == 2`
+    shape (QuickTimeStream.pl:1474). The 2-byte big-endian prefix `\\x00\\x00`
+    equals `size - 2 == 0`, so ExifTool strips nothing, fires the `next`, and
+    stores NO `Text` and runs NO `Process_text` decode — BUT `FoundSomething`
+    (:1461) already opened this sample's `Doc<N>` + emitted its `SampleTime`/
+    `SampleDuration` ABOVE the `unless` block, so the empty sample STILL consumes
+    a doc and surfaces its timing. Pins the size==2 escape-hatch close: an empty
+    text sample MUST emit `Doc<N>:Track<N>:SampleTime`/`SampleDuration`."""
+    return b"\x00\x00"
+
+
 def main() -> None:
     outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -318,6 +391,38 @@ def main() -> None:
         with open(path, "wb") as f:
             f.write(data)
         print("wrote %s (%d bytes)" % (path, len(data)))
+
+    # The four Process_text dashcam fixtures — single `text`-handler timed-text
+    # samples (#104 / #102). Each is built with `fmt=b"text"`, `handler=b"text"`.
+    for name, sample in [
+        ("QuickTime_text_mini0806.mov", mini_0806_sample()),
+        ("QuickTime_text_roadhawk.mov", roadhawk_sample()),
+        ("QuickTime_text_thinkware.mov", thinkware_sample()),
+        ("QuickTime_text_dji_telemetry.mov", dji_telemetry_sample()),
+    ]:
+        data = build_gpmd_mov([sample], fmt=b"text", handler=b"text")
+        path = os.path.join(outdir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        print("wrote %s (%d bytes)" % (path, len(data)))
+
+    # Two-sample `text`-handler fixture: a zero-length length-prefixed sample
+    # (`next if $size == 2`) FOLLOWED BY a valid Mini-0806 sample. ExifTool's
+    # `FoundSomething` (QuickTimeStream.pl:1461) opens a `Doc<N>` + emits the
+    # `SampleTime`/`SampleDuration` for EVERY text sample BEFORE the `next` /
+    # `Process_text`, so the empty sample STILL consumes `Doc1` (timing-only) and
+    # the valid Mini-0806 sample is renumbered `Doc2`; at `-ee -G1` the single
+    # `Track1:SampleTime` is the FIRST (empty) sample's `0 s`. Pins the size==2
+    # escape-hatch close of the per-text-sample-timing class (#104 R2 finding).
+    data = build_gpmd_mov(
+        [empty_length_prefix_sample(), mini_0806_sample()],
+        fmt=b"text",
+        handler=b"text",
+    )
+    path = os.path.join(outdir, "QuickTime_text_empty_then_valid.mov")
+    with open(path, "wb") as f:
+        f.write(data)
+    print("wrote %s (%d bytes)" % (path, len(data)))
 
 
 if __name__ == "__main__":
