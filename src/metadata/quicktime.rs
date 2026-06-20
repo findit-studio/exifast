@@ -1140,6 +1140,106 @@ impl Default for AudioSampleDesc {
   }
 }
 
+/// The `%SampleTable` `stsd` sample-description table a `trak`'s descriptor was
+/// routed to, decided at PARSE TIME from the handler SEEN SO FAR (file order).
+///
+/// ExifTool's `stsd` Condition chain (QuickTime.pm:7370-7405) tests
+/// `$$self{HandlerType}` — which inits to `''` and is filled by the `hdlr` atom
+/// — against `soun`/`vide`/`hint`/`meta` IN ORDER, routing each to its own
+/// sample-description table, and falls through UNCONDITIONALLY to
+/// `%OtherSampleDesc` for any other (or empty) handler. Because the chain reads
+/// the handler-so-far, a track whose `stsd` PRECEDES its `hdlr` (or has no
+/// `hdlr` at all) decodes under the empty handler and routes to
+/// [`SampleDescRoute::Other`] REGARDLESS of the handler the `hdlr` later
+/// assigns — the FINAL handler can never reclassify a descriptor that was
+/// already decoded. Capturing the route the DECODE used (rather than re-deriving
+/// it from the final handler at emission) is what keeps the emitted sample-desc
+/// tags faithful for a reordered / handler-less `mdia` (verified vs bundled
+/// ExifTool 13.59: a `meta` track with `stsd` before `hdlr` emits `OtherFormat`,
+/// NOT `MetaFormat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleDescRoute {
+  /// `soun` handler-so-far → `%AudioSampleDesc` (`AudioFormat`, AudioChannels, …).
+  Audio,
+  /// `vide` handler-so-far → `%VisualSampleDesc` (`CompressorID`, dimensions, …).
+  Visual,
+  /// `hint` handler-so-far → `%HintSampleDesc` (`HintFormat`, …).
+  Hint,
+  /// `meta` handler-so-far → `%MetaSampleDesc` (`MetaFormat`).
+  Meta,
+  /// Any OTHER handler-so-far, OR an empty handler (no `hdlr` yet / no `hdlr`)
+  /// → the `%OtherSampleDesc` fallback (`OtherFormat`, `PlaybackFrameRate`).
+  Other,
+}
+
+impl SampleDescRoute {
+  /// Classify the handler SEEN SO FAR (the `stsd`-decode-time handler, file
+  /// order) into the `%SampleTable` Condition chain's route
+  /// (QuickTime.pm:7370-7405). `None` (no `hdlr` decoded yet) and every
+  /// unmatched handler fall through to [`SampleDescRoute::Other`], mirroring
+  /// ExifTool's empty-`$$self{HandlerType}` fallthrough.
+  #[inline(always)]
+  #[must_use]
+  pub fn from_handler(handler: Option<&str>) -> Self {
+    match handler {
+      Some("soun") => Self::Audio,
+      Some("vide") => Self::Visual,
+      Some("hint") => Self::Hint,
+      Some("meta") => Self::Meta,
+      _ => Self::Other,
+    }
+  }
+
+  /// A short label for the routed table (diagnostics / tests).
+  #[inline(always)]
+  #[must_use]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Audio => "Audio",
+      Self::Visual => "Visual",
+      Self::Hint => "Hint",
+      Self::Meta => "Meta",
+      Self::Other => "Other",
+    }
+  }
+
+  /// `true` for the `soun` → `%AudioSampleDesc` route.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_audio(&self) -> bool {
+    matches!(self, Self::Audio)
+  }
+
+  /// `true` for the `vide` → `%VisualSampleDesc` route.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_visual(&self) -> bool {
+    matches!(self, Self::Visual)
+  }
+
+  /// `true` for the `hint` → `%HintSampleDesc` route.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_hint(&self) -> bool {
+    matches!(self, Self::Hint)
+  }
+
+  /// `true` for the `meta` → `%MetaSampleDesc` route (gates `MetaFormat`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_meta(&self) -> bool {
+    matches!(self, Self::Meta)
+  }
+
+  /// `true` for the `%OtherSampleDesc` fallback route (gates `OtherFormat` /
+  /// `PlaybackFrameRate`) — an unmatched or empty handler-so-far.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_other(&self) -> bool {
+    matches!(self, Self::Other)
+  }
+}
+
 /// One QuickTime track — the typed mirror of a `trak` atom and its
 /// `tkhd` / `mdia(mdhd, hdlr)` children (QuickTime.pm:1424-1582,
 /// 7218-7327). All fields are optional: a fixture too short for a given
@@ -1197,16 +1297,25 @@ pub struct MediaTrack {
   /// [`Self::handler_code`] so distinct codes are never collapsed.
   handler: Option<HandlerKind>,
   /// `stsd` sample-description 4-byte format code (`minf/stbl/stsd` entry, the
-  /// `undef[4]` at offset 4 — QuickTime.pm:7765/7803). This is the value of the
-  /// `MetaFormat` tag (`MetaSampleDesc`, emitted ONLY for a `meta`-handler track
-  /// — `Condition => '$$self{HandlerType} eq "meta"'`, QuickTime.pm:7393) — e.g.
-  /// `"rtmd"` / `"camm"` / `"mebx"` for a Sony / Android / Apple timed-metadata
-  /// track. `None` when no `stsd` 4cc was decoded (e.g. a non-metadata track).
-  /// The emission gates `Track<N>:MetaFormat` on the `meta` handler, mirroring
-  /// the `MetaSampleDesc` condition (a `soun`/`vide` track routes to its own
-  /// sample-desc table; an unmatched handler to `OtherSampleDesc`'s
-  /// `OtherFormat`, NOT `MetaFormat`).
+  /// `undef[4]` at offset 4 of the `%MetaSampleDesc` table — QuickTime.pm:7765),
+  /// the value of the `MetaFormat` tag. Set ONLY for a `stsd` that was DECODED
+  /// through the **`Meta` route** (the handler seen so far at decode time was
+  /// `meta` — `Condition => '$$self{HandlerType} eq "meta"'`, QuickTime.pm:7393)
+  /// — e.g. `"rtmd"` / `"camm"` / `"mebx"` for a Sony / Android / Apple
+  /// timed-metadata track. `None` when no `stsd` routed `Meta`. The OtherFormat
+  /// 4cc lives in the SEPARATE [`Self::other_format`] slot, so a multi-`minf`
+  /// track that routes one `stsd` `Meta` and another `Other` carries BOTH
+  /// without the two clobbering one shared slot (the per-`stsd` route carry of
+  /// #309). Drives `Track<N>:MetaFormat`.
   meta_format: Option<String>,
+  /// `stsd` sample-description 4-byte format code of a `stsd` decoded through
+  /// the **`Other` route** (the `%OtherSampleDesc` fallback — an unmatched or
+  /// EMPTY handler-so-far, QuickTime.pm:7802-7806; ExifTool stores it in the
+  /// same `$$self{MetaFormat}` slot, but exifast keeps a distinct field so it
+  /// never clobbers a `Meta`-routed `MetaFormat` from another `minf`). e.g. a
+  /// `tmcd` time-code track or a `text` track. `None` when no `stsd` routed
+  /// `Other`. Drives `Track<N>:OtherFormat`.
+  other_format: Option<String>,
   /// `hdlr` HandlerVendorID (the `mdia/hdlr` body offset 12, `undef[4]`,
   /// QuickTime.pm:8446). `None` when all-zero (`RawConv => '$val eq
   /// "\0\0\0\0" ? undef : $val'`). Drives `Track<N>:HandlerVendorID` (the
@@ -1269,20 +1378,6 @@ pub struct MediaTrack {
   /// `%.10g` quotient). `None` for a non-`tmcd` descriptor or a too-short entry.
   /// Drives `Track<N>:PlaybackFrameRate`.
   playback_frame_rate: Option<(u32, u32)>,
-  /// Whether this track's `stsd` sample description was decoded through the
-  /// `%OtherSampleDesc` fallback at PARSE TIME (QuickTime.pm:7370-7405). Set
-  /// `true` by the `stsd` decode when the handler SEEN SO FAR (file order)
-  /// routes to `%OtherSampleDesc`, capturing ExifTool's parse-order routing:
-  /// `$$self{HandlerType}` inits to `''` and is filled by the `hdlr` atom, so a
-  /// track whose `stsd` precedes its `hdlr` (or has no `hdlr`) decodes under the
-  /// empty handler and falls through to `%OtherSampleDesc` (`OtherFormat` at
-  /// offset 4, `PlaybackFrameRate` at offset 24) REGARDLESS of the handler the
-  /// `hdlr` later assigns. The `soun`/`vide`/`hint`/`meta` arms leave this
-  /// `false` (their `stsd` routes to their own sample-desc table). Gates BOTH
-  /// the `OtherFormat` and `PlaybackFrameRate` emission so the two are
-  /// consistent and faithful to the decode-time routing (a `meta`/`hint` track
-  /// whose `stsd` came BEFORE its `hdlr` emits BOTH, matching ExifTool).
-  routes_other_sample_desc: bool,
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427 `1 =>
   /// 'Track#'`). ExifTool's `$track` counter is a `my` local of each
   /// `ProcessMOV` invocation (QuickTime.pm:9944) that increments per `trak`
@@ -1329,6 +1424,7 @@ impl MediaTrack {
       handler_code: None,
       handler: None,
       meta_format: None,
+      other_format: None,
       handler_vendor_id: None,
       handler_description: None,
       audio_balance: None,
@@ -1341,7 +1437,6 @@ impl MediaTrack {
       tc_media_info: None,
       video_frame_rate: None,
       playback_frame_rate: None,
-      routes_other_sample_desc: false,
       track_group: None,
       warning: None,
     }
@@ -1485,14 +1580,24 @@ impl MediaTrack {
     self.handler.as_ref()
   }
 
-  /// The `stsd` sample-description 4-byte format code (the `MetaFormat` value —
-  /// `"rtmd"` / `"camm"` / `"mebx"` for a timed-metadata track), or `None` when
-  /// no `stsd` 4cc was decoded. The flat `Track<N>:MetaFormat` tag is emitted
-  /// from this, gated on a `meta` handler (QuickTime.pm:7393 `MetaSampleDesc`).
+  /// The `MetaFormat` 4cc of a `stsd` decoded through the `Meta` route (`"rtmd"`
+  /// / `"camm"` / `"mebx"` for a timed-metadata track), or `None` when no `stsd`
+  /// routed `Meta`. Drives `Track<N>:MetaFormat` (QuickTime.pm:7393
+  /// `MetaSampleDesc`). The `Other`-route fallback 4cc is [`Self::other_format`].
   #[inline(always)]
   #[must_use]
   pub fn meta_format(&self) -> Option<&str> {
     self.meta_format.as_deref()
+  }
+
+  /// The `OtherFormat` 4cc of a `stsd` decoded through the `Other` route (the
+  /// `%OtherSampleDesc` fallback — e.g. a `tmcd`/`text` track or a reordered /
+  /// handler-less `stsd`), or `None` when no `stsd` routed `Other`. Drives
+  /// `Track<N>:OtherFormat` (QuickTime.pm:7802-7806).
+  #[inline(always)]
+  #[must_use]
+  pub fn other_format(&self) -> Option<&str> {
+    self.other_format.as_deref()
   }
 
   /// `hdlr` HandlerVendorID (`None` when all-zero).
@@ -1585,16 +1690,6 @@ impl MediaTrack {
   #[must_use]
   pub const fn playback_frame_rate(&self) -> Option<(u32, u32)> {
     self.playback_frame_rate
-  }
-
-  /// Whether this track's `stsd` was decoded through the `%OtherSampleDesc`
-  /// fallback at parse time (the handler seen so far, file order, was not
-  /// `soun`/`vide`/`hint`/`meta`). Gates the `OtherFormat` + `PlaybackFrameRate`
-  /// emission.
-  #[inline(always)]
-  #[must_use]
-  pub const fn routes_other_sample_desc(&self) -> bool {
-    self.routes_other_sample_desc
   }
 
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427), reset
@@ -1762,11 +1857,19 @@ impl MediaTrack {
     self
   }
 
-  /// Set the `stsd` sample-description 4-byte format code (the `MetaFormat`
-  /// value). Filled by the parser when it descends `mdia/minf/stbl/stsd`.
+  /// Set the `Meta`-route `MetaFormat` 4cc (filled by the parser when a
+  /// `mdia/minf/stbl/stsd` routes through the `meta` handler).
   #[inline(always)]
   pub fn set_meta_format(&mut self, v: Option<String>) -> &mut Self {
     self.meta_format = v;
+    self
+  }
+
+  /// Set the `Other`-route `OtherFormat` 4cc (filled by the parser when a
+  /// `mdia/minf/stbl/stsd` routes through the `%OtherSampleDesc` fallback).
+  #[inline(always)]
+  pub fn set_other_format(&mut self, v: Option<String>) -> &mut Self {
+    self.other_format = v;
     self
   }
 
@@ -1851,15 +1954,6 @@ impl MediaTrack {
   #[inline(always)]
   pub const fn set_playback_frame_rate(&mut self, v: Option<(u32, u32)>) -> &mut Self {
     self.playback_frame_rate = v;
-    self
-  }
-
-  /// Mark this track's `stsd` as decoded through the `%OtherSampleDesc`
-  /// fallback (set by the parser at `stsd`-decode time when the handler seen so
-  /// far routes to `%OtherSampleDesc`).
-  #[inline(always)]
-  pub const fn set_routes_other_sample_desc(&mut self, v: bool) -> &mut Self {
-    self.routes_other_sample_desc = v;
     self
   }
 

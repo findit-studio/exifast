@@ -62,7 +62,7 @@ use crate::{
     AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
     GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta,
     LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
-    SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
+    SampleDescRoute, SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -1147,25 +1147,6 @@ const EE_WARNING: &str = "[minor] The ExtractEmbedded option may find more tags 
 /// tracks (their `stsd` `MetaFormat` differs but the `hdlr` type is `meta`).
 fn is_ee_handler(code: &str) -> bool {
   matches!(code, "text" | "meta" | "sbtl" | "data" | "camm" | "ctbx")
-}
-
-/// `true` iff a `trak` whose HandlerType-SO-FAR is `handler` routes its `stsd`
-/// sample description to `%OtherSampleDesc` — the UNCONDITIONAL fallback in
-/// the `%SampleTable` `stsd` Condition chain (QuickTime.pm:7370-7405): a
-/// `soun`/`vide`/`hint`/`meta` handler matches its own table
-/// (Audio/Visual/Hint/Meta`SampleDesc`) FIRST, and every OTHER handler (a
-/// `tmcd` timecode, a `text` track, …) falls through to `OtherSampleDesc`.
-/// A handler-less track (`None`) ALSO routes to `OtherSampleDesc`: ExifTool's
-/// `$$self{HandlerType}` inits to `''` and the `soun`/`vide`/`hint`/`meta`
-/// Conditions test a NON-empty match, so an empty handler (no `hdlr` yet, or
-/// no `hdlr` at all) falls through to the fallback — hence `None` ⇒ `true`.
-/// This is evaluated at `stsd`-DECODE time (the handler seen so far in file
-/// order); the result is stashed on the track as
-/// [`MediaTrack::routes_other_sample_desc`], which then gates BOTH the
-/// `OtherFormat` and `PlaybackFrameRate` emission, so the two cannot drift and
-/// both stay faithful to ExifTool's parse-order routing decision.
-fn routes_to_other_sample_desc(handler: Option<&str>) -> bool {
-  !matches!(handler, Some("vide" | "soun" | "hint" | "meta"))
 }
 
 /// `hdlr` HandlerType PrintConv table (QuickTime.pm:8418-8444).
@@ -2947,15 +2928,105 @@ fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<Stri
   });
 }
 
+/// The WALK-LEVEL routing HandlerType a `meta` box sets — the subtype 4cc of the
+/// `meta` box's direct-child `hdlr`, as the `%QuickTime::Meta` table routes it
+/// through `%QuickTime::Handler` (QuickTime.pm:2824 / 8403-8416). A data-
+/// reference handler (`alis` / `url `) does NOT change the routing handler
+/// (`$$self{HandlerType} = $val unless $val eq 'alis' or $val eq 'url '`,
+/// QuickTime.pm:8412) ⇒ `None`, so the caller keeps the prior handler.
+///
+/// `body_offset` is the `meta` SubDirectory `Start` (QuickTime.pm:10326 `$start
+/// = $$subdir{Start} || 0`): `0` for a `moov`/`trak` `meta` (the `%QuickTime::
+/// Movie`/`%QuickTime::Track` tables have no `Start` ⇒ the QT-style plain box,
+/// `hdlr` is the first child), `4` for a FILE-LEVEL `meta` (`%QuickTime::Main`
+/// QuickTime.pm:555-556 `Start => 4`) and a `udta/meta` (`%QuickTime::UserData`
+/// QuickTime.pm:1690-1691 `Start => 4`) — both ISO-prefixed, the 4-byte version
+/// header is skipped before the child atoms. So a file-level/udta `meta` whose
+/// version prefix is absent (the QT plain-box layout) reads garbage at offset 4
+/// and finds no `hdlr` ⇒ `None` (ground-truthed vs bundled ExifTool 13.59: a
+/// plain file-level `meta` routes `%OtherSampleDesc`, an ISO one routes Meta).
+/// Returns `None` when the box carries no usable `hdlr` at `body_offset`.
+fn meta_box_routing_handler(body: &[u8], body_offset: usize) -> Option<String> {
+  // The atom region after the `Start` version-prefix skip. An out-of-range
+  // offset (a `meta` shorter than its declared prefix) yields an empty region ⇒
+  // no `hdlr` ⇒ `None` (no-panic).
+  let region = body.get(body_offset..).unwrap_or_default();
+  let mut handler: Option<String> = None;
+  // A throwaway warning sink — Pass 1's `walk_meta` already surfaced any
+  // malformed-child warning for this same box; this read MUST NOT double-report.
+  let mut sink: Option<String> = None;
+  walk_atoms(0, region, 0, region.len(), &mut sink, |atom, abody, _w| {
+    if &atom.atom_type == b"hdlr"
+      && let Some(code) = decode_hdlr(abody)
+      // QuickTime.pm:8412 — a data-reference handler leaves HandlerType
+      // unchanged (the caller keeps whatever a prior `hdlr` set).
+      && code != "alis"
+      && code != "url "
+    {
+      handler = Some(code);
+    }
+  });
+  handler
+}
+
+/// The WALK-LEVEL routing HandlerType a `udta/meta` box sets, read from a `udta`
+/// body. The `%QuickTime::UserData` table (QuickTime.pm:1585) routes a `meta`
+/// child through `%QuickTime::Meta` with `Start => 4` (QuickTime.pm:1690-1691),
+/// so a `moov/udta/meta` or `trak/udta/meta` `hdlr` ALSO sets `$$self{
+/// HandlerType}` for a LATER same-`moov` `trak`/`stsd` (ground-truthed vs bundled
+/// ExifTool 13.59: `moov(udta(meta(hdlr meta)), trak(no-hdlr, stsd tmcd))` →
+/// `MetaFormat`). Returns the LAST non-data-reference `meta`-box hdlr in the
+/// `udta` (a `udta` normally has at most one `meta`), or `None` when the `udta`
+/// carries no `meta` box with a usable `hdlr`.
+fn udta_meta_routing_handler(udta_body: &[u8]) -> Option<String> {
+  let mut handler: Option<String> = None;
+  let mut sink: Option<String> = None;
+  walk_atoms(
+    0,
+    udta_body,
+    0,
+    udta_body.len(),
+    &mut sink,
+    |atom, abody, _w| {
+      if &atom.atom_type == b"meta"
+        // `%QuickTime::UserData` `meta` is `Start => 4` (ISO version prefix).
+        && let Some(h) = meta_box_routing_handler(abody, 4)
+      {
+        handler = Some(h);
+      }
+    },
+  );
+  handler
+}
+
 /// Decode every `trak` inside one `moov` atom, converting `TrackDuration`
 /// against the FINAL global movie `TimeScale` (`movie_ts`) established by the
 /// first pass over ALL top-level moovs (see [`decode_moov_mvhd`] /
 /// [`parse_inner`]).
+///
+/// **#309 — FILE-GLOBAL routing HandlerType.** ExifTool's `$$self{HandlerType}`
+/// is shared mutable state across the WHOLE file walk (file order): it is set
+/// from ANY `hdlr` / `meta`-box `hdlr` at ANY level (QuickTime.pm:8412) and reset
+/// ONLY at a `minf` exit (QuickTime.pm:10373) and at file-start (QuickTime.pm:9949
+/// `$$self{HandlerType} = '' if $topLevel`) — there is no per-`trak` reset.
+/// exifast's two-pass split (Pass 1 = `mvhd`/`udta`/`meta`, Pass 2 = `trak`) would
+/// lose the file order between a `moov/meta` box and a sibling `trak`, so this
+/// Pass-2 walk itself iterates the `moov` children in file order and threads the
+/// ONE file-global `handler_so_far` (owned by `parse_inner`'s Pass-2 scope, seeded
+/// by any file-level `meta` that preceded this `moov`): a `moov/meta` box
+/// (offset 0), a `moov/udta/meta` box (ISO offset 4) and each `trak`'s internal
+/// `hdlr`/`meta`/`minf` sites all update it. So a `moov/meta` (or `moov/udta/meta`)
+/// `hdlr` that PRECEDES a no-`hdlr` `trak` routes that `trak`'s `stsd` under the
+/// meta handler, while the SAME box AFTER the `trak` does not (the `trak` saw the
+/// empty handler) — ground-truthed vs bundled ExifTool 13.59. A bare `moov`-level
+/// `hdlr` is NOT a `%QuickTime::Movie` tag (it decodes as `Unknown_hdlr`) so it
+/// does NOT set HandlerType and is correctly ignored here.
 fn decode_moov_trak(
   payload: &[u8],
   movie_ts: Option<u32>,
   qt: &mut QuickTimeMeta,
   warning: &mut Option<String>,
+  handler_so_far: &mut Option<String>,
 ) {
   // ExifTool's `$track` counter is a `my` local of THIS `moov`'s `ProcessMOV`
   // invocation (QuickTime.pm:9944), starting undef⇒0 and `++`-incremented per
@@ -2965,29 +3036,107 @@ fn decode_moov_trak(
   // later same-group track (first-wins) so default JSON keeps the FIRST moov's
   // `Track1`.
   let mut track_num: u32 = 0;
+  // `handler_so_far` is the file-global routing HandlerType (`$$self{HandlerType}`),
+  // owned by `parse_inner`'s Pass-2 scope and threaded in by reference (#309). It
+  // arrives already carrying any file-level `meta` handler seen BEFORE this `moov`
+  // (case H) and is mutated in place as this `moov`'s children + `trak`s are
+  // walked; the post-`moov` state flows on to the next top-level atom. In practice
+  // a well-formed `moov` ends every `trak` with a `minf` reset, so it is `''` at
+  // each `moov` boundary — only a pathological `minf`-less hdlr tail leaks across.
+  //
   // Top-level entry (the `parse_inner` file loop) — this `moov` walk is depth
-  // 0; `walk_trak` re-enters `walk_atoms` so it starts one level deeper (1).
+  // 0; `walk_trak_threaded` re-enters `walk_atoms` so it starts one level
+  // deeper (1).
   walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
-    if &inner.atom_type == b"trak" {
-      track_num += 1; // QuickTime.pm:10354 `++$track`
-      let mut track = walk_trak(1, ibody, movie_ts);
-      track.set_track_group(track_num);
-      qt.push_track(track);
+    match &inner.atom_type {
+      // A `moov/meta` box's `hdlr` sets the walk-level HandlerType for any LATER
+      // sibling `trak` (the `%QuickTime::Meta` → `%QuickTime::Handler` route),
+      // unless it is a data-reference handler (then `meta_box_routing_handler`
+      // returns `None` and the prior handler is kept). `%QuickTime::Movie` `meta`
+      // has NO `Start` ⇒ offset 0 (the QT plain box). The full `meta` decode
+      // (Keys/ItemList) already ran in Pass 1; here we read ONLY its routing
+      // handler.
+      b"meta" => {
+        if let Some(h) = meta_box_routing_handler(ibody, 0) {
+          *handler_so_far = Some(h);
+        }
+      }
+      // A `moov/udta/meta` box's `hdlr` ALSO sets it (the `%QuickTime::UserData`
+      // `meta` is `Start => 4`, QuickTime.pm:1690-1691). The `udta` camera atoms
+      // (Make/Model/…) already decoded in Pass 1; here we read ONLY the routing
+      // handler of a `meta` box nested in this `moov/udta` (case F).
+      b"udta" => {
+        if let Some(h) = udta_meta_routing_handler(ibody) {
+          *handler_so_far = Some(h);
+        }
+      }
+      b"trak" => {
+        track_num += 1; // QuickTime.pm:10354 `++$track`
+        let mut track = walk_trak_threaded(1, ibody, movie_ts, handler_so_far);
+        track.set_track_group(track_num);
+        qt.push_track(track);
+      }
+      _ => {}
     }
   });
 }
 
 /// Walk one `trak` atom, collecting tkhd / mdia(mdhd,hdlr) into a
-/// [`MediaTrack`] (QuickTime.pm:1424-1490 + 7218-7327).
+/// [`MediaTrack`] (QuickTime.pm:1424-1490 + 7218-7327), starting from an EMPTY
+/// inbound routing handler (the common per-`trak` entry — used by the unit
+/// tests and any caller that does not thread cross-`trak` handler state).
 ///
 /// **R7/F2 + R9/F2.** A contained malformed header (a truncated tkhd / mdhd,
 /// or one with a structurally invalid size) is NOT silently dropped: ExifTool
 /// attaches the `Truncated '...' data` / `Invalid atom size` warning to the
 /// *current* family-1 group, so the warning is recorded ON THE TRACK (surfaced
 /// as `Track#:Warning`), not the document-level `ExifTool:Warning`.
+#[cfg(test)]
 fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
+  // A standalone `trak` with no inbound cross-`trak` handler state: seed an empty
+  // file-global routing handler local to this call.
+  let mut handler_so_far: Option<String> = None;
+  walk_trak_threaded(depth, payload, movie_timescale, &mut handler_so_far)
+}
+
+/// Walk one `trak` atom like [`walk_trak`], threading the FILE-GLOBAL routing
+/// HandlerType (ExifTool `$$self{HandlerType}`, file order) by reference:
+/// `handler_so_far` is the handler in scope when this `trak` is entered (set by
+/// an EARLIER `meta`/`udta-meta`/`mdia` `hdlr` anywhere before it in file order),
+/// mutated IN PLACE as this `trak`'s `meta`/`udta-meta`/`mdia-hdlr`/`minf-hdlr`
+/// sites are walked, and left holding the handler still in scope AFTER this `trak`
+/// (each `minf` exit resets it to empty) so the next sibling sees the correct
+/// state. ExifTool resets HandlerType ONLY at a `minf` exit (QuickTime.pm:10373)
+/// and at file-start (QuickTime.pm:9949), and sets it from ANY `hdlr` / `meta`-box
+/// `hdlr` at ANY level (QuickTime.pm:8412) — there is no per-`trak` reset — so a
+/// no-`hdlr` `trak` preceded by a `moov/meta` `hdlr` routes its `stsd` under that
+/// handler (#309; ground-truthed vs bundled ExifTool 13.59:
+/// `moov(meta(hdlr meta), trak(no-hdlr, stsd tmcd))` → `MetaFormat`, while the
+/// SAME `meta` AFTER the `trak` → `OtherFormat`+`PlaybackFrameRate`).
+fn walk_trak_threaded(
+  depth: u32,
+  payload: &[u8],
+  movie_timescale: Option<u32>,
+  handler_so_far: &mut Option<String>,
+) -> MediaTrack {
   let mut track = MediaTrack::new();
   let mut track_warning: Option<String> = None;
+  // `handler_so_far` is the FILE-GLOBAL HandlerType seen so far (ExifTool
+  // `$$self{HandlerType}`, file order), threaded in by reference: seeded from an
+  // earlier `meta`/`udta-meta`/`mdia` `hdlr` anywhere before this `trak`, set
+  // when this `trak`'s `meta`/`udta-meta`/`mdia-hdlr`/`minf-hdlr` is walked, RESET
+  // to `None` at the END of each `minf` (QuickTime.pm:10373) — NOT at `trak`
+  // entry. This is the handler the `%SampleTable` `stsd` Condition chain routes on
+  // (QuickTime.pm:7370-7405) — DISTINCT from the flat `track.handler_code()` (the
+  // `mdia/hdlr`'s verbatim 4cc, which is the `HandlerType` tag and the trak-scoped
+  // `$$self{MediaType}` proxy that gates the `stts` VideoFrameRate; QuickTime.pm:
+  // 8413 sets `MediaType` ONLY when the `hdlr`'s parent path is `Media`, so a
+  // `minf`/`meta` `hdlr` updates the ROUTING handler WITHOUT touching `MediaType`).
+  // Keeping it file-global (reset only at `minf` exit) is what makes `hdlr(vide) +
+  // minf(stsd avc1) + minf(stsd tmcd)` decode the FIRST `stsd` Visual and the
+  // SECOND (after the minf-end reset clears the handler) under the empty handler →
+  // `%OtherSampleDesc` → `OtherFormat`, AND makes a `moov/meta` `hdlr` flow into a
+  // following no-`hdlr` `trak` (#309; ground-truthed vs bundled ExifTool 13.59).
   walk_atoms(
     depth,
     payload,
@@ -3004,6 +3153,25 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
         // (sibling to `tkhd`/`mdia`), holding the `tmcd` `TimecodeTrack`
         // reference (the referenced timecode track's ID).
         b"tref" => walk_tref(depth + 1, body, w, &mut track),
+        // A `trak/meta` box's `hdlr` sets the file-global routing HandlerType for
+        // this `trak`'s LATER `mdia/stsd` (case B/C — `%QuickTime::Track` `meta`
+        // has NO `Start` ⇒ offset 0, the QT plain box). A `meta` AFTER the `mdia`
+        // in file order is too late (the `stsd` already decoded under the prior
+        // handler) — the file-order walk handles that naturally.
+        b"meta" => {
+          if let Some(h) = meta_box_routing_handler(body, 0) {
+            *handler_so_far = Some(h);
+          }
+        }
+        // A `trak/udta/meta` box's `hdlr` ALSO sets it (the `%QuickTime::UserData`
+        // `meta` is `Start => 4`, QuickTime.pm:1690-1691) — case G. The `udta`
+        // camera atoms already decoded in Pass 1; here we read ONLY the routing
+        // handler of a `meta` box nested in this `trak/udta`.
+        b"udta" => {
+          if let Some(h) = udta_meta_routing_handler(body) {
+            *handler_so_far = Some(h);
+          }
+        }
         b"mdia" => {
           // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237). This
           // re-enters `walk_atoms` from inside the trak walk, so it runs one
@@ -3023,6 +3191,16 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
               // (offset 24 to end, the Pascal/C-string RawConv).
               b"hdlr" => {
                 if let Some(code) = decode_hdlr(ibody) {
+                  // ExifTool sets `$$self{HandlerType} = $val unless $val eq
+                  // 'alis' or $val eq 'url '` (QuickTime.pm:8412): a data-
+                  // reference handler does NOT change the routing handler (it
+                  // keeps whatever a prior `hdlr` set, or stays empty). The flat
+                  // `handler_code` tag IS still set to the verbatim 4cc — this is
+                  // a `mdia/hdlr`, so its 4cc is ALSO the trak-scoped `MediaType`
+                  // (QuickTime.pm:8413, parent path `Media`).
+                  if code != "alis" && code != "url " {
+                    *handler_so_far = Some(code.clone());
+                  }
                   track.set_handler_code(code);
                 }
                 track.set_handler_class(decode_hdlr_class(ibody));
@@ -3036,12 +3214,40 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
               // `OtherFormat` for any other, QuickTime.pm:7765/7805); a `vide`/`soun`
               // handler ALSO decodes the per-handler Visual/Audio sample-description
               // binary fields (QuickTime.pm:7370-7405 `%SampleTable` stsd dispatch on
-              // `$$self{HandlerType}`). The handler 4cc is already on the track here
-              // (the `hdlr` precedes `minf` in file order), mirroring ExifTool's
+              // `$$self{HandlerType}`). The routing handler is whatever was SEEN SO
+              // FAR in file order — a `mdia/hdlr` that precedes this `minf`, OR a
+              // `minf/hdlr` walked below before the `stbl` — mirroring ExifTool's
               // parse-order Condition.
               b"minf" => {
+                // The `%SampleTable` `stsd` Condition chain routes on the handler
+                // SEEN SO FAR at DECODE TIME (`$$self{HandlerType}`, file order —
+                // QuickTime.pm:7370-7405). A `minf/hdlr` (QuickTime.pm:7319-7322,
+                // `%QuickTime::MediaInfo` `hdlr` → `%QuickTime::Handler`) is a
+                // DIRECT `minf` child that precedes `stbl` in file order, so it can
+                // SET the routing handler for this `minf`'s `stsd` (case E/K — it
+                // even OVERRIDES the `mdia/hdlr`). So we do NOT snapshot the route
+                // at `minf` entry; we update `*handler_so_far` when the `hdlr` child
+                // is walked, and snapshot the [`SampleDescRoute`] inside the `stbl`
+                // arm (after any `minf/hdlr` was seen). Every `stsd` of one `minf`
+                // shares that handler (no `hdlr` lives between two `stsd`s), and the
+                // end-of-`minf` reset below clears it so a LATER `minf` routes
+                // independently — an earlier `stsd`'s descriptor is NEVER
+                // reclassified by a later `minf`/`hdlr` (#309).
                 walk_atoms(depth + 2, ibody, 0, ibody.len(), iw, |m, mbody, mw| {
                   match &m.atom_type {
+                    // A `minf/hdlr` sets the file-global routing handler for this
+                    // `minf`'s `stbl/stsd` (NOT the trak-scoped `MediaType` — its
+                    // parent path is `MediaInfo`, not `Media`, so QuickTime.pm:8413
+                    // leaves `MediaType`/`handler_code` untouched). A data-reference
+                    // (`alis`/`url `) does not change it (QuickTime.pm:8412).
+                    b"hdlr" => {
+                      if let Some(code) = decode_hdlr(mbody)
+                        && code != "alis"
+                        && code != "url "
+                      {
+                        *handler_so_far = Some(code);
+                      }
+                    }
                     // `smhd` AudioHeader (QuickTime.pm:7299-7301, 7345-7351): Balance
                     // at body offset 4 (key 2 ⇒ 2*int16u), `fixed16s`.
                     b"smhd" => {
@@ -3066,34 +3272,40 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                     // (a generic / timecode / NRT-metadata track's media header).
                     b"gmhd" => walk_gmhd(depth + 3, mbody, mw, &mut track),
                     b"stbl" => {
+                      // Snapshot the [`SampleDescRoute`] from the handler SEEN SO
+                      // FAR (`$$self{HandlerType}`, file order — QuickTime.pm:7370-
+                      // 7405) at `stbl` time, AFTER any `minf/hdlr` updated it.
+                      // Computed ONCE here, so every `stsd` atom in this `stbl`
+                      // (and every entry within) decodes + emits under the SAME
+                      // route — no `hdlr` lives between two `stsd`s of one `minf`.
+                      let route = SampleDescRoute::from_handler(handler_so_far.as_deref());
                       walk_atoms(depth + 3, mbody, 0, mbody.len(), mw, |s, sbody, _sw| {
                         if &s.atom_type == b"stsd" {
-                          // Shared MetaFormat/OtherFormat 4cc (last-wins across
-                          // entries, the existing `meta`-handler path).
-                          if let Some(fmt) = decode_stsd_meta_format(sbody) {
-                            track.set_meta_format(Some(fmt));
-                          }
-                          // Per-handler sample-description: ExifTool
-                          // `ProcessSampleDesc` decodes EVERY entry and a later
-                          // entry's present tag overrides the earlier (a later
-                          // absent tag does NOT clear it — QuickTime.pm:9640-9648).
-                          // ExifTool's `ProcessMOV` ALSO dispatches every `stsd`
-                          // atom in the `trak` (file order) through the same
-                          // `ProcessSampleDesc`, so a later DUPLICATE `stsd` atom
-                          // (e.g. one carrying only a codec 4cc) overrides only its
-                          // present fields and leaves the earlier descriptor intact.
-                          // Seeding the per-atom fold from the track's CURRENT
-                          // descriptor makes the same Some-only `merge_from` the
-                          // uniform last-wins at BOTH levels — across the entries
-                          // of one `stsd` AND across the `stsd` atoms of the trak.
-                          // A trak normally has ONE `stsd`, so the seed is `None`
-                          // and the result is byte-identical to a fresh fold; only
-                          // the malformed/duplicate-`stsd` edge differs. The
-                          // `vide`/`soun` dispatch is the track's `hdlr` type
-                          // (invariant across entries and atoms), so it is checked
-                          // once.
-                          match track.handler_code() {
-                            Some("vide") => {
+                          // ExifTool `ProcessSampleDesc` decodes EVERY entry and a
+                          // later entry's PRESENT tag overrides the earlier (a
+                          // later ABSENT tag does NOT clear it — QuickTime.pm:9640-
+                          // 9648); `ProcessMOV` ALSO dispatches every `stsd` atom
+                          // in the trak (file order) through it, so a later
+                          // DUPLICATE `stsd` overrides only its present fields and
+                          // leaves the earlier descriptor intact. Seeding each
+                          // per-atom fold from the track's CURRENT descriptor makes
+                          // the SAME Some-only `merge_from` the uniform last-wins at
+                          // BOTH levels — across the entries of one `stsd` AND
+                          // across the `stsd` atoms of the trak. A trak normally has
+                          // ONE `stsd`, so the seed is `None` and the result is
+                          // byte-identical to a fresh fold; only the
+                          // malformed/duplicate-`stsd` edge differs.
+                          //
+                          // `route` is the [`SampleDescRoute`] this `stbl` was
+                          // snapshotted under (the handler SEEN SO FAR at decode
+                          // time, QuickTime.pm:7370-7405) — dispatch the decode AND
+                          // capture the 4cc into the route-specific slot so a later
+                          // `minf`/`hdlr` can never reclassify it. Each emission
+                          // gates on its OWN slot's presence (visual/audio) or on
+                          // its OWN captured 4cc (`meta_format`/`other_format`), so
+                          // the routes never share a mutable track-level field.
+                          match route {
+                            SampleDescRoute::Visual => {
                               let mut acc = track.visual_sample_desc().cloned();
                               for_each_stsd_entry(sbody, |dir_start, entry| {
                                 let v = decode_visual_sample_desc(entry, dir_start);
@@ -3106,7 +3318,7 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                                 track.set_visual_sample_desc(acc);
                               }
                             }
-                            Some("soun") => {
+                            SampleDescRoute::Audio => {
                               let mut acc = track.audio_sample_desc().cloned();
                               for_each_stsd_entry(sbody, |dir_start, entry| {
                                 let a = decode_audio_sample_desc(entry, dir_start);
@@ -3119,40 +3331,40 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                                 track.set_audio_sample_desc(acc);
                               }
                             }
-                            // Every handler that is NOT `soun`/`vide` falls
-                            // through to `%OtherSampleDesc` HERE iff the handler
-                            // SEEN SO FAR (file order) routes to it — captured by
-                            // `routes_to_other_sample_desc(track.handler_code())`.
-                            // ExifTool's `$$self{HandlerType}` inits to `''` and is
-                            // filled by the `hdlr` atom, so a `meta`/`hint` track
-                            // whose `stsd` precedes its `hdlr` (or a no-`hdlr`
-                            // track) DECODES under the empty handler and routes to
-                            // `%OtherSampleDesc` even though its FINAL handler is
-                            // `meta`/`hint` (QuickTime.pm:7370-7405). We stash that
-                            // parse-order decision on the track (`routes_other_sample_desc`)
-                            // and gate BOTH the `OtherFormat` and `PlaybackFrameRate`
-                            // emission on it — so the two cannot drift AND both stay
-                            // faithful to the decode-time routing (the `soun`/`vide`/
-                            // `hint`/`meta` arms below leave the flag `false`: their
-                            // `stsd`, seen AFTER their `hdlr`, routes to their own
-                            // sample-desc table). For an `%OtherSampleDesc` route a
-                            // `tmcd` timecode descriptor carries the offset-24
-                            // `rational64u` PlaybackFrameRate (`Condition =>
-                            // '$$self{MetaFormat} eq "tmcd"'`); the helper gates on
-                            // the entry's own `tmcd` 4cc, so a non-`tmcd`
-                            // `OtherSampleDesc` (e.g. a `text` track) yields `None`
-                            // and leaves the slot untouched. Last-wins across `stsd`
-                            // entries/atoms (Some-only), mirroring the folds above.
-                            _ if routes_to_other_sample_desc(track.handler_code()) => {
-                              track.set_routes_other_sample_desc(true);
+                            // The `%OtherSampleDesc` fallback (an unmatched or empty
+                            // handler-so-far). ExifTool stashes the 4cc in
+                            // `$$self{MetaFormat}` and emits it as `OtherFormat`
+                            // (QuickTime.pm:7802-7806); exifast captures it into the
+                            // distinct `other_format` slot (last-wins across `stsd`
+                            // atoms) so a `Meta`-routed `MetaFormat` from another
+                            // `minf` is never clobbered. A `tmcd` descriptor also
+                            // carries the offset-24 `rational64u` PlaybackFrameRate
+                            // (`Condition => '$$self{MetaFormat} eq "tmcd"'`); the
+                            // helper gates on the entry's own `tmcd` 4cc, so a
+                            // non-`tmcd` `OtherSampleDesc` (e.g. a `text` track)
+                            // yields `None` and leaves the slot untouched.
+                            SampleDescRoute::Other => {
+                              if let Some(fmt) = decode_stsd_meta_format(sbody) {
+                                track.set_other_format(Some(fmt));
+                              }
                               if let Some(rat) = decode_other_sample_desc_playback_rate(sbody) {
                                 track.set_playback_frame_rate(Some(rat));
                               }
                             }
-                            // `meta`/`hint` SEEN BEFORE this `stsd` (the normal
-                            // hdlr-first order): route to Meta/Hint`SampleDesc`, no
-                            // `%OtherSampleDesc` decode (flag stays `false`).
-                            _ => {}
+                            // `meta` SEEN BEFORE this `stsd` (the normal hdlr-first
+                            // order): the `%MetaSampleDesc` 4cc is `MetaFormat`
+                            // (`RawConv => '$$self{MetaFormat} = $val'`,
+                            // QuickTime.pm:7765), captured into the `meta_format`
+                            // slot (last-wins across `stsd` atoms) and emitted via
+                            // the `Meta` route.
+                            SampleDescRoute::Meta => {
+                              if let Some(fmt) = decode_stsd_meta_format(sbody) {
+                                track.set_meta_format(Some(fmt));
+                              }
+                            }
+                            // `hint` SEEN BEFORE this `stsd`: `%HintSampleDesc`'s
+                            // fields are unported, so no sample-desc tag is decoded.
+                            SampleDescRoute::Hint => {}
                           }
                         }
                         // `stts` time-to-sample table (QuickTime.pm:7408-7417):
@@ -3175,6 +3387,14 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                     _ => {}
                   }
                 });
+                // Reset the routing handler at the END of this media-info box
+                // (QuickTime.pm:10373 `$$et{HandlerType} = ''`): a FOLLOWING
+                // `minf` in the same trak re-snapshots from the then-current
+                // handler (empty unless another `hdlr` intervenes), so its `stsd`
+                // routes independently of this one. This is the FILE-GLOBAL reset
+                // — it also clears any `mdia`/`meta`/`udta-meta` handler so a LATER
+                // sibling `trak` with no `hdlr` sees the empty state (case I).
+                *handler_so_far = None;
               }
               _ => {}
             },
@@ -3185,6 +3405,10 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
     },
   );
   track.set_warning(track_warning);
+  // `*handler_so_far` now holds the handler still in scope after this `trak`
+  // (after its `minf` resets / `mdia`-`meta`-`udta-meta` `hdlr` sets), mutated in
+  // place so the next sibling `trak` in the same `moov` — and the next top-level
+  // atom — sees the correct file-global HandlerType (#309).
   track
 }
 
@@ -5472,6 +5696,18 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // Pass 2: decode every moov's `trak` against the FINAL global movie
   // TimeScale (in file order, so TrackN numbering is unchanged).
   let movie_ts = qt.time_scale();
+  // **#309 — the FILE-GLOBAL routing HandlerType** (`$$self{HandlerType}`),
+  // threaded through this Pass-2 file-order walk by reference. ExifTool resets it
+  // to `''` at file-start (QuickTime.pm:9949 `$$self{HandlerType} = '' if
+  // $topLevel`) — modelled by initializing it `None` here, at the start of the
+  // Pass-2 top-level loop — and thereafter sets it from ANY `hdlr` / `meta`-box
+  // `hdlr` at ANY level and resets it at each `minf` exit. So a FILE-LEVEL `meta`
+  // box (an ISO-prefixed `%QuickTime::Main` `meta`, QuickTime.pm:555-556 `Start
+  // => 4`) seen BEFORE a `moov` flows its handler into that `moov`'s no-`hdlr`
+  // `trak`s (case H), and a `moov/meta`, `moov/udta/meta`, `trak/meta`,
+  // `trak/udta/meta`, `mdia/hdlr` or `minf/hdlr` updates it as the walk reaches
+  // each — read ONLY at `stsd`-decode time, so NO source is missed.
+  let mut handler_so_far: Option<String> = None;
   let mut pos = 0usize;
   while pos < scan_end {
     // A top-level size-0 atom (`ExtendsToEof`) STOPS the walk with NO payload
@@ -5486,8 +5722,24 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     let body = scan_data
       .get(header.payload_start..body_end)
       .unwrap_or_default();
-    if &header.atom_type == b"moov" {
-      decode_moov_trak(body, movie_ts, &mut qt, &mut warning);
+    match &header.atom_type {
+      // A FILE-LEVEL `meta` box (`%QuickTime::Main` ⇒ QuickTime.pm:555-556,
+      // `Start => 4`): its `hdlr` sets the file-global routing HandlerType for a
+      // LATER `moov`'s no-`hdlr` `trak`s (case H). The version prefix is skipped
+      // (offset 4); a plain (non-ISO) file-level `meta` reads garbage there and
+      // sets nothing — matching bundled ExifTool (a plain file-level `meta`
+      // routes `%OtherSampleDesc`). The file-level `meta`'s OWN tags
+      // (Keys/ItemList) are decoded elsewhere; here we read ONLY its routing
+      // handler.
+      b"meta" => {
+        if let Some(h) = meta_box_routing_handler(body, 4) {
+          handler_so_far = Some(h);
+        }
+      }
+      b"moov" => {
+        decode_moov_trak(body, movie_ts, &mut qt, &mut warning, &mut handler_so_far);
+      }
+      _ => {}
     }
     // #159: a `trak` child decode runs only in this second pass; if it raised
     // the first warning of the whole walk (Pass 1 set none), record this
@@ -6964,17 +7216,20 @@ impl crate::emit::Taggable for Meta<'_> {
           ));
         }
       }
-      // MetaFormat (`stsd` 4cc): the `MetaSampleDesc` `MetaFormat` tag, emitted
-      // ONLY for a `meta`-handler track (QuickTime.pm:7393 `Condition =>
-      // '$$self{HandlerType} eq "meta"'`) — a `soun`/`vide`/`hint` track routes
-      // to its own sample-desc table, an unmatched handler to `OtherSampleDesc`'s
-      // `OtherFormat` (NOT `MetaFormat`). Positioned at the family-1 `Track<N>`
-      // level right AFTER `HandlerType` (the golden order; track-level, NOT under
-      // `Doc<N>`). Emit the raw 4-char code verbatim in both modes (no PrintConv
-      // — `Format => 'undef[4]'`, the RawConv only stashes `$$self{MetaFormat}`).
-      // Verified vs bundled 13.59: `Track1:MetaFormat = rtmd`/`camm`/`mebx`.
+      // MetaFormat (`%MetaSampleDesc` 4cc): the `MetaFormat` tag. The
+      // `meta_format` slot is populated ONLY by a `stsd` DECODED through the
+      // `Meta` route (QuickTime.pm:7393 `Condition => '$$self{HandlerType} eq
+      // "meta"'` — the handler SEEN SO FAR at decode time was `meta`), so its
+      // mere presence is the route gate: a `meta` track whose `stsd` PRECEDED
+      // its `hdlr` decoded under the empty handler → `%OtherSampleDesc` and
+      // populated `other_format` instead, emitting `OtherFormat` (NOT
+      // `MetaFormat`) — keeping that reordered case faithful (#309; #310 R4).
+      // Positioned at the family-1 `Track<N>` level right AFTER `HandlerType`
+      // (the golden order; track-level, NOT under `Doc<N>`). Emit the raw
+      // 4-char code verbatim in both modes (no PrintConv — `Format =>
+      // 'undef[4]'`, the RawConv only stashes `$$self{MetaFormat}`). Verified vs
+      // bundled 13.59: `Track1:MetaFormat = rtmd`/`camm`/`mebx`.
       if let Some(fmt) = track.meta_format()
-        && track.handler_code() == Some("meta")
         && first_seen(grp, "MetaFormat")
       {
         tags.push(EmittedTag::new(
@@ -7005,7 +7260,12 @@ impl crate::emit::Taggable for Meta<'_> {
       // `CompressorName` are mode-invariant strings; the dimensions are bare ints;
       // the resolutions are the rounded 16.16 fixed-point `f64` (an integer-valued
       // DPI like `72.0` stringifies bare per `%.15g`). `VendorID` uses the shared
-      // `%vendorID` PrintConv.
+      // `%vendorID` PrintConv. Gated on the captured `Visual` decode-time route:
+      // a `vide` track whose `stsd` preceded its `hdlr` decoded as `Other` (the
+      // descriptor was NOT read into a `visual_sample_desc`), so it emits
+      // `OtherFormat` instead — populating `visual_sample_desc` ONLY on the
+      // `Visual` route keeps the two paths mutually exclusive and faithful for a
+      // reordered / multi-`minf` `mdia` (#309).
       if let Some(v) = track.visual_sample_desc() {
         if let Some(cid) = v.compressor_id()
           && first_seen(grp, "CompressorID")
@@ -7210,6 +7470,10 @@ impl crate::emit::Taggable for Meta<'_> {
       // AudioVendorID, AudioChannels, AudioBitsPerSample, AudioSampleRate. The
       // 4cc/vendor are mode-invariant strings; channels/bits are bare ints
       // (emitted even when zero); the sample rate is the rounded 16.16 fixed `f64`.
+      // Gated on the captured `Audio` decode-time route (a `soun` track whose
+      // `stsd` preceded its `hdlr` decoded as `Other` → `OtherFormat`, NOT the
+      // audio fields; `audio_sample_desc` is populated ONLY on the `Audio`
+      // route, so its presence is the gate), #309.
       if let Some(a) = track.audio_sample_desc() {
         if let Some(fmt) = a.audio_format()
           && first_seen(grp, "AudioFormat")
@@ -7280,15 +7544,17 @@ impl crate::emit::Taggable for Meta<'_> {
       }
       // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
       // a track whose `stsd` was DECODED through the `%OtherSampleDesc` fallback
-      // (the `routes_other_sample_desc` flag, set at parse time on the handler
-      // SEEN SO FAR — so a `meta`/`hint` track whose `stsd` preceded its `hdlr`,
-      // or a no-`hdlr` track, emits this; the normal `vide`/`soun`/`meta`/`hint`
+      // (the captured `Other` decode-time route — the handler SEEN SO FAR routed
+      // to the fallback, so a `meta`/`hint`/`soun`/`vide` track whose `stsd`
+      // preceded its `hdlr`, or a no-`hdlr` track, emits this; the normal
       // hdlr-first order routes to its own sample-desc table and does not).
-      // Shares the `meta_format` slot (ExifTool stores both in
-      // `$$self{MetaFormat}`); the raw 4-char code verbatim in both modes. E.g. a
+      // Read from the dedicated `other_format` slot (populated ONLY by an
+      // `Other`-routed `stsd`; ExifTool keeps both `MetaFormat`/`OtherFormat` in
+      // `$$self{MetaFormat}`, but the separate slot lets a multi-`minf` track
+      // carry a `Meta`-routed `MetaFormat` AND an `Other`-routed `OtherFormat`
+      // at once — #309). The raw 4-char code verbatim in both modes. E.g. a
       // `tmcd` time-code track or a `text` track.
-      if let Some(fmt) = track.meta_format()
-        && track.routes_other_sample_desc()
+      if let Some(fmt) = track.other_format()
         && first_seen(grp, "OtherFormat")
       {
         tags.push(EmittedTag::new(
@@ -7300,16 +7566,13 @@ impl crate::emit::Taggable for Meta<'_> {
       }
       // `tmcd` PlaybackFrameRate (`%OtherSampleDesc` offset 24, `rational64u`,
       // QuickTime.pm:7807-7811): emitted immediately after `OtherFormat` (the
-      // same `OtherSampleDesc` entry), gated on the SAME parse-time
-      // `routes_other_sample_desc` flag so it stays consistent with `OtherFormat`
-      // — `playback_frame_rate` is only ever set on a track that took the
-      // `%OtherSampleDesc` decode arm, so the flag is redundant-but-explicit here
-      // and makes the two emissions provably consistent. No PrintConv, so both
-      // `-j`/`-n` render the `Rational`'s `%.10g` quotient (`29.97002997`). A zero
-      // denominator renders the `Rational` serializer's `inf`/`undef` word —
-      // faithful to ExifTool's `GetRational64u`.
+      // same `OtherSampleDesc` entry). `playback_frame_rate` is set ONLY by the
+      // `Other`-route decode arm (and only for a `tmcd` 4cc), so its presence is
+      // the gate and it is provably consistent with `other_format`. No PrintConv,
+      // so both `-j`/`-n` render the `Rational`'s `%.10g` quotient
+      // (`29.97002997`). A zero denominator renders the `Rational` serializer's
+      // `inf`/`undef` word — faithful to ExifTool's `GetRational64u`.
       if let Some((num, den)) = track.playback_frame_rate()
-        && track.routes_other_sample_desc()
         && first_seen(grp, "PlaybackFrameRate")
       {
         tags.push(EmittedTag::new(
@@ -22685,11 +22948,12 @@ mod tests {
     assert_eq!(track.video_frame_rate(), None);
   }
 
-  /// Finding 2 — a `meta`-handler track routes its `stsd` to `MetaSampleDesc`,
-  /// NOT `%OtherSampleDesc`, so even a `tmcd`-format `stsd` entry must NOT set
-  /// `playback_frame_rate` (`%OtherSampleDesc` is only the FALLBACK for
-  /// unmatched handlers, QuickTime.pm:7370-7405). Gated by the shared
-  /// `routes_to_other_sample_desc` predicate.
+  /// Finding 2 — a `meta`-handler track (hdlr-first) routes its `stsd` to
+  /// `MetaSampleDesc`, NOT `%OtherSampleDesc`, so even a `tmcd`-format `stsd`
+  /// entry must NOT set `playback_frame_rate` (`%OtherSampleDesc` is only the
+  /// FALLBACK for unmatched handlers, QuickTime.pm:7370-7405). Decided by the
+  /// captured [`SampleDescRoute`] (here `Meta`, since the `hdlr` precedes the
+  /// `stsd`).
   #[test]
   fn walk_trak_meta_handler_tmcd_stsd_emits_no_playback_rate() {
     let stbl = atom(b"stbl", &stsd_box(&[tmcd_entry(90000, 3003)]));
@@ -22902,6 +23166,966 @@ mod tests {
     mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
     let data = single_track_mov(&atom(b"mdia", &mdia_body));
     assert_emits_neither(&data, "E meta normal");
+  }
+
+  // ── #309: gate EVERY per-handler stsd sample-desc emission on the DECODE-TIME
+  // route (the handler SEEN SO FAR at `stsd`-parse time), not the FINAL handler.
+  // The #310 Option-X work proved this for `OtherFormat`/`PlaybackFrameRate`; the
+  // tests below extend the proof to the OTHER per-handler tables — `MetaFormat`
+  // (the #310 R4 finding: a reordered `meta` track wrongly emitted a spurious
+  // `MetaFormat`), the `soun` AudioSampleDesc fields and the `vide`
+  // VisualSampleDesc fields. Every expectation was ground-truthed against bundled
+  // ExifTool 13.59 on the SAME crafted bytes these builders produce.
+
+  /// `true` iff the emitted `Track1` tag list carries a tag named `name`.
+  fn track1_has(emitted: &[(String, crate::value::TagValue)], name: &str) -> bool {
+    emitted.iter().any(|(n, _)| n == name)
+  }
+
+  /// The string value of the named `Track1` tag, if present (used to assert an
+  /// `OtherFormat`/`AudioFormat`/`CompressorID` 4cc).
+  fn track1_str(emitted: &[(String, crate::value::TagValue)], name: &str) -> Option<String> {
+    emitted
+      .iter()
+      .find(|(n, _)| n == name)
+      .and_then(|(_, v)| match v {
+        crate::value::TagValue::Str(s) => Some(s.to_string()),
+        _ => None,
+      })
+  }
+
+  /// Assert NONE of `names` was emitted under `Track1` (the per-handler tables a
+  /// given decode-time route must NOT reach).
+  fn assert_track1_absent(
+    emitted: &[(String, crate::value::TagValue)],
+    names: &[&str],
+    case: &str,
+  ) {
+    for n in names {
+      assert!(
+        !track1_has(emitted, n),
+        "[{case}] {n} must NOT be emitted (wrong sample-desc table for the decode-time route)"
+      );
+    }
+  }
+
+  /// The full set of per-handler sample-desc tag names that must be MUTUALLY
+  /// EXCLUSIVE by decode-time route: the `%OtherSampleDesc`, `%MetaSampleDesc`,
+  /// `%AudioSampleDesc` and `%VisualSampleDesc` discriminators.
+  const META_TABLE: &[&str] = &["MetaFormat"];
+  const OTHER_TABLE: &[&str] = &["OtherFormat", "PlaybackFrameRate"];
+  const AUDIO_TABLE: &[&str] = &[
+    "AudioFormat",
+    "AudioChannels",
+    "AudioBitsPerSample",
+    "AudioSampleRate",
+  ];
+  const VISUAL_TABLE: &[&str] = &[
+    "CompressorID",
+    "SourceImageWidth",
+    "SourceImageHeight",
+    "CompressorName",
+  ];
+
+  /// **#309 / #310 R4** — a `meta`-handler track whose `stsd` comes BEFORE its
+  /// `hdlr` routes to `%OtherSampleDesc` at decode time, so it emits
+  /// `OtherFormat`/`PlaybackFrameRate` and — critically — does NOT emit the
+  /// spurious `MetaFormat` the prior FINAL-handler gate produced (ground truth:
+  /// `OtherFormat=tmcd`, `PlaybackFrameRate=29.97002997`, NO `MetaFormat`).
+  #[test]
+  fn decode_time_meta_stsd_before_hdlr_emits_other_not_metaformat() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"meta"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "reordered meta emits PlaybackFrameRate"
+    );
+    // The #310 R4 bug: MetaFormat must be ABSENT (the FINAL handler is `meta`, but
+    // the descriptor was decoded under the empty handler → `%OtherSampleDesc`).
+    assert_track1_absent(&e, META_TABLE, "meta stsd-before-hdlr");
+  }
+
+  /// **#309** — a `meta`-handler track in NORMAL (hdlr-first) order routes to
+  /// `%MetaSampleDesc`: it emits `MetaFormat` and NEITHER `OtherFormat` nor
+  /// `PlaybackFrameRate` (ground truth: `MetaFormat=tmcd`, no `OtherFormat`).
+  #[test]
+  fn decode_time_meta_normal_emits_metaformat_not_other() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"meta"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "MetaFormat").as_deref(), Some("tmcd"));
+    assert_track1_absent(&e, OTHER_TABLE, "meta normal");
+  }
+
+  /// **#309** — a `soun`-handler track whose `stsd` comes BEFORE its `hdlr`
+  /// decodes under the empty handler → `%OtherSampleDesc`: it emits
+  /// `OtherFormat=<codec>` and NONE of the `%AudioSampleDesc` fields (ground
+  /// truth on an `mp4a` entry: `OtherFormat=mp4a`, no `AudioFormat`/`AudioChannels`).
+  #[test]
+  fn decode_time_soun_stsd_before_hdlr_emits_other_not_audio() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[soun_entry(
+      b"mp4a", 2, 16, 48000, 36,
+    )])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"soun"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("mp4a"));
+    assert_track1_absent(&e, AUDIO_TABLE, "soun stsd-before-hdlr");
+    assert_track1_absent(&e, META_TABLE, "soun stsd-before-hdlr");
+  }
+
+  /// **#309** — a `soun`-handler track in NORMAL order routes to
+  /// `%AudioSampleDesc`: it emits `AudioFormat` + the audio fields and NO
+  /// `OtherFormat` (ground truth: `AudioFormat=mp4a`, `AudioChannels=2`,
+  /// `AudioBitsPerSample=16`, no `OtherFormat`).
+  #[test]
+  fn decode_time_soun_normal_emits_audio_not_other() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"soun"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[soun_entry(
+      b"mp4a", 2, 16, 48000, 36,
+    )])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "AudioFormat").as_deref(), Some("mp4a"));
+    assert!(
+      track1_has(&e, "AudioChannels"),
+      "soun normal emits AudioChannels"
+    );
+    assert!(
+      track1_has(&e, "AudioBitsPerSample"),
+      "soun normal emits AudioBitsPerSample"
+    );
+    assert_track1_absent(&e, OTHER_TABLE, "soun normal");
+    assert_track1_absent(&e, META_TABLE, "soun normal");
+  }
+
+  /// **#309** — a `vide`-handler track whose `stsd` comes BEFORE its `hdlr`
+  /// decodes under the empty handler → `%OtherSampleDesc`: it emits
+  /// `OtherFormat=<codec>` and NONE of the `%VisualSampleDesc` fields (ground
+  /// truth on an `avc1` entry: `OtherFormat=avc1`, no `CompressorID`/`SourceImageWidth`).
+  #[test]
+  fn decode_time_vide_stsd_before_hdlr_emits_other_not_visual() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[vide_entry(
+      b"avc1", 100, 100, b"Comp", 24, 86,
+    )])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("avc1"));
+    assert_track1_absent(&e, VISUAL_TABLE, "vide stsd-before-hdlr");
+    assert_track1_absent(&e, META_TABLE, "vide stsd-before-hdlr");
+  }
+
+  /// **#309** — a `vide`-handler track in NORMAL order routes to
+  /// `%VisualSampleDesc`: it emits `CompressorID` + the visual fields and NO
+  /// `OtherFormat` (ground truth: `CompressorID=avc1`, `SourceImageWidth=100`,
+  /// `CompressorName=Comp`, no `OtherFormat`).
+  #[test]
+  fn decode_time_vide_normal_emits_visual_not_other() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[vide_entry(
+      b"avc1", 100, 100, b"Comp", 24, 86,
+    )])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("avc1"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "vide normal emits SourceImageWidth"
+    );
+    assert_eq!(track1_str(&e, "CompressorName").as_deref(), Some("Comp"));
+    assert_track1_absent(&e, OTHER_TABLE, "vide normal");
+    assert_track1_absent(&e, META_TABLE, "vide normal");
+  }
+
+  /// **#309** — a `hint`-handler track whose `stsd` comes BEFORE its `hdlr`
+  /// decodes under the empty handler → `%OtherSampleDesc`: it emits
+  /// `OtherFormat`/`PlaybackFrameRate` and none of the meta/audio/visual tables
+  /// (ground truth: `OtherFormat=tmcd`, `PlaybackFrameRate=29.97002997`).
+  #[test]
+  fn decode_time_hint_stsd_before_hdlr_emits_other_not_metaformat() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"hint"));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "reordered hint emits PlaybackFrameRate"
+    );
+    assert_track1_absent(&e, META_TABLE, "hint stsd-before-hdlr");
+    assert_track1_absent(&e, AUDIO_TABLE, "hint stsd-before-hdlr");
+    assert_track1_absent(&e, VISUAL_TABLE, "hint stsd-before-hdlr");
+  }
+
+  /// **#309** — a `hint`-handler track in NORMAL order routes to
+  /// `%HintSampleDesc` (whose fields exifast does not port). The decode-time
+  /// route is `Hint`, so NONE of the OTHER per-handler tables emit: no
+  /// `OtherFormat`/`PlaybackFrameRate`, no `MetaFormat`, no audio/visual fields
+  /// (ground truth emits `HintFormat`/`HintTrackVersion`/`MaxPacketSize`, which
+  /// exifast leaves unported — the point here is the ABSENCE of the wrong tables).
+  #[test]
+  fn decode_time_hint_normal_emits_none_of_the_other_tables() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"hint"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_track1_absent(&e, OTHER_TABLE, "hint normal");
+    assert_track1_absent(&e, META_TABLE, "hint normal");
+    assert_track1_absent(&e, AUDIO_TABLE, "hint normal");
+    assert_track1_absent(&e, VISUAL_TABLE, "hint normal");
+  }
+
+  /// **#309** — a handler-LESS track (no `hdlr` at all) decodes its `stsd` under
+  /// the empty handler → `%OtherSampleDesc`: `OtherFormat`/`PlaybackFrameRate`
+  /// only, no `MetaFormat`/audio/visual (ground truth: `OtherFormat=tmcd`,
+  /// `PlaybackFrameRate=29.97002997`). The captured route is `Other`.
+  #[test]
+  fn decode_time_no_hdlr_emits_other_only() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "no-hdlr emits PlaybackFrameRate"
+    );
+    assert_track1_absent(&e, META_TABLE, "no-hdlr");
+    assert_track1_absent(&e, AUDIO_TABLE, "no-hdlr");
+    assert_track1_absent(&e, VISUAL_TABLE, "no-hdlr");
+  }
+
+  // ── #309 (Codex finding): the routing HandlerType is minf-SCOPED — it RESETS
+  // at the end of EACH `minf` (QuickTime.pm:10373), so a trak with multiple
+  // `minf`s routes each `stsd` by the handler in scope for ITS `minf`, and an
+  // earlier `stsd`'s emission is NEVER reclassified by a later `minf`/`hdlr`.
+  // Every expectation below was ground-truthed against bundled ExifTool 13.59 on
+  // the SAME crafted bytes these builders produce (the `hdlr(vide)+minf(avc1)+
+  // minf(tmcd)` case → `Track1` carries BOTH the `avc1` Visual fields AND
+  // `OtherFormat=tmcd`/`PlaybackFrameRate`, NOT a second Visual descriptor).
+
+  /// An `avc1` Visual sample entry matching the STEP-0 ground truth
+  /// (`1920x1080`, `XResolution/YResolution=72`, `CompressorName="AVC Coding"`,
+  /// `BitDepth=24`).
+  fn avc1_entry_truth() -> Vec<u8> {
+    vide_entry(b"avc1", 1920, 1080, b"AVC Coding", 24, 86)
+  }
+
+  /// Build a `minf` wrapping a `stbl` that holds ALL of `stsds` (each already a
+  /// full `atom(b"stsd", ..)`), in file order — for the cross-`minf` /
+  /// multi-`stsd`-per-`minf` routing tests.
+  fn minf_with_stsds(stsds: &[Vec<u8>]) -> Vec<u8> {
+    let mut stbl_body = Vec::new();
+    for stsd in stsds {
+      stbl_body.extend_from_slice(stsd);
+    }
+    atom(b"minf", &atom(b"stbl", &stbl_body))
+  }
+
+  /// **#309** — THE finding: `hdlr(vide) + minf(stsd avc1) + minf(stsd tmcd)`.
+  /// The `vide` HandlerType is in scope for the FIRST `minf` (→ `%VisualSampleDesc`)
+  /// but RESETS to empty at its end, so the SECOND `minf`'s `stsd` decodes under
+  /// the empty handler → `%OtherSampleDesc`. `Track1` must therefore carry BOTH
+  /// the `avc1` Visual fields AND `OtherFormat=tmcd` + `PlaybackFrameRate`, and
+  /// the `tmcd` `stsd` must NOT be reclassified as a second Visual descriptor
+  /// (NO `CompressorID=tmcd`). Ground truth (bundled ExifTool 13.59):
+  /// `CompressorID=avc1`, `SourceImageWidth=1920`, `SourceImageHeight=1080`,
+  /// `CompressorName="AVC Coding"`, `BitDepth=24`, `OtherFormat=tmcd`,
+  /// `PlaybackFrameRate=29.97002997`, and NO `MetaFormat`.
+  #[test]
+  fn duplicate_minf_vide_then_other_no_cross_reclassification() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[avc1_entry_truth()])));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    // FIRST minf → Visual (the `avc1` descriptor survives the second minf).
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("avc1"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "avc1 Visual SourceImageWidth"
+    );
+    assert!(
+      track1_has(&e, "SourceImageHeight"),
+      "avc1 Visual SourceImageHeight"
+    );
+    assert_eq!(
+      track1_str(&e, "CompressorName").as_deref(),
+      Some("AVC Coding")
+    );
+    // SECOND minf → Other (tmcd), under the reset (empty) handler.
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "tmcd Other PlaybackFrameRate"
+    );
+    // The `tmcd` was NOT routed as a second Visual: CompressorID stays `avc1`,
+    // and there is no spurious `MetaFormat`.
+    assert_ne!(
+      track1_str(&e, "CompressorID").as_deref(),
+      Some("tmcd"),
+      "the second-minf tmcd stsd must NOT reclassify the Visual descriptor"
+    );
+    assert_track1_absent(&e, META_TABLE, "vide-then-other dup-minf");
+  }
+
+  /// **#309** — mixed routes across `minf`s WITH a second `hdlr`:
+  /// `hdlr(vide) + minf(stsd avc1) + hdlr(soun) + minf(stsd mp4a)`. The first
+  /// `minf` routes Visual; the end-of-`minf` reset clears the handler; the
+  /// SECOND `hdlr(soun)` then sets it before the second `minf`, which routes
+  /// Audio. `Track1` carries BOTH tables, and NEITHER `OtherFormat` nor
+  /// `MetaFormat`. Ground truth (bundled ExifTool 13.59): `CompressorID=avc1` +
+  /// the Visual fields AND `AudioFormat=mp4a`/`AudioChannels=2`/
+  /// `AudioBitsPerSample=16`, `HandlerType="Audio Track"` (the final flat tag).
+  #[test]
+  fn duplicate_minf_vide_then_audio_mixed_routes() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[avc1_entry_truth()])));
+    mdia_body.extend_from_slice(&hdlr_atom(b"soun"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[soun_entry(
+      b"mp4a", 2, 16, 48000, 36,
+    )])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    // First minf → Visual; second minf (after reset + soun hdlr) → Audio.
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("avc1"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "avc1 Visual SourceImageWidth"
+    );
+    assert_eq!(track1_str(&e, "AudioFormat").as_deref(), Some("mp4a"));
+    assert!(track1_has(&e, "AudioChannels"), "mp4a Audio AudioChannels");
+    assert!(
+      track1_has(&e, "AudioBitsPerSample"),
+      "mp4a Audio AudioBitsPerSample"
+    );
+    // Neither table routed to the Other/Meta fallbacks.
+    assert_track1_absent(&e, OTHER_TABLE, "vide-then-audio dup-minf");
+    assert_track1_absent(&e, META_TABLE, "vide-then-audio dup-minf");
+  }
+
+  /// **#309 — within-ONE-`minf` control (no spurious reset).** Two `stsd` atoms
+  /// inside the SAME `minf`/`stbl` (`hdlr(vide) + minf(stsd avc1, stsd tmcd)`)
+  /// share the `vide` HandlerType — there is no minf boundary between them, so
+  /// BOTH route Visual and fold into ONE descriptor (last-wins per field). The
+  /// second entry's `tmcd` 4cc therefore WINS the `CompressorID` (it is a Visual
+  /// field here, NOT an `OtherFormat`), and NO `OtherFormat`/`PlaybackFrameRate`
+  /// is emitted. Ground truth (bundled ExifTool 13.59): `CompressorID=tmcd`, the
+  /// `avc1` Visual dimensions/`CompressorName` retained, NO `OtherFormat`. This
+  /// pins that the minf-end reset fires at the minf BOUNDARY, not between
+  /// `stsd`s of one `minf`.
+  #[test]
+  fn one_minf_two_stsd_no_reset_both_visual() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&minf_with_stsds(&[
+      stsd_box(&[avc1_entry_truth()]),
+      stsd_box(&[tmcd_entry(90000, 3003)]),
+    ]));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    // Both stsd routed Visual (one minf) → last-wins CompressorID = the second
+    // entry's 4cc; the avc1 dimensions/CompressorName survive (Some-only fold).
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "retained avc1 SourceImageWidth"
+    );
+    assert_eq!(
+      track1_str(&e, "CompressorName").as_deref(),
+      Some("AVC Coding")
+    );
+    // No Other route fired (the tmcd 4cc was a Visual CompressorID here).
+    assert_track1_absent(&e, OTHER_TABLE, "one-minf-two-stsd");
+    assert_track1_absent(&e, META_TABLE, "one-minf-two-stsd");
+  }
+
+  /// **#309 — well-formed byte-identity baseline.** The ordinary one-`hdlr`,
+  /// one-`minf`, hdlr-first VIDE track is unchanged by the minf-scoped-handler
+  /// fix: the handler-so-far at the single `stsd` == the final `handler_code()`,
+  /// so the route (and every emitted tag) is identical to the pre-fix path —
+  /// `CompressorID=avc1` + the Visual fields, NO `OtherFormat`/`MetaFormat`.
+  #[test]
+  fn single_minf_vide_unchanged_by_minf_scoping() {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[avc1_entry_truth()])));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("avc1"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "avc1 Visual SourceImageWidth"
+    );
+    assert_eq!(
+      track1_str(&e, "CompressorName").as_deref(),
+      Some("AVC Coding")
+    );
+    assert_track1_absent(&e, OTHER_TABLE, "single-minf vide");
+    assert_track1_absent(&e, META_TABLE, "single-minf vide");
+  }
+
+  /// **#309 — captured-route unit check.** [`walk_trak`] records the decode-time
+  /// route on the track for every handler/order, so the emission gates and the
+  /// decode dispatch read ONE classification. A reordered `soun`/`vide`/`meta`/
+  /// `hint` (stsd-before-hdlr) and a no-`hdlr` track all capture `Other`; the
+  /// hdlr-first order captures the handler's own route. The route the decode
+  /// USED is observed via which route-specific slot got populated (the conflated
+  /// single `decode_time_route` field is gone — each `stsd` carries its own
+  /// route into `visual_sample_desc` / `audio_sample_desc` / `meta_format` /
+  /// `other_format`, #309).
+  #[test]
+  fn walk_trak_captures_decode_time_route() {
+    // The route a single-`stsd` track decoded under, read back from the
+    // populated slot (`None` when no slot is set — e.g. `Hint`, or no `stsd`).
+    let route_of = |t: &MediaTrack| -> Option<SampleDescRoute> {
+      if t.visual_sample_desc().is_some() {
+        Some(SampleDescRoute::Visual)
+      } else if t.audio_sample_desc().is_some() {
+        Some(SampleDescRoute::Audio)
+      } else if t.meta_format().is_some() {
+        Some(SampleDescRoute::Meta)
+      } else if t.other_format().is_some() {
+        Some(SampleDescRoute::Other)
+      } else {
+        None
+      }
+    };
+
+    // hdlr-first (normal): each handler routes its `stsd` to its OWN table.
+    let normal = |h: &[u8; 4], entry: Vec<u8>| -> Option<SampleDescRoute> {
+      let mut mdia = mdhd_600();
+      mdia.extend_from_slice(&hdlr_atom(h));
+      mdia.extend_from_slice(&minf_with_stsd(&stsd_box(&[entry])));
+      route_of(&walk_trak(1, &atom(b"mdia", &mdia), Some(600)))
+    };
+    assert_eq!(
+      normal(b"soun", soun_entry(b"mp4a", 2, 16, 48000, 36)),
+      Some(SampleDescRoute::Audio)
+    );
+    assert_eq!(
+      normal(b"vide", vide_entry(b"avc1", 1, 1, b"C", 24, 86)),
+      Some(SampleDescRoute::Visual)
+    );
+    assert_eq!(
+      normal(b"meta", tmcd_entry(90000, 3003)),
+      Some(SampleDescRoute::Meta)
+    );
+    // `hint` routes to the unported `%HintSampleDesc` ⇒ no slot is populated.
+    assert_eq!(normal(b"hint", tmcd_entry(90000, 3003)), None);
+    assert_eq!(
+      normal(b"tmcd", tmcd_entry(90000, 3003)),
+      Some(SampleDescRoute::Other)
+    );
+
+    // stsd-before-hdlr (reordered): the handler-so-far is empty → `Other`.
+    let reordered = |h: &[u8; 4]| -> Option<SampleDescRoute> {
+      let mut mdia = mdhd_600();
+      mdia.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+      mdia.extend_from_slice(&hdlr_atom(h));
+      route_of(&walk_trak(1, &atom(b"mdia", &mdia), Some(600)))
+    };
+    assert_eq!(reordered(b"soun"), Some(SampleDescRoute::Other));
+    assert_eq!(reordered(b"vide"), Some(SampleDescRoute::Other));
+    assert_eq!(reordered(b"meta"), Some(SampleDescRoute::Other));
+    assert_eq!(reordered(b"hint"), Some(SampleDescRoute::Other));
+
+    // No `hdlr` at all → `Other`; no `stsd` at all → no slot (no route decided).
+    let mut nohdlr = mdhd_600();
+    nohdlr.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    assert_eq!(
+      route_of(&walk_trak(1, &atom(b"mdia", &nohdlr), Some(600))),
+      Some(SampleDescRoute::Other)
+    );
+    let mut nostsd = mdhd_600();
+    nostsd.extend_from_slice(&hdlr_atom(b"vide"));
+    assert_eq!(
+      route_of(&walk_trak(1, &atom(b"mdia", &nostsd), Some(600))),
+      None,
+      "a track with no stsd never decides a sample-desc route"
+    );
+  }
+
+  // ── #309 (Codex R2): the routing HandlerType is WALK-LEVEL — set by a
+  // `moov/meta` (or `mdia`) `hdlr` and reset only at a `minf` exit
+  // (QuickTime.pm:8412 / 10373), NOT re-initialized per `trak`. So a `moov/meta`
+  // box's `hdlr` is in scope for a LATER sibling `trak` that has no `hdlr` of its
+  // own, but NOT for a `trak` that PRECEDES it in file order. The STEP-0 truth
+  // table (bundled ExifTool 13.59) these tests pin:
+  //   moov(meta(hdlr meta), trak(no-hdlr, stsd tmcd)) -> Track1:MetaFormat=tmcd
+  //   moov(trak(no-hdlr, stsd tmcd), meta(hdlr meta)) -> Track1:OtherFormat=tmcd
+  //                                                       + PlaybackFrameRate
+  //   moov(trak1(no-hdlr,tmcd), meta(hdlr meta), trak2(no-hdlr,tmcd))
+  //                              -> Track1:OtherFormat, Track2:MetaFormat
+
+  /// A QT-style `moov/meta` box (plain — `hdlr` is the first child, no ISO
+  /// version/flags prefix, mirroring [`walk_meta`]) whose `hdlr` HandlerType
+  /// (offset 8) is `handler`.
+  fn meta_box_with_hdlr(handler: &[u8; 4]) -> Vec<u8> {
+    atom(b"meta", &hdlr_atom(handler))
+  }
+
+  /// Wrap an ordered list of `moov` child atoms (each already a full
+  /// `atom(b"...", ..)`) in a complete MOV: `ftyp` + `moov(mvhd, <children…>)`,
+  /// with the same TimeScale-600 `mvhd` as [`single_track_mov`]. Preserves the
+  /// caller's child ORDER so the `meta`-vs-`trak` file order drives the
+  /// walk-level routing handler (#309).
+  fn moov_children_mov(children: &[Vec<u8>]) -> Vec<u8> {
+    let mut mvhd_payload = vec![0u8; 100];
+    wr(&mut mvhd_payload, 12, &600u32.to_be_bytes());
+    let mut moov_body = atom(b"mvhd", &mvhd_payload);
+    for child in children {
+      moov_body.extend_from_slice(child);
+    }
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend_from_slice(&atom(b"moov", &moov_body));
+    data
+  }
+
+  /// A no-`hdlr` `trak` with the given `track_id` (tkhd) and a `tmcd` `stsd`
+  /// (`mdia(mdhd, minf(stbl(stsd<tmcd>)))`). With an empty routing handler its
+  /// `stsd` falls through to `%OtherSampleDesc`; with a `meta` handler in scope
+  /// it routes `%MetaSampleDesc` (#309).
+  fn nohdlr_tmcd_trak(track_id: u32) -> Vec<u8> {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let mut tkhd_body = vec![0u8; 84];
+    wr(&mut tkhd_body, 12, &track_id.to_be_bytes()); // TrackID at v0 offset 12
+    let mut trak_body = atom(b"tkhd", &tkhd_body);
+    trak_body.extend_from_slice(&atom(b"mdia", &mdia_body));
+    atom(b"trak", &trak_body)
+  }
+
+  /// The `(name, value)` pairs emitted under the family-1 `TrackN` group.
+  fn trackn_emitted(data: &[u8], group: &str) -> std::vec::Vec<(String, crate::value::TagValue)> {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let meta = parse_inner(data, None).expect("MOV accepted");
+    let opts = EmitOptions::g1(ConvMode::PrintConv, false);
+    meta
+      .tags(opts)
+      .filter(|t| t.tag().group_ref().family1() == group)
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect()
+  }
+
+  /// **#309 R2 / STEP-0 case A** — `moov(meta(hdlr meta), trak(no-hdlr, stsd
+  /// tmcd))`. The `moov/meta` `hdlr` sets the walk-level HandlerType to `meta`
+  /// BEFORE the `trak`; the `trak` has no `hdlr`, so its `stsd` decodes under the
+  /// `meta` handler → `%MetaSampleDesc` ⇒ `Track1:MetaFormat=tmcd`, and NEITHER
+  /// `OtherFormat` nor `PlaybackFrameRate` (ground truth: bundled ExifTool 13.59).
+  #[test]
+  fn moov_meta_hdlr_before_nohdlr_trak_routes_meta() {
+    let data = moov_children_mov(&[meta_box_with_hdlr(b"meta"), nohdlr_tmcd_trak(1)]);
+    let e = trackn_emitted(&data, "Track1");
+    assert_eq!(
+      track1_str(&e, "MetaFormat").as_deref(),
+      Some("tmcd"),
+      "a moov/meta hdlr BEFORE a no-hdlr trak routes its stsd Meta"
+    );
+    assert_track1_absent(&e, OTHER_TABLE, "meta-before-trak");
+  }
+
+  /// **#309 R2 / STEP-0 case B** — `moov(trak(no-hdlr, stsd tmcd), meta(hdlr
+  /// meta))`. The `trak` PRECEDES the `meta` box, so at the `trak`'s `stsd`-decode
+  /// time the walk-level HandlerType is still empty → `%OtherSampleDesc` ⇒
+  /// `Track1:OtherFormat=tmcd` + `PlaybackFrameRate`, and NO `MetaFormat` — EVEN
+  /// THOUGH a `meta` box follows (ground truth: bundled ExifTool 13.59). This is
+  /// the divergence the R2 fix corrects: a per-`trak` fresh `None` handler made
+  /// case A and case B identical, but ExifTool routes them by FILE ORDER.
+  #[test]
+  fn moov_meta_hdlr_after_nohdlr_trak_routes_other() {
+    let data = moov_children_mov(&[nohdlr_tmcd_trak(1), meta_box_with_hdlr(b"meta")]);
+    let e = trackn_emitted(&data, "Track1");
+    assert_eq!(
+      track1_str(&e, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "a no-hdlr trak BEFORE the moov/meta hdlr saw the empty handler → Other"
+    );
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "the Other-routed tmcd emits PlaybackFrameRate"
+    );
+    assert_track1_absent(&e, META_TABLE, "meta-after-trak");
+  }
+
+  /// **#309 R2 / STEP-0 byte-identity baseline (case C)** — a bare `moov(trak(
+  /// no-hdlr, stsd tmcd))` with NO `meta` box routes `%OtherSampleDesc` exactly as
+  /// before the walk-level change: the absence of any cross-level `hdlr` means the
+  /// walk-level handler == the old per-`trak` `None`, so the emission is identical
+  /// (`OtherFormat=tmcd` + `PlaybackFrameRate`, no `MetaFormat`).
+  #[test]
+  fn moov_nohdlr_trak_no_meta_unchanged_routes_other() {
+    let data = moov_children_mov(&[nohdlr_tmcd_trak(1)]);
+    let e = trackn_emitted(&data, "Track1");
+    assert_eq!(track1_str(&e, "OtherFormat").as_deref(), Some("tmcd"));
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "baseline PlaybackFrameRate"
+    );
+    assert_track1_absent(&e, META_TABLE, "no-meta baseline");
+  }
+
+  /// **#309 R2 / STEP-0 case F** — `moov(trak1(no-hdlr,tmcd), meta(hdlr meta),
+  /// trak2(no-hdlr,tmcd))`. The walk-level handler is empty for `trak1` (Other),
+  /// the `meta` box then sets it to `meta`, so `trak2` routes `%MetaSampleDesc`
+  /// (Meta). Pins that the handler PERSISTS from a `meta` box to a LATER sibling
+  /// `trak` and that the relative file order of `meta` vs each `trak` is honored
+  /// (ground truth: bundled ExifTool 13.59 — `Track1:OtherFormat`,
+  /// `Track2:MetaFormat`).
+  #[test]
+  fn moov_trak_meta_trak_routes_other_then_meta() {
+    let data = moov_children_mov(&[
+      nohdlr_tmcd_trak(1),
+      meta_box_with_hdlr(b"meta"),
+      nohdlr_tmcd_trak(2),
+    ]);
+    let e1 = trackn_emitted(&data, "Track1");
+    assert_eq!(
+      track1_str(&e1, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "trak1 (before the meta box) routes Other"
+    );
+    assert_track1_absent(&e1, META_TABLE, "trak1 before meta");
+    let e2 = trackn_emitted(&data, "Track2");
+    assert_eq!(
+      track1_str(&e2, "MetaFormat").as_deref(),
+      Some("tmcd"),
+      "trak2 (after the meta box) routes Meta"
+    );
+    assert_track1_absent(&e2, OTHER_TABLE, "trak2 after meta");
+  }
+
+  /// **#309 R2 / STEP-0 case G** — a BARE `moov`-level `hdlr(meta)` (NOT wrapped
+  /// in a `meta` box) does NOT set the walk-level HandlerType: `%QuickTime::Movie`
+  /// has no `hdlr` tag, so ExifTool decodes it as `Unknown_hdlr` and never runs
+  /// the Handler RawConv. A following no-`hdlr` `trak` therefore routes
+  /// `%OtherSampleDesc` (ground truth: bundled ExifTool 13.59 — `OtherFormat`, NO
+  /// `MetaFormat`). The exifast walk recognizes ONLY a `meta` box's `hdlr`, so a
+  /// bare moov-child `hdlr` is correctly ignored.
+  #[test]
+  fn moov_bare_hdlr_does_not_set_walk_handler() {
+    let data = moov_children_mov(&[hdlr_atom(b"meta"), nohdlr_tmcd_trak(1)]);
+    let e = trackn_emitted(&data, "Track1");
+    assert_eq!(
+      track1_str(&e, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "a bare moov-level hdlr is Unknown_hdlr → does NOT route the trak Meta"
+    );
+    assert_track1_absent(&e, META_TABLE, "bare-moov-hdlr");
+  }
+
+  /// **#309 R2 — a `meta`/`mdia` data-reference `hdlr` (`alis`/`url `) does NOT
+  /// set the routing handler** (QuickTime.pm:8412 `unless $val eq 'alis' or $val
+  /// eq 'url '`). A `moov/meta` box whose `hdlr` is `alis`, before a no-`hdlr`
+  /// `trak`, leaves the walk-level handler empty ⇒ the `trak` routes
+  /// `%OtherSampleDesc` (the `meta_box_routing_handler` exception).
+  #[test]
+  fn moov_meta_alis_hdlr_does_not_route_meta() {
+    let data = moov_children_mov(&[meta_box_with_hdlr(b"alis"), nohdlr_tmcd_trak(1)]);
+    let e = trackn_emitted(&data, "Track1");
+    assert_eq!(
+      track1_str(&e, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "an alis (data-reference) meta hdlr does not set HandlerType"
+    );
+    assert_track1_absent(&e, META_TABLE, "meta-alis-before-trak");
+  }
+
+  // ── #309 R5: the routing HandlerType is FILE-GLOBAL — threaded through the
+  // SHARED Pass-2 walk and updated at EVERY `hdlr`/`meta`-box site at ANY level
+  // (`mdia`/`minf`/`moov-meta`/`trak-meta`/`udta-meta`/file-meta), reset at
+  // minf-exit + file-start. The truth table below (ground-truthed vs bundled
+  // ExifTool 13.59 with crafted MOVs) pins EVERY source; each asserts the
+  // bundled-verified emission. The offset split: `moov`/`trak` `meta` are plain
+  // (offset 0); file-level + `udta` `meta` are ISO-prefixed (offset 4).
+
+  /// An ISO-prefixed `meta` box (a 4-byte version header before the `hdlr`),
+  /// matching the `%QuickTime::Main` / `%QuickTime::UserData` `Start => 4` layout
+  /// (QuickTime.pm:555-556 / 1690-1691).
+  fn meta_box_iso_with_hdlr(handler: &[u8; 4]) -> Vec<u8> {
+    let mut body = vec![0u8; 4]; // 4-byte version/flags prefix (skipped at Start=>4)
+    body.extend_from_slice(&hdlr_atom(handler));
+    atom(b"meta", &body)
+  }
+
+  /// A `udta` wrapping an ISO-prefixed `meta(hdlr <handler>)` — the
+  /// `moov/udta/meta` and `trak/udta/meta` source (`%QuickTime::UserData` `meta`
+  /// is `Start => 4`).
+  fn udta_with_iso_meta(handler: &[u8; 4]) -> Vec<u8> {
+    atom(b"udta", &meta_box_iso_with_hdlr(handler))
+  }
+
+  /// A bare `moov(mvhd<ts=600>, <children…>)` atom (NO `ftyp` wrapper) for the
+  /// file-level-`meta`-before-`moov` cases (a top-level `meta` is placed before
+  /// it without slicing a wrapped buffer).
+  fn moov_only_atom(children: &[Vec<u8>]) -> Vec<u8> {
+    let mut mvhd_payload = vec![0u8; 100];
+    wr(&mut mvhd_payload, 12, &600u32.to_be_bytes());
+    let mut moov_body = atom(b"mvhd", &mvhd_payload);
+    for child in children {
+      moov_body.extend_from_slice(child);
+    }
+    atom(b"moov", &moov_body)
+  }
+
+  /// A no-`hdlr` `tmcd` `trak` whose DIRECT children are the given ordered
+  /// `pre`/`post` atoms placed BEFORE / AFTER the `mdia(mdhd, minf(stbl(stsd
+  /// tmcd)))`. Lets a test put a `meta`/`udta` sibling on either side of the
+  /// `mdia` to drive the file-order routing (case B vs C / G).
+  fn tmcd_trak_with_siblings(track_id: u32, pre: &[Vec<u8>], post: &[Vec<u8>]) -> Vec<u8> {
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&minf_with_stsd(&stsd_box(&[tmcd_entry(90000, 3003)])));
+    let mut tkhd_body = vec![0u8; 84];
+    wr(&mut tkhd_body, 12, &track_id.to_be_bytes());
+    let mut trak_body = atom(b"tkhd", &tkhd_body);
+    for a in pre {
+      trak_body.extend_from_slice(a);
+    }
+    trak_body.extend_from_slice(&atom(b"mdia", &mdia_body));
+    for a in post {
+      trak_body.extend_from_slice(a);
+    }
+    atom(b"trak", &trak_body)
+  }
+
+  /// Assert the `Track1` emission carries `MetaFormat == tmcd` and NEITHER
+  /// `OtherFormat` nor `PlaybackFrameRate` (the `tmcd` `stsd` routed `%MetaSampleDesc`).
+  fn assert_track1_routes_meta(data: &[u8], case: &str) {
+    let e = trackn_emitted(data, "Track1");
+    assert_eq!(
+      track1_str(&e, "MetaFormat").as_deref(),
+      Some("tmcd"),
+      "[{case}] expected MetaFormat=tmcd (the handler-so-far routed Meta)"
+    );
+    assert_track1_absent(&e, OTHER_TABLE, case);
+  }
+
+  /// Assert the `Track1` emission carries `OtherFormat == tmcd` + `PlaybackFrameRate`
+  /// and NO `MetaFormat` (the `tmcd` `stsd` routed `%OtherSampleDesc`).
+  fn assert_track1_routes_other(data: &[u8], case: &str) {
+    let e = trackn_emitted(data, "Track1");
+    assert_eq!(
+      track1_str(&e, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "[{case}] expected OtherFormat=tmcd (the handler-so-far routed Other)"
+    );
+    assert!(
+      track1_has(&e, "PlaybackFrameRate"),
+      "[{case}] the Other-routed tmcd emits PlaybackFrameRate"
+    );
+    assert_track1_absent(&e, META_TABLE, case);
+  }
+
+  /// **R5 case B** — `trak(meta(hdlr meta) BEFORE mdia(no-hdlr, stsd tmcd))`. The
+  /// `trak/meta` `hdlr` (plain offset 0) sets the file-global HandlerType BEFORE
+  /// the `mdia`/`stsd`, so the `stsd` routes `%MetaSampleDesc` ⇒ `MetaFormat=tmcd`
+  /// (ground truth: bundled ExifTool 13.59).
+  #[test]
+  fn r5_trak_meta_before_mdia_routes_meta() {
+    let trak = tmcd_trak_with_siblings(1, &[atom(b"meta", &hdlr_atom(b"meta"))], &[]);
+    let data = moov_children_mov(&[trak]);
+    assert_track1_routes_meta(&data, "trak/meta(meta) BEFORE mdia");
+  }
+
+  /// **R5 case C** — `trak(mdia(no-hdlr, stsd tmcd), meta(hdlr meta) AFTER mdia)`.
+  /// The `mdia`/`stsd` decodes (and its `minf` exits, resetting the handler) BEFORE
+  /// the `trak/meta` `hdlr` is reached, so the `stsd` saw the empty handler →
+  /// `%OtherSampleDesc` ⇒ `OtherFormat=tmcd` + `PlaybackFrameRate`, NO `MetaFormat`
+  /// (ground truth: bundled ExifTool 13.59). Pins the file-ORDER dependence.
+  #[test]
+  fn r5_trak_meta_after_mdia_routes_other() {
+    let trak = tmcd_trak_with_siblings(1, &[], &[atom(b"meta", &hdlr_atom(b"meta"))]);
+    let data = moov_children_mov(&[trak]);
+    assert_track1_routes_other(&data, "trak/meta(meta) AFTER mdia");
+  }
+
+  /// **R5 case D** — `trak(meta(hdlr alis) BEFORE mdia, …)`. A data-reference
+  /// `trak/meta` `hdlr` (`alis`) does NOT set the routing handler (QuickTime.pm:
+  /// 8412), so the `stsd` routes `%OtherSampleDesc` ⇒ `OtherFormat=tmcd` +
+  /// `PlaybackFrameRate` (ground truth: bundled ExifTool 13.59). The `url ` variant
+  /// behaves identically.
+  #[test]
+  fn r5_trak_meta_alis_before_mdia_no_op_routes_other() {
+    let trak = tmcd_trak_with_siblings(1, &[atom(b"meta", &hdlr_atom(b"alis"))], &[]);
+    let data = moov_children_mov(&[trak]);
+    assert_track1_routes_other(&data, "trak/meta(alis) BEFORE mdia");
+    let trak_url = tmcd_trak_with_siblings(1, &[atom(b"meta", &hdlr_atom(b"url "))], &[]);
+    let data_url = moov_children_mov(&[trak_url]);
+    assert_track1_routes_other(&data_url, "trak/meta(url ) BEFORE mdia");
+  }
+
+  /// **R5 case E** — `mdia(no-hdlr, minf(hdlr meta, stbl(stsd tmcd)))`. A
+  /// `minf/hdlr` (`%QuickTime::MediaInfo` `hdlr`, QuickTime.pm:7319-7322) is a
+  /// DIRECT `minf` child preceding `stbl`, so it sets the routing handler for this
+  /// `minf`'s `stsd` ⇒ `%MetaSampleDesc` ⇒ `MetaFormat=tmcd` (ground truth: bundled
+  /// ExifTool 13.59).
+  #[test]
+  fn r5_minf_hdlr_meta_routes_meta() {
+    let mut minf_body = hdlr_atom(b"meta");
+    minf_body.extend_from_slice(&atom(b"stbl", &stsd_box(&[tmcd_entry(90000, 3003)])));
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&atom(b"minf", &minf_body));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    assert_track1_routes_meta(&data, "minf(hdlr meta, stsd tmcd)");
+  }
+
+  /// **R5 case E2** — `mdia(no-hdlr, minf(hdlr vide, stbl(stsd avc1)))`. A
+  /// `minf/hdlr` `vide` routes the `stsd` `%VisualSampleDesc` ⇒ `CompressorID=avc1`
+  /// + the Visual fields, NO `OtherFormat`/`MetaFormat` (ground truth: bundled
+  /// ExifTool 13.59). Proves the `minf/hdlr` feeds the FULL per-handler dispatch,
+  /// not just the Meta/Other split.
+  #[test]
+  fn r5_minf_hdlr_vide_routes_visual() {
+    let mut minf_body = hdlr_atom(b"vide");
+    minf_body.extend_from_slice(&atom(b"stbl", &stsd_box(&[avc1_entry_truth()])));
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&atom(b"minf", &minf_body));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(track1_str(&e, "CompressorID").as_deref(), Some("avc1"));
+    assert!(
+      track1_has(&e, "SourceImageWidth"),
+      "minf/hdlr vide → Visual SourceImageWidth"
+    );
+    assert_track1_absent(&e, OTHER_TABLE, "minf(hdlr vide)");
+    assert_track1_absent(&e, META_TABLE, "minf(hdlr vide)");
+  }
+
+  /// **R5 case K** — `mdia(hdlr vide, minf(hdlr meta, stbl(stsd tmcd)))`. The
+  /// `minf/hdlr` meta OVERRIDES the `mdia/hdlr` vide for the `stsd` routing ⇒
+  /// `MetaFormat=tmcd`, while the flat `HandlerType` tag stays the `mdia/hdlr`'s
+  /// `vide` (the `MediaType` proxy is set ONLY by a `Media`-parented `hdlr`,
+  /// QuickTime.pm:8413 — so `handler_code` is untouched by the `minf/hdlr`). Ground
+  /// truth: bundled ExifTool 13.59 routes `MetaFormat=tmcd` here.
+  #[test]
+  fn r5_minf_hdlr_overrides_mdia_hdlr_for_routing() {
+    let mut minf_body = hdlr_atom(b"meta");
+    minf_body.extend_from_slice(&atom(b"stbl", &stsd_box(&[tmcd_entry(90000, 3003)])));
+    let mut mdia_body = mdhd_600();
+    mdia_body.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia_body.extend_from_slice(&atom(b"minf", &minf_body));
+    let data = single_track_mov(&atom(b"mdia", &mdia_body));
+    let e = track1_emitted(&data);
+    assert_eq!(
+      track1_str(&e, "MetaFormat").as_deref(),
+      Some("tmcd"),
+      "minf/hdlr meta overrides mdia/hdlr vide for the stsd route"
+    );
+    // The flat HandlerType tag (the mdia/hdlr's MediaType) is still `vide` — the
+    // minf/hdlr does NOT touch `handler_code` (no Visual fields are decoded either,
+    // since the route is Meta).
+    assert_eq!(
+      track1_str(&e, "HandlerType").as_deref(),
+      Some("Video Track"),
+      "the flat HandlerType stays the mdia/hdlr vide (MediaType)"
+    );
+    assert_track1_absent(&e, OTHER_TABLE, "mdia vide + minf meta");
+  }
+
+  /// **R5 case F** — `moov(udta(meta(hdlr meta ISO+4)), trak(no-hdlr, stsd tmcd))`.
+  /// The `moov/udta/meta` `hdlr` (ISO-prefixed, `Start => 4`) sets the file-global
+  /// HandlerType BEFORE the sibling `trak`, so the `trak`'s `stsd` routes
+  /// `%MetaSampleDesc` ⇒ `MetaFormat=tmcd` (ground truth: bundled ExifTool 13.59).
+  #[test]
+  fn r5_moov_udta_meta_before_trak_routes_meta() {
+    let data = moov_children_mov(&[udta_with_iso_meta(b"meta"), nohdlr_tmcd_trak(1)]);
+    assert_track1_routes_meta(&data, "moov/udta/meta(meta) BEFORE trak");
+  }
+
+  /// **R5 case G** — `trak(udta(meta(hdlr meta ISO+4)) BEFORE mdia(no-hdlr, stsd
+  /// tmcd))`. The `trak/udta/meta` `hdlr` (ISO `Start => 4`) sets the file-global
+  /// HandlerType BEFORE the `mdia`/`stsd`, so the `stsd` routes `%MetaSampleDesc` ⇒
+  /// `MetaFormat=tmcd` (ground truth: bundled ExifTool 13.59).
+  #[test]
+  fn r5_trak_udta_meta_before_mdia_routes_meta() {
+    let trak = tmcd_trak_with_siblings(1, &[udta_with_iso_meta(b"meta")], &[]);
+    let data = moov_children_mov(&[trak]);
+    assert_track1_routes_meta(&data, "trak/udta/meta(meta) BEFORE mdia");
+  }
+
+  /// **R5 case G2** — a `trak/udta/meta` `hdlr` of `alis` (data-reference) does NOT
+  /// set the routing handler, so the `stsd` routes `%OtherSampleDesc` (the
+  /// `udta_meta_routing_handler` honors the QuickTime.pm:8412 exception through the
+  /// nested `meta_box_routing_handler`).
+  #[test]
+  fn r5_trak_udta_meta_alis_no_op_routes_other() {
+    let trak = tmcd_trak_with_siblings(1, &[udta_with_iso_meta(b"alis")], &[]);
+    let data = moov_children_mov(&[trak]);
+    assert_track1_routes_other(&data, "trak/udta/meta(alis) BEFORE mdia");
+  }
+
+  /// **R5 case H** — a FILE-LEVEL `meta(hdlr meta ISO+4)` BEFORE the `moov`. The
+  /// file-level `meta` (`%QuickTime::Main`, `Start => 4`) sets the file-global
+  /// HandlerType, which flows ACROSS the top-level boundary into the LATER `moov`'s
+  /// no-`hdlr` `trak` ⇒ `MetaFormat=tmcd` (ground truth: bundled ExifTool 13.59 —
+  /// proves the state is FILE-global, not moov-local).
+  #[test]
+  fn r5_file_level_meta_iso_flows_into_moov_trak() {
+    // ftyp + file-level meta(hdlr meta ISO) + moov(no-hdlr tmcd trak), in file order.
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend_from_slice(&meta_box_iso_with_hdlr(b"meta"));
+    data.extend_from_slice(&moov_only_atom(&[nohdlr_tmcd_trak(1)]));
+    assert_track1_routes_meta(&data, "file-level meta(meta ISO) BEFORE moov");
+  }
+
+  /// **R5 case H2** — a PLAIN (non-ISO) file-level `meta(hdlr meta)` BEFORE the
+  /// `moov`. The `%QuickTime::Main` `meta` is `Start => 4`, so the missing version
+  /// prefix means the `hdlr` is NOT at offset 4 (the read finds garbage) ⇒ the
+  /// handler stays empty ⇒ the `moov`'s `trak` routes `%OtherSampleDesc` (ground
+  /// truth: bundled ExifTool 13.59). Pins the offset-split: a plain file-level
+  /// `meta` does NOT route Meta.
+  #[test]
+  fn r5_file_level_meta_plain_does_not_flow() {
+    // A plain `meta(hdlr meta)` — hdlr at offset 0, NOT the offset-4 the `%Main`
+    // `meta` (`Start => 4`) reads — so the handler stays empty.
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend_from_slice(&atom(b"meta", &hdlr_atom(b"meta")));
+    data.extend_from_slice(&moov_only_atom(&[nohdlr_tmcd_trak(1)]));
+    assert_track1_routes_other(&data, "file-level meta(meta PLAIN) BEFORE moov");
+  }
+
+  /// **R5 case I** — `moov(trak1(mdia hdlr vide, minf stsd avc1), trak2(no-hdlr,
+  /// mdia no-hdlr, minf stsd tmcd))`. `trak1`'s `vide` (`mdia/hdlr`) is RESET at its
+  /// `minf` exit, so `trak2` sees the EMPTY handler ⇒ `Track1` Visual (avc1),
+  /// `Track2` `OtherFormat=tmcd` + `PlaybackFrameRate`, NO `Track2:MetaFormat`
+  /// (ground truth: bundled ExifTool 13.59). This is the byte-identity baseline: a
+  /// well-formed file (one `mdia/hdlr` before `minf`) gives the SAME per-trak result
+  /// the old behavior did — the minf-exit reset stops cross-trak leakage.
+  #[test]
+  fn r5_minf_exit_reset_stops_cross_trak_leak() {
+    let mut mdia1 = mdhd_600();
+    mdia1.extend_from_slice(&hdlr_atom(b"vide"));
+    mdia1.extend_from_slice(&minf_with_stsd(&stsd_box(&[avc1_entry_truth()])));
+    let mut tkhd1 = vec![0u8; 84];
+    wr(&mut tkhd1, 12, &1u32.to_be_bytes());
+    let mut trak1 = atom(b"tkhd", &tkhd1);
+    trak1.extend_from_slice(&atom(b"mdia", &mdia1));
+    let trak1 = atom(b"trak", &trak1);
+    let data = moov_children_mov(&[trak1, nohdlr_tmcd_trak(2)]);
+    let e1 = trackn_emitted(&data, "Track1");
+    assert_eq!(track1_str(&e1, "CompressorID").as_deref(), Some("avc1"));
+    let e2 = trackn_emitted(&data, "Track2");
+    assert_eq!(
+      track1_str(&e2, "OtherFormat").as_deref(),
+      Some("tmcd"),
+      "trak2 sees the minf-reset empty handler → Other (no vide leak)"
+    );
+    assert_track1_absent(&e2, META_TABLE, "trak2 after minf reset");
   }
 
   /// #211 finding 2 — GoPro `%noDups` is PER `(family1, name)`, decided by which
