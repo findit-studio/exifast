@@ -756,7 +756,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// `OtherFormat` + the `[minor]` `Track1:Warning`; the `Doc<N>` timing is `-ee`-only,
 /// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
 /// unported timed-GPS deferral, excluded at regen.
-const EXPECTED_ACTIVE_FIXTURES: usize = 549;
+const EXPECTED_ACTIVE_FIXTURES: usize = 555;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
