@@ -769,7 +769,29 @@ const NOT_ACTIVE: &[&str] = &[
 /// `OtherFormat` + the `[minor]` `Track1:Warning`; the `Doc<N>` timing is `-ee`-only,
 /// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
 /// unported timed-GPS deferral, excluded at regen.
-const EXPECTED_ACTIVE_FIXTURES: usize = 549;
+/// 549 → 550 after the #240 BigTIFF SubIFD-recursion fixture `BigTIFF_subifd.btf`:
+/// a CRAFTED BigTIFF (version 43, 8-byte offsets) whose IFD0 carries an ExifOffset
+/// (→ ExifIFD: ExposureTime/FNumber/ISO/ExifVersion) AND a GPSInfo SubIFD pointer,
+/// pinning `ProcessBigIFD`'s `$$tagInfo{SubIFD}` recursion — the child IFDs reuse
+/// the inherited `%Exif::Main` and group under the POINTER tag (`ExifOffset:ISO`;
+/// the GPSInfo child's 0x0001/0x0002 → `GPSInfo:InteropIndex`/`InteropVersion`, NOT
+/// `%GPS::Main`). Pairs `.json` + `.n.json`, byte-exact in both modes.
+/// 550 → 551 after the #240 round-2 fixture `BigTIFF_subifd_multi.btf`: a CRAFTED
+/// BigTIFF pinning that `ProcessBigIFD` recurses EVERY SubIFD offset (`split ' ',
+/// $val`, `BigTIFF.pm:184`), not just the first — an ExifOffset `LONG8` count=2
+/// pointer → `ExifOffset:ISO` (400) + the `$i`-suffixed `ExifOffset1:ISO` (800) —
+/// AND an ASCII-numeric GPSInfo pointer (`split` numifies the `string` "180") →
+/// `GPSInfo:InteropIndex` reusing `%Exif::Main`. ISO-only children ⇒ no Composite.
+/// Pairs `.json` + `.n.json`, byte-exact in both modes.
+/// 551 → 552 after the #240 round-2 follow-up fixture `BigTIFF_subifd_exp.btf`
+/// (the Codex [medium] finding): a CRAFTED BigTIFF whose GPSInfo (0x8825) SubIFD
+/// pointer is the ASCII STRING `"1e3"`, the GPS child IFD placed at byte 1000.
+/// Pins `ProcessBigIFD`'s FULL Perl numeric coercion of the `split ' ', $val`
+/// offset token (`0 + "1e3" == 1000`, NOT the digit-prefix-only 1) — ground-
+/// truthed: bundled recurses the child at byte 1000 → `GPSInfo:InteropIndex`
+/// ("Unknown (N)" / "N") + `InteropVersion` ("37 48 30") reusing `%Exif::Main`.
+/// GPS-only child ⇒ no Composite. Pairs `.json` + `.n.json`, byte-exact in both.
+const EXPECTED_ACTIVE_FIXTURES: usize = 552;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

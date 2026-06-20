@@ -136,6 +136,29 @@ pub enum IfdKind {
   Gps,
   /// InteropIFD — the interoperability sub-IFD (via ExifIFD tag 0xa005).
   Interop,
+  /// A BigTIFF SubIFD reached by `ProcessBigIFD`'s `$$tagInfo{SubIFD}` recursion
+  /// (`BigTIFF.pm:171-198`). UNLIKE the classic-TIFF SubIFDs above, `ProcessBigIFD`
+  /// recurses EVERY SubIFD pointer (ExifOffset/GPSInfo/InteropOffset) reusing the
+  /// INHERITED `%Exif::Main` table (`Table => $tagTablePtr`, `:172` — it does NOT
+  /// honor the pointer's `SubDirectory{TagTable}` redirect, so a GPSInfo SubIFD is
+  /// walked against `%Exif::Main`, not `%GPS::Main`), and names the family-1
+  /// directory from the POINTER TAG (`$$tagInfo{Name}` — `ExifOffset`/`GPSInfo`/
+  /// `InteropOffset`, NOT `ExifIFD`/`GPS`/`InteropIFD`).
+  ///
+  /// A single pointer can carry MULTIPLE offsets (`my @offsets = split ' ',
+  /// $val`, `:184`); each is walked as its own SubIFD, the family-1 group of
+  /// the `$i`-th getting the `$i` suffix appended (`$subdirName .= $i if $i`,
+  /// `:188`). So the payload is `(pointer-kind, $i)`: the kind selects the
+  /// base name, `$i` the suffix -- [`as_str`](Self::as_str) renders
+  /// `ExifOffset`/`ExifOffset1`/`ExifOffset2`/... via
+  /// [`IfdName::literal_suffixed`]; the table is forced to `Exif` by
+  /// [`table_for_ifd_kind`]. Oracle-confirmed on bundled ExifTool 13.59: a
+  /// BigTIFF whose IFD0 ExifOffset (count 2) / GPSInfo point at child IFDs
+  /// emits `ExifOffset:ISO` + `ExifOffset1:ISO` / `GPSInfo:InteropIndex` (the
+  /// GPS-pointer child's 0x0001/0x0002 resolve as `InteropIndex`/
+  /// `InteropVersion` in `%Exif::Main`); an ASCII-numeric pointer recurses too
+  /// (`split ' '` numifies the string, no integer-format gate).
+  BigSubIfd(SubDirKind, u32),
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -145,17 +168,20 @@ pub enum IfdKind {
 ///
 /// `walk_ifd_chain` follows the next-IFD chain with `for (;;)`
 /// (`Exif.pm:7211`); the trailing-IFD number is a `u32`, so a trailing name
-/// can be up to `"IFD4294967295"` (13 bytes) and `"InteropIFD"` (10 bytes)
-/// is the widest sub-IFD name — the 13-byte buffer covers both. [`Deref`]s
-/// to `&str`, so it drops straight into the `write_*` sinks (which already
-/// take `&str`).
+/// can be up to `"IFD4294967295"` (13 bytes). The widest name overall is a
+/// MULTI-OFFSET BigTIFF SubIFD group ([`IfdName::literal_suffixed`]): the
+/// pointer-tag name `"InteropOffset"` (13 bytes) plus a `u32` `$i` suffix
+/// (`BigTIFF.pm:187-188`, up to 10 digits) -> `"InteropOffset4294967295"`
+/// (23 bytes). The 24-byte buffer covers every case. [`Deref`]s to `&str`,
+/// so it drops straight into the `write_*` sinks (which already take `&str`).
 #[derive(Debug, Clone, Copy)]
 pub struct IfdName {
   /// UTF-8 bytes of the name; only `[..len]` is meaningful.
-  buf: [u8; 13],
-  /// Byte length of the rendered name. The widest name is the trailing-IFD
-  /// name `"IFD4294967295"` (13 bytes); `"InteropIFD"` (10 bytes) is the
-  /// widest sub-IFD name.
+  buf: [u8; 24],
+  /// Byte length of the rendered name. The widest name is the multi-offset
+  /// BigTIFF SubIFD group `"InteropOffset4294967295"` (23 bytes); the
+  /// trailing-IFD name `"IFD4294967295"` (13 bytes) is the widest core-IFD
+  /// name.
   len: u8,
 }
 
@@ -165,7 +191,7 @@ impl IfdName {
   /// (`Exif.pm:7215-7216`).
   #[must_use]
   fn ifd(n: u32) -> Self {
-    let mut buf = [0u8; 13];
+    let mut buf = [0u8; 24];
     buf[0] = b'I';
     buf[1] = b'F';
     buf[2] = b'D';
@@ -186,8 +212,8 @@ impl IfdName {
       }
     }
     // Copy the `ndigits` digits MOST-significant first into `buf[3..]`. Both
-    // `digits.get(..ndigits)` (ndigits ≤ 10) and `buf.get_mut(3..3+ndigits)`
-    // (3+ndigits ≤ 13) are `Some` — the checked, byte-identical form of the
+    // `digits.get(..ndigits)` (ndigits <= 10) and `buf.get_mut(3..3+ndigits)`
+    // (3+ndigits <= 13 <= 24) are `Some` -- the checked, byte-identical form of the
     // `buf[3 + i] = digits[ndigits - 1 - i]` reverse copy (the unreachable
     // `None` arm leaves `buf` zeroed, never taken).
     if let (Some(src), Some(dst)) = (digits.get(..ndigits), buf.get_mut(3..3 + ndigits)) {
@@ -201,18 +227,19 @@ impl IfdName {
     }
   }
 
-  /// Wrap a `&'static str` literal (the fixed sub-IFD names). The callers pass
-  /// only `"IFD0"` / `"ExifIFD"` / `"GPS"` / `"InteropIFD"` (≤ 10 bytes), which
-  /// fit the 13-byte buffer.
+  /// Wrap a `&'static str` literal (the fixed sub-IFD names + the BigTIFF
+  /// pointer-tag names). The callers pass `"IFD0"` / `"ExifIFD"` / `"GPS"` /
+  /// `"InteropIFD"` / `"ExifOffset"` / `"GPSInfo"` / `"InteropOffset"`
+  /// (<= 13 bytes), which fit the 24-byte buffer.
   #[must_use]
   fn literal(s: &str) -> Self {
     let bytes = s.as_bytes();
-    let mut buf = [0u8; 13];
+    let mut buf = [0u8; 24];
     // Copy `bytes` into the buffer prefix. `min(buf.len())` clamps the copy to
-    // the 13-byte capacity so `buf.get_mut(..n)` / `bytes.get(..n)` are both
-    // `Some` — the checked, panic-safe form of the `while i < bytes.len() {
-    // buf[i] = bytes[i] }` copy; for the ≤ 10-byte sub-IFD literals the clamp
-    // never trims, so the rendered name is byte-identical.
+    // the 24-byte capacity so `buf.get_mut(..n)` / `bytes.get(..n)` are both
+    // `Some` -- the checked, panic-safe form of the `while i < bytes.len() {
+    // buf[i] = bytes[i] }` copy; for the <= 13-byte names the clamp never
+    // trims, so the rendered name is byte-identical.
     let n = bytes.len().min(buf.len());
     if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
       dst.copy_from_slice(src);
@@ -220,15 +247,63 @@ impl IfdName {
     Self { buf, len: n as u8 }
   }
 
+  /// Render a BigTIFF multi-offset SubIFD group name: the pointer-tag literal
+  /// `s` followed (only when `i > 0`) by the bare decimal `$i` suffix -- the
+  /// faithful `$subdirName = $$tagInfo{Name}; $subdirName .= $i if $i`
+  /// (`BigTIFF.pm:187-188`). So offset 0 -> `s` verbatim (byte-identical to
+  /// [`Self::literal`]), offset 1 -> `"{s}1"`, offset 2 -> `"{s}2"`, ...
+  /// (oracle-confirmed on bundled ExifTool 13.59: a count-2 `ExifOffset`
+  /// BigTIFF SubIFD emits `ExifOffset:` then `ExifOffset1:`). The widest is
+  /// `"InteropOffset"` (13) + `u32::MAX` (10 digits) = 23 <= 24 = `buf.len()`.
+  #[must_use]
+  fn literal_suffixed(s: &str, i: u32) -> Self {
+    if i == 0 {
+      return Self::literal(s);
+    }
+    let bytes = s.as_bytes();
+    let mut buf = [0u8; 24];
+    // The `s` prefix (<= 13 bytes), then the decimal `$i` suffix.
+    let n = bytes.len().min(buf.len());
+    if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
+      dst.copy_from_slice(src);
+    }
+    // Decimal-render `i` (most-significant first) after the `s` prefix, into a
+    // scratch buffer then a checked copy -- the same panic-safe shape as
+    // [`Self::ifd`]. `i > 0` here, so at least one digit is written.
+    let mut digits = [0u8; 10];
+    let mut value = i;
+    let mut ndigits = 0usize;
+    for slot in &mut digits {
+      *slot = b'0' + (value % 10) as u8;
+      value /= 10;
+      ndigits += 1;
+      if value == 0 {
+        break;
+      }
+    }
+    // `n + ndigits <= 13 + 10 = 23 <= 24`, so `buf.get_mut(n..n+ndigits)` is
+    // `Some`; the unreachable `None` arm leaves the suffix unwritten.
+    if let (Some(src), Some(dst)) = (digits.get(..ndigits), buf.get_mut(n..n + ndigits)) {
+      for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+        *d = *s;
+      }
+    }
+    Self {
+      buf,
+      len: (n + ndigits) as u8,
+    }
+  }
+
   /// The rendered name as a `&str`.
   #[must_use]
   #[inline]
   pub fn as_str(&self) -> &str {
-    // SAFETY-free: `buf[..len]` is always ASCII (`IFD`, digits, or an
-    // ASCII literal), so it is valid UTF-8 by construction. `len` is set to
-    // `3+ndigits` / the clamped literal length — both ≤ 13 = `buf.len()` — so
-    // `buf.get(..len)` is `Some` (the `.unwrap_or(&self.buf)` fallback is
-    // unreachable): the checked, byte-identical form of `&self.buf[..len]`.
+    // SAFETY-free: `buf[..len]` is always ASCII (`IFD`, digits, an ASCII
+    // literal, or a literal + decimal `$i` suffix), so it is valid UTF-8 by
+    // construction. `len` is set to `3+ndigits` / the clamped literal length /
+    // `prefix+ndigits` -- all <= 23 <= 24 = `buf.len()` -- so `buf.get(..len)`
+    // is `Some` (the `.unwrap_or(&self.buf)` fallback is unreachable): the
+    // checked, byte-identical form of `&self.buf[..len]`.
     let bytes = self.buf.get(..self.len as usize).unwrap_or(&self.buf);
     core::str::from_utf8(bytes).unwrap_or("IFD?")
   }
@@ -287,6 +362,12 @@ impl IfdKind {
       IfdKind::ExifIfd => IfdName::literal("ExifIFD"),
       IfdKind::Gps => IfdName::literal("GPS"),
       IfdKind::Interop => IfdName::literal("InteropIFD"),
+      // `$dirName = $$tagInfo{Name}; $subdirName .= $i if $i` (`BigTIFF.pm:
+      // 187-188`) -- the POINTER tag's name (`ExifOffset`/`GPSInfo`/
+      // `InteropOffset`), NOT the classic SubIFD names, with the `$i` suffix
+      // appended for the 2nd+ offset of a multi-offset pointer (`$i = 0` -> no
+      // suffix, the dominant single-offset camera shape).
+      IfdKind::BigSubIfd(sub, i) => IfdName::literal_suffixed(sub.tag_name(), i),
     }
   }
 
@@ -312,6 +393,11 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     IfdKind::Gps => TableRef::Gps,
     IfdKind::Interop => TableRef::Interop,
     IfdKind::Ifd0 | IfdKind::Trailing(_) | IfdKind::ExifIfd => TableRef::Exif,
+    // A BigTIFF SubIFD ALWAYS reuses the inherited `%Exif::Main` (`ProcessBigIFD`
+    // recurses with `Table => $tagTablePtr`, NOT the pointer's `SubDirectory
+    // {TagTable}`) — even a `GPSInfo` BigTIFF SubIFD (`Exif::Main`, not
+    // `%GPS::Main`). So every payload maps to `Exif`, regardless of the pointer.
+    IfdKind::BigSubIfd(_, _) => TableRef::Exif,
   }
 }
 
@@ -3880,23 +3966,99 @@ impl Walker<'_, '_> {
     };
 
     // ---- SubIFD pointer tags (ExifOffset/GPSInfo/InteropOffset) ---------
-    // `if ($tagInfo and $$tagInfo{SubIFD}) { … ProcessBigIFD on each offset }`
-    // (`BigTIFF.pm:171-198`). ExifTool's `ProcessBigIFD` recurses a SubIFD as
-    // BigTIFF REUSING the INHERITED `Exif::Main` table (`Table => $tagTablePtr`,
-    // `:149`/`:172` — NOT switching to `GPS::Main` for a GPSInfo pointer) and
-    // names the family-1 directory from the POINTER TAG (`ExifOffset`/`GPSInfo`/
-    // `InteropOffset`, NOT `ExifIFD`/`GPS`/`InteropIFD`). Faithfully reproducing
-    // that (the Exif-table-reuse + pointer-tag-group model) is DEFERRED to a
-    // follow-up (it is crafted-only — the bundled `BigTIFF.btf` is a FLAT
-    // single-IFD image with NO SubIFD pointers — and needs crafted ExifOffset/
-    // GPSInfo fixtures). For now a BigTIFF SubIFD pointer is NOT recursed: the
-    // pointer tag emits nothing (the SubDirectory bogus-parent rule), which
-    // UNDER-emits a SubIFD-bearing BigTIFF rather than decoding it under the
-    // WRONG table/group (R1 finding). (#168 follow-up: faithful BigTIFF SubIFDs.)
+    // `if ($tagInfo and $$tagInfo{SubIFD}) { … process all SubIFD's as BigTIFF }`
+    // (`BigTIFF.pm:171-198`). All three pointer tags carry the `SubIFD` flag
+    // (`ExifOffset` `SubIFD => 2`; `GPSInfo`/`InteropOffset` `Flags => 'SubIFD'`,
+    // table-loaded to `SubIFD => 1`), so `is_sub_ifd()` is the faithful gate.
+    //
+    // ExifTool recurses each SubIFD offset via `ProcessBigIFD` REUSING the
+    // INHERITED `%Exif::Main` (`Table => $tagTablePtr`, `:172` — it does NOT honor
+    // the pointer's `SubDirectory{TagTable}` redirect, so a `GPSInfo` SubIFD is
+    // walked against `%Exif::Main`, not `%GPS::Main`) and names the family-1
+    // directory from the POINTER TAG (`$dirName = $$tagInfo{Name}`, `:191` —
+    // `ExifOffset`/`GPSInfo`/`InteropOffset`, NOT `ExifIFD`/`GPS`/`InteropIFD`).
+    // [`IfdKind::BigSubIfd`] carries that pointer kind: its `as_str` renders the
+    // pointer-tag group and [`table_for_ifd_kind`] forces `%Exif::Main`. Verified
+    // against bundled ExifTool 13.59 on the crafted `BigTIFF_subifd.btf`: the
+    // ExifOffset child emits `ExifOffset:ISO`/`ExifOffset:FNumber`, and the GPSInfo
+    // child's 0x0001/0x0002 resolve in `%Exif::Main` as `GPSInfo:InteropIndex` /
+    // `GPSInfo:InteropVersion` (NOT `GPS:GPSLatitudeRef`).
+    //
+    // NB: `ProcessBigIFD` has NO `Wrong format` integer-format gate for SubIFDs
+    // (unlike `ProcessExif` at `Exif.pm:6747`); it `ReadValue`s the pointer with
+    // the on-disk format and `split ' ', $val`s it. So no format gate here — decode
+    // the value with the on-disk `format`/`count` exactly as a leaf would.
     if let Some(sub) = sub_dir_for(tag_id, kind)
       && sub.is_sub_ifd()
     {
-      return Step::Keep; // deferred — emit nothing (no parent, no children)
+      // `my $val = ReadValue(...)` then `my @offsets = split ' ', $val; for
+      // ($i=0; $i<@offsets; ++$i) { ProcessDirectory(...) }` (`BigTIFF.pm:123`/
+      // `:184-198`). `ProcessBigIFD` recurses EVERY parsed offset (a count>1
+      // `int64u`/`ifd64` pointer carries several; a `string`/`undef` pointer is
+      // `split` numerically), not just the first, and gives the `$i`-th the
+      // `$i` group suffix. [`RawValue::subdir_offsets`] is the faithful
+      // `split ' ', $val` over the same `$val` string form `ReadValue` yields:
+      // each token numified to an offset (handling multi/signed/ASCII), in
+      // order. The single-offset camera shape collapses to one iteration,
+      // byte-identical to the prior `first_subdir_offset` walk.
+      if let Some(raw) = read_value(data, value_offset, format, count, read_len, order) {
+        for (i, off) in raw.subdir_offsets().into_iter().enumerate() {
+          // A negative / `> u64::MAX` / non-finite token is `None` (no seekable
+          // directory — `ProcessBigIFD` would `Bad SubDirectory start` it / the
+          // `Seek` would fail); a `Some(off)` that exceeds `usize` on this target
+          // is likewise unseekable. Skip this offset but KEEP its `$i` slot, so
+          // the next offset still takes the correct `$i+1` suffix (the Perl
+          // `for ($i...)` index advances regardless). An integer-shaped offset
+          // ABOVE `2^53` arrives here byte-exact (no `f64` precision loss), so a
+          // child IFD placed there recurses the CORRECT byte.
+          let Some(off) = off else {
+            continue;
+          };
+          let Ok(child_start) = usize::try_from(off) else {
+            continue;
+          };
+          // `$subdirName .= $i if $i` (`:188`) — the `$i`-th offset's family-1
+          // group is the pointer name + `$i` (`$i = 0` → no suffix). The index
+          // is a `usize`; a pointer with > `u32::MAX` offsets is structurally
+          // impossible (`size <= 0x7fffffff`, each offset ≥ 8 bytes ⇒ ≤ ~256M),
+          // but saturate defensively so the `u32` suffix is well-defined.
+          let i_suffix = u32::try_from(i).unwrap_or(u32::MAX);
+          // Recurse into the child BigTIFF IFD with the SAME 8-byte-width reader
+          // ([`walk_big_one_ifd`]) the parent used — the only difference from a
+          // classic SubIFD is the 64-bit count/offset widths, which that reader
+          // already handles. `kind = BigSubIfd(sub, $i)` forces `%Exif::Main`
+          // ([`table_for_ifd_kind`]) + the `$i`-suffixed pointer-tag group,
+          // faithful to `ProcessBigIFD`'s table-reuse + `$$tagInfo{Name}.$i`
+          // dir-naming.
+          //
+          // SAVE/SET/RESTORE the active table + warn count around EACH child's
+          // recursion, exactly as [`process_subdir`] does for a classic
+          // sub-IFD: `walk_big_one_ifd` does NOT touch `active_table` (it is set
+          // by `walk_big_ifd_chain`'s entry seed and otherwise inherited), so
+          // each child walk must run under the resolved child table and resume
+          // the PARENT's table + warn count before the next sibling (each
+          // SubIFD is its own `ProcessDirectory`, warn-counted independently
+          // from the parent's running total). (`order` is inherited unchanged —
+          // BigTIFF SubIFDs share the parent's byte order, `BigTIFF.pm` carries
+          // no per-SubIFD `ByteOrder`.) The ancestor-cycle guard
+          // ([`active_ifd_offsets`], pushed by `walk_big_one_ifd`) breaks a
+          // SubIFD pointing back at an ancestor; the chain `%PROCESSED` guard is
+          // NOT applied (a SubIFD is not a chain directory — `BigTIFF.pm:213`
+          // `last unless /^(IFD|SubIFD)\d*$/`).
+          let child_kind = IfdKind::BigSubIfd(sub, i_suffix);
+          let saved_table = self.active_table;
+          let saved_warn_count = self.warn_count;
+          self.active_table = table_for_ifd_kind(child_kind);
+          let _ = self.walk_big_one_ifd(child_start, child_kind);
+          self.warn_count = saved_warn_count;
+          self.active_table = saved_table;
+        }
+      }
+      // The SubIFD pointer was processed (every offset recursed, degenerate
+      // ones skipped) — a normal entry: [`Step::Keep`] (the pointer itself
+      // emits no leaf, matching `ProcessBigIFD`'s `if SubIFD { … } else {
+      // HandleTag }`).
+      return Step::Keep;
     }
 
     // ---- Leaf tag — decode with the ON-DISK format + emit ---------------
@@ -11955,6 +12117,198 @@ mod tests {
     assert!(
       meta.warnings().is_empty(),
       "clean BigTIFF raises no warnings: {:?}",
+      meta.warnings()
+    );
+  }
+
+  #[test]
+  fn bigtiff_subifd_pointer_recurses() {
+    // #240 — `ProcessBigIFD`'s `$$tagInfo{SubIFD}` recursion (`BigTIFF.pm:171-198`).
+    // IFD0 carries an ExifOffset (0x8769) pointer to a child ExifIFD (ISO 0x8827)
+    // AND a GPSInfo (0x8825) pointer to a child IFD whose 0x0001 tag proves the
+    // INHERITED-`%Exif::Main`-table reuse + pointer-tag GROUP naming:
+    //   - the ExifIFD child's ISO emits under group `ExifOffset` (the pointer
+    //     tag's `Name`, NOT `ExifIFD`);
+    //   - the GPS child's 0x0001 resolves in `%Exif::Main` as `InteropIndex`
+    //     under group `GPSInfo` (NOT `GPS:GPSLatitudeRef` — `ProcessBigIFD` does
+    //     NOT switch to `%GPS::Main` for a GPSInfo BigTIFF SubIFD).
+    let order = ByteOrder::Little;
+    // Layout: header(16) + IFD0[ count(8) + 2*entry(40) + next(8) = 56 ] = 72.
+    // Two child IFDs follow in the trailing block, at absolute offsets:
+    let exif_child_off: u64 = 72; // ExifIFD: count(8) + 1*entry(20) + next(8) = 36
+    let gps_child_off: u64 = exif_child_off + 36; // GPS child: same shape = 36
+
+    // IFD0: ExifOffset + GPSInfo pointers (LONG8 = code 16, count 1), ascending.
+    let exif_ptr = big_entry_inline(order, 0x8769, 16, 1, &exif_child_off.to_le_bytes());
+    let gps_ptr = big_entry_inline(order, 0x8825, 16, 1, &gps_child_off.to_le_bytes());
+
+    // ---- Build the trailing block: the two child IFDs. ----
+    let u64b = |v: u64| v.to_le_bytes();
+    let mut trailing: Vec<u8> = Vec::new();
+    // ExifIFD child: 1 entry — ISO (0x8827, int16u, inline 400).
+    trailing.extend_from_slice(&u64b(1)); // count
+    trailing.extend_from_slice(&big_entry_inline(
+      order,
+      0x8827,
+      3,
+      1,
+      &400u16.to_le_bytes(),
+    ));
+    trailing.extend_from_slice(&u64b(0)); // next (ignored for a SubIFD)
+    // GPS child: 1 entry — 0x0001 (ASCII "N", count 2) → InteropIndex in Exif::Main.
+    trailing.extend_from_slice(&u64b(1));
+    trailing.extend_from_slice(&big_entry_inline(order, 0x0001, 2, 2, b"N\x00"));
+    trailing.extend_from_slice(&u64b(0));
+
+    let data = minimal_bigtiff(order, &[exif_ptr, gps_ptr], &trailing);
+    assert_eq!(
+      data.len() as u64,
+      gps_child_off + 36,
+      "BigTIFF SubIFD layout sanity"
+    );
+
+    let meta = parse_borrowed(&data).expect("BigTIFF parses");
+    // The ExifIFD child's ISO recursed AND took the pointer-tag group.
+    let iso = meta
+      .entry("ISO")
+      .expect("BigTIFF ExifOffset SubIFD recursed → ISO");
+    assert_eq!(iso.tag_id(), 0x8827);
+    assert_eq!(
+      iso.group(),
+      "ExifOffset",
+      "BigTIFF SubIFD names the family-1 group from the pointer tag (BigTIFF.pm:191)"
+    );
+    // The GPS child resolved 0x0001 against the INHERITED %Exif::Main, NOT %GPS::Main.
+    let interop = meta
+      .entry("InteropIndex")
+      .expect("BigTIFF GPSInfo SubIFD reuses %Exif::Main → 0x0001 == InteropIndex");
+    assert_eq!(interop.tag_id(), 0x0001);
+    assert_eq!(
+      interop.group(),
+      "GPSInfo",
+      "a GPSInfo BigTIFF SubIFD groups under the pointer tag, with the Exif table"
+    );
+    assert!(
+      meta.entry("GPSLatitudeRef").is_none(),
+      "0x0001 must NOT resolve as a GPS tag (no %GPS::Main switch for a BigTIFF SubIFD)"
+    );
+    assert!(
+      meta.warnings().is_empty(),
+      "clean BigTIFF SubIFD recursion raises no warnings: {:?}",
+      meta.warnings()
+    );
+  }
+
+  /// #240 round 2 — `ProcessBigIFD` recurses EVERY parsed SubIFD offset (`my
+  /// @offsets = split ' ', $val; for ($i...)`, `BigTIFF.pm:184-198`), not just
+  /// the first, and not just an `int64u`/`ifd64` shape:
+  ///   - an ExifOffset `LONG8` count=2 pointer → TWO child ExifIFDs, the 2nd
+  ///     `$i`-suffixed (`ExifOffset:ISO` + `ExifOffset1:ISO`);
+  ///   - an ASCII-NUMERIC GPSInfo pointer (a `string` "180") → `split` numifies
+  ///     it → the GPS child recurses reusing `%Exif::Main` (`GPSInfo:
+  ///     InteropIndex`), which the old `U64`/`I64`-only `first_subdir_offset`
+  ///     returned `None` for (a `RawValue::Text`) and dropped.
+  ///
+  /// Oracle-confirmed on bundled ExifTool 13.59 (the conformance golden
+  /// `BigTIFF_subifd_multi.btf` pins the same output byte-exact).
+  #[test]
+  fn bigtiff_subifd_recurses_every_offset_and_ascii() {
+    let order = ByteOrder::Little;
+    // Layout: header(16) + IFD0[ count(8) + 3*entry(60) + next(8) = 76 ] = 92.
+    let p_ptr: u64 = 92; // ExifOffset value block: two LONG8 offsets (16 bytes)
+    let c0: u64 = p_ptr + 16; // ExifIFD child 0: count(8)+entry(20)+next(8) = 36
+    let c1: u64 = c0 + 36; // ExifIFD child 1 (same shape)
+    let g: u64 = c1 + 36; // GPS child (same shape)
+
+    // IFD0 entries (ascending tag id): Make, ExifOffset (LONG8 count2, OUT-of-line
+    // → the value block at p_ptr), GPSInfo (ASCII-numeric, INLINE "180").
+    let make = big_entry_inline(order, 0x010f, 2, 7, b"BigCam\0");
+    let exif_ptr = big_entry_offset(order, 0x8769, 16, 2, p_ptr);
+    let gps_text = {
+      let g_str = std::format!("{g}\0"); // decimal of the GPS child offset + NUL
+      let bytes = g_str.into_bytes();
+      assert!(bytes.len() <= 8, "ASCII GPS offset must be inline");
+      big_entry_inline(order, 0x8825, 2, bytes.len() as u64, &bytes)
+    };
+
+    // Trailing block: the ExifOffset value block (two offsets) then the children.
+    let u64b = |v: u64| v.to_le_bytes();
+    let mut trailing: Vec<u8> = Vec::new();
+    trailing.extend_from_slice(&u64b(c0)); // ExifOffset offset 0
+    trailing.extend_from_slice(&u64b(c1)); // ExifOffset offset 1
+    // ExifIFD child 0: ISO=400.
+    trailing.extend_from_slice(&u64b(1));
+    trailing.extend_from_slice(&big_entry_inline(
+      order,
+      0x8827,
+      3,
+      1,
+      &400u16.to_le_bytes(),
+    ));
+    trailing.extend_from_slice(&u64b(0));
+    // ExifIFD child 1: ISO=800.
+    trailing.extend_from_slice(&u64b(1));
+    trailing.extend_from_slice(&big_entry_inline(
+      order,
+      0x8827,
+      3,
+      1,
+      &800u16.to_le_bytes(),
+    ));
+    trailing.extend_from_slice(&u64b(0));
+    // GPS child: 0x0001 (ASCII "N", count 2) → InteropIndex in %Exif::Main.
+    trailing.extend_from_slice(&u64b(1));
+    trailing.extend_from_slice(&big_entry_inline(order, 0x0001, 2, 2, b"N\0"));
+    trailing.extend_from_slice(&u64b(0));
+
+    let data = minimal_bigtiff(order, &[make, exif_ptr, gps_text], &trailing);
+    assert_eq!(
+      data.len() as u64,
+      g + 36,
+      "multi-offset BigTIFF layout sanity"
+    );
+
+    let meta = parse_borrowed(&data).expect("BigTIFF parses");
+
+    // Offset 0 → group "ExifOffset" (no suffix), ISO 400.
+    let entries: Vec<_> = meta
+      .entries()
+      .iter()
+      .filter(|e| e.tag_id() == 0x8827)
+      .map(|e| (e.group().to_string(), e.value_ref().raw().clone()))
+      .collect();
+    assert!(
+      entries
+        .iter()
+        .any(|(g, v)| g == "ExifOffset" && *v == RawValue::U64(vec![400])),
+      "offset 0 → ExifOffset:ISO=400, got {entries:?}"
+    );
+    // Offset 1 → group "ExifOffset1" (the `$i` suffix), ISO 800 — the value the
+    // first-only `first_subdir_offset` walk DROPPED.
+    assert!(
+      entries
+        .iter()
+        .any(|(g, v)| g == "ExifOffset1" && *v == RawValue::U64(vec![800])),
+      "offset 1 → ExifOffset1:ISO=800 (the dropped second offset), got {entries:?}"
+    );
+    // The ASCII-numeric GPSInfo pointer recursed (the dropped `RawValue::Text`
+    // case): 0x0001 resolved in %Exif::Main as InteropIndex under group GPSInfo.
+    let interop = meta
+      .entry("InteropIndex")
+      .expect("ASCII-numeric GPSInfo SubIFD recursed → InteropIndex");
+    assert_eq!(interop.tag_id(), 0x0001);
+    assert_eq!(
+      interop.group(),
+      "GPSInfo",
+      "ASCII GPSInfo SubIFD groups under the pointer tag, reusing %Exif::Main"
+    );
+    assert!(
+      meta.entry("GPSLatitudeRef").is_none(),
+      "0x0001 must NOT resolve as a GPS tag (no %GPS::Main switch)"
+    );
+    assert!(
+      meta.warnings().is_empty(),
+      "clean multi-offset BigTIFF recursion raises no warnings: {:?}",
       meta.warnings()
     );
   }

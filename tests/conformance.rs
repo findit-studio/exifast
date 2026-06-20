@@ -8321,6 +8321,95 @@ fn exif_conformance() {
   check("Exif.tif", "Exif.tif.n.json", false);
 }
 #[test]
+fn bigtiff_subifd_conformance() {
+  // #240 — BigTIFF SubIFD pointer recursion (`ProcessBigIFD`'s `$$tagInfo{SubIFD}`
+  // branch, `BigTIFF.pm:171-198`). The bundled `BigTIFF.btf` is a FLAT single-IFD
+  // image with NO SubIFD pointers, so it never exercises the recursion; this is a
+  // CRAFTED BigTIFF (version 43, 8-byte offsets — `tools/gen_bigtiff_subifd_fixture.py`)
+  // whose little-endian IFD0 carries Make/Model plus an ExifOffset (0x8769) pointer
+  // to an ExifIFD (ExposureTime/FNumber/ISO/ExifVersion) AND a GPSInfo (0x8825)
+  // pointer to a GPS IFD (GPSVersionID/Ref/Latitude bytes).
+  //
+  // It pins the FAITHFUL recursion semantics — verified against bundled ExifTool
+  // 13.59 (the gap proof + oracle): `ProcessBigIFD` recurses EVERY SubIFD pointer
+  // REUSING the inherited `%Exif::Main` (NOT the pointer's `SubDirectory{TagTable}`)
+  // and names the family-1 dir from the POINTER TAG (`$$tagInfo{Name}`). So:
+  //   - the ExifIFD child emits `ExifOffset:ExposureTime`/`FNumber`/`ISO`/`ExifVersion`
+  //     (group `ExifOffset`, NOT `ExifIFD`);
+  //   - the GPS child's 0x0001/0x0002 resolve in `%Exif::Main` (NOT `%GPS::Main`),
+  //     so they emit as `GPSInfo:InteropIndex` ("Unknown (N)") / `GPSInfo:InteropVersion`
+  //     ("37 48 30"), NOT `GPS:GPSLatitudeRef`/`GPS:GPSLatitude`.
+  // The ported EXIF Composites (`Aperture`/`ShutterSpeed`/`LightValue`, built from
+  // the ExifOffset child's FNumber/ExposureTime) are kept (EXIF is Composite
+  // allow-listed, #133); `gen_golden.sh` strips only `System:*` for this fixture.
+  check("BigTIFF_subifd.btf", "BigTIFF_subifd.btf.json", true);
+  check("BigTIFF_subifd.btf", "BigTIFF_subifd.btf.n.json", false);
+}
+
+#[test]
+fn bigtiff_subifd_multi_offset_conformance() {
+  // #240 Codex round 2 — `ProcessBigIFD` recurses EVERY parsed SubIFD offset,
+  // not just the first, and not just an `int64u`/`ifd64` shape: it `ReadValue`s
+  // the pointer, `my @offsets = split ' ', $val`s the resulting STRING, and
+  // recurses each token (`BigTIFF.pm:184-198`) with NO integer-format gate. The
+  // R1 `BigTIFF_subifd.btf` fixture uses LONG8 count=1 pointers, so it cannot
+  // catch the first-only / integer-only regression. This CRAFTED BigTIFF
+  // (little-endian, 8-byte offsets) exercises BOTH gaps in one file:
+  //   - an ExifOffset (0x8769) `LONG8` count=2 pointer → TWO child ExifIFDs.
+  //     ExifTool walks both and `$subdirName .= $i if $i`-suffixes the family-1
+  //     group of the 2nd: `ExifOffset:ISO` (400) + `ExifOffset1:ISO` (800)
+  //     (oracle-confirmed on bundled 13.59; the first-only walk dropped 800);
+  //   - a GPSInfo (0x8825) ASCII-NUMERIC pointer (a `string` whose text "180"
+  //     is the child offset). `split ' ', "180"` numifies it → offset 180, so
+  //     the GPS child recurses REUSING `%Exif::Main`: `GPSInfo:InteropIndex`
+  //     ("Unknown (N)" / "N"), NOT `%GPS::Main` (the U64/I64-only extractor
+  //     returned None for this `RawValue::Text` and dropped it entirely).
+  // ISO-only children carry no FNumber/ExposureTime, so NO `Composite:*` is
+  // synthesized — the golden is File:/IFD0:/ExifOffset*:/GPSInfo: only (no
+  // EXCLUDE arm; `gen_golden.sh` strips `System:*` via COMMON).
+  check(
+    "BigTIFF_subifd_multi.btf",
+    "BigTIFF_subifd_multi.btf.json",
+    true,
+  );
+  check(
+    "BigTIFF_subifd_multi.btf",
+    "BigTIFF_subifd_multi.btf.n.json",
+    false,
+  );
+}
+
+#[test]
+fn bigtiff_subifd_exp_offset_conformance() {
+  // #240 round-2 follow-up (the Codex [medium] finding) — `ProcessBigIFD` numifies
+  // the `split ' ', $val` SubIFD-offset token in Perl numeric context, i.e. via
+  // Perl's FULL string→number grammar (fraction + exponent), NOT a leading-decimal-
+  // digit run. A digit-prefix-only reader coerces an ASCII pointer `"1e3"` to 1 and
+  // recurses at byte 1 (dropping the child); Perl `0 + "1e3" == 1000`, so the child
+  // is at byte 1000. This CRAFTED BigTIFF (little-endian, 8-byte offsets —
+  // `tools/gen_bigtiff_subifd_fixture.py <out> exp`) has IFD0 carry Make/Model plus
+  // a GPSInfo (0x8825) pointer whose VALUE is the ASCII string `"1e3"`, with the GPS
+  // child IFD placed at absolute byte 1000.
+  //
+  // Ground-truthed against bundled ExifTool 13.59: it recurses the child at byte
+  // 1000, REUSING the inherited `%Exif::Main` (so 0x0001/0x0002 → `GPSInfo:
+  // InteropIndex` "Unknown (N)" / `GPSInfo:InteropVersion` "37 48 30", NOT
+  // `%GPS::Main`). The GPS-only child carries no FNumber/ExposureTime ⇒ no
+  // `Composite:*` is synthesized; `gen_golden.sh` strips only `System:*`.
+  // Pins [`crate::convert::perl_str_to_f64`]-based offset coercion: the child tags
+  // appear iff exifast recurses at the Perl-coerced 1000 (the pre-fix 1 dropped them).
+  check(
+    "BigTIFF_subifd_exp.btf",
+    "BigTIFF_subifd_exp.btf.json",
+    true,
+  );
+  check(
+    "BigTIFF_subifd_exp.btf",
+    "BigTIFF_subifd_exp.btf.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_eofoverrun_chain_conformance() {
   // PR #36 Codex R14 F1 — IFD0 entry 1 is an out-of-line value (Software)
   // that overruns EOF, with a VALID entry 2 (Orientation) AFTER it AND a
