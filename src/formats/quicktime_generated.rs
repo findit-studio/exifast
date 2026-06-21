@@ -15,7 +15,7 @@ use super::ConvlessAtom;
 
 /// `%QuickTime::UserData` (g0 `QuickTime`, g1 `UserData`) conv-less plain-string atoms,
 /// keyed by the raw 4-character-code bytes (the `©`-prefixed and `FOV\0`
-/// atoms carry their non-ASCII bytes verbatim). 7 atoms.
+/// atoms carry their non-ASCII bytes verbatim). 9 atoms.
 pub static QUICKTIME_USERDATA_CONVLESS: &[ConvlessAtom<&[u8]>] = &[
   ConvlessAtom::new(&[0x47, 0x6f, 0x50, 0x72], "GoProType"),
   ConvlessAtom::new(&[0x4c, 0x45, 0x4e, 0x53], "LensSerialNumber"),
@@ -24,6 +24,8 @@ pub static QUICKTIME_USERDATA_CONVLESS: &[ConvlessAtom<&[u8]>] = &[
   ConvlessAtom::new(&[0xa9, 0x67, 0x70, 0x74], "CameraPitch"),
   ConvlessAtom::new(&[0xa9, 0x67, 0x79, 0x77], "CameraYaw"),
   ConvlessAtom::new(&[0xa9, 0x67, 0x72, 0x6c], "CameraRoll"),
+  ConvlessAtom::new(&[0xa9, 0x66, 0x6d, 0x74], "Format"),
+  ConvlessAtom::new(&[0xa9, 0x69, 0x6e, 0x66], "Information"),
 ];
 
 /// `%QuickTime::Keys` (g0 `QuickTime`, g1 `Keys`) conv-less plain-string atoms,

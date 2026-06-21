@@ -120,18 +120,18 @@ const NOT_ACTIVE: &[&str] = &[
   // exifast emits all 45 `Samsung:*` Type2 leaves — the SAME surface as the
   // already-active NX500 — byte-exact vs bundled ExifTool 13.59.)
   "QuickTime_gopro_hero6_gpmf.mp4",
-  // #342/#336: two real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS)
-  // ship full bundled goldens + #[ignore]'d conformance tests, but exifast does
-  // not yet emit the full tag set (the parsers need completion — #122 Parrot,
-  // #138 LigoGPS). Accept-deferred here until activated; #342 added them but
-  // missed this NOT_ACTIVE entry, leaving main red on the auto-discovered
-  // active-fixture parity check.
+  // #342/#336: the Parrot Anafi mett fixture ships a full bundled golden +
+  // #[ignore]'d conformance test, but exifast does not yet emit its full tag set
+  // (the #122 Parrot parser needs completion). Accept-deferred here until
+  // activated.
+  // (#138 `MP4_viofo_a119_gps.mp4` was here too but is now ACTIVE — the #348
+  // dual-`hdlr` per-track Handler dedup landed, so its no-`ee` `.json`/`.n.json`
+  // are byte-exact, see `conformance.rs::mp4_viofo_a119_gps_conformance`.)
   // (#130 MISB KLV M2TS was here too but is now ACTIVE: this fixture's PMT
   // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
   // PID — and the file carries no SMPTE/MISB universal label, so bundled
   // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
   "MP4_parrot_anafi.mp4",
-  "MP4_viofo_a119_gps.mp4",
   // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
   // bundled goldens for the #173 MakerNote conditional branches, but their
   // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
@@ -175,15 +175,18 @@ const NOT_ACTIVE: &[&str] = &[
   "QuickTime_insta360_real.insv",
   // The #285 round-2 real-device fixtures (#109/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
-  // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect, the
-  // Rove dashcam GPS). Their no-ee .json carries tags exifast does not yet emit,
-  // so accept-deferred here until each port lands (then they move to active).
+  // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect).
+  // Their no-ee .json carries tags exifast does not yet emit, so accept-deferred
+  // here until each port lands (then they move to active).
   // `DJI_Matrice30T.jpg` (#114) is now ACTIVE — the JFIF/MPF/DJI-thermal port
   // landed (`src/exif/jpeg_app.rs`), byte-exact at both `-j`/`-n` (see
   // `tests/conformance.rs::dji_matrice30t_conformance`).
+  // (#100 `QuickTime_rove_r2_4k.MP4` was here too but is now ACTIVE — the #348
+  // dual-`hdlr` per-track Handler dedup + the `©fmt`/`©inf` UserData atoms landed,
+  // so its no-`ee` `.json`/`.n.json` are byte-exact, see
+  // `conformance.rs::quicktime_rove_r2_4k_conformance`.)
   "DJI_M3T_thermal.RJPEG",
   "Insta360ONE_equirectangular.jpg",
-  "QuickTime_rove_r2_4k.MP4",
   // The BlackVue DR770X (#213) dashcam fixture — dropped with goldens +
   // #[ignore]d conformance test pending its port (BlackVue GPS/accelerometer/
   // embedded-JSON). Its no-ee .json carries tags exifast does not yet emit, so
@@ -861,7 +864,15 @@ const NOT_ACTIVE: &[&str] = &[
 /// ARW) both activate byte-exact — the IFD0:PreviewImage proof of the `DataTag`
 /// P2 wiring. The set's `DNG_preview_image.dng` is NOT_ACTIVE (its SubIFD walk is
 /// deferred to #352), so the bump is +2 (not +3).
-const EXPECTED_ACTIVE_FIXTURES: usize = 560;
+///
+/// 560 → 562 after `MP4_viofo_a119_gps.mp4` (#138) + `QuickTime_rove_r2_4k.MP4`
+/// (#100) activated — the #348 dual-`hdlr` per-track Handler dedup (the FINAL
+/// `trak`'s `minf/hdlr` data handler owns the bare `Track<N>:Handler*` key,
+/// every earlier `trak` keeps its `mdia/hdlr` media handler; the MP4→M4A
+/// FileType decision keys on the file-global `HasHandler` set) makes both dashcam
+/// MP4s' no-`ee` `.json`/`.n.json` byte-exact; rove also needed the `©fmt`/`©inf`
+/// (Format/Information) conv-less `udta` atoms (NOVATEK chipset).
+const EXPECTED_ACTIVE_FIXTURES: usize = 562;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

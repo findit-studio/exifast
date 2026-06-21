@@ -77,5 +77,9 @@
   "Track2:AudioBitsPerSample": 16,
   "Track2:AudioSampleRate": 32000,
   "UserData:Format": "NOVATEK",
-  "UserData:Information": "DEMO1"
+  "UserData:Information": "DEMO1",
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736,
+  "Composite:AvgBitrate": 20603946,
+  "Composite:Rotation": 0
 }]

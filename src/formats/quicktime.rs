@@ -59,10 +59,10 @@ use crate::{
     insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
   },
   metadata::{
-    AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
-    GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta,
-    LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
-    SampleDescRoute, SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
+    AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DataReferenceHandler,
+    DjiProtobufMeta, GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta,
+    HandlerBox, Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
+    QuickTimeStreamMeta, SampleDescRoute, SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -190,6 +190,13 @@ pub const QUICKTIME_USERDATA_CONVLESS_ALLOW: &[&str] = &[
   "CameraPitch",
   "CameraYaw",
   "CameraRoll",
+  // `©fmt` Format (QuickTime.pm:1630) / `©inf` Information (1633): bare `'Name'`
+  // international-text atoms (NOVATEK/Novatek-chipset dashcams write
+  // `Format = NOVATEK`, `Information = DEMO1` in `moov/udta`). No
+  // RawConv/ValueConv/PrintConv/Avoid ⇒ conv-less, emitted verbatim under
+  // `QuickTime:UserData`.
+  "Format",
+  "Information",
 ];
 
 /// The `xtask --kind quicktime` allowlist of `%QuickTime::Keys` atoms verified
@@ -3075,6 +3082,61 @@ fn meta_box_routing_handler(body: &[u8], body_offset: usize) -> Option<String> {
   handler
 }
 
+/// Push EVERY `hdlr` HandlerType code a `meta` box carries onto the file-global
+/// HasHandler accumulator (`$$self{HasHandler}{$val} = 1`, QuickTime.pm:8414 — set
+/// in the `%QuickTime::Handler` RawConv for EACH `hdlr` box the file contains, at
+/// ANY level). Unlike [`meta_box_routing_handler`] (which suppresses the routing
+/// update for an `alis`/`url ` data-reference handler, QuickTime.pm:8412), the
+/// `HasHandler` set records ALL codes including `alis`/`url ` — so this collector
+/// does NOT filter them. It is the NON-track contribution to the file-global set:
+/// a top-level (`%QuickTime::Main`, `body_offset` 4), `moov`/`trak` (`%Movie`/
+/// `%Track`, offset 0) or `udta` (`%UserData`, offset 4) `meta/hdlr`. The MP4→M4A
+/// FileType override (QuickTime.pm:10621-10622) keys on this file-global set, so a
+/// non-track `meta/hdlr` = `soun` (no `soun` `trak`) still flips MP4→M4A, and a
+/// non-track `meta/hdlr` = `vide` still SUPPRESSES the override on an audio-only
+/// file — ground-truthed vs bundled ExifTool 13.59.
+fn collect_meta_box_handler_codes(body: &[u8], body_offset: usize, sink: &mut Vec<String>) {
+  let region = body.get(body_offset..).unwrap_or_default();
+  // A throwaway warning sink — Pass 1's `walk_meta` already surfaced any
+  // malformed-child warning for this same box; this read MUST NOT double-report.
+  let mut warn_sink: Option<String> = None;
+  walk_atoms(
+    0,
+    region,
+    0,
+    region.len(),
+    &mut warn_sink,
+    |atom, abody, _w| {
+      if &atom.atom_type == b"hdlr"
+        && let Some(code) = decode_hdlr(abody)
+      {
+        sink.push(code);
+      }
+    },
+  );
+}
+
+/// Push EVERY `meta`-box `hdlr` code nested in a `udta` body onto the file-global
+/// HasHandler accumulator (the `%UserData` `meta` is `Start => 4`,
+/// QuickTime.pm:1690-1691). The `udta` counterpart to
+/// [`collect_meta_box_handler_codes`] — same all-codes (no `alis`/`url ` filter)
+/// `HasHandler` semantics — for a `moov/udta/meta` or `trak/udta/meta`.
+fn collect_udta_meta_handler_codes(udta_body: &[u8], sink: &mut Vec<String>) {
+  let mut warn_sink: Option<String> = None;
+  walk_atoms(
+    0,
+    udta_body,
+    0,
+    udta_body.len(),
+    &mut warn_sink,
+    |atom, abody, _w| {
+      if &atom.atom_type == b"meta" {
+        collect_meta_box_handler_codes(abody, 4, sink);
+      }
+    },
+  );
+}
+
 /// The WALK-LEVEL routing HandlerType a `udta/meta` box sets, read from a `udta`
 /// body. The `%QuickTime::UserData` table (QuickTime.pm:1585) routes a `meta`
 /// child through `%QuickTime::Meta` with `Start => 4` (QuickTime.pm:1690-1691),
@@ -3133,6 +3195,7 @@ fn decode_moov_trak(
   qt: &mut QuickTimeMeta,
   warning: &mut Option<String>,
   handler_so_far: &mut Option<String>,
+  file_handlers: &mut Vec<String>,
 ) {
   // ExifTool's `$track` counter is a `my` local of THIS `moov`'s `ProcessMOV`
   // invocation (QuickTime.pm:9944), starting undef⇒0 and `++`-incremented per
@@ -3163,6 +3226,10 @@ fn decode_moov_trak(
       // (Keys/ItemList) already ran in Pass 1; here we read ONLY its routing
       // handler.
       b"meta" => {
+        // The file-global `HasHandler` set (QuickTime.pm:8414) records this
+        // NON-track `moov/meta` `hdlr` — including `alis`/`url ` — so it feeds the
+        // MP4→M4A FileType override even with no matching `trak`.
+        collect_meta_box_handler_codes(ibody, 0, file_handlers);
         if let Some(h) = meta_box_routing_handler(ibody, 0) {
           *handler_so_far = Some(h);
         }
@@ -3172,13 +3239,14 @@ fn decode_moov_trak(
       // (Make/Model/…) already decoded in Pass 1; here we read ONLY the routing
       // handler of a `meta` box nested in this `moov/udta` (case F).
       b"udta" => {
+        collect_udta_meta_handler_codes(ibody, file_handlers);
         if let Some(h) = udta_meta_routing_handler(ibody) {
           *handler_so_far = Some(h);
         }
       }
       b"trak" => {
         track_num += 1; // QuickTime.pm:10354 `++$track`
-        let mut track = walk_trak_threaded(1, ibody, movie_ts, handler_so_far);
+        let mut track = walk_trak_threaded(1, ibody, movie_ts, handler_so_far, file_handlers);
         track.set_track_group(track_num);
         qt.push_track(track);
       }
@@ -3200,9 +3268,16 @@ fn decode_moov_trak(
 #[cfg(test)]
 fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
   // A standalone `trak` with no inbound cross-`trak` handler state: seed an empty
-  // file-global routing handler local to this call.
+  // file-global routing handler + HasHandler accumulator local to this call.
   let mut handler_so_far: Option<String> = None;
-  walk_trak_threaded(depth, payload, movie_timescale, &mut handler_so_far)
+  let mut file_handlers: Vec<String> = Vec::new();
+  walk_trak_threaded(
+    depth,
+    payload,
+    movie_timescale,
+    &mut handler_so_far,
+    &mut file_handlers,
+  )
 }
 
 /// Walk one `trak` atom like [`walk_trak`], threading the FILE-GLOBAL routing
@@ -3224,6 +3299,7 @@ fn walk_trak_threaded(
   payload: &[u8],
   movie_timescale: Option<u32>,
   handler_so_far: &mut Option<String>,
+  file_handlers: &mut Vec<String>,
 ) -> MediaTrack {
   let mut track = MediaTrack::new();
   let mut track_warning: Option<String> = None;
@@ -3265,6 +3341,10 @@ fn walk_trak_threaded(
         // in file order is too late (the `stsd` already decoded under the prior
         // handler) — the file-order walk handles that naturally.
         b"meta" => {
+          // A `trak/meta` `hdlr` ALSO enters the file-global `HasHandler` set
+          // (QuickTime.pm:8414 is `$$self`-scoped, not per-trak) — collected here
+          // alongside the routing update (incl. `alis`/`url `).
+          collect_meta_box_handler_codes(body, 0, file_handlers);
           if let Some(h) = meta_box_routing_handler(body, 0) {
             *handler_so_far = Some(h);
           }
@@ -3274,6 +3354,7 @@ fn walk_trak_threaded(
         // camera atoms already decoded in Pass 1; here we read ONLY the routing
         // handler of a `meta` box nested in this `trak/udta`.
         b"udta" => {
+          collect_udta_meta_handler_codes(body, file_handlers);
           if let Some(h) = udta_meta_routing_handler(body) {
             *handler_so_far = Some(h);
           }
@@ -3307,11 +3388,28 @@ fn walk_trak_threaded(
                   if code != "alis" && code != "url " {
                     *handler_so_far = Some(code.clone());
                   }
+                  // Accumulate EVERY walked `hdlr` code for the no-`ee` EEWarn
+                  // (it runs the `%Handler` HandlerType RawConv per box —
+                  // QuickTime.pm:8407-8414), separate from the single-slot
+                  // `handler_code` tag value.
+                  track.push_handler_code(code.clone());
                   track.set_handler_code(code);
                 }
                 track.set_handler_class(decode_hdlr_class(ibody));
                 track.set_handler_vendor_id(decode_hdlr_vendor_id(ibody));
                 track.set_handler_description(decode_hdlr_description(ibody));
+                // Record this MEDIA `hdlr` as a walked box (file order) for the
+                // per-field LAST-in-file-order Handler resolution — the same four
+                // `%Handler` fields ExifTool extracts here, captured at the box's
+                // actual parse position (BEFORE any `minf/hdlr` in a normal
+                // `mdia(hdlr, minf)`, but AFTER the `minf/hdlr` in a reordered
+                // `mdia(minf, hdlr)`). NO media-before-data assumption is baked in.
+                track.push_handler_box(HandlerBox::new(
+                  decode_hdlr_class(ibody),
+                  decode_hdlr(ibody),
+                  decode_hdlr_vendor_id(ibody),
+                  decode_hdlr_description(ibody),
+                ));
               }
               // `minf` holds the audio media header (`smhd` Balance) and the
               // sample table (`stbl/stsd`). The `stsd` first-entry format 4cc is
@@ -3347,7 +3445,69 @@ fn walk_trak_threaded(
                     // leaves `MediaType`/`handler_code` untouched). A data-reference
                     // (`alis`/`url `) does not change it (QuickTime.pm:8412).
                     b"hdlr" => {
-                      if let Some(code) = decode_hdlr(mbody)
+                      // ExifTool extracts the FULL `%Handler` triplet (HandlerClass
+                      // / HandlerType / HandlerVendorID / HandlerDescription) for
+                      // EVERY `hdlr` it walks, INCLUDING this `minf/hdlr` data
+                      // handler (QuickTime.pm:7319-7322 → `%QuickTime::Handler`),
+                      // all into the same `Track<N>` family-1 group. Capture it on
+                      // the track's `data_handler` slot so the per-track Handler
+                      // dedup (in the emission) can choose it for the FINAL `trak`.
+                      let code = decode_hdlr(mbody);
+                      // Accumulate EVERY `minf/hdlr` code for the no-`ee` EEWarn
+                      // (one push per walked `hdlr` box, INCLUDING a repeated
+                      // `minf`), separate from the single last-contentful
+                      // `data_handler` triplet slot below — so a `meta` data
+                      // handler that a LATER `minf/hdlr` (`url `) overwrites
+                      // still triggers the warning. An all-undef `minf/hdlr`
+                      // (`code` is `None`) contributes nothing here.
+                      if let Some(code) = &code {
+                        track.push_handler_code(code.clone());
+                      }
+                      // Build the candidate `%Handler` fields for THIS
+                      // `minf/hdlr`, then fold them into the track's data-handler
+                      // slot PER FIELD (last-Some) — but ONLY when the candidate
+                      // carries content (any of HandlerClass / HandlerType /
+                      // HandlerVendorID / HandlerDescription decoded to `Some`).
+                      // A fully-undef box (a short/empty/all-zero `minf/hdlr`
+                      // whose every field is `None`) extracts NO tag in bundled
+                      // ExifTool — its `HandlerType` RawConv yields nothing
+                      // usable — so it must be a NO-OP: it can neither own a bare
+                      // `Track<N>:Handler*` key, suppress the `mdia/hdlr` media
+                      // handler, NOR clear a valid earlier data handler. A
+                      // repeated-`minf` track (`url ` then a later short box)
+                      // therefore KEEPS the `url ` fields — the empty box does
+                      // not erase them. A CODED-or-classed box merges its OWN
+                      // present fields over the slot (`merge_from` last-Some), so
+                      // the slot holds the per-field LAST data-handler value
+                      // across every `minf/hdlr` (matching ExifTool's
+                      // last-extracted `%Handler` `FoundTag` PER FIELD — each of
+                      // the four is independent). A `url ` full then a class-only
+                      // `dhlr` keeps `url `'s HandlerType/Description and takes
+                      // the later HandlerClass.
+                      let mut candidate = DataReferenceHandler::default();
+                      candidate.set_class(decode_hdlr_class(mbody));
+                      candidate.set_code(code.clone());
+                      candidate.set_vendor_id(decode_hdlr_vendor_id(mbody));
+                      candidate.set_description(decode_hdlr_description(mbody));
+                      // Record this DATA `hdlr` as a walked box (file order) for
+                      // the per-field LAST-in-file-order Handler resolution,
+                      // BEFORE the content-gated `data_handler` fold below. Every
+                      // `minf/hdlr` is recorded at its actual parse position —
+                      // including a fully-undef box (it wins no field, so it needs
+                      // no `has_content` gate here; the resolver skips its `None`
+                      // fields). The merged `data_handler` slot stays content-gated
+                      // (the existing accessor/projection contract) — the resolver
+                      // now reads `handler_boxes`, not that slot.
+                      track.push_handler_box(HandlerBox::new(
+                        candidate.class().map(str::to_owned),
+                        candidate.code().map(str::to_owned),
+                        candidate.vendor_id().map(str::to_owned),
+                        candidate.description().map(str::to_owned),
+                      ));
+                      if candidate.has_content() {
+                        track.merge_data_handler(&candidate);
+                      }
+                      if let Some(code) = code
                         && code != "alis"
                         && code != "url "
                       {
@@ -5820,6 +5980,17 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `trak/udta/meta`, `mdia/hdlr` or `minf/hdlr` updates it as the walk reaches
   // each — read ONLY at `stsd`-decode time, so NO source is missed.
   let mut handler_so_far: Option<String> = None;
+  // **#348 — the FILE-GLOBAL `HasHandler` set** (`$$self{HasHandler}`,
+  // QuickTime.pm:8414): EVERY NON-track `meta`-box `hdlr` code the walk encounters
+  // at ANY level (file-level `meta`, `moov/meta`, `moov/udta/meta`, `trak/meta`,
+  // `trak/udta/meta`), collected here in file order. The per-track `mdia/hdlr` +
+  // `minf/hdlr` codes are NOT duplicated into this Vec — they already live on each
+  // [`MediaTrack::all_handler_codes`] — so the file-global `HasHandler` set is the
+  // UNION of this Vec and every track's `all_handler_codes` (computed below in the
+  // MP4→M4A `has_handler` closure). A `meta/hdlr` = `soun` with no `soun` `trak`
+  // therefore still flips MP4→M4A, and a non-track `meta/hdlr` = `vide` suppresses
+  // the override on an audio-only file (ground-truthed vs bundled ExifTool 13.59).
+  let mut file_handlers: Vec<String> = Vec::new();
   let mut pos = 0usize;
   while pos < scan_end {
     // A top-level size-0 atom (`ExtendsToEof`) STOPS the walk with NO payload
@@ -5844,12 +6015,23 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       // (Keys/ItemList) are decoded elsewhere; here we read ONLY its routing
       // handler.
       b"meta" => {
+        // A FILE-LEVEL `meta` `hdlr` enters the file-global `HasHandler` set
+        // (QuickTime.pm:8414, incl. `alis`/`url `) — so a top-level `meta/hdlr` =
+        // `soun` with no `trak` still drives the MP4→M4A override.
+        collect_meta_box_handler_codes(body, 4, &mut file_handlers);
         if let Some(h) = meta_box_routing_handler(body, 4) {
           handler_so_far = Some(h);
         }
       }
       b"moov" => {
-        decode_moov_trak(body, movie_ts, &mut qt, &mut warning, &mut handler_so_far);
+        decode_moov_trak(
+          body,
+          movie_ts,
+          &mut qt,
+          &mut warning,
+          &mut handler_so_far,
+          &mut file_handlers,
+        );
       }
       _ => {}
     }
@@ -5879,25 +6061,54 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // ```
   //
   // `$$et{save_ftyp}` is the `ftyp` MAJOR brand (the first 4 bytes,
-  // QuickTime.pm:9990-9991) — here `qt.major_brand()`. `$$et{HasHandler}{$h}`
-  // records every `hdlr` HandlerType seen (QuickTime.pm:8414); `soun`/`vide`
-  // only ever appear as the MEDIA handler in `trak/mdia/hdlr` (SP1's sole
-  // `hdlr` decode site), so the per-track handler codes are the faithful
-  // source for these two keys. The override fires only when the resolved type
-  // is MP4, the major brand starts with `iso`/`dash`/`mp42`, at least one
-  // track is a `soun` handler, and NO track is a `vide` handler — flipping the
-  // common audio-only `.m4a` (e.g. `ftyp isom` + a lone `soun` track) to
-  // `File:FileType=M4A` / `File:MIMEType=audio/mp4`. `OverrideFileType`
-  // additionally rewrites `FileTypeExtension` to `uc($fileTypeExt{M4A} //
-  // 'M4A') = 'M4A'` (PrintConv `lc` ⇒ `m4a`); the engine derives that from
-  // the new `file_type` via the shared `resolve_file_type`, so setting the
-  // type + MIME here is sufficient (verified vs bundled ExifTool 13.58).
+  // QuickTime.pm:9990-9991) — here `qt.major_brand()`. `$$et{HasHandler}{$h}` is
+  // the FILE-GLOBAL set of EVERY `hdlr` HandlerType `$val` the walk saw
+  // (QuickTime.pm:8414 `$$self{HasHandler}{$val} = 1` runs in the `%Handler`
+  // RawConv for EACH `hdlr` box the file contains, at ANY level — the per-track
+  // `mdia/hdlr` MEDIA handler and every nested `mdia/minf/hdlr` DATA handler, AND
+  // every NON-track `meta/hdlr`: a top-level `meta`, a `moov/meta`, a
+  // `moov/udta/meta`, a `trak/meta`, a `trak/udta/meta`). The faithful source for
+  // the `soun`/`vide` keys is therefore the UNION of the per-track
+  // [`MediaTrack::all_handler_codes`] (the `mdia/hdlr` + `minf/hdlr` codes) and the
+  // file-global `file_handlers` Vec (#348 — the non-track `meta/hdlr` codes
+  // collected during the Pass-2 walk), NOT the single `mdia/hdlr` `handler_code()`
+  // media 4cc. So a nested `minf/hdlr` = `vide` SUPPRESSES the override even when
+  // every track's MEDIA handler is `soun`, AND a non-track `meta/hdlr` = `soun`
+  // with NO `soun` `trak` STILL flips MP4→M4A (a non-track `meta/hdlr` = `vide`
+  // suppresses an audio-only file) — ALL ground-truthed vs bundled 13.59:
+  //   * a lone `soun` `mdia/hdlr` + a `minf/hdlr` = `url ` ⇒ `M4A`; the SAME bytes
+  //     with the `minf/hdlr` = `vide` ⇒ `MP4` / `video/mp4`;
+  //   * a `moov/meta/hdlr` = `soun` with NO `trak` ⇒ `M4A` / `audio/mp4`;
+  //   * a `soun` `trak` + a `moov/meta/hdlr` = `vide` ⇒ `MP4` / `video/mp4`.
+  // This mirrors the EEWarn (R4) and Handler-tag (R8) consumers, which already read
+  // the all-`hdlr` per-track model; the trak-scoped `MediaType` consumers (the
+  // `stts` VideoFrameRate gate, QuickTime.pm:7412) stay on `handler_code()` because
+  // `$$self{MediaType}` is set ONLY for a `mdia/hdlr` (parent path `Media`,
+  // QuickTime.pm:8413), not a nested `minf/hdlr` or a `meta/hdlr` code — so a
+  // non-track/`minf` `hdlr` updates the file-global `HasHandler` WITHOUT touching
+  // the trak-scoped `MediaType`/VideoFrameRate.
+  //
+  // The override fires only when the resolved type is MP4, the major brand
+  // starts with `iso`/`dash`/`mp42`, some `hdlr` is `soun`, and NO `hdlr` is
+  // `vide` — flipping the common audio-only `.m4a` (e.g. `ftyp isom` + a lone
+  // `soun` track) to `File:FileType=M4A` / `File:MIMEType=audio/mp4`.
+  // `OverrideFileType` additionally rewrites `FileTypeExtension` to
+  // `uc($fileTypeExt{M4A} // 'M4A') = 'M4A'` (PrintConv `lc` ⇒ `m4a`); the
+  // engine derives that from the new `file_type` via the shared
+  // `resolve_file_type`, so setting the type + MIME here is sufficient.
+  let has_handler = |code: &str| {
+    file_handlers.iter().any(|c| c == code)
+      || qt
+        .tracks()
+        .iter()
+        .any(|t| t.all_handler_codes().iter().any(|c| c == code))
+  };
   if file_type == "MP4"
     && qt
       .major_brand()
       .is_some_and(|b| b.starts_with("iso") || b.starts_with("dash") || b.starts_with("mp42"))
-    && qt.tracks().iter().any(|t| t.handler_code() == Some("soun"))
-    && !qt.tracks().iter().any(|t| t.handler_code() == Some("vide"))
+    && has_handler("soun")
+    && !has_handler("vide")
   {
     file_type = "M4A";
     mime = "audio/mp4";
@@ -6555,6 +6766,163 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   }
 }
 
+/// The four `%Handler` fields a `Track<N>` group surfaces, resolved PER FIELD
+/// (HandlerClass / HandlerType / HandlerVendorID / HandlerDescription each its
+/// own borrowed value, `None` when no `hdlr` in the group provided it).
+#[cfg(feature = "alloc")]
+#[derive(Default, Clone, Copy)]
+struct ResolvedHandlers<'a> {
+  class: Option<&'a str>,
+  code: Option<&'a str>,
+  vendor_id: Option<&'a str>,
+  description: Option<&'a str>,
+}
+
+/// Resolve, for each `Track<N>` family-1 group, the bundled `Track<N>:Handler*`
+/// triplet PER FIELD — the TRUE structural model: ExifTool's `%Handler` table is
+/// binary-data, so HandlerClass (offset 4), HandlerType (8), HandlerVendorID (12)
+/// and HandlerDescription (24) are FOUR INDEPENDENT `FoundTag`s, each extracted
+/// from EVERY `hdlr` box (a track's `mdia/hdlr` MEDIA handler + each
+/// `mdia/minf/hdlr` DATA handler) whose RawConv yields a value for THAT field
+/// (HandlerClass/VendorID skip an all-zero code, HandlerDescription an empty
+/// string; HandlerType always extracts — a zero code becomes `Unknown ()`).
+///
+/// For a given field, the GLOBAL bare key lands on the LAST extraction in file
+/// order (FoundTag last-wins, ExifTool.pm:9564); its family-1 group is the
+/// field's `owner_group`. The render-stage filter (exiftool:2745) then keeps,
+/// per `(Track<N>, field)`: in the owner's group the bare-key value (the global
+/// last), and in EVERY OTHER group the FIRST-in-file-order extraction (the
+/// surviving `(n)` duplicate resolves first-wins, exiftool:2952). Because the
+/// bare key is per-field, two fields can resolve to DIFFERENT owner groups, so
+/// the triplet is NEVER a unit: a partial `hdlr` (class-only `dhlr`, or a
+/// zero-code box) overrides ONLY the field it provides, the other boxes' fields
+/// are KEPT. This subsumes the empty (R5/R6 — no field, the other box wins all),
+/// full-`url ` (viofo/rove — the `url ` wins all), partial (the #348 finding)
+/// and zero-code cases uniformly.
+///
+/// The per-field provider order is the ACTUAL FILE ORDER of the walked `hdlr`
+/// boxes ([`MediaTrack::handler_boxes`] — recorded as the `trak` walk visits
+/// them), with NO media-before-data assumption: the FIRST-in-file-order provider
+/// of a field is the value from the LOWEST-index box that provides it, the
+/// LAST-in-file-order provider the value from the HIGHEST-index box that provides
+/// it. A NORMAL `mdia(hdlr, minf(hdlr))` records the media box first, so its data
+/// `minf/hdlr` is the per-field last (R7 result); a REORDERED `mdia(minf(hdlr),
+/// hdlr)` records the data box first, so the MEDIA `hdlr` is the per-field last
+/// and wins its fields (ground-truthed vs bundled ExifTool 13.59:
+/// `mdia(minf(hdlr=url ), hdlr=vide)` → `HandlerType=Video Track`,
+/// `HandlerClass=Media Handler`, `HandlerDescription=VideoHandler`). The global
+/// per-field owner is the LAST track (file order) whose LAST-provider is `Some`.
+/// Returned in track/group file order; a group is listed once (its first
+/// appearance).
+#[cfg(feature = "alloc")]
+fn resolve_per_track_handlers(tracks: &[MediaTrack]) -> std::vec::Vec<(u32, ResolvedHandlers<'_>)> {
+  // Field selectors for the four `%Handler` tags (HandlerClass / HandlerType /
+  // HandlerVendorID / HandlerDescription — binary-table offsets 4/8/12/24),
+  // matched on rather than used as array indices.
+  const CLASS: usize = 0;
+  const CODE: usize = 1;
+  const VENDOR: usize = 2;
+  const DESC: usize = 3;
+  // A track's family-1 group number (the per-`moov` `Track<N>` index; the
+  // 1-based Vec index for unit-built tracks without a recorded group).
+  fn group_of(idx: usize, t: &MediaTrack) -> u32 {
+    t.track_group().unwrap_or((idx + 1) as u32)
+  }
+  // One walked `hdlr` box's value for a field (the `%Handler` binary-table
+  // offsets 4/8/12/24), `None` when this box did not provide it.
+  fn box_field(b: &HandlerBox, field: usize) -> Option<&str> {
+    match field {
+      CLASS => b.class(),
+      CODE => b.code(),
+      VENDOR => b.vendor_id(),
+      _ => b.description(),
+    }
+  }
+  // The per-field FIRST-in-file-order provider of one track: the value from the
+  // LOWEST-index (earliest-walked) `hdlr` box that provides the field. This is
+  // what a NON-owner group surfaces (its surviving first-in-file-order `(n)`
+  // duplicate, exiftool:2952). The walk records the boxes in ACTUAL file order,
+  // so there is NO media-before-data assumption — a reordered
+  // `mdia(minf(hdlr), hdlr)` makes the `minf/hdlr` the first provider.
+  fn first_of(t: &MediaTrack, field: usize) -> Option<&str> {
+    t.handler_boxes().iter().find_map(|b| box_field(b, field))
+  }
+  // The per-field LAST-in-file-order provider of one track: the value from the
+  // HIGHEST-index (latest-walked) `hdlr` box that provides the field. This is
+  // what the OWNER group surfaces (the global last-extracted bare key,
+  // ExifTool.pm:9564). By actual file order — a NORMAL `mdia(hdlr, minf(hdlr))`
+  // makes the data `minf/hdlr` last; a REORDERED `mdia(minf(hdlr), hdlr)` makes
+  // the MEDIA `hdlr` last (and it wins its fields).
+  fn last_of(t: &MediaTrack, field: usize) -> Option<&str> {
+    t.handler_boxes()
+      .iter()
+      .rev()
+      .find_map(|b| box_field(b, field))
+  }
+  // Per field, the global bare-key owner = the LAST track (file order) whose
+  // LAST-provider is `Some`; record its group + value once. A field with no
+  // provider anywhere has `owner_group == None` (never emitted).
+  let owner_group_value = |field: usize| -> (Option<u32>, Option<&str>) {
+    tracks
+      .iter()
+      .enumerate()
+      .rev()
+      .find(|(_, t)| last_of(t, field).is_some())
+      .map_or((None, None), |(i, t)| {
+        (Some(group_of(i, t)), last_of(t, field))
+      })
+  };
+  // Resolve one field for a group: the owner group takes the global
+  // LAST-provider value (`owner`); every other group takes its FIRST-in-group
+  // track's FIRST-provider value (the surviving first-in-file-order `(n)`
+  // duplicate). A free `fn` (not a closure) so the borrowed `&str` it returns is
+  // tied to `tracks`.
+  fn resolve<'a>(
+    tracks: &'a [MediaTrack],
+    g: u32,
+    field: usize,
+    owner: (Option<u32>, Option<&'a str>),
+  ) -> Option<&'a str> {
+    let (owner_g, owner_v) = owner;
+    if owner_g == Some(g) {
+      owner_v
+    } else {
+      tracks
+        .iter()
+        .enumerate()
+        .filter(|(i, tk)| group_of(*i, tk) == g)
+        .find_map(|(_, tk)| first_of(tk, field))
+    }
+  }
+  // The per-field global bare-key owner (group + value), computed once each; a
+  // named binding per field avoids index-based array access (the file-level
+  // `#![deny(clippy::indexing_slicing)]` panic-safety contract).
+  let owner_class = owner_group_value(CLASS);
+  let owner_code = owner_group_value(CODE);
+  let owner_vendor = owner_group_value(VENDOR);
+  let owner_desc = owner_group_value(DESC);
+  // Walk tracks in file order, one row per group at its FIRST appearance.
+  let mut out: std::vec::Vec<(u32, ResolvedHandlers<'_>)> = std::vec::Vec::new();
+  for (idx, t) in tracks.iter().enumerate() {
+    let g = group_of(idx, t);
+    if out.iter().any(|(seen, _)| *seen == g) {
+      // A later same-group track is render-suppressed for the bare key; its
+      // contribution is already folded via the owner / first-in-group lookups.
+      continue;
+    }
+    out.push((
+      g,
+      ResolvedHandlers {
+        class: resolve(tracks, g, CLASS, owner_class),
+        code: resolve(tracks, g, CODE, owner_code),
+        vendor_id: resolve(tracks, g, VENDOR, owner_vendor),
+        description: resolve(tracks, g, DESC, owner_desc),
+      },
+    ));
+  }
+  out
+}
+
 #[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield `QuickTime:*` / `Track<N>:*` (+ SP4 `GoPro:*`) tags in ExifTool's
@@ -6875,6 +7243,27 @@ impl crate::emit::Taggable for Meta<'_> {
       emitted_keys.push(key);
       true
     };
+    // Per-track Handler (HandlerClass/HandlerType/HandlerVendorID/
+    // HandlerDescription) PER-FIELD dual-`hdlr` resolution. A `trak` carries up
+    // to TWO kinds of `hdlr` — the `mdia/hdlr` MEDIA handler (`mhlr` vide/soun/…)
+    // and one-or-more `mdia/minf/hdlr` DATA handlers (`dhlr` url/alis/…) — and
+    // ExifTool's `%Handler` is a binary-data table, so HandlerClass (offset 4),
+    // HandlerType (8), HandlerVendorID (12) and HandlerDescription (24) are FOUR
+    // INDEPENDENT `FoundTag`s, NOT a unit. Each is extracted from EVERY `hdlr`
+    // box that provides it; per field, the bare key lands on the global LAST
+    // extraction (FoundTag last-wins, ExifTool.pm:9564) and the render filter
+    // (exiftool:2745) keeps the owner group's bare value + every other group's
+    // first-in-file-order `(n)` (its media handler). Because the bare key is
+    // per-field, a partial `minf/hdlr` (class-only `dhlr`, or a zero-code box)
+    // overrides ONLY its field — the media handler's other fields are KEPT. The
+    // full derivation + cases live on [`resolve_per_track_handlers`], which
+    // returns one row per `Track<N>` group (first appearance) carrying the four
+    // independently-resolved values. Ground-truthed vs bundled ExifTool 13.59 on
+    // the viofo + rove dashcam MP4s (full `url ` data handler → all three from
+    // the data handler for the audio track, all from the media handler for the
+    // video track) and on crafted class-only / zero-code / empty / two-`moov`
+    // dual-`hdlr` files.
+    let resolved_handlers = resolve_per_track_handlers(self.qt.tracks());
     for (idx, track) in self.qt.tracks().iter().enumerate() {
       // Fall back to the 1-based Vec index only for tracks built directly in
       // unit tests (no `track_group` recorded).
@@ -6884,6 +7273,18 @@ impl crate::emit::Taggable for Meta<'_> {
       // The per-track family1 is the computed `Track<N>` string; family0 stays
       // "QuickTime" (the `%QuickTime::Main` table group).
       let track_group = || Group::new("QuickTime", grp);
+      // The four per-field-resolved Handler values for THIS track's group (the
+      // same row for every track in the group; the `first_seen` gate below emits
+      // them once, at the FIRST track of the group — where bundled places them).
+      let resolved = resolved_handlers
+        .iter()
+        .find(|(g, _)| *g == group_num)
+        .map(|(_, r)| *r)
+        .unwrap_or_default();
+      let sel_handler_class = resolved.class;
+      let sel_handler_code = resolved.code;
+      let sel_handler_vendor_id = resolved.vendor_id;
+      let sel_handler_description = resolved.description;
       // R7/F2: a `Truncated '...' data` warning raised inside this `trak`'s
       // walk (a header-valid but payload-overrunning tkhd / mdhd) surfaces
       // under this track's family-1 group — ExifTool attaches the warning to
@@ -7089,7 +7490,7 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
-      if let Some(class) = track.handler_class()
+      if let Some(class) = sel_handler_class
         && first_seen(grp, "HandlerClass")
       {
         // HandlerClass / ComponentType (QuickTime.pm:8395-8402); emitted only
@@ -7126,22 +7527,37 @@ impl crate::emit::Taggable for Meta<'_> {
       // first-wins `Warning` (a truncation warning raised earlier in THIS track's
       // walk takes precedence). The per-sample GPS stays `-ee` gated (see
       // `emit_timed_samples`).
-      if !opts.extract_embedded
-        && let Some(code) = track.handler_code()
-        && is_ee_handler(code)
-        && !ee_warned.contains(&code)
-      {
-        ee_warned.push(code);
-        if first_seen(grp, "Warning") {
-          tags.push(EmittedTag::new(
-            track_group(),
-            "Warning".into(),
-            TagValue::Str(EE_WARNING.into()),
-            false,
-          ));
+      //
+      // ExifTool runs the `%Handler` `HandlerType` RawConv for EVERY `hdlr` box
+      // it walks — the `mdia/hdlr` MEDIA handler AND every nested `mdia/minf/hdlr`
+      // DATA handler (repeated `minf` boxes included) — so the warning sees ALL of
+      // their codes (in file order), INDEPENDENT of which one the per-group
+      // per-field Handler resolution (`resolve_per_track_handlers`) surfaces.
+      // We therefore iterate the COMPLETE accumulated `all_handler_codes` list
+      // (filled at each `hdlr` box in `walk_trak`), NOT the per-field-merged
+      // `data_handler` (a `meta` data handler that a LATER `minf/hdlr` = `url `
+      // overrides in the HandlerType field would otherwise be missed). A track
+      // whose `mdia/hdlr` is `vide` (no warn — gated on the
+      // `stsd`) but whose `minf/hdlr` is a metadata handler (`meta`/`mett`→`meta`/
+      // …) therefore still warns, exactly as bundled does. Data-reference handlers
+      // (`url `/`alis`/`dhlr`) are NOT in `%eeBox`, so the common `minf/hdlr` =
+      // `url ` (viofo/rove → list `[vide|soun, url ]`) does NOT fire the warning.
+      if !opts.extract_embedded {
+        for code in track.all_handler_codes().iter().map(String::as_str) {
+          if is_ee_handler(code) && !ee_warned.contains(&code) {
+            ee_warned.push(code);
+            if first_seen(grp, "Warning") {
+              tags.push(EmittedTag::new(
+                track_group(),
+                "Warning".into(),
+                TagValue::Str(EE_WARNING.into()),
+                false,
+              ));
+            }
+          }
         }
       }
-      if let Some(code) = track.handler_code()
+      if let Some(code) = sel_handler_code
         && first_seen(grp, "HandlerType")
       {
         // HandlerType: the flat tag is driven by the RAW 4-byte code (F3).
@@ -7170,7 +7586,7 @@ impl crate::emit::Taggable for Meta<'_> {
       // raw 4-char code. Only present when non-zero (the all-zero RawConv-undef
       // branch is applied at decode). Right after HandlerType (the `%Handler`
       // binary-table field order: offset 8 before 12).
-      if let Some(vid) = track.handler_vendor_id()
+      if let Some(vid) = sel_handler_vendor_id
         && first_seen(grp, "HandlerVendorID")
       {
         let value = if print_conv {
@@ -7193,7 +7609,7 @@ impl crate::emit::Taggable for Meta<'_> {
       // HandlerDescription (`hdlr` offset 24 to end, QuickTime.pm:8453-8461):
       // the post Pascal/C-string RawConv value, mode-invariant (no PrintConv/
       // ValueConv). In ALL the codec fixtures; right after HandlerVendorID.
-      if let Some(desc) = track.handler_description()
+      if let Some(desc) = sel_handler_description
         && first_seen(grp, "HandlerDescription")
       {
         tags.push(EmittedTag::new(
@@ -18770,6 +19186,268 @@ mod tests {
   }
 
   #[test]
+  fn mp4_m4a_override_keys_on_all_handler_codes_not_just_media_handler() {
+    // #348 dual-`hdlr` structural close — the MP4→M4A override
+    // (QuickTime.pm:10619-10624) keys on `$$et{HasHandler}{soun/vide}`, the set
+    // of EVERY walked `hdlr` HandlerType (`$$self{HasHandler}{$val} = 1` runs in
+    // the `%Handler` RawConv for EACH `hdlr` box — QuickTime.pm:8414 — the
+    // `mdia/hdlr` MEDIA handler AND every nested `mdia/minf/hdlr` DATA handler),
+    // NOT just the single `mdia/hdlr` `handler_code()` media 4cc. A `soun`
+    // `mdia/hdlr` whose nested `minf/hdlr` carries `vide` therefore sets
+    // `HasHandler{vide}` ⇒ the override is SUPPRESSED. The pre-fix predicate read
+    // only `handler_code()` (the media 4cc), so it never saw the nested `vide`
+    // and WRONGLY flipped this audio-looking file to M4A.
+    //
+    // Ground truth — bundled ExifTool 13.59 on these exact byte layouts:
+    //   (a) `ftyp isom` + `mdia/hdlr` = soun + `minf/hdlr` = `url ` ⇒
+    //         FileType = M4A,  MIMEType = audio/mp4
+    //   (b) SAME bytes but `minf/hdlr` = `vide` (a nested media code) ⇒
+    //         FileType = MP4,  MIMEType = video/mp4   (HasHandler{vide} suppresses)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal one-entry `mp4a` `stsd` so the audio `minf` walk is well-formed.
+    let stsd = {
+      let entry_body: Vec<u8> = [0u8; 6].iter().copied().chain(1u16.to_be_bytes()).collect();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"mp4a");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    // `mdia/hdlr` MEDIA = soun; nested `minf/hdlr` DATA = `minf_code`.
+    let build = |minf_code: &[u8; 4]| {
+      let mut tkhd = vec![0u8; 84];
+      wr(&mut tkhd, 12, &1u32.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+      let media_hdlr = hdlr(b"mhlr", b"soun", "SoundHandler");
+      let minf = atom(b"minf", &{
+        let mut b = hdlr(b"dhlr", minf_code, "DataHandler");
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&media_hdlr);
+        b.extend_from_slice(&minf);
+        b
+      });
+      let trak = atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      });
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      let moov = atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        b.extend_from_slice(&trak);
+        b
+      });
+      // `ftyp isom` + a non-first `mp42` compat slot ⇒ resolves MP4.
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&moov);
+      full
+    };
+
+    // (a) data handler `url ` ⇒ HasHandler = {soun, url } ⇒ M4A.
+    let a_bytes = build(b"url ");
+    let a = parse_inner(&a_bytes, None).expect("accepted");
+    assert_eq!(
+      a.quicktime().tracks().first().unwrap().handler_code(),
+      Some("soun"),
+      "mdia/hdlr media handler is soun"
+    );
+    assert_eq!(
+      a.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "url ".to_string()],
+      "all_handler_codes lists the media (soun) then the data (url ) hdlr"
+    );
+    assert_eq!(
+      (a.file_type(), a.mime()),
+      ("M4A", "audio/mp4"),
+      "a lone soun media + a url data handler ⇒ M4A (matches bundled 13.59)"
+    );
+
+    // (b) data handler `vide` ⇒ HasHandler = {soun, vide} ⇒ override SUPPRESSED.
+    let b_bytes = build(b"vide");
+    let b = parse_inner(&b_bytes, None).expect("accepted");
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().handler_code(),
+      Some("soun"),
+      "mdia/hdlr media handler is STILL soun (the minf/hdlr vide is the data slot)"
+    );
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "vide".to_string()],
+      "all_handler_codes now contains the nested minf/hdlr vide"
+    );
+    assert_eq!(
+      (b.file_type(), b.mime()),
+      ("MP4", "video/mp4"),
+      "a nested minf/hdlr vide sets HasHandler{{vide}} ⇒ NO M4A (matches bundled 13.59)"
+    );
+  }
+
+  #[test]
+  fn mp4_m4a_override_keys_on_file_global_nontrack_meta_hdlr() {
+    // #348 file-global `HasHandler` — the MP4→M4A override (QuickTime.pm:10619-
+    // 10624) keys on `$$et{HasHandler}{soun/vide}`, which is FILE-GLOBAL: the
+    // `%QuickTime::Handler` RawConv sets `$$self{HasHandler}{$val} = 1`
+    // (QuickTime.pm:8414) for EVERY `hdlr` box the file contains AT ANY LEVEL,
+    // including a NON-track `meta/hdlr` (a `moov`-level `meta` here) that lives
+    // OUTSIDE any `trak`/`mdia`. The per-track `all_handler_codes` model (R8/R9)
+    // never sees such a box, so before this fix an audio-only `moov/meta/hdlr` =
+    // soun (no `soun` `trak`) stayed MP4 and a `moov/meta/hdlr` = vide failed to
+    // suppress the override — both diverging from bundled.
+    //
+    // Ground truth — bundled ExifTool 13.59 on these exact byte layouts:
+    //   (a) `ftyp isom` + `moov{ mvhd, meta(hdlr soun) }` (NO trak) ⇒
+    //         FileType = M4A,  MIMEType = audio/mp4
+    //   (b) `ftyp isom` + `moov{ mvhd, <soun trak>, meta(hdlr vide) }` ⇒
+    //         FileType = MP4,  MIMEType = video/mp4  (file-global HasHandler{vide})
+    //
+    // A `%QuickTime::Movie` `meta` has NO `Start` ⇒ offset-0 (QT plain box), so
+    // the `hdlr` is the first child with no version prefix.
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal well-formed `soun` `trak` (mp4a stsd) — used only by case (b).
+    let soun_trak = || {
+      let stsd = {
+        let entry_body: Vec<u8> = [0u8; 6].iter().copied().chain(1u16.to_be_bytes()).collect();
+        let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+        entry.extend_from_slice(b"mp4a");
+        entry.extend_from_slice(&entry_body);
+        let mut sb = vec![0u8; 4];
+        sb.extend_from_slice(&1u32.to_be_bytes());
+        sb.extend_from_slice(&entry);
+        atom(b"stsd", &sb)
+      };
+      let mut tkhd = vec![0u8; 84];
+      wr(&mut tkhd, 12, &1u32.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+      let minf = atom(b"minf", &{
+        let mut b = hdlr(b"dhlr", b"url ", "DataHandler");
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&hdlr(b"mhlr", b"soun", "SoundHandler"));
+        b.extend_from_slice(&minf);
+        b
+      });
+      atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      })
+    };
+    let build = |with_soun_trak: bool, meta_hdlr: &[u8; 4]| {
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      // `moov/meta` (offset-0 QT box) carrying one `hdlr` of `meta_hdlr`.
+      let meta = atom(b"meta", &hdlr(b"mhlr", meta_hdlr, "Handler"));
+      let moov = atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        if with_soun_trak {
+          b.extend_from_slice(&soun_trak());
+        }
+        b.extend_from_slice(&meta);
+        b
+      });
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&moov);
+      full
+    };
+
+    // (a) NON-track `moov/meta/hdlr` = soun, NO `trak` ⇒ file-global HasHandler
+    // sees soun ⇒ M4A (the per-track model has ZERO tracks here).
+    let a_bytes = build(false, b"soun");
+    let a = parse_inner(&a_bytes, None).expect("accepted");
+    assert!(
+      a.quicktime().tracks().is_empty(),
+      "case (a) has no trak — the soun comes ONLY from the non-track moov/meta/hdlr"
+    );
+    assert_eq!(
+      (a.file_type(), a.mime()),
+      ("M4A", "audio/mp4"),
+      "a non-track moov/meta/hdlr=soun (no trak) flips MP4→M4A (matches bundled 13.59)"
+    );
+
+    // (b) `soun` `trak` + a NON-track `moov/meta/hdlr` = vide ⇒ file-global
+    // HasHandler{vide} SUPPRESSES the override ⇒ MP4 (every track's hdlr is soun).
+    let b_bytes = build(true, b"vide");
+    let b = parse_inner(&b_bytes, None).expect("accepted");
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "url ".to_string()],
+      "the only trak carries soun + url (no vide) — the vide is the non-track meta/hdlr"
+    );
+    assert_eq!(
+      (b.file_type(), b.mime()),
+      ("MP4", "video/mp4"),
+      "a non-track moov/meta/hdlr=vide suppresses the M4A override (matches bundled 13.59)"
+    );
+
+    // (c) a TOP-LEVEL (file-level) `meta/hdlr` = soun (the `%QuickTime::Main`
+    // `meta` is `Start => 4` ⇒ ISO version prefix) sitting BESIDE an empty `moov`
+    // (no `trak`) — the distinct file-level collector site (`parse_inner` Pass 2).
+    // Ground truth bundled 13.59: FileType M4A / audio/mp4.
+    let c_bytes = {
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      // `%Main` `meta` = `Start => 4`: a 4-byte version prefix before the `hdlr`.
+      let meta = atom(b"meta", &{
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(&hdlr(b"mhlr", b"soun", "SoundHandler"));
+        b
+      });
+      let moov = atom(b"moov", &atom(b"mvhd", &mvhd));
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&meta);
+      full.extend_from_slice(&moov);
+      full
+    };
+    let c = parse_inner(&c_bytes, None).expect("accepted");
+    assert!(
+      c.quicktime().tracks().is_empty(),
+      "case (c) has no trak — the soun comes ONLY from the file-level meta/hdlr"
+    );
+    assert_eq!(
+      (c.file_type(), c.mime()),
+      ("M4A", "audio/mp4"),
+      "a top-level meta/hdlr=soun (no trak) flips MP4→M4A (matches bundled 13.59)"
+    );
+  }
+
+  #[test]
   fn use_ext_table_is_glv_to_mp4_only() {
     // R11/F1: `%useExt = ( GLV => 'MP4' )` (QuickTime.pm:240) — the WHOLE
     // table is this single entry, and the predicate (QuickTime.pm:10007)
@@ -19477,6 +20155,1001 @@ mod tests {
     assert!(
       map.get("Track2", "TrackID").is_none(),
       "no Track2 group is emitted (Track# resets per moov)"
+    );
+  }
+
+  #[test]
+  fn two_top_level_moovs_dual_hdlr_bare_key_is_last_moov_data_handler() {
+    // #348 — two TOP-LEVEL moovs, each a single `trak` that RESETS to `Track1`
+    // (per-moov `$track`), and each `trak` carries BOTH a `mdia/hdlr` MEDIA
+    // handler (`vide`) and a `mdia/minf/hdlr` DATA handler (`url `). All four
+    // `hdlr`s extract into the SAME `Track1` family-1 group; the bare-key owner
+    // is the LAST-extracted surviving `hdlr` = moov2's `Track1` DATA handler, and
+    // the render-stage same-group filter (exiftool:2745) suppresses moov1's pair
+    // + moov2's media. So bundled ExifTool surfaces ONLY the LATER moov's DATA
+    // handler for `Track1`. The old GLOBAL last-track-index rule emitted moov1's
+    // MEDIA handler here (it won the first-wins gate before moov2's data could
+    // land); the per-`(family1 group)` rule resolves to moov2's data.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout:
+    //   Track1:HandlerType = "URL", HandlerClass = "Data Handler",
+    //   HandlerDescription = "DataHandler2"  (moov2's `minf/hdlr`).
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      // version+flags(4) ComponentType(4) ComponentSubType(4) reserved(12)
+      // then the HandlerDescription C-string (decoded from offset 24).
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal one-entry `vide` `stsd` so the `minf` walk is well-formed.
+    let stsd = {
+      let entry_body = [0u8; 6] // reserved
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes()) // data-ref index
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4]; // version+flags
+      sb.extend_from_slice(&1u32.to_be_bytes()); // entry count
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mk_moov = |track_id: u32, media_name: &str, data_name: &str| {
+      let mut tkhd = vec![0u8; 84];
+      wb(&mut tkhd, 0, 0);
+      wr(&mut tkhd, 12, &track_id.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes()); // MediaTimeScale
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes()); // MediaDuration
+      let media_hdlr = hdlr(b"mhlr", b"vide", media_name);
+      let data_hdlr = hdlr(b"dhlr", b"url ", data_name);
+      let minf = atom(b"minf", &{
+        let mut b = data_hdlr.clone();
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&media_hdlr);
+        b.extend_from_slice(&minf);
+        b
+      });
+      let trak = atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      });
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes()); // TimeScale
+      atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        b.extend_from_slice(&trak);
+        b
+      })
+    };
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&mk_moov(1, "VideoHandler1", "DataHandler1"));
+    full.extend_from_slice(&mk_moov(2, "VideoHandler2", "DataHandler2"));
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let tracks = meta.quicktime().tracks();
+    assert_eq!(tracks.len(), 2, "both traks decoded");
+    // Both reset to Track1, and BOTH carry a media (`vide`) + data (`url `) hdlr.
+    assert_eq!(tracks.first().unwrap().track_group(), Some(1));
+    assert_eq!(tracks.get(1).unwrap().track_group(), Some(1));
+    assert_eq!(tracks.first().unwrap().handler_code(), Some("vide"));
+    assert_eq!(
+      tracks
+        .first()
+        .unwrap()
+        .data_handler()
+        .and_then(|d| d.code()),
+      Some("url ")
+    );
+    assert_eq!(
+      tracks
+        .get(1)
+        .unwrap()
+        .data_handler()
+        .and_then(|d| d.description()),
+      Some("DataHandler2")
+    );
+
+    // The bare `Track1:Handler*` triplet = moov2's DATA handler (per-group
+    // last-extracted-owns-bare), NOT moov1's media handler.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "Track1:HandlerType is the LAST moov's data handler (URL), not moov1's vide"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "Track1:HandlerClass is the data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("DataHandler2"),
+      "Track1:HandlerDescription is moov2's DataHandler2"
+    );
+    // No second Track1 media handler leaks in (every earlier-same-group hdlr is
+    // render-suppressed; the data triplet is the sole survivor).
+    assert!(
+      map.get("Track2", "HandlerType").is_none(),
+      "Track# resets per moov: no Track2 group exists"
+    );
+  }
+
+  #[test]
+  fn vide_media_hdlr_with_meta_minf_hdlr_fires_eewarn_and_surfaces_nrt_metadata() {
+    // #348 R3 — a single `trak` whose `mdia/hdlr` MEDIA handler is `vide` (NOT an
+    // EEWarn trigger — `vide` is gated on the `stsd`, QuickTime.pm:8407 `$val eq
+    // 'vide'`) BUT whose nested `mdia/minf/hdlr` DATA handler is the metadata
+    // handler `meta`. ExifTool runs the `%Handler` `HandlerType` RawConv for EVERY
+    // `hdlr` it walks (both this `vide` and the nested `meta`), so the no-`ee`
+    // EEWarn fires on the `meta` code even though the media handler is `vide`. The
+    // R2 per-group owner selection ALSO surfaces that `meta` data handler as
+    // `Track1:HandlerType` = "NRT Metadata" (it is the sole/last `hdlr` owner).
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerType        = "NRT Metadata"  (the `meta` minf/hdlr)
+    //   Track1:HandlerClass       = "Data Handler"
+    //   Track1:HandlerDescription = "MetaDataHandler1"
+    //   Track1:Warning = "[minor] The ExtractEmbedded option may find more tags
+    //                     in the media data"
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = vide (no warn); `minf/hdlr` DATA = meta (warns).
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let data_hdlr = hdlr(b"dhlr", b"meta", "MetaDataHandler1");
+    let minf = atom(b"minf", &{
+      let mut b = data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    assert_eq!(
+      track.data_handler().and_then(|d| d.code()),
+      Some("meta"),
+      "minf/hdlr is the meta data handler"
+    );
+
+    // No `-ee`: faithful emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // R2 owner selection: the `meta` data handler surfaces as the Track1 triplet.
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("NRT Metadata"),
+      "owner selection surfaces the meta minf/hdlr as HandlerType"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the meta data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("MetaDataHandler1")
+    );
+    // R3 fix: the EEWarn fires on the nested `meta` minf/hdlr code, even though
+    // the `mdia/hdlr` media handler (`vide`) is itself not an EEWarn trigger.
+    assert_eq!(
+      map.get_str("Track1", "Warning").as_deref(),
+      Some(EE_WARNING),
+      "the meta minf/hdlr triggers the no-ee ExtractEmbedded warning"
+    );
+  }
+
+  #[test]
+  fn multi_minf_meta_then_url_fires_eewarn_with_url_owner_triplet() {
+    // #348 R4 — the STRUCTURAL close. A single `trak` with `mdia/hdlr` = `vide`
+    // (NOT an EEWarn trigger — gated on the `stsd`) and TWO `minf` boxes: the
+    // FIRST `minf/hdlr` is `meta` (an `%eeBox` trigger), the SECOND is `url ` (a
+    // data-reference handler, NOT a trigger). The parser walks BOTH `minf` boxes,
+    // so the single last-wins `data_handler` slot is OVERWRITTEN from `meta` to
+    // `url ` — yet ExifTool runs the `%Handler` HandlerType RawConv for EVERY
+    // `hdlr` box it walks (vide, meta, url), so the no-`ee` EEWarn STILL fires on
+    // the `meta` even though the surviving owner triplet is the `url `. The R3 fix
+    // (which checked only the single `data_handler` slot) would MISS this, since
+    // the slot holds `url `; the R4 fix iterates the COMPLETE `all_handler_codes`
+    // accumulation (every walked `hdlr`), so the `meta` is seen regardless.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:Warning = "[minor] The ExtractEmbedded option may find more tags
+    //                     in the media data"          (the FIRST minf `meta`)
+    //   Track1:HandlerType        = "URL"             (the LAST `hdlr` = the
+    //                                                  owner triplet, the `url `)
+    //   Track1:HandlerClass       = "Data Handler"
+    //   Track1:HandlerDescription = "UrlDataHandler2"
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = vide (no warn); FIRST `minf/hdlr` = meta (warns); SECOND
+    // `minf/hdlr` = url (the surviving owner triplet, NOT a warn trigger).
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let minf1 = atom(b"minf", &hdlr(b"dhlr", b"meta", "MetaDataHandler1"));
+    let minf2 = atom(b"minf", &hdlr(b"dhlr", b"url ", "UrlDataHandler2"));
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf1);
+      b.extend_from_slice(&minf2);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The single last-wins `data_handler` slot holds the SECOND minf/hdlr (url ),
+    // the OWNER triplet — the `meta` it once held was overwritten.
+    assert_eq!(
+      track.data_handler().and_then(|d| d.code()),
+      Some("url "),
+      "the last minf/hdlr (url) is the surviving data_handler owner"
+    );
+    // The COMPLETE accumulation carries every walked `hdlr` in file order — both
+    // the overwritten `meta` AND the surviving `url ` are present, so the EEWarn
+    // can see the `meta` regardless of which one won the triplet slot.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide", "meta", "url "],
+      "all_handler_codes accumulates every walked hdlr in file order"
+    );
+
+    // No `-ee`: faithful emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // The owner triplet is the LAST `hdlr` = the `url ` data handler (last-wins).
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "owner selection surfaces the LAST (url) minf/hdlr as HandlerType"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the url data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("UrlDataHandler2"),
+      "HandlerDescription is the url data handler's, as a unit"
+    );
+    // The STRUCTURAL fix: the EEWarn FIRES on the FIRST minf/hdlr `meta` even
+    // though the surviving owner triplet (the SECOND minf/hdlr) is `url ` (which
+    // is itself NOT a trigger). The single-slot R3 check would miss it.
+    assert_eq!(
+      map.get_str("Track1", "Warning").as_deref(),
+      Some(EE_WARNING),
+      "the first minf/hdlr meta still triggers the no-ee warning despite the url owner"
+    );
+  }
+
+  #[test]
+  fn empty_minf_hdlr_does_not_suppress_the_vide_media_handler() {
+    // #348 R4 follow-up — a single `trak` whose `mdia/hdlr` MEDIA handler is a
+    // valid `vide`, but whose nested `mdia/minf/hdlr` DATA handler is SHORT/EMPTY
+    // (an 8-byte body: no HandlerType window, all-zero HandlerClass window, no
+    // vendor, no description). Every `%Handler` field of that `minf/hdlr` decodes
+    // to `None` — it is "fully undef": it extracts NO tag. A fully-undef `hdlr`
+    // therefore cannot OWN the bare `Track1:Handler*` key nor SUPPRESS the track's
+    // `mdia/hdlr` media handler. The bug was: the empty data handler was
+    // materialized + counted by `owner_idx` (and chosen by `data_handler`), so the
+    // track emitted NOTHING and the valid `vide` HandlerType was DROPPED. The fix
+    // (`DataReferenceHandler::has_content`) makes the empty data handler not a
+    // valid owner, so the `vide` MEDIA handler surfaces instead.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler"   (the `mdia/hdlr` vide)
+    //   Track1:HandlerType        = "Video Track"
+    //   Track1:HandlerDescription = "VideoHandler1"
+    //   (no Track1:Warning — the empty minf/hdlr carries no `%eeBox` code)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = a valid `vide`; the `minf/hdlr` DATA handler is a SHORT
+    // (8-byte) all-undef box: no HandlerType (8..12 absent), all-zero class
+    // (4..8), no vendor, no description.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let empty_data_hdlr = atom(b"hdlr", &[0u8; 8]);
+    let minf = atom(b"minf", &{
+      let mut b = empty_data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The fully-undef `minf/hdlr` is a NO-OP at the walk source: every `%Handler`
+    // field decoded to `None`, so the candidate carried no content and the
+    // `data_handler` slot was never installed (it stays `None`). It can neither
+    // own the bare key, suppress the media handler, nor clear a prior one.
+    assert!(
+      track.data_handler().is_none(),
+      "an all-undef minf/hdlr is a no-op: the data_handler slot stays None"
+    );
+    // The empty minf/hdlr has no code, so it contributes nothing to the EEWarn
+    // accumulation — only the `vide` media handler's code is present.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide"],
+      "an all-undef minf/hdlr (no code) is not pushed to all_handler_codes"
+    );
+
+    // The valid `vide` MEDIA handler is emitted — NOT dropped/suppressed by the
+    // empty data handler (bundled parity: an undef minf/hdlr produces no
+    // HandlerType, so the media handler shows).
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "the vide media handler is emitted, not dropped by the empty minf/hdlr"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is the mdia/hdlr media handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is the media handler's, as a unit"
+    );
+    // `vide` is gated on the `stsd`, not the handler, and the empty minf/hdlr has
+    // no `%eeBox` code — so NO no-`ee` ExtractEmbedded warning fires.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: the empty minf/hdlr carries no eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn repeated_minf_empty_hdlr_after_contentful_url_keeps_the_url_data_handler() {
+    // #348 R6 — the STRUCTURAL close of the empty-`minf/hdlr` class. A single
+    // `trak` with `mdia/hdlr` = `vide` (media) and TWO `minf` boxes: the FIRST
+    // `minf/hdlr` is a CONTENTFUL `url ` data handler, the SECOND is a SHORT/EMPTY
+    // (8-byte, all-undef) `hdlr`. The walk hits both `minf/hdlr` boxes; the prior
+    // bug overwrote the single `data_handler` slot for EVERY `minf/hdlr` (even
+    // all-None), so the later empty box CLEARED the valid `url ` triplet (every
+    // field → `None`) and the owner-selection then fell back to the `vide` media
+    // handler — LOSING the data handler. The source-level fix only installs the
+    // slot when the candidate `has_content`, so a fully-undef `minf/hdlr` is a
+    // no-op: it cannot own, suppress, OR clear. The slot therefore HOLDS the LAST
+    // CONTENTFUL data handler (the `url ` from `minf1`), the empty box can't erase
+    // it.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Data Handler"   (the `url ` minf1/hdlr)
+    //   Track1:HandlerType        = "URL"
+    //   Track1:HandlerDescription = "UrlDataHandler1"
+    //   (no Track1:Warning — neither the `url ` nor the empty box is an `%eeBox`)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = a valid `vide`; FIRST `minf/hdlr` = a contentful `url `
+    // (with a well-formed `stbl`); SECOND `minf/hdlr` = a SHORT (8-byte) all-undef
+    // box that must NOT clear the `url ` already in the slot.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let url_hdlr = hdlr(b"dhlr", b"url ", "UrlDataHandler1");
+    let minf1 = atom(b"minf", &{
+      let mut b = url_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let empty_data_hdlr = atom(b"hdlr", &[0u8; 8]);
+    let minf2 = atom(b"minf", &empty_data_hdlr);
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf1);
+      b.extend_from_slice(&minf2);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The data_handler slot HOLDS the contentful `url ` from `minf1`; the later
+    // empty `minf/hdlr` is a no-op and did NOT clear it.
+    let dh = track
+      .data_handler()
+      .expect("the contentful url minf/hdlr installed the slot");
+    assert!(
+      dh.has_content(),
+      "the url data handler carries content and was not cleared by the empty box"
+    );
+    assert_eq!(
+      dh.code(),
+      Some("url "),
+      "the last CONTENTFUL minf/hdlr (url) survives; the empty box did not erase it"
+    );
+    assert_eq!(
+      dh.class(),
+      Some("dhlr"),
+      "the url data handler's class survives"
+    );
+    assert_eq!(
+      dh.description(),
+      Some("UrlDataHandler1"),
+      "the url data handler's description survives the later empty box"
+    );
+    // The empty `minf/hdlr` (no code) contributes nothing to the EEWarn
+    // accumulation; only the `vide` media handler and the `url ` are present.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide", "url "],
+      "the all-undef minf/hdlr (no code) is not pushed; only vide + url are"
+    );
+
+    // No `-ee`: faithful emission — the `url ` DATA handler is surfaced as the
+    // Track1 triplet (owner selection), NOT the `vide` media handler.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "the preserved url data handler is the bare-key owner (not the vide media)"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the url data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("UrlDataHandler1"),
+      "HandlerDescription is the url data handler's, preserved past the empty box"
+    );
+    // The `vide` media handler is NOT shown — the url data handler owns the bare
+    // key and the render-stage same-group filter suppresses the media pair.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: neither the url nor the empty box carries an eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn class_only_minf_hdlr_overrides_only_handler_class_keeping_media_type_and_desc() {
+    // #348 round 7 — the PER-FIELD structural model. A single `trak` whose
+    // `mdia/hdlr` MEDIA handler is a full `vide` (HandlerClass=mhlr,
+    // HandlerType=vide, HandlerDescription=VideoHandler1) and whose
+    // `mdia/minf/hdlr` DATA handler is CLASS-ONLY: a 8-byte body (version+flags +
+    // a `dhlr` ComponentType at offset 4) — NO HandlerType window (offset 8 past
+    // the box end) and NO HandlerDescription. ExifTool's `%Handler` is a
+    // binary-data table, so HandlerClass / HandlerType / HandlerDescription are
+    // THREE independent `FoundTag`s: the class-only `dhlr` provides ONLY
+    // HandlerClass, so its global bare key wins HandlerClass (Data Handler), while
+    // HandlerType and HandlerDescription — which the data handler does NOT provide
+    // — KEEP the media handler's values. The prior per-UNIT emission selected the
+    // class-only data handler as a whole and dropped HandlerType + Description;
+    // the per-field merge keeps them.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerType        = "Video Track"   (KEPT from the `vide` media)
+    //   Track1:HandlerDescription = "VideoHandler1" (KEPT from the media)
+    //   Track1:HandlerClass       = "Data Handler"  (the `dhlr` minf/hdlr)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    // CLASS-ONLY `minf/hdlr`: an 8-byte body = version+flags(4) + `dhlr` at
+    // offset 4. Offset 8 (HandlerType) and 24 (HandlerDescription) are past the
+    // box end, so the data handler provides ONLY HandlerClass.
+    let class_only_data = {
+      let mut body = vec![0u8; 8];
+      wr(&mut body, 4, b"dhlr");
+      atom(b"hdlr", &body)
+    };
+    let minf = atom(b"minf", &{
+      let mut b = class_only_data;
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The class-only data handler carries ONLY HandlerClass (`dhlr`); its
+    // HandlerType / HandlerDescription decoded to `None`.
+    let dh = track
+      .data_handler()
+      .expect("class-only minf/hdlr installs the slot");
+    assert_eq!(
+      dh.class(),
+      Some("dhlr"),
+      "the data handler provides HandlerClass"
+    );
+    assert_eq!(dh.code(), None, "no HandlerType window in the 8-byte body");
+    assert_eq!(
+      dh.description(),
+      None,
+      "no HandlerDescription in the 8-byte body"
+    );
+
+    // No `-ee`: faithful PER-FIELD emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // HandlerClass: the data handler's `dhlr` (its global bare key wins).
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is overridden by the class-only data handler"
+    );
+    // HandlerType: the data handler does NOT provide it ⇒ the media `vide` is
+    // KEPT (the prior per-unit model wrongly dropped it).
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "HandlerType is KEPT from the media handler (data handler has none)"
+    );
+    // HandlerDescription: likewise KEPT from the media handler.
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is KEPT from the media handler (data handler has none)"
+    );
+    // `vide` is gated on the `stsd`; `dhlr` is not an `%eeBox` code ⇒ no warning.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: neither vide nor dhlr is an eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn zero_code_minf_hdlr_overrides_only_handler_type_keeping_media_class_and_desc() {
+    // #348 round 7 — the zero-code arm of the PER-FIELD model. A single `trak`
+    // whose `mdia/hdlr` MEDIA handler is a full `vide` and whose `mdia/minf/hdlr`
+    // DATA handler is a 12-byte body: version+flags(4) + an all-zero HandlerClass
+    // window (offset 4, RawConv `\0\0\0\0` → undef) + a present-but-ZERO
+    // HandlerType window (offset 8 = `\0\0\0\0`). The HandlerType RawConv always
+    // returns its value (even a zero code → "Unknown ()"), so the data handler
+    // provides ONLY HandlerType; HandlerClass (all-zero → undef) and
+    // HandlerDescription (absent) do NOT override the media handler. Per the
+    // per-field model: HandlerType = "Unknown ()" (the zero-code data handler),
+    // HandlerClass = "Media Handler" + HandlerDescription = "VideoHandler1" KEPT
+    // from media. The prior per-unit model would have selected the zero-code data
+    // handler as a whole (it `has_content` via its code) and dropped the media
+    // HandlerClass + HandlerDescription.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler" (KEPT from the `vide` media)
+    //   Track1:HandlerDescription = "VideoHandler1" (KEPT from the media)
+    //   Track1:HandlerType        = "Unknown ()"    (the zero-code minf/hdlr; the
+    //     raw `-p` value is `Unknown (\0\0\0\0)`, the JSON writer strips the NULs)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    // ZERO-CODE `minf/hdlr`: a 12-byte all-zero body. HandlerClass window
+    // (offset 4) is all-zero ⇒ undef; HandlerType window (offset 8) is present
+    // and `\0\0\0\0` ⇒ the RawConv returns it (renders "Unknown ()"); no desc.
+    let zero_code_data = atom(b"hdlr", &[0u8; 12]);
+    let minf = atom(b"minf", &{
+      let mut b = zero_code_data;
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The zero-code data handler carries ONLY a (zero) HandlerType code; its
+    // HandlerClass (all-zero → undef) and HandlerDescription decoded to `None`.
+    let dh = track
+      .data_handler()
+      .expect("zero-code minf/hdlr installs the slot");
+    assert_eq!(
+      dh.code(),
+      Some("\0\0\0\0"),
+      "the zero HandlerType code is present"
+    );
+    assert_eq!(dh.class(), None, "all-zero HandlerClass decodes to None");
+    assert_eq!(dh.description(), None, "no HandlerDescription");
+
+    // No `-ee`: faithful PER-FIELD emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // HandlerType: the zero-code data handler wins. The RAW value carries the 4
+    // NUL bytes of the code inside the `Unknown ($val)` PrintConv miss; the JSON
+    // writer then strips every NUL (`exiftool:3819` `tr/\0//d`, value.rs), so the
+    // rendered token is "Unknown ()" — bundled parity. Assert BOTH layers.
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Unknown (\0\0\0\0)"),
+      "HandlerType is the zero-code data handler (raw value carries the NUL code)"
+    );
+    assert_eq!(
+      serde_json::to_string(&crate::value::TagValue::Str("Unknown (\0\0\0\0)".into()))
+        .expect("serialize"),
+      "\"Unknown ()\"",
+      "the JSON writer strips the NULs ⇒ the rendered token matches bundled"
+    );
+    // HandlerClass: the data handler does NOT provide it ⇒ media `mhlr` KEPT.
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is KEPT from the media handler (data handler all-zero)"
+    );
+    // HandlerDescription: KEPT from the media handler.
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is KEPT from the media handler (data handler has none)"
+    );
+  }
+
+  #[test]
+  fn reordered_mdia_minf_hdlr_before_media_hdlr_media_wins_per_field_by_file_order() {
+    // #348 round 8 — the ORDERING facet: actual parse/file order, not a
+    // hard-coded media-before-data assumption. A single `trak` whose `mdia` lists
+    // its children REORDERED: the `minf` (carrying a CONTENTFUL `url ` DATA
+    // handler) comes BEFORE the `mdia/hdlr` MEDIA handler (`vide`). The parser
+    // walks `mdia` children in FILE order, so it records the `url ` data box FIRST
+    // and the `vide` media box LAST. ExifTool extracts every `hdlr`'s `%Handler`
+    // fields in that same file order, so the bare `Track1:Handler*` key lands on
+    // the LAST extraction per field = the MEDIA handler (it appears last). The old
+    // resolver hard-coded media-as-first / data-as-last and would have emitted the
+    // `url ` data handler here; the per-field actual-file-order model emits the
+    // media handler (`vide`) — it is last in file order and wins its fields.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler"  (the `vide` mdia/hdlr, LAST)
+    //   Track1:HandlerType        = "Video Track"
+    //   Track1:HandlerDescription = "VideoHandler1"
+    // (the `url ` data handler appeared FIRST, so it loses every field it sets).
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // CONTENTFUL `url ` data handler + a full `vide` media handler, but the `mdia`
+    // lists the `minf` (data) BEFORE the `mdia/hdlr` (media) — the REORDERED case.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let data_hdlr = hdlr(b"dhlr", b"url ", "DataHandler1");
+    let minf = atom(b"minf", &{
+      let mut b = data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    // mdia(mdhd, minf(hdlr=url), hdlr=vide) — minf BEFORE the media hdlr.
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&minf);
+      b.extend_from_slice(&media_hdlr);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The walk recorded the boxes in FILE order: the `url ` data box FIRST (the
+    // `minf/hdlr` precedes the `mdia/hdlr` here), the `vide` media box LAST.
+    let boxes = track.handler_boxes();
+    assert_eq!(boxes.len(), 2, "two hdlr boxes recorded (data + media)");
+    assert_eq!(
+      boxes.first().and_then(HandlerBox::code),
+      Some("url "),
+      "the data minf/hdlr was walked FIRST (it precedes the media hdlr)"
+    );
+    assert_eq!(
+      boxes.get(1).and_then(HandlerBox::code),
+      Some("vide"),
+      "the media mdia/hdlr was walked LAST in this reordered mdia"
+    );
+
+    // No `-ee`: faithful PER-FIELD emission by ACTUAL FILE ORDER. The MEDIA
+    // handler is LAST in file order, so it wins every field it provides — even
+    // though the `url ` DATA handler appeared first.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "HandlerType is the media vide (last in file order), not the url data"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is the media handler's (it is last in file order)"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is the media handler's (last in file order)"
+    );
+    // No URL/DataHandler leaks in — the data handler appeared FIRST, so its bare
+    // key lost to the later media handler per field.
+    assert_ne!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "the url data handler (first in file order) does NOT win the bare key"
     );
   }
 
@@ -24773,12 +26446,19 @@ mod tests {
     assert_track1_absent(&e, META_TABLE, "minf(hdlr vide)");
   }
 
-  /// **R5 case K** — `mdia(hdlr vide, minf(hdlr meta, stbl(stsd tmcd)))`. The
-  /// `minf/hdlr` meta OVERRIDES the `mdia/hdlr` vide for the `stsd` routing ⇒
-  /// `MetaFormat=tmcd`, while the flat `HandlerType` tag stays the `mdia/hdlr`'s
-  /// `vide` (the `MediaType` proxy is set ONLY by a `Media`-parented `hdlr`,
-  /// QuickTime.pm:8413 — so `handler_code` is untouched by the `minf/hdlr`). Ground
-  /// truth: bundled ExifTool 13.59 routes `MetaFormat=tmcd` here.
+  /// **R5 case K** — `mdia(hdlr vide, minf(hdlr meta, stbl(stsd tmcd)))`. Two
+  /// things, both ground-truthed vs bundled ExifTool 13.59 on this exact crafted
+  /// MOV: (1) the `minf/hdlr` meta OVERRIDES the `mdia/hdlr` vide for the `stsd`
+  /// ROUTING ⇒ `MetaFormat=tmcd` (the routing handler is set without touching the
+  /// trak-scoped `MediaType`, QuickTime.pm:8413); (2) the surfaced flat
+  /// `HandlerType` TAG is `meta` ("NRT Metadata"), NOT vide — the #348 dual-`hdlr`
+  /// dedup: BOTH `hdlr`s extract into `Track1`, and the LAST one (the `minf/hdlr`
+  /// meta) owns the bare `Track1:HandlerType` key (FoundTag last-wins,
+  /// ExifTool.pm:9564) while the `mdia/hdlr` vide is suppressed as a same-group
+  /// `(n)` duplicate (exiftool:2745). (A standalone single-`trak` IS the "final"
+  /// trak, so it surfaces its `minf/hdlr` — bundled emits exactly `HandlerType =
+  /// "NRT Metadata"` here, with no HandlerClass/HandlerDescription since the
+  /// crafted `hdlr`s zero those fields.)
   #[test]
   fn r5_minf_hdlr_overrides_mdia_hdlr_for_routing() {
     let mut minf_body = hdlr_atom(b"meta");
@@ -24793,13 +26473,12 @@ mod tests {
       Some("tmcd"),
       "minf/hdlr meta overrides mdia/hdlr vide for the stsd route"
     );
-    // The flat HandlerType tag (the mdia/hdlr's MediaType) is still `vide` — the
-    // minf/hdlr does NOT touch `handler_code` (no Visual fields are decoded either,
-    // since the route is Meta).
+    // The surfaced flat HandlerType is the minf/hdlr meta — the final trak's last
+    // `hdlr` owns the bare `Track1:HandlerType` key (matches bundled 13.59).
     assert_eq!(
       track1_str(&e, "HandlerType").as_deref(),
-      Some("Video Track"),
-      "the flat HandlerType stays the mdia/hdlr vide (MediaType)"
+      Some("NRT Metadata"),
+      "the surfaced HandlerType is the minf/hdlr meta (dual-hdlr last-wins)"
     );
     assert_track1_absent(&e, OTHER_TABLE, "mdia vide + minf meta");
   }
