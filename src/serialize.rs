@@ -134,7 +134,10 @@ mod serde_doc {
           crate::serialize_key::GroupMode::G1,
         );
         if seen.insert(token.clone()) {
-          map.serialize_entry(&token, t.value_ref())?;
+          // The `-j` JSON output path: wrap in `JsonTagValue` so an in-gate
+          // numeric string token is emitted VERBATIM (`EscapeJSON` `return $str`,
+          // #321), keeping the generic `TagValue::Serialize` serializer-agnostic.
+          map.serialize_entry(&token, &crate::value::JsonTagValue(t.value_ref()))?;
         }
       }
       if let Some(w) = doc.warning {
@@ -290,6 +293,78 @@ mod tests {
     assert_value_eq(
       &m,
       r#"[{"SourceFile":"a.jpg","ExifIFD:Aperture":3.5,"ExifIFD:ISO":100}]"#,
+    );
+  }
+
+  /// #321 R4 (Codex [medium]) — END-TO-END byte-exact lock on the REAL document
+  /// render path. The `assert_value_eq` test above is numeric-VALUE-insensitive
+  /// (`jsondiff` coerces `"534805.880"` to the bare number a golden carries), and
+  /// the conformance comparator (`json_equivalent_strict`) is ALSO insensitive
+  /// WITHIN the JSON number type (`534805.880` == `534805.88`) — so neither would
+  /// catch a regression that rewrote the EscapeJSON lexeme. This test asserts the
+  /// RAW OUTPUT STRING of `to_exiftool_json` (which is `render_document` ->
+  /// `serde_json::to_string(&Document)`, the actual `-j` document path that wraps
+  /// every value in `JsonTagValue`) contains the VERBATIM source bytes of each
+  /// in-gate numeric `TagValue::Str`, and NOT the canonicalized spelling — locking
+  /// the golden path independently of the value-insensitive comparators.
+  #[cfg(feature = "json")]
+  #[test]
+  fn render_document_emits_in_gate_numeric_str_token_verbatim() {
+    let mut m = Metadata::new("a.mp4");
+    // The motivating real Insta360 trailing-zero token + the degenerate controls.
+    m.push(
+      Group::new("Insta360", "Insta360"),
+      "TimeCode",
+      TagValue::Str("534805.880".into()),
+    );
+    m.push(Group::new("X", "X"), "ZeroExp", TagValue::Str("0E0".into()));
+    m.push(Group::new("X", "X"), "NegZero", TagValue::Str("-0".into()));
+    m.push(Group::new("X", "X"), "Exp", TagValue::Str("1.4e2".into()));
+    // Render through the ACTUAL document path (NOT bare `JsonTagValue`).
+    let s = to_exiftool_json(&m);
+    // The EXACT source bytes survive as a BARE number (verbatim EscapeJSON).
+    assert!(
+      s.contains(r#""Insta360:TimeCode":534805.880"#),
+      "trailing-zero token must emit verbatim, not canonicalized: {s}"
+    );
+    assert!(
+      s.contains(r#""X:ZeroExp":0E0"#),
+      "0E0 must emit verbatim: {s}"
+    );
+    assert!(
+      s.contains(r#""X:NegZero":-0"#),
+      "-0 must emit verbatim: {s}"
+    );
+    assert!(
+      s.contains(r#""X:Exp":1.4e2"#),
+      "1.4e2 must emit verbatim: {s}"
+    );
+    // And NOT the value-canonicalized spellings a `to_value` round-trip yields —
+    // proving the lexeme is NOT being silently rewritten on the render path.
+    assert!(
+      !s.contains("534805.88,") && !s.contains("534805.88}"),
+      "must NOT canonicalize 534805.880 -> 534805.88: {s}"
+    );
+    assert!(
+      !s.contains("\"X:ZeroExp\":0.0"),
+      "0E0 must not canonicalize: {s}"
+    );
+    assert!(
+      !s.contains("\"X:Exp\":140"),
+      "1.4e2 must not canonicalize: {s}"
+    );
+    // The verbatim bytes are nonetheless valid JSON: the document parses, and the
+    // bare token round-trips byte-identically through a borrowed `RawValue` (the
+    // raw bytes, not a reparsed canonical `Number`).
+    let raw: Vec<&serde_json::value::RawValue> =
+      serde_json::from_str(&s).expect("document is a valid single-object JSON array");
+    assert_eq!(raw.len(), 1, "single-element document array");
+    let obj: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+      serde_json::from_str(raw[0].get()).expect("file object");
+    assert_eq!(
+      obj["Insta360:TimeCode"].get(),
+      "534805.880",
+      "the rendered token is byte-identical to the source: {s}"
     );
   }
 

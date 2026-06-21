@@ -915,9 +915,12 @@ impl Metadata {
 // [`escape_json_is_number`](crate::value::escape_json_is_number)): a value whose
 // stringified form is a clean JSON number is printed BARE, everything else is
 // QUOTED. Each numeric/string arm below mirrors that exactly:
-//   * `Str`  -> a numeric-looking string lands as a BARE number (e.g. an
-//               `APE:Year` "2005" -> `2005`, `ExifTool:ExifToolVersion` "13.59"
-//               -> `13.59`); a non-numeric string (PrintConv label,
+//   * `Str`  -> a numeric-looking string lands as a BARE number, emitted
+//               VERBATIM (the EXACT source token, `EscapeJSON`'s `return $str`,
+//               #321): an `APE:Year` "2005" -> `2005`,
+//               `ExifTool:ExifToolVersion` "13.59" -> `13.59`, a degenerate
+//               in-gate `0E0` -> `0E0` / `-0` -> `-0` (NOT canonicalized to
+//               `0.0`/`0`); a non-numeric string (PrintConv label,
 //               `:`/`/`/space-bearing value) stays quoted; a `"true"`/`"false"`
 //               string stays a bare JSON boolean (`exiftool:3804-3805`).
 //   * `I64`/`U64` -> a bare integer token, EXCEPT a `>= 16`-digit integer (the
@@ -943,55 +946,64 @@ impl Metadata {
 const _: () = {
   use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
-  /// Emit an in-gate fractional/exponent numeric STRING (`escape_json_is_number`
-  /// already verified its grammar) as a BARE JSON number.
+  /// Emit an in-gate numeric STRING token (`escape_json_is_number` already
+  /// verified its grammar) as a serializer-AGNOSTIC numeric SCALAR — the generic
+  /// [`TagValue`] `Serialize` contract.
   ///
-  /// **Common path (the value parses to a FINITE f64).** Emit via the
-  /// allocation-free `serialize_f64`. serde renders a value-equal bare number
-  /// (`"13.59"` → `13.59`), which the token-exact (strict) comparator accepts
-  /// under its within-one-type numeric insensitivity (`1.50` ≈ `1.5`,
-  /// `1.4e2` ≈ `140.0`). This keeps every existing golden byte-output unchanged
-  /// AND adds NO allocation on the hot path (the alloc-budget regression guard).
+  /// This is the GENERIC leaf: it must hold under ANY `serde::Serializer` and
+  /// under ANY feature combination (`serde`-without-`json` included), so it emits
+  /// the value through the standard serde number API — NEVER a `serde_json`
+  /// `RawValue` (whose private token shape a non-`serde_json` serializer would
+  /// observe instead of a number, breaking the contract). The byte-exact
+  /// EscapeJSON-VERBATIM emission (`return $str`, `XMPStruct.pl:176`) is NOT done
+  /// here; it lives ONLY in [`JsonTagValue`], the internal wrapper exifast's JSON
+  /// renderers use (so verbatim is reachable solely through `serde_json`).
   ///
-  /// **Soundness path (the f64 does not FAITHFULLY represent the token).** The
-  /// gate admits an exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`),
-  /// so it accepts a token OUTSIDE finite-f64 range on BOTH sides. An OVERFLOW
-  /// token such as `1e999` parses to `INFINITY`; `serialize_f64(INFINITY)` would
-  /// emit `null` (silent corruption). An UNDERFLOW token such as `1e-999` parses
-  /// to a FINITE `0.0`, so `is_finite()` alone would let it through and emit a
-  /// bare `0.0`, silently rewriting the nonzero source token to zero. In EITHER
-  /// case emit the ORIGINAL token as a QUOTED JSON STRING instead.
+  /// **Faithful path (the token round-trips as a FINITE f64).** Emit a plain
+  /// numeric scalar. A pure-integer token routes through the exact integer writer
+  /// (so `2005` -> `2005`, not `2005.0`; the gate caps the integer part at 15
+  /// digits, so it always fits `i64`/`u64`); a fractional/exponent token routes
+  /// through `serialize_f64`. A degenerate lexeme is value-canonicalized here
+  /// (`0E0` -> `0.0`, `1.4e2` -> `140.0`, `-0` -> `0`) — that is the agnostic
+  /// scalar a bare `TagValue` must yield; the renderer wrapper restores the exact
+  /// source bytes for the JSON-output path.
   ///
-  /// **Completeness (the f64-representation class is CLOSED).** A gate-matching
-  /// token falls into exactly one of three cases: (a) it overflows finite-f64
-  /// range ⇒ `!is_finite()` ⇒ string; (b) it is a nonzero value that underflows
-  /// to zero ⇒ `f == 0.0 && lexeme_is_nonzero(token)` ⇒ string; or (c) it parses
-  /// to a finite f64 that faithfully denotes its value ⇒ bare number. There is no
-  /// fourth corrupting case: a genuine-zero lexeme (`0`/`0.0`/`0e-5`/`-0`) is
-  /// `f == 0.0` with a zero significand, so it stays a bare `0`; and precision
-  /// loss strictly within finite-nonzero range is value-preserving under the
-  /// token-exact comparator (`1.50` ≈ `1.5`). Hence [`f64_token_is_faithful`]
+  /// **Soundness fallback (the f64 does NOT faithfully represent the token).**
+  /// The gate admits an exponent up to `e[-+]?\d{1,3}` (faithful to
+  /// `XMPStruct.pl:176`), so it accepts a token OUTSIDE finite-f64 range on BOTH
+  /// sides. An OVERFLOW token (`1e999`) parses to `INFINITY`; an UNDERFLOW token
+  /// with a nonzero significand (`1e-999`) parses to a FINITE `0.0`. Emitting
+  /// EITHER as a number is unsound (`serialize_f64(INFINITY)` -> `null`; a bare
+  /// `0.0` would rewrite the nonzero `1e-999` to zero). So emit the ORIGINAL
+  /// token as a QUOTED JSON STRING — sound on EVERY serde path (`to_string` AND
+  /// `to_value`), never panics, never `null`, never a value-corrupting zero.
+  ///
+  /// **Completeness (the in-gate token class is CLOSED).** A gate-matching token
+  /// falls into exactly one of three cases: (a) it overflows finite-f64 range ⇒
+  /// `!is_finite()` ⇒ quoted string; (b) it is a nonzero value that underflows to
+  /// zero ⇒ `f == 0.0 && lexeme_is_nonzero(token)` ⇒ quoted string; or (c) it
+  /// parses to a finite f64 that faithfully denotes its value ⇒ a numeric scalar.
+  /// Hence [`f64_token_is_faithful`]
   /// (`is_finite() && !(f == 0.0 && lexeme_is_nonzero)`) is the complete,
-  /// crate-wide predicate for "the f64 may be emitted bare".
-  ///
-  /// NOTE — this is a deliberate CRAFTED-input divergence from ExifTool's
-  /// `EscapeJSON`, which `return $str`s an over-range exponent BARE. Emitting a
-  /// bare number here (e.g. via `serde_json::value::RawValue`) is NOT sound on
-  /// every serde path: the same `Serialize` impl is driven by
-  /// `serde_json::to_value` (`Rendered` / the typed-serde+parity harness), and
-  /// with this crate's serde_json features (`raw_value`+`alloc`, NO
-  /// `arbitrary_precision`) materializing a `RawValue("1e999")` into a
-  /// `serde_json::Value` REPARSES the token → `NumberOutOfRange` → `to_value`
-  /// returns `Err`/panics. A quoted string is sound on EVERY path
-  /// (`to_string` AND `to_value`), never panics, never emits `null`. Per the
-  /// project ship-bar, `1e999` never appears in real metadata, so byte-for-byte
-  /// crafted-faithfulness is optional here while soundness is required. (We do
-  /// NOT enable `arbitrary_precision` — a broad dependency-feature change that
-  /// could perturb the comparator.)
+  /// crate-wide predicate for "the token may be emitted as a number".
   fn serialize_in_gate_number_str<S: Serializer>(text: &str, s: S) -> Result<S::Ok, S::Error> {
     if let Ok(f) = text.parse::<f64>()
       && crate::value::f64_token_is_faithful(f, text)
     {
+      // A pure-integer token routes through the exact integer writer (so `2005`
+      // -> `2005`, not `2005.0`; the gate caps the integer part at 15 digits, so
+      // it always fits `i64`/`u64`); a fractional/exponent token routes through
+      // `serialize_f64`. A sound numeric scalar on every serde path.
+      let is_integer = !text.bytes().any(|b| b == b'.' || b == b'e' || b == b'E');
+      if is_integer {
+        if let Some(rest) = text.strip_prefix('-') {
+          if let Ok(n) = rest.parse::<i64>() {
+            return s.serialize_i64(-n);
+          }
+        } else if let Ok(n) = text.parse::<u64>() {
+          return s.serialize_u64(n);
+        }
+      }
       return s.serialize_f64(f);
     }
     // The f64 does NOT faithfully represent the token: an over-range exponent
@@ -1115,39 +1127,23 @@ const _: () = {
         // here to match the golden's bare `true`/`false`.
         TagValue::Str(text) if text.eq_ignore_ascii_case("true") => s.serialize_bool(true),
         TagValue::Str(text) if text.eq_ignore_ascii_case("false") => s.serialize_bool(false),
-        // ExifTool's terminal `EscapeJSON` NUMBER gate (`exiftool:3809`,
-        // Contract B / #197): a string whose ENTIRE text is an
-        // [`escape_json_is_number`] is emitted as a BARE JSON number — exactly
-        // the token ExifTool's JSON writer produces for that value (e.g.
-        // `ExifTool:ExifToolVersion` "13.59" -> `13.59`, an `APE:Year` "2005"
-        // -> `2005`). A pure integer (no `.`/`e`) routes through the integer
-        // writer so serde emits an exact integer token (`2005`, not `2005.0`);
-        // a fractional/exponent value routes through `serialize_f64`. The gate's
-        // 15-digit integer cap keeps a `>= 16`-digit integer (e.g. a `u64` above
-        // `i64::MAX`) a QUOTED string, byte-identical to bundled. Anything not a
-        // clean JSON number (a PrintConv label, a `:`/`/`/space-bearing value,
-        // `inf`/`undef`/`Inf`/`NaN`) stays a quoted string.
+        // ExifTool's terminal `EscapeJSON` NUMBER gate (`XMPStruct.pl:176`,
+        // Contract B / #197 + #321): a string whose ENTIRE text is an
+        // [`escape_json_is_number`] is emitted as a BARE JSON number VERBATIM —
+        // the EXACT source token, byte-for-byte, exactly as `EscapeJSON`'s
+        // `return $str` does (`ExifTool:ExifToolVersion` "13.59" -> `13.59`, an
+        // `APE:Year` "2005" -> `2005`; and a degenerate-but-in-gate `0E0` -> `0E0`,
+        // `-0` -> `-0`, `1.4e2` -> `1.4e2`, NOT canonicalized to serde's own
+        // `0.0`/`0`/`140.0` rendering, #321). The gate's 15-digit integer cap
+        // keeps a `>= 16`-digit integer (e.g. a `u64` above `i64::MAX`) a QUOTED
+        // string. Anything not a clean JSON number (a PrintConv label, a
+        // `:`/`/`/space-bearing value, `inf`/`undef`/`Inf`/`NaN`) stays quoted.
         TagValue::Str(text) if escape_json_is_number(text) => {
-          // A pure integer ⇒ an exact integer token; the gate caps the integer
-          // part at 15 digits, so it always fits `i64`/`u64`.
-          let is_integer = !text.bytes().any(|b| b == b'.' || b == b'e' || b == b'E');
-          if is_integer {
-            if let Some(rest) = text.strip_prefix('-') {
-              if let Ok(n) = rest.parse::<i64>() {
-                return s.serialize_i64(-n);
-              }
-            } else if let Ok(n) = text.parse::<u64>() {
-              return s.serialize_u64(n);
-            }
-          }
-          // Fractional / exponent in-gate string (Contract B / #197). A FINITE
-          // value emits a value-equal bare number via the allocation-free
-          // `serialize_f64` (unchanged golden bytes); a value OUTSIDE finite-f64
-          // range that the gate still admits (`e[-+]?\d{1,3}`, e.g. `1e999`)
-          // emits the ORIGINAL token as a QUOTED string — sound on every serde
-          // path (`to_string` AND `to_value`) instead of the `null` that
-          // `serialize_f64(INFINITY)` would corrupt it to, or the `to_value`
-          // `NumberOutOfRange` a bare raw token would trigger. See the helper.
+          // Emit the in-gate token VERBATIM as a bare number (the helper writes
+          // the exact source bytes via `RawValue`), EXCEPT an over/underflow
+          // exponent (`1e999`/`1e-999`) the gate still admits but which is not a
+          // faithful finite f64 — that emits the ORIGINAL token as a QUOTED string
+          // (sound on `to_string` AND `to_value`, never `null`/`NumberOutOfRange`).
           serialize_in_gate_number_str(text, s)
         }
         // Otherwise STANDARD string emission: a non-numeric value (a PrintConv
@@ -1195,6 +1191,170 @@ const _: () = {
     }
   }
 };
+
+/// Internal JSON-output wrapper around a [`TagValue`], confined to exifast's two
+/// INTERNAL serde_json-only renderers — `serialize.rs`'s `Document`
+/// (`render_document`, the typed-Meta staging / value-rendering oracle) and
+/// `parser.rs`'s `Document` (`extract_info_with_options`, the PRODUCTION golden
+/// path). Both HARDCODE `serde_json::to_string`, so `RawValue` only ever fires
+/// under `serde_json`; neither is a public, arbitrary-`Serializer` surface. Each
+/// wraps every tag value in `JsonTagValue` before `serialize_entry`. This wrapper
+/// — and ONLY this wrapper — performs the ExifTool `EscapeJSON`-VERBATIM emission
+/// (`return $str`, `XMPStruct.pl:176`): an in-gate numeric STRING token is
+/// written as a BARE JSON number, EXACTLY its source bytes (`0E0` → `0E0`,
+/// `-0` → `-0`, `1.4e2` → `1.4e2`, `534805.880` → `534805.880`), not the
+/// value-canonicalized scalar a bare [`TagValue`] yields.
+///
+/// The PUBLIC, generic [`crate::Rendered`] wrapper does NOT use this — it
+/// serializes the plain `TagValue` through that value's serializer-agnostic
+/// `Serialize`, so NO `RawValue` is reachable through a public/generic surface
+/// (`Rendered`, `TagValue`). This is the #321 leak-class close: `RawValue` lives
+/// ONLY in the two internal serde_json-hardcoded golden renderers above.
+///
+/// Why a wrapper and not the generic impl: verbatim emission requires a
+/// `serde_json::value::RawValue`, whose private token shape any OTHER serde
+/// `Serializer` would observe instead of a number — breaking the GENERIC
+/// `TagValue` `Serialize` contract (which must stay serializer-agnostic and emit
+/// a plain numeric scalar). Confining `RawValue` to this `serde_json`-only path
+/// keeps the generic impl agnostic while preserving byte-exact JSON for the two
+/// internal renderer paths that observe goldens.
+///
+/// **The byte-exact verbatim guarantee is the `serde_json::to_string` /
+/// `to_writer` render path ONLY** — the path that produces exifast's actual JSON
+/// output (`render_document` -> `serde_json::to_string(&Document)`,
+/// `serialize.rs`; and the `parser.rs` `Document` reached through
+/// `extract_info_with_options`). There, the `RawValue` is written DIRECTLY as its
+/// source bytes, so the EscapeJSON lexeme survives (`534805.880` stays
+/// `534805.880`).
+/// NOTE: the conformance pass does NOT lock this lexeme — its comparator
+/// (`jsondiff::json_equivalent_strict`) keeps numeric VALUE-insensitivity
+/// *within* the JSON number type (`534805.880` == `534805.88`, `3.4e+38` ==
+/// `3.4e38`), so a lexeme-rewriting regression would still pass conformance. The
+/// verbatim guarantee is therefore proven SEPARATELY, end to end on the actual
+/// render path, by the dedicated raw-output tests
+/// (`render_document_emits_in_gate_numeric_str_token_verbatim`, `serialize.rs`;
+/// `rendered_emits_in_gate_numeric_str_token_verbatim`, `format_parser.rs`),
+/// which assert the rendered string contains the exact source bytes — plus the
+/// `json_tag_value_wrapper_*` wrapper-level tests below.
+///
+/// The lexeme is NOT preserved through `serde_json::to_value`: with this crate's
+/// `serde_json` features (`raw_value`, NO `arbitrary_precision`), the `Value`
+/// serializer REPARSES a `RawValue` into a canonical `Value::Number`, dropping the
+/// lexeme (`534805.880` -> `534805.88`, `0E0` -> `0.0`, `1.4e2` -> `140.0`) — an
+/// inherent `serde_json` limitation (`Value` has no raw-number variant without
+/// `arbitrary_precision`, which the project deliberately does NOT enable). So the
+/// `to_value` path (the `typed_serde_parity` harness) is a NUMERIC-`Value`
+/// structural check (order-insensitive, value-equal), NOT a byte-exact lexeme
+/// check; canonicalization there is correct for that test. The
+/// `to_string`-verbatim vs `to_value`-canonicalizes contract is locked by the two
+/// `json_tag_value_wrapper_*` tests below.
+///
+/// Under `not(feature = "json")` (a `serde`-without-`serde_json` build) there is
+/// no JSON writer to honour verbatim bytes, and these renderers are not compiled
+/// anyway; the wrapper simply DELEGATES to the inner value's generic
+/// (agnostic-scalar) `Serialize`, so the crate still compiles on the serde-only
+/// contract.
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub(crate) struct JsonTagValue<'a>(pub(crate) &'a TagValue);
+
+#[cfg(feature = "serde")]
+const _: () = {
+  use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+
+  impl Serialize for JsonTagValue<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      match self.0 {
+        // The ONE place EscapeJSON-verbatim happens: an in-gate numeric string
+        // (NOT a `true`/`false` word — those fail `escape_json_is_number`) is
+        // emitted as its EXACT source bytes via `serde_json::value::RawValue`,
+        // with the over/underflow-exponent soundness fallback (quoted string).
+        // Under `not(json)` there is no `serde_json`, so DELEGATE to the inner
+        // value's generic (agnostic-scalar) emission.
+        TagValue::Str(text) if escape_json_is_number(text) => {
+          #[cfg(feature = "json")]
+          {
+            serialize_in_gate_number_str_verbatim(text, s)
+          }
+          #[cfg(not(feature = "json"))]
+          {
+            self.0.serialize(s)
+          }
+        }
+        // A `List`/`Map` value is recursed through `JsonTagValue` so a NESTED
+        // in-gate numeric string ALSO emits verbatim (the pre-existing #321
+        // property — the generic impl reached the same verbatim leaf for nested
+        // `Str` elements; the wrapper preserves it). Every non-numeric-string
+        // leaf bottoms out in the inner value's generic `Serialize` (the `else`
+        // arm below), so the output is otherwise identical.
+        TagValue::List(items) => {
+          let mut seq = s.serialize_seq(Some(items.len()))?;
+          for item in items {
+            seq.serialize_element(&JsonTagValue(item))?;
+          }
+          seq.end()
+        }
+        TagValue::Map(pairs) => {
+          let mut map = s.serialize_map(Some(pairs.len()))?;
+          for (k, v) in pairs {
+            map.serialize_entry(k.as_str(), &JsonTagValue(v))?;
+          }
+          map.end()
+        }
+        // Every OTHER value (integers, floats, booleans, bytes, rationals,
+        // non-numeric strings) has no verbatim concern — delegate straight to the
+        // generic agnostic `TagValue::Serialize` (identical bytes under JSON).
+        _ => self.0.serialize(s),
+      }
+    }
+  }
+};
+
+/// Emit an in-gate numeric STRING token (`escape_json_is_number` already
+/// verified its grammar) as a BARE JSON number, VERBATIM — exactly the source
+/// bytes, mirroring ExifTool `EscapeJSON`'s `return $str` (`XMPStruct.pl:176`).
+/// Used ONLY by [`JsonTagValue`] (the `serde_json` renderer path); the GENERIC
+/// `TagValue` `Serialize` never reaches here (it stays agnostic-scalar).
+///
+/// **Faithful path (the token round-trips as a FINITE f64).** Emit the ORIGINAL
+/// token bytes UNQUOTED via `serde_json::value::RawValue` — so a
+/// degenerate-but-in-gate token round-trips byte-identically (`0E0` → `0E0`,
+/// `-0` → `-0`, `1.4e2` → `1.4e2`, a real trailing-zero `534805.880` →
+/// `534805.880`), NOT canonicalized. On `serde_json::to_value` (the typed-serde /
+/// parity harness) a `RawValue` of a finite token REPARSES into the same
+/// canonical `Number` the agnostic scalar produces — sound, value-identical,
+/// never `Err`.
+///
+/// **Soundness fallback (the f64 does NOT faithfully represent the token).** The
+/// gate admits an exponent up to `e[-+]?\d{1,3}`, so it accepts a token OUTSIDE
+/// finite-f64 range (`1e999` → `INFINITY`; `1e-999` → a nonzero significand that
+/// underflowed to `0.0`). A `RawValue` of either is unsound (`to_value`
+/// `NumberOutOfRange`; or a value-corrupting bare `0.0`), so emit the ORIGINAL
+/// token as a QUOTED JSON STRING — sound on `to_string` AND `to_value`, never
+/// panics, never `null`. (Per the ship-bar such over/underflow exponents never
+/// appear in real metadata; the bare-vs-quoted divergence is an accepted
+/// crafted-input gap while soundness on every serde path is required.)
+#[cfg(feature = "json")]
+fn serialize_in_gate_number_str_verbatim<S: serde::ser::Serializer>(
+  text: &str,
+  s: S,
+) -> Result<S::Ok, S::Error> {
+  use serde::ser::Serialize;
+  if let Ok(f) = text.parse::<f64>()
+    && f64_token_is_faithful(f, text)
+  {
+    // `RawValue` writes the exact source bytes unquoted on `to_string`, and
+    // reparses to the value-identical `Number` on `to_value`.
+    // `escape_json_is_number` has already verified the grammar, so this is
+    // always syntactically valid JSON.
+    let raw = serde_json::value::RawValue::from_string(text.to_owned())
+      .expect("escape_json_is_number token is valid JSON");
+    return raw.serialize(s);
+  }
+  // Over/underflow exponent the gate admits but f64 cannot faithfully represent:
+  // the sound QUOTED source token (never `null`/`NumberOutOfRange`).
+  s.serialize_str(text)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1423,7 +1583,7 @@ mod tests {
   /// non-numeric string stays quoted, and an integer of `>= 16` digits stays
   /// quoted (the gate's 15-digit integer cap — this is what keeps `PLIST:Big`
   /// = `9223372036854775808` a quoted string, exactly as bundled emits it).
-  #[cfg(feature = "serde")]
+  #[cfg(feature = "json")]
   #[test]
   fn str_serializes_through_escape_json_number_gate() {
     let j = |v: &TagValue| serde_json::to_string(v).unwrap();
@@ -1458,6 +1618,427 @@ mod tests {
     assert_eq!(j(&TagValue::Str("false".into())), "false");
   }
 
+  /// #321 — a `TagValue::Str` that passes the `EscapeJSON` number gate is emitted
+  /// VERBATIM as a bare JSON number (the EXACT source token, mirroring
+  /// `EscapeJSON`'s `return $str`, `XMPStruct.pl:176`), NOT canonicalized through
+  /// a serde reparse. The pre-#321 serializer routed an integer string through
+  /// `serialize_i64` (so `-0` lost its sign → `0`) and a fractional/exponent
+  /// string through `serialize_f64` (so `0E0` → `0.0`, `1.4e2` → `140.0`),
+  /// diverging from bundled. Now every in-gate token round-trips byte-identically.
+  /// The already-canonical tokens (`4.0`, `2005`, `13.59`) are unchanged — their
+  /// verbatim form IS their canonical form — which is exactly why the fix is a
+  /// no-op for every existing golden (no golden carries a degenerate token).
+  #[cfg(feature = "json")]
+  #[test]
+  fn str_in_gate_number_emits_verbatim_like_escape_json() {
+    // The RENDERER path: `JsonTagValue` (what the two internal `Document`
+    // renderers — `serialize.rs` + `parser.rs` — wrap each value in) emits the
+    // in-gate token VERBATIM. The GENERIC `TagValue` impl (which the public
+    // `Rendered` uses) is serializer-agnostic and canonicalizes (see the
+    // `to_value` block below + `generic_str_serialize_is_agnostic_scalar_not_rawvalue`).
+    let j = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
+    // DEGENERATE in-gate tokens — the #321 fix: emitted VERBATIM, byte-for-byte.
+    // (Before: `0E0`->`0.0`, `-0`->`0`, `1.4e2`->`140.0`, `-1e2`->`-100.0`,
+    // `6.4e-05`->`0.000064` — all canonicalized, diverging from bundled.)
+    assert_eq!(j(&TagValue::Str("0E0".into())), "0E0");
+    assert_eq!(j(&TagValue::Str("-0".into())), "-0");
+    assert_eq!(j(&TagValue::Str("0.0".into())), "0.0");
+    assert_eq!(j(&TagValue::Str("-0.0".into())), "-0.0");
+    assert_eq!(j(&TagValue::Str("1.4e2".into())), "1.4e2");
+    assert_eq!(j(&TagValue::Str("-1e2".into())), "-1e2");
+    assert_eq!(j(&TagValue::Str("6.4e-05".into())), "6.4e-05");
+    assert_eq!(j(&TagValue::Str("0e-5".into())), "0e-5");
+    // ALREADY-CANONICAL tokens — verbatim === their previous output, so these
+    // (the shape every current golden carries) are UNCHANGED (the no-op property).
+    assert_eq!(j(&TagValue::Str("4.0".into())), "4.0");
+    assert_eq!(j(&TagValue::Str("2005".into())), "2005");
+    assert_eq!(j(&TagValue::Str("13.59".into())), "13.59");
+    assert_eq!(j(&TagValue::Str("-3".into())), "-3");
+    // `+0` is NOT in the gate (`EscapeJSON`'s `-?` rejects a leading `+`), so it
+    // stays a QUOTED string in BOTH exifast and bundled — verbatim emission must
+    // NOT make it a bare number.
+    assert_eq!(j(&TagValue::Str("+0".into())), "\"+0\"");
+    // Every in-gate verbatim emission is syntactically valid JSON (round-trips as
+    // a `RawValue`) and decodes to the EXACT source token.
+    for tok in [
+      "0E0", "-0", "0.0", "-0.0", "1.4e2", "-1e2", "6.4e-05", "0e-5",
+    ] {
+      let out = j(&TagValue::Str(tok.into()));
+      let rv: Result<Box<serde_json::value::RawValue>, _> = serde_json::from_str(&out);
+      assert!(rv.is_ok(), "verbatim token {out:?} must be valid JSON");
+      assert_eq!(rv.unwrap().get(), tok, "{tok} must emit byte-identically");
+    }
+    // GENERIC-CONTRACT proof on `to_value`: the BARE `TagValue` (NOT wrapped in
+    // `JsonTagValue`) is serializer-agnostic — it emits a value-canonicalized
+    // numeric SCALAR (`0E0` -> `0.0`, `1.4e2` -> `140.0`), NEVER a `RawValue`
+    // shape — so the generic impl holds under any serializer / any feature.
+    #[cfg(feature = "json")]
+    {
+      assert_eq!(
+        serde_json::to_value(TagValue::Str("0E0".into())).unwrap(),
+        serde_json::json!(0.0)
+      );
+      assert_eq!(
+        serde_json::to_value(TagValue::Str("1.4e2".into())).unwrap(),
+        serde_json::json!(140.0)
+      );
+    }
+  }
+
+  /// #321 R2 (Codex [high]) — the GENERIC `impl Serialize for TagValue` must be
+  /// serializer-AGNOSTIC: it emits a plain numeric SCALAR through the standard
+  /// serde number API, NEVER a `serde_json::value::RawValue`. `serde_json`
+  /// special-cases `RawValue`'s private newtype token, but ANY OTHER serializer
+  /// (or a downstream that feature-unifies `json` on globally) would observe
+  /// `RawValue`'s newtype-struct shape instead of the number — breaking the
+  /// contract. This drives a numeric `TagValue::Str` through a NON-`serde_json`
+  /// `Serializer` (`CaptureScalar`) and asserts a NUMERIC scalar is emitted
+  /// (`Str("2005")` -> `U64(2005)`, `Str("1.4e2")` -> `F64(140.0)`), and that
+  /// `serialize_newtype_struct` (the `RawValue` channel) is NEVER reached. The
+  /// EscapeJSON-verbatim emission lives ONLY in `JsonTagValue` (the next test).
+  #[test]
+  fn generic_str_serialize_is_agnostic_scalar_not_rawvalue() {
+    use serde::ser::{Impossible, Serialize, Serializer};
+
+    /// A minimal non-`serde_json` `Serializer` that records WHICH serde scalar
+    /// method a value emits through. A `RawValue` leak would arrive via
+    /// `serialize_newtype_struct` (its private `$serde_json::private::RawValue`
+    /// token) — recorded as `NewtypeStruct` so the test can reject it.
+    #[derive(Debug, PartialEq)]
+    enum Captured {
+      U64(u64),
+      I64(i64),
+      F64(f64),
+      Str(String),
+      NewtypeStruct,
+    }
+
+    /// The error type for [`CaptureScalar`]. A numeric `TagValue::Str` only ever
+    /// reaches a scalar method; any other serde method is a contract violation,
+    /// signalled as this error (loud, not a silent pass).
+    #[derive(Debug)]
+    struct CaptureErr(String);
+    impl std::fmt::Display for CaptureErr {
+      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+      }
+    }
+    impl std::error::Error for CaptureErr {}
+    impl serde::ser::Error for CaptureErr {
+      fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        CaptureErr(msg.to_string())
+      }
+    }
+
+    struct CaptureScalar;
+
+    // Every method a numeric `TagValue::Str` does NOT use returns an error
+    // (`unexpected`), so an unexpected serde path fails the test loudly. The
+    // RawValue channel (`serialize_newtype_struct`) is recorded as
+    // `NewtypeStruct` so a leak is observable.
+    macro_rules! unexpected {
+      ($($m:ident ( $($a:ty),* ) );* $(;)?) => {
+        $(fn $m(self $(, _: $a)*) -> Result<Captured, CaptureErr> {
+          Err(CaptureErr(concat!("unexpected ", stringify!($m)).to_owned()))
+        })*
+      };
+    }
+
+    impl Serializer for CaptureScalar {
+      type Ok = Captured;
+      type Error = CaptureErr;
+      type SerializeSeq = Impossible<Captured, CaptureErr>;
+      type SerializeTuple = Impossible<Captured, CaptureErr>;
+      type SerializeTupleStruct = Impossible<Captured, CaptureErr>;
+      type SerializeTupleVariant = Impossible<Captured, CaptureErr>;
+      type SerializeMap = Impossible<Captured, CaptureErr>;
+      type SerializeStruct = Impossible<Captured, CaptureErr>;
+      type SerializeStructVariant = Impossible<Captured, CaptureErr>;
+
+      fn serialize_u64(self, v: u64) -> Result<Captured, CaptureErr> {
+        Ok(Captured::U64(v))
+      }
+      fn serialize_i64(self, v: i64) -> Result<Captured, CaptureErr> {
+        Ok(Captured::I64(v))
+      }
+      fn serialize_f64(self, v: f64) -> Result<Captured, CaptureErr> {
+        Ok(Captured::F64(v))
+      }
+      fn serialize_str(self, v: &str) -> Result<Captured, CaptureErr> {
+        Ok(Captured::Str(v.to_owned()))
+      }
+      // The `RawValue` channel: a leak of `serde_json`'s private token reaches
+      // here. Record it so the assertion below rejects it.
+      fn serialize_newtype_struct<T>(
+        self,
+        _name: &'static str,
+        _value: &T,
+      ) -> Result<Captured, CaptureErr>
+      where
+        T: ?Sized + Serialize,
+      {
+        Ok(Captured::NewtypeStruct)
+      }
+
+      unexpected! {
+        serialize_bool(bool);
+        serialize_i8(i8); serialize_i16(i16); serialize_i32(i32); serialize_i128(i128);
+        serialize_u8(u8); serialize_u16(u16); serialize_u32(u32); serialize_u128(u128);
+        serialize_f32(f32); serialize_char(char); serialize_bytes(&[u8]);
+        serialize_none(); serialize_unit(); serialize_unit_struct(&'static str);
+      }
+      fn serialize_some<T>(self, _: &T) -> Result<Captured, CaptureErr>
+      where
+        T: ?Sized + Serialize,
+      {
+        Err(CaptureErr("unexpected serialize_some".to_owned()))
+      }
+      fn serialize_unit_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+      ) -> Result<Captured, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_unit_variant".to_owned()))
+      }
+      fn serialize_newtype_variant<T>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: &T,
+      ) -> Result<Captured, CaptureErr>
+      where
+        T: ?Sized + Serialize,
+      {
+        Err(CaptureErr(
+          "unexpected serialize_newtype_variant".to_owned(),
+        ))
+      }
+      fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_seq".to_owned()))
+      }
+      fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_tuple".to_owned()))
+      }
+      fn serialize_tuple_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleStruct, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_tuple_struct".to_owned()))
+      }
+      fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleVariant, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_tuple_variant".to_owned()))
+      }
+      fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_map".to_owned()))
+      }
+      fn serialize_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStruct, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_struct".to_owned()))
+      }
+      fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStructVariant, CaptureErr> {
+        Err(CaptureErr("unexpected serialize_struct_variant".to_owned()))
+      }
+    }
+
+    // An integer-shaped token -> the exact integer writer (a NUMERIC scalar).
+    assert_eq!(
+      TagValue::Str("2005".into())
+        .serialize(CaptureScalar)
+        .unwrap(),
+      Captured::U64(2005),
+      "a bare integer string must emit a numeric scalar, not a RawValue"
+    );
+    // A fractional/exponent token -> `serialize_f64` (value-canonicalized).
+    assert_eq!(
+      TagValue::Str("1.4e2".into())
+        .serialize(CaptureScalar)
+        .unwrap(),
+      Captured::F64(140.0),
+      "a bare exponent string must emit a numeric scalar (140.0), not a RawValue"
+    );
+    // A negative integer token -> `serialize_i64`.
+    assert_eq!(
+      TagValue::Str("-3".into()).serialize(CaptureScalar).unwrap(),
+      Captured::I64(-3)
+    );
+    // A non-numeric string stays a string scalar (never a RawValue).
+    assert_eq!(
+      TagValue::Str("2.64 s".into())
+        .serialize(CaptureScalar)
+        .unwrap(),
+      Captured::Str("2.64 s".to_owned())
+    );
+    // An over-range exponent -> the QUOTED-string soundness fallback (a string
+    // scalar), never a RawValue, never a panic.
+    assert_eq!(
+      TagValue::Str("1e999".into())
+        .serialize(CaptureScalar)
+        .unwrap(),
+      Captured::Str("1e999".to_owned())
+    );
+  }
+
+  /// #321 R2 — the COMPANION to the agnostic-contract test: the SAME numeric
+  /// `TagValue::Str` token, routed through the renderer wrapper `JsonTagValue`
+  /// (what the two internal `Document` renderers wrap each value in), is emitted
+  /// VERBATIM under `serde_json` — the EXACT source bytes (`2005` -> `2005`,
+  /// `1.4e2` -> `1.4e2`),
+  /// NOT the canonicalized scalar the bare `TagValue` yields. This is the ONLY
+  /// place EscapeJSON-verbatim happens, so the byte-exact goldens stay faithful.
+  #[cfg(feature = "json")]
+  #[test]
+  fn json_tag_value_wrapper_emits_in_gate_token_verbatim() {
+    let j = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
+    // The degenerate tokens the bare impl canonicalizes are VERBATIM here.
+    assert_eq!(j(&TagValue::Str("1.4e2".into())), "1.4e2");
+    assert_eq!(j(&TagValue::Str("0E0".into())), "0E0");
+    assert_eq!(j(&TagValue::Str("-0".into())), "-0");
+    // A pure integer is verbatim too (`2005`, not `2005.0`).
+    assert_eq!(j(&TagValue::Str("2005".into())), "2005");
+    // The real Insta360 trailing-zero case: `534805.880` stays byte-identical
+    // (the bare impl would reparse it to the canonical `534805.88`).
+    assert_eq!(j(&TagValue::Str("534805.880".into())), "534805.880");
+    // The wrapper delegates EVERY non-in-gate value to the generic agnostic
+    // emission, so a non-numeric string / integer / float is identical to a bare
+    // `TagValue` (no double-encoding, no RawValue for non-numeric leaves).
+    assert_eq!(j(&TagValue::Str("2.64 s".into())), "\"2.64 s\"");
+    assert_eq!(j(&TagValue::U64(44100)), "44100");
+    assert_eq!(j(&TagValue::F64(0.5)), "0.5");
+    // A NESTED in-gate numeric string inside a List/Map ALSO emits verbatim
+    // (the wrapper recurses), matching the pre-#321-structural behavior.
+    assert_eq!(
+      j(&TagValue::List(vec![
+        TagValue::Str("1.4e2".into()),
+        TagValue::Str("0E0".into()),
+      ])),
+      "[1.4e2,0E0]"
+    );
+  }
+
+  /// #321 R3 (Codex [high]) — the BYTE-EXACT contract: the verbatim EscapeJSON
+  /// lexeme survives ONLY through the `serde_json::to_string` / `to_writer` RENDER
+  /// path — exactly the path that produces exifast's actual JSON output
+  /// (`render_document` -> `serde_json::to_string(&Document)`, `serialize.rs`; and
+  /// the `parser.rs` `Document` reached through `extract_info_with_options`), both
+  /// of which wrap each value in `JsonTagValue`. There a `RawValue` is written DIRECTLY as its
+  /// source bytes, so the lexeme is preserved byte-for-byte. The conformance
+  /// `.json` fixtures flow through this same render path, but do NOT by themselves
+  /// LOCK the lexeme — `jsondiff::json_equivalent_strict` stays numeric-VALUE-
+  /// insensitive within the JSON number type (`534805.880` == `534805.88`), so a
+  /// lexeme rewrite would still pass conformance. The byte-exact guarantee is
+  /// pinned by THIS wrapper-level test for the full degenerate-token class plus
+  /// the canonical controls, and end to end on the actual render path by
+  /// `render_document_emits_in_gate_numeric_str_token_verbatim` (`serialize.rs`)
+  /// and `rendered_emits_in_gate_numeric_str_token_verbatim` (`format_parser.rs`).
+  /// Its companion (`..._to_value_canonicalizes_the_lexeme`) documents that the
+  /// SEPARATE `to_value` path does NOT preserve the lexeme.
+  #[cfg(feature = "json")]
+  #[test]
+  fn json_tag_value_wrapper_to_string_preserves_lexeme_verbatim() {
+    let j = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
+    // DEGENERATE in-gate tokens — emitted byte-for-byte verbatim (the #321 fix).
+    // The real Insta360 trailing-zero is the motivating case.
+    assert_eq!(j(&TagValue::Str("534805.880".into())), "534805.880");
+    assert_eq!(j(&TagValue::Str("0E0".into())), "0E0");
+    assert_eq!(j(&TagValue::Str("-0".into())), "-0");
+    assert_eq!(j(&TagValue::Str("-0.0".into())), "-0.0");
+    assert_eq!(j(&TagValue::Str("1.4e2".into())), "1.4e2");
+    assert_eq!(j(&TagValue::Str("6.4e-05".into())), "6.4e-05");
+    // CANONICAL CONTROLS — their verbatim form IS their canonical form, so they
+    // emit identically (this is the no-op property for every existing golden).
+    assert_eq!(j(&TagValue::Str("4.0".into())), "4.0");
+    assert_eq!(j(&TagValue::Str("2005".into())), "2005");
+    // Every verbatim emission is valid JSON and decodes to the EXACT source token.
+    for tok in ["534805.880", "0E0", "-0", "-0.0", "1.4e2", "6.4e-05"] {
+      let out = j(&TagValue::Str(tok.into()));
+      let rv: Box<serde_json::value::RawValue> = serde_json::from_str(&out)
+        .unwrap_or_else(|_| panic!("verbatim token {out:?} must be valid JSON"));
+      assert_eq!(
+        rv.get(),
+        tok,
+        "{tok} must emit byte-identically on to_string"
+      );
+    }
+  }
+
+  /// #321 R3 (Codex [high]) — the CONTRAST that DOCUMENTS the `to_value`
+  /// limitation: the byte-exact verbatim guarantee is the `to_string` render path
+  /// (the companion test above), NOT `serde_json::to_value`. The SAME
+  /// `JsonTagValue` tokens, serialized through `to_value`, are CANONICALIZED — with
+  /// this crate's `serde_json` features (`raw_value`, NO `arbitrary_precision`),
+  /// the `Value` serializer REPARSES the `RawValue` into a `Value::Number`, dropping
+  /// the source lexeme (`534805.880` -> `534805.88`, `0E0` -> `0.0`,
+  /// `1.4e2` -> `140.0`). This is an INHERENT `serde_json` limitation (`Value` has
+  /// no raw-number variant without `arbitrary_precision`, which the project does
+  /// NOT enable) and is exactly why `typed_serde_parity` (which runs `to_value`) is
+  /// a NUMERIC-`Value` structural check, not a byte-exact lexeme check. Locking it
+  /// here makes the canonicalization EXPLICIT, not a silent surprise. (We assert
+  /// value-equality + a representative canonical form; the precise canonical
+  /// spelling is `serde_json`'s, not exifast's contract.)
+  #[cfg(feature = "json")]
+  #[test]
+  fn json_tag_value_wrapper_to_value_canonicalizes_the_lexeme() {
+    let v = |t: &TagValue| serde_json::to_value(JsonTagValue(t)).unwrap();
+    // The lexeme is DROPPED on the `to_value` path: each degenerate token reparses
+    // into a numeric `Value` that is value-equal to its canonical spelling but does
+    // NOT carry the verbatim source bytes. We assert (a) it is a Number (the
+    // RawValue reparsed away, not a String of the token), (b) numeric value-equality
+    // to the canonical token (the order-insensitive multiset property
+    // `typed_serde_parity` relies on), and (c) its rendering is NOT the verbatim
+    // lexeme. The PRECISE canonical spelling is `serde_json`'s float heuristic, not
+    // exifast's contract (e.g. it renders `6.4e-05` as `0.000064`), so we do NOT
+    // pin it — value-equality + "not verbatim" is the durable, non-brittle claim.
+    for (tok, canon) in [
+      ("534805.880", "534805.88"),
+      ("0E0", "0.0"),
+      ("1.4e2", "140.0"),
+      ("6.4e-05", "0.000064"),
+    ] {
+      let value = v(&TagValue::Str(tok.into()));
+      // It is a Number (the lexeme reparsed away), not a String carrying the token.
+      assert!(
+        value.is_number(),
+        "{tok} reparses to a numeric Value on to_value"
+      );
+      // Value-equal to the canonical token's Value (the numeric multiset property).
+      assert_eq!(
+        value,
+        serde_json::from_str::<serde_json::Value>(canon).unwrap(),
+        "{tok} must be value-equal to {canon} on the to_value path"
+      );
+      // Crucially: its rendering is NOT the verbatim source bytes — the lexeme is
+      // lost on `to_value` (this is the documented `serde_json` limitation; the
+      // byte-exact guarantee is the `to_string` render path, the companion test).
+      assert_ne!(
+        value.to_string(),
+        tok,
+        "to_value must NOT preserve the verbatim lexeme {tok} (serde_json limitation)"
+      );
+    }
+    // The already-canonical controls are unchanged on BOTH paths (their verbatim
+    // form is their canonical form), so to_value renders them identically.
+    assert_eq!(v(&TagValue::Str("4.0".into())).to_string(), "4.0");
+    assert_eq!(v(&TagValue::Str("2005".into())).to_string(), "2005");
+  }
+
   /// FINDING 2 (Codex) — `escape_json_is_number` admits an exponent of up to
   /// `e[-+]?\d{1,3}` (faithful to ExifTool `exiftool:3810`), so it accepts
   /// `1e999`, which is OUTSIDE finite-f64 range. Routing such a string through
@@ -1469,10 +2050,13 @@ mod tests {
   /// SOUND on every serde path (a bare raw token would `NumberOutOfRange` under
   /// `serde_json::to_value`; see `str_over_f64_range_exponent_to_value_is_ok_…`).
   /// This must (a) NOT panic, (b) emit VALID JSON, and (c) NEVER emit `null`.
-  #[cfg(feature = "serde")]
+  #[cfg(feature = "json")]
   #[test]
   fn str_over_f64_range_exponent_emits_quoted_token_not_null() {
-    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // The RENDERER path (`JsonTagValue`): in-RANGE tokens emit VERBATIM, the
+    // over/underflow soundness fallback emits a QUOTED string — both observed
+    // through the wrapper the two internal `Document` renderers use.
+    let j = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
     // SOUNDNESS — out-of-f64-range exponents must NOT become `null`. They are
     // emitted as a QUOTED string carrying the EXACT source token (sound on
     // every serde path).
@@ -1497,14 +2081,15 @@ mod tests {
         "over-range token must round-trip byte-identically as the string payload"
       );
     }
-    // In-RANGE fractional/exponent strings keep the value-equal bare number from
-    // the allocation-free f64 path (serde's canonical rendering). The strict
-    // comparator's within-type numeric insensitivity treats these as equal to
-    // any same-valued golden token (`3.4e38` == `3.4e+38`, `1e3` == `1000.0`).
-    assert_eq!(j(&TagValue::Str("3.4e38".into())), "3.4e+38");
-    assert_eq!(j(&TagValue::Str("1e3".into())), "1000.0");
+    // In-RANGE fractional/exponent strings are now emitted VERBATIM as a bare
+    // number (#321, `EscapeJSON`'s `return $str`) — the EXACT source token, not
+    // serde's canonical re-rendering. The strict comparator's within-type numeric
+    // insensitivity treats these as equal to any same-valued golden token
+    // (`3.4e38` == `3.4e+38`, `1e3` == `1000.0`), so goldens stay green.
+    assert_eq!(j(&TagValue::Str("3.4e38".into())), "3.4e38");
+    assert_eq!(j(&TagValue::Str("1e3".into())), "1e3");
     assert_eq!(j(&TagValue::Str("13.59".into())), "13.59");
-    // A pure in-gate integer still routes through the exact integer writer.
+    // A pure in-gate integer is also emitted verbatim (`2005`, not `2005.0`).
     assert_eq!(j(&TagValue::Str("2005".into())), "2005");
   }
 
@@ -1554,10 +2139,12 @@ mod tests {
   /// `is_finite() && !(f == 0.0 && lexeme_is_nonzero)` routes a nonzero-underflow
   /// token to the QUOTED-string (preserve) path while keeping a GENUINE zero
   /// token a bare `0`/`0.0` and a finite-nonzero in-range value a bare number.
-  #[cfg(feature = "serde")]
+  #[cfg(feature = "json")]
   #[test]
   fn str_underflow_exponent_preserves_nonzero_token_not_zero() {
-    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // The RENDERER path (`JsonTagValue`): a genuine-zero token emits VERBATIM,
+    // the nonzero-underflow soundness fallback emits a QUOTED string.
+    let j = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
     // A NONZERO significand that underflows to `0.0` ⇒ preserved as a QUOTED
     // string carrying the exact token, NEVER rewritten to a bare `0`/`0.0`.
     assert_eq!(j(&TagValue::Str("1e-999".into())), r#""1e-999""#);
@@ -1577,8 +2164,8 @@ mod tests {
       );
     }
     // A GENUINE zero token (significand is zero) legitimately denotes the value
-    // zero ⇒ stays a BARE number, not quoted.
-    assert_eq!(j(&TagValue::Str("0e-5".into())), "0.0");
+    // zero ⇒ stays a BARE number (now emitted VERBATIM, #321), not quoted.
+    assert_eq!(j(&TagValue::Str("0e-5".into())), "0e-5");
     assert_eq!(j(&TagValue::Str("0.0".into())), "0.0");
     // A FINITE tiny IN-RANGE value (nonzero, does NOT underflow) ⇒ a bare number,
     // NOT a quoted string — the predicate must not over-trigger on small magnitudes.
@@ -1641,7 +2228,7 @@ mod tests {
   /// digit integer such as a `u64` above `i64::MAX`, or a float whose `%.15g`
   /// rendering exceeds the 16-fraction-digit cap such as a `DV:Duration`) is a
   /// QUOTED string, byte-identical to bundled.
-  #[cfg(feature = "serde")]
+  #[cfg(feature = "json")]
   #[test]
   fn numeric_scalars_serialize_through_escape_json_gate() {
     let j = |v: &TagValue| serde_json::to_string(v).unwrap();
@@ -1686,7 +2273,7 @@ mod tests {
   /// the string-origin R5 consumers AND this numeric-origin arm): the extreme
   /// rounded form falls to a SOUND quoted string (never `null`, never a panic) on
   /// `to_string` AND `to_value`, while every normal finite double is UNCHANGED.
-  #[cfg(feature = "serde")]
+  #[cfg(feature = "json")]
   #[test]
   fn f64_near_max_rounds_to_quoted_string_not_null() {
     let js = |v: &TagValue| serde_json::to_string(v).unwrap();

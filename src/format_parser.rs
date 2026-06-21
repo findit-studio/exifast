@@ -2011,6 +2011,17 @@ const _: () = {
       let mut key = std::string::String::new();
       for (doc, doc_sub, group, name, _priority, value, _family0) in entries {
         crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, group_mode);
+        // `Rendered` is a PUBLIC, generic `Serialize` (re-exported as
+        // [`crate::Rendered`]) reachable by ANY `Serializer`, so it serializes
+        // the plain `TagValue` through that value's OWN serializer-agnostic
+        // `Serialize` — never `JsonTagValue`. `JsonTagValue`'s verbatim path
+        // writes a `serde_json::value::RawValue`, whose private token shape a
+        // foreign serializer (or `to_value`) would observe; confining it to the
+        // two INTERNAL serde_json-only renderers (`serialize.rs::Document`,
+        // `parser.rs::Document`) keeps every public/generic surface agnostic.
+        // The numeric-string token is value-canonicalized here (e.g.
+        // `534805.880` -> `534805.88`), the same scalar `to_value(&Rendered)`
+        // yields — which is exactly what `typed_serde_parity` compares.
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {
@@ -2842,6 +2853,326 @@ mod tests {
     // `Rendered` is value-stable: serializing twice yields equivalent JSON.
     let j2 = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize again");
     json_equivalent(&j, &j2).expect("Rendered is deterministic");
+  }
+
+  /// #321 R7 (Codex [medium]) — `Rendered` is a PUBLIC, generic `Serialize`
+  /// (re-exported as [`crate::Rendered`]), so its in-gate numeric STRING token
+  /// must emit the serializer-AGNOSTIC numeric SCALAR — NEVER a `serde_json`
+  /// `RawValue`, whose private token shape a foreign serializer would observe.
+  /// `Rendered` was reverted to serialize the plain `TagValue` (its agnostic
+  /// `Serialize`), so the byte-exact EscapeJSON-verbatim lexeme is NO LONGER
+  /// reachable through this public path — it lives ONLY in the two INTERNAL
+  /// serde_json-only renderers (`serialize.rs::Document`, `parser.rs::Document`),
+  /// which keep their `render_document` / `extract_info` verbatim locks. This
+  /// test drives the real Insta360 OneRS `.insv` capture through the actual parse
+  /// + `Rendered` render under `-ee -G3` (the mode whose golden carries the
+  /// trailing-zero timecode) and asserts the RAW OUTPUT STRING now carries the
+  /// value-CANONICALIZED `534805.88` (the agnostic scalar), NOT the verbatim
+  /// `534805.880` — confirming no `RawValue` leaks through the public `Rendered`.
+  /// (The internal `extract_info` path STILL emits `534805.880` verbatim for the
+  /// `.ee.g3` golden — locked by `parser.rs`'s
+  /// `extract_info_production_path_emits_numeric_str_token_verbatim` and
+  /// `tests/timed_metadata_conformance.rs`.)
+  #[cfg(all(feature = "json", feature = "quicktime"))]
+  #[test]
+  fn rendered_emits_in_gate_numeric_str_token_as_agnostic_scalar() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_insta360_real.insv"
+    ))
+    .expect("read QuickTime_insta360_real.insv fixture");
+    // `-ee` (extract embedded) + `-G3` — the mode whose internal golden
+    // (`QuickTime_insta360_real.insv.ee.g3.json`) carries the verbatim
+    // `Doc502:Insta360:TimeCode":534805.880` trailing-zero token. The PUBLIC
+    // `Rendered` path canonicalizes it.
+    let opts = crate::ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    let meta = crate::parse_bytes_with_options(&data, &opts).expect("Insta360 .insv recognized");
+    // Render through the ACTUAL public `Rendered` path, -j.
+    let s = serde_json::to_string(&Rendered::new_with_options(&meta, true, &opts))
+      .expect("serialize Insta360 meta -ee -G3");
+    // The agnostic scalar: the value-canonicalized `534805.88`, NOT the verbatim
+    // source bytes `534805.880` (which only the internal renderers preserve).
+    assert!(
+      s.contains(r#""Doc502:Insta360:TimeCode":534805.88,"#)
+        || s.contains(r#""Doc502:Insta360:TimeCode":534805.88}"#),
+      "public Rendered path must emit the canonicalized scalar 534805.88: {s}"
+    );
+    assert!(
+      !s.contains(r#""Doc502:Insta360:TimeCode":534805.880"#),
+      "public Rendered path must NOT emit the verbatim trailing-zero token: {s}"
+    );
+  }
+
+  /// #321 R7 (the leak-class close) — `Rendered` is public + generic, so it must
+  /// be serializer-AGNOSTIC: serializing it through a NON-`serde_json`
+  /// `Serializer` must yield a plain numeric scalar, NEVER a `serde_json`
+  /// `RawValue`. A `RawValue` serializes via `serialize_newtype_struct` under the
+  /// magic token name `$serde_json::private::RawValue`; a foreign serializer that
+  /// does not special-case that name would observe the raw-token NEWTYPE shape
+  /// instead of a number. This [`RawValueDetector`] is exactly such a foreign
+  /// serializer — it FAILS the moment any value reaches it as that magic newtype,
+  /// and otherwise records the `f64` a numeric scalar emits. Driving the real
+  /// Insta360 `.insv` (whose in-gate `534805.880` timecode would, if `Rendered`
+  /// still wrapped in `JsonTagValue`, arrive as a `RawValue`) through it proves
+  /// the public `Rendered` surface carries NO `RawValue` — the R7 protection.
+  #[cfg(all(feature = "json", feature = "quicktime"))]
+  #[test]
+  fn rendered_is_serializer_agnostic_no_rawvalue_leak() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_insta360_real.insv"
+    ))
+    .expect("read QuickTime_insta360_real.insv fixture");
+    let opts = crate::ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    let meta = crate::parse_bytes_with_options(&data, &opts).expect("Insta360 .insv recognized");
+    // Serialize the public `Rendered` through a FOREIGN (non-`serde_json`)
+    // serializer that detects the `RawValue` magic newtype. It runs to
+    // completion (Ok) only if NO value leaked as a `RawValue`, capturing the
+    // numeric scalars it saw along the way.
+    let mut detector = raw_value_detector::RawValueDetector::default();
+    serde::Serialize::serialize(
+      &Rendered::new_with_options(&meta, true, &opts),
+      &mut detector,
+    )
+    .expect("public Rendered must be serializer-agnostic — no RawValue newtype leaks");
+    // The in-gate timecode reached the foreign serializer as a genuine numeric
+    // scalar (the agnostic `serialize_f64`), value-canonicalized to `534805.88`.
+    assert!(
+      detector.saw_f64(534_805.88),
+      "the in-gate numeric timecode must reach a foreign serializer as a bare f64 scalar, \
+       not a serde_json RawValue; numbers seen: {:?}",
+      detector.numbers()
+    );
+  }
+}
+
+/// A minimal foreign (non-`serde_json`) [`serde::Serializer`] used by
+/// `rendered_is_serializer_agnostic_no_rawvalue_leak` to PROVE the public
+/// [`Rendered`] surface never emits a `serde_json::value::RawValue`.
+///
+/// `serde_json`'s `RawValue` serializes via `serialize_newtype_struct` under the
+/// special token name `$serde_json::private::RawValue`. This serializer treats
+/// that name as a HARD ERROR — so any `RawValue` reaching it (the leak the R7
+/// finding guards against) fails the serialize; every other newtype is
+/// transparent. It records each `f64`/`i64`/`u64` numeric scalar it observes so
+/// the test can assert the in-gate numeric token arrived as a real number.
+#[cfg(all(test, feature = "json", feature = "quicktime"))]
+mod raw_value_detector {
+  use serde::ser::{Impossible, Serialize, SerializeMap, SerializeSeq, Serializer};
+  use std::error::Error as StdError;
+  use std::fmt;
+
+  /// serde_json's private magic newtype name for a borrowed/owned `RawValue`.
+  const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+  #[derive(Debug)]
+  pub struct LeakError(String);
+
+  impl fmt::Display for LeakError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str(&self.0)
+    }
+  }
+  impl StdError for LeakError {}
+  impl serde::ser::Error for LeakError {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+      LeakError(msg.to_string())
+    }
+  }
+
+  /// Records the numeric scalars a serialize pass emits; errors on a `RawValue`.
+  #[derive(Default)]
+  pub struct RawValueDetector {
+    numbers: Vec<f64>,
+  }
+
+  impl RawValueDetector {
+    pub fn numbers(&self) -> &[f64] {
+      &self.numbers
+    }
+    /// True if any numeric scalar emitted equals `want` (exact-bits compare on
+    /// the canonical f64 — the value flows straight through `serialize_f64`).
+    pub fn saw_f64(&self, want: f64) -> bool {
+      self.numbers.iter().any(|&n| n == want)
+    }
+  }
+
+  /// Borrow-based serializer: only the surface `Rendered` actually exercises (a
+  /// top-level map, its string keys, numeric/string/bool scalars, nested
+  /// seqs/maps) is implemented; everything else is `unimplemented!` because the
+  /// typed tag stream never reaches it. The newtype-struct hook is the load-
+  /// bearing one — it rejects the `RawValue` magic token.
+  impl Serializer for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    type SerializeSeq = Self;
+    type SerializeMap = Self;
+    type SerializeTuple = Impossible<(), LeakError>;
+    type SerializeTupleStruct = Impossible<(), LeakError>;
+    type SerializeTupleVariant = Impossible<(), LeakError>;
+    type SerializeStruct = Impossible<(), LeakError>;
+    type SerializeStructVariant = Impossible<(), LeakError>;
+
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+      self,
+      name: &'static str,
+      value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+      if name == RAW_VALUE_TOKEN {
+        return Err(serde::ser::Error::custom(
+          "serde_json RawValue leaked into the public/generic Rendered Serialize surface",
+        ));
+      }
+      value.serialize(self)
+    }
+
+    fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v);
+      Ok(())
+    }
+    fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v as f64);
+      Ok(())
+    }
+    fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v as f64);
+      Ok(())
+    }
+    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+      Ok(self)
+    }
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+      Ok(self)
+    }
+
+    // Remaining scalar/primitive forms route through the wide ones above.
+    fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_f64(f64::from(v))
+    }
+    fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+      value.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_unit_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+      value.serialize(self)
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple")
+    }
+    fn serialize_tuple_struct(
+      self,
+      _name: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple struct")
+    }
+    fn serialize_tuple_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple variant")
+    }
+    fn serialize_struct(
+      self,
+      _name: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+      unimplemented!("Rendered never serializes a struct")
+    }
+    fn serialize_struct_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+      unimplemented!("Rendered never serializes a struct variant")
+    }
+  }
+
+  impl SerializeSeq for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+      value.serialize(&mut **self)
+    }
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+  }
+
+  impl SerializeMap for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
+      key.serialize(&mut **self)
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+      value.serialize(&mut **self)
+    }
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
   }
 }
 

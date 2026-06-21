@@ -1080,7 +1080,10 @@ impl serde::Serialize for DocObject<'_> {
       if self.obj.contains_key(key.as_str()) {
         continue;
       }
-      map.serialize_entry(key.as_str(), value)?;
+      // Wrap in `JsonTagValue` for the `-j` path: an in-gate numeric string
+      // token emits VERBATIM (`EscapeJSON` `return $str`, #321), while the
+      // generic `TagValue::Serialize` stays serializer-agnostic.
+      map.serialize_entry(key.as_str(), &crate::value::JsonTagValue(value))?;
     }
     map.end()
   }
@@ -1655,5 +1658,62 @@ mod tests {
     let got = extract_info("AAC.aac", &data, false);
     crate::jsondiff::json_equivalent(&got, &want)
       .unwrap_or_else(|e| panic!("AAC -n conformance: {}", e.message()));
+  }
+
+  /// #321 R5 (Codex [medium]) — the DEFINITIVE production-path lock. The R4/R5
+  /// tests pin the EscapeJSON lexeme on the `serialize.rs::Document`
+  /// (`render_document`, the internal staging oracle) and `format_parser.rs::Rendered`
+  /// (the typed-serde view) paths, but the committed `.ee.g3` golden is produced
+  /// by a THIRD serializer: the production [`Document`] / [`DocObject`] here,
+  /// reached through [`extract_info_with_options`] — the very fn the `-ee -G3`
+  /// timed-metadata conformance + `gen_golden.sh` invoke. Because the comparators
+  /// (`jsondiff` / `json_equivalent_strict`) are numeric-VALUE-insensitive
+  /// (`534805.880` == `534805.88` within the JSON number type), a regression that
+  /// removed the `JsonTagValue` wrap from THIS call-site would canonicalize the
+  /// production output yet still pass conformance and both other lexeme tests.
+  /// This drives the real Insta360 OneRS `.insv` through `extract_info_with_options`
+  /// (the path USERS ACTUALLY CALL) under `-ee -G3` and asserts the raw production
+  /// JSON STRING carries the verbatim `Doc502:Insta360:TimeCode":534805.880` — NOT
+  /// the canonicalized `534805.88` — locking the production serializer against a
+  /// numeric-lexeme rewrite independently of the comparators.
+  #[cfg(all(feature = "json", feature = "quicktime"))]
+  #[test]
+  fn extract_info_production_path_emits_numeric_str_token_verbatim() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_insta360_real.insv"
+    ))
+    .expect("read QuickTime_insta360_real.insv fixture");
+    // `-ee` (extract embedded) + `-G3` — the exact mode whose committed golden
+    // (`QuickTime_insta360_real.insv.ee.g3.json`) carries the verbatim
+    // `Doc502:Insta360:TimeCode":534805.880` trailing-zero token, produced by
+    // `extract_info_with_options` (see `tests/timed_metadata_conformance.rs`).
+    let opts = crate::ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    // The REAL production entry point — `Document` / `DocObject::serialize` here,
+    // NOT `Rendered` or `serialize.rs::Document`.
+    let s = extract_info_with_options("QuickTime_insta360_real.insv", &data, true, opts);
+    // The EXACT source bytes survive as a BARE number (verbatim EscapeJSON), NOT
+    // the value-canonicalized `534805.88` a `to_value` round-trip would yield.
+    assert!(
+      s.contains(r#""Doc502:Insta360:TimeCode":534805.880"#),
+      "production extract_info path must emit the trailing-zero timecode verbatim: {s}"
+    );
+    assert!(
+      !s.contains(r#""Doc502:Insta360:TimeCode":534805.88,"#)
+        && !s.contains(r#""Doc502:Insta360:TimeCode":534805.88}"#),
+      "production extract_info path must NOT canonicalize 534805.880 -> 534805.88: {s}"
+    );
+    // The verbatim token is still valid JSON: the per-file object round-trips
+    // byte-identically through a borrowed `RawValue` (the raw lexeme, not a
+    // reparsed `Number`). The production document is a one-element array.
+    let docs: Vec<std::collections::BTreeMap<String, &serde_json::value::RawValue>> =
+      serde_json::from_str(&s).expect("production output is a valid `[{ … }]` document");
+    assert_eq!(
+      docs[0]["Doc502:Insta360:TimeCode"].get(),
+      "534805.880",
+      "the production token is byte-identical to the source: {s}"
+    );
   }
 }
