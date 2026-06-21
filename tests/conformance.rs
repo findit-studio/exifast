@@ -11195,7 +11195,20 @@ fn mp4_parrot_anafi_conformance() {
   check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.n.json", false);
 }
 
-// #138 — Viofo A119 dashcam with LigoGPS freeGPS atom in MP4
+// #138 — Viofo A119 dashcam with LigoGPS freeGPS atom in MP4. The non-`ee`
+// `.json`/`.n.json` are the always-on QuickTime/Track/Composite structure (no
+// GPS — the LigoGPS GPS is `-ee`/trailer-gated); the `'ver '`/`thma` SkipInfo
+// (70mai/Viofo `skip` atom → QuickTime:Version + ThumbnailImage) now emits.
+// STILL `#[ignore]`d (and viofo stays in `typed_serde_parity::NOT_ACTIVE`):
+// a PRE-EXISTING, non-LigoGPS QuickTime container gap — the audio `trak`'s dual
+// `hdlr` (`mdia/hdlr soun` + nested `minf/hdlr url `, QuickTime.pm:7319) — leaves
+// `Track2:HandlerClass`/`HandlerType`/`HandlerDescription` divergent (bundled
+// keeps the `url ` dref triplet for AUDIO yet the `soun` media triplet for VIDEO;
+// exifast emits the media triplet for both). The same gap defers the
+// `QuickTime_rove_r2_4k.MP4` sibling. The LigoGPS GPS — the fixture's value — IS
+// byte-exact, pinned in `tests/timed_metadata_conformance.rs`
+// (`viofo_a119_ligogps_ee_byte_exact`, the handler triplet excluded). Activation
+// awaits the handler-dedup fix (see the #138 report).
 #[test]
 #[ignore]
 fn mp4_viofo_a119_gps_conformance() {

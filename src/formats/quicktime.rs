@@ -2973,6 +2973,67 @@ fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<Stri
   });
 }
 
+/// The `%QuickTime::Main` `skip` atom's `SkipInfo` Condition (QuickTime.pm:634):
+/// `$$valPt =~ /^\0[\0-\x04]..[a-zA-Z ]{4}/s` — the first 8 payload bytes must
+/// look like a QuickTime atom header (a big-endian size whose top two bytes are
+/// `0x00` and `0x00..=0x04`, i.e. a sub-32-bit length, followed by a 4-byte type
+/// of ASCII letters/spaces). A `skip` atom that fails this is the (unported,
+/// out-of-scope) plain padding atom — NOT a SkipInfo container.
+fn looks_like_skipinfo(body: &[u8]) -> bool {
+  // The first 8 bytes (a slice pattern avoids panicking indexing): `[hi, lo, _,
+  // _, t0, t1, t2, t3, ..]`. `hi == 0 && lo <= 0x04` is the sub-32-bit size; the
+  // four type bytes must each be an ASCII letter or space.
+  match body {
+    [0, lo, _, _, t0, t1, t2, t3, ..] if *lo <= 0x04 => [t0, t1, t2, t3]
+      .into_iter()
+      .all(|&b| b.is_ascii_alphabetic() || b == b' '),
+    _ => false,
+  }
+}
+
+/// Decode the top-level `skip` atom as a `SubDirectory` dispatched to
+/// `Image::ExifTool::QuickTime::SkipInfo` from the `%QuickTime::Main` `skip`
+/// Condition list (QuickTime.pm:631-636 — "found in 70mai Pro Plus+ MP4 videos",
+/// also the Viofo A119). ExifTool re-uses `ProcessMOV` to walk the SkipInfo
+/// SubDirectory, so each sub-atom is a standard `[size:4][type:4][payload]` box
+/// (QuickTime.pm:1017-1027):
+///
+///  - `'ver '` → **Version** (the raw string value; no PrintConv/ValueConv).
+///  - `tima` → int32u, `Unknown` (commented-out in the table) ⇒ not emitted.
+///  - `thma` → **ThumbnailImage** (`Binary => 1` ⇒ the `(Binary data N bytes…)`
+///    placeholder; group2 `Preview`).
+///
+/// The Version/ThumbnailImage land on `QuickTime` (the SkipInfo table's family-0
+/// default), distinct from the Kodak-grouped `frea` `'ver '`/`thma`.
+fn decode_skip(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
+  // The Condition gates the whole SubDirectory dispatch: a non-SkipInfo `skip`
+  // (plain padding) contributes nothing.
+  if !looks_like_skipinfo(payload) {
+    return;
+  }
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
+    match &inner.atom_type {
+      // `'ver '` Version — the raw string (QuickTime.pm:1020). Trailing NULs (a
+      // NUL-padded box) are dropped; the value is otherwise verbatim.
+      b"ver " => {
+        let s = core::str::from_utf8(ibody)
+          .unwrap_or("")
+          .trim_end_matches('\0');
+        if !s.is_empty() {
+          qt.set_skip_version(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `thma` ThumbnailImage — `Binary => 1` (QuickTime.pm:1022-1026). Record
+      // only the payload byte length for the placeholder; bytes are not kept.
+      b"thma" => {
+        qt.set_skip_thumbnail_len(Some(ibody.len() as u64));
+      }
+      _ => {}
+    }
+  });
+}
+
 /// The WALK-LEVEL routing HandlerType a `meta` box sets — the subtype 4cc of the
 /// `meta` box's direct-child `hdlr`, as the `%QuickTime::Meta` table routes it
 /// through `%QuickTime::Handler` (QuickTime.pm:2824 / 8403-8416). A data-
@@ -5626,6 +5687,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // Pass 1 so `KodakVersion` is populated BEFORE the `mdat` freeGPS
           // scan (which reads it to apply the Type-17b lat/lon scaling).
           b"frea" => decode_frea(body, &mut qt, &mut warning),
+          // The top-level `skip` atom (QuickTime.pm:631-636 `%QuickTime::Main`
+          // Condition list ⇒ `Image::ExifTool::QuickTime::SkipInfo` for a body
+          // that looks like a QuickTime atom header) — the 70mai/Viofo A119
+          // `'ver '` Version + `thma` ThumbnailImage. A non-SkipInfo `skip`
+          // (plain padding) is a no-op (the Condition fails inside `decode_skip`).
+          b"skip" => decode_skip(body, &mut qt, &mut warning),
           b"mdat" => {
             // QuickTime.pm:10158-10160 — the synthetic `mdat-size`/`mdat-offset`
             // tags: payload byte count + absolute payload file offset.
@@ -6571,6 +6638,30 @@ impl crate::emit::Taggable for Meta<'_> {
         main(),
         "CompatibleBrands".into(),
         TagValue::List(items),
+        false,
+      ));
+    }
+
+    // ── skip / SkipInfo (70mai Pro Plus+ / Viofo A119) ─────────────────
+    // The top-level `skip` atom's `Image::ExifTool::QuickTime::SkipInfo`
+    // `'ver '` Version + `thma` ThumbnailImage (QuickTime.pm:1017-1027). Both
+    // are `QuickTime`-grouped (the SkipInfo table's family-0 default) — distinct
+    // from the Kodak-grouped `frea` `'ver '`/`thma` emitted below.
+    if let Some(ver) = self.qt.skip_version() {
+      tags.push(EmittedTag::new(
+        main(),
+        "Version".into(),
+        TagValue::Str(ver.into()),
+        false,
+      ));
+    }
+    if let Some(len) = self.qt.skip_thumbnail_len() {
+      // `thma` ThumbnailImage: `Binary => 1` ⇒ the `(Binary data N bytes, use -b
+      // option to extract)` placeholder in BOTH modes (QuickTime.pm:1022-1026).
+      tags.push(EmittedTag::new(
+        main(),
+        "ThumbnailImage".into(),
+        TagValue::Str(binary_placeholder(len)),
         false,
       ));
     }

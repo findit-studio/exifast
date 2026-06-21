@@ -2938,6 +2938,16 @@ pub struct QuickTimeMeta {
   /// `mdat-offset` MediaDataOffset — the absolute file offset of the `mdat`
   /// payload (QuickTime.pm:697-700 + 10160).
   media_data_offset: Option<u64>,
+  /// The top-level `skip` atom's `Image::ExifTool::QuickTime::SkipInfo` `'ver '`
+  /// Version (QuickTime.pm:1020 — "found in 70mai Pro Plus+ MP4 videos", also
+  /// the Viofo A119). The raw string value; no PrintConv/ValueConv. `None` for
+  /// the common case (no SkipInfo `skip` atom).
+  skip_version: Option<smol_str::SmolStr>,
+  /// The top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload byte
+  /// length (QuickTime.pm:1022-1026, `Binary => 1`, group2 `Preview`). Rendered
+  /// as the `(Binary data N bytes, use -b option to extract)` placeholder; the
+  /// bytes are not retained. `None` when no SkipInfo `thma` was decoded.
+  skip_thumbnail_len: Option<u64>,
   /// The top-level `frea` atom's `Image::ExifTool::Kodak::frea` tags
   /// (Kodak PixPro / Rexing — Kodak.pm:2977-2990). Empty for the common case
   /// (no `frea` atom). See [`KodakFrea`].
@@ -2997,6 +3007,8 @@ impl QuickTimeMeta {
       media_data_size: None,
       media_data_total: None,
       media_data_offset: None,
+      skip_version: None,
+      skip_thumbnail_len: None,
       kodak_frea: KodakFrea::new(),
       tracks: Vec::new(),
       meta_handler_type: None,
@@ -3113,6 +3125,24 @@ impl QuickTimeMeta {
   #[must_use]
   pub const fn media_data_offset(&self) -> Option<u64> {
     self.media_data_offset
+  }
+
+  /// The top-level `skip` atom's `SkipInfo` `'ver '` Version (raw string).
+  #[inline(always)]
+  #[must_use]
+  pub fn skip_version(&self) -> Option<&str> {
+    match &self.skip_version {
+      Some(v) => Some(v.as_str()),
+      None => None,
+    }
+  }
+
+  /// The top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload byte
+  /// length (for the binary placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn skip_thumbnail_len(&self) -> Option<u64> {
+    self.skip_thumbnail_len
   }
 
   /// The top-level `frea` atom's [`KodakFrea`] tags (Kodak PixPro / Rexing).
@@ -3337,6 +3367,21 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub const fn set_media_data_offset(&mut self, v: Option<u64>) -> &mut Self {
     self.media_data_offset = v;
+    self
+  }
+
+  /// Record the top-level `skip` atom's `SkipInfo` `'ver '` Version string.
+  #[inline(always)]
+  pub fn set_skip_version(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.skip_version = v;
+    self
+  }
+
+  /// Record the top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload
+  /// byte length.
+  #[inline(always)]
+  pub const fn set_skip_thumbnail_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.skip_thumbnail_len = v;
     self
   }
 

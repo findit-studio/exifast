@@ -187,7 +187,7 @@ case "$FIX" in
   QuickTime_insta360_badstride.mp4 | QuickTime_insta360_chained.mp4 | \
   QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
   QuickTime_fmas_n2s.mov | QuickTime_wolfbox_redtiger_f9.mov | \
-  QuickTime_fmas_empty_then_valid.mov | \
+  QuickTime_fmas_empty_then_valid.mov | MP4_viofo_a119_gps.mp4 | \
   QuickTime_text_mini0806.mov | QuickTime_text_roadhawk.mov | \
   QuickTime_text_thinkware.mov | QuickTime_text_dji_telemetry.mov | \
   QuickTime_text_empty_then_valid.mov | \
