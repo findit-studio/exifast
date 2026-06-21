@@ -1,0 +1,25 @@
+[
+  {
+    "ExifTool:ExifToolVersion": 13.55,
+    "File:FileName": "ARW_preview_image.arw",
+    "File:Directory": "tests/fixtures",
+    "File:FileSize": 106,
+    "File:FileModifyDate": "2026:06:21 17:33:05+09:00",
+    "File:FileAccessDate": "2026:06:21 17:33:06+09:00",
+    "File:FileInodeChangeDate": "2026:06:21 17:33:05+09:00",
+    "File:FilePermissions": 100644,
+    "File:FileType": "ARW",
+    "File:FileTypeExtension": "ARW",
+    "File:MIMEType": "image/x-sony-arw",
+    "File:ExifByteOrder": "II",
+    "EXIF:ImageWidth": 100,
+    "EXIF:ImageHeight": 80,
+    "EXIF:Make": "SONY",
+    "EXIF:Model": "ILCE-7M4",
+    "EXIF:PreviewImageStart": 102,
+    "EXIF:PreviewImageLength": 4,
+    "EXIF:PreviewImage": "(Binary data 4 bytes, use -b option to extract)",
+    "Composite:ImageSize": "100 80",
+    "Composite:Megapixels": 0.008
+  }
+]

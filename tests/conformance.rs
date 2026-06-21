@@ -11236,3 +11236,27 @@ fn makernotes_samsung_nx1_conformance() {
     check("SamsungNX1.srw", "SamsungNX1.srw.json", true);
     check("SamsungNX1.srw", "SamsungNX1.srw.n.json", false);
 }
+
+// #352 — CR2 with PreviewImage via DataTag (0x0111/0x0117 offset-pair)
+#[test]
+#[ignore]
+fn cr2_preview_image_conformance() {
+    check("CR2_preview_image.cr2", "CR2_preview_image.cr2.json", true);
+    check("CR2_preview_image.cr2", "CR2_preview_image.cr2.n.json", false);
+}
+
+// #352 — DNG with PreviewImage via DataTag (0x0111/0x0117 in SubIFD)
+#[test]
+#[ignore]
+fn dng_preview_image_conformance() {
+    check("DNG_preview_image.dng", "DNG_preview_image.dng.json", true);
+    check("DNG_preview_image.dng", "DNG_preview_image.dng.n.json", false);
+}
+
+// #352 — Sony ARW with PreviewImage via DataTag (0x0201/0x0202 offset-pair)
+#[test]
+#[ignore]
+fn arw_preview_image_conformance() {
+    check("ARW_preview_image.arw", "ARW_preview_image.arw.json", true);
+    check("ARW_preview_image.arw", "ARW_preview_image.arw.n.json", false);
+}
