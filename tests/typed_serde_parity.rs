@@ -112,6 +112,15 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
+  // #342/#336: the 3 real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS,
+  // MISB KLV M2TS) ship full bundled goldens + #[ignore]'d conformance tests, but
+  // exifast does not yet emit the full tag set (the parsers need completion — #122
+  // Parrot, #138 LigoGPS, #130 MISB). Accept-deferred here until activated; #342
+  // added them but missed this NOT_ACTIVE entry, leaving main red on the
+  // auto-discovered active-fixture parity check.
+  "MP4_parrot_anafi.mp4",
+  "MP4_viofo_a119_gps.mp4",
+  "MPEG2_TS_misb_klv.ts",
   // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
   // bundled goldens for the #173 MakerNote conditional branches, but their
   // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
