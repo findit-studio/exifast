@@ -7645,8 +7645,8 @@ impl crate::emit::Taggable for Meta<'_> {
     // samples carry sample-table timing (the movie-level `moov`-`gps `/`mdat`-scan
     // sources have none), so this leaves their goldens untouched. `-G1` only.
     if opts.extract_embedded && !matches!(opts.group_mode, crate::serialize_key::GroupMode::G3) {
-      for (track, st, sd) in gpmd_gps_min_doc_timing(&self.stream) {
-        let group = Group::new("QuickTime", std::format!("Track{track}").as_str());
+      for (family1, st, sd) in gpmd_gps_min_doc_timing(&self.stream) {
+        let group = Group::new("QuickTime", family1.as_str());
         for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
           if let Some(secs) = val
             && first_seen(group.family1(), name)
@@ -7694,9 +7694,16 @@ impl crate::emit::Taggable for Meta<'_> {
     emit_timed_samples(
       self.stream.gps_samples(),
       |s| match s.origin() {
-        Some(crate::metadata::GpsOrigin::Gpmd { track }) => {
-          Group::new("QuickTime", std::format!("Track{track}").as_str())
-        }
+        // A `gpmd` fix carries `Track<N>` only while `$$et{SET_GROUP1}` is still
+        // active; once a PRECEDING Kingslim `ProcessLigoGPS` `delete`d the key
+        // (LigoGPS.pm:266) every following matched sample's fix + timing rides the
+        // DEFAULT `QuickTime` group (ground-truth `-ee -G3:1` on `[Kingslim, valid
+        // FMAS]`: `Doc3:QuickTime:GPSLatitude`). `set_group1_active == false`
+        // captures that flip at this sample's `FoundSomething` time.
+        Some(crate::metadata::GpsOrigin::Gpmd {
+          track,
+          set_group1_active: true,
+        }) => Group::new("QuickTime", std::format!("Track{track}").as_str()),
         _ => Group::new("QuickTime", "QuickTime"),
       },
       opts,
@@ -7907,16 +7914,18 @@ impl crate::emit::Taggable for Meta<'_> {
     // merge every `gpmd`-dispatched row passes through ONE doc-ordered stream — no
     // pairwise source-vs-source ordering interaction remains.
     //
-    // LIMITATION (a SEPARATE, pre-existing gap — NOT an ordering bug): the
-    // Kingslim arm does not yet emit the gpmd SAMPLE'S OWN
-    // `Track<N>:SampleTime`/`SampleDuration` timing doc that ExifTool opens (via
-    // `FoundSomething`) for the matched sample BEFORE `ProcessLigoGPS` opens the
-    // LigoGPS doc — so a real MIXED Kingslim+other-variant `gpmd` track is not yet
-    // doc-number byte-exact vs bundled (the LIGO doc is one lower than bundled,
-    // and the Kingslim sample timing row is absent). Closing that needs the
-    // Kingslim arm to allocate + emit a timing-only marker ahead of the LigoGPS
-    // decode (the doc-allocation refactor tracked for follow-up); no real device
-    // mixes `gpmd` variants in one track, so this is crafted-input-only.
+    // **#328 — the Kingslim per-sample timing doc.** ExifTool's `FoundSomething`
+    // opens this Kingslim sample's OWN `Track<N>:SampleTime`/`SampleDuration`
+    // timing `Doc<N>` BEFORE `ProcessLigoGPS` opens the LigoGPS doc, so a Kingslim
+    // sample consumes TWO docs (timing then LIGO). The walker now claims that lower
+    // ordinal up front (`decode_one_sample`'s `kingslim_timing` `open_doc`) and
+    // records a [`GpmdTimingOnly`] marker (kind 2) carrying it, so the merge below
+    // interleaves it AHEAD of the LigoGPS record (kind 3) by `Doc<N>` — making a
+    // pure or mixed Kingslim `gpmd` track doc-number byte-exact vs bundled. The
+    // marker's family-1 group obeys the SET_GROUP1 `delete` (LigoGPS.pm:266): the
+    // FIRST Kingslim sample of a `trak` rides `Track<N>`, every later matched
+    // sample (Kingslim or a trailing matched-empty FMAS) rides the DEFAULT
+    // `QuickTime` group.
     //
     // Gated on `-ee -G3` AND at least one `gpmd`-dispatched source (markers OR
     // `gpmd` LigoGPS): at `-G1` the doc axis collapses (the markers emit nothing
@@ -9744,19 +9753,35 @@ fn camm_min_doc_timing(
     .collect()
 }
 
-/// Emit, at `-ee -G1`, ONE `Track<N>:SampleTime` + `Track<N>:SampleDuration` per
-/// `gpmd`-MetaFormat dashcam track from that track's MINIMUM-`doc()` (first)
-/// sample — the SP3 analogue of [`camm_min_doc_timing`]. Only a `gpmd` dashcam
-/// variant (FMAS / Wolfbox / Rove `Process_text`) carries the [`GpsOrigin::Gpmd`]
-/// origin plus the sample-table timing the walker stamped; the movie-level
-/// freeGPS fixes (the `moov`-`gps `-box and the brute-force `mdat` scan) have NO
-/// sample-table timing (they keep the trait default), so they contribute no
-/// candidate and their goldens are untouched. The `doc()` ordinal is GLOBAL and
-/// monotonic in walk order, so "smallest `doc()`" is exactly "first sample" for
-/// the track. Returns
-/// `(track_index, sample_time, sample_duration)` per track in ascending
-/// `track_index` order. At `-G3` this is NOT used (each `Doc<N>` carries its own
-/// sample's timing via the [`crate::metadata::TimedSample::sample_timing`] path).
+/// Emit, at `-ee -G1`, ONE `SampleTime` + `SampleDuration` per FAMILY-1 GROUP
+/// from that group's MINIMUM-`doc()` (first) `gpmd` sample — the SP3 analogue of
+/// [`camm_min_doc_timing`]. Only a `gpmd` dashcam variant (FMAS / Wolfbox / Rove
+/// `Process_text` / Kingslim) carries the sample-table timing the walker stamped;
+/// the movie-level freeGPS fixes (the `moov`-`gps `-box and the brute-force
+/// `mdat` scan) have NO sample-table timing (they keep the trait default), so
+/// they contribute no candidate and their goldens are untouched. The `doc()`
+/// ordinal is GLOBAL and monotonic in walk order, so "smallest `doc()`" is
+/// exactly "first sample" of the group. At `-G3` this is NOT used (each `Doc<N>`
+/// carries its own sample's timing via the [`crate::metadata::TimedSample::
+/// sample_timing`] path).
+///
+/// **The family-1 group is per-sample, not per-track.** Most `gpmd` timing rows
+/// land under the `trak`'s `Track<N>` group, but a sample whose
+/// `set_group1_active` is `false` (recorded AFTER its `trak`'s first
+/// `ProcessLigoGPS` `delete`d `$$et{SET_GROUP1}`, LigoGPS.pm:266) lands under the
+/// DEFAULT `QuickTime` group instead — that applies to BOTH the matched-but-empty
+/// [`crate::metadata::GpmdTimingOnly`] markers AND a DECODED post-delete fix (a
+/// valid FMAS/Rove/Wolfbox sample following the Kingslim LigoGPS — its
+/// [`crate::metadata::GpsOrigin::Gpmd`] carries the same flag). So a
+/// pure-Kingslim track yields BOTH a `Track1:SampleTime` (the first sample, min
+/// `doc()` of the `Track1` group) AND a `QuickTime:SampleTime` (the first
+/// post-LigoGPS sample, min `doc()` of the `QuickTime` group) — ground-truth
+/// `-ee -G1 -j`: `Track1:SampleTime "0 s"` + `QuickTime:SampleTime "1.00 s"`;
+/// and a `[Kingslim, valid FMAS]` track's `QuickTime` min-doc IS the FMAS fix's
+/// sample (so `-ee -G1` keeps `QuickTime:SampleTime "1.00 s"` alongside the FMAS
+/// `QuickTime:GPS*`). Returns `(family1, sample_time, sample_duration)` per group
+/// — `Track<N>` groups first (by track index) then the `QuickTime` group, each at
+/// its min `doc()`.
 ///
 /// The matched-but-empty self-contained samples ([`crate::metadata::
 /// GpmdTimingOnly`]) carry their own min-doc candidate timing — ExifTool's
@@ -9768,38 +9793,79 @@ fn camm_min_doc_timing(
 #[cfg(feature = "alloc")]
 fn gpmd_gps_min_doc_timing(
   stream: &crate::metadata::QuickTimeStreamMeta,
-) -> std::vec::Vec<(u32, Option<f64>, Option<f64>)> {
-  let mut per_track: std::vec::Vec<(u32, u32, Option<f64>, Option<f64>)> = std::vec::Vec::new();
-  let mut consider = |track: u32, doc: u32, st: Option<f64>, sd: Option<f64>| {
-    if let Some(slot) = per_track.iter_mut().find(|(t, ..)| *t == track) {
-      if doc < slot.1 {
-        *slot = (track, doc, st, sd);
+) -> std::vec::Vec<(smol_str::SmolStr, Option<f64>, Option<f64>)> {
+  // Keyed by the EFFECTIVE family-1 group string (`Track<N>` or `QuickTime`), so
+  // the SET_GROUP1-cleared Kingslim markers collapse into their OWN `QuickTime`
+  // slot rather than the track's. `sort_order` keeps the `Track<N>` slots ahead
+  // of `QuickTime` and orders the tracks by index (a stable `-G1` group order:
+  // every `Track<N>` < `u32::MAX`).
+  let mut per_group: std::vec::Vec<(smol_str::SmolStr, u32, u32, Option<f64>, Option<f64>)> =
+    std::vec::Vec::new();
+  let mut consider =
+    |family1: smol_str::SmolStr, sort_order: u32, doc: u32, st: Option<f64>, sd: Option<f64>| {
+      if let Some(slot) = per_group.iter_mut().find(|(g, ..)| *g == family1) {
+        if doc < slot.2 {
+          *slot = (family1, sort_order, doc, st, sd);
+        }
+      } else {
+        per_group.push((family1, sort_order, doc, st, sd));
       }
-    } else {
-      per_track.push((track, doc, st, sd));
-    }
-  };
+    };
   for s in stream.gps_samples() {
-    let Some(crate::metadata::GpsOrigin::Gpmd { track }) = s.origin() else {
+    let Some(crate::metadata::GpsOrigin::Gpmd {
+      track,
+      set_group1_active,
+    }) = s.origin()
+    else {
       continue;
     };
     // A `gpmd` fix always carries a stamped `doc()` (the dispatch opens one per
-    // sample); guard anyway so an unstamped one cannot establish the minimum.
+    // sample); guard anyway so an unstamped one cannot establish the minimum. The
+    // SP3 fixes (FMAS / Wolfbox / Rove) normally keep their `trak`'s `Track<N>`
+    // group, but a fix decoded AFTER a preceding Kingslim `ProcessLigoGPS`
+    // `delete`d `$$et{SET_GROUP1}` (LigoGPS.pm:266) rides the DEFAULT `QuickTime`
+    // group (`set_group1_active == false`) — same `QuickTime`-slot collapse as the
+    // post-delete timing-only markers below (a `[Kingslim, valid FMAS]` walk's
+    // `-ee -G1` keeps the FMAS fix's `QuickTime:SampleTime "1.00 s"`).
     let Some(doc) = s.doc() else { continue };
-    consider(track, doc, s.sample_time(), s.sample_duration());
+    let (family1, sort_order) = if set_group1_active {
+      (smol_str::SmolStr::from(std::format!("Track{track}")), track)
+    } else {
+      (smol_str::SmolStr::from("QuickTime"), u32::MAX)
+    };
+    consider(
+      family1,
+      sort_order,
+      doc,
+      s.sample_time(),
+      s.sample_duration(),
+    );
   }
   // The matched-but-empty self-contained samples — same min-doc candidacy (their
-  // `FoundSomething` emitted `SampleTime`/`SampleDuration` too).
+  // `FoundSomething` emitted `SampleTime`/`SampleDuration` too). A Kingslim marker
+  // AFTER its `trak`'s first `ProcessLigoGPS` carries `set_group1_active() ==
+  // false` ⇒ the DEFAULT `QuickTime` group (sorted after every `Track<N>`).
   for m in stream.gpmd_timing_only() {
     let (Some(track), Some(doc)) = (m.track_index(), m.doc()) else {
       continue;
     };
-    consider(track, doc, m.sample_time(), m.sample_duration());
+    let (family1, sort_order) = if m.set_group1_active() {
+      (smol_str::SmolStr::from(std::format!("Track{track}")), track)
+    } else {
+      (smol_str::SmolStr::from("QuickTime"), u32::MAX)
+    };
+    consider(
+      family1,
+      sort_order,
+      doc,
+      m.sample_time(),
+      m.sample_duration(),
+    );
   }
-  per_track.sort_by_key(|(t, ..)| *t);
-  per_track
+  per_group.sort_by_key(|(_, order, ..)| *order);
+  per_group
     .into_iter()
-    .map(|(t, _doc, st, sd)| (t, st, sd))
+    .map(|(g, _order, _doc, st, sd)| (g, st, sd))
     .collect()
 }
 
@@ -10552,8 +10618,20 @@ fn emit_gpmd_timing_only(
     return;
   }
   for m in markers {
+    // The family-1 group follows the SET_GROUP1 state (LigoGPS.pm:255/266): a
+    // marker emitted while `$$et{SET_GROUP1} = "Track$num"` is still active rides
+    // the `trak`'s `Track<N>` group; one emitted AFTER a preceding Kingslim
+    // `ProcessLigoGPS` `delete`d the key (the `delete` DROPS it rather than
+    // restoring `Track<N>`) rides the DEFAULT `QuickTime` group. The FMAS / Wolfbox
+    // / Rove / `text` markers never follow a LigoGPS `delete`, so they stay
+    // `Track<N>` (`set_group1_active() == true`).
     let track = std::format!("Track{}", m.track_index().unwrap_or(1));
-    let group = Group::with_doc("QuickTime", track.as_str(), m.doc().unwrap_or(0));
+    let family1 = if m.set_group1_active() {
+      track.as_str()
+    } else {
+      "QuickTime"
+    };
+    let group = Group::with_doc("QuickTime", family1, m.doc().unwrap_or(0));
     for (val, name) in [
       (m.sample_time(), "SampleTime"),
       (m.sample_duration(), "SampleDuration"),

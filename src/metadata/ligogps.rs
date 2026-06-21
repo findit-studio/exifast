@@ -563,6 +563,25 @@ impl LigoGpsMeta {
     self.samples.len()
   }
 
+  /// `true` when ANY sample at or after `start` is a REAL fix (not a
+  /// [`LigoGpsSample::is_suppressed`] placeholder) — the faithful signal that
+  /// `ParseLigoGPS` reached LigoGPS.pm:266 (`delete $$et{SET_GROUP1}`) for ≥1
+  /// record since the caller's [`Self::sample_count`] watermark. ExifTool runs
+  /// that `delete` only AFTER the format-error (`:236`) and out-of-range (`:254`,
+  /// the suppressed-placeholder path here) `return`s, so a Kingslim sample whose
+  /// `ProcessLigoGPS` emitted ONLY suppressed/no records did NOT clear
+  /// `$$et{SET_GROUP1}`. The QuickTime walker uses this to flip its
+  /// `set_group1_cleared` flag exactly when ExifTool would (see
+  /// [`crate::formats::quicktime_freegps::GpmdDispatch::Kingslim`]).
+  #[inline]
+  #[must_use]
+  pub(crate) fn emitted_real_fix_since(&self, start: usize) -> bool {
+    self
+      .samples
+      .get(start..)
+      .is_some_and(|slice| slice.iter().any(|s| !s.is_suppressed()))
+  }
+
   /// Stamp the GLOBAL document ordinal onto each sample at or after `start` —
   /// the records decoded since the walker took its [`Self::sample_count`]
   /// watermark. `counter` is the CURRENT value of the shared
