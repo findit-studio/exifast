@@ -307,10 +307,14 @@ case "$FIX" in
   #    so exifast has no bare `ImageWidth` to build them (it carries only
   #    `ExifIFD:ExifImageWidth`, a `Desire`). A documented sub-IFD deferral.
   # (NOT `-x Composite:all`, which the conformance `EXCLUDE` env previously used.)
-  # The non-Composite SRW/PreviewIFD sub-IFD deferrals (`PreviewIFD:all`/
-  # `SubIFD:all`/`SubIFD1:all`) are retained.
+  # #242: the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD is now WALKED — its 8
+  # tags (SubfileType/XResolution/YResolution/ResolutionUnit/PreviewImageStart/
+  # PreviewImageLength/YCbCrPositioning + the PreviewImage blob via the DataTag
+  # channel) emit byte-exact, so `-x PreviewIFD:all` is REMOVED. The raw SRW image
+  # sub-IFDs `SubIFD:all`/`SubIFD1:all` stay deferred (the raw strips + the
+  # embedded JpgFromRaw JPEG, not walked).
   SamsungNX500.srw)
-    EXCLUDE_ARR+=(-x PreviewIFD:all -x SubIFD:all -x SubIFD1:all \
+    EXCLUDE_ARR+=(-x SubIFD:all -x SubIFD1:all \
                   -x Composite:LensID -x Composite:WB_RGGBLevels \
                   -x Composite:RedBalance -x Composite:BlueBalance \
                   -x Composite:CFAPattern -x Composite:ImageSize \
