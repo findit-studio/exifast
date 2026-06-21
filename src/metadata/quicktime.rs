@@ -1240,6 +1240,203 @@ impl SampleDescRoute {
   }
 }
 
+/// The `mdia/minf/hdlr` data-reference handler triplet (QuickTime.pm:7319-7322
+/// → `%QuickTime::Handler`): a track's SECOND `hdlr`, distinct from the
+/// `mdia/hdlr` media handler. Carries the same four `%Handler` fields
+/// (HandlerClass offset 4, HandlerType offset 8, HandlerVendorID offset 12,
+/// HandlerDescription offset 24). Held separately on [`MediaTrack`] so the
+/// per-track Handler dedup can choose between the media and the data handler
+/// without the two clobbering one set of slots.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DataReferenceHandler {
+  class: Option<String>,
+  code: Option<String>,
+  vendor_id: Option<String>,
+  description: Option<String>,
+}
+
+impl DataReferenceHandler {
+  /// `hdlr` HandlerClass / ComponentType (raw 4-byte code), `None` when all-zero.
+  #[inline(always)]
+  #[must_use]
+  pub fn class(&self) -> Option<&str> {
+    self.class.as_deref()
+  }
+
+  /// `hdlr` HandlerType (raw 4-byte code, verbatim — e.g. `"url "`).
+  #[inline(always)]
+  #[must_use]
+  pub fn code(&self) -> Option<&str> {
+    self.code.as_deref()
+  }
+
+  /// `hdlr` HandlerVendorID (`None` when all-zero).
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// `hdlr` HandlerDescription (post the Pascal/C-string `RawConv`), `None`
+  /// when empty.
+  #[inline(always)]
+  #[must_use]
+  pub fn description(&self) -> Option<&str> {
+    self.description.as_deref()
+  }
+
+  /// Set the raw 4-byte HandlerClass / ComponentType (already RawConv-filtered).
+  #[inline(always)]
+  pub fn set_class(&mut self, v: Option<String>) -> &mut Self {
+    self.class = v;
+    self
+  }
+
+  /// Set the raw 4-byte HandlerType code (verbatim).
+  #[inline(always)]
+  pub fn set_code(&mut self, v: Option<String>) -> &mut Self {
+    self.code = v;
+    self
+  }
+
+  /// Set the HandlerVendorID (already RawConv-filtered to non-zero).
+  #[inline(always)]
+  pub fn set_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.vendor_id = v;
+    self
+  }
+
+  /// Set the HandlerDescription (already RawConv-decoded).
+  #[inline(always)]
+  pub fn set_description(&mut self, v: Option<String>) -> &mut Self {
+    self.description = v;
+    self
+  }
+
+  /// Whether this `minf/hdlr` carried any extractable `%Handler` field — a
+  /// HandlerType code, HandlerClass, HandlerVendorID or HandlerDescription. A
+  /// short/empty/all-undef `minf/hdlr` (every field `None`) returns `false`: it
+  /// extracts no tag, so it cannot own the bare `Track<N>:Handler*` key nor
+  /// suppress the track's `mdia/hdlr` MEDIA handler (a fully-undef `hdlr`
+  /// produces no `HandlerType` in bundled ExifTool — only the media handler
+  /// shows). A present-but-zero HandlerType (`code == Some("\0\0\0\0")`) still
+  /// counts as content: bundled emits `HandlerType => "Unknown ()"` for it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn has_content(&self) -> bool {
+    self.class.is_some()
+      || self.code.is_some()
+      || self.vendor_id.is_some()
+      || self.description.is_some()
+  }
+
+  /// Fold a later `minf/hdlr`'s decoded `%Handler` fields into this slot,
+  /// PER FIELD (last-Some): a field the later box PROVIDES (`Some`) overrides,
+  /// a field it OMITS (`None`) leaves the earlier value intact. This mirrors
+  /// ExifTool's binary `%Handler` table — each of HandlerClass (offset 4),
+  /// HandlerType (8), HandlerVendorID (12) and HandlerDescription (24) is an
+  /// INDEPENDENT `FoundTag`, and a box whose RawConv yields `undef` for a field
+  /// (an all-zero HandlerClass/VendorID, an empty HandlerDescription, or an
+  /// offset past the box end) extracts NO tag for it, so it cannot override an
+  /// earlier `minf/hdlr`'s value of that field. Two `minf/hdlr` boxes in one
+  /// `trak` (`url ` full then a class-only `dhlr`) therefore retain the `url `'s
+  /// HandlerType/Description while taking the later HandlerClass.
+  #[inline(always)]
+  pub fn merge_from(&mut self, other: &Self) {
+    if other.class.is_some() {
+      self.class = other.class.clone();
+    }
+    if other.code.is_some() {
+      self.code = other.code.clone();
+    }
+    if other.vendor_id.is_some() {
+      self.vendor_id = other.vendor_id.clone();
+    }
+    if other.description.is_some() {
+      self.description = other.description.clone();
+    }
+  }
+}
+
+/// One walked `hdlr` box's four `%Handler` fields, recorded IN FILE ORDER as the
+/// `trak` walk visits it — the `mdia/hdlr` MEDIA handler AND every `mdia/minf/hdlr`
+/// DATA handler, each as a SEPARATE record (no media/data distinction stored).
+/// ExifTool runs the `%Handler` binary-data table for EVERY `hdlr` box it walks
+/// (QuickTime.pm:8391-8461 / 7319-7322), extracting HandlerClass (offset 4),
+/// HandlerType (offset 8), HandlerVendorID (offset 12) and HandlerDescription
+/// (offset 24) as FOUR independent `FoundTag`s, all into the same `Track<N>`
+/// family-1 group. The position of a box in [`MediaTrack::handler_boxes`] IS its
+/// monotonic parse-order sequence: the parser walks the `mdia` children in FILE
+/// order, so a NORMAL `mdia(mdhd, hdlr, minf(hdlr))` records the media handler
+/// before the data handler, whereas a REORDERED `mdia(mdhd, minf(hdlr), hdlr)`
+/// records the data handler first and the media handler last. The per-track
+/// Handler resolution (`resolve_per_track_handlers` in `formats/quicktime.rs`)
+/// reads these boxes in actual file order — the per-field LAST-in-file-order
+/// provider wins — with NO media-before-data assumption. A field a box does NOT
+/// provide (its RawConv yields `undef` — an all-zero HandlerClass/VendorID, an
+/// empty HandlerDescription, or an offset past the box end) is `None`, so it
+/// never wins that field; an all-`None` box (a short/empty `hdlr`) contributes
+/// nothing and can neither own a bare key nor suppress a neighbour.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HandlerBox {
+  class: Option<String>,
+  code: Option<String>,
+  vendor_id: Option<String>,
+  description: Option<String>,
+}
+
+impl HandlerBox {
+  /// Build one walked `hdlr` box record from its four already-RawConv-filtered
+  /// `%Handler` fields (HandlerClass / HandlerType / HandlerVendorID /
+  /// HandlerDescription).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new(
+    class: Option<String>,
+    code: Option<String>,
+    vendor_id: Option<String>,
+    description: Option<String>,
+  ) -> Self {
+    Self {
+      class,
+      code,
+      vendor_id,
+      description,
+    }
+  }
+
+  /// The box's HandlerClass / ComponentType (raw 4-byte code), `None` when
+  /// all-zero or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn class(&self) -> Option<&str> {
+    self.class.as_deref()
+  }
+
+  /// The box's HandlerType (raw 4-byte code, verbatim), `None` when past the
+  /// box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn code(&self) -> Option<&str> {
+    self.code.as_deref()
+  }
+
+  /// The box's HandlerVendorID, `None` when all-zero or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// The box's HandlerDescription (post the Pascal/C-string `RawConv`), `None`
+  /// when empty or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn description(&self) -> Option<&str> {
+    self.description.as_deref()
+  }
+}
+
 /// One QuickTime track — the typed mirror of a `trak` atom and its
 /// `tkhd` / `mdia(mdhd, hdlr)` children (QuickTime.pm:1424-1582,
 /// 7218-7327). All fields are optional: a fixture too short for a given
@@ -1327,6 +1524,48 @@ pub struct MediaTrack {
   /// ord(first))`), else a NUL-terminated C string; an empty result is `None`.
   /// Drives `Track<N>:HandlerDescription`.
   handler_description: Option<String>,
+  /// The `mdia/minf/hdlr` data-reference handler triplet (HandlerClass /
+  /// HandlerType / HandlerVendorID / HandlerDescription), the SECOND `hdlr` in a
+  /// `trak` (a `dhlr`/`url ` data handler, QuickTime.pm:7319-7322 →
+  /// `%QuickTime::Handler`), kept DISTINCT from the `mdia/hdlr` media triplet
+  /// above. ExifTool extracts BOTH `hdlr`s into the same `Track<N>` family-1
+  /// group; its group-aware JSON dedup (exiftool:2745 + 2952) then keeps, per
+  /// track, ONE `HandlerClass`/`HandlerType`/`HandlerDescription` — the bare
+  /// tag key lands (via the FoundTag priority shuffle, ExifTool.pm:9564) on the
+  /// LAST-extracted `hdlr` in the whole file, so only the FINAL `trak`'s
+  /// `minf/hdlr` survives as its track's value while every earlier `trak` keeps
+  /// its `mdia/hdlr` media triplet. The emission replays that selection (see
+  /// the per-track Handler block in `formats/quicktime.rs`). `None` when this
+  /// `trak` has no `minf/hdlr`.
+  data_handler: Option<DataReferenceHandler>,
+  /// EVERY raw 4-byte `hdlr` HandlerType code the `trak` walk encounters, in
+  /// file order — the `mdia/hdlr` MEDIA handler followed by EACH `mdia/minf/hdlr`
+  /// DATA handler, INCLUDING repeated `minf` boxes (the parser walks every
+  /// `minf` child). Distinct from both [`Self::handler_code`] (the single
+  /// `mdia/hdlr` 4cc that is the `HandlerType` tag) and [`Self::data_handler`]
+  /// (the SINGLE last-wins data-reference triplet the Handler dedup may surface):
+  /// each of those keeps only ONE code, whereas ExifTool runs the `%Handler`
+  /// `HandlerType` RawConv (QuickTime.pm:8407-8414) for EVERY `hdlr` box it
+  /// walks. This complete list is what the no-`ee` `EEWarn` iterates so the
+  /// warning fires for ANY `%eeBox` code seen — even one carried by a `minf/hdlr`
+  /// that a LATER `minf/hdlr` overwrites in the `data_handler` slot (a track with
+  /// `mdia/hdlr=vide` + first `minf/hdlr=meta` + later `minf/hdlr=url ` still
+  /// warns on the `meta`). The triplet emission is UNCHANGED (still the
+  /// last-surviving `hdlr` per group). Empty when the `trak` has no `hdlr`.
+  all_handler_codes: std::vec::Vec<String>,
+  /// EVERY walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]), recorded
+  /// IN FILE ORDER — the `mdia/hdlr` MEDIA handler AND each `mdia/minf/hdlr` DATA
+  /// handler, in the order the `trak` walk visits them (the `mdia` children are
+  /// walked in file order). The `Vec` position is the box's monotonic parse-order
+  /// sequence, so a NORMAL `mdia(hdlr, minf(hdlr))` lists the media box before the
+  /// data box, while a REORDERED `mdia(minf(hdlr), hdlr)` lists the data box first.
+  /// This is what `resolve_per_track_handlers` reads for the per-field
+  /// LAST-in-file-order Handler resolution — NO media-before-data assumption. The
+  /// per-`mdia/hdlr` media triplet ([`Self::handler_class`] etc.) and the merged
+  /// [`Self::data_handler`] slot are KEPT for the [`crate::metadata::MediaMetadata`]
+  /// projection and the existing accessors; this `Vec` is the additive provenance
+  /// channel the resolver consults. Empty when the `trak` has no `hdlr`.
+  handler_boxes: std::vec::Vec<HandlerBox>,
   /// `minf/smhd` AudioHeader Balance (the `%QuickTime::AudioHeader` key 2 ⇒
   /// byte 4, `fixed16s`, QuickTime.pm:7349). Present only for an audio track
   /// with an `smhd`. Drives `Track<N>:Balance` (the rounded 16.8 fixed-point).
@@ -1427,6 +1666,9 @@ impl MediaTrack {
       other_format: None,
       handler_vendor_id: None,
       handler_description: None,
+      data_handler: None,
+      all_handler_codes: std::vec::Vec::new(),
+      handler_boxes: std::vec::Vec::new(),
       audio_balance: None,
       visual_sample_desc: None,
       audio_sample_desc: None,
@@ -1613,6 +1855,57 @@ impl MediaTrack {
   #[must_use]
   pub fn handler_description(&self) -> Option<&str> {
     self.handler_description.as_deref()
+  }
+
+  /// The `mdia/minf/hdlr` data-reference handler triplet (the track's SECOND
+  /// `hdlr`), or `None` when the `trak` has no `minf/hdlr`. Distinct from the
+  /// `mdia/hdlr` media handler above; the per-track Handler dedup chooses
+  /// between them.
+  #[inline(always)]
+  #[must_use]
+  pub const fn data_handler(&self) -> Option<&DataReferenceHandler> {
+    self.data_handler.as_ref()
+  }
+
+  /// Fold one `mdia/minf/hdlr` data-reference handler into the track's slot,
+  /// PER FIELD (last-Some — [`DataReferenceHandler::merge_from`]). The parser
+  /// builds the candidate from one `minf/hdlr` body and only calls this when the
+  /// candidate carries content ([`DataReferenceHandler::has_content`]); a
+  /// fully-undef `minf/hdlr` is a no-op at the walk source, so it can neither
+  /// clear nor overwrite a prior valid handler (a short/empty box never erases
+  /// an earlier `url ` triplet). When a `trak` carries SEVERAL `minf/hdlr`
+  /// boxes, each contributes only the `%Handler` fields it provides, so the slot
+  /// accumulates the per-field LAST value across them (a `url ` full then a
+  /// class-only `dhlr` keeps the `url ` HandlerType/Description, takes the later
+  /// HandlerClass) — exactly the bundled last-extracted-per-`FoundTag` result.
+  #[inline(always)]
+  pub fn merge_data_handler(&mut self, handler: &DataReferenceHandler) {
+    match &mut self.data_handler {
+      Some(slot) => slot.merge_from(handler),
+      slot @ None => *slot = Some(handler.clone()),
+    }
+  }
+
+  /// EVERY `hdlr` HandlerType code the `trak` walk encountered, in file order
+  /// (`mdia/hdlr` then each `mdia/minf/hdlr`, including repeated `minf` boxes).
+  /// The no-`ee` `EEWarn` iterates this complete list so it sees every
+  /// `%eeBox` code regardless of which one won the single-slot
+  /// [`Self::data_handler`] triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn all_handler_codes(&self) -> &[String] {
+    &self.all_handler_codes
+  }
+
+  /// EVERY walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]), in FILE
+  /// ORDER (the `mdia/hdlr` media handler and each `mdia/minf/hdlr` data handler,
+  /// in walk order). The slice position is the box's parse-order sequence; the
+  /// per-track Handler resolution reads it for the per-field LAST-in-file-order
+  /// provider, with NO media-before-data assumption.
+  #[inline(always)]
+  #[must_use]
+  pub fn handler_boxes(&self) -> &[HandlerBox] {
+    &self.handler_boxes
   }
 
   /// `minf/smhd` Balance (the rounded 16.8 fixed-point), `None` for a track
@@ -1839,6 +2132,30 @@ impl MediaTrack {
     let code = code.into();
     self.handler = Some(HandlerKind::from_code(&code));
     self.handler_code = Some(code);
+    self
+  }
+
+  /// Append a raw 4-byte `hdlr` HandlerType code to the file-order
+  /// [`Self::all_handler_codes`] accumulation. Called by the parser at EVERY
+  /// `hdlr` box of the `trak` walk (`mdia/hdlr` AND every `mdia/minf/hdlr`,
+  /// including repeated `minf` boxes) so the no-`ee` `EEWarn` sees the complete
+  /// set — separate from the single-slot media/data-handler triplets.
+  #[inline(always)]
+  pub fn push_handler_code(&mut self, code: impl Into<String>) -> &mut Self {
+    self.all_handler_codes.push(code.into());
+    self
+  }
+
+  /// Append one walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]) to
+  /// the file-order [`Self::handler_boxes`] provenance. Called by the parser at
+  /// EVERY `hdlr` box of the `trak` walk (the `mdia/hdlr` media handler AND each
+  /// `mdia/minf/hdlr` data handler, in walk order), so the slice records the boxes
+  /// in actual file order for the per-field LAST-in-file-order Handler resolution.
+  /// A fully-undef box (every field `None`) is still recorded — it simply wins no
+  /// field — so the caller need not pre-filter on content.
+  #[inline(always)]
+  pub fn push_handler_box(&mut self, handler: HandlerBox) -> &mut Self {
+    self.handler_boxes.push(handler);
     self
   }
 
