@@ -343,6 +343,37 @@ case "$FIX" in
   # `System:all` excludes the filesystem tags as for the other synthetic TIFFs.
   CR2_imagesize.cr2)
     EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
+  # The #331-P2 PreviewImage `DataTag` fixtures (#352/#353): minimal RAW TIFFs
+  # whose IFD0 offset-pair drives the synthetic `IFD0:PreviewImage` binary blob
+  # (a 4-byte SOI+EOI), faithful to ExifTool 13.59.
+  #
+  # CR2_preview_image.cr2 — 0x0111/0x0117 (`PreviewImageStart`/`Length` in IFD0
+  # of CR2, `Exif.pm:645-661`/`:742-758`, gated `$$self{TIFF_TYPE} eq "CR2"`).
+  # CR2 is one of the RAW subtypes (`$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|
+  # IIQ|EIP)$/`, Exif.pm:4759) for which exifast's Composite post-pass DEFERS
+  # every Composite (no `TIFF_TYPE` handle — same rationale as `CR2_imagesize.cr2`
+  # above), so `-x Composite:all` drops the bundled `Aperture`/`ShutterSpeed`/
+  # `ImageSize`/`Megapixels` the port does not build.
+  CR2_preview_image.cr2)
+    EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
+  # ARW_preview_image.arw — 0x0201/0x0202 (`PreviewImageStart`/`Length` in IFD0
+  # of ARW, `Exif.pm:1226-1237`, gated `DIR_NAME eq "IFD0" and TIFF_TYPE =~
+  # /^(ARW|SR2)$/`). ARW is NOT a RAW-ImageSize subtype, so exifast BUILDS the
+  # ported `Composite:ImageSize`/`Megapixels` (from IFD0 ImageWidth/Height,
+  # `100x80` / `0.008`) byte-exact with bundled — KEEP them (no `-x Composite`).
+  ARW_preview_image.arw)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # DNG_preview_image.dng — IFD0→SubIFD (0x014a) with `SubfileType=1` +
+  # StripOffsets/StripByteCounts and NO `Compression`, so 0x0111 takes the plain
+  # `StripOffsets` arm (`Exif.pm:639-653` — the CR2/IFD0 and `Compression=7`
+  # exclusions both miss) ⇒ NO PreviewImage. The port DOES NOT yet walk the
+  # classic-TIFF `SubIFD` (0x014a) pointer, so it cannot emit the SubIFD's
+  # `SubfileType`/`ImageWidth`/`ImageHeight`/`StripOffsets`/`StripByteCounts` —
+  # this fixture is `#[ignore]`-d / NOT_ACTIVE pending SubIFD support (#352). The
+  # golden is still generated (the conventioned `-x System:all` form, composites
+  # KEPT) so the deferral is documented and ready to activate once SubIFD lands.
+  DNG_preview_image.dng)
+    EXCLUDE_ARR+=(-x System:all) ;;
 esac
 
 # Run from the fixtures dir and pass only the basename so the embedded

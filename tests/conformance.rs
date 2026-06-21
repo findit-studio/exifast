@@ -9481,6 +9481,99 @@ fn composite_deferred_for_cr2_raw_imagesize_subtype() {
   }
 }
 #[test]
+fn cr2_preview_image_conformance() {
+  // #331-P2 (#352/#353): a CR2 whose IFD0 0x0111/0x0117 offset-pair
+  // (`PreviewImageStart`/`PreviewImageLength`, `Exif.pm:645-661`/`:742-758`,
+  // gated `$$self{TIFF_TYPE} eq "CR2"`) drives the synthetic
+  // `IFD0:PreviewImage = (Binary data 4 bytes, …)` via the EXIF `DataTag`
+  // channel — the IFD0-side proof of the P2 wiring. The 4-byte SOI+EOI blob is
+  // in-bounds, so the placeholder is emitted under the offset tag's OWN groups.
+  check("CR2_preview_image.cr2", "CR2_preview_image.cr2.json", true);
+  check(
+    "CR2_preview_image.cr2",
+    "CR2_preview_image.cr2.n.json",
+    false,
+  );
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/CR2_preview_image.cr2"))
+    .expect("read CR2_preview_image.cr2");
+  for print_on in [true, false] {
+    let got = extract_info("CR2_preview_image.cr2", &data, print_on);
+    assert!(
+      got.contains("\"File:FileType\":\"CR2\""),
+      "fixture must finalize as CR2 (print_conv={print_on}): {got}",
+    );
+    assert!(
+      got.contains("\"IFD0:PreviewImage\":\"(Binary data 4 bytes, use -b option to extract)\""),
+      "CR2 must emit IFD0:PreviewImage via the P2 DataTag channel (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
+fn arw_preview_image_conformance() {
+  // #331-P2 (#352/#353): a Sony ARW whose IFD0 0x0201/0x0202 offset-pair
+  // (`PreviewImageStart`/`PreviewImageLength`, `Exif.pm:1226-1237`, gated
+  // `DIR_NAME eq "IFD0" and TIFF_TYPE =~ /^(ARW|SR2)$/`) drives
+  // `IFD0:PreviewImage` — the SAME 0x0201 id that names `ThumbnailImage` in
+  // IFD1, here selected to `PreviewImage` by the IFD0/ARW condition.
+  check("ARW_preview_image.arw", "ARW_preview_image.arw.json", true);
+  check(
+    "ARW_preview_image.arw",
+    "ARW_preview_image.arw.n.json",
+    false,
+  );
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/ARW_preview_image.arw"))
+    .expect("read ARW_preview_image.arw");
+  for print_on in [true, false] {
+    let got = extract_info("ARW_preview_image.arw", &data, print_on);
+    assert!(
+      got.contains("\"File:FileType\":\"ARW\""),
+      "fixture must finalize as ARW (print_conv={print_on}): {got}",
+    );
+    assert!(
+      got.contains("\"IFD0:PreviewImage\":\"(Binary data 4 bytes, use -b option to extract)\""),
+      "ARW must emit IFD0:PreviewImage via the P2 DataTag channel (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
+#[ignore = "DNG SubIFD (0x014a) walk not yet ported — deferred to #352 (SubIFD2). \
+            The P2 PreviewImage gating IS correct (the DNG must emit NO PreviewImage, \
+            asserted positively below), but exifast cannot yet emit the SubIFD's \
+            SubfileType/ImageWidth/ImageHeight/StripOffsets/StripByteCounts, so the \
+            full -G1 golden is not byte-exact. NOT_ACTIVE in typed_serde_parity. \
+            Re-activate (drop #[ignore] + the NOT_ACTIVE entry, 560→561) once the \
+            classic-TIFF SubIFD pointer is walked."]
+fn dng_preview_image_no_preview() {
+  // #331-P2 (#352/#353): a DNG whose IFD0→SubIFD carries `SubfileType=1` +
+  // StripOffsets/StripByteCounts (0x0111/0x0117) but NO `Compression`. ExifTool
+  // routes 0x0111 to the PLAIN `StripOffsets` arm (`Exif.pm:639-653`): the
+  // CR2/IFD0 exclusion misses (it is a SubIFD) AND the `Compression=7`
+  // DNG-preview exclusion misses (no Compression tag), so the first arm wins and
+  // the later `PreviewImageStart` arms are never reached. The port must emit NO
+  // `PreviewImage` — proving the P2 wiring is Condition-gated and does NOT
+  // spuriously fire on a DNG's SubIFD strips. (The byte-exact `check` is DEFERRED
+  // to #352 — the SubIFD walk — so this is the focused negative assertion only.)
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/DNG_preview_image.dng"))
+    .expect("read DNG_preview_image.dng");
+  for print_on in [true, false] {
+    let got = extract_info("DNG_preview_image.dng", &data, print_on);
+    assert!(
+      got.contains("\"File:FileType\":\"DNG\""),
+      "fixture must finalize as DNG (print_conv={print_on}): {got}",
+    );
+    assert!(
+      !got.contains("PreviewImage"),
+      "DNG must NOT emit any PreviewImage (the SubIFD strips are not a preview) \
+       (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
 fn exif_numeric_emission_json_token_type() {
   // PR #36 Codex R18/F1 — Exif/GPS numeric values must be emitted as bare
   // JSON NUMBER tokens, not quoted strings. The conformance `check`s above
@@ -11277,44 +11370,4 @@ fn quicktime_gopro_hero6_gpmf_conformance() {
 fn makernotes_samsung_nx1_conformance() {
   check("SamsungNX1.srw", "SamsungNX1.srw.json", true);
   check("SamsungNX1.srw", "SamsungNX1.srw.n.json", false);
-}
-
-// #211 — Real GoPro HERO6 Black with live gpmd GPS track (from gopro/gpmf-parser)
-#[test]
-#[ignore]
-fn quicktime_gopro_hero6_gpmf_conformance() {
-    check("QuickTime_gopro_hero6_gpmf.mp4", "QuickTime_gopro_hero6_gpmf.mp4.json", true);
-    check("QuickTime_gopro_hero6_gpmf.mp4", "QuickTime_gopro_hero6_gpmf.mp4.n.json", false);
-}
-
-// #210 — Real Samsung NX1 SRW with populated Type2 MakerNote (DeviceType/SamsungModelID/LensType)
-#[test]
-#[ignore]
-fn makernotes_samsung_nx1_conformance() {
-    check("SamsungNX1.srw", "SamsungNX1.srw.json", true);
-    check("SamsungNX1.srw", "SamsungNX1.srw.n.json", false);
-}
-
-// #352 — CR2 with PreviewImage via DataTag (0x0111/0x0117 offset-pair)
-#[test]
-#[ignore]
-fn cr2_preview_image_conformance() {
-    check("CR2_preview_image.cr2", "CR2_preview_image.cr2.json", true);
-    check("CR2_preview_image.cr2", "CR2_preview_image.cr2.n.json", false);
-}
-
-// #352 — DNG with PreviewImage via DataTag (0x0111/0x0117 in SubIFD)
-#[test]
-#[ignore]
-fn dng_preview_image_conformance() {
-    check("DNG_preview_image.dng", "DNG_preview_image.dng.json", true);
-    check("DNG_preview_image.dng", "DNG_preview_image.dng.n.json", false);
-}
-
-// #352 — Sony ARW with PreviewImage via DataTag (0x0201/0x0202 offset-pair)
-#[test]
-#[ignore]
-fn arw_preview_image_conformance() {
-    check("ARW_preview_image.arw", "ARW_preview_image.arw.json", true);
-    check("ARW_preview_image.arw", "ARW_preview_image.arw.n.json", false);
 }
