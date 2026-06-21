@@ -112,6 +112,11 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
+  // #345/#211/#210: GoPro HERO6 gpmd + Samsung NX1 fixtures ship raw bundled
+  // goldens (System tags) + #[ignore]'d conformance; exifast does not yet match
+  // (GoPro real gpmd GPS = #211; NX1 Type2 = #210). Accept-deferred until driven.
+  "QuickTime_gopro_hero6_gpmf.mp4",
+  "SamsungNX1.srw",
   // #342/#336: two real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS)
   // ship full bundled goldens + #[ignore]'d conformance tests, but exifast does
   // not yet emit the full tag set (the parsers need completion — #122 Parrot,
