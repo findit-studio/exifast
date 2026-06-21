@@ -109,13 +109,16 @@ fn quicktime_iter_tags_carries_quicktime_groups() {
   let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
   assert!(!tags.is_empty(), "QuickTime must yield tags");
 
-  // Every tag carries family-0 `QuickTime` and a non-empty family-1; the
+  // Every FORMAT tag carries family-0 `QuickTime` and a non-empty family-1; the
   // family-1 is either the main `QuickTime` group or a per-track `Track<N>`.
+  // The appended `Composite:*` tags (#133 PR 5: a video QuickTime now runs the
+  // Composite post-pass) carry family-0 == family-1 == `Composite`, so they are
+  // the one exception.
   for t in &tags {
-    assert_eq!(
-      t.group_ref().family0(),
-      "QuickTime",
-      "family-0 must be QuickTime for {}",
+    let f0 = t.group_ref().family0();
+    assert!(
+      f0 == "QuickTime" || f0 == "Composite",
+      "family-0 must be QuickTime (format) or Composite (built composite) for {}, got {f0}",
       t.name()
     );
     assert!(
@@ -225,4 +228,92 @@ fn chained_id3v1_iter_tags_family0_is_id3() {
       t.name()
     );
   }
+}
+
+/// `iter_tags` (the public generic-extraction L4 API) yields the engine-built
+/// `Composite:Duration` too — the same `Composite:*` set the JSON path produces.
+/// FLAC_duration.flac: family-0/1 `Composite`, value `"0:00:30"` under `-j`, and
+/// (as the post-pass append) the LAST tag in the stream.
+#[cfg(feature = "flac")]
+#[test]
+fn flac_iter_tags_carries_engine_composite_duration() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/FLAC_duration.flac"
+  ))
+  .unwrap();
+  let meta = exifast::parse_bytes(&data).expect("FLAC recognized");
+
+  let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
+  let dur = tags
+    .iter()
+    .find(|t| t.group_ref().family1() == "Composite" && t.name() == "Duration")
+    .expect("iter_tags must yield the engine-built Composite:Duration");
+  assert_eq!(dur.group_ref().family0(), "Composite");
+  assert!(
+    matches!(dur.value_ref(), exifast::TagValue::Str(s) if s == "0:00:30"),
+    "got {:?}",
+    dur.value_ref()
+  );
+  // The composite is appended last (positional last-ness).
+  let last = tags.last().expect("non-empty");
+  assert_eq!(last.name(), "Duration");
+  assert_eq!(last.group_ref().family1(), "Composite");
+
+  // -n: the raw f64 (30.0).
+  let raw: Vec<exifast::Tag> = meta.iter_tags(ConvMode::ValueConv).collect();
+  let dur_n = raw
+    .iter()
+    .find(|t| t.group_ref().family1() == "Composite" && t.name() == "Duration")
+    .expect("Composite:Duration under -n");
+  assert!(
+    matches!(dur_n.value_ref(), exifast::TagValue::F64(x) if (*x - 30.0).abs() < 1e-9),
+    "got {:?}",
+    dur_n.value_ref()
+  );
+}
+
+/// The allow-list (`AnyMeta::runs_composites`) after #133 PR 5 (full video
+/// activation): a `video/*` QuickTime NOW runs the Composite post-pass, so a MOV
+/// carrying `Track1:ImageWidth`/`ImageHeight` DOES build `Composite:ImageSize`
+/// from those bare-name dimensions (byte-exact vs bundled), as does an EXIF
+/// still. (Pre-PR this was a deferral; the flip is the whole point of PR 5.)
+#[test]
+fn allow_list_video_quicktime_builds_image_size() {
+  let has_image_size = |meta: &AnyMeta<'_>| {
+    meta
+      .iter_tags(ConvMode::PrintConv)
+      .any(|t| t.group_ref().family1() == "Composite" && t.name() == "ImageSize")
+  };
+
+  // A `video/quicktime` MOV with Track1:ImageWidth=1920 — NOW allow-listed
+  // (#133 PR 5: video QuickTime runs the Composite post-pass).
+  let mov = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/QuickTime_sp1.mov"
+  ))
+  .unwrap();
+  let mov_meta = exifast::parse_bytes(&mov).expect("MOV recognized");
+  assert!(
+    matches!(mov_meta, AnyMeta::QuickTime(_)),
+    "got {mov_meta:?}"
+  );
+  assert!(
+    has_image_size(&mov_meta),
+    "a video/* QuickTime must build Composite:ImageSize from its bare \
+     Track1:ImageWidth/Height (#133 PR 5 full-video activation)"
+  );
+
+  // An EXIF still WITH dimensions DOES build it too (the allow-list runs EXIF).
+  let tif = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/NikonD2Hs.jpg"
+  ))
+  .unwrap();
+  let tif_meta = exifast::parse_bytes(&tif).expect("JPEG recognized");
+  assert!(matches!(tif_meta, AnyMeta::Exif(_)), "got {tif_meta:?}");
+  assert!(
+    has_image_size(&tif_meta),
+    "an EXIF still must build Composite:ImageSize (allow-listed)"
+  );
 }

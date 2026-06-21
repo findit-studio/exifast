@@ -111,3 +111,131 @@ fn exif_project_trims_padded_identity_strings() {
   assert_eq!(camera.model(), Some("EOS R5"));
   assert_eq!(camera.software(), Some("FW v2.0"));
 }
+
+/// A still's EXIF `Orientation` projects onto the `MediaInfo::orientation`
+/// domain field (#324) — the single normalized orientation a consumer reads
+/// to orient a decoded-frame thumbnail. `Pentax.jpg`'s IFD0 `Orientation` is
+/// `8` ("Rotate 270 CW" — see its `-n` golden), so the projected orientation
+/// is 270° CW, un-mirrored.
+#[test]
+fn exif_project_populates_orientation() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/Pentax.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Pentax JPEG parsed");
+  let projected = meta.project();
+  let orientation = projected
+    .media()
+    .orientation()
+    .expect("orientation projected from EXIF 0x0112");
+  assert_eq!(orientation.exif_value(), 8);
+  assert_eq!(orientation.rotation_degrees(), 270);
+  assert!(!orientation.mirrored());
+}
+
+/// Build a little-endian TIFF: IFD0 carries `Make` and `next-IFD -> IFD1`;
+/// IFD1 (the thumbnail) carries an `Orientation` (SHORT) and ends the chain.
+/// `ifd0_orientation = Some(v)` adds an `Orientation` SHORT to IFD0 as well.
+/// Used to pin that `MediaInfo::orientation` is sourced from the PRIMARY image
+/// (IFD0) only — a thumbnail's IFD1 `Orientation` must NOT populate it.
+fn tiff_orientation_in_ifd1(ifd1_orientation: u16, ifd0_orientation: Option<u16>) -> Vec<u8> {
+  let make = b"M\0"; // "M" NUL-terminated
+  let ifd0_start: u32 = 8;
+  let n0: u16 = if ifd0_orientation.is_some() { 2 } else { 1 };
+  // IFD0 layout: count(2) + n0*12 entries + next-IFD ptr(4), then the Make value.
+  let ifd0_val_off = ifd0_start + 2 + u32::from(n0) * 12 + 4;
+  let ifd1_off = ifd0_val_off + make.len() as u32; // IFD1 sits right after Make.
+
+  let mut t = Vec::new();
+  t.extend_from_slice(b"II");
+  t.extend_from_slice(&0x002a_u16.to_le_bytes());
+  t.extend_from_slice(&ifd0_start.to_le_bytes());
+
+  // ---- IFD0 ----
+  t.extend_from_slice(&n0.to_le_bytes());
+  // IFD entries are sorted by tag id; Orientation (0x0112) > Make (0x010f),
+  // so Make comes first when both are present.
+  t.extend_from_slice(&0x010f_u16.to_le_bytes()); // Make
+  t.extend_from_slice(&0x0002_u16.to_le_bytes()); // ASCII
+  t.extend_from_slice(&(make.len() as u32).to_le_bytes());
+  t.extend_from_slice(&ifd0_val_off.to_le_bytes());
+  if let Some(v) = ifd0_orientation {
+    t.extend_from_slice(&0x0112_u16.to_le_bytes()); // Orientation
+    t.extend_from_slice(&0x0003_u16.to_le_bytes()); // SHORT
+    t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    // Inline SHORT value (2 bytes) in the low half of the 4-byte value field.
+    t.extend_from_slice(&v.to_le_bytes());
+    t.extend_from_slice(&0u16.to_le_bytes()); // pad to 4 bytes
+  }
+  t.extend_from_slice(&ifd1_off.to_le_bytes()); // next IFD -> IFD1
+  t.extend_from_slice(make); // Make value
+
+  // ---- IFD1 (thumbnail) ----
+  let n1: u16 = 1;
+  t.extend_from_slice(&n1.to_le_bytes());
+  t.extend_from_slice(&0x0112_u16.to_le_bytes()); // Orientation
+  t.extend_from_slice(&0x0003_u16.to_le_bytes()); // SHORT
+  t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  t.extend_from_slice(&ifd1_orientation.to_le_bytes()); // inline SHORT
+  t.extend_from_slice(&0u16.to_le_bytes()); // pad to 4 bytes
+  t.extend_from_slice(&0u32.to_le_bytes()); // no further IFD
+  t
+}
+
+/// Regression (#324, Codex finding 2): `Orientation` must be resolved from the
+/// PRIMARY image's IFD0 ONLY. A TIFF whose IFD0 has NO `Orientation` but whose
+/// IFD1 (thumbnail) DOES must project `MediaInfo::orientation() == None` — the
+/// thumbnail's orientation must not leak into the primary frame's.
+#[test]
+fn exif_project_orientation_ignores_thumbnail_ifd1() {
+  // IFD1 says "Rotate 90 CW" (6); IFD0 has none.
+  let data = tiff_orientation_in_ifd1(6, None);
+  let meta = exifast::exif::parse_exif_block(&data).expect("TIFF parsed");
+
+  // Sanity: the IFD1 Orientation IS present among the emitted entries (so the
+  // None below is genuinely the IFD0-only filter, not a parse miss).
+  assert!(
+    meta
+      .entries()
+      .iter()
+      .any(|e| e.tag_id() == 0x0112 && format!("{}", e.group()) == "IFD1"),
+    "expected an IFD1 Orientation entry in the parse"
+  );
+  assert!(
+    !meta
+      .entries()
+      .iter()
+      .any(|e| e.tag_id() == 0x0112 && format!("{}", e.group()) == "IFD0"),
+    "IFD0 must carry no Orientation in this fixture"
+  );
+
+  let projected = meta.project();
+  assert!(
+    projected.media().orientation().is_none(),
+    "a thumbnail (IFD1) Orientation must not populate the primary MediaInfo::orientation"
+  );
+}
+
+/// Counterpart: when IFD0 DOES carry an `Orientation`, it is the one projected
+/// — even if IFD1 carries a different value (the IFD0-only resolution picks
+/// the primary, never the thumbnail).
+#[test]
+fn exif_project_orientation_prefers_ifd0_over_thumbnail() {
+  // IFD0 = "Rotate 180" (3); IFD1 = "Rotate 90 CW" (6) — IFD0 must win.
+  let data = tiff_orientation_in_ifd1(6, Some(3));
+  let meta = exifast::exif::parse_exif_block(&data).expect("TIFF parsed");
+  let projected = meta.project();
+  let orientation = projected
+    .media()
+    .orientation()
+    .expect("IFD0 Orientation projects");
+  assert_eq!(
+    orientation.exif_value(),
+    3,
+    "the IFD0 value (3), not IFD1's (6)"
+  );
+  assert_eq!(orientation.rotation_degrees(), 180);
+  assert!(!orientation.mirrored());
+}

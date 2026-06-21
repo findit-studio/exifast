@@ -266,11 +266,44 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // faithful cost (these tags are byte-identical to bundled ExifTool), NOT a
     // redundant clone — the names are `SmolStr::new_static` and the dimension
     // values are integer `TagValue`s (no heap), the only heap touch being the Vec
-    // growth. Ceilings raised to (395, 528).
-    "MakerNotes_Apple.jpg" => (395, 528), // measured (384, 520) — #261 SOF tags
+    // growth.
+    //
+    // RE-BASELINED for #133 PR 3 (Tier-A EXIF Composites): the JSON render path's
+    // Composite post-pass now BUILDS Apple's full ported Composite set — the PR-2
+    // GPS quintet (GPSLatitude/Longitude/Altitude/DateTime/Position) PLUS the new
+    // Tier-A `Aperture`/`ImageSize`/`Megapixels`/`ShutterSpeed`/`SubSecCreateDate`/
+    // `SubSecDateTimeOriginal` (Apple carries FNumber/dimensions/DateTimeOriginal/
+    // SubSecTime). Each built composite renders a value + appends to BOTH the
+    // ValueConv and PrintConv views, and the `BuildCompositeTags` fixpoint
+    // allocates a per-def `$val[]`/`$prt[]` pair on each pass over the now-15-entry
+    // registry (Megapixels defers on `Composite:ImageSize`, forcing a 2nd pass), so
+    // `-j` rises 384 → 699 and `-n` 520 → 790. This is the INTENDED cost of
+    // building the newly-ported composites (the output is conformance- + typed-
+    // serde-pinned byte-exact), NOT a redundant clone or double decode — the
+    // `media_metadata` typed path is UNCHANGED (152 < 165) since it never runs the
+    // Composite post-pass. (A future engine-perf PR could reuse the per-pass
+    // `$val[]`/`$prt[]` scratch Vecs to shave the fixpoint overhead.) Ceilings
+    // raised to (770, 860).
+    // RE-BASELINED for #133 PR 5 (full video Composite activation): the TagMap
+    // now carries each entry's family-0 group (an extra inline `SmolStr` per
+    // insert) so the Composite engine can resolve a family-0-qualified
+    // ingredient (`Sony:GPSLatitude`). The Composite re-emission inserts every
+    // tag into BOTH the ValueConv and PrintConv views, so the per-entry family-0
+    // clone is paid twice over the now-large Apple tag+composite set: `-j` 699 →
+    // 835, `-n` 790 → 956. A faithful, necessary metadata carry (PART A — it is
+    // what enables the Sony SubDoc GPS Composites), NOT a redundant clone; the
+    // `media_metadata` typed path is UNCHANGED (152) since it never runs the
+    // Composite post-pass. Ceilings raised to (870, 990).
+    "MakerNotes_Apple.jpg" => (870, 990), // measured (835, 956) — #133 PR 5 family-0 carry
     "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
-    "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
-    "Real.ra" => (100, 100),              // measured (88, 87)
+    // RE-BASELINED for #133 PR 5: a `video/*` QuickTime now RUNS the Composite
+    // post-pass (the full-video flip), building `Composite:AvgBitrate`/`ImageSize`/
+    // `Megapixels`/`Rotation` + re-emitting the opposite view — `-j` 135 → 195,
+    // `-n` 137 → 213. The intended cost of the newly-built video composites (the
+    // `Composite:GPSPosition` is the unported timed-GPS deferral), NOT a redundant
+    // clone. Ceilings raised to (210, 230).
+    "QuickTime_frea_rexing17b.mov" => (210, 230), // measured (195, 213) — #133 PR 5 video composites
+    "Real.ra" => (100, 100),                      // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }
 }

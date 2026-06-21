@@ -55,5 +55,9 @@
   "Track2:MediaTimeScale": 44100,
   "Track2:MediaDuration": 30,
   "Track2:MediaLanguageCode": "eng",
-  "Track2:HandlerType": "soun"
+  "Track2:HandlerType": "soun",
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736,
+  "Composite:AvgBitrate": 4,
+  "Composite:Rotation": 0
 }]

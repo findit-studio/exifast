@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "BigTIFF_subifd_multi.btf",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "BTF",
+  "File:FileTypeExtension": "btf",
+  "File:MIMEType": "image/x-tiff-big",
+  "IFD0:Make": "BigCam",
+  "ExifOffset:ISO": 400,
+  "ExifOffset1:ISO": 800,
+  "GPSInfo:InteropIndex": "Unknown (N)"
+}]

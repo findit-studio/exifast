@@ -32,5 +32,9 @@
   "Red:FocalLength": 24,
   "Red:FocusDistance": "-0.001 m",
   "Red:Model": "S-WEAPON",
-  "Red:Filter": "STANDARD"
+  "Red:Filter": "STANDARD",
+  "Composite:Aperture": 4.9,
+  "Composite:ImageSize": "5120x2560",
+  "Composite:Megapixels": 13.1,
+  "Composite:FocalLength35efl": "24.0 mm"
 }]

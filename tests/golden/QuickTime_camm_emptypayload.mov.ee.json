@@ -40,5 +40,6 @@
   "Track1:HandlerType": "NRT Metadata",
   "Track1:MetaFormat": "camm",
   "Track1:SampleTime": "0 s",
-  "Track1:SampleDuration": "1.00 s"
+  "Track1:SampleDuration": "1.00 s",
+  "Composite:AvgBitrate": "32 bps"
 }]

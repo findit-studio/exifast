@@ -60,5 +60,10 @@
   "Doc2:Track1:ExifByteOrder": "Little-endian (Intel, II)",
   "Doc2:Track1:CanonFirmwareVersion": "Firmware Version 1.0.0",
   "Doc2:ExifIFD:ExposureTime": "1/80",
-  "Doc2:ExifIFD:ISO": 200
+  "Doc2:ExifIFD:ISO": 200,
+  "Composite:Aperture": 3.5,
+  "Composite:ShutterSpeed": "1/80",
+  "Composite:AvgBitrate": "1.59 kbps",
+  "Composite:LightValue": 7.9,
+  "Composite:FocalLength35efl": "15.0 mm"
 }]

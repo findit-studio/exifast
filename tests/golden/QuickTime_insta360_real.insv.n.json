@@ -94,5 +94,9 @@
   "Track3:GenGraphicsMode": 64,
   "Track3:GenOpColor": "32768 32768 32768",
   "Track3:GenBalance": 0,
-  "Track3:OtherFormat": "text"
+  "Track3:OtherFormat": "text",
+  "Composite:ImageSize": "768 384",
+  "Composite:Megapixels": 0.294912,
+  "Composite:AvgBitrate": 2794,
+  "Composite:Rotation": 0
 }]

@@ -64,7 +64,7 @@
 
 use crate::{
   charset::decode_macroman,
-  datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_duration, convert_unix_time},
+  datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
   processbinarydata::process_binary_data,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -1574,34 +1574,11 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
-    // Composite Duration (AIFF.pm:136-145). Emitted POST-chunk-loop in the
-    // bundled-Perl AddCompositeTags pass. Group is ExifTool's own `Composite`
-    // table (family-0/1 = "Composite").
-    if let Some(secs) = self.composite_duration {
-      let value = if print_conv {
-        // PrintConv = ConvertDuration. ConvertDuration's `unless
-        // IsFloat($time)` early-return is wired through
-        // `perl_nonfinite_str` for byte-exact casing of Inf/NaN — but
-        // `convert_duration` already routes non-finite values through it, so
-        // the formatted string is byte-exact either way.
-        TagValue::Str(convert_duration(secs).into())
-      } else if let Some(non_finite) = perl_nonfinite_str(secs) {
-        // `-n` mode, non-finite. Perl still emits the titlecase text (the
-        // serializer's `EscapeJSON` quotes non-numeric scalars); a
-        // `TagValue::Str` reproduces that quoted string.
-        TagValue::Str(non_finite.into())
-      } else {
-        // `-n` mode, finite. `TagValue::F64` routes through the serializer's
-        // bare-number gate (byte-identical to the retired `write_f64`).
-        TagValue::F64(secs)
-      };
-      tags.push(EmittedTag::new(
-        Group::new("Composite", "Composite"),
-        "Duration".into(),
-        value,
-        false,
-      ));
-    }
+    // Composite:Duration (AIFF.pm:136-145) is no longer emitted inline: the
+    // generic Composite engine (`crate::composite`) derives it from the emitted
+    // `AIFF:SampleRate` + `AIFF:NumSampleFrames` as a post-`run_emission` pass.
+    // The typed `composite_duration` field is retained — it backs the
+    // cross-format `duration()` MediaInfo accessor.
 
     tags.into_iter()
   }
@@ -2206,10 +2183,11 @@ mod tests {
     assert_eq!(w.get("AIFF", "SampleRate"), Some(&TagValue::I64(0)));
   }
 
-  /// AIFF_duration.aif: the post-loop Composite `Duration` lands under the
-  /// `Composite` family-1 group as the ConvertDuration string `"2.00 s"`
-  /// (`-j`) / the bare number `2` from `F64(2.0)` (`-n`) — byte-identical to
-  /// the `AIFF_duration.aif` golden.
+  /// AIFF_duration.aif: the generic Composite engine derives `Composite:
+  /// Duration` from the emitted `AIFF:SampleRate` + `AIFF:NumSampleFrames` as
+  /// the post-`run_emission` pass — the ConvertDuration string `"2.00 s"`
+  /// (`-j`) / the bare number `2` from `F64(2.0)` (`-n`), byte-identical to the
+  /// `AIFF_duration.aif` golden.
   #[test]
   fn taggable_emits_composite_duration() {
     use crate::emit::ConvMode;
@@ -2220,8 +2198,16 @@ mod tests {
     .expect("read AIFF_duration.aif fixture");
     let meta = parse_borrowed(&data).expect("AIFF parsed");
 
-    // -j: ConvertDuration string, under the Composite (-G1) group.
-    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    // -j: run_emission emits the AIFF inputs, then build_composites derives the
+    // ConvertDuration string under the Composite (-G1) group.
+    let mut w = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some("2.00 s".to_string())
@@ -2230,12 +2216,61 @@ mod tests {
 
     // -n: finite f64 ⇒ bare number (serializer renders 2.0 as `2`); assert
     // the variant carried is F64 so the bare-number gate applies.
-    let w = emit_into_tagmap(&meta, ConvMode::ValueConv);
+    let mut w = emit_into_tagmap(&meta, ConvMode::ValueConv);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
     assert_eq!(w.get("Composite", "Duration"), Some(&TagValue::F64(2.0)));
   }
 
-  /// `tags()` yields AIFF tags under family-0/1 `"AIFF"` and the Composite
-  /// `Duration` under family-0/1 `"Composite"`; no tag is `Unknown=>1`.
+  /// Migration safety net (old ≡ new): the engine-derived `Composite:Duration`
+  /// equals the value the retained typed compute (`composite_duration_secs` —
+  /// the former inline path) would have emitted, for both modes.
+  #[test]
+  fn composite_duration_engine_matches_typed_compute() {
+    use crate::emit::ConvMode;
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFF_duration.aif",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFF_duration.aif fixture");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
+    let secs = meta.composite_duration_secs().expect("typed duration");
+
+    // -j: engine string == canonical ConvertDuration of the typed value.
+    let mut w = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    crate::composite::build_composites(
+      &mut w,
+      None,
+      ConvMode::PrintConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
+    assert_eq!(
+      w.get_str("Composite", "Duration"),
+      Some(crate::composite::convs::convert_duration(secs))
+    );
+    // -n: engine bare f64 == the typed value.
+    let mut wn = emit_into_tagmap(&meta, ConvMode::ValueConv);
+    crate::composite::build_composites(
+      &mut wn,
+      None,
+      ConvMode::ValueConv,
+      0,
+      &crate::composite::CompositeContext::new(None, None),
+    );
+    assert_eq!(wn.get("Composite", "Duration"), Some(&TagValue::F64(secs)));
+  }
+
+  /// The format's `tags()` stream now yields ONLY AIFF tags under family-0/1
+  /// `"AIFF"` (no tag is `Unknown=>1`); `Composite:Duration` is no longer part
+  /// of this stream — the generic Composite engine appends it as a separate
+  /// post-`run_emission` pass (asserted by `taggable_emits_composite_duration`
+  /// and the `AIFF_duration.aif` golden).
   #[test]
   fn taggable_group_family0_family1_and_unknown() {
     use crate::emit::{ConvMode, Taggable};
@@ -2250,27 +2285,18 @@ mod tests {
       .collect();
 
     let mut saw_aiff = false;
-    let mut saw_composite = false;
     for t in &tags {
       assert!(!t.unknown(), "no AIFF table carries Unknown=>1");
-      match t.tag().name() {
-        "Duration" => {
-          // Composite table is its own group0/1.
-          assert_eq!(t.tag().group_ref().family0(), "Composite");
-          assert_eq!(t.tag().group_ref().family1(), "Composite");
-          saw_composite = true;
-        }
-        _ => {
-          assert_eq!(t.tag().group_ref().family0(), "AIFF");
-          assert_eq!(t.tag().group_ref().family1(), "AIFF");
-          saw_aiff = true;
-        }
-      }
+      assert_ne!(
+        t.tag().name(),
+        "Duration",
+        "Composite:Duration must come from the engine, not the AIFF tag stream"
+      );
+      assert_eq!(t.tag().group_ref().family0(), "AIFF");
+      assert_eq!(t.tag().group_ref().family1(), "AIFF");
+      saw_aiff = true;
     }
     assert!(saw_aiff, "expected at least one AIFF-group tag");
-    assert!(saw_composite, "expected the Composite Duration tag");
-    // Emission order: the COMM sub-fields precede the post-loop Duration.
-    assert_eq!(tags.last().unwrap().tag().name(), "Duration");
   }
 
   /// The DjVu branch (`AT&TFORM` + `DJVU`) emits NO body tags through the

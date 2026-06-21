@@ -39,5 +39,6 @@
   "Track1:HandlerClass": "mhlr",
   "Track1:Warning": "[minor] The ExtractEmbedded option may find more tags in the media data",
   "Track1:HandlerType": "meta",
-  "Track1:MetaFormat": "CTMD"
+  "Track1:MetaFormat": "CTMD",
+  "Composite:AvgBitrate": 1456
 }]

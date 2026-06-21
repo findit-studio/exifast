@@ -65,5 +65,9 @@
   "UserData:Title": "Test Clip",
   "UserData:ContentCreateDate": "2024:01:02 03:04:05+00:00",
   "UserData:GPSCoordinates": "37 deg 19' 54.48\" N, 122 deg 1' 52.32\" W, 10.5 m Above Sea Level",
-  "UserData:Comment": "A comment"
+  "UserData:Comment": "A comment",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "4 bps",
+  "Composite:Rotation": 0
 }]

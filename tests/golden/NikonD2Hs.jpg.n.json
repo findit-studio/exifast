@@ -132,5 +132,20 @@
   "IFD1:ResolutionUnit": 2,
   "IFD1:ThumbnailOffset": 3202,
   "IFD1:ThumbnailLength": 28,
-  "IFD1:YCbCrPositioning": 2
+  "IFD1:YCbCrPositioning": 2,
+  "IFD1:ThumbnailImage": "(Binary data 28 bytes, use -b option to extract)",
+  "Composite:Aperture": 4,
+  "Composite:ImageSize": "8 8",
+  "Composite:Megapixels": 6.4e-05,
+  "Composite:ScaleFactor35efl": 1.5,
+  "Composite:ShutterSpeed": 0.008,
+  "Composite:SubSecCreateDate": "2005:03:18 02:55:18.16",
+  "Composite:SubSecDateTimeOriginal": "2005:03:18 02:55:18.16",
+  "Composite:SubSecModifyDate": "2005:03:18 02:55:18.16",
+  "Composite:CircleOfConfusion": 0.0200308404192444,
+  "Composite:DOF": "0.693325809394639 0.723195615956146",
+  "Composite:FOV": "25.1479641359127 0.315813976504386",
+  "Composite:FocalLength35efl": 75,
+  "Composite:HyperfocalDistance": 31.2018860376691,
+  "Composite:LightValue": 7.96578428466209
 }]

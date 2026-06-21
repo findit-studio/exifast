@@ -45,5 +45,7 @@
   "Track1:ExifByteOrder": "Little-endian (Intel, II)",
   "ExifIFD:ExposureTime": "1/80",
   "ExifIFD:ISO": 400,
-  "InteropIFD:InteropIndex": "R98 - DCF basic file (sRGB)"
+  "InteropIFD:InteropIndex": "R98 - DCF basic file (sRGB)",
+  "Composite:ShutterSpeed": "1/80",
+  "Composite:AvgBitrate": "960 bps"
 }]

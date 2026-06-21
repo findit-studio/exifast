@@ -15,5 +15,7 @@
   "LIGO:GPSSpeed": 18.5407,
   "LIGO:GPSTrack": 178.3,
   "LIGO:GPSAltitude": "-27.9 m",
-  "LIGO:Accelerometer": "0.00 0.00 0.00"
+  "LIGO:Accelerometer": "0.00 0.00 0.00",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1
 }]

@@ -49,6 +49,19 @@ impl ConvMode {
       ConvMode::ValueConv
     }
   }
+
+  /// The OPPOSITE conversion mode. Used by the Composite engine, which needs
+  /// both a ValueConv view (`$val[i]`) and a PrintConv view (`$prt[i]`): the
+  /// active-output mode's view is the emitted set, and the opposite-mode
+  /// re-emission supplies the other view (see [`crate::composite`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn flipped(self) -> Self {
+    match self {
+      ConvMode::PrintConv => ConvMode::ValueConv,
+      ConvMode::ValueConv => ConvMode::PrintConv,
+    }
+  }
 }
 
 /// Options that shape a [`Taggable::tags`] emission: the conv mode (`-j`/`-n`),
@@ -238,6 +251,9 @@ pub(crate) fn run_emission<T: Taggable>(
     // rule (`ExifTool.pm:9544-9560`).
     let priority = e.priority();
     let (group, name, value) = e.into_tag().into_parts();
+    // The sink keys + serializes on the family-1 group; family-0 is carried as
+    // METADATA (NOT part of the dedup key) so the Composite engine can resolve a
+    // family-0-qualified ingredient (`Sony:GPSLatitude`). Behavior-preserving.
     let _ = out.write_value_doc(
       group.doc(),
       group.doc_sub(),
@@ -245,6 +261,7 @@ pub(crate) fn run_emission<T: Taggable>(
       name.as_str(),
       priority,
       value,
+      group.family0(),
     );
   }
 }

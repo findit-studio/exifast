@@ -62,5 +62,6 @@
   "Track2:SampleDuration": "1.00 s",
   "Track2:GPSLatitude": "47 deg 37' 42.32\" N",
   "Track2:GPSLongitude": "122 deg 9' 54.06\" W",
-  "Track2:GPSAltitude": "123 m"
+  "Track2:GPSAltitude": "123 m",
+  "Composite:AvgBitrate": "272 bps"
 }]

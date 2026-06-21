@@ -26,5 +26,9 @@
   "ExifIFD:LensModel": "EF50mm f/1.8 STM",
   "IFD1:Compression": 6,
   "IFD1:ThumbnailOffset": 0,
-  "IFD1:ThumbnailLength": 0
+  "IFD1:ThumbnailLength": 0,
+  "Composite:Aperture": 4,
+  "Composite:ShutterSpeed": 0.00625,
+  "Composite:FocalLength35efl": 50,
+  "Composite:LightValue": 11.3219280948874
 }]

@@ -40,5 +40,7 @@
   "Track2:DefaultDuration": "24 ms",
   "Track2:TrackLanguage": "und",
   "Track2:AudioSampleRate": 48000,
-  "Track2:AudioChannels": 2
+  "Track2:AudioChannels": 2,
+  "Composite:ImageSize": "704x576",
+  "Composite:Megapixels": 0.406
 }]

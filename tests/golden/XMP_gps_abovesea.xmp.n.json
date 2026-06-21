@@ -7,5 +7,6 @@
   "XMP-exif:GPSLatitude": 45.5,
   "XMP-exif:GPSLongitude": -122.508333333333,
   "XMP-exif:GPSAltitude": 35,
-  "XMP-exif:GPSAltitudeRef": 0
+  "XMP-exif:GPSAltitudeRef": 0,
+  "Composite:GPSAltitude": 35
 }]

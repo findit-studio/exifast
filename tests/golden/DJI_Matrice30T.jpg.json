@@ -57,6 +57,7 @@
   "IFD1:ResolutionUnit": "inches",
   "IFD1:ThumbnailOffset": 976,
   "IFD1:ThumbnailLength": 19346,
+  "IFD1:ThumbnailImage": "(Binary data 19346 bytes, use -b option to extract)",
   "MPF0:MPFVersion": "0100",
   "MPF0:NumberOfImages": 2,
   "MPF0:ImageUIDList": "(Binary data 66 bytes, use -b option to extract)",
@@ -88,5 +89,14 @@
   "JFIF:JFIFVersion": 1.02,
   "JFIF:ResolutionUnit": "None",
   "JFIF:XResolution": 1,
-  "JFIF:YResolution": 1
+  "JFIF:YResolution": 1,
+  "Composite:Aperture": 1.0,
+  "Composite:ImageSize": "1280x1024",
+  "Composite:Megapixels": 1.3,
+  "Composite:ScaleFactor35efl": 4.4,
+  "Composite:CircleOfConfusion": "0.007 mm",
+  "Composite:DOF": "4.96 m (3.54 - 8.50 m)",
+  "Composite:FOV": "48.5 deg",
+  "Composite:FocalLength35efl": "9.1 mm (35 mm equivalent: 40.0 mm)",
+  "Composite:HyperfocalDistance": "12.11 m"
 }]

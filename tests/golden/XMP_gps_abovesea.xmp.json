@@ -7,5 +7,6 @@
   "XMP-exif:GPSLatitude": "45 deg 30' 0.00\" N",
   "XMP-exif:GPSLongitude": "122 deg 30' 30.00\" W",
   "XMP-exif:GPSAltitude": "35 m",
-  "XMP-exif:GPSAltitudeRef": "Above Sea Level"
+  "XMP-exif:GPSAltitudeRef": "Above Sea Level",
+  "Composite:GPSAltitude": "35 m Above Sea Level"
 }]

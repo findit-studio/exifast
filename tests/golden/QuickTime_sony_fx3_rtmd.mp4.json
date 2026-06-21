@@ -95,5 +95,9 @@
   "Track3:HandlerType": "NRT Metadata",
   "Track3:HandlerDescription": "Timed Metadata Media Handler",
   "Track3:MetaFormat": "rtmd",
-  "Track3:TrackProperty": "[4]; No attributes; Priority 0"
+  "Track3:TrackProperty": "[4]; No attributes; Priority 0",
+  "Composite:ImageSize": "3840x2160",
+  "Composite:Megapixels": 8.3,
+  "Composite:AvgBitrate": "90 kbps",
+  "Composite:Rotation": 0
 }]

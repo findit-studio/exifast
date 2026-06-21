@@ -12,5 +12,7 @@
   "RIFF:VP8Version": 0,
   "RIFF:HorizontalScale": 0,
   "RIFF:VerticalScale": 0,
-  "IFD0:Artist": "AA"
+  "IFD0:Artist": "AA",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
 }]

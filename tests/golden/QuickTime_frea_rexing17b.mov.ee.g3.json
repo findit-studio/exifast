@@ -31,5 +31,6 @@
   "Doc1:QuickTime:GPSLatitude": "33 deg 40' 11.19\" N",
   "Doc1:QuickTime:GPSLongitude": "112 deg 5' 48.91\" W",
   "Doc1:QuickTime:GPSSpeed": 92.6,
-  "Doc1:QuickTime:GPSTrack": 90
+  "Doc1:QuickTime:GPSTrack": 90,
+  "Composite:AvgBitrate": "262 kbps"
 }]

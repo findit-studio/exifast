@@ -44,5 +44,7 @@
   "Flash:AudioSampleRate": 11025,
   "Flash:AudioBitsPerSample": 16,
   "Flash:AudioChannels": 1,
-  "Flash:VideoEncoding": 4
+  "Flash:VideoEncoding": 4,
+  "Composite:ImageSize": "320 240",
+  "Composite:Megapixels": 0.0768
 }]

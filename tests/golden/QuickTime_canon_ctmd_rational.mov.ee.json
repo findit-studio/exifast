@@ -45,5 +45,10 @@
   "Track1:FocalLength": "3.3 mm",
   "Track1:FNumber": 0.33,
   "Track1:ExposureTime": 0.3,
-  "Track1:ISO": 12800
+  "Track1:ISO": 12800,
+  "Composite:Aperture": 0.33,
+  "Composite:ShutterSpeed": 0.3,
+  "Composite:AvgBitrate": "608 bps",
+  "Composite:LightValue": -8.6,
+  "Composite:FocalLength35efl": "3.3 mm"
 }]

@@ -23,5 +23,6 @@
   "QuickTime:CurrentTime": 0,
   "QuickTime:NextTrackID": 0,
   "QuickTime:MediaDataSize": 8,
-  "QuickTime:MediaDataOffset": 144
+  "QuickTime:MediaDataOffset": 144,
+  "Composite:AvgBitrate": 32
 }]

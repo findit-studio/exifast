@@ -112,6 +112,19 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
+  // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
+  // bundled goldens for the #173 MakerNote conditional branches, but their
+  // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
+  // not yet emit the full ~245-tag MakerNote set bundled does (it emits ~118),
+  // so they are NOT byte-exact-active. Accept-deferred here until the Pentax port
+  // is extended (see #311). #318 added them but missed this NOT_ACTIVE entry,
+  // leaving main red on the auto-discovered active-fixture parity check.
+  "JPEG_pentax_k1.jpg",
+  "JPEG_pentax_k3.jpg",
+  "JPEG_pentax_k5_ii.jpg",
+  "JPEG_pentax_k70.jpg",
+  "JPEG_pentax_kp.jpg",
+  "JPEG_pentax_ks2.jpg",
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
@@ -707,7 +720,101 @@ const NOT_ACTIVE: &[&str] = &[
 /// the next entry's bytes (`Track1:BitDepth 48879`), pinning the faithful
 /// whole-box ProcessHybrid fixed-field read. Its `.json`/`.n.json`
 /// (QuickTime, `System:*`/`Composite:*` excluded) are byte-exact.
-const EXPECTED_ACTIVE_FIXTURES: usize = 539;
+/// 539 → 540 after `CR2_imagesize.cr2` (#133 Finding 2) activated — the crafted
+/// CR2 (TIFF-base Canon RAW) whose IFD0 `ImageWidth` differs from
+/// `ExifImageWidth`. exifast DEFERS all composites for the CR2/IIQ/EIP/Canon-1D-
+/// RAW subtypes (the `Composite:ImageSize` `TIFF_TYPE` branch is unavailable to
+/// the post-pass), so its `.json`/`.n.json` (`System:*`/`Composite:*` excluded)
+/// are byte-exact with NO Composite.
+///
+/// 540 → 541 after #133 PR 5 (full video Composite activation): the timed
+/// fixture `QuickTime_gps0_oor0.mov` gained the `.n.json` it was missing (every
+/// other gps0/camm/sony_rtmd timed fixture already had one), so it now pairs
+/// `.json` + `.n.json` and enters the active set like its siblings — byte-exact
+/// (its `Composite:GPSPosition` is the unported timed-GPS deferral, excluded at
+/// regen, so the typed-serde path matches the writer + golden).
+/// 541 → 543 after #100 (FMAS / Wolfbox `gpmd` dashcam GPS fixtures): the two
+/// crafted `gpmd`-MetaFormat fixtures `QuickTime_fmas_n2s.mov` (Vantrue N2S) and
+/// `QuickTime_wolfbox_redtiger_f9.mov` (Redtiger F9 4K) pair `.json` + `.n.json`
+/// and are FULLY byte-exact at no-`ee` (the only timed tags there are
+/// `Track1:MetaFormat` + the `[minor]` `Track1:Warning`; the GPS is `-ee`-only,
+/// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
+/// unported timed-GPS deferral, excluded at regen, so the typed-serde path
+/// matches the writer + golden.
+/// 543 → 544 after the #100 follow-up `QuickTime_fmas_empty_then_valid.mov`: a
+/// two-sample `gpmd` stream (a matched-but-empty FMAS sample followed by a valid
+/// one) pinning the per-MATCHED-sample `Doc<N>`/timing — the matched-empty sample
+/// opens `Doc1` (so the valid one is `Doc2`) and `-ee -G1` keeps the FIRST
+/// sample's `SampleTime "0 s"`. Pairs `.json` + `.n.json` and is FULLY byte-exact
+/// at no-`ee` (only `Track1:MetaFormat` plus the `[minor]` `Track1:Warning`; the
+/// GPS and the `Doc<N>` timing are `-ee`-only, pinned in
+/// `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the unported
+/// timed-GPS deferral, excluded at regen.
+/// 544 → 548 after #104/#102 (the four `Process_text` dashcam text-GPS
+/// fixtures): `QuickTime_text_mini0806.mov` (Mini 0806), `_roadhawk.mov`
+/// (Roadhawk), `_thinkware.mov` (Thinkware) and `_dji_telemetry.mov` (DJI
+/// telemetry) — single `text`-HandlerType timed-text samples. Each pairs `.json`
+/// + `.n.json` and is FULLY byte-exact at no-`ee` (the only timed tags there are
+/// the structural `Track1:HandlerType`/`OtherFormat` + the `[minor]`
+/// `Track1:Warning`; the decoded GPS + text extras are `-ee`-only, pinned in
+/// `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the unported
+/// timed-GPS deferral, excluded at regen.
+/// 548 → 549 after the #104 R2 structural fix `QuickTime_text_empty_then_valid.mov`:
+/// a two-sample `text` stream — a ZERO-LENGTH length-prefixed sample (the `next if
+/// $size == 2` shape) followed by a valid Mini-0806 sample — pinning the
+/// per-text-sample-timing class close. `FoundSomething` opens `Doc1` for the empty
+/// sample BEFORE the `next` / `Process_text`, so the valid sample is `Doc2` and
+/// `-ee -G1` keeps the FIRST (empty) sample's `SampleTime "0 s"`. Pairs `.json` +
+/// `.n.json` and is FULLY byte-exact at no-`ee` (only `Track1:HandlerType`/
+/// `OtherFormat` + the `[minor]` `Track1:Warning`; the `Doc<N>` timing is `-ee`-only,
+/// pinned in `timed_metadata_conformance.rs`). `Composite:GPSPosition` is the
+/// unported timed-GPS deferral, excluded at regen.
+/// 549 → 550 after the #240 BigTIFF SubIFD-recursion fixture `BigTIFF_subifd.btf`:
+/// a CRAFTED BigTIFF (version 43, 8-byte offsets) whose IFD0 carries an ExifOffset
+/// (→ ExifIFD: ExposureTime/FNumber/ISO/ExifVersion) AND a GPSInfo SubIFD pointer,
+/// pinning `ProcessBigIFD`'s `$$tagInfo{SubIFD}` recursion — the child IFDs reuse
+/// the inherited `%Exif::Main` and group under the POINTER tag (`ExifOffset:ISO`;
+/// the GPSInfo child's 0x0001/0x0002 → `GPSInfo:InteropIndex`/`InteropVersion`, NOT
+/// `%GPS::Main`). Pairs `.json` + `.n.json`, byte-exact in both modes.
+/// 550 → 551 after the #240 round-2 fixture `BigTIFF_subifd_multi.btf`: a CRAFTED
+/// BigTIFF pinning that `ProcessBigIFD` recurses EVERY SubIFD offset (`split ' ',
+/// $val`, `BigTIFF.pm:184`), not just the first — an ExifOffset `LONG8` count=2
+/// pointer → `ExifOffset:ISO` (400) + the `$i`-suffixed `ExifOffset1:ISO` (800) —
+/// AND an ASCII-numeric GPSInfo pointer (`split` numifies the `string` "180") →
+/// `GPSInfo:InteropIndex` reusing `%Exif::Main`. ISO-only children ⇒ no Composite.
+/// Pairs `.json` + `.n.json`, byte-exact in both modes.
+/// 551 → 552 after the #240 round-2 follow-up fixture `BigTIFF_subifd_exp.btf`
+/// (the Codex [medium] finding): a CRAFTED BigTIFF whose GPSInfo (0x8825) SubIFD
+/// pointer is the ASCII STRING `"1e3"`, the GPS child IFD placed at byte 1000.
+/// Pins `ProcessBigIFD`'s FULL Perl numeric coercion of the `split ' ', $val`
+/// offset token (`0 + "1e3" == 1000`, NOT the digit-prefix-only 1) — ground-
+/// truthed: bundled recurses the child at byte 1000 → `GPSInfo:InteropIndex`
+/// ("Unknown (N)" / "N") + `InteropVersion` ("37 48 30") reusing `%Exif::Main`.
+/// GPS-only child ⇒ no Composite. Pairs `.json` + `.n.json`, byte-exact in both.
+/// 552 → 554 after the #328 Kingslim per-sample-timing fixtures
+/// `QuickTime_gpmd_kingslim_pure.mov` + `QuickTime_gpmd_kingslim_fmas_mixed.mov`
+/// (the `gpmd` Kingslim timing-`Doc<N>`-ahead-of-LigoGPS port + the
+/// `SET_GROUP1`-cleared `Track<N>`→`QuickTime` group flip). Both are `gpmd`-handler
+/// `.mov`s that are fully `-ee`-gated, so their no-`ee` `.json`/`.n.json` carry
+/// only the structural moov/track scalars + `Track1:MetaFormat "gpmd"` + the
+/// `[minor]` ExtractEmbedded `Track1:Warning` (byte-exact); the `-ee` Doc sequence
+/// is pinned in `tests/timed_metadata_conformance.rs`.
+/// 554 → 556 after the two #328 round-2 [medium] fixtures
+/// `QuickTime_gpmd_kingslim_fmas_valid.mov` (Finding 1) +
+/// `QuickTime_gpmd_kingslim_noligo_fmas.mov` (Finding 2). Finding 1's fixture is a
+/// Kingslim (LigoGPS) sample followed by a VALID FMAS sample that decodes a REAL
+/// GPS fix — proving the `SET_GROUP1`-cleared `Track<N>`→`QuickTime` flip reaches
+/// a DECODED fix (the FMAS sample's GPS + timing ride `Doc3:QuickTime`, not
+/// `Track1`), not only the matched-empty markers. Finding 2's fixture is a
+/// Kingslim Condition-match whose `ProcessLigoGPS` decodes NOTHING (the
+/// `LIGOGPSINFO` block is present but the record is unparseable), so the
+/// `delete $$et{SET_GROUP1}` never runs: the FOLLOWING valid FMAS sample is
+/// `Doc2:Track1` (no LigoGPS doc consumed, NO QuickTime flip), proving the flag
+/// flips only AFTER LigoGPS actually emitted. Both are fully `-ee`-gated
+/// `gpmd`-handler `.mov`s (no-`ee` `.json`/`.n.json` = structural scalars + the
+/// `[minor]` EEWarn, byte-exact); the `-ee` group behavior is pinned in
+/// `tests/timed_metadata_conformance.rs`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 556;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

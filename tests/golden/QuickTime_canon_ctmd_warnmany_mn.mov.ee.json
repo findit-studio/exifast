@@ -43,5 +43,6 @@
   "Track1:SampleDuration": "1.00 s",
   "Track1:TimeStamp": "2018:02:21 12:08:56.21",
   "Track1:CanonFirmwareVersion": "FW1.0.0",
-  "Track1:Warning": "[minor] Bad format (255) for MakerNotes entry 1"
+  "Track1:Warning": "[minor] Bad format (255) for MakerNotes entry 1",
+  "Composite:AvgBitrate": "1.87 kbps"
 }]

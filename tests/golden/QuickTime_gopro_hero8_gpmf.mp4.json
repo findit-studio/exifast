@@ -185,5 +185,9 @@
   "Track5:GenGraphicsMode": "srcCopy",
   "Track5:GenOpColor": "0 0 0",
   "Track5:GenBalance": 0,
-  "Track5:MetaFormat": "fdsc"
+  "Track5:MetaFormat": "fdsc",
+  "Composite:ImageSize": "848x480",
+  "Composite:Megapixels": 0.407,
+  "Composite:AvgBitrate": "2.76 Mbps",
+  "Composite:Rotation": 0
 }]

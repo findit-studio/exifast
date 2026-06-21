@@ -55,5 +55,6 @@
   "Track2:MediaDuration": 2,
   "Track2:HandlerClass": "mhlr",
   "Track2:HandlerType": "meta",
-  "Track2:MetaFormat": "camm"
+  "Track2:MetaFormat": "camm",
+  "Composite:AvgBitrate": 272
 }]

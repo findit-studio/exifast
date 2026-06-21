@@ -104,5 +104,10 @@
   "Insta360:TimeCode": 534773.966,
   "Insta360:Accelerometer": "-1.025 0.026 0.034",
   "Insta360:AngularVelocity": "0.007 0.018 0.007",
-  "Insta360:ExposureTime": "1/1701"
+  "Insta360:ExposureTime": "1/1701",
+  "Composite:ImageSize": "768x384",
+  "Composite:Megapixels": 0.295,
+  "Composite:ShutterSpeed": "1/1701",
+  "Composite:AvgBitrate": "2.79 kbps",
+  "Composite:Rotation": 0
 }]

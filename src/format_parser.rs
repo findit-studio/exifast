@@ -700,6 +700,66 @@ impl AnyMeta<'_> {
     }
   }
 
+  /// Collect this Meta's `-G1`/`-ee`-off [`Taggable`](crate::emit::Taggable)
+  /// stream into a deduped [`Tag`](crate::value::Tag) `Vec` for the given
+  /// `mode`, applying the SAME cross-cutting rules
+  /// [`run_emission`](crate::emit::run_emission) does — Unknown-suppression
+  /// (`ExifTool.pm:9179`) then the priority-aware `(family1, name)` dedup
+  /// (`ExifTool.pm:9544-9560`). Shared by [`iter_tags`](Self::iter_tags) (the
+  /// public output) and the Composite engine's ValueConv resolution view, so
+  /// both observe an identical pre-composite tag set.
+  ///
+  /// The dedup decision is the SHARED [`crate::tagmap::dedup_override`] +
+  /// [`crate::tagmap::effective_priority`] predicate
+  /// [`crate::tagmap::TagMap::insert`] (the JSON / golden sink) also calls, so
+  /// the two sinks CANNOT diverge: a duplicate REPLACES the surviving slot (the
+  /// winner's whole `Tag` — value + family-0 + group) AND its stored effective
+  /// priority IFF the duplicate's effective priority is non-zero AND `>=` the
+  /// stored one. A `Priority => 0` duplicate (`Warning`/`Error`, or a
+  /// `VP8`/`VP8L` `ImageWidth` behind a `VP8X` canvas) never overrides ⇒
+  /// first-wins; an ordinary `Priority => 1` tag last-wins (`1 >= 1`).
+  /// First-occurrence POSITION is always preserved.
+  #[cfg(feature = "alloc")]
+  fn collect_deduped_tags(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::value::Tag> {
+    let opts = crate::emit::EmitOptions::g1(mode, false);
+    // Each slot carries its surviving entry's EFFECTIVE priority alongside the
+    // `Tag`, exactly as [`crate::tagmap::TagMap`] stores it, so a later
+    // duplicate is compared against the value that currently occupies the slot.
+    let mut out: std::vec::Vec<(crate::value::Tag, u8)> = std::vec::Vec::new();
+    for e in self.collect_emitted(opts) {
+      // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
+      // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
+      if e.unknown() {
+        continue;
+      }
+      let priority = e.priority();
+      let tag = e.into_tag();
+      // Priority-aware dedup on the (family1, name) key — the SAME identity AND
+      // the SAME override decision the `TagMap` sink applies (keeps
+      // first-occurrence POSITION). Linear scan (no_std + alloc clean; tag
+      // counts are small). The effective priority forces `Warning`/`Error` to
+      // `0`; the shared [`crate::tagmap::dedup_override`] predicate then makes
+      // them (and any other priority-0 tag, e.g. a `VP8`/`VP8L` `ImageWidth`
+      // behind a `VP8X` canvas) first-wins, while an ordinary `Priority => 1`
+      // duplicate last-wins — bit-for-bit identical to
+      // [`crate::tagmap::TagMap::insert`].
+      let effective = crate::tagmap::effective_priority(tag.name(), priority);
+      if let Some(slot) = out.iter_mut().find(|(t, _p)| {
+        t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name()
+      }) {
+        if crate::tagmap::dedup_override(effective, slot.1) {
+          // The winner's WHOLE tag (value + family-0 + the full group) replaces
+          // the slot, and its effective priority becomes the new stored one —
+          // mirroring `TagMap::insert`'s `(priority, value, family0)` co-update.
+          *slot = (tag, effective);
+        }
+      } else {
+        out.push((tag, effective));
+      }
+    }
+    out.into_iter().map(|(t, _p)| t).collect()
+  }
+
   /// The format tag stream as [`value::Tag`](crate::value::Tag)s
   /// (golden-pattern **L4**) — the public, no-JSON generic-extraction API.
   /// Yields the Unknown-gated, de-duplicated tag set carrying the full
@@ -721,33 +781,135 @@ impl AnyMeta<'_> {
     // The generic-extraction path is the `-G1` default with `-ee` off — this
     // option-free tag iterator is the faithful baseline; the `-ee`/`-G3`-aware
     // render path is [`Rendered::new_with_options`] (driven by `ParseOptions`).
-    let opts = crate::emit::EmitOptions::g1(mode, false);
-    let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
-    for e in self.collect_emitted(opts) {
-      // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
-      // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
-      if e.unknown() {
-        continue;
-      }
-      let tag = e.into_tag();
-      // Faithful last-wins-IN-PLACE dedup on the (family1, name) key — the
-      // same identity the `TagMap` sink dedups on (keeps first-occurrence
-      // POSITION, latest value wins). Linear scan (no_std + alloc clean; tag
-      // counts are small). EXCEPTION: the priority-0 `Warning`/`Error`
-      // pseudo-tags are FIRST-wins (a duplicate never overrides — ExifTool
-      // .pm:9544-9560 / 5404-5417), mirroring [`crate::tagmap::TagMap::insert`].
-      if let Some(slot) = out
-        .iter_mut()
-        .find(|t| t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name())
-      {
-        if tag.name() != "Warning" && tag.name() != "Error" {
-          *slot = tag;
-        }
-      } else {
-        out.push(tag);
-      }
+    let mut out = self.collect_deduped_tags(mode);
+    // Composite tags (ExifTool.pm:4577 — built after extraction). The same
+    // standalone post-pass the JSON path runs, over the deduped `Tag` Vec, so
+    // this generic-extraction API yields the same `Composite:*` set. Appended
+    // last (preserves their positional last-ness, matching the JSON path).
+    //
+    // The engine needs BOTH a ValueConv view (`$val[i]`, ExifTool.pm:4112) and
+    // a PrintConv view (`$prt[i]`, ExifTool.pm:4116) regardless of `mode`
+    // (`GPSPosition`'s PrintConv reads `$prt[i]`). `out` is the active-mode view;
+    // we re-collect the SAME stream in the OPPOSITE mode for the other view.
+    let mut other_view = self.collect_deduped_tags(mode.flipped());
+    if self.runs_composites() {
+      let doc_count = out.iter().map(|t| t.group_ref().doc()).max().unwrap_or(0);
+      let mdat_total = self.composite_media_data_total();
+      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType.
+      let value_view: &std::vec::Vec<crate::value::Tag> = match mode {
+        crate::emit::ConvMode::ValueConv => &out,
+        crate::emit::ConvMode::PrintConv => &other_view,
+      };
+      let rotation = crate::composite::calc_rotation_from(
+        value_view
+          .iter()
+          .map(|t| (t.group_ref().family1(), t.name(), t.value_ref())),
+      );
+      let ctx = crate::composite::CompositeContext::new(mdat_total, rotation);
+      crate::composite::build_composites_into_tags(
+        &mut out,
+        Some(&mut other_view),
+        mode,
+        doc_count,
+        &ctx,
+      );
     }
     out.into_iter()
+  }
+
+  /// Does this `AnyMeta` RUN the Composite post-pass?
+  ///
+  /// An ALLOW-LIST of the `AnyMeta` variants whose ported Composite path is
+  /// faithful (#133 PR 5 — FULL video activation). The post-pass is a generic
+  /// `BuildCompositeTags` fixpoint; the allow-list gates WHICH formats run it so
+  /// a not-yet-covered format keeps its (Composite-excluded) golden untouched.
+  ///
+  /// The reason this is an allow-list and not a blanket "all formats run": the
+  /// remaining audio/container formats (Mxf / Real / Ogg / Mpc / Wv / Dsf / Mp3
+  /// / Mpeg / Plist / Jp2 / Crw / Moi / Aac / Audible …) have NO Composite tag
+  /// in their bundled output (or one this port has not ported), so their goldens
+  /// are generated with `-x Composite:all`; running the pass for them would
+  /// build `Composite:ImageSize`/`Megapixels` from a bare `ImageWidth` and
+  /// diverge. The allow-list is every format whose video/still goldens HAVE been
+  /// regenerated WITH composites.
+  ///
+  /// Runs for:
+  /// * `Exif` — TIFF/JPEG EXIF stills (the EXIF + GPS + lens Composite
+  ///   subsystem), EXCEPT the Canon/Phase-One TIFF-base RAW subtypes (see the
+  ///   `Exif` arm).
+  /// * `Xmp` — an XMP sidecar / packet (the Tier-A + GPS-altitude Composites).
+  /// * `QuickTime` — stills (HEIF/HEIC/AVIF) AND video (MOV/MP4/M4V/iso5/CR3/…):
+  ///   `AvgBitrate` + `Rotation` + `ImageSize`/`Megapixels` at Main, plus the
+  ///   per-`Doc<N>` GPS SubDoc composites — the Sony rtmd `Doc<N>:Composite:GPS*`
+  ///   (built from the family-0-qualified `Sony:` inputs, which the TagMap now
+  ///   carries), the GoPro/camm Main `GPSPosition` (cross-doc base-key), etc.
+  /// * `M2ts` / `H264` — the AVCHD H.264/MDPM `Doc<N>` GPS + `ImageSize`/
+  ///   `Megapixels`/`AvgBitrate` from the H.264 dimensions.
+  /// * `Matroska` / `Riff` (avi + webp) / `R3d` / `Dv` / `Flv` — the container
+  ///   `ImageSize`/`Megapixels`/`Duration`/`Rotation` composites.
+  /// * `Png` — `Composite:ImageSize`/`Megapixels` from the IHDR dimensions.
+  /// * `Ape` / `Flac` / `Aiff` — the audio `Composite:Duration` path.
+  ///
+  /// Everything else (the remaining audio/container formats above) defers.
+  #[cfg(feature = "alloc")]
+  fn runs_composites(&self) -> bool {
+    match self {
+      // EXIF TIFF/JPEG stills run — EXCEPT the Canon/Phase-One TIFF-base RAW
+      // subtypes (CR2 / Canon 1D RAW / IIQ / EIP). `Composite:ImageSize`
+      // (Exif.pm:4757) takes a `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|
+      // EIP)$/`-gated branch using `ExifImageWidth`/`ExifImageHeight` for those
+      // — but the composite post-pass has NO `TIFF_TYPE` handle (`File:FileType`
+      // is finalized at the JSON-orchestration layer, AFTER `serialize_tags`,
+      // and is absent from the `iter_tags` path), so it cannot honour that
+      // branch and would instead fall through to `ImageWidth`/`ImageHeight` —
+      // the WRONG `ImageSize` (poisoning `Megapixels`). Until the subtype is
+      // threaded into the post-pass (the faithful option (a)), DEFER all
+      // composites for those RAW subtypes (a documented deferral), so exifast
+      // emits NO `Composite:ImageSize`/`Megapixels` rather than a wrong one.
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) => !exif_file_type_is_raw_imagesize_subtype(m),
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(_) => true,
+      // QuickTime — stills (HEIF/HEIC/AVIF) AND video. #133 PR 5: AvgBitrate +
+      // Rotation + ImageSize/Megapixels at Main, plus the per-`Doc<N>` GPS SubDoc
+      // composites. The Sony rtmd `Doc<N>:Composite:GPS*` build from the
+      // family-0-qualified `Sony:` inputs the TagMap now carries (PART A); GoPro/
+      // camm/mebx (family-0 `GoPro`/…) do NOT match the Sony defs, so they get
+      // only the Main cross-doc `GPSPosition`, matching bundled.
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(_) => true,
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(_) => true,
+      // H264 is ENGINE-ONLY (no file type): a standalone `.h264` is reached only
+      // via `parse_h264` (the bare `ParseH264Video` callback), whose reference
+      // golden is a bare-parser capture with NO composites (ExifTool builds
+      // Composites at the `BuildCompositeTags` level, never in a format parser).
+      // When H264 is wrapped in M2TS, the `M2ts` arm (above) runs the pass over
+      // the spliced H264 tags — so M2TS still gets `Composite:ShutterSpeed`/
+      // `ImageSize`/… faithfully. So H264 itself does NOT run the pass (flipping
+      // it would emit composites the bare-parser reference lacks).
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(_) => false,
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(_) => true,
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(_) => true,
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(_) => true,
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(_) => true,
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(_) => true,
+      #[cfg(feature = "png")]
+      AnyMeta::Png(_) => true,
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(_) => true,
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(_) => true,
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(_) => true,
+      _ => false,
+    }
   }
 
   /// Serialize this typed Meta's FORMAT tags into the inline tag-collection
@@ -783,15 +945,105 @@ impl AnyMeta<'_> {
     group_mode: crate::serialize_key::GroupMode,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    let opts = crate::emit::EmitOptions::with_group_mode(
-      crate::emit::ConvMode::from_print_conv(print_conv),
-      extract_embedded,
-      group_mode,
-    );
+    let mode = crate::emit::ConvMode::from_print_conv(print_conv);
+    let opts = crate::emit::EmitOptions::with_group_mode(mode, extract_embedded, group_mode);
     crate::emit::run_emission(self, opts, out);
+    // ExifTool builds Composite tags AFTER all format extraction completes
+    // (ExifTool.pm:4577, inside ExtractInfo). The standalone post-pass reads the
+    // FINAL emitted tag set and APPENDS each surviving `Composite:*` (so its
+    // positional last-ness is preserved). Always-on (Composite default ON,
+    // ExifTool.pm:1125). `doc_count` is the highest family-3 sub-document index
+    // present (reserved for `SubDoc` composites; the Duration defs build at Main
+    // only).
+    // ExifTool's `BuildCompositeTags` builds BOTH a `@val` array (each input's
+    // ValueConv value, `GetValue($tag, 'ValueConv')`, ExifTool.pm:4112) and a
+    // `@prt` array (each input's PrintConv value, ExifTool.pm:4116). A
+    // composite's `RawConv`/`ValueConv` reads `$val[i]`; its `PrintConv` may read
+    // `$prt[i]` (`Composite:GPSPosition`'s PrintConv is the literal `"$prt[0],
+    // $prt[1]"`). So the engine needs BOTH views REGARDLESS of `-j`/`-n`: `out`
+    // is the active-mode view, and we re-emit the SAME Meta in the OPPOSITE mode
+    // (identical tag set + dedup; only the rendered values differ) for the other
+    // view. (Duration's ingredients have no PrintConv difference, so its goldens
+    // are unchanged; the GPS composites genuinely need the raw `"N"`/`"S"` /
+    // decimal `$val[i]` AND the DMS `$prt[i]`.) Run ONLY for the allow-listed
+    // ported paths (EXIF stills, image/* QuickTime, the audio Durations); the
+    // deferred timed/video/container formats keep their Composite-excluded
+    // goldens byte-identical (`runs_composites`).
+    if self.runs_composites() {
+      let doc_count = out.entries().iter().map(|e| e.0).max().unwrap_or(0);
+      let mut other_view = crate::tagmap::TagMap::new();
+      let other_opts =
+        crate::emit::EmitOptions::with_group_mode(mode.flipped(), extract_embedded, group_mode);
+      crate::emit::run_emission(self, other_opts, &mut other_view);
+      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType +
+      // MatrixStructure (ExifTool tests the raw 4cc): `out` under `-n`, else the
+      // opposite-mode re-emission.
+      let mdat_total = self.composite_media_data_total();
+      let ctx = {
+        let value_view = match mode {
+          crate::emit::ConvMode::ValueConv => &*out,
+          crate::emit::ConvMode::PrintConv => &other_view,
+        };
+        crate::composite::make_context(mdat_total, value_view)
+      };
+      crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count, &ctx);
+    }
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }
+
+  /// The summed `MediaDataSize` total the Composite post-pass threads into
+  /// `Composite:AvgBitrate` (the `NextTagKey('MediaDataSize')` sum,
+  /// QuickTime.pm:8654-8660; the dedup-collapsing `TagMap` keeps only one
+  /// `MediaDataSize` tag). Only QuickTime carries it; every other Meta returns
+  /// `None`.
+  #[cfg(feature = "alloc")]
+  fn composite_media_data_total(&self) -> Option<u64> {
+    match self {
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => m.quicktime().media_data_total(),
+      _ => None,
+    }
+  }
+}
+
+/// Is this `ExifMeta`'s FINALIZED `File:FileType` one of the Canon/Phase-One
+/// TIFF-base RAW subtypes whose `Composite:ImageSize` branch (Exif.pm:4759
+/// `$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/`) the composite post-pass
+/// cannot honour (it has no `TIFF_TYPE` handle)? Those defer ALL composites (see
+/// [`AnyMeta::runs_composites`]).
+///
+/// Reconstructs the finalized `$$self{FileType}` from the `ExifMeta`'s own
+/// signals, mirroring [`crate::parser::tiff_finalize_file_type_with_content`]:
+///
+/// * [`ExifMeta::file_type`](crate::exif::ExifMeta::file_type) is the
+///   ext/parent-finalized name the engine threads in (`finalized_tiff_file_type`
+///   — already `"IIQ"`/`"EIP"`/`"CR2"`/… for those extensions, `None` for an
+///   embedded JPEG/PNG/RIFF block);
+/// * the CR2 byte-8 magic ([`is_cr2_magic`](crate::exif::ExifMeta::is_cr2_magic))
+///   forces `CR2` regardless of extension (a CR2 body renamed `.dng`/`.nef`);
+/// * a TRUTHY `DNGVersion` ([`has_dng_version`](crate::exif::ExifMeta::
+///   has_dng_version)) then `OverrideFileType('DNG')` (Exif `TIFF_TYPE` becomes
+///   `DNG`, NOT a RAW-ImageSize subtype) — the standalone base type is always
+///   `"TIFF"`, and the `$$self{FileType} !~ /^(DNG|GPR)$/` guard mirrors
+///   bundled. So a CR2-with-DNGVersion finalizes to `DNG` and composites RUN.
+///
+/// An embedded block (`file_type() == None`, both content signals false) is
+/// never a RAW subtype ⇒ `false` (JPEG/PNG/RIFF EXIF still run composites).
+#[cfg(all(feature = "alloc", feature = "exif"))]
+fn exif_file_type_is_raw_imagesize_subtype(m: &crate::exif::ExifMeta<'_>) -> bool {
+  // CR2 magic wins over the extension-derived name (ExifTool.pm:8636-8641).
+  let mut ft = if m.is_cr2_magic() {
+    "CR2"
+  } else {
+    m.file_type().unwrap_or("")
+  };
+  // `DNGVersion` override (ExifTool.pm:8763-8765): standalone base is `"TIFF"`;
+  // the override fires unless the name is already `DNG`/`GPR`.
+  if m.has_dng_version() && !matches!(ft, "DNG" | "GPR") {
+    ft = "DNG";
+  }
+  matches!(ft, "CR2" | "Canon 1D RAW" | "IIQ" | "EIP")
 }
 
 #[cfg(feature = "alloc")]
@@ -1757,8 +2009,19 @@ const _: () = {
       // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
       let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (doc, doc_sub, group, name, _priority, value) in entries {
+      for (doc, doc_sub, group, name, _priority, value, _family0) in entries {
         crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, group_mode);
+        // `Rendered` is a PUBLIC, generic `Serialize` (re-exported as
+        // [`crate::Rendered`]) reachable by ANY `Serializer`, so it serializes
+        // the plain `TagValue` through that value's OWN serializer-agnostic
+        // `Serialize` — never `JsonTagValue`. `JsonTagValue`'s verbatim path
+        // writes a `serde_json::value::RawValue`, whose private token shape a
+        // foreign serializer (or `to_value`) would observe; confining it to the
+        // two INTERNAL serde_json-only renderers (`serialize.rs::Document`,
+        // `parser.rs::Document`) keeps every public/generic surface agnostic.
+        // The numeric-string token is value-canonicalized here (e.g.
+        // `534805.880` -> `534805.88`), the same scalar `to_value(&Rendered)`
+        // yields — which is exactly what `typed_serde_parity` compares.
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {
@@ -2590,6 +2853,326 @@ mod tests {
     // `Rendered` is value-stable: serializing twice yields equivalent JSON.
     let j2 = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize again");
     json_equivalent(&j, &j2).expect("Rendered is deterministic");
+  }
+
+  /// #321 R7 (Codex [medium]) — `Rendered` is a PUBLIC, generic `Serialize`
+  /// (re-exported as [`crate::Rendered`]), so its in-gate numeric STRING token
+  /// must emit the serializer-AGNOSTIC numeric SCALAR — NEVER a `serde_json`
+  /// `RawValue`, whose private token shape a foreign serializer would observe.
+  /// `Rendered` was reverted to serialize the plain `TagValue` (its agnostic
+  /// `Serialize`), so the byte-exact EscapeJSON-verbatim lexeme is NO LONGER
+  /// reachable through this public path — it lives ONLY in the two INTERNAL
+  /// serde_json-only renderers (`serialize.rs::Document`, `parser.rs::Document`),
+  /// which keep their `render_document` / `extract_info` verbatim locks. This
+  /// test drives the real Insta360 OneRS `.insv` capture through the actual parse
+  /// + `Rendered` render under `-ee -G3` (the mode whose golden carries the
+  /// trailing-zero timecode) and asserts the RAW OUTPUT STRING now carries the
+  /// value-CANONICALIZED `534805.88` (the agnostic scalar), NOT the verbatim
+  /// `534805.880` — confirming no `RawValue` leaks through the public `Rendered`.
+  /// (The internal `extract_info` path STILL emits `534805.880` verbatim for the
+  /// `.ee.g3` golden — locked by `parser.rs`'s
+  /// `extract_info_production_path_emits_numeric_str_token_verbatim` and
+  /// `tests/timed_metadata_conformance.rs`.)
+  #[cfg(all(feature = "json", feature = "quicktime"))]
+  #[test]
+  fn rendered_emits_in_gate_numeric_str_token_as_agnostic_scalar() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_insta360_real.insv"
+    ))
+    .expect("read QuickTime_insta360_real.insv fixture");
+    // `-ee` (extract embedded) + `-G3` — the mode whose internal golden
+    // (`QuickTime_insta360_real.insv.ee.g3.json`) carries the verbatim
+    // `Doc502:Insta360:TimeCode":534805.880` trailing-zero token. The PUBLIC
+    // `Rendered` path canonicalizes it.
+    let opts = crate::ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    let meta = crate::parse_bytes_with_options(&data, &opts).expect("Insta360 .insv recognized");
+    // Render through the ACTUAL public `Rendered` path, -j.
+    let s = serde_json::to_string(&Rendered::new_with_options(&meta, true, &opts))
+      .expect("serialize Insta360 meta -ee -G3");
+    // The agnostic scalar: the value-canonicalized `534805.88`, NOT the verbatim
+    // source bytes `534805.880` (which only the internal renderers preserve).
+    assert!(
+      s.contains(r#""Doc502:Insta360:TimeCode":534805.88,"#)
+        || s.contains(r#""Doc502:Insta360:TimeCode":534805.88}"#),
+      "public Rendered path must emit the canonicalized scalar 534805.88: {s}"
+    );
+    assert!(
+      !s.contains(r#""Doc502:Insta360:TimeCode":534805.880"#),
+      "public Rendered path must NOT emit the verbatim trailing-zero token: {s}"
+    );
+  }
+
+  /// #321 R7 (the leak-class close) — `Rendered` is public + generic, so it must
+  /// be serializer-AGNOSTIC: serializing it through a NON-`serde_json`
+  /// `Serializer` must yield a plain numeric scalar, NEVER a `serde_json`
+  /// `RawValue`. A `RawValue` serializes via `serialize_newtype_struct` under the
+  /// magic token name `$serde_json::private::RawValue`; a foreign serializer that
+  /// does not special-case that name would observe the raw-token NEWTYPE shape
+  /// instead of a number. This [`RawValueDetector`] is exactly such a foreign
+  /// serializer — it FAILS the moment any value reaches it as that magic newtype,
+  /// and otherwise records the `f64` a numeric scalar emits. Driving the real
+  /// Insta360 `.insv` (whose in-gate `534805.880` timecode would, if `Rendered`
+  /// still wrapped in `JsonTagValue`, arrive as a `RawValue`) through it proves
+  /// the public `Rendered` surface carries NO `RawValue` — the R7 protection.
+  #[cfg(all(feature = "json", feature = "quicktime"))]
+  #[test]
+  fn rendered_is_serializer_agnostic_no_rawvalue_leak() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/QuickTime_insta360_real.insv"
+    ))
+    .expect("read QuickTime_insta360_real.insv fixture");
+    let opts = crate::ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    let meta = crate::parse_bytes_with_options(&data, &opts).expect("Insta360 .insv recognized");
+    // Serialize the public `Rendered` through a FOREIGN (non-`serde_json`)
+    // serializer that detects the `RawValue` magic newtype. It runs to
+    // completion (Ok) only if NO value leaked as a `RawValue`, capturing the
+    // numeric scalars it saw along the way.
+    let mut detector = raw_value_detector::RawValueDetector::default();
+    serde::Serialize::serialize(
+      &Rendered::new_with_options(&meta, true, &opts),
+      &mut detector,
+    )
+    .expect("public Rendered must be serializer-agnostic — no RawValue newtype leaks");
+    // The in-gate timecode reached the foreign serializer as a genuine numeric
+    // scalar (the agnostic `serialize_f64`), value-canonicalized to `534805.88`.
+    assert!(
+      detector.saw_f64(534_805.88),
+      "the in-gate numeric timecode must reach a foreign serializer as a bare f64 scalar, \
+       not a serde_json RawValue; numbers seen: {:?}",
+      detector.numbers()
+    );
+  }
+}
+
+/// A minimal foreign (non-`serde_json`) [`serde::Serializer`] used by
+/// `rendered_is_serializer_agnostic_no_rawvalue_leak` to PROVE the public
+/// [`Rendered`] surface never emits a `serde_json::value::RawValue`.
+///
+/// `serde_json`'s `RawValue` serializes via `serialize_newtype_struct` under the
+/// special token name `$serde_json::private::RawValue`. This serializer treats
+/// that name as a HARD ERROR — so any `RawValue` reaching it (the leak the R7
+/// finding guards against) fails the serialize; every other newtype is
+/// transparent. It records each `f64`/`i64`/`u64` numeric scalar it observes so
+/// the test can assert the in-gate numeric token arrived as a real number.
+#[cfg(all(test, feature = "json", feature = "quicktime"))]
+mod raw_value_detector {
+  use serde::ser::{Impossible, Serialize, SerializeMap, SerializeSeq, Serializer};
+  use std::error::Error as StdError;
+  use std::fmt;
+
+  /// serde_json's private magic newtype name for a borrowed/owned `RawValue`.
+  const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+  #[derive(Debug)]
+  pub struct LeakError(String);
+
+  impl fmt::Display for LeakError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str(&self.0)
+    }
+  }
+  impl StdError for LeakError {}
+  impl serde::ser::Error for LeakError {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+      LeakError(msg.to_string())
+    }
+  }
+
+  /// Records the numeric scalars a serialize pass emits; errors on a `RawValue`.
+  #[derive(Default)]
+  pub struct RawValueDetector {
+    numbers: Vec<f64>,
+  }
+
+  impl RawValueDetector {
+    pub fn numbers(&self) -> &[f64] {
+      &self.numbers
+    }
+    /// True if any numeric scalar emitted equals `want` (exact-bits compare on
+    /// the canonical f64 — the value flows straight through `serialize_f64`).
+    pub fn saw_f64(&self, want: f64) -> bool {
+      self.numbers.iter().any(|&n| n == want)
+    }
+  }
+
+  /// Borrow-based serializer: only the surface `Rendered` actually exercises (a
+  /// top-level map, its string keys, numeric/string/bool scalars, nested
+  /// seqs/maps) is implemented; everything else is `unimplemented!` because the
+  /// typed tag stream never reaches it. The newtype-struct hook is the load-
+  /// bearing one — it rejects the `RawValue` magic token.
+  impl Serializer for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    type SerializeSeq = Self;
+    type SerializeMap = Self;
+    type SerializeTuple = Impossible<(), LeakError>;
+    type SerializeTupleStruct = Impossible<(), LeakError>;
+    type SerializeTupleVariant = Impossible<(), LeakError>;
+    type SerializeStruct = Impossible<(), LeakError>;
+    type SerializeStructVariant = Impossible<(), LeakError>;
+
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+      self,
+      name: &'static str,
+      value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+      if name == RAW_VALUE_TOKEN {
+        return Err(serde::ser::Error::custom(
+          "serde_json RawValue leaked into the public/generic Rendered Serialize surface",
+        ));
+      }
+      value.serialize(self)
+    }
+
+    fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v);
+      Ok(())
+    }
+    fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v as f64);
+      Ok(())
+    }
+    fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
+      self.numbers.push(v as f64);
+      Ok(())
+    }
+    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+      Ok(self)
+    }
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+      Ok(self)
+    }
+
+    // Remaining scalar/primitive forms route through the wide ones above.
+    fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_i64(i64::from(v))
+    }
+    fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_u64(u64::from(v))
+    }
+    fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
+      self.serialize_f64(f64::from(v))
+    }
+    fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+      value.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_unit_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+      value.serialize(self)
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple")
+    }
+    fn serialize_tuple_struct(
+      self,
+      _name: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple struct")
+    }
+    fn serialize_tuple_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+      unimplemented!("Rendered never serializes a tuple variant")
+    }
+    fn serialize_struct(
+      self,
+      _name: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+      unimplemented!("Rendered never serializes a struct")
+    }
+    fn serialize_struct_variant(
+      self,
+      _name: &'static str,
+      _idx: u32,
+      _variant: &'static str,
+      _len: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+      unimplemented!("Rendered never serializes a struct variant")
+    }
+  }
+
+  impl SerializeSeq for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+      value.serialize(&mut **self)
+    }
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
+  }
+
+  impl SerializeMap for &mut RawValueDetector {
+    type Ok = ();
+    type Error = LeakError;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
+      key.serialize(&mut **self)
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+      value.serialize(&mut **self)
+    }
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+      Ok(())
+    }
   }
 }
 

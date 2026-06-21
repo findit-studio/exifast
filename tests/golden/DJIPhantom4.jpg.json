@@ -86,6 +86,7 @@
   "IFD1:ResolutionUnit": "inches",
   "IFD1:ThumbnailOffset": 41984,
   "IFD1:ThumbnailLength": 8257,
+  "IFD1:ThumbnailImage": "(Binary data 8257 bytes, use -b option to extract)",
   "MPF0:MPFVersion": "0010",
   "MPF0:NumberOfImages": 2,
   "MPF0:ImageUIDList": "(Binary data 66 bytes, use -b option to extract)",
@@ -104,5 +105,19 @@
   "MPImage2:MPImageStart": 4768674,
   "MPImage2:DependentImage1EntryNumber": 0,
   "MPImage2:DependentImage2EntryNumber": 0,
-  "MPImage2:PreviewImage": "(Binary data 301118 bytes, use -b option to extract)"
+  "MPImage2:PreviewImage": "(Binary data 301118 bytes, use -b option to extract)",
+  "Composite:Aperture": 2.8,
+  "Composite:ImageSize": "4000x3000",
+  "Composite:Megapixels": 12.0,
+  "Composite:ScaleFactor35efl": 5.5,
+  "Composite:ShutterSpeed": "1/393",
+  "Composite:GPSAltitude": "109.7 m Above Sea Level",
+  "Composite:GPSLatitude": "32 deg 28' 42.95\" N",
+  "Composite:GPSLongitude": "90 deg 15' 36.01\" W",
+  "Composite:CircleOfConfusion": "0.005 mm",
+  "Composite:FOV": "84.0 deg",
+  "Composite:FocalLength35efl": "3.6 mm (35 mm equivalent: 20.0 mm)",
+  "Composite:GPSPosition": "32 deg 28' 42.95\" N, 90 deg 15' 36.01\" W",
+  "Composite:HyperfocalDistance": "0.86 m",
+  "Composite:LightValue": 11.6
 }]

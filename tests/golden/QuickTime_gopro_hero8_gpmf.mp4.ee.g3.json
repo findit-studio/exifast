@@ -1696,5 +1696,9 @@
   "Doc14:Track5:FirmwareVersion": "HD8.01.01.20.00",
   "Doc14:Track5:SerialNumber": "C3343224520348",
   "Doc14:Track5:OtherSerialNumber": "C3331324501403",
-  "Doc14:Track5:Model": "HERO8 Black"
+  "Doc14:Track5:Model": "HERO8 Black",
+  "Composite:ImageSize": "848x480",
+  "Composite:Megapixels": 0.407,
+  "Composite:AvgBitrate": "2.76 Mbps",
+  "Composite:Rotation": 0
 }]

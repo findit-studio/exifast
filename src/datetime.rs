@@ -386,71 +386,11 @@ pub fn convert_datetime(val: &str) -> String {
 /// other branches for future composite-tag consumers.
 #[must_use]
 pub fn convert_duration(time: f64) -> String {
-  // ExifTool.pm:6869 `return $time unless IsFloat($time)`. A non-finite
-  // f64 is NOT IsFloat (IsFloat checks for a numeric scalar that parses
-  // as a float); Perl returns the input scalar unchanged, and the scalar
-  // stringifies via Perl's default NV-to-string with titlecase `Inf`/
-  // `-Inf`/`NaN` casing (verified 2026-05-20). Codex R8 fix: use
-  // `perl_nonfinite_str` for byte-exact casing (the prior `format!
-  // ("{time}")` emitted Rust's lowercase `inf`/`-inf`).
-  if !time.is_finite() {
-    return crate::value::perl_nonfinite_str(time)
-      .unwrap_or("")
-      .to_string();
-  }
-  // ExifTool.pm:6870 `return '0 s' if $time == 0`.
-  if time == 0.0 {
-    return "0 s".to_string();
-  }
-  // ExifTool.pm:6871 `$sign = ($time > 0 ? '' : (($time = -$time), '-'))`.
-  let (sign, t) = if time > 0.0 { ("", time) } else { ("-", -time) };
-  // ExifTool.pm:6872 `return sprintf("$sign%.2f s", $time) if $time < 30`.
-  if t < 30.0 {
-    return format!("{sign}{t:.2} s");
-  }
-  // ExifTool.pm:6873 `$time += 0.5` — round to nearest second.
-  let mut rounded = t + 0.5;
-  // ExifTool.pm:6874-6877 `$h = int($time/3600); $time -= $h*3600;
-  // $m = int($time/60); $time -= $m*60;`. `int()` in Perl is truncate-
-  // toward-zero ON A FLOAT (NV); the FLOAT magnitude is preserved through
-  // the modulo arithmetic (Codex R7 fix: prior `as i64` cast saturated for
-  // huge finite durations, e.g. a SampleRate of 2^-84 / NumSampleFrames=1
-  // yields ~1.93e+25 seconds and the i64 cast saturated to i64::MAX,
-  // producing wrong sub-day values. Perl keeps `$h`, `$m`, `$d` as NV-
-  // typed scalars whose magnitudes can exceed i64; we faithfully use f64
-  // throughout and only cast the SMALL REMAINDERS to i64 for the final
-  // `%d:%.2d:%.2d` printf).
-  let h_f = (rounded / 3600.0).trunc();
-  rounded -= h_f * 3600.0;
-  let m_f = (rounded / 60.0).trunc();
-  rounded -= m_f * 60.0;
-  let s_f = rounded.trunc(); // `int($time)` of remaining
-  // ExifTool.pm:6878-6882 `if ($h > 24) { my $d = int($h/24); $h -= $d*24;
-  // $sign = "$sign$d days "; }`.
-  let mut prefix = sign.to_string();
-  let h_after_days = if h_f > 24.0 {
-    let d_f = (h_f / 24.0).trunc();
-    let h_left = h_f - d_f * 24.0;
-    // Perl `"$sign$d days "` interpolates `$d` as Perl's default NV
-    // stringification. Small integer d ⇒ no decimal (e.g. "12 days ");
-    // very large d ⇒ scientific notation via `format_g(_, 15)` (Perl's
-    // default NV → string precision). Oracle (2026-05-20) on SampleRate=
-    // 2^-84 / NumSampleFrames=1 (`/tmp/test_ext_tiny.aif`) emits
-    // `"2.23875151780487e+20 days 0:00:00"` — byte-exact via format_g(d, 15).
-    prefix.push_str(&crate::value::format_g(d_f, 15));
-    prefix.push_str(" days ");
-    h_left
-  } else {
-    h_f
-  };
-  // ExifTool.pm:6883 `return sprintf("$sign%d:%.2d:%.2d", $h, $m, int($time))`.
-  // After the `days` reduction `h_after_days` is in `0.0..=24.0` (always
-  // a small float); m_f is in `0.0..=60.0`; s_f is in `0.0..=60.0`. All
-  // safely fit i64 for `%d`/`%.2d` printf semantics.
-  let h_i = h_after_days as i64;
-  let m_i = m_f as i64;
-  let s_i = s_f as i64;
-  format!("{prefix}{h_i}:{m_i:02}:{s_i:02}")
+  // The single canonical `ConvertDuration` lives in `composite::convs` (the
+  // Composite engine + every duration caller share it). This is now a thin
+  // alias; the AIFF Composite Duration that used to call this is built by the
+  // engine, but the cross-format callers (e.g. Matroska/MXF) still route here.
+  crate::composite::convs::convert_duration(time)
 }
 
 /// Convert a Unix timestamp (seconds since 1970-01-01T00:00:00Z) to its

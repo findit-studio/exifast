@@ -7632,22 +7632,80 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── SP3 `gpmd` dashcam-variant cross-sample `-G1` SampleTime/SampleDuration ─
+    // At `-ee -G1` the single `Track<N>:SampleTime`/`SampleDuration` is the timing
+    // of that track's MINIMUM-`doc()` (FIRST) `gpmd` sample: ExifTool's
+    // `ProcessSamples` emits each sample's timing in sample order BEFORE
+    // dispatching its `freeGPS` process-proc, and `%noDups` is first-wins
+    // (QuickTimeStream.pl:1518-1523). The SP3 `emit_timed_samples` below emits its
+    // own per-`Doc<N>` SampleTime ONLY at `-G3` (its `-G1` internal collapse keeps
+    // the first DOC's GPS columns but ExifTool's per-sample timing precedes those),
+    // so — mirroring the camm precompute — emit the min-`doc()` timing per
+    // `Track<N>` HERE through the shared `first_seen` gate. ONLY `gpmd`-origin
+    // samples carry sample-table timing (the movie-level `moov`-`gps `/`mdat`-scan
+    // sources have none), so this leaves their goldens untouched. `-G1` only.
+    if opts.extract_embedded && !matches!(opts.group_mode, crate::serialize_key::GroupMode::G3) {
+      for (family1, st, sd) in gpmd_gps_min_doc_timing(&self.stream) {
+        let group = Group::new("QuickTime", family1.as_str());
+        for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
+          if let Some(secs) = val
+            && first_seen(group.family1(), name)
+          {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+      }
+    }
+
     // ── SP3: embedded timed-metadata (QuickTimeStream) ─────────────────
     // ExifTool surfaces these per-sample tags ONLY under `-ee` (ExtractEmbedded)
     // and opens one `Doc<N>` sub-document per GPS fix (`$$et{DOC_NUM} =
     // ++$$et{DOC_COUNT}`, QuickTimeStream.pl:967-973). The shared
     // [`emit_timed_samples`] reproduces both: gated on `opts.extract_embedded`,
     // it emits every fix as a `Doc<N>` row at `-G3` and the first-fix-wins
-    // collapse at `-G1`. The SP3 stream is MOOV-level / freeGPS-scanned, so its
-    // family-1 group is `QuickTime` for every fix (oracle: `QuickTime:GPSLatitude`
-    // / `Doc1:QuickTime:GPSLatitude`). lat/lon → `GPS::ToDMS` at `-j`
-    // (QuickTimeStream.pl:116-117), altitude → the `+ 0` `%.4f` `" m"` PrintConv
-    // (:120), both raw `F64` at `-n`. GPSSpeed (km/h, the typed layer's
+    // collapse at `-G1`. Most SP3 fixes are MOOV-level / freeGPS-scanned, so the
+    // family-1 group is `QuickTime` (oracle: `QuickTime:GPSLatitude` /
+    // `Doc1:QuickTime:GPSLatitude`). The EXCEPTION is a `gpmd` MetaFormat dashcam
+    // variant (FMAS / Wolfbox / Rove) — `ProcessSamples`-dispatched, so ExifTool
+    // scopes it to the enclosing `trak`'s `SET_GROUP1 = "Track$num"`
+    // (QuickTime.pm:10353-10354): such a fix carries [`GpsOrigin::Gpmd`] and
+    // emits under `Track<N>:` (+ its sample-table `SampleTime`/`SampleDuration`,
+    // surfaced via the `sample_timing()` trait override). lat/lon → `GPS::ToDMS`
+    // at `-j` (QuickTimeStream.pl:116-117), altitude → the `+ 0` `%.4f` `" m"`
+    // PrintConv (:120), both raw `F64` at `-n`. GPSSpeed (km/h, the typed layer's
     // post-ValueConv value) and GPSTrack are the per-source columns; GPSDateTime
     // is the common ConvertDateTime string.
+    //
+    // Remember where these SP3 stream rows begin: the `gpmd` matched-but-empty
+    // [`GpmdTimingOnly`] markers below belong to the SAME per-sample
+    // `ProcessSamples` walk and must INTERLEAVE with the GPS fixes by `Doc<N>`
+    // (sample order), not append after them. ExifTool emits each sample's
+    // `SampleTime`/`SampleDuration` then its payload in sample order, so an
+    // empty-then-valid `gpmd` track yields `Doc1` timing BEFORE the `Doc2` fix
+    // (ground-truth `-ee -G3:1`). The conformance comparator is order-INSENSITIVE,
+    // so this ordering is locked by an explicit emission-order assertion in
+    // `tests/timed_metadata_conformance.rs` instead.
+    let gps_start = tags.len();
     emit_timed_samples(
       self.stream.gps_samples(),
-      |_s| Group::new("QuickTime", "QuickTime"),
+      |s| match s.origin() {
+        // A `gpmd` fix carries `Track<N>` only while `$$et{SET_GROUP1}` is still
+        // active; once a PRECEDING Kingslim `ProcessLigoGPS` `delete`d the key
+        // (LigoGPS.pm:266) every following matched sample's fix + timing rides the
+        // DEFAULT `QuickTime` group (ground-truth `-ee -G3:1` on `[Kingslim, valid
+        // FMAS]`: `Doc3:QuickTime:GPSLatitude`). `set_group1_active == false`
+        // captures that flip at this sample's `FoundSomething` time.
+        Some(crate::metadata::GpsOrigin::Gpmd {
+          track,
+          set_group1_active: true,
+        }) => Group::new("QuickTime", std::format!("Track{track}").as_str()),
+        _ => Group::new("QuickTime", "QuickTime"),
+      },
       opts,
       print_conv,
       // The SP3 stream carries no GPSMeasureMode column — never invoked.
@@ -7700,9 +7758,209 @@ impl crate::emit::Taggable for Meta<'_> {
             false,
           ));
         }
+        // The `Process_text` dashcam extras (Mini 0806 / Roadhawk / Thinkware /
+        // DJI telemetry, QuickTimeStream.pl:1213-1294 + the timed-text `Text`).
+        // Each maps to its `%QuickTime::Stream` table entry's PrintConv; the
+        // numeric-shaped strings (`FNumber`/`ExposureCompensation`/`ISO`) emit as
+        // BARE JSON numbers via `EscapeJSON` (oracle `FNumber 3.5`, `ISO 100`).
+        if let Some(extras) = s.text_extras() {
+          // `Text` (:667) — a `Groups 2 Other` string, no conv. Verbatim.
+          if let Some(text) = extras.text() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Text".into(),
+              TagValue::Str(text.into()),
+              false,
+            ));
+          }
+          // `GSensor` (:155) / `Car` (:156) — bare strings, no conv.
+          if let Some(gs) = extras.gsensor() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "GSensor".into(),
+              TagValue::Str(gs.into()),
+              false,
+            ));
+          }
+          if let Some(car) = extras.car() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Car".into(),
+              TagValue::Str(car.into()),
+              false,
+            ));
+          }
+          // `Distance` (:137) `PrintConv => '"$val m"'` — `$val` already `×
+          // $mpsToKph` (the float stringifies via Perl's `%.15g`, e.g. `87.336`).
+          // Under `-n` the PrintConv is DISABLED, so the raw scaled f64 is emitted
+          // (a bare JSON number, `87.336`); under `-j` the `" m"` suffix applies.
+          // (Branch like `FNumber`/`ExposureTime` below — the table entry carries
+          // NO ValueConv, so the `-n` value is the raw ValueConv'd scalar.)
+          if let Some(d) = extras.distance() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "Distance".into(),
+              if print_conv {
+                TagValue::Str(std::format!("{} m", crate::value::format_g(d, 15)).into())
+              } else {
+                TagValue::F64(d)
+              },
+              false,
+            ));
+          }
+          // `VerticalSpeed` (:138) `PrintConv => '"$val m/s"'` — `$val` is the RAW
+          // captured token verbatim (no arithmetic), e.g. `"0.00"`. Under `-n` the
+          // PrintConv is DISABLED, so the raw token is emitted with NO `" m/s"`
+          // suffix as a `TagValue::Str`; the terminal `EscapeJSON` number gate
+          // ([`crate::value::escape_json_is_number`]) renders the numeric-looking
+          // token as a BARE JSON number (`0.00`), matching the `-ee -n` oracle —
+          // exactly the `ISO` raw-token path below. Under `-j` the `" m/s"` suffix
+          // applies (`"0.00 m/s"`).
+          if let Some(vs) = extras.vertical_speed() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "VerticalSpeed".into(),
+              if print_conv {
+                TagValue::Str(std::format!("{vs} m/s").into())
+              } else {
+                TagValue::Str(vs.into())
+              },
+              false,
+            ));
+          }
+          // `FNumber` (:140) `PrintFNumber` at `-j`, the raw F64 at `-n`.
+          if let Some(f) = extras.fnumber() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "FNumber".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_fnumber(f).into())
+              } else {
+                TagValue::F64(f)
+              },
+              false,
+            ));
+          }
+          // `ExposureTime` (:141) `PrintExposureTime` at `-j` (`"1/1000"`), raw at
+          // `-n`.
+          if let Some(et) = extras.exposure_time_s() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ExposureTime".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_exposure_time(et).into())
+              } else {
+                TagValue::F64(et)
+              },
+              false,
+            ));
+          }
+          // `ExposureCompensation` (:142) `PrintFraction` at `-j` (`0` → `"0"` →
+          // bare `0`), raw at `-n`.
+          if let Some(ev) = extras.exposure_compensation() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ExposureCompensation".into(),
+              if print_conv {
+                TagValue::Str(crate::exif::tables::print_fraction(ev).into())
+              } else {
+                TagValue::F64(ev)
+              },
+              false,
+            ));
+          }
+          // `ISO` (:143) — bare table entry: the RAW captured token, emitted as a
+          // BARE number via `EscapeJSON` (oracle `ISO 100`), in both modes.
+          if let Some(iso) = extras.iso() {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              "ISO".into(),
+              TagValue::Str(iso.into()),
+              false,
+            ));
+          }
+        }
       },
       &mut tags,
     );
+    // ── Unified `gpmd` doc-ordered emission (closes the gpmd-emission-order
+    //    class) ───────────────────────────────────────────────────────────────
+    // At `-ee -G3` EVERY `gpmd`-dispatched source emits IN-STREAM in sample (=
+    // `Doc<N>`) walk order — ExifTool's `ProcessSamples` walks the `gpmd` `stbl`
+    // once and emits each sample's rows the moment it is decoded. exifast decodes
+    // the three `gpmd`-dispatched kinds into SEPARATE typed sinks, so without
+    // re-ordering they would emit in SINK order, not walk order. The three kinds:
+    //   1. the SP3 GpsSamples with [`crate::metadata::GpsOrigin::Gpmd`] (the
+    //      self-contained FMAS / Wolfbox / Rove fixes — already in `tags` since
+    //      `gps_start`, emitted by `emit_timed_samples`),
+    //   2. the matched-empty [`GpmdTimingOnly`] markers (a Condition matched but
+    //      its process-proc decoded no fix — a `SampleTime`/`SampleDuration`-only
+    //      `Doc<N>`),
+    //   3. the `gpmd`-DISPATCHED LigoGPS records (the Kingslim arm's
+    //      `ProcessFreeGPS` → `ProcessLigoGPS` output, flagged
+    //      [`crate::metadata::LigoGpsSample::is_gpmd_dispatched`]) — NOT the
+    //      movie-level `moov`-`gps `-box / `mdat`-scan LigoGPS, NOR the
+    //      `udta`/trailer LigoGPS, which are NOT `ProcessSamples`-dispatched.
+    // Collect all three into ONE buffer and STABLE-SORT by `Doc<N>` so the merged
+    // stream matches ExifTool's per-sample walk order: each global `Doc<N>` is
+    // owned by exactly ONE sample (the shared `++DOC_COUNT` is bumped once per
+    // sample), so the stable sort keeps every sample's rows contiguous and orders
+    // the samples by their stamped doc — a Kingslim LigoGPS record and a matched-
+    // empty FMAS marker emit in their decoded doc order rather than in sink order
+    // (all LIGO rows after all markers). It is a NO-OP for a SINGLE-SOURCE `gpmd`
+    // track (the rows are already in `Doc<N>` order from their one sink) and for
+    // every non-`gpmd` file (no rows qualify), so the FMAS / Wolfbox /
+    // GoPro-fallback / `moov`-`gps ` / camm goldens are byte-identical. After this
+    // merge every `gpmd`-dispatched row passes through ONE doc-ordered stream — no
+    // pairwise source-vs-source ordering interaction remains.
+    //
+    // **#328 — the Kingslim per-sample timing doc.** ExifTool's `FoundSomething`
+    // opens this Kingslim sample's OWN `Track<N>:SampleTime`/`SampleDuration`
+    // timing `Doc<N>` BEFORE `ProcessLigoGPS` opens the LigoGPS doc, so a Kingslim
+    // sample consumes TWO docs (timing then LIGO). The walker now claims that lower
+    // ordinal up front (`decode_one_sample`'s `kingslim_timing` `open_doc`) and
+    // records a [`GpmdTimingOnly`] marker (kind 2) carrying it, so the merge below
+    // interleaves it AHEAD of the LigoGPS record (kind 3) by `Doc<N>` — making a
+    // pure or mixed Kingslim `gpmd` track doc-number byte-exact vs bundled. The
+    // marker's family-1 group obeys the SET_GROUP1 `delete` (LigoGPS.pm:266): the
+    // FIRST Kingslim sample of a `trak` rides `Track<N>`, every later matched
+    // sample (Kingslim or a trailing matched-empty FMAS) rides the DEFAULT
+    // `QuickTime` group.
+    //
+    // Gated on `-ee -G3` AND at least one `gpmd`-dispatched source (markers OR
+    // `gpmd` LigoGPS): at `-G1` the doc axis collapses (the markers emit nothing
+    // and the min-doc `SampleTime` precompute above owns the single timing); at
+    // no-`ee` nothing here surfaces.
+    let has_gpmd_ligogps = self
+      .ligogps
+      .samples()
+      .iter()
+      .any(crate::metadata::LigoGpsSample::is_gpmd_dispatched);
+    let unify_gpmd = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3)
+      && opts.extract_embedded
+      && (!self.stream.gpmd_timing_only().is_empty() || has_gpmd_ligogps);
+    if unify_gpmd {
+      // Kind 1 is already in `tags` from `gps_start`; pull it back out, append
+      // kinds 2 + 3, stable-sort the lot by `Doc<N>`, and re-append once.
+      let mut merged: std::vec::Vec<EmittedTag> = tags.split_off(gps_start);
+      emit_gpmd_timing_only(
+        self.stream.gpmd_timing_only(),
+        opts,
+        print_conv,
+        &mut merged,
+      );
+      emit_ligogps(
+        &self.ligogps,
+        opts,
+        print_conv,
+        LigoSelect::GpmdOnly,
+        &mut merged,
+      );
+      merged.sort_by_key(|t| t.tag().group_ref().doc());
+      tags.append(&mut merged);
+    } else {
+      emit_gpmd_timing_only(self.stream.gpmd_timing_only(), opts, print_conv, &mut tags);
+    }
     // No-`ee` DOCUMENT-level `EEWarn` (QuickTime.pm:9545-9549 `EEWarn` →
     // `Warn('The ExtractEmbedded option may find more tags in the media data',
     // 3)`): a TOP-LEVEL magic box (`gps0`/`gsen`/`3gf`) holding more than one
@@ -7734,7 +7992,26 @@ impl crate::emit::Taggable for Meta<'_> {
     // `LIGOGPSINFO` sample) emit through the `%QuickTime::Stream` table under the
     // family-1 `LIGO` group, one `Doc<N>` per record. `-ee`-gated. See
     // [`emit_ligogps`] for the per-record order + per-tag PrintConv.
-    emit_ligogps(&self.ligogps, opts, print_conv, &mut tags);
+    //
+    // When the unified `gpmd` merge ran (above), it already emitted the
+    // `gpmd`-dispatched LigoGPS records at their `Doc<N>` walk position, so this
+    // trailing block emits only the NON-`gpmd` records (movie-level
+    // `moov`-`gps `-box / `mdat`-scan + `udta`/trailer) to avoid double-emit.
+    // Otherwise (no unified merge — `-G1`, no-`ee`, or no `gpmd` source) this
+    // emits ALL records as before (at `-G1` they collapse first-wins; a pure
+    // single-source `gpmd`-LigoGPS track is unaffected — every record is
+    // `gpmd`-dispatched, so `All` and `NonGpmd` differ only when the merge ran).
+    emit_ligogps(
+      &self.ligogps,
+      opts,
+      print_conv,
+      if unify_gpmd {
+        LigoSelect::NonGpmd
+      } else {
+        LigoSelect::All
+      },
+      &mut tags,
+    );
 
     // The Apple `mebx` key/value pairs — ExifTool emits these per timed sample
     // under the enclosing `Track<N>` (family-1) at its `Doc<N>` (oracle:
@@ -7843,14 +8120,20 @@ impl crate::emit::Taggable for Meta<'_> {
           }
           // Accumulate this record's tags with WITHIN-doc last-wins by
           // `(family1, name)` (the records of one timed sample all share that
-          // sample's `Track<N>`, so this matches the cross-doc collapse key).
+          // sample's `Track<N>`, so this matches the cross-doc collapse key),
+          // through the SHARED [`crate::tagmap::emitted_dedup_override`] the final
+          // sinks use. `mebx` rows are all `Priority => 1` and never `Warning`/
+          // `Error`, so this is the same last-wins as before — routed through the
+          // shared rule so no per-`Doc` collapse can diverge by construction.
           for tag in mebx_scratch.drain(..) {
             let key = (
               smol_str::SmolStr::new(tag.tag().group_ref().family1()),
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -7927,10 +8210,17 @@ impl crate::emit::Taggable for Meta<'_> {
           let t = sample.track_index();
           if t == 0 { 1 } else { t }
         });
+        // The Sony rtmd tags come from `%Image::ExifTool::Sony::rtmd`, whose
+        // module gives them family-0 `Sony` (ExifTool `-G0:1` ⇒ `[Sony:Track1]`,
+        // Sony.pm:10727) — NOT `QuickTime`. The `-G1`/`-G3:1` golden keys show
+        // family-1 (`Track1`/`Doc1:Track1`), so family-0 is invisible to them;
+        // it is LOAD-BEARING only for the family-0-qualified `Sony:` SubDoc GPS
+        // Composites (Sony.pm:10929), which match `Sony` but not the GoPro/camm/
+        // mebx tracks (family-0 `QuickTime`/`GoPro`). See `sony_req`.
         let group = if g3 {
-          Group::with_doc("QuickTime", track.as_str(), doc_n)
+          Group::with_doc("Sony", track.as_str(), doc_n)
         } else {
-          Group::new("QuickTime", track.as_str())
+          Group::new("Sony", track.as_str())
         };
         sony_scratch.clear();
         // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
@@ -8242,13 +8532,20 @@ impl crate::emit::Taggable for Meta<'_> {
             flush_doc(&mut doc_vals, &mut sony_committed, &mut tags);
             cur_doc = Some(doc_n);
           }
+          // Within-doc last-wins through the SHARED
+          // [`crate::tagmap::emitted_dedup_override`] the final sinks use. Sony
+          // rtmd rows are all `Priority => 1` and never `Warning`/`Error`, so the
+          // surviving value is unchanged from the prior unconditional last-wins —
+          // routed through the shared rule so no per-`Doc` collapse can diverge.
           for tag in sony_scratch.drain(..) {
             let key = (
               smol_str::SmolStr::new(tag.tag().group_ref().family1()),
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              slot.1 = tag;
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+                slot.1 = tag;
+              }
             } else {
               doc_vals.push((key, tag));
             }
@@ -8419,14 +8716,19 @@ impl crate::emit::Taggable for Meta<'_> {
         if g3 {
           // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
           // `ctmd_scratch` carry one doc. Collapse the within-sample `(family1,
-          // name)` duplicates HONORING `Priority => N` BEFORE appending: a later
-          // same-key row overrides the earlier ONLY when its priority is
-          // non-zero AND `>=` the stored one (`ExifTool.pm:9544-9560`), keeping
-          // the priority-winner at the EARLIER row's position. This is what
-          // makes the re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority =>
-          // 0`, emitted after the type-5 payload) NOT clobber this sample's
-          // `ExposureInfo` `FNumber` (`Priority => 1`) — matching bundled
-          // (`Doc<N>:Track<N>:FNumber` = the ExposureInfo value).
+          // name)` duplicates HONORING `Priority => N` BEFORE appending, via the
+          // SHARED [`crate::tagmap::emitted_dedup_override`] the `TagMap` /
+          // `collect_deduped_tags` sinks also use: a later same-key row overrides
+          // the earlier ONLY when the shared rule says so (`ExifTool.pm:9544-9560`
+          // — non-zero effective priority `>=` the stored one), keeping the
+          // priority-winner at the EARLIER row's position. This is what makes the
+          // re-dispatched `ShotInfo` `Track<N>:FNumber` (`Priority => 0`, emitted
+          // after the type-5 payload) NOT clobber this sample's `ExposureInfo`
+          // `FNumber` (`Priority => 1`) — matching bundled (`Doc<N>:Track<N>:
+          // FNumber` = the ExposureInfo value). Routing through the shared helper
+          // (vs the old hard-coded `priority()` test) also makes a CTMD scratch
+          // `Warning`/`Error` first-win by NAME (effective-priority-0), exactly
+          // as the final sinks do — no path can diverge by construction.
           let mut g3_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
             std::vec::Vec::new();
           for tag in ctmd_scratch.drain(..) {
@@ -8435,7 +8737,7 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = g3_vals.iter_mut().find(|(k, _)| *k == key) {
-              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
                 slot.1 = tag;
               }
             } else {
@@ -8454,13 +8756,16 @@ impl crate::emit::Taggable for Meta<'_> {
               smol_str::SmolStr::new(tag.tag().name()),
             );
             if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-              // Within-sample last-wins, HONORING `Priority => N`: a later
+              // Within-sample last-wins, HONORING `Priority => N` via the SHARED
+              // [`crate::tagmap::emitted_dedup_override`] (the same rule the
+              // `TagMap` / `collect_deduped_tags` sinks apply): a later
               // same-`(family1, name)` row overrides the stored value ONLY when
-              // its priority is non-zero AND `>=` the stored one
-              // (`ExifTool.pm:9544-9560`). So the `ShotInfo` `Track<N>:FNumber`
-              // (`Priority => 0`) leaves the earlier `ExposureInfo` `FNumber`
-              // (`Priority => 1`) in place — the `-G1` half of the CTMD fix.
-              if tag.priority() != 0 && tag.priority() >= slot.1.priority() {
+              // the shared rule says so (`ExifTool.pm:9544-9560`). So the
+              // `ShotInfo` `Track<N>:FNumber` (`Priority => 0`) leaves the earlier
+              // `ExposureInfo` `FNumber` (`Priority => 1`) in place — the `-G1`
+              // half of the CTMD fix — and a CTMD scratch `Warning`/`Error`
+              // first-wins by NAME, with no path able to diverge by construction.
+              if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
                 slot.1 = tag;
               }
             } else {
@@ -9309,7 +9614,11 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       // accumulating this sample's packets. Consecutive samples that share a
       // `doc_n` (two camm5 packets in one camm sample) accumulate into the SAME
       // document buffer, so a later packet's value overwrites the earlier
-      // (within-doc last-wins).
+      // (within-doc last-wins) — through the SHARED
+      // [`crate::tagmap::emitted_dedup_override`] the final sinks use. camm rows
+      // are all `Priority => 1` and never `Warning`/`Error`, so the survivor is
+      // unchanged; routing through the shared rule keeps every per-`Doc` collapse
+      // non-divergent by construction.
       if cur_doc != Some(doc_n) {
         flush_doc(&mut doc_vals, &mut committed, out);
         cur_doc = Some(doc_n);
@@ -9320,7 +9629,9 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
           smol_str::SmolStr::new(tag.tag().name()),
         );
         if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-          slot.1 = tag;
+          if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+            slot.1 = tag;
+          }
         } else {
           doc_vals.push((key, tag));
         }
@@ -9439,6 +9750,122 @@ fn camm_min_doc_timing(
   per_track
     .into_iter()
     .map(|(t, _doc, st, sd)| (t, st, sd))
+    .collect()
+}
+
+/// Emit, at `-ee -G1`, ONE `SampleTime` + `SampleDuration` per FAMILY-1 GROUP
+/// from that group's MINIMUM-`doc()` (first) `gpmd` sample — the SP3 analogue of
+/// [`camm_min_doc_timing`]. Only a `gpmd` dashcam variant (FMAS / Wolfbox / Rove
+/// `Process_text` / Kingslim) carries the sample-table timing the walker stamped;
+/// the movie-level freeGPS fixes (the `moov`-`gps `-box and the brute-force
+/// `mdat` scan) have NO sample-table timing (they keep the trait default), so
+/// they contribute no candidate and their goldens are untouched. The `doc()`
+/// ordinal is GLOBAL and monotonic in walk order, so "smallest `doc()`" is
+/// exactly "first sample" of the group. At `-G3` this is NOT used (each `Doc<N>`
+/// carries its own sample's timing via the [`crate::metadata::TimedSample::
+/// sample_timing`] path).
+///
+/// **The family-1 group is per-sample, not per-track.** Most `gpmd` timing rows
+/// land under the `trak`'s `Track<N>` group, but a sample whose
+/// `set_group1_active` is `false` (recorded AFTER its `trak`'s first
+/// `ProcessLigoGPS` `delete`d `$$et{SET_GROUP1}`, LigoGPS.pm:266) lands under the
+/// DEFAULT `QuickTime` group instead — that applies to BOTH the matched-but-empty
+/// [`crate::metadata::GpmdTimingOnly`] markers AND a DECODED post-delete fix (a
+/// valid FMAS/Rove/Wolfbox sample following the Kingslim LigoGPS — its
+/// [`crate::metadata::GpsOrigin::Gpmd`] carries the same flag). So a
+/// pure-Kingslim track yields BOTH a `Track1:SampleTime` (the first sample, min
+/// `doc()` of the `Track1` group) AND a `QuickTime:SampleTime` (the first
+/// post-LigoGPS sample, min `doc()` of the `QuickTime` group) — ground-truth
+/// `-ee -G1 -j`: `Track1:SampleTime "0 s"` + `QuickTime:SampleTime "1.00 s"`;
+/// and a `[Kingslim, valid FMAS]` track's `QuickTime` min-doc IS the FMAS fix's
+/// sample (so `-ee -G1` keeps `QuickTime:SampleTime "1.00 s"` alongside the FMAS
+/// `QuickTime:GPS*`). Returns `(family1, sample_time, sample_duration)` per group
+/// — `Track<N>` groups first (by track index) then the `QuickTime` group, each at
+/// its min `doc()`.
+///
+/// The matched-but-empty self-contained samples ([`crate::metadata::
+/// GpmdTimingOnly`]) carry their own min-doc candidate timing — ExifTool's
+/// `FoundSomething` emitted their `SampleTime`/`SampleDuration` too (the
+/// Condition matched even though the process-proc decoded nothing) — so a track
+/// whose FIRST (smallest-`doc()`) sample is a matched-empty one owns the `-G1`
+/// `Track<N>:SampleTime` (ground-truth: empty FMAS at `Doc1` ⇒ `-G1` keeps the
+/// `0 s` timing while the GPS columns come from the later `Doc2` fix).
+#[cfg(feature = "alloc")]
+fn gpmd_gps_min_doc_timing(
+  stream: &crate::metadata::QuickTimeStreamMeta,
+) -> std::vec::Vec<(smol_str::SmolStr, Option<f64>, Option<f64>)> {
+  // Keyed by the EFFECTIVE family-1 group string (`Track<N>` or `QuickTime`), so
+  // the SET_GROUP1-cleared Kingslim markers collapse into their OWN `QuickTime`
+  // slot rather than the track's. `sort_order` keeps the `Track<N>` slots ahead
+  // of `QuickTime` and orders the tracks by index (a stable `-G1` group order:
+  // every `Track<N>` < `u32::MAX`).
+  let mut per_group: std::vec::Vec<(smol_str::SmolStr, u32, u32, Option<f64>, Option<f64>)> =
+    std::vec::Vec::new();
+  let mut consider =
+    |family1: smol_str::SmolStr, sort_order: u32, doc: u32, st: Option<f64>, sd: Option<f64>| {
+      if let Some(slot) = per_group.iter_mut().find(|(g, ..)| *g == family1) {
+        if doc < slot.2 {
+          *slot = (family1, sort_order, doc, st, sd);
+        }
+      } else {
+        per_group.push((family1, sort_order, doc, st, sd));
+      }
+    };
+  for s in stream.gps_samples() {
+    let Some(crate::metadata::GpsOrigin::Gpmd {
+      track,
+      set_group1_active,
+    }) = s.origin()
+    else {
+      continue;
+    };
+    // A `gpmd` fix always carries a stamped `doc()` (the dispatch opens one per
+    // sample); guard anyway so an unstamped one cannot establish the minimum. The
+    // SP3 fixes (FMAS / Wolfbox / Rove) normally keep their `trak`'s `Track<N>`
+    // group, but a fix decoded AFTER a preceding Kingslim `ProcessLigoGPS`
+    // `delete`d `$$et{SET_GROUP1}` (LigoGPS.pm:266) rides the DEFAULT `QuickTime`
+    // group (`set_group1_active == false`) — same `QuickTime`-slot collapse as the
+    // post-delete timing-only markers below (a `[Kingslim, valid FMAS]` walk's
+    // `-ee -G1` keeps the FMAS fix's `QuickTime:SampleTime "1.00 s"`).
+    let Some(doc) = s.doc() else { continue };
+    let (family1, sort_order) = if set_group1_active {
+      (smol_str::SmolStr::from(std::format!("Track{track}")), track)
+    } else {
+      (smol_str::SmolStr::from("QuickTime"), u32::MAX)
+    };
+    consider(
+      family1,
+      sort_order,
+      doc,
+      s.sample_time(),
+      s.sample_duration(),
+    );
+  }
+  // The matched-but-empty self-contained samples — same min-doc candidacy (their
+  // `FoundSomething` emitted `SampleTime`/`SampleDuration` too). A Kingslim marker
+  // AFTER its `trak`'s first `ProcessLigoGPS` carries `set_group1_active() ==
+  // false` ⇒ the DEFAULT `QuickTime` group (sorted after every `Track<N>`).
+  for m in stream.gpmd_timing_only() {
+    let (Some(track), Some(doc)) = (m.track_index(), m.doc()) else {
+      continue;
+    };
+    let (family1, sort_order) = if m.set_group1_active() {
+      (smol_str::SmolStr::from(std::format!("Track{track}")), track)
+    } else {
+      (smol_str::SmolStr::from("QuickTime"), u32::MAX)
+    };
+    consider(
+      family1,
+      sort_order,
+      doc,
+      m.sample_time(),
+      m.sample_duration(),
+    );
+  }
+  per_group.sort_by_key(|(_, order, ..)| *order);
+  per_group
+    .into_iter()
+    .map(|(g, _order, _doc, st, sd)| (g, st, sd))
     .collect()
 }
 
@@ -10148,6 +10575,63 @@ fn emit_camm_timing_only(
   for m in markers {
     let track = std::format!("Track{}", m.track_index().unwrap_or(1));
     let group = Group::with_doc("QuickTime", track.as_str(), m.doc().unwrap_or(0));
+    for (val, name) in [
+      (m.sample_time(), "SampleTime"),
+      (m.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+  }
+}
+
+/// Emit the `Doc<N>:Track<N>:SampleTime`/`SampleDuration` of every `gpmd`
+/// matched-but-empty self-contained sample ([`crate::metadata::GpmdTimingOnly`]:
+/// a sample whose FMAS / Wolfbox / Rove `Condition` matched but whose
+/// process-proc decoded no fix). ExifTool's `FoundSomething` emitted that timing
+/// under the sample's `Doc<N>` (QuickTimeStream.pl:1567-1571) even though the
+/// process-proc stored nothing — ground-truth `-ee -G3:1`: a truncated
+/// `FMAS\0\0\0\0` sample followed by a valid one yields `Doc1:Track1:SampleTime`
+/// for the empty one, then the GPS at `Doc2`. `-ee`-gated (a `gpmd` handler
+/// `trak`). EMITTED ONLY at `-G3`: each marker writes its own `Doc<N>:Track<N>:`
+/// timing. At `-G1` the single `Track<N>:SampleTime` is the cross-sample
+/// MINIMUM-`doc()` sample's, owned by the [`gpmd_gps_min_doc_timing`] precompute
+/// at the call site (these markers are among its candidates), so this emitter
+/// pushes nothing at `-G1`. The camm [`emit_camm_timing_only`] analogue.
+#[cfg(feature = "alloc")]
+fn emit_gpmd_timing_only(
+  markers: &[crate::metadata::GpmdTimingOnly],
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  if !opts.extract_embedded || !matches!(opts.group_mode, GroupMode::G3) || markers.is_empty() {
+    return;
+  }
+  for m in markers {
+    // The family-1 group follows the SET_GROUP1 state (LigoGPS.pm:255/266): a
+    // marker emitted while `$$et{SET_GROUP1} = "Track$num"` is still active rides
+    // the `trak`'s `Track<N>` group; one emitted AFTER a preceding Kingslim
+    // `ProcessLigoGPS` `delete`d the key (the `delete` DROPS it rather than
+    // restoring `Track<N>`) rides the DEFAULT `QuickTime` group. The FMAS / Wolfbox
+    // / Rove / `text` markers never follow a LigoGPS `delete`, so they stay
+    // `Track<N>` (`set_group1_active() == true`).
+    let track = std::format!("Track{}", m.track_index().unwrap_or(1));
+    let family1 = if m.set_group1_active() {
+      track.as_str()
+    } else {
+      "QuickTime"
+    };
+    let group = Group::with_doc("QuickTime", family1, m.doc().unwrap_or(0));
     for (val, name) in [
       (m.sample_time(), "SampleTime"),
       (m.sample_duration(), "SampleDuration"),
@@ -11450,6 +11934,42 @@ fn parrot_emit_automation(
   }
 }
 
+/// Which LigoGPS records [`emit_ligogps`] should emit — the split that lets the
+/// QuickTime emitter route the `gpmd`-dispatched LigoGPS records (Kingslim arm)
+/// through the unified `gpmd` doc-ordered merge while the movie-level / `udta` /
+/// trailer records emit from the standalone trailing block.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LigoSelect {
+  /// Emit every record (the M2TS path — it has no `gpmd` MetaFormat tracks, so
+  /// all its LigoGPS records are non-gpmd and this is identical to
+  /// [`Self::NonGpmd`]).
+  All,
+  /// Emit only the records NOT produced by the `gpmd` Kingslim dispatch — the
+  /// movie-level `moov`-`gps `-box / brute-force `mdat`-scan binary records and
+  /// the `udta`/file-end-trailer records. The standalone trailing LigoGPS block
+  /// in the QuickTime emitter (after the unified `gpmd` merge).
+  NonGpmd,
+  /// Emit only the records produced by the `gpmd` Kingslim dispatch
+  /// ([`crate::metadata::LigoGpsSample::is_gpmd_dispatched`]) — pulled into the
+  /// QuickTime emitter's single `gpmd` doc-ordered merge.
+  GpmdOnly,
+}
+
+#[cfg(feature = "alloc")]
+impl LigoSelect {
+  /// `true` when `sample` passes this selection.
+  #[inline(always)]
+  #[must_use]
+  fn accepts(self, sample: &crate::metadata::LigoGpsSample) -> bool {
+    match self {
+      Self::All => true,
+      Self::NonGpmd => !sample.is_gpmd_dispatched(),
+      Self::GpmdOnly => sample.is_gpmd_dispatched(),
+    }
+  }
+}
+
 /// Emit the LigoGPS dashcam GPS samples (`ProcessLigoGPS` / `ProcessLigoJSON`,
 /// LigoGPS.pm) through the `tags()` engine. ExifTool routes these through the
 /// shared `%QuickTime::Stream` tag table (LigoGPS.pm passes the caller's
@@ -11498,6 +12018,7 @@ pub(crate) fn emit_ligogps(
   meta: &crate::metadata::LigoGpsMeta,
   opts: crate::emit::EmitOptions,
   print_conv: bool,
+  select: LigoSelect,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -11509,8 +12030,13 @@ pub(crate) fn emit_ligogps(
   // at no-`ee` ONLY the FIRST `udta`-JSON-sourced sample qualifies — track
   // whether it has been emitted yet. With `-ee` every sample qualifies. Bail
   // early when nothing can emit (the common no-`ee` non-`udta`-JSON case), so the
-  // hot path pays no dedup bookkeeping.
-  let has_first_udta_json = meta.samples().iter().any(|s| s.source().is_udta_json());
+  // hot path pays no dedup bookkeeping. (`gpmd`-dispatched records are always
+  // `Binary` source, so the `GpmdOnly` selection never has a no-`ee` udta-JSON
+  // record; the `select`-filtered `any` keeps the bail correct for every mode.)
+  let has_first_udta_json = meta
+    .samples()
+    .iter()
+    .any(|s| select.accepts(s) && s.source().is_udta_json());
   if !opts.extract_embedded && !has_first_udta_json {
     return;
   }
@@ -11532,7 +12058,7 @@ pub(crate) fn emit_ligogps(
   let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
   // FINDING 1 — has the no-`ee` first `udta`-JSON record been emitted?
   let mut emitted_no_ee_first = false;
-  for sample in meta.samples() {
+  for sample in meta.samples().iter().filter(|s| select.accepts(s)) {
     // FINDING 1 — skip samples that don't qualify under the current `-ee` state.
     if !opts.extract_embedded {
       // No-`ee`: emit ONLY the first `udta`-JSON record; skip the rest + all
@@ -11810,13 +12336,20 @@ fn emit_camm_motion<T>(
         flush_doc(&mut doc_vals, &mut committed, out);
         cur_doc = Some(doc_n);
       }
+      // Within-doc last-wins through the SHARED
+      // [`crate::tagmap::emitted_dedup_override`] the final sinks use. The motion
+      // payload rows are all `Priority => 1` and never `Warning`/`Error`, so the
+      // survivor is unchanged from the prior unconditional last-wins — routed
+      // through the shared rule so no per-`Doc` collapse can diverge.
       for tag in scratch.drain(..) {
         let key = (
           smol_str::SmolStr::new(tag.tag().group_ref().family1()),
           smol_str::SmolStr::new(tag.tag().name()),
         );
         if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-          slot.1 = tag;
+          if crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
+            slot.1 = tag;
+          }
         } else {
           doc_vals.push((key, tag));
         }
@@ -12638,9 +13171,16 @@ fn emit_gopro_doc<F: FnMut(&str, &str) -> bool>(
         smol_str::SmolStr::new(tag.tag().name()),
       );
       if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
-        // Repeated key WITHIN this document: overwrite (last-wins) only when this
-        // document owns the key's primary; otherwise keep the first occurrence.
-        if !committed.contains(&key) {
+        // Repeated key WITHIN this document: overwrite only when this document
+        // OWNS the key's primary (the `committed` cross-document FIRST-document-
+        // wins ownership — a genuinely different axis from priority); otherwise
+        // keep the first occurrence. The WITHIN-doc replace, gated by that
+        // ownership, is the SHARED [`crate::tagmap::emitted_dedup_override`]
+        // last-wins the final sinks use (GoPro `STRM` rows are all `Priority => 1`
+        // and never `Warning`/`Error`, so the survivor is unchanged) — routed
+        // through the shared rule so the within-doc collapse cannot diverge, while
+        // the `committed` ownership gate stays as the document-level model.
+        if !committed.contains(&key) && crate::tagmap::emitted_dedup_override(&tag, &slot.1) {
           slot.1 = tag;
         }
       } else {

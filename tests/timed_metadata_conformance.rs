@@ -44,6 +44,28 @@ use exifast::parser::extract_info_with_options;
 /// sites read clearly after the `MetaFormat` gap was closed (R13).
 const NO_EXCL: &[&str] = &[];
 
+/// The crafted-degenerate Sony rtmd GPS Composites dropped from BOTH sides (the
+/// `*_excluding` arg) for the `_coordzero`/`_nonfinite`/`_zerolen` fixtures: a
+/// degenerate `0x8502`/`0x8503` GPS record (an empty / non-finite / zero-length
+/// coordinate) makes bundled's `Composite:GPSLatitude`/`Longitude`/`Position`
+/// diverge from exifast's (a crafted-input ship-bar deferral, NOT a real-camera
+/// gap — the REAL `QuickTime_sony_rtmd.mov` builds every GPS Composite
+/// byte-exact). Every other Composite + tag stays byte-exact.
+const SONY_RTMD_DEGEN_GPS_EXCL: &[&str] =
+  &["GPSLatitude", "GPSLongitude", "GPSPosition", "GPSDateTime"];
+
+/// `QuickTime_sony_rtmd_shortnum.mov`: every numeric record is sub-width, so
+/// FNumber is the `EmptyRead` sentinel `256` (`2^(8-0/8192)`) — bundled does NOT
+/// build `Composite:Aperture` from that sentinel while exifast does, so it is
+/// dropped from both sides (the GPS / other Composites stay byte-exact).
+const SONY_RTMD_SHORTNUM_EXCL: &[&str] = &["Aperture"];
+
+/// `QuickTime_canon_ctmd_exifinfo.mov`: the type-7 MakerNote re-dispatch makes
+/// `Composite:LightValue` read a different `$prt[2]` ISO than exifast's collapsed
+/// `Track1:ISO`, so the crafted LightValue diverges; dropped from both sides
+/// (Aperture / ShutterSpeed / the redispatch proof tags stay byte-exact).
+const CANON_CTMD_EXIFINFO_EXCL: &[&str] = &["LightValue"];
+
 /// Read a fixture into memory.
 fn fixture(name: &str) -> Vec<u8> {
   let root = env!("CARGO_MANIFEST_DIR");
@@ -98,6 +120,28 @@ fn check_ee(fixture_name: &str, golden_name: &str, g3: bool) {
     panic!(
       "{fixture_name} ({}) vs {golden_name}: {}\n--- got ---\n{got}\n--- want ---\n{want}",
       if g3 { "-G3" } else { "-G1" },
+      e.message()
+    );
+  }
+}
+
+/// Render `fixture` at `-ee -n` (`-G1`, PrintConv DISABLED) and compare
+/// TOKEN-EXACT to `golden_name`. The `-n` axis pins the tags whose
+/// `%QuickTime::Stream` PrintConv is dropped under `-n` — e.g. the DJI
+/// `Distance` (`"$val m"` → raw `87.336`) and `VerticalSpeed` (`"$val m/s"` →
+/// raw `0.00`) — which the `-j` `.ee.json`/`.ee.g3.json` goldens cannot catch
+/// (they exercise only the PrintConv'd string form). The third
+/// `extract_info_with_options` arg is the PrintConv toggle (`false` = `-n`).
+fn check_ee_n(fixture_name: &str, golden_name: &str) {
+  let data = fixture(fixture_name);
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options(fixture_name, &data, false, opts);
+  let want = golden(golden_name);
+  if let Err(e) = json_equivalent_strict(&got, &want) {
+    panic!(
+      "{fixture_name} (-ee -n) vs {golden_name}: {}\n--- got ---\n{got}\n--- want ---\n{want}",
       e.message()
     );
   }
@@ -244,6 +288,682 @@ fn gopro_hero8_gpmd_ee_byte_exact() {
     "QuickTime_gopro_hero8_gpmf.mp4",
     "QuickTime_gopro_hero8_gpmf.mp4.ee.g3.json",
     true,
+  );
+}
+
+// ── Track<N>: gpmd dashcam variants (FMAS / Wolfbox — per-sample Track<N>) ───
+// The `gpmd` MetaFormat Condition cascade (QuickTimeStream.pl:181-212) routes
+// the self-contained dashcam variants to their `freeGPS` process-procs:
+// `^FMAS\0\0\0\0` → `ProcessFMAS` (Vantrue N2S, :3580), and `.{136}(0{16}[A-Z]{4}
+// |https://www.redtiger\0)` → `ProcessWolfbox` (Wolfbox G900 / Redtiger F9 4K,
+// :3615). UNLIKE the movie-level `moov`-`gps `-box / brute-force `mdat`-scan
+// freeGPS sources, these are `ProcessSamples`-dispatched per timed sample, so
+// ExifTool scopes the decoded GPS to the `gpmd` trak's `SET_GROUP1 = "Track1"`
+// and emits the sample-table `SampleTime`/`SampleDuration` (QuickTimeStream.pl:
+// 161-162) ahead of the fix. exifast stamps these fixes with `GpsOrigin::Gpmd`
+// so the SP3 emission lands under `Track1:` with the sample timing — every tag
+// (incl. `Track1:MetaFormat`, the stsd `gpmd` 4cc) compared byte-exact.
+//
+// The fixtures are HAND-CRAFTED minimal `.mov`s (`tools/gen_freegps_gpmd_fixture.py`)
+// — exifast has no real Vantrue N2S / Redtiger F9 4K clip (#100). The container
+// mirrors the crafted Sony rtmd / camm fixtures (a single-sample `meta`-handler
+// trak); only the stsd format code is `gpmd`. Verified bundled-decodable vs
+// ExifTool 13.59 (the FMAS fix lands at 47°37'42.00"N 8°30'6.00"E, the Wolfbox at
+// 47°37'42.32"N 8°22'30.46"E).
+
+#[test]
+fn fmas_n2s_gpmd_ee_byte_exact() {
+  // `-ee -G1`: the single `gpmd` sample's FMAS fix collapsed to `Track1:` (the
+  // doc axis collapsed) + the cross-sample min-doc `Track1:SampleTime`/
+  // `SampleDuration` — byte-exact.
+  check_ee(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the FMAS fix as its own `Doc1:Track1:…` with the sample's own
+  // SampleTime/SampleDuration — byte-exact.
+  check_ee(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn wolfbox_redtiger_f9_gpmd_ee_byte_exact() {
+  // `-ee -G1`: the single `gpmd` sample's Wolfbox fix (incl. `Track1:GPSAltitude`)
+  // collapsed to `Track1:` + the min-doc `Track1:SampleTime`/`SampleDuration` —
+  // byte-exact.
+  check_ee(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the Wolfbox fix as its own `Doc1:Track1:…` — byte-exact.
+  check_ee(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.ee.g3.json",
+    true,
+  );
+}
+
+// The no-`ee` default path: a `gpmd` trak is `meta`-handler ⇒ fully `-ee` gated,
+// so the only surfaced timed tag is the `Track1:Warning` ([minor] ExtractEmbedded
+// hint, QuickTime.pm `EEWarn`); NO GPS surfaces. Pins that the `gpmd`-variant GPS
+// emission is `-ee`-only (the same gate as camm / the GoPro gpmd), so a default
+// parse leaks no fix. Every tag (incl. `Track1:MetaFormat`) compared byte-exact.
+// The four Process_text dashcam fixtures (#104 / #102) — single `text`-handler
+// timed-text samples whose ASCII bytes carry one vendor's Process_text
+// fingerprint (QuickTimeStream.pl:1213-1294). ExifTool routes a `text`
+// HandlerType sample to `Process_text` (:1467-1516), emitting the decoded GPS +
+// the non-GPS extras (`Text`/`GSensor`/`Car`/`Distance`/`VerticalSpeed`/
+// `FNumber`/`ExposureTime`/`ExposureCompensation`/`ISO`) under `Track1:` with the
+// sample-table timing, `-ee` only. Verified bundled-decodable vs ExifTool 13.59.
+#[test]
+fn text_mini0806_ee_byte_exact() {
+  // Mini 0806: `^A,DDMMYY,HHMMSS.sss,…` → 33°56'53.55"N 84°20'12.43"W,
+  // 2019:05:27 20:15:55.000, alt 331 m, speed 0, Accelerometer.
+  check_ee(
+    "QuickTime_text_mini0806.mov",
+    "QuickTime_text_mini0806.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_mini0806.mov",
+    "QuickTime_text_mini0806.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_roadhawk_ee_byte_exact() {
+  // Roadhawk: the `*HH~`-terminated substitution-encoded buffer → a decoded
+  // `$GPRMC` (53°30'40.10"N 6°41'58.49"W, 2013:02:05 08:21:38, speed 23.15,
+  // track 87.86) + the 4-value Accelerometer.
+  check_ee(
+    "QuickTime_text_roadhawk.mov",
+    "QuickTime_text_roadhawk.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_roadhawk.mov",
+    "QuickTime_text_roadhawk.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_thinkware_ee_byte_exact() {
+  // Thinkware: `gsensori,…;GNRMC,…;CAR,…` → 45°29'52.49"N 73°37'0.73"W,
+  // 2019:08:31 16:13:13, speed 11.5287, track 35.34, GSensor + Car.
+  check_ee(
+    "QuickTime_text_thinkware.mov",
+    "QuickTime_text_thinkware.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_thinkware.mov",
+    "QuickTime_text_thinkware.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn text_dji_telemetry_ee_byte_exact() {
+  // DJI telemetry: `F/3.5, SS 1000, …, GPS (lon, lat, alt), D …, H …, H.S …,
+  // V.S …` → 53°9'59.40"N 8°38'59.64"E, alt 6 m, speed 7.56, Distance/FNumber/
+  // ExposureTime/ExposureCompensation/ISO/VerticalSpeed.
+  check_ee(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -n` (#104 finding-2): under `-n` the `Distance` (`"$val m"`) and
+  // `VerticalSpeed` (`"$val m/s"`) PrintConvs are DISABLED, so `Distance` is the
+  // raw scaled number (`87.336`, not `"87.336 m"`) and `VerticalSpeed` is the raw
+  // token (`0.00`, not `"0.00 m/s"`). The `-j` goldens above only exercise the
+  // suffixed string form, so this `-n` golden is what pins the numeric branch.
+  check_ee_n(
+    "QuickTime_text_dji_telemetry.mov",
+    "QuickTime_text_dji_telemetry.mov.ee.n.json",
+  );
+}
+
+// A two-sample `text`-handler track: a ZERO-LENGTH length-prefixed sample (the
+// `next if $size == 2` shape — a 2-byte big-endian prefix `\0\0` equal to
+// `size - 2 == 0`) FOLLOWED BY a valid Mini-0806 sample. ExifTool's
+// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}` + `SampleTime`/
+// `SampleDuration`, QuickTimeStream.pl:1461) fires for EVERY `text` sample
+// BEFORE the `unless ($buff =~ /^\$BEGIN/)` block — so BEFORE the `next if
+// $size == 2` AND before `Process_text`. The empty sample therefore STILL opens
+// `Doc1` and emits its timing (no `Text`, no GPS — the `next` skips the `Text`
+// store + decode), so the valid Mini-0806 fix is renumbered `Doc2` (NOT `Doc1`),
+// and at `-ee -G1` the single `Track1:SampleTime` is the FIRST (empty) sample's
+// `0 s`. This pins the size==2 escape-hatch close of the per-text-sample-timing
+// class (#104 R2): the third occurrence after #100 (gpmd matched-empty) and
+// #104 R1 (binary `\0[^\0]` empty), now the size==2 wrapper case. Verified
+// byte-exact vs bundled ExifTool 13.59.
+#[test]
+fn text_empty_size2_then_valid_doc_renumber_byte_exact() {
+  // `-ee -G3:1`: the empty size==2 sample is `Doc1:Track1:SampleTime "0 s"` +
+  // `SampleDuration "1.00 s"` (NO Text / NO GPS), and the valid Mini-0806 fix is
+  // `Doc2:Track1:…` — proving the empty sample consumed `Doc1` so the valid one
+  // is `Doc2`. Byte-exact.
+  check_ee(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, and the single `Track1:SampleTime "0 s"`
+  // is the FIRST (min-`doc()` = `Doc1`, empty) sample's timing while the GPS +
+  // `Text` columns come from the `Doc2` fix — byte-exact (the timing-only marker
+  // is a candidate in the min-doc precompute).
+  check_ee(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `text` trak is fully `-ee` gated, so only the
+  // structural `Track1:HandlerType`/`OtherFormat` + the `[minor]` EEWarn surface
+  // (no GPS, no Text, no SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_text_empty_then_valid.mov",
+    "QuickTime_text_empty_then_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the size==2 empty-then-valid `text` `-ee -G3`
+/// emission (the per-text-sample-timing class close). [`json_equivalent_strict`]
+/// compares object keys as an UNORDERED multiset, so it does NOT catch a wrong
+/// key ORDER — the `.ee.g3.json` golden carries the correct bundled order yet a
+/// divergent emission order still passes it. This asserts directly on the RAW
+/// emitted document that the empty sample's `Doc1:Track1:SampleTime`/
+/// `SampleDuration` are emitted BEFORE the valid fix's `Doc2:Track1:` rows —
+/// exactly ExifTool's `ProcessSamples` per-sample (= `Doc<N>`) emission order. A
+/// size==2 early-return (the bug) would drop `Doc1` timing entirely, so this
+/// also guards against the escape hatch reopening.
+#[test]
+fn text_empty_size2_then_valid_g3_emission_order() {
+  let data = fixture("QuickTime_text_empty_then_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_text_empty_then_valid.mov", &data, true, opts);
+
+  // The empty size==2 sample (Doc1) carries ONLY SampleTime/SampleDuration; the
+  // valid Mini-0806 fix (Doc2) carries SampleTime/SampleDuration + Text + GPS.
+  let doc1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the empty size==2 sample's timing)");
+  let doc1_dur = got
+    .find("\"Doc1:Track1:SampleDuration\"")
+    .expect("Doc1:Track1:SampleDuration present");
+  let doc2_time = got
+    .find("\"Doc2:Track1:SampleTime\"")
+    .expect("Doc2:Track1:SampleTime present");
+  let doc2_text = got
+    .find("\"Doc2:Track1:Text\"")
+    .expect("Doc2:Track1:Text present");
+  let doc2_lat = got
+    .find("\"Doc2:Track1:GPSLatitude\"")
+    .expect("Doc2:Track1:GPSLatitude present");
+
+  // Doc1's timing block must precede the ENTIRE Doc2 block (its timing AND its
+  // Text/GPS rows) — ProcessSamples emits the empty sample fully before the
+  // valid one. The empty sample must NOT be missing (the size==2 escape hatch).
+  assert!(
+    doc1_time < doc2_time && doc1_dur < doc2_time && doc1_time < doc2_text && doc1_time < doc2_lat,
+    "text size==2 -ee -G3 emission order: Doc1 timing must precede the Doc2 fix \
+     (Doc1:SampleTime@{doc1_time}, Doc1:SampleDuration@{doc1_dur}, \
+     Doc2:SampleTime@{doc2_time}, Doc2:Text@{doc2_text}, \
+     Doc2:GPSLatitude@{doc2_lat})\n--- got ---\n{got}"
+  );
+}
+
+#[test]
+fn fmas_n2s_gpmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_fmas_n2s.mov",
+    "QuickTime_fmas_n2s.mov.json",
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn wolfbox_redtiger_f9_gpmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_wolfbox_redtiger_f9.mov",
+    "QuickTime_wolfbox_redtiger_f9.mov.json",
+    NO_EXCL,
+  );
+}
+
+// A two-sample `gpmd` stream where the FIRST sample MATCHES the FMAS `Condition`
+// (`^FMAS\0\0\0\0`, QuickTimeStream.pl:197) but `ProcessFMAS`'s stricter full
+// record regex FAILS (a 100-byte sample, no `SAMM`@80 / `A`@120), so it DECODES
+// NOTHING; the SECOND sample is a valid FMAS record. ExifTool fires
+// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}` + `SampleTime`/
+// `SampleDuration`, QuickTimeStream.pl:967-972) the moment `GetTagInfo` matches
+// the SHORT Condition (`ProcessSamples`:1567-1571), BEFORE — and independently
+// of — what `ProcessFMAS` decodes. So the matched-but-empty first sample STILL
+// opens a `Doc<N>` and emits its timing, which means the valid sample is
+// renumbered `Doc2` (NOT `Doc1`), and at `-G1` the single `Track1:SampleTime` is
+// the FIRST (empty) sample's `0 s`, not the valid sample's `1.00 s`. Verified
+// byte-exact vs bundled ExifTool 13.59 (the matched-empty sample's `Doc<N>` +
+// timing — the `gpmd` analogue of the camm timing-only marker; #100 follow-up).
+#[test]
+fn fmas_gpmd_matched_empty_then_valid_doc_renumber_byte_exact() {
+  // `-ee -G3:1`: the matched-empty sample is `Doc1:Track1:SampleTime "0 s"` (no
+  // GPS) and the valid FMAS fix is `Doc2:Track1:…` — proving the empty sample
+  // consumed `Doc1` so the valid one is `Doc2`. Byte-exact.
+  check_ee(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, and the single `Track1:SampleTime "0 s"`
+  // is the FIRST (min-`doc()` = `Doc1`, empty) sample's timing while the GPS
+  // columns come from the `Doc2` fix — byte-exact (the min-doc precompute
+  // includes the timing-only marker as a candidate).
+  check_ee(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `gpmd` trak is fully `-ee` gated, so only the
+  // structural `Track1:MetaFormat` + the `[minor]` EEWarn surface (no GPS, no
+  // SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_fmas_empty_then_valid.mov",
+    "QuickTime_fmas_empty_then_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the `gpmd` matched-empty-then-valid `-ee -G3`
+/// emission (the `#100` R2 Codex finding). [`json_equivalent_strict`] (used by
+/// [`check_ee`] above) compares object keys as an UNORDERED multiset, so it does
+/// NOT catch a wrong key ORDER — the `.ee.g3.json` golden on disk carries the
+/// correct bundled order yet a divergent emission order still passes it. This
+/// asserts directly on the RAW emitted document that the matched-empty sample's
+/// `Doc1:Track1:SampleTime`/`SampleDuration` are emitted BEFORE the valid fix's
+/// `Doc2:Track1:` rows — exactly ExifTool's `ProcessSamples` per-sample (=
+/// `Doc<N>`) emission order. Before the doc-merge fix the GPS fixes appended
+/// ahead of the timing-only markers, so `Doc2:` preceded `Doc1:` here while
+/// conformance stayed green.
+#[test]
+fn fmas_gpmd_matched_empty_then_valid_g3_emission_order() {
+  let data = fixture("QuickTime_fmas_empty_then_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_fmas_empty_then_valid.mov", &data, true, opts);
+
+  // The matched-empty sample (Doc1) carries ONLY SampleTime/SampleDuration; the
+  // valid FMAS fix (Doc2) carries SampleTime/SampleDuration + the GPS columns.
+  let doc1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present");
+  let doc1_dur = got
+    .find("\"Doc1:Track1:SampleDuration\"")
+    .expect("Doc1:Track1:SampleDuration present");
+  let doc2_time = got
+    .find("\"Doc2:Track1:SampleTime\"")
+    .expect("Doc2:Track1:SampleTime present");
+  let doc2_lat = got
+    .find("\"Doc2:Track1:GPSLatitude\"")
+    .expect("Doc2:Track1:GPSLatitude present");
+  let doc2_datetime = got
+    .find("\"Doc2:Track1:GPSDateTime\"")
+    .expect("Doc2:Track1:GPSDateTime present");
+
+  // Doc1's timing block must precede the ENTIRE Doc2 block (its timing AND its
+  // GPS rows) — ProcessSamples emits the empty sample fully before the valid one.
+  assert!(
+    doc1_time < doc2_time
+      && doc1_dur < doc2_time
+      && doc1_time < doc2_datetime
+      && doc1_time < doc2_lat,
+    "gpmd -ee -G3 emission order: Doc1 timing must precede the Doc2 fix \
+     (Doc1:SampleTime@{doc1_time}, Doc1:SampleDuration@{doc1_dur}, \
+     Doc2:SampleTime@{doc2_time}, Doc2:GPSDateTime@{doc2_datetime}, \
+     Doc2:GPSLatitude@{doc2_lat})\n--- got ---\n{got}"
+  );
+}
+
+// ── #328: Kingslim `gpmd` per-sample timing `Doc<N>` + the SET_GROUP1 flip ────
+// A Kingslim `gpmd` sample (`^.{21}\0\0\0A[NS][EW]` → `ProcessFreeGPS` →
+// `ProcessLigoGPS`) consumes TWO docs: ExifTool's `FoundSomething`
+// (`ProcessSamples`:1567-1571) opens this sample's `SampleTime`/`SampleDuration`
+// timing `Doc<N>` the moment the Condition matches, THEN `ProcessLigoGPS`
+// (LigoGPS.pm:243) opens the LigoGPS sub-document — so a leading Kingslim sample
+// is `Doc1`-timing + `Doc2`-LIGO. `ProcessLigoGPS` does `SET_GROUP1 = 'LIGO'`
+// then `delete $$et{SET_GROUP1}` (LigoGPS.pm:255/266); the `delete` DROPS the key
+// WITHOUT restoring the `trak`'s `Track$num`, so every FOLLOWING matched sample's
+// timing rides the DEFAULT `QuickTime` group, not `Track<N>`. Both verified
+// byte-exact vs bundled ExifTool 13.59.
+
+// A PURE-Kingslim track (two Kingslim samples). Ground-truth `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing, `Doc4:LIGO` — the
+// SECOND sample's timing rides `QuickTime` because the FIRST sample's
+// `ProcessLigoGPS` already `delete`d `$$et{SET_GROUP1}`. The proof of the
+// `Track<N>`→`QuickTime` SET_GROUP1 flip.
+#[test]
+fn kingslim_gpmd_pure_per_sample_timing_doc_byte_exact() {
+  // `-ee -G3:1`: each Kingslim sample = a timing doc then a LigoGPS doc; the
+  // first timing rides `Track1`, the second `QuickTime`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, but the timing rows split by their
+  // family-1 group — the min-`doc()` `Track1` sample (`Doc1`, "0 s") AND the
+  // min-`doc()` `QuickTime` sample (`Doc3`, "1.00 s") BOTH emit. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `gpmd` trak is fully `-ee` gated, so only the
+  // structural `Track1:MetaFormat "gpmd"` + the `[minor]` EEWarn surface (no GPS,
+  // no SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the pure-Kingslim `-ee -G3` emission. The strict
+/// comparator treats object keys as an UNORDERED multiset, so it would pass a
+/// divergent key ORDER; assert directly on the RAW document that the per-sample
+/// walk order holds — `Doc1:Track1`-timing precedes `Doc2:LIGO` precedes
+/// `Doc3:QuickTime`-timing precedes `Doc4:LIGO` — AND that the SET_GROUP1 flip
+/// puts the SECOND sample's timing under `QuickTime` (the `Doc3:QuickTime:` key
+/// is present, NOT `Doc3:Track1:`). This is the order + group proof of the
+/// timing-doc-ahead-of-LigoGPS interleave through the unified `gpmd` doc-merge.
+#[test]
+fn kingslim_gpmd_pure_g3_emission_order_and_group_flip() {
+  let data = fixture("QuickTime_gpmd_kingslim_pure.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_pure.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (first sample's timing rides Track1)");
+  let doc2_ligo_lat = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (first sample's LigoGPS)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (second sample's timing rides QuickTime, NOT Track1)",
+  );
+  let doc4_ligo_lat = got
+    .find("\"Doc4:LIGO:GPSLatitude\"")
+    .expect("Doc4:LIGO:GPSLatitude present (second sample's LigoGPS)");
+
+  // The SET_GROUP1 flip: the SECOND sample's timing must NOT ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\""),
+    "the post-LigoGPS Kingslim sample's timing must ride QuickTime, not Track1 \
+     (SET_GROUP1 was deleted)\n--- got ---\n{got}"
+  );
+  // Walk order: timing → LIGO → timing → LIGO, strictly increasing.
+  assert!(
+    doc1_track1_time < doc2_ligo_lat
+      && doc2_ligo_lat < doc3_qt_time
+      && doc3_qt_time < doc4_ligo_lat,
+    "kingslim pure -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc4:LIGO \
+     (got @{doc1_track1_time}/{doc2_ligo_lat}/{doc3_qt_time}/{doc4_ligo_lat})\n\
+     --- got ---\n{got}"
+  );
+}
+
+// A MIXED `gpmd` track: a Kingslim (LigoGPS) sample, then a matched-empty FMAS
+// sample, then ANOTHER Kingslim sample. Ground-truth `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing (the FMAS marker),
+// `Doc4:QuickTime`-timing (the second Kingslim sample), `Doc5:LIGO` — both the
+// FMAS marker and the second Kingslim sample ride `QuickTime` because the first
+// Kingslim `ProcessLigoGPS` already `delete`d `$$et{SET_GROUP1}`. This is the
+// order-sensitive proof that the unified `gpmd` doc-ordered merge interleaves the
+// `gpmd`-dispatched LigoGPS records with the timing-only markers (a Kingslim
+// sample BEFORE *and* AFTER the FMAS marker), with the SET_GROUP1 group flip.
+#[test]
+fn kingslim_gpmd_mixed_per_sample_timing_doc_byte_exact() {
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the `Track1` group's min-`doc()` is `Doc1` ("0 s"); the `QuickTime`
+  // group's min-`doc()` is `Doc3` ("1.00 s"). Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.ee.json",
+    false,
+  );
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the MIXED `-ee -G3` emission: the three `gpmd`-
+/// dispatched sinks (Kingslim LigoGPS records, the matched-empty FMAS timing
+/// marker, the Kingslim timing markers) must interleave by `Doc<N>` —
+/// `Doc1:Track1`-timing < `Doc2:LIGO` < `Doc3:QuickTime`-timing (FMAS) <
+/// `Doc4:QuickTime`-timing (Kingslim) < `Doc5:LIGO` — with a Kingslim LigoGPS
+/// record both BEFORE and AFTER the FMAS marker, and the SET_GROUP1 flip putting
+/// the post-LigoGPS markers (`Doc3`/`Doc4`) under `QuickTime`.
+#[test]
+fn kingslim_gpmd_mixed_g3_emission_order_and_group_flip() {
+  let data = fixture("QuickTime_gpmd_kingslim_fmas_mixed.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_fmas_mixed.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (first Kingslim sample's timing)");
+  let doc2_ligo = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (first Kingslim LigoGPS, BEFORE the FMAS marker)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (the matched-empty FMAS marker, post-SET_GROUP1-delete)",
+  );
+  let doc4_qt_time = got
+    .find("\"Doc4:QuickTime:SampleTime\"")
+    .expect("Doc4:QuickTime:SampleTime present (the second Kingslim sample's timing)");
+  let doc5_ligo = got
+    .find("\"Doc5:LIGO:GPSLatitude\"")
+    .expect("Doc5:LIGO:GPSLatitude present (second Kingslim LigoGPS, AFTER the FMAS marker)");
+
+  // The FMAS marker and the second Kingslim timing must NOT ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\"") && !got.contains("\"Doc4:Track1:SampleTime\""),
+    "the post-LigoGPS markers (FMAS + 2nd Kingslim) must ride QuickTime, not Track1\n\
+     --- got ---\n{got}"
+  );
+  // Walk order: a Kingslim LigoGPS (Doc2) BEFORE the FMAS marker (Doc3) AND a
+  // Kingslim LigoGPS (Doc5) AFTER it — the doc-merge interleave.
+  assert!(
+    doc1_track1_time < doc2_ligo
+      && doc2_ligo < doc3_qt_time
+      && doc3_qt_time < doc4_qt_time
+      && doc4_qt_time < doc5_ligo,
+    "kingslim mixed -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc4:QuickTime-timing < Doc5:LIGO \
+     (got @{doc1_track1_time}/{doc2_ligo}/{doc3_qt_time}/{doc4_qt_time}/{doc5_ligo})\n\
+     --- got ---\n{got}"
+  );
+}
+
+// ── #328 Finding 1: the SET_GROUP1 flip reaches a DECODED post-LigoGPS fix ────
+// A Kingslim (LigoGPS) sample FOLLOWED BY a VALID FMAS sample that decodes a REAL
+// GPS fix (a `GpsSample` stamped `GpsOrigin::Gpmd`, NOT a matched-empty marker).
+// The first Kingslim `ProcessLigoGPS` emits its fix (reaching LigoGPS.pm:266) and
+// `delete`s `$$et{SET_GROUP1}` WITHOUT restoring `Track1`, so the FMAS sample's
+// `FoundSomething` timing AND its decoded GPS columns ride the DEFAULT `QuickTime`
+// group — NOT `Track1`. Ground-truth bundled ExifTool 13.59 `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing + `Doc3:QuickTime`
+// GPS (the FMAS fix, post-LigoGPS). The pre-fix code stamped a decoded `gpmd` fix
+// `Track<N>` unconditionally, so this is the proof that the cleared-state is
+// carried onto decoded rows too, not only the timing-only markers.
+#[test]
+fn kingslim_gpmd_valid_fmas_post_ligogps_group_flip_byte_exact() {
+  // `-ee -G3:1`: the FMAS fix's timing + GPS ride `Doc3:QuickTime`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the `QuickTime` group's min-`doc()` IS the FMAS sample (`Doc3`), so
+  // it keeps `QuickTime:SampleTime "1.00 s"` alongside the FMAS `QuickTime:GPS*`;
+  // the `Track1` group keeps the Kingslim `"0 s"` + `LIGO:GPS*`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: fully `-ee`-gated `gpmd` trak — only the structural
+  // scalars + `Track1:MetaFormat "gpmd"` + the `[minor]` EEWarn. Byte-exact.
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER + GROUP guard for the `[Kingslim, valid FMAS]` `-ee -G3` emission. The
+/// strict comparator treats keys as an unordered multiset, so assert directly on
+/// the RAW document that (a) the FMAS fix's GPS lands under `Doc3:QuickTime:`, NOT
+/// `Doc3:Track1:` (the SET_GROUP1 flip reaching a DECODED fix), and (b) the walk
+/// order holds — `Doc1:Track1`-timing < `Doc2:LIGO` < `Doc3:QuickTime`-timing <
+/// the `Doc3:QuickTime` FMAS GPS. This is the order + group proof that the
+/// cleared-state carries onto the decoded `gpmd` fix, not only the markers.
+#[test]
+fn kingslim_gpmd_valid_fmas_g3_decoded_fix_rides_quicktime() {
+  let data = fixture("QuickTime_gpmd_kingslim_fmas_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_fmas_valid.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the Kingslim sample's timing rides Track1)");
+  let doc2_ligo = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (the Kingslim LigoGPS fix)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (the FMAS sample's timing rides QuickTime, post-LigoGPS)",
+  );
+  let doc3_qt_lat = got.find("\"Doc3:QuickTime:GPSLatitude\"").expect(
+    "Doc3:QuickTime:GPSLatitude present (the DECODED FMAS fix rides QuickTime, NOT Track1)",
+  );
+
+  // The SET_GROUP1 flip must reach the DECODED fix: neither its timing NOR its GPS
+  // may ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\"") && !got.contains("\"Doc3:Track1:GPSLatitude\""),
+    "the post-LigoGPS FMAS fix (timing AND GPS) must ride QuickTime, not Track1 \
+     (SET_GROUP1 was deleted by the preceding Kingslim ProcessLigoGPS)\n--- got ---\n{got}"
+  );
+  // Walk order: Kingslim timing → Kingslim LIGO → FMAS timing → FMAS GPS.
+  assert!(
+    doc1_track1_time < doc2_ligo && doc2_ligo < doc3_qt_time && doc3_qt_time < doc3_qt_lat,
+    "kingslim+valid-FMAS -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc3:QuickTime-GPS \
+     (got @{doc1_track1_time}/{doc2_ligo}/{doc3_qt_time}/{doc3_qt_lat})\n--- got ---\n{got}"
+  );
+}
+
+// ── #328 Finding 2: SET_GROUP1 clears only AFTER ProcessLigoGPS actually ran ──
+// A Kingslim Condition-match whose `ProcessLigoGPS` decodes NOTHING (the
+// `LIGOGPSINFO\0` block is present so it routes to `ProcessLigoGPS`, but the
+// record is unparseable), FOLLOWED BY a valid FMAS sample. ExifTool clears
+// `$$et{SET_GROUP1}` at LigoGPS.pm:266 — INSIDE `ParseLigoGPS`, only after a
+// record passes its guards and emits — so a no-output Kingslim match leaves the
+// key active AND consumes NO LigoGPS `Doc<N>`. Ground-truth bundled ExifTool
+// 13.59 `-ee -G3:1`: `Doc1:Track1`-timing (the Kingslim sample's timing only),
+// then the FMAS sample at `Doc2:Track1`-timing + `Doc2:Track1` GPS — NOT `Doc3`,
+// NOT `QuickTime`. Proves exifast flips `set_group1_cleared` only when LigoGPS
+// emitted (`ligo_emitted`), not merely when the Kingslim Condition matched.
+#[test]
+fn kingslim_gpmd_match_no_ligogps_keeps_track_group_byte_exact() {
+  check_ee(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.ee.g3.json",
+    true,
+  );
+  check_ee(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.ee.json",
+    false,
+  );
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER + GROUP guard for the Finding-2 `-ee -G3` emission: a Kingslim
+/// Condition-match with NO LigoGPS output must (a) consume only its timing
+/// `Doc1` (NO LigoGPS doc — so no `Doc2:LIGO`), and (b) leave `$$et{SET_GROUP1}`
+/// active, so the FOLLOWING FMAS sample is `Doc2:Track1` (timing AND GPS), NOT a
+/// `QuickTime`-flipped `Doc3`. Asserts the raw document directly because the
+/// strict comparator is key-order-insensitive.
+#[test]
+fn kingslim_gpmd_match_no_ligogps_g3_no_flip_no_extra_doc() {
+  let data = fixture("QuickTime_gpmd_kingslim_noligo_fmas.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_noligo_fmas.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the Kingslim sample's timing, no LigoGPS fix)");
+  let doc2_track1_gps = got.find("\"Doc2:Track1:GPSLatitude\"").expect(
+    "Doc2:Track1:GPSLatitude present (the FMAS fix is Doc2 — no LigoGPS doc consumed — \
+     and rides Track1 because SET_GROUP1 was NOT cleared)",
+  );
+
+  // No LigoGPS doc was consumed (the match produced no fix): there is no
+  // `Doc2:LIGO`, and the FMAS fix is Doc2, not Doc3.
+  assert!(
+    !got.contains(":LIGO:"),
+    "a Kingslim Condition-match with no LigoGPS output must emit NO LIGO record\n\
+     --- got ---\n{got}"
+  );
+  assert!(
+    !got.contains("\"Doc3:"),
+    "the FMAS sample must be Doc2 (the un-emitted LigoGPS consumed no doc), not Doc3\n\
+     --- got ---\n{got}"
+  );
+  // SET_GROUP1 stayed active: the FMAS fix must NOT ride QuickTime.
+  assert!(
+    !got.contains(":QuickTime:GPSLatitude") && !got.contains(":QuickTime:SampleTime"),
+    "SET_GROUP1 must stay active (no LigoGPS delete ran), so the FMAS fix rides \
+     Track1, not QuickTime\n--- got ---\n{got}"
+  );
+  assert!(
+    doc1_track1_time < doc2_track1_gps,
+    "walk order must be Doc1:Track1-timing < Doc2:Track1-GPS \
+     (got @{doc1_track1_time}/{doc2_track1_gps})\n--- got ---\n{got}"
   );
 }
 
@@ -1005,13 +1725,13 @@ fn sony_rtmd_coordzero_ee_byte_exact() {
     "QuickTime_sony_rtmd_coordzero.mov",
     "QuickTime_sony_rtmd_coordzero.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_coordzero.mov",
     "QuickTime_sony_rtmd_coordzero.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1108,13 +1828,13 @@ fn sony_rtmd_nonfinite_ee_byte_exact() {
     "QuickTime_sony_rtmd_nonfinite.mov",
     "QuickTime_sony_rtmd_nonfinite.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_nonfinite.mov",
     "QuickTime_sony_rtmd_nonfinite.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1479,13 +2199,13 @@ fn sony_rtmd_zerolen_ee_byte_exact() {
     "QuickTime_sony_rtmd_zerolen.mov",
     "QuickTime_sony_rtmd_zerolen.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_zerolen.mov",
     "QuickTime_sony_rtmd_zerolen.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_DEGEN_GPS_EXCL,
   );
 }
 
@@ -1564,13 +2284,13 @@ fn sony_rtmd_shortnum_ee_byte_exact() {
     "QuickTime_sony_rtmd_shortnum.mov",
     "QuickTime_sony_rtmd_shortnum.mov.ee.json",
     false,
-    NO_EXCL,
+    SONY_RTMD_SHORTNUM_EXCL,
   );
   check_ee_excluding(
     "QuickTime_sony_rtmd_shortnum.mov",
     "QuickTime_sony_rtmd_shortnum.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    SONY_RTMD_SHORTNUM_EXCL,
   );
 }
 
@@ -2085,13 +2805,13 @@ fn canon_ctmd_exifinfo_redispatch_byte_exact() {
     "QuickTime_canon_ctmd_exifinfo.mov",
     "QuickTime_canon_ctmd_exifinfo.mov.ee.json",
     false,
-    NO_EXCL,
+    CANON_CTMD_EXIFINFO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_canon_ctmd_exifinfo.mov",
     "QuickTime_canon_ctmd_exifinfo.mov.ee.g3.json",
     true,
-    NO_EXCL,
+    CANON_CTMD_EXIFINFO_EXCL,
   );
 }
 
@@ -2160,6 +2880,17 @@ const CR3_CTMD_EXCL: &[&str] = &[
   "ChromaticAberrationSetting",
   "DistortionCorrectionSetting",
   "DigitalLensOptimizerSetting",
+  // #133 PR 5: the MakerNote-DERIVED Canon Composites bundled synthesizes from
+  // the CTMD MakerNote sub-tables (`Composite:LensID` + the Canon flash/drive
+  // bitfield composites) are UNPORTED — exifast emits none, so they are dropped
+  // (the same by-name MakerNote-Composite deferral the still Canon goldens take).
+  "LensID",
+  "ConditionalFEC",
+  "DriveMode",
+  "FlashType",
+  "RedEyeReduction",
+  "ShootingMode",
+  "ShutterCurtainHack",
 ];
 
 // REAL Canon CR3 (`CanonRaw_ctmd.cr3`, a minimal CRX still-RAW), the #81 phase-2
@@ -3556,6 +4287,46 @@ fn insta360_doc_entries(
   (entries, docs)
 }
 
+/// Filter a `-ee -G3:1 -j` document to its `Doc<N>:Track3:SampleTime` /
+/// `Doc<N>:Track3:SampleDuration` rows (the timed-`text` track's per-sample
+/// timing), preserving DUPLICATE keys + source order. These are the rows
+/// `FoundSomething` (QuickTimeStream.pl:1473) emits for EVERY `text` sample
+/// BEFORE `Process_text` — including the Insta360 `.insv`'s 469 BINARY text
+/// samples that decode to no `Text`/GPS (so the timing is the ONLY thing they
+/// emit). Their absence was the #104 masking finding: the dispatch opened the
+/// 469 `Doc<N>` (shifting the Insta360 records to `Doc470..`) but emitted no
+/// `Track3:SampleTime`/`SampleDuration`, so the oracle's `Doc1..469:Track3:*`
+/// timing was missing yet UNCHECKED (the stream test filtered `Insta360:*`
+/// only). The `text`-path [`crate::metadata::GpmdTimingOnly`] marker now emits
+/// them; this filter pins them byte-exact vs the UNCHANGED `.ee.g3.json` oracle.
+/// Returns the ordered `(full-key, raw-value-text)` pairs (duplicates kept).
+fn track3_timing_entries(doc: &str) -> Vec<(String, String)> {
+  let arr: Vec<&serde_json::value::RawValue> =
+    serde_json::from_str(doc).expect("valid -ee -G3 JSON document (single-object array)");
+  let first = arr
+    .first()
+    .expect("-ee -G3 document is a single-object array");
+  let OrderedEntries(pairs) =
+    serde_json::from_str(first.get()).expect("-ee -G3 first element is a JSON object");
+  let mut entries: Vec<(String, String)> = Vec::new();
+  for (k, v) in pairs {
+    let Some(rest) = k.strip_prefix("Doc") else {
+      continue;
+    };
+    let Some((num, name)) = rest.split_once(':') else {
+      continue;
+    };
+    if name != "Track3:SampleTime" && name != "Track3:SampleDuration" {
+      continue;
+    }
+    if num.parse::<u64>().is_err() {
+      continue;
+    }
+    entries.push((k.clone(), v.get().trim().to_string()));
+  }
+  entries
+}
+
 /// The `(first, last, distinct)` doc span of an Insta360 record stream's per-entry
 /// doc numbers (`insta360_doc_entries`'s second return, duplicates kept),
 /// asserting CONTIGUITY (an unbroken `Doc{first}..Doc{last}` run over the DISTINCT
@@ -3605,11 +4376,14 @@ fn insta360_entries_to_document(entries: &[(String, String)]) -> String {
 }
 
 /// The constant Insta360 `Doc<N>` offset: ExifTool numbers the trailer records
-/// `Doc470..` because the un-extracted 469-sample timed-`text` track occupies
-/// `Doc1..Doc469`; exifast (not extracting that track) emits the SAME records at
-/// `Doc1..`. STAGE 1 re-derives and asserts this offset from the raw doc numbers;
-/// STAGE 2 renumbers the exifast side UP by it so both sides share `Doc470..`.
-const INSTA360_DOC_OFFSET: u64 = 469;
+/// `Doc470..` because the 469-sample timed-`text` track (Track3) occupies
+/// `Doc1..Doc469` — `FoundSomething` opens a `Doc<N>` per text sample even though
+/// `Process_text` extracts nothing from them (they are binary, so no `Text` /
+/// GPS). Since #104/#102 wired the `text`-HandlerType dispatch, exifast now opens
+/// those same 469 docs, so its Insta360 records START at `Doc470` — ABSOLUTELY
+/// matching the oracle, so the offset is now ZERO. STAGE 1 re-derives + asserts
+/// it from the raw doc numbers (both sides `Doc470..`).
+const INSTA360_DOC_OFFSET: u64 = 0;
 
 // ── Insta360 OneRS REAL `.insv` — FULL `-ee -G3` timed-record stream ─────────
 // Pins the ENTIRE Insta360 timed-record stream the `-ee -G1` view collapses:
@@ -3647,18 +4421,28 @@ const INSTA360_DOC_OFFSET: u64 = 469;
 //       ExifTool — and a duplicate `Doc<N>:Insta360:*` key on EITHER side now
 //       fails the cardinality check (it is no longer collapsed pre-compare).
 //
-// The committed golden (`…ee.g3.insta360.json`) carries ExifTool's RAW
-// `Doc<N>:Insta360:*` keys (`Doc470..Doc21616`), so both sides go through the
-// identical filter + renumber (the golden with offset 0). It is NOT produced by
-// `gen_golden.sh` (whose raw `.ee.g3.json` also carries the un-extracted `Track3`
-// text-track samples at `Doc1..Doc469`); regenerate it by filtering that oracle
-// to the Insta360 records, preserving the raw doc numbers:
-//   ( cd tests/fixtures && LC_ALL=C TZ=UTC perl "$EXIFTOOL" -j -G3:1 -struct \
-//       -api QuickTimeUTC=1 --FileName --Directory --FileSize --FileModifyDate \
-//       --FileAccessDate --FileInodeChangeDate --FilePermissions -ee \
-//       QuickTime_insta360_real.insv ) \
-//     | jq -c '[ .[0] | with_entries(select(.key | test("^Doc[0-9]+:Insta360:"))) ]' \
-//     > tests/golden/QuickTime_insta360_real.insv.ee.g3.insta360.json
+// The oracle is the RAW `-ee -G3:1` golden `gen_golden.sh` already writes
+// (`…insv.ee.g3.json`, line 346: `perl "$EXIFTOOL" … -ee -G3:1 > $OUT_EE_G3`),
+// filtered IN-PROCESS by the DUPLICATE-PRESERVING `insta360_doc_entries`
+// (`OrderedEntries`) — NOT a separately-committed pre-filtered subset (#279).
+//
+// REGENERATION (deterministic + duplicate-preserving): re-run `gen_golden.sh`
+//   EE=1 EXCLUDE="…" tools/gen_golden.sh QuickTime_insta360_real.insv
+// and the `.ee.g3.json` rewrites byte-stable (`LC_ALL=C TZ=UTC perl exiftool`
+// emits its tag stream verbatim — no jq re-materialization). The earlier path
+// piped this oracle through `jq -c '[ .[0] | with_entries(select(…)) ]'` into a
+// `…ee.g3.insta360.json` golden, which was NOT deterministic: jq's `from_entries`
+// (and its very object PARSE) keeps only the LAST of any duplicate key, so a
+// future ExifTool emitting a repeated `Doc<N>:Insta360:*` tag would silently
+// collapse to one entry BEFORE the golden was written — masking the `%noDups`
+// regression class the in-test multiset compare exists to catch — and jq also
+// mangled the verbatim numeric lexemes (`545172.930` → `545172.93`). Filtering
+// the raw oracle here instead keeps every duplicate (and the verbatim token),
+// and the duplicate protection is now structural on BOTH the in-test AND the
+// oracle-refresh paths. `insta360_doc_entries` drops every non-`Doc<N>:Insta360:*`
+// key (the `Doc1..469:Track3:*` text-track timing rows STAGE 3 pins, plus the
+// family-1 identity/Parameters/Warning), so feeding it the full raw oracle yields
+// exactly the Insta360 record stream.
 #[test]
 fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   let data = fixture("QuickTime_insta360_real.insv");
@@ -3666,7 +4450,12 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
     .with_extract_embedded(true)
     .with_group3(true);
   let got_raw = extract_info_with_options("QuickTime_insta360_real.insv", &data, true, opts);
-  let want_raw = golden("QuickTime_insta360_real.insv.ee.g3.insta360.json");
+  // The single RAW `-ee -G3:1` oracle (`gen_golden.sh` output) — duplicate-keys
+  // and verbatim tokens intact; STAGE 1/2 filter its `Doc<N>:Insta360:*` records,
+  // STAGE 3 its `Doc<N>:Track3:*` timing rows, both via `insta360_doc_entries` /
+  // `track3_timing_entries` (duplicate-preserving), so neither stage depends on a
+  // jq-derived pre-filtered golden.
+  let want_raw = golden("QuickTime_insta360_real.insv.ee.g3.json");
 
   // Filter to `Doc<N>:Insta360:*` records via the DUPLICATE-PRESERVING ordered
   // parse; renumber the exifast side UP by the offset so both carry `Doc470..`.
@@ -3683,20 +4472,22 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   assert_eq!(
     (oracle_first, oracle_last, oracle_count),
     (470, 21616, 21147),
-    "raw-doc oracle golden must run exactly Doc470..Doc21616 (21 147 records); \
-     a manually-regenerated golden with a gap / wrong start fails here"
+    "raw-doc oracle (.ee.g3.json) must run exactly Doc470..Doc21616 (21 147 \
+     records); a regenerated oracle with a gap / wrong start fails here"
   );
   assert_eq!(
     (got_first, got_last, got_count),
-    (1, 21147, 21147),
-    "exifast -ee -G3 Insta360 records must run exactly Doc1..Doc21147 (21 147 \
-     records); a doc-shifted run (e.g. Doc2..Doc21148) fails here"
+    (470, 21616, 21147),
+    "exifast -ee -G3 Insta360 records must run exactly Doc470..Doc21616 (21 147 \
+     records); since the `text`-track dispatch (#104) opens the 469 Track3 docs, \
+     exifast now matches the oracle's ABSOLUTE numbering — a doc-shifted run fails"
   );
   assert_eq!(
     oracle_first - got_first,
     INSTA360_DOC_OFFSET,
-    "the constant Insta360 doc offset (un-extracted 469-sample text track) must \
-     be exactly 469: oracle_first {oracle_first} - got_first {got_first}"
+    "the Insta360 doc offset is now ZERO (exifast opens the 469-sample text-track \
+     docs too, matching the oracle): oracle_first {oracle_first} - got_first \
+     {got_first}"
   );
 
   // STAGE 2 — re-serialize both renumbered streams to RAW single-object-array
@@ -3709,7 +4500,38 @@ fn insta360_real_oners_insv_g3_full_stream_byte_exact() {
   if let Err(e) = json_equivalent_strict(&got, &want) {
     panic!(
       "QuickTime_insta360_real.insv (-ee -G3, Insta360 record stream, \
-       renumbered) vs QuickTime_insta360_real.insv.ee.g3.insta360.json: {}",
+       renumbered) vs QuickTime_insta360_real.insv.ee.g3.json: {}",
+      e.message()
+    );
+  }
+
+  // STAGE 3 — the timed-`text` track timing (#104 finding-1 unmasking). The
+  // 469 BINARY text samples (Track3) decode to no `Text`/GPS, so `FoundSomething`
+  // (QuickTimeStream.pl:1473) emits ONLY their `Doc<N>:Track3:SampleTime` /
+  // `SampleDuration` — which the `text`-path matched-but-empty marker now
+  // reproduces. Pin those rows byte-exact vs the RAW `.ee.g3.json` oracle (the
+  // same `want_raw` STAGE 1/2 filter — `gen_golden.sh` writes it carrying the
+  // `Track3` rows at `Doc1..Doc469`). The stream filter above drops every
+  // non-`Insta360` `Doc<N>` group, so without this stage the 469×2 timing rows
+  // would be UNVERIFIED (the original masking).
+  let got_t3 = track3_timing_entries(&got_raw);
+  let want_t3 = track3_timing_entries(&want_raw);
+  assert_eq!(
+    want_t3.len(),
+    469 * 2,
+    "the .ee.g3.json oracle must carry 469 Doc<N>:Track3:SampleTime + 469 \
+     SampleDuration rows (the 469 binary text samples' FoundSomething timing)"
+  );
+  // The `Track3` timing rows ride `Doc1..Doc469` on BOTH sides (exifast opens the
+  // same docs; offset 0), so compare verbatim — no renumber. The
+  // duplicate-preserving re-serialize + strict comparator pins the count, the
+  // full `Doc<N>` key set, AND every `SampleTime`/`SampleDuration` value.
+  let got_t3_doc = insta360_entries_to_document(&got_t3);
+  let want_t3_doc = insta360_entries_to_document(&want_t3);
+  if let Err(e) = json_equivalent_strict(&got_t3_doc, &want_t3_doc) {
+    panic!(
+      "QuickTime_insta360_real.insv (-ee -G3, Track3 text-track timing, \
+       Doc1..Doc469) vs QuickTime_insta360_real.insv.ee.g3.json: {}",
       e.message()
     );
   }
@@ -3762,6 +4584,59 @@ fn insta360_full_stream_rejects_duplicate_doc_key() {
     "the failure must be the object-key MULTISET check (the structural \
      duplicate-key guard), got: {}",
     msg.message()
+  );
+}
+
+// The SYMMETRIC half of the #279 fix: a DUPLICATE `Doc<N>:Insta360:*` key on the
+// ORACLE (golden) side must SURVIVE the in-process filter and stay significant —
+// the protection now covers the oracle-refresh path, not just the exifast side.
+// The old regeneration piped the raw oracle through `jq … with_entries(…)`, whose
+// `from_entries` (and jq's object PARSE itself) keeps only the LAST of a repeated
+// key, so a golden-side duplicate would have been COLLAPSED before the file was
+// written; the in-test negative `insta360_full_stream_rejects_duplicate_doc_key`
+// only exercised an exifast-side dup, leaving the oracle path unguarded.
+// `insta360_doc_entries` filters the raw `.ee.g3.json` oracle directly via the
+// duplicate-preserving `OrderedEntries`, so a golden-side repeat is KEPT — proven
+// here by feeding the comparator a golden with a duplicated record and a clean
+// (single-record) exifast side: the parse keeps both golden copies and the strict
+// multiset compare FAILS the cardinality, exactly as it must against a faithful
+// duplicate-preserving oracle (it would have read EQUAL through the jq path).
+#[test]
+fn insta360_full_stream_oracle_duplicate_doc_key_is_significant() {
+  // Oracle side: the SAME record emitted TWICE (what a future `%noDups`-emitting
+  // ExifTool could write into the raw `.ee.g3.json` oracle; `gen_golden.sh` writes
+  // perl's stdout verbatim, so both copies land on disk — no jq collapse).
+  let want_raw =
+    r#"[{"Doc470:Insta360:TimeCode":534773.966,"Doc470:Insta360:TimeCode":534773.966}]"#;
+  // exifast side: ONE clean record (the non-duplicated truth).
+  let got_raw = r#"[{"Doc470:Insta360:TimeCode":534773.966}]"#;
+
+  let (got_entries, _got_docs) = insta360_doc_entries(got_raw, "got", 0);
+  let (want_entries, want_docs) = insta360_doc_entries(want_raw, "oracle", 0);
+
+  // The duplicate-preserving filter must KEEP both ORACLE copies — the jq
+  // `with_entries` refresh path would have collapsed them to one here, masking
+  // the divergence and making the comparison read EQUAL.
+  assert_eq!(
+    want_docs.len(),
+    2,
+    "duplicate-preserving filter must keep BOTH oracle Doc470 entries (the old jq \
+     `with_entries` refresh path would have collapsed them to 1)"
+  );
+
+  let got = insta360_entries_to_document(&got_entries);
+  let want = insta360_entries_to_document(&want_entries);
+  let res = json_equivalent_strict(&got, &want);
+  assert!(
+    res.is_err(),
+    "a duplicate Doc470:Insta360:TimeCode on the ORACLE side MUST stay significant \
+     and fail the strict comparison against a non-duplicated exifast side, not be \
+     silently collapsed by the refresh path"
+  );
+  assert!(
+    res.unwrap_err().message().contains("multiset differs"),
+    "the failure must be the object-key MULTISET check (the structural \
+     duplicate-key guard on the oracle side)"
   );
 }
 

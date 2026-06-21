@@ -43,5 +43,9 @@
   "Track1:MediaLanguageCode": "und",
   "Track1:HandlerClass": "mhlr",
   "Track1:HandlerType": "vide",
-  "Keys:CreationDate": "\u0001\u0002\u0003\u0004"
+  "Keys:CreationDate": "\u0001\u0002\u0003\u0004",
+  "Composite:ImageSize": "1920 1080",
+  "Composite:Megapixels": 2.0736,
+  "Composite:AvgBitrate": 2,
+  "Composite:Rotation": 0
 }]

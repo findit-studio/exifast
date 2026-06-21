@@ -2499,6 +2499,20 @@ impl QuickTimeUserData {
   /// Merge a value into a multi-source [`PriorityValue`] slot per ExifTool's
   /// duplicate-tag rule: a priority-1 value always overwrites; a priority-0
   /// (`Avoid`) value only fills an empty slot (see [`PriorityValue`]).
+  ///
+  /// This is a DIFFERENT dedup surface from the `(group, name)` tag-stream
+  /// FoundTag dedup the shared [`crate::tagmap::effective_priority`] /
+  /// [`crate::tagmap::dedup_override`] helpers govern: it selects WHICH SOURCE
+  /// ATOM wins for one TYPED [`MediaMetadata`](crate::metadata::MediaMetadata)
+  /// field (Make/Model/SerialNumber/FirmwareVersion — each fed by several
+  /// distinct `udta` atoms), not which value survives in the rendered tag list.
+  /// The field names are FIXED camera identifiers, never `Warning`/`Error`, so
+  /// the effective-priority NAME coercion is meaningless here. Its NON-empty
+  /// branch nonetheless coincides exactly with [`crate::tagmap::dedup_override`]
+  /// (`priority >= 1` ≡ `priority != 0 && priority >= stored` for `priority`,
+  /// `stored` ∈ `{0, 1}`); the `None => true` empty-fill is the typed analogue of
+  /// the tag sinks' "new key ⇒ push" branch. Kept on this typed-domain shape
+  /// (`Option<PriorityValue>`) by design — it is NOT a tag-collection collapse.
   #[inline(always)]
   fn merge_priority(slot: &mut Option<PriorityValue>, value: String, priority: u8) {
     let replace = match slot {
@@ -2910,8 +2924,17 @@ pub struct QuickTimeMeta {
   /// `mvhd` NextTrackID (QuickTime.pm:1420).
   next_track_id: Option<u32>,
   /// `mdat-size` MediaDataSize — the `mdat` payload byte count
-  /// (QuickTime.pm:689-696 + 10158-10160).
+  /// (QuickTime.pm:689-696 + 10158-10160). Last-wins (the VISIBLE tag value, as
+  /// ExifTool's `-G1` render keeps), so a multi-`mdat` file shows the LAST size.
   media_data_size: Option<u64>,
+  /// The SUM of EVERY `mdat` payload size seen (each `set_media_data_size` adds
+  /// to this running total). `Composite:AvgBitrate`'s RawConv reads `$val[0]`
+  /// (the first MediaDataSize) then `NextTagKey`-loops to add the rest
+  /// (QuickTime.pm:8649-8662) — i.e. the SUM of all `mdat` sizes — while the
+  /// emitted `MediaDataSize` tag stays the single (last-wins) per-`mdat` value.
+  /// The dedup-collapsing `TagMap` cannot preserve the duplicates, so the
+  /// pre-summed total is threaded into the composite post-pass instead.
+  media_data_total: Option<u64>,
   /// `mdat-offset` MediaDataOffset — the absolute file offset of the `mdat`
   /// payload (QuickTime.pm:697-700 + 10160).
   media_data_offset: Option<u64>,
@@ -2972,6 +2995,7 @@ impl QuickTimeMeta {
       current_time_count: None,
       next_track_id: None,
       media_data_size: None,
+      media_data_total: None,
       media_data_offset: None,
       kodak_frea: KodakFrea::new(),
       tracks: Vec::new(),
@@ -3283,11 +3307,30 @@ impl QuickTimeMeta {
     self
   }
 
-  /// Assign the raw MediaDataSize wrapper.
+  /// Assign the raw MediaDataSize wrapper (the VISIBLE last-wins per-`mdat` tag)
+  /// AND fold it into the running [`media_data_total`](Self::media_data_total)
+  /// (the SUM `Composite:AvgBitrate` needs — QuickTime.pm:8649). A `Some(sz)`
+  /// adds `sz` to the total (saturating); a `None` clears the visible value but
+  /// leaves the total (no production caller passes `None`).
   #[inline(always)]
   pub const fn set_media_data_size(&mut self, v: Option<u64>) -> &mut Self {
     self.media_data_size = v;
+    if let Some(sz) = v {
+      self.media_data_total = Some(match self.media_data_total {
+        Some(t) => t.saturating_add(sz),
+        None => sz,
+      });
+    }
     self
+  }
+
+  /// The SUM of every `mdat` payload size (`Composite:AvgBitrate`'s
+  /// `NextTagKey`-summed `$val[0]`, QuickTime.pm:8649-8662). `None` when no
+  /// `mdat` was seen.
+  #[inline(always)]
+  #[must_use]
+  pub const fn media_data_total(&self) -> Option<u64> {
+    self.media_data_total
   }
 
   /// Assign the raw MediaDataOffset wrapper.

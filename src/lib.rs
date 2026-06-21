@@ -84,6 +84,12 @@ extern crate std;
 pub mod bitstream;
 pub mod charset;
 pub mod convert;
+// The generic ExifTool Composite-tag engine (`BuildCompositeTags`): a
+// standalone post-`run_emission` pass that derives `Composite:*` tags from the
+// final emitted tag set. `alloc`-gated to match `tagmap` (the engine's sink);
+// the canonical `ConvertDuration` (`composite::convs`) is the single source the
+// cross-format duration callers alias.
+pub mod composite;
 pub mod datetime;
 // The format-agnostic emission framework (`Taggable` + the `run_emission`
 // engine + `ConvMode`/`EmittedTag`): the single place the cross-cutting
@@ -941,6 +947,29 @@ mod tests {
     assert_eq!(camera.make(), Some("Canon"));
     // Sanity that the projection is the full EXIF+MakerNote one (not empty).
     assert!(camera.model().is_some_and(|m| m.starts_with("Canon EOS")));
+  }
+
+  /// `media_metadata` over a still with an EXIF `Orientation` projects it onto
+  /// `MediaInfo::orientation` (the domain field a consumer reads to orient a
+  /// decoded thumbnail). `Pentax.jpg`'s IFD0 `Orientation` is `8`
+  /// ("Rotate 270 CW") per the bundled `-n` golden, so the normalized
+  /// orientation is 270° CW, un-mirrored.
+  #[test]
+  #[cfg(all(feature = "exif", feature = "std"))]
+  fn media_metadata_still_projects_exif_orientation() {
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Pentax.jpg"
+    ))
+    .expect("read Pentax.jpg fixture");
+    let md = media_metadata(&bytes).expect("Pentax JPEG projects to Some(MediaMetadata)");
+    let o = md
+      .media()
+      .orientation()
+      .expect("the still's EXIF Orientation projects onto MediaInfo");
+    assert_eq!(o.exif_value(), 8); // IFD0:Orientation == 8 in the golden
+    assert_eq!(o.rotation_degrees(), 270);
+    assert!(!o.mirrored());
   }
 
   /// `media_metadata` over the real Sony rtmd timed-metadata fixtures projects

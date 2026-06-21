@@ -485,6 +485,48 @@ impl RawValue {
     }
   }
 
+  /// EVERY SubIFD offset in a `ProcessBigIFD` `$$tagInfo{SubIFD}` pointer —
+  /// the faithful port of `my @offsets = split ' ', $val` (`BigTIFF.pm:184`).
+  ///
+  /// `ProcessBigIFD` does NOT gate the pointer on an integer on-disk format
+  /// (there is no `%intFormat` `Wrong format` check, unlike `ProcessExif` at
+  /// `Exif.pm:6747`): it `ReadValue`s the pointer with whatever format the
+  /// entry declares, takes the resulting `$val` STRING, `split ' '`s it, and
+  /// recurses each token as an IFD start. So this iterates the SAME string
+  /// form `ReadValue` produces ([`Self::raw_conv_val_string`] — `join(' ',
+  /// @vals)` for the numeric shapes, the decoded text for `string`/`undef`),
+  /// splits on whitespace runs exactly as Perl's `split ' '` does (leading
+  /// whitespace stripped, no empty leading field), and coerces each token to
+  /// an integer offset the way Perl numifies a string used as
+  /// `Start => $offsets[$i]` (see [`perl_int_prefix`] for the IV/UV-vs-NV
+  /// boundary): a WHOLLY-integer token (`^[+-]?[0-9]+$`) that fits `u64` is
+  /// parsed on an EXACT checked `u64` path (byte-exact across BigTIFF's full
+  /// 64-bit surface — an offset above `2^53` does NOT round-trip through `f64`);
+  /// EVERY other token (trailing junk after a digit run, a fraction/exponent, a
+  /// clean digit run `> u64::MAX`, or a non-finite spelling) goes through the
+  /// `f64` grammar (`"1e3"` -> 1000, `"12abc"` -> 12, `"abc"` -> `Some(0)` — the
+  /// degenerate offset-0 recursion bundled also takes). A NEGATIVE, `> u64::MAX`,
+  /// or non-finite token -> [`None`] (skip — the `Bad SubDirectory start` /
+  /// failed-`Seek` analogue). This subsumes the
+  /// single-`int64u`/`ifd64` camera shape (`U64(vec![off])` -> one token -> one
+  /// offset, byte-identical to [`Self::first_subdir_offset`]) AND the count>1
+  /// (multiple offsets) / signed / ASCII-numeric shapes the first-only,
+  /// `U64`/`I64`-only `first_subdir_offset` dropped.
+  ///
+  /// The offsets are positional: index `i` -> the `$i`-suffixed family-1
+  /// group `$$tagInfo{Name}` + `$i` (`BigTIFF.pm:187-188`); a `None` entry is a
+  /// skipped offset that STILL consumes its `$i` slot (so the next offset keeps
+  /// the correct `$i+1` suffix — the Perl `for ($i...)` index advances
+  /// regardless).
+  #[must_use]
+  pub fn subdir_offsets(&self) -> std::vec::Vec<Option<u64>> {
+    self
+      .raw_conv_val_string()
+      .split_whitespace()
+      .map(perl_int_prefix)
+      .collect()
+  }
+
   /// The first scalar integer (signed) — works for `U64`/`I64`. The dominant
   /// Apple maker-note shape (most tags are scalar int32s); the Apple PrintConv
   /// and typed-population paths read it directly from the decoded `$val`.
@@ -644,6 +686,169 @@ fn join_display<T: core::fmt::Display>(s: &mut std::string::String, vals: &[T]) 
     }
     let _ = write!(s, "{v}");
   }
+}
+
+/// Perl numeric coercion of one whitespace-stripped `split ' '` token to an
+/// integer offset (`Start => $offsets[$i]`, `BigTIFF.pm:192`).
+///
+/// `ProcessBigIFD` uses the token in Perl numeric context (`$$dirInfo{DirStart}
+/// = $offsets[$i]` then `Seek`), so the coercion is Perl's FULL string→number
+/// grammar, NOT just a leading decimal-digit run: an optional sign, the leading
+/// numeric run including a fraction AND an exponent, the rest ignored. Verified
+/// against bundled Perl 5 / ExifTool 13.59 (`0 + $val`): `"1e3"` → 1000,
+/// `"1.9e2"` → 190, `"12abc"` → 12, `"abc"` → 0, `"-1e2"` → -100. A crafted
+/// BigTIFF whose GPSInfo (0x8825) SubIFD pointer is the ASCII string `"1e3"`
+/// makes bundled recurse the child IFD at byte **1000** (emitting the child's
+/// `GPSInfo:InteropIndex`/`InteropVersion`), NOT byte 1 — so a digit-prefix-only
+/// reader would drop the child tags. [`crate::convert::perl_str_to_f64`] (the
+/// `#133` Composite-engine port of that same grammar) supplies the coercion;
+/// this truncates the `f64` toward zero (`int()` / the offset cast: `1000.0` →
+/// 1000, `190.0` → 190, `-1.9e2` = `-190.0` → -190).
+///
+/// A non-finite coercion (`"inf"`/`"nan"` → `±Inf`/`NaN`) describes no seekable
+/// directory — `ProcessBigIFD`'s `ReadValue`/`Seek` would yield no valid start —
+/// so it is mapped to [`None`] (skip), exactly as a negative or oversized finite
+/// offset is skipped. A token with no leading numeric run yields 0 (Perl's `0 +
+/// "abc"`): bundled then recurses at byte 0 (the header) — a degenerate but real
+/// recursion (ground-truthed: it reads the header as a directory count, hence a
+/// content-dependent `Huge directory counts` warning, NOT a skip), so `"abc"` →
+/// `Some(0)`. The caller has already split on whitespace, so `tok` carries no
+/// surrounding spaces.
+///
+/// # IV/UV-vs-NV dispatch (the precision-faithful core)
+///
+/// BigTIFF is the 64-bit-offset format, so a pointer token can span the FULL
+/// `u64` surface, and an `f64` round-trip loses precision above `2^53`
+/// (`int(0 + '9007199254740993')` is `9007199254740993` on a 64-bit Perl, but
+/// the `f64` path yields `9007199254740992` — off by one, recursing the wrong
+/// byte). Perl's `grok_number`/`my_atof` does NOT go through `NV` for a scalar
+/// whose WHOLE spelling is a clean 64-bit-fitting integer; it keeps the exact
+/// `IV`/`UV`. So this mirrors that one boundary PER TOKEN, with no second
+/// approximation of where integer ends and float begins:
+///   - the EXACT checked-`u64` path is taken **iff the WHOLE token is a clean
+///     Perl integer spelling** — `^[+-]?[0-9]+$`, an optional single sign then
+///     one-or-more digits then END-OF-TOKEN — AND the magnitude fits `u64`. A
+///     non-negative magnitude is the seek offset; a NEGATIVE one (Perl
+///     `0 + "-5" == -5`, then ExifTool's `$subdirStart < 0 → Bad SubDirectory
+///     start`, `Exif.pm:7017`) skips → [`None`];
+///   - EVERY other token routes through [`crate::convert::perl_str_to_f64`] (the
+///     `#133` Composite-engine port of Perl `my_atof`) → truncate toward zero
+///     (`int()`) → range-check `[0, 2^64)` (out-of-range or non-finite → skip).
+///     This is exactly the set Perl's integer fast-path does NOT accept wholly,
+///     so Perl falls to `NV`: trailing junk after a digit run (`"9007199254740993abc"`
+///     → `0 + …` is `9.0072e15` → `int` `…992`, NOT the exact `u64` of the
+///     `…993` digit run; `"12abc"` → 12); a fraction/exponent (`"1.9e2"` → 190,
+///     `"1e3"` → 1000); an MSVCRT non-finite spelling (`"1#INF"`/`"1#IND"`/
+///     `"1#QNAN"` → ±Inf/NaN → skip) or a malformed one (`"1#IN"` → 1); a clean
+///     all-digit magnitude `> u64::MAX` (`"18446744073709551616"` → an `NV`
+///     `1.84e19` → out of range → skip); and an empty / sign-only token.
+///
+/// Verified against bundled Perl 5 / ExifTool 13.59 (`0 + $val`, `int(0 + $val)`):
+/// `"9007199254740993"` → 9007199254740993 (EXACT, not `…992`);
+/// `"9007199254740993abc"` → `…992` (NV path); `"18446744073709551615"`
+/// (`u64::MAX`) → exact; `"18446744073709551616"` / `"99999999999999999999"`
+/// (> `u64::MAX`) → an `NV` float → skip; `"1e3"` → 1000; `"1.9e2"` → 190;
+/// `"12abc"` → 12; `"abc"` → 0; `"1#INF"` / `"1#IND"` / `"1#QNAN"` → skip;
+/// `"1#IN"` → 1; `"-1e2"` → -100 (negative → skip); `"-5"` → skip. A crafted
+/// BigTIFF whose GPSInfo (0x8825) SubIFD pointer is the ASCII string `"1e3"`
+/// makes bundled recurse the child IFD at byte **1000** (emitting the child's
+/// `GPSInfo:InteropIndex`/`InteropVersion`), NOT byte 1.
+///
+/// The returned [`u64`] is the byte offset to seek; the walker's EOF bound then
+/// rejects an in-`u64`-but-past-end offset (the seek-fails-→-no-directory skip).
+fn perl_int_prefix(tok: &str) -> Option<u64> {
+  if let Some(parsed) = perl_integer_offset(tok) {
+    // Wholly-integer (`^[+-]?[0-9]+$`) fast path: exact, no `f64`. `Some(off)` =
+    // a non-negative `≤ u64::MAX` offset; `None` = a negative magnitude (skip).
+    return parsed;
+  }
+  // EVERY not-wholly-integer token (trailing junk, fraction/exponent, non-finite
+  // spelling, or a clean digit run `> u64::MAX`) goes through the one faithful
+  // `f64` grammar — the single boundary, no second approximation.
+  let f = crate::convert::perl_str_to_f64(tok);
+  if !f.is_finite() {
+    return None; // `±Inf` / `NaN`: no in-range directory.
+  }
+  let t = f.trunc(); // `int()` — truncate toward zero.
+  // Range-check `[0, u64::MAX]` BEFORE recursing (do NOT saturate-then-seek): a
+  // negative or `> u64::MAX` truncated `f64` resolves to no physical offset.
+  // `u64::MAX as f64` rounds UP to `2^64`, so the strict `< 2^64` upper bound.
+  if !(0.0..TWO_POW_64).contains(&t) {
+    return None;
+  }
+  Some(t as u64)
+}
+
+/// `2^64` as an `f64` — the strict upper bound for a truncated-`f64` offset.
+/// `u64::MAX` (`2^64 - 1`) is not exactly representable in `f64` (it rounds to
+/// `2^64`), so a `≤ u64::MAX` test must compare `< 2^64`.
+const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Perl's integer fast-path for a SubIFD-offset token: `Some(Some(off))` when the
+/// token is INTEGER-shaped (Perl dual-sign + a leading decimal-digit run, no
+/// fraction/exponent/`#` joining the numeric prefix) AND parses to a non-negative
+/// `u64`; `Some(None)` when the token is a clean integer spelling but NEGATIVE
+/// (skip, `$subdirStart < 0`); [`None`] when the token is NOT a clean integer —
+/// trailing junk after a digit run, a fraction/exponent/non-finite spelling, OR
+/// a clean all-digit magnitude that EXCEEDS `u64::MAX` (Perl spills it to an
+/// `NV`) — all of which defer to [`crate::convert::perl_str_to_f64`].
+///
+/// This is the IV/UV-vs-NV boundary of Perl's `grok_number`/`my_atof`, mirrored
+/// EXACTLY: the exact-integer fast path is taken **iff the WHOLE token is a clean
+/// Perl integer spelling** — an optional single sign then one-or-more ASCII
+/// digits then END-OF-TOKEN, i.e. the regex `^[+-]?[0-9]+$` with nothing
+/// trailing — AND the magnitude fits `u64`. A scalar of that shape stays an exact
+/// 64-bit `IV`/`UV` in Perl (no `NV` round-trip), so an offset above `2^53` is
+/// byte-exact. Anything else is what Perl's integer fast-path does NOT accept
+/// wholly, so Perl falls to `my_atof`/`NV`:
+///   - trailing junk after the digits (`"9007199254740993abc"`, `"12abc"`) —
+///     Perl numifies the leading run as a float (`0 + "9007199254740993abc"` is
+///     `9.0072e15`, `int` → `…992`, NOT `…993`);
+///   - a fraction or exponent (`"1.9e2"`, `"1e3"`);
+///   - an MSVCRT non-finite spelling (`"1#INF"`/`"1#IND"`/`"1#QNAN"`) or a
+///     malformed one (`"1#IN"` → Perl reads the integer `1`);
+///   - a clean all-digit magnitude `> u64::MAX` (`"18446744073709551616"`): Perl
+///     can't hold it in a `UV`, so it becomes an `NV` (`1.84e19`) — the `f64` arm
+///     then range-checks it out (`> 2^64`) and skips;
+///   - an empty or sign-only token (`""`, `"-"`).
+///
+/// Routing every not-wholly-integer token through the one faithful
+/// [`crate::convert::perl_str_to_f64`] (the `#133` Composite-engine port of Perl
+/// `my_atof`, which already mirrors the leading-numeric run, the dual-sign /
+/// inter-sign-whitespace grammar, and the MSVCRT non-finite recognition) leaves
+/// NO second approximation of the integer/float boundary to diverge.
+fn perl_integer_offset(tok: &str) -> Option<Option<u64>> {
+  let bytes = tok.as_bytes();
+  // Optional SINGLE leading sign, then the token must be ALL ASCII digits to its
+  // end (the `^[+-]?[0-9]+$` clean-integer spelling). A dual sign, inter-sign
+  // whitespace, trailing junk, a `.`/`e`/`#`, or an empty digit run all fail this
+  // and return `None` → the `f64` arm (Perl's `my_atof`/`NV`).
+  let (negative, mag_bytes) = match bytes.split_first() {
+    Some((&b'-', rest)) => (true, rest),
+    Some((&b'+', rest)) => (false, rest),
+    _ => (false, bytes),
+  };
+  if mag_bytes.is_empty() || !mag_bytes.iter().all(u8::is_ascii_digit) {
+    return None; // not a clean integer spelling → defer to the `f64` arm.
+  }
+  // A clean `^[+-]?[0-9]+$` token: parse the EXACT magnitude as `u64` (no `f64`).
+  // A magnitude `> u64::MAX` overflows the `parse` — Perl makes such a scalar an
+  // `NV`, so defer to the `f64` arm (`None`), which range-checks it out. The
+  // suffix slice is always in bounds (`mag_bytes` is the tail of `bytes`); the
+  // `?` is a total formality.
+  let mag_str = tok.get(tok.len() - mag_bytes.len()..)?;
+  let Ok(mag) = mag_str.parse::<u64>() else {
+    return None; // `> u64::MAX` magnitude → an `NV` → the `f64` arm.
+  };
+  if negative {
+    // Perl `0 + "-5" == -5`; ExifTool's `$subdirStart < 0` skips it. A `-0`
+    // (`mag == 0`) is `0`, a valid non-negative offset.
+    if mag == 0 {
+      return Some(Some(0));
+    }
+    return Some(None);
+  }
+  Some(Some(mag))
 }
 
 /// `numerator / denominator` as f64, `None` for a zero denominator — the
@@ -947,6 +1152,265 @@ mod tests {
       &*RawValue::Rational(vec![Rational::new(1, 2, 7), Rational::new(3, 1, 7)]).val_bytes(),
       b"0.5 3"
     );
+  }
+
+  /// #240 round 2 — `subdir_offsets` is the faithful `my @offsets = split ' ',
+  /// $val` (`BigTIFF.pm:184`) over the `$val` STRING form for EVERY shape, with
+  /// Perl numeric coercion per token. It must:
+  ///   - return EVERY offset of a count>1 numeric pointer (not just the first);
+  ///   - numify an ASCII-numeric `string`/`undef` pointer (the case
+  ///     `first_subdir_offset` dropped as a non-`U64`/`I64` shape);
+  ///   - match `first_subdir_offset` for the single-offset camera shape.
+  #[test]
+  fn subdir_offsets_splits_every_token_and_ascii() {
+    // count>1 LONG8 → both offsets, in order.
+    assert_eq!(
+      RawValue::U64(vec![88, 124]).subdir_offsets(),
+      vec![Some(88), Some(124)]
+    );
+    assert_eq!(
+      RawValue::U64(vec![96, 132, 168]).subdir_offsets(),
+      vec![Some(96), Some(132), Some(168)]
+    );
+    // signed shape → a negative offset is SKIPPED (`None`), the `Bad SubDirectory
+    // start` analogue (`$subdirStart < 0`); the positive sibling keeps its slot.
+    assert_eq!(
+      RawValue::I64(vec![-5, 7]).subdir_offsets(),
+      vec![None, Some(7)]
+    );
+    // ASCII single "72" → one offset 72 (the `RawValue::Text` case
+    // `first_subdir_offset` returned `None` for).
+    let ascii = RawValue::Text {
+      text: "72".into(),
+      raw: b"72"[..].into(),
+    };
+    assert_eq!(ascii.subdir_offsets(), vec![Some(72)]);
+    assert!(
+      ascii.first_subdir_offset().is_none(),
+      "the old extractor drops an ASCII pointer"
+    );
+    // ASCII multi-token "88 124" → split on whitespace → two offsets.
+    let ascii_multi = RawValue::Text {
+      text: "88 124".into(),
+      raw: b"88 124"[..].into(),
+    };
+    assert_eq!(ascii_multi.subdir_offsets(), vec![Some(88), Some(124)]);
+    // Perl numeric coercion of degenerate tokens: leading-numeric prefix
+    // (`"72abc"` → 72), leading whitespace stripped (`" 72"` → 72), no leading
+    // digits → 0 (`"abc"` → 0, the degenerate offset-0 recursion bundled takes).
+    let junk = RawValue::Text {
+      text: "72abc".into(),
+      raw: b"72abc"[..].into(),
+    };
+    assert_eq!(junk.subdir_offsets(), vec![Some(72)]);
+    let lead_space = RawValue::Text {
+      text: " 72".into(),
+      raw: b" 72"[..].into(),
+    };
+    assert_eq!(lead_space.subdir_offsets(), vec![Some(72)]);
+    let nonnum = RawValue::Text {
+      text: "abc".into(),
+      raw: b"abc"[..].into(),
+    };
+    assert_eq!(nonnum.subdir_offsets(), vec![Some(0)]);
+    // ASCII exponent/fraction token — the Perl numeric grammar (`0 + "1e3" ==
+    // 1000`), the class the digit-prefix-only reader mis-coerced to 1. Ground-
+    // truthed: bundled recurses the child IFD at byte 1000 (not byte 1).
+    let exp = RawValue::Text {
+      text: "1e3".into(),
+      raw: b"1e3"[..].into(),
+    };
+    assert_eq!(exp.subdir_offsets(), vec![Some(1000)]);
+    let exp_multi = RawValue::Text {
+      text: "1e3 1.9e2".into(),
+      raw: b"1e3 1.9e2"[..].into(),
+    };
+    assert_eq!(exp_multi.subdir_offsets(), vec![Some(1000), Some(190)]);
+    // #240 R4 boundary, end-to-end: a trailing-junk token whose digit run
+    // exceeds `2^53` numifies via the `f64`/NV path (`…992`), NOT the exact `u64`
+    // of the leading digits (`…993`). Paired with a clean integer token (which
+    // stays exact) and a `1#INF` non-finite (skipped) in one `split ' '` value.
+    let boundary = RawValue::Text {
+      text: "9007199254740993abc 9007199254740993 1#INF".into(),
+      raw: b"9007199254740993abc 9007199254740993 1#INF"[..].into(),
+    };
+    assert_eq!(
+      boundary.subdir_offsets(),
+      vec![
+        Some(9_007_199_254_740_992),
+        Some(9_007_199_254_740_993),
+        None
+      ],
+      "trailing junk → f64 (…992); clean integer → exact (…993); 1#INF → skip"
+    );
+    // Single-offset numeric → identical to `first_subdir_offset` (modulo the
+    // `Some`-wrap; `first_subdir_offset` is `i64`, `subdir_offsets` a `u64`
+    // offset).
+    let single = RawValue::U64(vec![112]);
+    assert_eq!(single.subdir_offsets(), vec![Some(112)]);
+    assert_eq!(single.first_subdir_offset(), Some(112));
+  }
+
+  /// `perl_int_prefix` coerces one `split ' '` token to an offset the way Perl
+  /// numifies a string used as `Start => $offsets[$i]`, mirroring Perl
+  /// `grok_number`'s IV/UV-vs-NV boundary EXACTLY: the exact checked-`u64` path
+  /// is taken IFF the WHOLE token is a clean Perl integer spelling
+  /// (`^[+-]?[0-9]+$`) that fits `u64` (byte-exact across the full 64-bit
+  /// surface, NO `f64` above `2^53`); a non-negative magnitude is the offset, a
+  /// negative one skips. EVERY other token — trailing junk after a digit run, a
+  /// fraction/exponent, an MSVCRT non-finite spelling, OR a clean digit run that
+  /// exceeds `u64::MAX` (Perl spills it to an `NV`) — routes through the one
+  /// faithful `perl_str_to_f64` (truncate toward zero, range-check `[0, 2^64)`,
+  /// non-finite → skip). Every value is ground-truthed against bundled Perl 5 /
+  /// ExifTool 13.59 (`0 + $val` and `int(0 + $val)`).
+  #[test]
+  fn perl_int_prefix_numifies_like_perl() {
+    assert_eq!(perl_int_prefix("72"), Some(72)); // clean integer → exact path
+    assert_eq!(perl_int_prefix("72abc"), Some(72)); // trailing junk → f64 → 72.0
+    assert_eq!(perl_int_prefix("abc"), Some(0)); // no leading numeric run → f64 → 0
+    assert_eq!(perl_int_prefix(""), Some(0)); // empty → f64 → 0
+    // A negative offset is SKIPPED (`$subdirStart < 0 → Bad SubDirectory start`),
+    // not carried as a signed value.
+    assert_eq!(perl_int_prefix("-5"), None);
+    assert_eq!(perl_int_prefix("+5"), Some(5)); // clean signed integer → exact path
+    assert_eq!(perl_int_prefix("0"), Some(0));
+    assert_eq!(perl_int_prefix("-0"), Some(0)); // `0 + "-0" == 0` → a valid offset
+    assert_eq!(perl_int_prefix("007"), Some(7)); // leading zeros
+    // Exponent / fraction forms — Perl numeric context, the class #240 R1/R2
+    // fixed (`0 + "1e3" == 1000`, NOT the digit-prefix-only `1`). These are NOT
+    // clean integer spellings, so they route through the `f64` arm; truncated
+    // toward zero, then range-checked `[0, u64::MAX]`.
+    assert_eq!(perl_int_prefix("1e3"), Some(1000)); // 0 + "1e3" == 1000
+    assert_eq!(perl_int_prefix("1.9e2"), Some(190)); // 1.9e2 == 190.0 → 190
+    assert_eq!(perl_int_prefix("1.5e2"), Some(150)); // 150.0 → 150
+    assert_eq!(perl_int_prefix("-1e2"), None); // -100.0 < 0 → skip
+    assert_eq!(perl_int_prefix("12abc"), Some(12)); // trailing junk → f64 → 12.0
+    assert_eq!(perl_int_prefix("3.9"), Some(3)); // truncate toward zero, not round
+    assert_eq!(perl_int_prefix("-3.9"), None); // -3.9 < 0 → skip
+    // `"12e"` / `"12e+"` — an `e` with no power digit is NOT an exponent; the
+    // token is not a clean integer either (the `e`), so it routes through the
+    // `f64` arm, where `perl_str_to_f64` reads the `12` mantissa → 12.0.
+    assert_eq!(perl_int_prefix("12e"), Some(12));
+    assert_eq!(perl_int_prefix("12e+"), Some(12));
+    // A non-finite coercion (no seekable directory) → skip.
+    assert_eq!(perl_int_prefix("inf"), None);
+    assert_eq!(perl_int_prefix("nan"), None);
+    assert_eq!(perl_int_prefix("-inf"), None);
+
+    // ---- THE PRECISION CASE (#240 R3 finding) ----------------------------
+    // A CLEAN integer offset ABOVE `2^53` must be EXACT via the wholly-integer
+    // path — it must NOT round-trip through `f64` (which would yield `…992`, off
+    // by one, recursing the wrong byte). Ground-truthed: bundled
+    // `0 + "9007199254740993"` == 9007199254740993 (the exact 64-bit IV/UV), NOT
+    // 9007199254740992.
+    assert_eq!(
+      perl_int_prefix("9007199254740993"),
+      Some(9_007_199_254_740_993),
+      "a clean integer offset above 2^53 must be exact (not the f64-rounded …992)"
+    );
+    assert_ne!(
+      perl_int_prefix("9007199254740993"),
+      Some(9_007_199_254_740_992),
+      "the wholly-integer path must not collapse to the 2^53-rounded value"
+    );
+    // The boundary itself and one above are also exact.
+    assert_eq!(perl_int_prefix("9007199254740992"), Some(1u64 << 53)); // 2^53
+    assert_eq!(perl_int_prefix("9007199254740994"), Some((1u64 << 53) + 2));
+    // `i64::MAX` and the range above it up to `u64::MAX` are exact (the old `i64`
+    // path could not represent above `i64::MAX`).
+    assert_eq!(
+      perl_int_prefix("9223372036854775807"),
+      Some(i64::MAX as u64)
+    ); // i64::MAX
+    assert_eq!(perl_int_prefix("9223372036854775808"), Some(1u64 << 63)); // i64::MAX+1
+    assert_eq!(perl_int_prefix("18446744073709551615"), Some(u64::MAX)); // u64::MAX (UV)
+
+    // ---- THE BOUNDARY CASE (#240 R4 finding): trailing junk after a digit run
+    // that exceeds `2^53` must take the `f64` (NV) path, NOT the exact path.
+    // Ground-truthed: bundled `0 + "9007199254740993abc"` == 9.0072e15 (an `NV`,
+    // the trailing junk forcing `my_atof`), `int` → 9007199254740992 — NOT the
+    // exact-`u64`-of-the-leading-digits 9007199254740993, and NOT a stop-at-993
+    // truncation either. The structural boundary: a clean integer spelling is
+    // exact; ANY trailing junk routes through the single faithful `f64` path.
+    assert_eq!(
+      perl_int_prefix("9007199254740993abc"),
+      Some(9_007_199_254_740_992),
+      "trailing junk above 2^53 must numify via the f64/NV path (…992), not the exact u64 of 993"
+    );
+    assert_ne!(
+      perl_int_prefix("9007199254740993abc"),
+      Some(9_007_199_254_740_993),
+      "trailing junk must NOT take the exact-u64 path of the leading digit run"
+    );
+
+    // ---- MSVCRT non-finite spellings (#240 R4): `1#INF`/`1#IND`/`1#QNAN` are
+    // recognised by `perl_str_to_f64` as ±Inf / NaN → non-finite → skip (no
+    // seekable directory). Ground-truthed: `0 + "1#INF"` == Inf, `0 + "1#IND"`
+    // and `0 + "1#QNAN"` == NaN. They are NOT clean integers, so they route
+    // through the `f64` arm and are rejected there.
+    assert_eq!(perl_int_prefix("1#INF"), None);
+    assert_eq!(perl_int_prefix("1#IND"), None);
+    assert_eq!(perl_int_prefix("1#QNAN"), None);
+    // A MALFORMED MSVCRT spelling (`1#IN`) is NOT a recognised non-finite form;
+    // `perl_str_to_f64` reads the `1` mantissa (`#` terminates the prefix) →
+    // 1.0. Ground-truthed: bundled `int(0 + "1#IN")` == 1.
+    assert_eq!(perl_int_prefix("1#IN"), Some(1));
+
+    // ---- RANGE REJECTION (above u64::MAX / Perl spills to NV) ------------
+    // A CLEAN all-digit token that exceeds `u64::MAX` is NOT held in a Perl `UV`;
+    // it becomes an `NV` (`0 + "18446744073709551616"` == 1.84467440737096e+19),
+    // a non-physical offset no `Seek` resolves → the wholly-integer path falls
+    // through to the `f64` arm, which range-checks it out → skip. NOT a
+    // saturate-then-seek.
+    assert_eq!(perl_int_prefix("18446744073709551616"), None); // u64::MAX + 1 (clean >u64)
+    assert_eq!(perl_int_prefix("99999999999999999999"), None); // ~1e20 > 2^64
+    assert_eq!(perl_int_prefix("99999999999999999999999"), None); // far above
+    assert_eq!(perl_int_prefix("-99999999999999999999999"), None); // negative
+  }
+
+  /// LOCKS the Perl-faithful handling of a NEGATIVE *fractional* SubIFD-offset
+  /// token (the `f64` arm). The SubIFD start is `int(0 + $token)` and ExifTool
+  /// skips the directory IFF that integer is `< 0` (`Exif.pm:7017`
+  /// `$subdirStart < 0`, computed from the `Start => $val[0]` eval at
+  /// `Exif.pm:6956` then `IsInt` at `:5954`). Perl `int()` truncates TOWARD
+  /// ZERO, so a magnitude-`< 1` negative numifies to `0` (a VALID offset →
+  /// recurse at byte 0), and ONLY a magnitude-`>= 1` negative gives a negative
+  /// `int` (→ skip). The `f64` arm mirrors this BY CONSTRUCTION:
+  /// `(-0.5).trunc()` is `-0.0`, which `(0.0..2^64).contains` accepts (`-0.0 ==
+  /// 0.0`) → `Some(0)`; `(-1.5).trunc()` is `-1.0`, out of range → `None`. So
+  /// the trunc-then-`[0, 2^64)` range-check is faithful WITHOUT a separate
+  /// pre-truncation sign test.
+  ///
+  /// Anti-regression: a reviewer "fix" that skips when the *raw* token is `< 0`
+  /// BEFORE truncating (e.g. an early `if f < 0.0 { return None }`) would WRONGLY
+  /// skip `-0.5` / `-0.9` (Perl `int` → `0`, recurse@0). The faithful invariant
+  /// is `int(token) < 0` (POST-truncation), NOT `token < 0`. All values
+  /// ground-truthed against bundled Perl 5 / ExifTool 13.59
+  /// (`int(0 + "-0.5")` == 0, `int(0 + "-1.5")` == -1).
+  #[test]
+  fn perl_int_prefix_negative_fraction_truncates_toward_zero() {
+    // Magnitude-`< 1` negatives: `int()` truncates to `0` → recurse at byte 0
+    // (NOT a skip). These all route through the `f64` arm (a `.`/`e` makes them
+    // non-clean-integer); `trunc()` yields `-0.0`, which is `>= 0.0`.
+    assert_eq!(
+      perl_int_prefix("-0.5"),
+      Some(0),
+      "int(-0.5) == 0 → recurse@0; the raw token being negative must NOT skip"
+    );
+    assert_eq!(perl_int_prefix("-.5"), Some(0)); // int(-0.5) == 0
+    assert_eq!(perl_int_prefix("-1e-1"), Some(0)); // -0.1 → int 0
+    assert_eq!(perl_int_prefix("-0.0"), Some(0)); // int(-0.0) == 0
+    assert_eq!(perl_int_prefix("-0.9"), Some(0)); // int(-0.9) == 0 (truncate, not round)
+
+    // Magnitude-`>= 1` negatives: `int()` is a NEGATIVE integer → no seekable
+    // directory → skip. The fractional forms route through the `f64` arm
+    // (`trunc()` is `<= -1.0`, out of `[0, 2^64)`); the clean-integer forms
+    // (`-5`, `-100`) are caught earlier by `perl_integer_offset` as `Some(None)`.
+    assert_eq!(perl_int_prefix("-1.5"), None, "int(-1.5) == -1 < 0 → skip");
+    assert_eq!(perl_int_prefix("-2.9"), None); // int(-2.9) == -2 < 0 → skip
+    assert_eq!(perl_int_prefix("-100.5"), None); // int(-100.5) == -100 < 0 → skip
+    assert_eq!(perl_int_prefix("-5"), None); // clean integer, int -5 < 0 → skip
+    assert_eq!(perl_int_prefix("-100"), None); // clean integer, int -100 < 0 → skip
   }
 
   #[test]

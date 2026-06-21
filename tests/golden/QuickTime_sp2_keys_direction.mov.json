@@ -46,5 +46,9 @@
   "Keys:CameraDirection": "front",
   "Keys:CameraMotion": "walking",
   "Keys:AndroidCaptureFPS": 29.9699993133545,
-  "Keys:AndroidTimeZone": "+09:00"
+  "Keys:AndroidTimeZone": "+09:00",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "2 bps",
+  "Composite:Rotation": 0
 }]

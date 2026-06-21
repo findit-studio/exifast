@@ -60,5 +60,6 @@
   "Track2:MetaFormat": "mebx",
   "Track2:SampleTime": "0 s",
   "Track2:SampleDuration": "1.00 s",
-  "Track2:SceneIlluminance": 5678
+  "Track2:SceneIlluminance": 5678,
+  "Composite:AvgBitrate": "192 bps"
 }]

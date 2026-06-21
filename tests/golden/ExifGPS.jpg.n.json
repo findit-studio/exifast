@@ -60,5 +60,14 @@
   "IFD1:YResolution": 72,
   "IFD1:ResolutionUnit": 2,
   "IFD1:ThumbnailOffset": 1050,
-  "IFD1:ThumbnailLength": 28
+  "IFD1:ThumbnailLength": 28,
+  "IFD1:ThumbnailImage": "(Binary data 28 bytes, use -b option to extract)",
+  "Composite:Aperture": 0.640234375,
+  "Composite:ImageSize": "120 80",
+  "Composite:Megapixels": 0.0096,
+  "Composite:ShutterSpeed": "0.00138106793200498",
+  "Composite:GPSLatitude": 54.9896666666667,
+  "Composite:GPSLongitude": -1.91416666666667,
+  "Composite:FocalLength35efl": 0,
+  "Composite:GPSPosition": "54.9896666666667 -1.91416666666667"
 }]

@@ -152,10 +152,16 @@ impl TimedSample for GpsSample {
   }
   // `gsen`/`3gf` records carry an `Accelerometer` / `TimeCode` but NO
   // coordinate pair; `Process_gsen`/`Process_3gf` still `++DOC_COUNT` +
-  // `HandleTag` them, so a sensor-only `GpsSample` is emittable.
+  // `HandleTag` them, so a sensor-only `GpsSample` is emittable. A `text`-handler
+  // sample likewise emits a `Text` (+ other) row with no coordinates (the
+  // timed-text wrapper `FoundSomething` opens a `Doc<N>` per sample,
+  // QuickTimeStream.pl:1473/1512), so a text-extras-only sample is emittable too.
   #[inline(always)]
   fn has_emittable_data(&self) -> bool {
-    self.has_coordinates() || self.accelerometer().is_some() || self.time_code().is_some()
+    self.has_coordinates()
+      || self.accelerometer().is_some()
+      || self.time_code().is_some()
+      || self.text_extras().is_some()
   }
   #[inline(always)]
   fn emits_without_ee(&self) -> bool {
@@ -168,6 +174,18 @@ impl TimedSample for GpsSample {
   #[inline(always)]
   fn doc(&self) -> Option<u32> {
     self.doc()
+  }
+  // The sample-table `(SampleTime, SampleDuration)` is surfaced ONLY for a
+  // `gpmd` MetaFormat dashcam variant (FMAS / Wolfbox / Rove) — a
+  // `ProcessSamples`-dispatched fix ExifTool emits ahead of the payload under
+  // its `Track<N>` (QuickTimeStream.pl:1520, 161-162). The movie-level freeGPS
+  // sources (`moov`-`gps `-box, brute-force `mdat` scan) and the top-level magic
+  // boxes (`gps0`/`gsen`/`3gf`/Kenwood) carry NO sample-table timing — they keep
+  // the trait default `None`, so their goldens (which have none) stay byte-exact.
+  #[inline(always)]
+  fn sample_timing(&self) -> Option<(Option<f64>, Option<f64>)> {
+    matches!(self.origin(), Some(crate::metadata::GpsOrigin::Gpmd { .. }))
+      .then(|| (self.sample_time(), self.sample_duration()))
   }
 }
 
