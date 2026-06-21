@@ -263,6 +263,70 @@ pub struct ExifTag {
   pub conv: Conv,
 }
 
+/// The `OffsetPair` + `DataTag` attribute pair on an `IsOffset` leaf
+/// (`Exif.pm:1168-1171` for `ThumbnailOffset`). It binds an offset tag to its
+/// paired LENGTH tag (`OffsetPair => 0x202`) and the SYNTHETIC binary-image
+/// tag that the offset+length describe (`DataTag => 'ThumbnailImage'`).
+///
+/// ExifTool extracts the named image as a Composite that `Require`s the
+/// offset+length and calls `ExtractImage($self, $offset, $length, $dataTag)`
+/// (`Exif.pm:4977-4991`), emitting it under the offset tag's OWN family-0/1
+/// groups (`@grps = $self->GetGroup($$val{0})`, `Exif.pm:4989`) — i.e.
+/// `IFD1:ThumbnailImage` for an IFD1 `ThumbnailOffset`. The port reproduces
+/// that with the [`crate::exif`] walker's post-IFD data-tag pass.
+#[derive(Debug, Clone, Copy)]
+pub struct DataTagSpec {
+  /// The paired tag ID — the LENGTH tag for an `IsOffset` leaf
+  /// (`OffsetPair => 0x202`, `Exif.pm:1170`).
+  offset_pair: u16,
+  /// The synthetic image tag NAME the offset+length describe
+  /// (`DataTag => 'ThumbnailImage'`, `Exif.pm:1171`).
+  data_tag: &'static str,
+}
+
+impl DataTagSpec {
+  /// The paired LENGTH tag ID (`$$tagInfo{OffsetPair}`).
+  #[must_use]
+  #[inline]
+  pub const fn offset_pair(self) -> u16 {
+    self.offset_pair
+  }
+
+  /// The synthetic image tag NAME (`$$tagInfo{DataTag}`).
+  #[must_use]
+  #[inline]
+  pub const fn data_tag(self) -> &'static str {
+    self.data_tag
+  }
+}
+
+impl ExifTag {
+  /// The `OffsetPair`/`DataTag` attribute pair for this leaf, if it is an
+  /// `IsOffset` tag that names a binary `DataTag` image — `None` for every
+  /// other leaf. Keyed by tag ID (the attribute lives on the `%Exif::Main`
+  /// row), mirroring the existing id-keyed [`format_override`] /
+  /// [`crate::exif::is_offset_tag`] modelling of the per-row `Format`/`IsOffset`
+  /// attributes rather than threading a field through all ~215 table literals
+  /// (incl. the generated shadow, which the xtask owns).
+  ///
+  /// Currently ONLY `ThumbnailOffset` (0x0201) — the camera-relevant IFD1
+  /// thumbnail (`Exif.pm:1168-1171`, `OffsetPair => 0x202`,
+  /// `DataTag => 'ThumbnailImage'`). The other `DataTag` offsets in
+  /// `%Exif::Main` (`PreviewImageStart`/`JpgFromRawStart`/`OtherImageStart`,
+  /// `Exif.pm:649-679`) are P2/P3 follow-ups (#331); when ported, extend this.
+  #[must_use]
+  #[inline]
+  pub const fn data_tag_spec(&self) -> Option<DataTagSpec> {
+    match self.id {
+      0x0201 => Some(DataTagSpec {
+        offset_pair: 0x0202,
+        data_tag: "ThumbnailImage",
+      }),
+      _ => None,
+    }
+  }
+}
+
 /// Static PrintConv slice — `%orientation` (`Exif.pm:291-299`).
 const ORIENTATION: &[(i64, &str)] = &[
   (1, "Horizontal (normal)"),

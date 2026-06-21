@@ -6,5 +6,6 @@
   "IFD0:Make": "Canon",
   "IFD1:Compression": "JPEG (old-style)",
   "IFD1:ThumbnailOffset": 90,
-  "IFD1:ThumbnailLength": 4
+  "IFD1:ThumbnailLength": 4,
+  "IFD1:ThumbnailImage": "(Binary data 4 bytes, use -b option to extract)"
 }]

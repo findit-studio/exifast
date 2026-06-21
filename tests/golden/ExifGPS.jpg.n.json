@@ -61,6 +61,7 @@
   "IFD1:ResolutionUnit": 2,
   "IFD1:ThumbnailOffset": 1050,
   "IFD1:ThumbnailLength": 28,
+  "IFD1:ThumbnailImage": "(Binary data 28 bytes, use -b option to extract)",
   "Composite:Aperture": 0.640234375,
   "Composite:ImageSize": "120 80",
   "Composite:Megapixels": 0.0096,

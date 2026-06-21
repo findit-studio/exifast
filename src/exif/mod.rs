@@ -115,7 +115,11 @@ use tables::Conv;
 /// FoundTag with it (`Exif.pm:7184` `SetGroup($tagKey, $dirName)`).
 ///
 /// D8: enum predicates + `as_str` (the family-1 group string).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` lets an `IfdKind` key the `(IfdKind, length_tag_id)` length-lookup
+/// index [`Walker::finalize_data_tags`] precomputes in one pass (an O(1) per-pair
+/// length lookup instead of a reverse rescan of `self.entries`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IfdKind {
   /// IFD0 — the main image directory (`ExifTool.pm:8688`).
   Ifd0,
@@ -413,7 +417,10 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
 ///
 /// D8: enum predicates; `#[non_exhaustive]` so a MakerNotes wave can add
 /// vendor arms without breaking matchers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` rides along because [`IfdKind::BigSubIfd`] carries a `SubDirKind`, and
+/// `IfdKind` is `Hash` (it keys [`Walker::finalize_data_tags`]'s length index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SubDirKind {
   /// `ExifOffset` (0x8769) — recurse into the ExifIFD (`%Exif::Main`).
@@ -2629,6 +2636,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     canon_focal_length_blob: None,
     // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
     dir_len: None,
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
@@ -2641,6 +2650,10 @@ fn parse_tiff_with_base_no_raf<'a>(
     w.cycle_guard_warnings.is_empty(),
     "the common (Owned) path must never produce cross-source cycle-guard warnings"
   );
+  // POST-IFD `DataTag` pass — pair each `ThumbnailOffset`/`ThumbnailLength` and
+  // append `IFD1:ThumbnailImage` (`Exif.pm:4977-4991`'s Composite). Inert when
+  // the chain decoded no `DataTag` offset.
+  w.finalize_data_tags();
 
   // `File:PageCount` synthesis (`ExifTool.pm:8756-8757`): emitted ONLY when
   // `$$self{TIFF_TYPE} eq 'TIFF'`. The embedded paths (PNG `eXIf`, JPEG `APP1`,
@@ -2772,12 +2785,17 @@ fn parse_bigtiff<'a>(
     canon_focal_length_blob: None,
     // BigTIFF top-level walk — no maker-note `DirLen` (salvage gated to maker notes).
     dir_len: None,
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
   debug_assert!(
     w.cycle_guard_warnings.is_empty(),
     "the common (Owned) path must never produce cross-source cycle-guard warnings"
   );
+  // POST-IFD `DataTag` pass (`Exif.pm:4977-4991`) — inert when no `DataTag`
+  // offset was decoded (a BigTIFF IFD1 thumbnail resolves the same way).
+  w.finalize_data_tags();
 
   Some(ExifMeta {
     entries: w.entries,
@@ -2968,8 +2986,13 @@ fn parse_tiff_with_base_shared<'a>(
     canon_focal_length_blob: None,
     // Top-level walk — no maker-note `DirLen` (the salvage is gated to maker notes).
     dir_len: None,
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
+  // POST-IFD `DataTag` pass (`Exif.pm:4977-4991`) — inert when no `DataTag`
+  // offset was decoded (the PNG `eXIf` / shared-`PROCESSED` core walk).
+  w.finalize_data_tags();
 
   let cycle_guard_warnings = w.cycle_guard_warnings;
   let meta = ExifMeta {
@@ -3039,6 +3062,60 @@ enum ChainGuard<'g> {
   /// PNG multi-source path, ExifTool's object-level `$$et{PROCESSED}`).
   Shared(&'g mut std::collections::HashMap<usize, IfdName>),
 }
+
+/// One deferred `DataTag` offset/length pair — a `%offsetInfo` entry for an
+/// `IsOffset` leaf that names a binary `DataTag` image (`ThumbnailOffset`
+/// 0x0201, `Exif.pm:1168-1171`). Collected during the IFD walk and resolved by
+/// the post-IFD [`Walker::finalize_data_tags`] pass into the synthetic
+/// `<family1>:<DataTag>` tag (`IFD1:ThumbnailImage`).
+struct DataTagPair {
+  /// The IFD the offset leaf was found in — the synthetic image tag inherits
+  /// its family-1 group (`@grps = $self->GetGroup($$val{0})`, `Exif.pm:4989`),
+  /// so an IFD1 `ThumbnailOffset` yields `IFD1:ThumbnailImage`.
+  ifd: IfdKind,
+  /// The buffer-relative START OFFSET of the IFD this offset leaf was walked in
+  /// (`walk_one_ifd`/`walk_big_one_ifd`'s `ifd_start`) — HALF of the offset↔length
+  /// pairing identity (the other half is [`ifd`](Self::ifd), the family-1
+  /// [`IfdKind`]). NEITHER alone is the emitted-directory identity:
+  ///  - `ifd_start` alone COLLAPSES — the walker permits ONE physical body (one
+  ///    `ifd_start`) to be reprocessed under SEVERAL family-1 labels (a completed
+  ///    sub-IFD walked as `ExifIfd` then `Interop` via two pointers to the same
+  ///    offset; `walk_one_ifd` only blocks an offset still on the ACTIVE recursion
+  ///    path, not a sibling/already-completed one — line 3577-3585). Each walk
+  ///    emits its OWN `<group>:ThumbnailOffset`/`Length` AND should emit its own
+  ///    `<group>:ThumbnailImage`; an `ifd_start`-only key keeps only the LAST and
+  ///    drops the other group's image;
+  ///  - `IfdKind` alone CROSS-PAIRS — `IfdKind` is a LABEL, not a unique
+  ///    directory: a malformed EXIF can walk several DISTINCT bodies (different
+  ///    `ifd_start`) as the same `ExifIfd`/`Interop`/`BigSubIfd(..,0)`, so a
+  ///    surviving offset from one body could pick up a length from another.
+  ///
+  /// So [`finalize_data_tags`](Self::finalize_data_tags) keys the pairing on the
+  /// COMPOSITE `(ifd_start, ifd)` — the precise identity of ONE concrete emitted
+  /// directory walk: different `ifd_start` ⇒ no cross-pair; same `ifd_start`,
+  /// different `IfdKind` ⇒ both labels' images preserved; same `(ifd_start, ifd)`
+  /// ⇒ last-wins within that one walk (the per-directory `%offsetInfo`).
+  ifd_start: usize,
+  /// The REBASED ABSOLUTE offset — the offset leaf's value after the `IsOffset`
+  /// `$val += $offsetBase` rebase (`Exif.pm:7156-7170`), i.e. in the same
+  /// file-absolute coordinates as [`Walker::base`] (`$$et{EXIF_POS}`). The
+  /// in-buffer slice position is `offset - base` (`Exif.pm:6227`'s
+  /// `$offset - $dataPos`).
+  offset: u64,
+  /// The `OffsetPair` LENGTH tag ID to look up in the SAME IFD
+  /// (`$$tagInfo{OffsetPair}`, 0x0202 for ThumbnailOffset).
+  length_tag_id: u16,
+  /// The synthetic image tag NAME (`$$tagInfo{DataTag}`, `"ThumbnailImage"`).
+  data_tag: &'static str,
+}
+
+/// DoS ceiling on a `DataTag` image length (~100 MiB) — the robustness budget
+/// (Golden-v2 Contract 3) cap on a single binary blob a hostile `OffsetPair`
+/// LENGTH could claim. A declared length above this is treated as out-of-bounds
+/// (the image is NOT emitted), independent of the buffer-bounds check below
+/// (which already rejects any length past `data.len()`). Faithful default
+/// output is unaffected — a real thumbnail is kilobytes.
+const DATA_TAG_MAX_BLOB: u64 = 100 * 1024 * 1024;
 
 /// IFD walker state. All IFD offsets are relative to the start of `data`
 /// (the TIFF block) — i.e. `$base == 0`, `$dataPos == 0` in ExifTool terms
@@ -3301,6 +3378,34 @@ struct Walker<'a, 'g> {
   /// `ProcessUnknown` `LocateIFD` relocation delta (`DirLen -= offset`,
   /// `MakerNotes.pm:1589`/`:1658`) for the duration of that sub-walk.
   dir_len: Option<usize>,
+  /// `%offsetInfo` — the IFD's `DataTag` offset/length pairs deferred to the
+  /// POST-IFD pass (`Exif.pm:7173-7174`/`:7195`). Each entry records a
+  /// `DataTag`-bearing `IsOffset` leaf (`ThumbnailOffset` 0x0201) at its
+  /// rebased ABSOLUTE offset, so [`finalize_data_tags`](Self::finalize_data_tags)
+  /// can pair it with its `OffsetPair` LENGTH leaf and emit the synthetic
+  /// binary-image tag (`IFD1:ThumbnailImage`) once the whole chain is walked —
+  /// mirroring ExifTool's `ThumbnailImage` Composite, which `Require`s
+  /// ThumbnailOffset+ThumbnailLength and runs `ExtractImage` only after the
+  /// directory walk (`Exif.pm:4977-4991`). EMPTY for every walk that decodes no
+  /// `DataTag` offset (every GPS/vendor walk, and a core walk with no IFD1
+  /// thumbnail) — so it never allocates on those paths.
+  data_tag_pairs: Vec<DataTagPair>,
+  /// The `OffsetPair` LENGTH leaves (`ThumbnailLength` 0x0202) collected DURING
+  /// the walk, each tagged with its EMITTED-DIRECTORY identity — `(ifd_start,
+  /// ifd_kind, length_tag_id, length)`. The companion to [`data_tag_pairs`](Self::data_tag_pairs):
+  /// `%offsetInfo` records BOTH the offset AND the length tag keyed by tag id
+  /// (`Exif.pm:7173-7174`), so [`finalize_data_tags`](Self::finalize_data_tags)
+  /// pairs offset↔length entirely WITHIN these two collectors — by the COMPOSITE
+  /// `(ifd_start, ifd_kind)` of one concrete emitted walk — without ever rescanning
+  /// [`entries`](Self::entries) (which removes both the prior O(N²) reverse-scan
+  /// AND the cross-pairing: the length lives here with its own emitted-directory
+  /// identity, so it pairs only with an offset from the SAME `(ifd_start, ifd_kind)`).
+  /// The [`IfdKind`] is carried alongside `ifd_start` because the walker permits
+  /// ONE physical body (one `ifd_start`) to be walked under SEVERAL family-1 labels
+  /// (a completed sub-IFD reprocessed as `ExifIfd` then `Interop`); each such walk
+  /// emits its OWN group-scoped `ThumbnailLength`, so each needs its own length
+  /// entry. EMPTY for every walk that decodes no `OffsetPair` length leaf.
+  data_tag_lengths: Vec<(usize, IfdKind, u16, u64)>,
 }
 
 impl Walker<'_, '_> {
@@ -3814,7 +3919,7 @@ impl Walker<'_, '_> {
       if entry.checked_add(20).is_none_or(|end| end > data.len()) {
         break;
       }
-      match self.walk_big_entry(entry, index, kind) {
+      match self.walk_big_entry(entry, index, ifd_start, kind) {
         step if step.continues() => {}
         Step::AbortDir | Step::Reject => return None,
         Step::Keep | Step::Skip => {}
@@ -3862,7 +3967,13 @@ impl Walker<'_, '_> {
   /// (`BigTIFF.pm:92`, abort the directory), [`Step::Skip`] for a per-entry
   /// `next` (unknown tag, huge size, unreadable value), [`Step::Keep`] for a
   /// processed entry (leaf emitted or SubIFD recursed).
-  fn walk_big_entry(&mut self, entry: usize, index: usize, kind: IfdKind) -> Step {
+  fn walk_big_entry(
+    &mut self,
+    entry: usize,
+    index: usize,
+    ifd_start: usize,
+    kind: IfdKind,
+  ) -> Step {
     let data = self.data;
     let order = self.order;
     let dir = kind.as_str();
@@ -4084,7 +4195,7 @@ impl Walker<'_, '_> {
     // `value_offset`/`read_len` are the resolved value pointer + on-disk byte
     // size — carried on the entry for the vendor span re-slice (inert for the
     // core BigTIFF walk, which has no vendor sub-tables).
-    self.emit(kind, tag_id, format, value_offset, read_len, raw);
+    self.emit(kind, ifd_start, tag_id, format, value_offset, read_len, raw);
     Step::Keep
   }
 
@@ -4683,7 +4794,7 @@ impl Walker<'_, '_> {
       // The Canon specials keep their on-disk `$format` (no Sony `$format` gate
       // applies to a Canon walk). `value_offset`/`read_len` are the resolved value
       // pointer + on-disk byte size (the same SPAN `canon_special_leaf_value` read).
-      self.emit(kind, tag_id, format, value_offset, read_len, raw);
+      self.emit(kind, ifd_start, tag_id, format, value_offset, read_len, raw);
       // The special-case value was decoded + emitted (FoundTag) — [`Step::Keep`].
       return Step::Keep;
     }
@@ -4884,6 +4995,7 @@ impl Walker<'_, '_> {
         let raw = placeholder.clone().into_bytes().into_boxed_slice();
         self.emit(
           kind,
+          ifd_start,
           tag_id,
           on_disk_format,
           value_offset,
@@ -4955,7 +5067,15 @@ impl Walker<'_, '_> {
     // carried on the entry so a vendor capture loop can re-slice the verbatim value
     // SPAN independent of the (possibly int8u-coerced) decoded `raw` shape
     // (the Nikon sub-table emitters, #243 phase 3-bis).
-    self.emit(kind, tag_id, on_disk_format, value_offset, read_len, raw);
+    self.emit(
+      kind,
+      ifd_start,
+      tag_id,
+      on_disk_format,
+      value_offset,
+      read_len,
+      raw,
+    );
     // The leaf value was decoded + emitted (FoundTag) — a normal entry:
     // [`Step::Keep`].
     Step::Keep
@@ -6237,6 +6357,7 @@ impl Walker<'_, '_> {
   fn emit(
     &mut self,
     kind: IfdKind,
+    ifd_start: usize,
     tag_id: u16,
     on_disk_format: Format,
     value_offset: usize,
@@ -6487,6 +6608,55 @@ impl Walker<'_, '_> {
       },
     };
 
+    // `%offsetInfo` collection (`Exif.pm:7173-7174`): the IFD's `DataTag`
+    // offset/length pairs are DEFERRED to the post-IFD [`finalize_data_tags`]
+    // pass — mirroring ExifTool's `ThumbnailImage` Composite, which `Require`s
+    // both `ThumbnailOffset` AND `ThumbnailLength` and runs `ExtractImage` only
+    // after the directory walk (`Exif.pm:4977-4991`). The leaves are STILL
+    // emitted normally below (ExifTool keeps the raw `ThumbnailOffset`/
+    // `ThumbnailLength` tags too). Only the core Exif table carries the
+    // `DataTag`/`OffsetPair` rows (`%Exif::Main`); a GPS/vendor leaf never
+    // matches, so this is inert for every non-core walk.
+    //
+    // Both sides are tagged with the EMITTED-DIRECTORY identity — the COMPOSITE
+    // `(ifd_start, kind)` (`%offsetInfo` is per-directory state). The composite
+    // keeps offset↔length from cross-pairing across two DISTINCT bodies a
+    // malformed EXIF walked under the same `IfdKind` (different `ifd_start`),
+    // AND preserves BOTH groups' images when ONE body is reprocessed under two
+    // labels (`ExifIfd` then `Interop` — same `ifd_start`, different `kind`).
+    if let ResolvedConv::Exif(t) = &conv {
+      // (a) The OFFSET leaf (`ThumbnailOffset` 0x0201, `IsOffset` + `DataTag`).
+      //     The offset is read from the post-`add_offset_base` `raw`, so it is
+      //     already file-absolute — the `$val[0]` ExifTool hands `ExtractImage`.
+      if let Some(spec) = t.data_tag_spec()
+        && let Some(offset) = first_uint(&raw)
+      {
+        self.data_tag_pairs.push(DataTagPair {
+          ifd: kind,
+          ifd_start,
+          offset,
+          length_tag_id: spec.offset_pair(),
+          data_tag: spec.data_tag(),
+        });
+      }
+      // (b) The `OffsetPair` LENGTH leaf (`ThumbnailLength` 0x0202) — recorded
+      //     HERE with its own EMITTED-DIRECTORY identity `(ifd_start, kind)`, so
+      //     the post-pass resolves the length WITHIN the collector by
+      //     `(ifd_start, kind, tag_id)` and never reverse-scans `self.entries`.
+      //     `kind` (not just `ifd_start`) is carried because one physical body
+      //     can be walked under two family-1 labels (`ExifIfd` then `Interop`),
+      //     each emitting its own group-scoped length. `first_uint` reads the
+      //     decoded length (a non-integer shape, like ExifTool's `next` on a bad
+      //     value, is simply not recorded ⇒ no pair).
+      if is_offset_pair_length_tag(tag_id)
+        && let Some(length) = first_uint(&raw)
+      {
+        self
+          .data_tag_lengths
+          .push((ifd_start, kind, tag_id, length));
+      }
+    }
+
     // Capture `Make` (0x010f) and `Model` (0x0110) — IFD0 tags
     // (`Exif.pm:585`/`:599`) needed by the MakerNotes dispatcher
     // (`MakerNotes.pm`'s `$$self{Make}` / `$$self{Model}` conditions).
@@ -6550,7 +6720,206 @@ impl Walker<'_, '_> {
       conv,
     });
   }
+
+  /// The POST-IFD `DataTag` pass — resolve each collected
+  /// [`DataTagPair`] into the synthetic binary-image tag and APPEND it to
+  /// [`entries`](Self::entries) after the regular IFD leaves. The faithful
+  /// reader-side analogue of ExifTool's `ThumbnailImage` Composite, which
+  /// `Require`s `ThumbnailOffset`+`ThumbnailLength` and — after the directory
+  /// walk — runs `ExtractImage($self, $offset, $length, 'ThumbnailImage')`
+  /// under the offset tag's own groups (`Exif.pm:4977-4991`). The emitted value
+  /// is the universal no-`-b` binary placeholder
+  /// `(Binary data <length> bytes, use -b option to extract)`
+  /// ([`ValidateImage`]'s display form), so a multi-megabyte payload is never
+  /// materialized.
+  ///
+  /// Pairing + bounds (`ExtractImage`, `Exif.pm:6216-6244`, and the
+  /// `ValidateOffsetInfo` checks, `Validate.pm:502-559`):
+  ///  - the LENGTH comes from the SAME EMITTED IFD's `OffsetPair` leaf (0x0202)
+  ///    — the LAST such entry in that directory, matching the IFD's last-wins
+  ///    `$$et{VALUE}` the Composite reads; a missing length leaf ⇒ no image.
+  ///    Offset and length are paired by the COMPOSITE emitted-directory identity
+  ///    `(`[`ifd_start`](DataTagPair::ifd_start)`, `[`ifd`](DataTagPair::ifd)`)`
+  ///    — the buffer-relative start offset AND the family-1 [`IfdKind`] — entirely
+  ///    WITHIN the two in-walk collectors
+  ///    ([`data_tag_pairs`](Self::data_tag_pairs) + [`data_tag_lengths`](Self::data_tag_lengths)):
+  ///    `self.entries` is never rescanned. This keeps finalization O(entries
+  ///    + collected pairs) — not the prior O(N²) per-pair reverse-rescan a hostile
+  ///    offset-packed IFD could weaponize — AND keys on ONE concrete emitted walk,
+  ///    so (a) two DISTINCT bodies a malformed EXIF walked under the same `IfdKind`
+  ///    LABEL (different `ifd_start`) never cross-pair an offset from one with a
+  ///    length from the other, AND (b) ONE body reprocessed under TWO labels (same
+  ///    `ifd_start`, e.g. `ExifIfd` then `Interop`) keeps BOTH groups'
+  ///    `ThumbnailImage` (each group emits its own `ThumbnailOffset`/`Length`
+  ///    leaves, so each emits its own synthetic image) — an `ifd_start`-alone key
+  ///    would collapse them to one;
+  ///  - `length == 0` (incl. a 0-offset/0-length IFD1 like the bundled
+  ///    `Exif.tif`) ⇒ NO image, SILENTLY (`ExtractImage`'s
+  ///    `return undef if not $len`) — so those goldens stay byte-identical;
+  ///  - `length > `[`DATA_TAG_MAX_BLOB`] ⇒ NO image (the DoS ceiling), warned;
+  ///  - the blob must lie inside the EXIF buffer:
+  ///    `offset >= base && offset + length <= base + data.len()`
+  ///    (`ExtractImage`'s `$offset>=$dataPos and $offset+$len<=$dataPos+len`);
+  ///    out-of-range ⇒ NO image, warned (the port has no separate RAF — an
+  ///    embedded EXIF block IS the whole readable buffer, so a past-buffer blob
+  ///    is genuinely unavailable, unlike a standalone `$raf` re-read).
+  ///
+  /// Inert when [`data_tag_pairs`](Self::data_tag_pairs) is empty (every
+  /// GPS/vendor walk and every core walk with no IFD1 thumbnail).
+  fn finalize_data_tags(&mut self) {
+    if self.data_tag_pairs.is_empty() {
+      return;
+    }
+    let base = u64::from(self.base);
+    let buf_end = base.saturating_add(self.data.len() as u64);
+    // Drain so a re-entrant walk never re-processes a stale pair/length.
+    let pairs = std::mem::take(&mut self.data_tag_pairs);
+    let lengths = std::mem::take(&mut self.data_tag_lengths);
+
+    // The offset+length are paired WITHIN the two in-walk collectors, keyed by
+    // the EMITTED-DIRECTORY identity — the COMPOSITE `(ifd_start, IfdKind)` —
+    // `self.entries` is NEVER rescanned. This kills BOTH the prior O(N²)
+    // reverse-rescan (a hostile IFD packed with `ThumbnailOffset` leaves forced
+    // ~N² entry checks, a parser-availability DoS, #331-P1 Codex [high]) AND the
+    // cross-pairing (#331-P1 Codex [medium]/R3). The composite is the precise
+    // identity of ONE concrete emitted walk — neither half alone is:
+    //  - `ifd_start` alone COLLAPSES a body reprocessed under two labels (one
+    //    `ifd_start` walked as `ExifIfd` THEN `Interop`) to ONE image, dropping
+    //    the other group's — but both groups emit their own `ThumbnailOffset`/
+    //    `Length` leaves, so both should emit `ThumbnailImage` (R3);
+    //  - `IfdKind` alone CROSS-PAIRS two DISTINCT bodies (different `ifd_start`)
+    //    sharing the label (R2): an offset from one + a length from the other.
+    // Keying on `(ifd_start, IfdKind)` ⇒ different body / different label both
+    // get distinct keys, so an offset only pairs with a length from the SAME
+    // emitted walk.
+    //
+    // (1) Last-wins DEDUP of the offset-pairs to ONE pair per `(ifd_start,
+    //     IfdKind, data_tag)` (`%offsetInfo` is per-directory, keyed by tag id,
+    //     so a later `ThumbnailOffset` in the SAME emitted walk overrides an
+    //     earlier one and the LAST decoded wins, `Exif.pm:7173-7174` + the
+    //     `$$et{VALUE}` the Composite reads). One ThumbnailOffset per emitted IFD
+    //     ⇒ a no-op for every well-formed file; emission order = first appearance
+    //     of each key.
+    let dedup_pairs = {
+      let mut order: Vec<(usize, IfdKind, &'static str)> = Vec::new();
+      let mut by_key: std::collections::HashMap<(usize, IfdKind, &'static str), DataTagPair> =
+        std::collections::HashMap::new();
+      for pair in pairs {
+        let key = (pair.ifd_start, pair.ifd, pair.data_tag);
+        if by_key.insert(key, pair).is_none() {
+          order.push(key);
+        }
+      }
+      order
+        .into_iter()
+        .filter_map(move |k| by_key.remove(&k))
+        .collect::<Vec<_>>()
+    };
+
+    // (2) ONE forward pass over the collected LENGTH leaves building the length
+    //     index keyed by the COMPOSITE `(ifd_start, IfdKind, length_tag_id)` each
+    //     surviving pair needs — last collected wins, reproducing the
+    //     per-directory last-wins `$$et{VALUE}` (for a well-formed
+    //     single-thumbnail IFD ONE length leaf exists, so the index yields the
+    //     SAME length and the goldens stay byte-identical). The `IfdKind` is in
+    //     the key so a length collected for ONE emitted walk (`ExifIfd`) never
+    //     satisfies the SAME-`ifd_start` pair from another walk (`Interop`) — each
+    //     re-walk's length pairs only with its own walk's offset. Only the needed
+    //     keys are indexed (a pair's `OffsetPair` length tag in its own emitted
+    //     directory), keeping the map bounded by the surviving-pair count.
+    let length_index = {
+      let needed: std::collections::HashSet<(usize, IfdKind, u16)> = dedup_pairs
+        .iter()
+        .map(|p| (p.ifd_start, p.ifd, p.length_tag_id))
+        .collect();
+      let mut index: std::collections::HashMap<(usize, IfdKind, u16), u64> =
+        std::collections::HashMap::new();
+      for &(ifd_start, kind, tag_id, length) in &lengths {
+        let key = (ifd_start, kind, tag_id);
+        if needed.contains(&key) {
+          index.insert(key, length); // last collected wins ⇒ last-extracted
+        }
+      }
+      index
+    };
+
+    for pair in dedup_pairs {
+      // The `OffsetPair` LENGTH leaf in the SAME emitted directory — last-wins
+      // (`$$et{VALUE}` keeps the last-extracted value the Composite `Require`s),
+      // resolved by the pair's own COMPOSITE `(ifd_start, IfdKind)`. An absent
+      // length leaf in THIS emitted walk ⇒ no pair ⇒ no image (ExifTool's
+      // Composite `Require` fails) — a length from a DIFFERENT body (different
+      // `ifd_start`) OR the SAME body's OTHER emitted walk (different `IfdKind`)
+      // does NOT satisfy it (the cross-pairing the finding flagged).
+      let Some(&length) = length_index.get(&(pair.ifd_start, pair.ifd, pair.length_tag_id)) else {
+        continue;
+      };
+      // `return undef if not $len` (`Exif.pm:6224`) — SILENT on zero length
+      // (and the 0-offset/0-length degenerate IFD1), keeping `Exif.tif` /
+      // `Exif_multipage.tif` byte-identical (no tag, no warning).
+      if length == 0 {
+        continue;
+      }
+      // DoS ceiling (Golden-v2 Contract 3) — a hostile `OffsetPair` LENGTH.
+      if length > DATA_TAG_MAX_BLOB {
+        self.warn(std::format!(
+          "{}:{} length {length} exceeds the {DATA_TAG_MAX_BLOB}-byte cap",
+          pair.ifd.as_str(),
+          pair.data_tag,
+        ));
+        continue;
+      }
+      // In-buffer bounds (`$offset>=$dataPos and $offset+$len<=$dataPos+len`,
+      // `Exif.pm:6227`). The port has no out-of-buffer RAF, so a blob outside
+      // the EXIF buffer is unavailable ⇒ no image (+ a faithful warning).
+      let end = pair.offset.saturating_add(length);
+      if pair.offset < base || end > buf_end {
+        self.warn(std::format!(
+          "{}:{} runs past the EXIF data ({}+{length} > {buf_end})",
+          pair.ifd.as_str(),
+          pair.data_tag,
+          pair.offset,
+        ));
+        continue;
+      }
+      // Emit `<family1>:<DataTag>` AFTER the regular IFD leaves (so the
+      // multiset + the immediately-after-ThumbnailLength position match
+      // bundled). The placeholder text is carried as a `RawValue::Text`
+      // (`Conv::None` emits it verbatim) — the byte count is baked in, so the
+      // payload is never read. The synthetic leaf has no on-disk presence:
+      // `value_offset`/`value_size` are 0 (no vendor span re-slices it).
+      let placeholder = crate::value::binary_placeholder(length);
+      let text = placeholder.as_str().to_string();
+      self.entries.push(ExifEntry {
+        ifd: pair.ifd,
+        // A synthetic Composite-derived tag has no on-disk TIFF ID; 0 is unused
+        // by any IFD1 leaf and never re-collected (no `DataTag` row at 0x0000).
+        tag_id: 0,
+        name: pair.data_tag,
+        value: ExifValue::new(RawValue::Text {
+          raw: text.clone().into_bytes().into_boxed_slice(),
+          text,
+        }),
+        on_disk_format: Format::Undef,
+        value_offset: 0,
+        value_size: 0,
+        conv: ResolvedConv::Exif(&SYNTHETIC_DATA_TAG),
+      });
+    }
+  }
 }
+
+/// The leaf descriptor a synthetic `DataTag` image entry
+/// ([`Walker::finalize_data_tags`]) carries — a `Conv::None` row whose value is
+/// the pre-rendered `(Binary data N bytes …)` placeholder, emitted VERBATIM
+/// (the [`render::render_value`] `Text` → `TagValue::Str` path). The `id`/`name`
+/// are placeholders; the real name overrides via the `ExifEntry`'s own `name`,
+/// and `Conv::None` ignores the id.
+static SYNTHETIC_DATA_TAG: tables::ExifTag = tables::ExifTag {
+  id: 0,
+  name: "ThumbnailImage",
+  conv: tables::Conv::None,
+};
 
 /// The large-array placeholder value — `"(large array of $count $formatStr
 /// values)"` (`Exif.pm:6777`). `$formatStr` is ExifTool's format NAME (e.g.
@@ -6574,6 +6943,23 @@ fn large_array_placeholder(count: usize, format: Format) -> std::string::String 
 #[inline]
 const fn is_offset_tag(tag_id: u16) -> bool {
   matches!(tag_id, 0x0111 | 0x0201)
+}
+
+/// `true` for a tag that is the `OffsetPair` LENGTH target of a `DataTag` offset
+/// leaf — i.e. a tag id some [`DataTagSpec::offset_pair`] points at. The
+/// post-IFD [`Walker::finalize_data_tags`] pass collects these leaves into
+/// [`Walker::data_tag_lengths`] DURING the walk (each keyed by its concrete-IFD
+/// identity) so it can pair offset↔length without rescanning
+/// [`Walker::entries`].
+///
+/// Currently only `ThumbnailLength` (0x0202), the pair of `ThumbnailOffset`
+/// 0x0201 (`OffsetPair => 0x202`, `Exif.pm:1170`). This is the LENGTH-side
+/// mirror of [`is_offset_tag`]; when a further `DataTag` offset is ported (its
+/// `OffsetPair` length added to `%Exif::Main`), extend BOTH in lockstep with
+/// [`tables::ExifTag::data_tag_spec`].
+#[inline]
+const fn is_offset_pair_length_tag(tag_id: u16) -> bool {
+  matches!(tag_id, 0x0202)
 }
 
 /// Add the offset base to each integer of an `IsOffset` tag's value
@@ -8651,6 +9037,8 @@ pub(in crate::exif) fn apple_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Apple IFD's declared length: the captured value (`blob`) end minus the `14 + header` body offset (`Exif.pm:6385` salvage gate).
     dir_len: Some(blob.len().saturating_sub(ifd_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Apple Main IFD walk — the SAME `process_subdir` entry the Canon walk uses,
   // but with `ProcessProc::Exif` (Apple needs NO Canon DataMember pre-scan; the
@@ -8846,6 +9234,8 @@ pub(in crate::exif) fn sony_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Sony IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(body_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Sony Main IFD walk — `ProcessProc::Exif` (Sony needs NO Canon DataMember
   // pre-scan; the `if table == TableRef::Canon` hook is inert). `Fixed(order)` is
@@ -9132,6 +9522,8 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Panasonic IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(body_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Panasonic Main IFD walk — `ProcessProc::Exif` (Panasonic needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -9397,6 +9789,8 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Nikon IFD's declared length: the `0x927c` value size minus the layout's body offset (equal in both the blob and parent-TIFF layouts; the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(layout.ifd_offset())),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Nikon Main/Type2 IFD walk — `ProcessProc::Exif` (Nikon needs NO Canon
   // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
@@ -9726,6 +10120,8 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Pentax IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(body_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Pentax Main IFD walk — `ProcessProc::Unknown` runs `LocateIFD` (Pentax's
   // offsets are inconsistent, `MakerNotes.pm:1816` / `subdir.rs`) then
@@ -10075,6 +10471,8 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Samsung IFD's declared length: the `0x927c` value size minus the body offset; `process_subdir` further subtracts the `LocateIFD` relocation (the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(body_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Samsung Type2 IFD walk — `ProcessProc::Unknown` runs `LocateIFD`
   // (Samsung's offsets are inconsistent, `MakerNotes.pm:976`) then `ProcessExif`.
@@ -10317,6 +10715,8 @@ pub(in crate::exif) fn leica_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Leica IFD's declared length: the `0x927c` value size minus the body offset (the salvage gate, `Exif.pm:6383`).
     dir_len: Some(mn_len.saturating_sub(body_offset)),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Leica variant IFD walk — `ProcessProc::Exif` directly (the Leica2..Leica9
   // tables carry no `PROCESS_PROC`; only their deferred binary sub-tables do). The
@@ -10499,6 +10899,8 @@ pub(in crate::exif) fn canon_makernote_isolated(
     canon_focal_length_blob: None,
     // `$$dirInfo{DirLen}` — the Canon MakerNote's declared length (`DirLen => $size`, the `0x927c` value size; Canon's body offset is 0). Gates the directory-size salvage clamp (`Exif.pm:6383-6388`, #248).
     dir_len: Some(mn_len),
+    data_tag_pairs: Vec::new(),
+    data_tag_lengths: Vec::new(),
   };
   // The Canon Main IFD walk — the SAME `process_subdir` entry the recompute used
   // (`IfdKind::ExifIfd` directory kind, fixed parent order, no FixBase, the Canon
@@ -13557,6 +13959,8 @@ mod tests {
       canon_focal_length_blob: None,
       // Test walk — no maker-note `DirLen`.
       dir_len: None,
+      data_tag_pairs: Vec::new(),
+      data_tag_lengths: Vec::new(),
     }
   }
 
@@ -19020,6 +19424,408 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         serial_emission(b"AB!CDE ", print_conv),
         None,
         "a non-word byte in the first five positions fails the Condition"
+      );
+    }
+  }
+
+  // -- #331: the IFD1 `ThumbnailImage` `DataTag` channel ---------------------
+  //
+  // A standalone two-IFD big-endian TIFF: IFD0 (one inert leaf + a next-IFD
+  // pointer to IFD1) → IFD1 (`ThumbnailOffset` 0x0201 + `ThumbnailLength`
+  // 0x0202). `base == 0` for a standalone TIFF, so the rebased absolute offset
+  // equals the buffer-relative offset and the in-buffer bounds check is direct.
+  // The post-IFD `DataTag` pass pairs 0x0201/0x0202 and emits
+  // `IFD1:ThumbnailImage = (Binary data <len> bytes …)` after the IFD leaves.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  mod data_tag_thumbnail {
+    use super::*;
+
+    /// Build the TIFF. `thumb_offset` is the on-disk 0x0201 value (a
+    /// standalone-TIFF buffer offset), `thumb_len` the on-disk 0x0202 value,
+    /// and `pad_to` (when `Some`) the total buffer length to pad the file to
+    /// with trailing zeros (so a valid in-bounds thumbnail region exists).
+    fn build(thumb_offset: u32, thumb_len: u32, pad_to: Option<usize>) -> Vec<u8> {
+      // Header (8) + IFD0 (count 2 + 1 entry 12 + next-ptr 4 = 18) ⇒ IFD1 @ 26.
+      let ifd1_off: u32 = 26;
+      let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+      // IFD0: one inert leaf (Orientation 0x0112 = 1) + next-IFD = IFD1.
+      t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+      t.extend_from_slice(&entry(
+        0x0112,
+        3, /* int16u */
+        1,
+        [0x00, 0x01, 0x00, 0x00],
+      ));
+      t.extend_from_slice(&ifd1_off.to_be_bytes()); // next-IFD → IFD1
+      // IFD1: ThumbnailOffset (0x0201) + ThumbnailLength (0x0202), both int32u.
+      t.extend_from_slice(&[0x00, 0x02]); // 2 entries
+      t.extend_from_slice(&entry(0x0201, 4, 1, thumb_offset.to_be_bytes()));
+      t.extend_from_slice(&entry(0x0202, 4, 1, thumb_len.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+      if let Some(n) = pad_to
+        && t.len() < n
+      {
+        t.resize(n, 0);
+      }
+      t
+    }
+
+    /// `IFD1:ThumbnailImage` as the engine emits it (`-G1`, PrintConv mode),
+    /// paired with the walk's warnings.
+    fn emitted(data: &[u8]) -> (Option<String>, Vec<String>) {
+      let meta = parse_exif_block(data).expect("valid TIFF");
+      let warnings = meta.warnings().to_vec();
+      let mut map = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(
+        &meta,
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+        &mut map,
+      );
+      (map.get_str("IFD1", "ThumbnailImage"), warnings)
+    }
+
+    #[test]
+    fn in_bounds_offset_pair_emits_binary_placeholder() {
+      // A 40-byte thumbnail at offset 40; pad the buffer to 80 so [40,80) is
+      // fully in-bounds. The `DataTag` pass emits the placeholder with the
+      // 0x0202 length baked in — byte-identical to bundled's `ThumbnailImage`.
+      let (img, warnings) = emitted(&build(40, 40, Some(80)));
+      assert_eq!(
+        img.as_deref(),
+        Some("(Binary data 40 bytes, use -b option to extract)"),
+        "an in-bounds IFD1 offset/length pair emits the placeholder"
+      );
+      assert!(
+        warnings.is_empty(),
+        "a valid in-bounds thumbnail raises no warning, got {warnings:?}"
+      );
+    }
+
+    #[test]
+    fn zero_length_skips_silently() {
+      // `ExtractImage`'s `return undef if not $len` (Exif.pm:6224): a 0-length
+      // (or the 0-offset/0-length degenerate IFD1 like `Exif.tif`) emits NO
+      // tag and NO warning — keeping those goldens byte-identical.
+      let (img, warnings) = emitted(&build(0, 0, None));
+      assert_eq!(img, None, "a zero-length thumbnail emits no ThumbnailImage");
+      assert!(
+        warnings.is_empty(),
+        "a zero-length thumbnail is SILENT (no warning), got {warnings:?}"
+      );
+      // A non-zero offset with a zero length is also silent.
+      let (img2, warnings2) = emitted(&build(40, 0, Some(80)));
+      assert_eq!(img2, None);
+      assert!(warnings2.is_empty(), "got {warnings2:?}");
+    }
+
+    #[test]
+    fn out_of_bounds_offset_skips_with_warning() {
+      // The thumbnail region [60, 60+40) runs past the (unpadded ~50-byte)
+      // buffer, so the blob is unavailable (no out-of-buffer RAF) ⇒ no tag, a
+      // faithful warning. The 0x0201/0x0202 leaves themselves still decode.
+      let data = build(60, 40, None);
+      let (img, warnings) = emitted(&data);
+      assert_eq!(
+        img, None,
+        "an out-of-bounds thumbnail emits no ThumbnailImage"
+      );
+      assert!(
+        warnings
+          .iter()
+          .any(|w| w.contains("ThumbnailImage") && w.contains("past")),
+        "an out-of-bounds thumbnail warns, got {warnings:?}"
+      );
+    }
+
+    #[test]
+    fn oversize_length_hits_dos_cap_and_skips() {
+      // A declared length above the ~100 MiB DoS ceiling is rejected (it would
+      // also be out-of-bounds, but the cap fires first and names the limit).
+      let over = DATA_TAG_MAX_BLOB + 1;
+      assert!(
+        over <= u64::from(u32::MAX),
+        "length must fit the int32u leaf"
+      );
+      let (img, warnings) = emitted(&build(40, over as u32, Some(80)));
+      assert_eq!(img, None, "an oversize thumbnail emits no ThumbnailImage");
+      assert!(
+        warnings
+          .iter()
+          .any(|w| w.contains("ThumbnailImage") && w.contains("cap")),
+        "an oversize thumbnail warns about the cap, got {warnings:?}"
+      );
+    }
+
+    /// Build a single-IFD TIFF whose IFD1 holds ONE `ThumbnailLength` (0x0202)
+    /// entry FIRST, then `offsets.len()` `ThumbnailOffset` (0x0201) entries —
+    /// the finding's DoS pattern (one length + a flood of offsets in one IFD).
+    /// Each offset's on-disk int32u value is taken from `offsets` in order, so
+    /// the LAST element is the last-wins offset. `pad_to` pads the buffer with
+    /// trailing zeros so an in-bounds thumbnail region can exist.
+    fn build_offset_flood(thumb_len: u32, offsets: &[u32], pad_to: Option<usize>) -> Vec<u8> {
+      let entry_count = 1 + offsets.len();
+      // Header (8) + IFD0 (count 2 + 1 entry 12 + next-ptr 4 = 18) ⇒ IFD1 @ 26.
+      let ifd1_off: u32 = 26;
+      let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+      // IFD0: one inert leaf (Orientation) + next-IFD = IFD1.
+      t.extend_from_slice(&[0x00, 0x01]);
+      t.extend_from_slice(&entry(0x0112, 3, 1, [0x00, 0x01, 0x00, 0x00]));
+      t.extend_from_slice(&ifd1_off.to_be_bytes());
+      // IFD1: `entry_count` entries — 0x0202 (length) first, then the 0x0201 flood.
+      let count = u16::try_from(entry_count).expect("entry count fits int16u");
+      t.extend_from_slice(&count.to_be_bytes());
+      t.extend_from_slice(&entry(0x0202, 4, 1, thumb_len.to_be_bytes()));
+      for &off in offsets {
+        t.extend_from_slice(&entry(0x0201, 4, 1, off.to_be_bytes()));
+      }
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+      if let Some(n) = pad_to
+        && t.len() < n
+      {
+        t.resize(n, 0);
+      }
+      t
+    }
+
+    // -- #331-P1 Codex [high]: O(N) finalize, no O(N²) on a hostile IFD --------
+    //
+    // `finalize_data_tags` once stored every decoded `ThumbnailOffset` and, FOR
+    // EACH, reverse-rescanned `self.entries` for the matching `ThumbnailLength`
+    // — O(N²) from a sub-MB IFD packed with offsets (a parser-availability DoS).
+    // The fix precomputes a `(ifd_start, IfdKind, length_tag_id)` length index in
+    // ONE pass and dedups the offset-pairs to the LAST per `(ifd_start, IfdKind,
+    // data_tag)`. This crafts the finding's pattern at a size where the old O(N²)
+    // rescan would blow the test budget but the O(N) path is instant, asserting it
+    // both TERMINATES and yields the faithful last-wins result.
+    #[test]
+    fn offset_flood_finalizes_in_linear_time() {
+      // N = 50 000 `ThumbnailOffset` leaves: old O(N²) ≈ 2.5 G entry checks
+      // (seconds); new O(N) is instant. All offsets point in-bounds, so the
+      // last-wins offset pairs with the length ⇒ the placeholder emits ONCE.
+      const N: usize = 50_000;
+      let offsets = std::vec![64u32; N];
+      let data = build_offset_flood(40, &offsets, Some(160));
+
+      let started = std::time::Instant::now();
+      let (img, warnings) = emitted(&data);
+      let elapsed = started.elapsed();
+
+      assert_eq!(
+        img.as_deref(),
+        Some("(Binary data 40 bytes, use -b option to extract)"),
+        "the last-wins in-bounds offset pairs with the length ⇒ ONE placeholder"
+      );
+      assert!(
+        warnings.is_empty(),
+        "an in-bounds flood raises no warning, got {warnings:?}"
+      );
+      // Generous ceiling: the O(N) path completes in a few ms; only a regression
+      // to the O(N²) reverse-rescan could approach this bound (caught, not flaky).
+      assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "finalize must be O(N): {N} offsets took {elapsed:?} (an O(N²) regression)"
+      );
+    }
+
+    #[test]
+    fn offset_flood_last_wins_offset_is_the_one_evaluated() {
+      // Earlier offsets are in-bounds, the LAST is out-of-bounds. Last-wins ⇒ the
+      // OUT-OF-BOUNDS offset is the one paired with the length ⇒ SKIP + a "past"
+      // warning (proving the LAST offset won, not an earlier in-bounds one), and
+      // NOT an emitted placeholder. Also confirms the dedup collapses the flood
+      // to a single evaluated pair (no per-offset warning storm).
+      let mut offsets = std::vec![64u32; 2_000];
+      *offsets.last_mut().unwrap() = 1_000_000; // far past the padded buffer
+      let data = build_offset_flood(40, &offsets, Some(160));
+      let (img, warnings) = emitted(&data);
+      assert_eq!(
+        img, None,
+        "the last-wins OUT-OF-BOUNDS offset ⇒ no ThumbnailImage"
+      );
+      let past: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("ThumbnailImage") && w.contains("past"))
+        .collect();
+      assert_eq!(
+        past.len(),
+        1,
+        "exactly ONE past-buffer warning (the deduped last-wins pair), got {warnings:?}"
+      );
+    }
+
+    // -- #331-P1 Codex [medium]: pairing keys on the CONCRETE IFD, not the label --
+    //
+    // The offset/length pairing once keyed on `(IfdKind, ..)` — but `IfdKind` is
+    // a FAMILY-1 LABEL, not a unique directory: a malformed-but-parseable EXIF
+    // walks several concrete directories as the SAME `ExifIFD` (repeated
+    // SubDirectory pointers). So a surviving `ThumbnailOffset` from one directory
+    // could pick up a `ThumbnailLength` from ANOTHER (cross-pairing), or the
+    // dedup could DROP an earlier directory's valid pair. The fix carries each
+    // directory's START OFFSET (`ifd_start`) as a stable concrete identity and
+    // pairs offset↔length by it — within the in-walk collectors, no `self.entries`
+    // rescan.
+
+    /// `ExifIFD:ThumbnailImage` as the engine emits it (`-G1`, PrintConv mode),
+    /// paired with the walk's warnings (the cross-IFD test reads the ExifIFD
+    /// group, not IFD1).
+    fn emitted_exififd(data: &[u8]) -> (Option<String>, Vec<String>) {
+      let meta = parse_exif_block(data).expect("valid TIFF");
+      let warnings = meta.warnings().to_vec();
+      let mut map = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(
+        &meta,
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+        &mut map,
+      );
+      (map.get_str("ExifIFD", "ThumbnailImage"), warnings)
+    }
+
+    /// A standalone big-endian TIFF whose IFD0 carries TWO `ExifOffset` (0x8769)
+    /// pointers to two DISTINCT `ExifIFD` bodies (both walked as
+    /// `IfdKind::ExifIfd`, so they share the family-1 label but have different
+    /// start offsets / identities):
+    ///  - ExifIFD-A (the EARLIER directory): a `ThumbnailOffset` at an IN-BOUNDS
+    ///    offset (80) PLUS its own `ThumbnailLength` (40) — a valid self-contained
+    ///    pair;
+    ///  - ExifIFD-B (the LATER directory): a `ThumbnailOffset` at an OUT-OF-BOUNDS
+    ///    offset (1_000_000) and NO `ThumbnailLength` of its own.
+    /// The buffer is padded to 120 so A's `[80, 120)` region is fully in-bounds.
+    fn build_two_exififd() -> Vec<u8> {
+      // Header (8) + IFD0 (count 2 + 2 entries 24 + next-ptr 4 = 30) ⇒ bodies
+      // begin at 38. ExifIFD-A (count 2 + 2 entries 24 + next-ptr 4 = 30) ⇒ A
+      // spans [38, 68); ExifIFD-B begins at 68.
+      let exif_a_off: u32 = 38;
+      let exif_b_off: u32 = 68;
+      let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+      // IFD0: two ExifOffset (0x8769) pointers → ExifIFD-A, ExifIFD-B.
+      t.extend_from_slice(&[0x00, 0x02]); // 2 entries
+      t.extend_from_slice(&entry(0x8769, 4, 1, exif_a_off.to_be_bytes()));
+      t.extend_from_slice(&entry(0x8769, 4, 1, exif_b_off.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next-IFD = 0
+      // ExifIFD-A @ 38: ThumbnailOffset (in-bounds 80) + ThumbnailLength (40).
+      t.extend_from_slice(&[0x00, 0x02]); // 2 entries
+      t.extend_from_slice(&entry(0x0201, 4, 1, 80u32.to_be_bytes()));
+      t.extend_from_slice(&entry(0x0202, 4, 1, 40u32.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+      debug_assert_eq!(t.len(), exif_b_off as usize, "ExifIFD-B must begin at 68");
+      // ExifIFD-B @ 68: ThumbnailOffset only (out-of-bounds), NO ThumbnailLength.
+      t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+      t.extend_from_slice(&entry(0x0201, 4, 1, 1_000_000u32.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+      // Pad so A's [80, 120) thumbnail region is in-bounds.
+      t.resize(120, 0);
+      t
+    }
+
+    #[test]
+    fn later_ifd_offset_does_not_cross_pair_earlier_ifd_length() {
+      // Two concrete ExifIFD directories share the `IfdKind::ExifIfd` label but
+      // have distinct start offsets. A (earlier) is a complete in-bounds pair; B
+      // (later) has an out-of-bounds offset and NO length of its own. Pairing by
+      // the CONCRETE identity ⇒ A emits its placeholder and B is dropped SILENTLY
+      // (no length in B's own directory) — NO cross-pair of B's offset with A's
+      // length (which, under the old `IfdKind`-keyed dedup, would have dropped A
+      // and produced a spurious out-of-bounds "past" warning instead).
+      let (img, warnings) = emitted_exififd(&build_two_exififd());
+      assert_eq!(
+        img.as_deref(),
+        Some("(Binary data 40 bytes, use -b option to extract)"),
+        "the EARLIER ExifIFD's own offset+length pair survives (not dropped by a \
+         label-keyed dedup), emitting its placeholder"
+      );
+      assert!(
+        !warnings
+          .iter()
+          .any(|w| w.contains("ThumbnailImage") && w.contains("past")),
+        "the LATER ExifIFD's out-of-bounds offset must NOT cross-pair the earlier \
+         directory's length (no spurious past-buffer warning), got {warnings:?}"
+      );
+    }
+
+    // -- #331-P1 Codex R3 [medium]: the COMPOSITE `(ifd_start, IfdKind)` key --
+    //
+    // R3 keyed the dedup + length index on `ifd_start` ALONE. But the walker
+    // reprocesses a COMPLETED sub-IFD offset under another family-1 label — a
+    // malformed file can walk the SAME physical body (one `ifd_start`) as
+    // `Interop` AND `ExifIfd` (two pointers to the same offset; `walk_one_ifd`
+    // only rejects an offset STILL on the active recursion path, line 3577-3585,
+    // not a sibling/already-completed one). Regular `ThumbnailOffset`/`Length`
+    // leaves emit for BOTH groups (`InteropIFD:*` AND `ExifIFD:*`), so the
+    // synthetic `ThumbnailImage` should too — but an `ifd_start`-only key keeps
+    // only the LAST `DataTagPair` for that start and emits ONE image. The
+    // composite `(ifd_start, IfdKind)` key gives each emitted walk its own slot,
+    // preserving both group-specific images (the synthesis of R2's `IfdKind`-only
+    // cross-pairing and R3's `ifd_start`-only collapse).
+
+    /// `<group>:ThumbnailImage` for an arbitrary family-1 group, as the engine
+    /// emits it (`-G1`, PrintConv mode).
+    fn emitted_group(data: &[u8], group: &str) -> Option<String> {
+      let meta = parse_exif_block(data).expect("valid TIFF");
+      let mut map = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(
+        &meta,
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+        &mut map,
+      );
+      map.get_str(group, "ThumbnailImage")
+    }
+
+    /// A standalone big-endian TIFF whose IFD0 carries an `ExifOffset` (0x8769)
+    /// AND an `InteropOffset` (0xa005) pointer BOTH targeting the SAME body
+    /// offset. That ONE physical body is walked TWICE — once as `IfdKind::ExifIfd`
+    /// (the 0x8769 dispatch completes and pops off the active recursion path),
+    /// then once as `IfdKind::Interop` (the 0xa005 dispatch sees the offset is no
+    /// longer on the active path ⇒ reprocesses it). So the two walks share ONE
+    /// `ifd_start` but carry DIFFERENT `IfdKind` labels. The body holds an
+    /// IN-BOUNDS `ThumbnailOffset` (80) + its `ThumbnailLength` (40), so BOTH
+    /// walks form a valid self-contained pair; the buffer is padded to 120 so
+    /// `[80, 120)` is in-bounds.
+    fn build_one_body_two_labels() -> Vec<u8> {
+      // Header (8) + IFD0 (count 2 + 2 entries 24 + next-ptr 4 = 30) ⇒ the body
+      // begins at 38. Both pointers target 38.
+      let body_off: u32 = 38;
+      let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+      // IFD0: ExifOffset (0x8769) + InteropOffset (0xa005), both → the same body.
+      // `sub_dir_for` maps 0x8769→ExifIfd and 0xa005→Interop for any non-GPS
+      // parent, so IFD0 dispatches the body under BOTH labels (sequentially —
+      // neither nested inside the other).
+      t.extend_from_slice(&[0x00, 0x02]); // 2 entries
+      t.extend_from_slice(&entry(0x8769, 4, 1, body_off.to_be_bytes()));
+      t.extend_from_slice(&entry(0xa005, 4, 1, body_off.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next-IFD = 0
+      debug_assert_eq!(t.len(), body_off as usize, "the body must begin at 38");
+      // The shared body @ 38: ThumbnailOffset (in-bounds 80) + ThumbnailLength (40).
+      t.extend_from_slice(&[0x00, 0x02]); // 2 entries
+      t.extend_from_slice(&entry(0x0201, 4, 1, 80u32.to_be_bytes()));
+      t.extend_from_slice(&entry(0x0202, 4, 1, 40u32.to_be_bytes()));
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+      // Pad so the [80, 120) thumbnail region is in-bounds.
+      t.resize(120, 0);
+      t
+    }
+
+    #[test]
+    fn one_body_two_labels_emits_both_group_thumbnail_images() {
+      // ONE physical IFD body is walked under TWO labels (`ExifIfd` then
+      // `Interop`) — same `ifd_start`, two `IfdKind`s, each a complete in-bounds
+      // pair. The COMPOSITE `(ifd_start, IfdKind)` key gives each emitted walk its
+      // own slot ⇒ BOTH `ExifIFD:ThumbnailImage` AND `InteropIFD:ThumbnailImage`
+      // emit (the offset leaf's group is inherited by its synthetic image). An
+      // `ifd_start`-ONLY key (R3) would have collapsed the two pairs to ONE and
+      // emitted only the LAST group's image — this test catches that regression.
+      let data = build_one_body_two_labels();
+      let placeholder = Some("(Binary data 40 bytes, use -b option to extract)".to_string());
+      assert_eq!(
+        emitted_group(&data, "ExifIFD"),
+        placeholder,
+        "the ExifIfd walk of the shared body must emit ExifIFD:ThumbnailImage"
+      );
+      assert_eq!(
+        emitted_group(&data, "InteropIFD"),
+        placeholder,
+        "the Interop walk of the SAME body must ALSO emit InteropIFD:ThumbnailImage \
+         (the composite key preserves both group-specific images; an ifd_start-only \
+         key would collapse to one)"
       );
     }
   }
