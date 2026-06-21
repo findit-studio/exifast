@@ -68,7 +68,18 @@ pub(crate) enum GpsOrigin {
   /// sample-table `SampleTime`/`SampleDuration` (QuickTimeStream.pl:161-162) ahead
   /// of the fix — exactly the GoPro `gpmd` / `mebx` / `camm` shape. `track` is
   /// that 1-based moov track number. `-ee` only.
-  Gpmd { track: u32 },
+  ///
+  /// `set_group1_active` is the `$$et{SET_GROUP1}` state captured at THIS sample's
+  /// `FoundSomething` time: `true` ⇒ the key is still `"Track$num"` ⇒ the fix +
+  /// its `SampleTime`/`SampleDuration` ride the `Track<N>` group; `false` ⇒ a
+  /// PRECEDING Kingslim `ProcessLigoGPS` in this same `trak` already
+  /// `delete`d the key (LigoGPS.pm:266) WITHOUT restoring `Track$num` ⇒ the fix
+  /// rides the DEFAULT `QuickTime` group. Mirrors the
+  /// [`GpmdTimingOnly::set_group1_active`] flag on the matched-but-empty markers,
+  /// extended to the DECODED fixes so a `[Kingslim-LIGO, valid-FMAS]` walk stamps
+  /// the FMAS fix's GPS + timing `QuickTime` (ground-truth `-ee -G3:1`:
+  /// `Doc3:QuickTime:GPSLatitude` / `Doc3:QuickTime:SampleTime`), not `Track<N>`.
+  Gpmd { track: u32, set_group1_active: bool },
 }
 
 impl GpsOrigin {
@@ -811,6 +822,19 @@ pub struct GpmdTimingOnly {
   /// `SampleDuration` (seconds) of this `gpmd` sample (paired with
   /// [`Self::sample_time`]). `None` until the walker stamps it.
   sample_duration: Option<f64>,
+  /// Whether ExifTool's `$$et{SET_GROUP1} = "Track$num"` was still active when
+  /// `FoundSomething` emitted this sample's timing — i.e. the timing rides the
+  /// `trak`'s `Track<N>` family-1 group (`true`) or the DEFAULT `QuickTime` group
+  /// (`false`). `ProcessLigoGPS` does `SET_GROUP1 = 'LIGO'` then `delete
+  /// $$et{SET_GROUP1}` (LigoGPS.pm:255/266) — the `delete` DROPS the key rather
+  /// than restoring the `trak`'s `Track$num`, so a Kingslim `gpmd` sample whose
+  /// timing is emitted AFTER a PRECEDING Kingslim `ProcessLigoGPS` in the SAME
+  /// `ProcessSamples` walk lands under `QuickTime`, not `Track<N>` (ground-truth
+  /// `-ee -G3:1`: `[kingslim, fmas-empty, kingslim]` ⇒ `Doc1:Track1` timing,
+  /// `Doc2:LIGO`, `Doc3:QuickTime` timing, `Doc4:QuickTime` timing, `Doc5:LIGO`).
+  /// Defaults to `true` (the FMAS / Wolfbox / Rove / `text` markers never follow
+  /// a LigoGPS `delete`, so they always keep `Track<N>`).
+  set_group1_active: bool,
 }
 
 impl GpmdTimingOnly {
@@ -824,6 +848,7 @@ impl GpmdTimingOnly {
       doc: None,
       sample_time: None,
       sample_duration: None,
+      set_group1_active: true,
     }
   }
 
@@ -857,8 +882,18 @@ impl GpmdTimingOnly {
     self.sample_duration
   }
 
-  /// Stamp the `Track<N>` index, GLOBAL `Doc<N>` ordinal, and sample-table
-  /// `SampleTime` / `SampleDuration` (walker-only).
+  /// Whether this marker's timing rides the `trak`'s `Track<N>` family-1 group
+  /// (`true`) or the DEFAULT `QuickTime` group (`false`) — the `$$et{SET_GROUP1}`
+  /// state at `FoundSomething` time (see the `set_group1_active` field docs).
+  #[inline(always)]
+  #[must_use]
+  pub const fn set_group1_active(&self) -> bool {
+    self.set_group1_active
+  }
+
+  /// Stamp the `Track<N>` index, GLOBAL `Doc<N>` ordinal, sample-table
+  /// `SampleTime` / `SampleDuration`, and the `$$et{SET_GROUP1}`-active flag
+  /// (`true` ⇒ `Track<N>` group, `false` ⇒ `QuickTime` group) (walker-only).
   #[inline(always)]
   pub(crate) const fn set_stamp(
     &mut self,
@@ -866,11 +901,13 @@ impl GpmdTimingOnly {
     doc: u32,
     time: Option<f64>,
     duration: Option<f64>,
+    set_group1_active: bool,
   ) -> &mut Self {
     self.track_index = Some(track);
     self.doc = Some(doc);
     self.sample_time = time;
     self.sample_duration = duration;
+    self.set_group1_active = set_group1_active;
     self
   }
 }
@@ -1159,6 +1196,13 @@ impl QuickTimeStreamMeta {
   /// stamped (none in this path — `dispatch_gpmd` pushes bare fixes) are left
   /// alone. The `doc` is shared across the (usually single) fixes of one sample,
   /// matching `FoundSomething`'s one-doc-per-sample.
+  ///
+  /// `set_group1_active` is the `$$et{SET_GROUP1}`-active state captured at this
+  /// sample's `FoundSomething` time (BEFORE any of this `trak`'s own LigoGPS
+  /// ran) — carried onto the [`GpsOrigin::Gpmd`] origin so the emitter groups
+  /// the fix `Track<N>` (`true`) or the DEFAULT `QuickTime` (`false`, a preceding
+  /// Kingslim `ProcessLigoGPS` already `delete`d the key). See
+  /// [`GpsOrigin::Gpmd`].
   pub(crate) fn stamp_gps_gpmd_from(
     &mut self,
     start: usize,
@@ -1166,10 +1210,14 @@ impl QuickTimeStreamMeta {
     doc: u32,
     sample_time: Option<f64>,
     sample_duration: Option<f64>,
+    set_group1_active: bool,
   ) {
     if let Some(slice) = self.gps_samples.get_mut(start..) {
       for s in slice {
-        s.set_origin(Some(GpsOrigin::Gpmd { track }));
+        s.set_origin(Some(GpsOrigin::Gpmd {
+          track,
+          set_group1_active,
+        }));
         if s.doc().is_none() {
           s.set_doc(Some(doc));
         }
@@ -1207,17 +1255,21 @@ impl QuickTimeStreamMeta {
   }
 
   /// Stamp the most-recently-pushed `gpmd` TIMING-ONLY marker with its sample's
-  /// `Track<N>` index, GLOBAL `Doc<N>` ordinal, and sample-table timing —
-  /// called immediately after [`Self::push_gpmd_timing_only`].
+  /// `Track<N>` index, GLOBAL `Doc<N>` ordinal, sample-table timing, and the
+  /// `$$et{SET_GROUP1}`-active flag (`true` ⇒ the `Track<N>` group, `false` ⇒ the
+  /// DEFAULT `QuickTime` group after a preceding Kingslim `ProcessLigoGPS`
+  /// `delete`d the key — see [`GpmdTimingOnly::set_group1_active`]) — called
+  /// immediately after [`Self::push_gpmd_timing_only`].
   pub(crate) fn stamp_gpmd_timing_only_last(
     &mut self,
     track: u32,
     doc: u32,
     sample_time: Option<f64>,
     sample_duration: Option<f64>,
+    set_group1_active: bool,
   ) -> &mut Self {
     if let Some(m) = self.gpmd_timing_only.last_mut() {
-      m.set_stamp(track, doc, sample_time, sample_duration);
+      m.set_stamp(track, doc, sample_time, sample_duration, set_group1_active);
     }
     self
   }

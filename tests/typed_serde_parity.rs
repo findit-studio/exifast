@@ -791,7 +791,30 @@ const NOT_ACTIVE: &[&str] = &[
 /// truthed: bundled recurses the child at byte 1000 → `GPSInfo:InteropIndex`
 /// ("Unknown (N)" / "N") + `InteropVersion` ("37 48 30") reusing `%Exif::Main`.
 /// GPS-only child ⇒ no Composite. Pairs `.json` + `.n.json`, byte-exact in both.
-const EXPECTED_ACTIVE_FIXTURES: usize = 552;
+/// 552 → 554 after the #328 Kingslim per-sample-timing fixtures
+/// `QuickTime_gpmd_kingslim_pure.mov` + `QuickTime_gpmd_kingslim_fmas_mixed.mov`
+/// (the `gpmd` Kingslim timing-`Doc<N>`-ahead-of-LigoGPS port + the
+/// `SET_GROUP1`-cleared `Track<N>`→`QuickTime` group flip). Both are `gpmd`-handler
+/// `.mov`s that are fully `-ee`-gated, so their no-`ee` `.json`/`.n.json` carry
+/// only the structural moov/track scalars + `Track1:MetaFormat "gpmd"` + the
+/// `[minor]` ExtractEmbedded `Track1:Warning` (byte-exact); the `-ee` Doc sequence
+/// is pinned in `tests/timed_metadata_conformance.rs`.
+/// 554 → 556 after the two #328 round-2 [medium] fixtures
+/// `QuickTime_gpmd_kingslim_fmas_valid.mov` (Finding 1) +
+/// `QuickTime_gpmd_kingslim_noligo_fmas.mov` (Finding 2). Finding 1's fixture is a
+/// Kingslim (LigoGPS) sample followed by a VALID FMAS sample that decodes a REAL
+/// GPS fix — proving the `SET_GROUP1`-cleared `Track<N>`→`QuickTime` flip reaches
+/// a DECODED fix (the FMAS sample's GPS + timing ride `Doc3:QuickTime`, not
+/// `Track1`), not only the matched-empty markers. Finding 2's fixture is a
+/// Kingslim Condition-match whose `ProcessLigoGPS` decodes NOTHING (the
+/// `LIGOGPSINFO` block is present but the record is unparseable), so the
+/// `delete $$et{SET_GROUP1}` never runs: the FOLLOWING valid FMAS sample is
+/// `Doc2:Track1` (no LigoGPS doc consumed, NO QuickTime flip), proving the flag
+/// flips only AFTER LigoGPS actually emitted. Both are fully `-ee`-gated
+/// `gpmd`-handler `.mov`s (no-`ee` `.json`/`.n.json` = structural scalars + the
+/// `[minor]` EEWarn, byte-exact); the `-ee` group behavior is pinned in
+/// `tests/timed_metadata_conformance.rs`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 556;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

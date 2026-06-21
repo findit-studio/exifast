@@ -2018,6 +2018,16 @@ fn process_samples(
   // — a second metadata `trak` re-enters `process_samples` and gets a NEW empty
   // state (R15-F2). Unused by non-`djmd` traks (only the `djmd` arm reads it).
   let mut dji_track_state = crate::formats::dji_protobuf::DjiTrackState::new();
+  // The per-`trak` `$$et{SET_GROUP1}`-deleted flag (LigoGPS.pm:266). ExifTool
+  // sets `SET_GROUP1 = "Track$num"` on entry to this `trak`'s `ProcessSamples`
+  // (QuickTime.pm:10353-10354), so it starts `false` (= the key is present /
+  // active); a Kingslim sample's `ProcessLigoGPS` flips it `true` once it
+  // `delete`s the key (the `delete` does NOT restore `Track$num`), and every
+  // following matched sample's `FoundSomething` timing then rides the DEFAULT
+  // `QuickTime` group instead of `Track<N>`. A NEW metadata `trak` re-enters
+  // `process_samples` with a fresh `false`. Threaded through every
+  // `decode_one_sample` so the Kingslim timing markers stamp the right group.
+  let mut set_group1_cleared = false;
   // QuickTimeStream.pl:1418 `for ($i=0; $i<@$start and $i<@$size; ++$i)` — the
   // walk is consistent, so re-run it and dispatch each in-bounds sample as it is
   // yielded (the second pass re-derives the identical prefix the probe counted).
@@ -2063,6 +2073,7 @@ fn process_samples(
       &mut *dji_out,
       &mut dji_track_state,
       &mut *ligogps_out,
+      &mut set_group1_cleared,
     );
   });
   found_embedded
@@ -2101,6 +2112,12 @@ fn decode_one_sample(
   dji_out: &mut crate::metadata::DjiProtobufMeta,
   dji_track_state: &mut crate::formats::dji_protobuf::DjiTrackState,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
+  // The per-`ProcessSamples`-walk `$$et{SET_GROUP1}`-deleted flag
+  // (LigoGPS.pm:266). Starts `false` (`SET_GROUP1 = "Track$num"` active on `trak`
+  // entry); the Kingslim arm flips it `true` after its `ProcessLigoGPS` `delete`s
+  // the key, so every following matched sample's `FoundSomething` timing emits
+  // under the DEFAULT `QuickTime` group instead of `Track<N>`. Reset per `trak`.
+  set_group1_cleared: &mut bool,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -2209,6 +2226,25 @@ fn decode_one_sample(
     // paths. Stamp exactly the fixes this sample produced (below) with the
     // global doc + `Track<N>` origin + the sample-table timing.
     let gpmd_start = out.gps_sample_count();
+    // **#328 — the Kingslim per-sample timing `Doc<N>` AHEAD of its LigoGPS doc.**
+    // ExifTool's `FoundSomething` (`ProcessSamples`:1567-1571) opens this sample's
+    // `Doc<N>` + emits its `SampleTime`/`SampleDuration` the moment the
+    // `gpmd_Kingslim` Condition matches — BEFORE `ProcessFreeGPS` → `ProcessLigoGPS`
+    // (LigoGPS.pm:243) opens the LigoGPS doc. So a Kingslim sample consumes TWO
+    // docs: the timing doc (lower) then the LigoGPS doc (next). `dispatch_gpmd`'s
+    // Kingslim arm runs `ProcessLigoGPS` inline (stamping the LigoGPS doc off the
+    // shared `out.doc_counter()`), so peek the Condition and `open_doc()` the
+    // TIMING doc HERE, BEFORE the dispatch, to claim the lower ordinal; the marker
+    // is pushed (and the flag flipped) in the `Kingslim` arm below. The timing's
+    // family-1 group obeys the SET_GROUP1 state AT THIS sample (`!set_group1_cleared`
+    // ⇒ `Track<N>`, since this sample's OWN LigoGPS has not run yet; a PRECEDING
+    // Kingslim LigoGPS in this walk already `delete`d the key ⇒ `QuickTime`).
+    let kingslim_timing = if crate::formats::quicktime_freegps::is_kingslim_gpmd(buff) {
+      let active = !*set_group1_cleared;
+      Some((out.open_doc(), active))
+    } else {
+      None
+    };
     match crate::formats::quicktime_freegps::dispatch_gpmd(buff, out, ligogps_out, free_gps_state) {
       // A self-contained variant (FMAS / Wolfbox / Rove `Process_text`) matched
       // its `Condition`. ExifTool's `FoundSomething` (`ProcessSamples`:1567-1571)
@@ -2235,10 +2271,36 @@ fn decode_one_sample(
       crate::formats::quicktime_freegps::GpmdDispatch::SelfContained => {
         let gpmd_doc = out.open_doc();
         if out.gps_sample_count() > gpmd_start {
-          out.stamp_gps_gpmd_from(gpmd_start, track_index, gpmd_doc, sample.time, sample.dur);
+          // The decoded fix's family-1 group follows the SET_GROUP1 state AT THIS
+          // sample (`!set_group1_cleared` ⇒ `Track<N>`; a PRECEDING Kingslim
+          // `ProcessLigoGPS` in this `trak` already `delete`d the key ⇒ the DEFAULT
+          // `QuickTime`). So a `[Kingslim-LIGO, valid-FMAS]` walk stamps the FMAS
+          // fix `QuickTime` (ground-truth `-ee -G3:1`: `Doc3:QuickTime:GPSLatitude`
+          // + `Doc3:QuickTime:SampleTime`), exactly as the matched-empty marker
+          // path below stamps its timing.
+          out.stamp_gps_gpmd_from(
+            gpmd_start,
+            track_index,
+            gpmd_doc,
+            sample.time,
+            sample.dur,
+            !*set_group1_cleared,
+          );
         } else {
+          // The marker's family-1 group follows the SET_GROUP1 state: `Track<N>`
+          // normally (the trak's `SET_GROUP1 = "Track$num"`), but the DEFAULT
+          // `QuickTime` group once a PRECEDING Kingslim `ProcessLigoGPS` in this
+          // SAME `trak` `delete`d `$$et{SET_GROUP1}` (LigoGPS.pm:266) — e.g. the
+          // trailing matched-empty FMAS sample of `[kingslim, fmas-empty]` ⇒
+          // `QuickTime` (ground-truth `-ee -G3:1`).
           out.push_gpmd_timing_only(crate::metadata::GpmdTimingOnly::new());
-          out.stamp_gpmd_timing_only_last(track_index, gpmd_doc, sample.time, sample.dur);
+          out.stamp_gpmd_timing_only_last(
+            track_index,
+            gpmd_doc,
+            sample.time,
+            sample.dur,
+            !*set_group1_cleared,
+          );
         }
         return false;
       }
@@ -2246,14 +2308,44 @@ fn decode_one_sample(
       // `.{80}LIGOGPSINFO` arm, QuickTimeStream.pl:1843-1888) via
       // `process_free_gps`, which is the bundled `gpmd_Kingslim` process-proc
       // `ProcessFreeGPS` and sets `$$et{FoundEmbedded} = 1`
-      // (QuickTimeStream.pl:1650). It writes only to `ligogps_out`, which opens
-      // its OWN LigoGPS `Doc<N>` off the SHARED counter lazily at finalization —
-      // so the walker must NOT consume a second ordinal here (that would shift
-      // every later doc by one). The WALK-LEVEL `free_gps_state` carries the
-      // Kingslim `FoundEmbedded` to `extract_stream`, suppressing the brute-force
-      // `mdat` re-scan (QuickTimeStream.pl:3689); the `return false` here is only
-      // the GoPro `FoundEmbedded` channel.
-      crate::formats::quicktime_freegps::GpmdDispatch::Kingslim => {
+      // (QuickTimeStream.pl:1650). It opened the LigoGPS `Doc<N>` INLINE off the
+      // shared counter (one ordinal ABOVE the timing doc claimed above). The
+      // WALK-LEVEL `free_gps_state` carries the Kingslim `FoundEmbedded` to
+      // `extract_stream`, suppressing the brute-force `mdat` re-scan
+      // (QuickTimeStream.pl:3689); the `return false` here is only the GoPro
+      // `FoundEmbedded` channel.
+      crate::formats::quicktime_freegps::GpmdDispatch::Kingslim { ligo_emitted } => {
+        // Record the per-sample timing-only marker for the `Doc<N>` opened AHEAD
+        // of the LigoGPS doc (the `FoundSomething` `SampleTime`/`SampleDuration`):
+        // it carries the timing doc + `Track<N>` + the SET_GROUP1 state captured
+        // BEFORE this sample's `ProcessLigoGPS` ran (so the FIRST Kingslim sample
+        // of a trak rides `Track<N>`, a later one rides `QuickTime`). The unified
+        // `gpmd` doc-ordered merge then interleaves it with the LigoGPS records by
+        // `Doc<N>`, so `Doc1`-timing precedes `Doc2`-LIGO. `is_kingslim_gpmd`
+        // peeked the SAME Condition `dispatch_gpmd` matched, so `kingslim_timing`
+        // is always `Some` in this arm.
+        if let Some((timing_doc, set_group1_active)) = kingslim_timing {
+          out.push_gpmd_timing_only(crate::metadata::GpmdTimingOnly::new());
+          out.stamp_gpmd_timing_only_last(
+            track_index,
+            timing_doc,
+            sample.time,
+            sample.dur,
+            set_group1_active,
+          );
+        }
+        // The `ProcessLigoGPS` `delete $$et{SET_GROUP1}` (LigoGPS.pm:266) drops the
+        // key WITHOUT restoring the trak's `Track$num`, so EVERY following matched
+        // sample of THIS `trak` (a later Kingslim sample, a trailing matched-empty
+        // FMAS sample, OR a valid FMAS/Rove/Wolfbox fix) emits its timing — and its
+        // GPS — under the DEFAULT `QuickTime` group. But that delete lives INSIDE
+        // `ParseLigoGPS` (after the `:236`/`:254` guards), so it runs ONLY when
+        // `ProcessLigoGPS` actually emitted ≥1 real fix: flip the flag iff
+        // `ligo_emitted` (a Condition-match with no LigoGPS output keeps
+        // `$$et{SET_GROUP1}` active ⇒ following timing stays `Track<N>`).
+        if ligo_emitted {
+          *set_group1_cleared = true;
+        }
         return false;
       }
       // No variant matched — fall through to the `gpmd_GoPro` KLV walker below.
@@ -3351,7 +3443,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
     );
@@ -3380,7 +3473,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
     );
@@ -3408,7 +3502,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
     );
@@ -3432,7 +3527,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
     );
@@ -3461,7 +3557,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
     );
@@ -3489,7 +3586,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "a camm track does not set FoundEmbedded"
     );
@@ -3627,7 +3725,8 @@ mod tests {
         &mut pr,
         &mut dji,
         &mut dji_st,
-        &mut lg
+        &mut lg,
+        &mut false
       ),
       "djmd does not set FoundEmbedded (ProcessProtobuf never does)"
     );
@@ -3664,6 +3763,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     assert_eq!(out.doc_counter(), 2, "second djmd sample opened Doc2");
     assert_eq!(dji.samples().len(), 2);
@@ -3727,6 +3827,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     let row0 = &dji.samples()[0];
     assert_eq!(row0.latitude(), Some(45.0));
@@ -3783,6 +3884,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     let row1 = &dji.samples()[1];
     assert!(row1.latitude().is_none(), "sample 2 has no GPS");
@@ -3873,6 +3975,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     let row0 = &dji.samples()[0];
     assert_eq!(
@@ -3941,6 +4044,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     assert_eq!(out.doc_counter(), 0, "dbgi must NOT bump the doc counter");
     assert_eq!(dji.protocol(), None, "dbgi sets no protocol");
@@ -3983,6 +4087,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     assert!(
       dji.warnings().is_empty(),
@@ -4059,6 +4164,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     // djmd walked SECOND.
     let sj = mk(&djmd_buf);
@@ -4079,6 +4185,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     // The DJMD emission protocol is ac203 — the dbgi sample contributed nothing.
     assert_eq!(
@@ -4140,6 +4247,7 @@ mod tests {
       &mut dji,
       &mut dji_st,
       &mut lg,
+      &mut false,
     );
     // The doc still bumps (FoundSomething fires per dispatched djmd sample),
     // and the warning is stamped to that sample's Doc1 / Track3. An

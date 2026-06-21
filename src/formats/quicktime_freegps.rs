@@ -2883,7 +2883,22 @@ pub enum GpmdDispatch {
   /// LigoGPS). Its GPS lives in the LigoGPS block, which opens its OWN `Doc<N>`
   /// off the shared counter at finalization, so the walker must add NO `gpmd`
   /// doc/timing here.
-  Kingslim,
+  ///
+  /// `ligo_emitted` is `true` iff `ProcessLigoGPS` actually decoded ≥1 record
+  /// that reached LigoGPS.pm:266 — i.e. emitted a real fix. ExifTool's
+  /// `delete $$et{SET_GROUP1}` lives at LigoGPS.pm:266, INSIDE `ParseLigoGPS`,
+  /// AFTER the format-error (`:236`) and out-of-range (`:254`) `return`s — so a
+  /// Kingslim sample whose Condition matched but whose `ProcessLigoGPS` produced
+  /// nothing (every record bailed early) leaves `$$et{SET_GROUP1}` UNTOUCHED.
+  /// The walker flips its `set_group1_cleared` flag only when this is `true`, so
+  /// a no-output Kingslim match does NOT push the trak's following timing to
+  /// `QuickTime` (it stays `Track<N>`).
+  Kingslim {
+    /// `true` iff `ProcessLigoGPS` decoded ≥1 real fix (reached LigoGPS.pm:266,
+    /// the `delete $$et{SET_GROUP1}`); `false` for a Condition-match that
+    /// produced no LigoGPS output (so `$$et{SET_GROUP1}` stays active).
+    ligo_emitted: bool,
+  },
   /// A self-contained dashcam variant — Rove (`Process_text`), FMAS
   /// (`ProcessFMAS`), or Wolfbox (`ProcessWolfbox`). Its Condition matched, so
   /// the walker opens ONE per-sample `Doc<N>` regardless of whether the
@@ -2891,6 +2906,26 @@ pub enum GpmdDispatch {
   /// doc + `Track<N>` + sample timing, and a matched-but-empty sample records a
   /// [`crate::metadata::GpmdTimingOnly`] marker carrying the same doc + timing.
   SelfContained,
+}
+
+/// Whether a `gpmd` sample matches the `gpmd_Kingslim` Condition
+/// `^.{21}\0\0\0A[NS][EW]` (QuickTimeStream.pl:183) — the SAME leading-byte
+/// signature the Kingslim arm of [`dispatch_gpmd`] keys on. The walker peeks
+/// this BEFORE calling [`dispatch_gpmd`] so it can open the per-sample
+/// `FoundSomething` timing `Doc<N>` AHEAD of the LigoGPS doc that
+/// [`process_free_gps`] opens INSIDE the Kingslim arm: ExifTool's
+/// `FoundSomething` (`ProcessSamples`:1567-1571) emits this sample's
+/// `SampleTime`/`SampleDuration` the moment `GetTagInfo` matches the Condition,
+/// BEFORE `ProcessFreeGPS` → `ProcessLigoGPS` runs (LigoGPS.pm:243), so a
+/// Kingslim sample consumes TWO docs — the timing doc (lower ordinal) then the
+/// LigoGPS doc (next). A const byte test, no decode.
+#[inline]
+#[must_use]
+pub fn is_kingslim_gpmd(data: &[u8]) -> bool {
+  data.len() >= 28
+    && data.get(21..25) == Some(&[0, 0, 0, b'A'])
+    && matches!(data.get(25), Some(&b'N' | &b'S'))
+    && matches!(data.get(26), Some(&b'E' | &b'W'))
 }
 
 /// Dispatch a `gpmd` sample by the bundled QuickTimeStream.pl:181-212
@@ -2932,11 +2967,7 @@ pub fn dispatch_gpmd(
   // COMMENTED-OUT secondary, QuickTimeStream.pl:1890-1904). Pass the RAW
   // sample straight to `process_free_gps` so `detect_type5_ligogps` fires at
   // offset 80 and routes to `process_ligogps` via `ligogps_out`.
-  if data.len() >= 28
-    && data.get(21..25) == Some(&[0, 0, 0, b'A'])
-    && matches!(data.get(25), Some(&b'N' | &b'S'))
-    && matches!(data.get(26), Some(&b'E' | &b'W'))
-  {
+  if is_kingslim_gpmd(data) {
     // The gpmd Kingslim path carries no Kodak version and no enclosing sample
     // time (`create_date_raw`/`sample_time = None`). `process_free_gps` guards
     // `< 82` internally and sets `state.found_embedded = true`
@@ -2966,7 +2997,15 @@ pub fn dispatch_gpmd(
       Some(ligogps_out),
     );
     ligogps_out.stamp_gpmd_dispatched_from(ligo_start);
-    return GpmdDispatch::Kingslim;
+    // ExifTool clears `$$et{SET_GROUP1}` at LigoGPS.pm:266 — INSIDE `ParseLigoGPS`,
+    // only AFTER a record passes the format-error (`:236`) and out-of-range
+    // (`:254`) guards and emits its fix. So the walker must flip its
+    // `set_group1_cleared` flag only when `ProcessLigoGPS` actually produced ≥1
+    // real fix (a Condition match with no LigoGPS output keeps `SET_GROUP1`
+    // active). `emitted_real_fix_since` ignores the out-of-range suppressed
+    // placeholders (which burn a `Doc<N>` but `return` BEFORE the `:266` delete).
+    let ligo_emitted = ligogps_out.emitted_real_fix_since(ligo_start);
+    return GpmdDispatch::Kingslim { ligo_emitted };
   }
   // gpmd_Rove — `^\0\0\xf2\xe1\xf0\xeeTT` (QuickTimeStream.pl:190).
   if data.get(0..8) == Some(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54][..]) {
@@ -3120,7 +3159,17 @@ pub fn process_timed_text(
   if out.gps_sample_count() > gps_start {
     // Stamp the enclosing `Track<N>` origin + the sample-table timing onto exactly
     // the fix/Text row this sample produced (`FoundSomething` already opened `doc`).
-    out.stamp_gps_gpmd_from(gps_start, track_index, doc, sample_time, sample_duration);
+    // The `text` HandlerType trak runs no `ProcessLigoGPS`, so `$$et{SET_GROUP1} =
+    // "Track$num"` is never `delete`d here — the fix always rides `Track<N>`
+    // (`set_group1_active = true`).
+    out.stamp_gps_gpmd_from(
+      gps_start,
+      track_index,
+      doc,
+      sample_time,
+      sample_duration,
+      true,
+    );
   } else {
     // `Process_text` emitted nothing (a binary `\0[^\0]` sample whose `Text` is
     // gated and which matches no sentence). `FoundSomething` (:1473) still emitted
@@ -3130,7 +3179,9 @@ pub fn process_timed_text(
     // `Doc<N>` would carry no `Track<N>` timing row even though the oracle has one
     // (the Insta360 `.insv`'s `Doc1..469:Track3:SampleTime`/`SampleDuration`).
     out.push_gpmd_timing_only(crate::metadata::GpmdTimingOnly::new());
-    out.stamp_gpmd_timing_only_last(track_index, doc, sample_time, sample_duration);
+    // The `text` handler path runs no `ProcessLigoGPS`, so `$$et{SET_GROUP1} =
+    // "Track$num"` is never `delete`d here — the timing always rides `Track<N>`.
+    out.stamp_gpmd_timing_only_last(track_index, doc, sample_time, sample_duration, true);
   }
 }
 
@@ -6840,8 +6891,11 @@ D 24.26m, H 6.00m, H.S 2.10m/s, V.S 0.00m/s \n";
     let matched = dispatch_gpmd(&d, &mut out, &mut lg, &mut state);
     assert_eq!(
       matched,
-      GpmdDispatch::Kingslim,
-      "Kingslim Condition should match (LigoGPS arm; own deferred Doc)"
+      // This record decodes a valid fix (45.5 N below), so `ProcessLigoGPS`
+      // reached LigoGPS.pm:266 ⇒ `ligo_emitted == true` (the SET_GROUP1 delete
+      // ran).
+      GpmdDispatch::Kingslim { ligo_emitted: true },
+      "Kingslim Condition should match (LigoGPS arm; own deferred Doc; emitted a fix)"
     );
     // Route reached the GPSType-5 / LigoGPS arm AND decoded the record into
     // the LigoGPS accumulator (NOT GPSType-14/XBHT, NOT the Type-3/4 freeGPS

@@ -638,6 +638,335 @@ fn fmas_gpmd_matched_empty_then_valid_g3_emission_order() {
   );
 }
 
+// ── #328: Kingslim `gpmd` per-sample timing `Doc<N>` + the SET_GROUP1 flip ────
+// A Kingslim `gpmd` sample (`^.{21}\0\0\0A[NS][EW]` → `ProcessFreeGPS` →
+// `ProcessLigoGPS`) consumes TWO docs: ExifTool's `FoundSomething`
+// (`ProcessSamples`:1567-1571) opens this sample's `SampleTime`/`SampleDuration`
+// timing `Doc<N>` the moment the Condition matches, THEN `ProcessLigoGPS`
+// (LigoGPS.pm:243) opens the LigoGPS sub-document — so a leading Kingslim sample
+// is `Doc1`-timing + `Doc2`-LIGO. `ProcessLigoGPS` does `SET_GROUP1 = 'LIGO'`
+// then `delete $$et{SET_GROUP1}` (LigoGPS.pm:255/266); the `delete` DROPS the key
+// WITHOUT restoring the `trak`'s `Track$num`, so every FOLLOWING matched sample's
+// timing rides the DEFAULT `QuickTime` group, not `Track<N>`. Both verified
+// byte-exact vs bundled ExifTool 13.59.
+
+// A PURE-Kingslim track (two Kingslim samples). Ground-truth `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing, `Doc4:LIGO` — the
+// SECOND sample's timing rides `QuickTime` because the FIRST sample's
+// `ProcessLigoGPS` already `delete`d `$$et{SET_GROUP1}`. The proof of the
+// `Track<N>`→`QuickTime` SET_GROUP1 flip.
+#[test]
+fn kingslim_gpmd_pure_per_sample_timing_doc_byte_exact() {
+  // `-ee -G3:1`: each Kingslim sample = a timing doc then a LigoGPS doc; the
+  // first timing rides `Track1`, the second `QuickTime`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the doc axis collapses, but the timing rows split by their
+  // family-1 group — the min-`doc()` `Track1` sample (`Doc1`, "0 s") AND the
+  // min-`doc()` `QuickTime` sample (`Doc3`, "1.00 s") BOTH emit. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: a `gpmd` trak is fully `-ee` gated, so only the
+  // structural `Track1:MetaFormat "gpmd"` + the `[minor]` EEWarn surface (no GPS,
+  // no SampleTime) — byte-exact.
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_pure.mov",
+    "QuickTime_gpmd_kingslim_pure.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the pure-Kingslim `-ee -G3` emission. The strict
+/// comparator treats object keys as an UNORDERED multiset, so it would pass a
+/// divergent key ORDER; assert directly on the RAW document that the per-sample
+/// walk order holds — `Doc1:Track1`-timing precedes `Doc2:LIGO` precedes
+/// `Doc3:QuickTime`-timing precedes `Doc4:LIGO` — AND that the SET_GROUP1 flip
+/// puts the SECOND sample's timing under `QuickTime` (the `Doc3:QuickTime:` key
+/// is present, NOT `Doc3:Track1:`). This is the order + group proof of the
+/// timing-doc-ahead-of-LigoGPS interleave through the unified `gpmd` doc-merge.
+#[test]
+fn kingslim_gpmd_pure_g3_emission_order_and_group_flip() {
+  let data = fixture("QuickTime_gpmd_kingslim_pure.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_pure.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (first sample's timing rides Track1)");
+  let doc2_ligo_lat = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (first sample's LigoGPS)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (second sample's timing rides QuickTime, NOT Track1)",
+  );
+  let doc4_ligo_lat = got
+    .find("\"Doc4:LIGO:GPSLatitude\"")
+    .expect("Doc4:LIGO:GPSLatitude present (second sample's LigoGPS)");
+
+  // The SET_GROUP1 flip: the SECOND sample's timing must NOT ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\""),
+    "the post-LigoGPS Kingslim sample's timing must ride QuickTime, not Track1 \
+     (SET_GROUP1 was deleted)\n--- got ---\n{got}"
+  );
+  // Walk order: timing → LIGO → timing → LIGO, strictly increasing.
+  assert!(
+    doc1_track1_time < doc2_ligo_lat
+      && doc2_ligo_lat < doc3_qt_time
+      && doc3_qt_time < doc4_ligo_lat,
+    "kingslim pure -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc4:LIGO \
+     (got @{doc1_track1_time}/{doc2_ligo_lat}/{doc3_qt_time}/{doc4_ligo_lat})\n\
+     --- got ---\n{got}"
+  );
+}
+
+// A MIXED `gpmd` track: a Kingslim (LigoGPS) sample, then a matched-empty FMAS
+// sample, then ANOTHER Kingslim sample. Ground-truth `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing (the FMAS marker),
+// `Doc4:QuickTime`-timing (the second Kingslim sample), `Doc5:LIGO` — both the
+// FMAS marker and the second Kingslim sample ride `QuickTime` because the first
+// Kingslim `ProcessLigoGPS` already `delete`d `$$et{SET_GROUP1}`. This is the
+// order-sensitive proof that the unified `gpmd` doc-ordered merge interleaves the
+// `gpmd`-dispatched LigoGPS records with the timing-only markers (a Kingslim
+// sample BEFORE *and* AFTER the FMAS marker), with the SET_GROUP1 group flip.
+#[test]
+fn kingslim_gpmd_mixed_per_sample_timing_doc_byte_exact() {
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the `Track1` group's min-`doc()` is `Doc1` ("0 s"); the `QuickTime`
+  // group's min-`doc()` is `Doc3` ("1.00 s"). Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.ee.json",
+    false,
+  );
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov",
+    "QuickTime_gpmd_kingslim_fmas_mixed.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER-SENSITIVE guard for the MIXED `-ee -G3` emission: the three `gpmd`-
+/// dispatched sinks (Kingslim LigoGPS records, the matched-empty FMAS timing
+/// marker, the Kingslim timing markers) must interleave by `Doc<N>` —
+/// `Doc1:Track1`-timing < `Doc2:LIGO` < `Doc3:QuickTime`-timing (FMAS) <
+/// `Doc4:QuickTime`-timing (Kingslim) < `Doc5:LIGO` — with a Kingslim LigoGPS
+/// record both BEFORE and AFTER the FMAS marker, and the SET_GROUP1 flip putting
+/// the post-LigoGPS markers (`Doc3`/`Doc4`) under `QuickTime`.
+#[test]
+fn kingslim_gpmd_mixed_g3_emission_order_and_group_flip() {
+  let data = fixture("QuickTime_gpmd_kingslim_fmas_mixed.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_fmas_mixed.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (first Kingslim sample's timing)");
+  let doc2_ligo = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (first Kingslim LigoGPS, BEFORE the FMAS marker)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (the matched-empty FMAS marker, post-SET_GROUP1-delete)",
+  );
+  let doc4_qt_time = got
+    .find("\"Doc4:QuickTime:SampleTime\"")
+    .expect("Doc4:QuickTime:SampleTime present (the second Kingslim sample's timing)");
+  let doc5_ligo = got
+    .find("\"Doc5:LIGO:GPSLatitude\"")
+    .expect("Doc5:LIGO:GPSLatitude present (second Kingslim LigoGPS, AFTER the FMAS marker)");
+
+  // The FMAS marker and the second Kingslim timing must NOT ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\"") && !got.contains("\"Doc4:Track1:SampleTime\""),
+    "the post-LigoGPS markers (FMAS + 2nd Kingslim) must ride QuickTime, not Track1\n\
+     --- got ---\n{got}"
+  );
+  // Walk order: a Kingslim LigoGPS (Doc2) BEFORE the FMAS marker (Doc3) AND a
+  // Kingslim LigoGPS (Doc5) AFTER it — the doc-merge interleave.
+  assert!(
+    doc1_track1_time < doc2_ligo
+      && doc2_ligo < doc3_qt_time
+      && doc3_qt_time < doc4_qt_time
+      && doc4_qt_time < doc5_ligo,
+    "kingslim mixed -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc4:QuickTime-timing < Doc5:LIGO \
+     (got @{doc1_track1_time}/{doc2_ligo}/{doc3_qt_time}/{doc4_qt_time}/{doc5_ligo})\n\
+     --- got ---\n{got}"
+  );
+}
+
+// ── #328 Finding 1: the SET_GROUP1 flip reaches a DECODED post-LigoGPS fix ────
+// A Kingslim (LigoGPS) sample FOLLOWED BY a VALID FMAS sample that decodes a REAL
+// GPS fix (a `GpsSample` stamped `GpsOrigin::Gpmd`, NOT a matched-empty marker).
+// The first Kingslim `ProcessLigoGPS` emits its fix (reaching LigoGPS.pm:266) and
+// `delete`s `$$et{SET_GROUP1}` WITHOUT restoring `Track1`, so the FMAS sample's
+// `FoundSomething` timing AND its decoded GPS columns ride the DEFAULT `QuickTime`
+// group — NOT `Track1`. Ground-truth bundled ExifTool 13.59 `-ee -G3:1`:
+// `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing + `Doc3:QuickTime`
+// GPS (the FMAS fix, post-LigoGPS). The pre-fix code stamped a decoded `gpmd` fix
+// `Track<N>` unconditionally, so this is the proof that the cleared-state is
+// carried onto decoded rows too, not only the timing-only markers.
+#[test]
+fn kingslim_gpmd_valid_fmas_post_ligogps_group_flip_byte_exact() {
+  // `-ee -G3:1`: the FMAS fix's timing + GPS ride `Doc3:QuickTime`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.ee.g3.json",
+    true,
+  );
+  // `-ee -G1`: the `QuickTime` group's min-`doc()` IS the FMAS sample (`Doc3`), so
+  // it keeps `QuickTime:SampleTime "1.00 s"` alongside the FMAS `QuickTime:GPS*`;
+  // the `Track1` group keeps the Kingslim `"0 s"` + `LIGO:GPS*`. Byte-exact.
+  check_ee(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.ee.json",
+    false,
+  );
+  // The no-`ee` default: fully `-ee`-gated `gpmd` trak — only the structural
+  // scalars + `Track1:MetaFormat "gpmd"` + the `[minor]` EEWarn. Byte-exact.
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_fmas_valid.mov",
+    "QuickTime_gpmd_kingslim_fmas_valid.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER + GROUP guard for the `[Kingslim, valid FMAS]` `-ee -G3` emission. The
+/// strict comparator treats keys as an unordered multiset, so assert directly on
+/// the RAW document that (a) the FMAS fix's GPS lands under `Doc3:QuickTime:`, NOT
+/// `Doc3:Track1:` (the SET_GROUP1 flip reaching a DECODED fix), and (b) the walk
+/// order holds — `Doc1:Track1`-timing < `Doc2:LIGO` < `Doc3:QuickTime`-timing <
+/// the `Doc3:QuickTime` FMAS GPS. This is the order + group proof that the
+/// cleared-state carries onto the decoded `gpmd` fix, not only the markers.
+#[test]
+fn kingslim_gpmd_valid_fmas_g3_decoded_fix_rides_quicktime() {
+  let data = fixture("QuickTime_gpmd_kingslim_fmas_valid.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_fmas_valid.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the Kingslim sample's timing rides Track1)");
+  let doc2_ligo = got
+    .find("\"Doc2:LIGO:GPSLatitude\"")
+    .expect("Doc2:LIGO:GPSLatitude present (the Kingslim LigoGPS fix)");
+  let doc3_qt_time = got.find("\"Doc3:QuickTime:SampleTime\"").expect(
+    "Doc3:QuickTime:SampleTime present (the FMAS sample's timing rides QuickTime, post-LigoGPS)",
+  );
+  let doc3_qt_lat = got.find("\"Doc3:QuickTime:GPSLatitude\"").expect(
+    "Doc3:QuickTime:GPSLatitude present (the DECODED FMAS fix rides QuickTime, NOT Track1)",
+  );
+
+  // The SET_GROUP1 flip must reach the DECODED fix: neither its timing NOR its GPS
+  // may ride Track1.
+  assert!(
+    !got.contains("\"Doc3:Track1:SampleTime\"") && !got.contains("\"Doc3:Track1:GPSLatitude\""),
+    "the post-LigoGPS FMAS fix (timing AND GPS) must ride QuickTime, not Track1 \
+     (SET_GROUP1 was deleted by the preceding Kingslim ProcessLigoGPS)\n--- got ---\n{got}"
+  );
+  // Walk order: Kingslim timing → Kingslim LIGO → FMAS timing → FMAS GPS.
+  assert!(
+    doc1_track1_time < doc2_ligo && doc2_ligo < doc3_qt_time && doc3_qt_time < doc3_qt_lat,
+    "kingslim+valid-FMAS -ee -G3 walk order must be \
+     Doc1:Track1-timing < Doc2:LIGO < Doc3:QuickTime-timing < Doc3:QuickTime-GPS \
+     (got @{doc1_track1_time}/{doc2_ligo}/{doc3_qt_time}/{doc3_qt_lat})\n--- got ---\n{got}"
+  );
+}
+
+// ── #328 Finding 2: SET_GROUP1 clears only AFTER ProcessLigoGPS actually ran ──
+// A Kingslim Condition-match whose `ProcessLigoGPS` decodes NOTHING (the
+// `LIGOGPSINFO\0` block is present so it routes to `ProcessLigoGPS`, but the
+// record is unparseable), FOLLOWED BY a valid FMAS sample. ExifTool clears
+// `$$et{SET_GROUP1}` at LigoGPS.pm:266 — INSIDE `ParseLigoGPS`, only after a
+// record passes its guards and emits — so a no-output Kingslim match leaves the
+// key active AND consumes NO LigoGPS `Doc<N>`. Ground-truth bundled ExifTool
+// 13.59 `-ee -G3:1`: `Doc1:Track1`-timing (the Kingslim sample's timing only),
+// then the FMAS sample at `Doc2:Track1`-timing + `Doc2:Track1` GPS — NOT `Doc3`,
+// NOT `QuickTime`. Proves exifast flips `set_group1_cleared` only when LigoGPS
+// emitted (`ligo_emitted`), not merely when the Kingslim Condition matched.
+#[test]
+fn kingslim_gpmd_match_no_ligogps_keeps_track_group_byte_exact() {
+  check_ee(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.ee.g3.json",
+    true,
+  );
+  check_ee(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.ee.json",
+    false,
+  );
+  check_noee_excluding(
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+    "QuickTime_gpmd_kingslim_noligo_fmas.mov.json",
+    NO_EXCL,
+  );
+}
+
+/// ORDER + GROUP guard for the Finding-2 `-ee -G3` emission: a Kingslim
+/// Condition-match with NO LigoGPS output must (a) consume only its timing
+/// `Doc1` (NO LigoGPS doc — so no `Doc2:LIGO`), and (b) leave `$$et{SET_GROUP1}`
+/// active, so the FOLLOWING FMAS sample is `Doc2:Track1` (timing AND GPS), NOT a
+/// `QuickTime`-flipped `Doc3`. Asserts the raw document directly because the
+/// strict comparator is key-order-insensitive.
+#[test]
+fn kingslim_gpmd_match_no_ligogps_g3_no_flip_no_extra_doc() {
+  let data = fixture("QuickTime_gpmd_kingslim_noligo_fmas.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_gpmd_kingslim_noligo_fmas.mov", &data, true, opts);
+
+  let doc1_track1_time = got
+    .find("\"Doc1:Track1:SampleTime\"")
+    .expect("Doc1:Track1:SampleTime present (the Kingslim sample's timing, no LigoGPS fix)");
+  let doc2_track1_gps = got.find("\"Doc2:Track1:GPSLatitude\"").expect(
+    "Doc2:Track1:GPSLatitude present (the FMAS fix is Doc2 — no LigoGPS doc consumed — \
+     and rides Track1 because SET_GROUP1 was NOT cleared)",
+  );
+
+  // No LigoGPS doc was consumed (the match produced no fix): there is no
+  // `Doc2:LIGO`, and the FMAS fix is Doc2, not Doc3.
+  assert!(
+    !got.contains(":LIGO:"),
+    "a Kingslim Condition-match with no LigoGPS output must emit NO LIGO record\n\
+     --- got ---\n{got}"
+  );
+  assert!(
+    !got.contains("\"Doc3:"),
+    "the FMAS sample must be Doc2 (the un-emitted LigoGPS consumed no doc), not Doc3\n\
+     --- got ---\n{got}"
+  );
+  // SET_GROUP1 stayed active: the FMAS fix must NOT ride QuickTime.
+  assert!(
+    !got.contains(":QuickTime:GPSLatitude") && !got.contains(":QuickTime:SampleTime"),
+    "SET_GROUP1 must stay active (no LigoGPS delete ran), so the FMAS fix rides \
+     Track1, not QuickTime\n--- got ---\n{got}"
+  );
+  assert!(
+    doc1_track1_time < doc2_track1_gps,
+    "walk order must be Doc1:Track1-timing < Doc2:Track1-GPS \
+     (got @{doc1_track1_time}/{doc2_track1_gps})\n--- got ---\n{got}"
+  );
+}
+
 // ── Track<N>: camm (Android CAMM — per-sample Track<N>, via track_index) ─────
 // SampleTime / SampleDuration ARE emitted (one per camm SAMPLE, off the
 // sample-table timing threaded onto each sample's records) and compared; every

@@ -26,7 +26,10 @@ After running, regenerate the goldens with bundled ExifTool 13.59:
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_fmas_n2s.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_wolfbox_redtiger_f9.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_fmas_empty_then_valid.mov
+  EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_gpmd_kingslim_pure.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_gpmd_kingslim_fmas_mixed.mov
+  EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_gpmd_kingslim_fmas_valid.mov
+  EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_gpmd_kingslim_noligo_fmas.mov
   EE=1 EXCLUDE="-x System:all -x Composite:GPSPosition" tools/gen_golden.sh QuickTime_text_empty_then_valid.mov
 """
 import os
@@ -217,9 +220,16 @@ def kingslim_sample() -> bytes:
     fuzz). Lands at 45.5 N, 170.5 E, 2024:01:15 10:00:00, alt 30 m — exactly the
     unit test's fix, so ExifTool decodes it to `…:LIGO:GPSLatitude 45.5` etc.
 
-    The Kingslim arm carries its GPS in a LigoGPS sub-document that opens its OWN
-    `Doc<N>` off the shared `DOC_COUNT`; placed BEFORE the matched-empty FMAS
-    sample it is `Doc1` (the FMAS marker is `Doc2`).
+    A Kingslim sample consumes TWO docs: ExifTool's `FoundSomething` opens this
+    sample's `SampleTime`/`SampleDuration` timing `Doc<N>` (the LOWER ordinal,
+    `Track<N>` group while `$$et{SET_GROUP1}` is still active) the moment the
+    Condition matches, THEN `ProcessLigoGPS` opens the LigoGPS sub-document (the
+    NEXT ordinal) off the shared `DOC_COUNT`. So a leading Kingslim sample is
+    `Doc1`-timing + `Doc2`-LIGO. `ProcessLigoGPS` then `delete`s `$$et{SET_GROUP1}`
+    (LigoGPS.pm:266) WITHOUT restoring `Track$num`, so every FOLLOWING matched
+    sample's timing rides the DEFAULT `QuickTime` group (ground-truth `-ee -G3:1`:
+    pure `[kingslim, kingslim]` ⇒ `Doc1:Track1`-timing, `Doc2:LIGO`,
+    `Doc3:QuickTime`-timing, `Doc4:LIGO`).
     """
     d = bytearray(240)
     d[24] = ord("A")
@@ -228,6 +238,35 @@ def kingslim_sample() -> bytes:
     d[80:92] = b"LIGOGPSINFO\0"
     rec = b"\x00\x00\x00\x00" + b"2024/01/15 10:00:00 N:45.5 E:170.5 30.0"
     d[100:100 + len(rec)] = rec
+    return bytes(d)
+
+
+def kingslim_no_ligo_record_sample() -> bytes:
+    """A `gpmd` sample that MATCHES the Kingslim Condition (`^.{21}\\0\\0\\0A[NS][EW]`,
+    QuickTimeStream.pl:183) and carries a `LIGOGPSINFO\\0` block (so `ProcessFreeGPS`
+    routes to the GPSType-5 `ProcessLigoGPS` arm), but whose record region is
+    UNPARSEABLE — `ProcessLigoGPS`'s per-record loop (LigoGPS.pm:301-316) matches
+    neither the `####` encrypted prefix nor the `^.{4}\\d{4}/\\d{2}/\\d{2} ` plain
+    ASCII date, so it decodes NOTHING and never reaches the `delete $$et{SET_GROUP1}`
+    at LigoGPS.pm:266.
+
+    This is the #328 Finding 2 ground-truth: a Kingslim Condition-match that yields
+    NO LigoGPS output must NOT clear `$$et{SET_GROUP1}`. ExifTool's `FoundSomething`
+    still opens this sample's timing `Doc<N>` (the Condition matched), but
+    `ProcessLigoGPS` consumes NO second doc, so a FOLLOWING valid sample is `Doc2`
+    (not `Doc3`) and rides `Track<N>` (not `QuickTime`) — verified vs bundled
+    ExifTool 13.59 `-ee -G3:1`: `[this, valid FMAS]` ⇒ `Doc1:Track1`-timing,
+    `Doc2:Track1`-timing + `Doc2:Track1` FMAS GPS (the SET_GROUP1 delete did NOT
+    run, so the FMAS fix stays `Track1`). The record bytes are `0xFF`-filled so
+    neither LigoGPS record form matches.
+    """
+    d = bytearray(240)
+    d[24] = ord("A")
+    d[25] = ord("N")
+    d[26] = ord("W")
+    d[80:92] = b"LIGOGPSINFO\0"  # routes to ProcessLigoGPS …
+    for i in range(100, 240):     # … but the record region parses to nothing.
+        d[i] = 0xFF
     return bytes(d)
 
 
@@ -367,23 +406,73 @@ def main() -> None:
     # FIRST (empty) sample's `SampleTime "0 s"`. Pins the `gpmd` per-MATCHED-sample
     # Doc/timing semantics (the timing-only marker).
     #
+    # PURE-Kingslim `gpmd` track: two Kingslim (LigoGPS) samples. Each consumes
+    # TWO docs — a `FoundSomething` timing doc then a `ProcessLigoGPS` LigoGPS doc.
+    # The FIRST sample's timing rides `Track1` (`$$et{SET_GROUP1}` still active),
+    # but its `ProcessLigoGPS` `delete`s the key (LigoGPS.pm:266) WITHOUT restoring
+    # `Track1`, so the SECOND sample's timing rides the DEFAULT `QuickTime` group:
+    # `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing, `Doc4:LIGO`
+    # (ground-truth `-ee -G3:1`). Proves the `Track<N>`→`QuickTime` SET_GROUP1 flip;
+    # at `-ee -G1` it yields BOTH `Track1:SampleTime "0 s"` (min-doc of the `Track1`
+    # group) AND `QuickTime:SampleTime "1.00 s"` (min-doc of the `QuickTime` group).
+    #
     # MIXED-source `gpmd` track: a Kingslim (LigoGPS) sample, then a matched-empty
     # FMAS sample, then ANOTHER Kingslim sample. The Kingslim GPS lives in a
-    # LigoGPS sub-document (`Doc1` / `Doc3`); the matched-empty FMAS sample emits a
-    # timing-only `Doc2`. ExifTool's `ProcessSamples` emits each sample in walk (=
-    # `Doc<N>`) order, so `Doc1`-LIGO precedes `Doc2`-timing precedes `Doc3`-LIGO.
-    # exifast decodes the LigoGPS records and the FMAS marker into SEPARATE typed
-    # sinks, so this is the order-sensitive proof that the unified `gpmd`
-    # doc-ordered merge interleaves the `gpmd`-dispatched LigoGPS records with the
-    # timing-only markers (a Kingslim sample BEFORE *and* AFTER the FMAS marker).
+    # LigoGPS sub-document (`Doc2` / `Doc5`); the FIRST Kingslim sample's timing is
+    # `Doc1:Track1`, the matched-empty FMAS sample emits a timing-only `Doc3`, and
+    # — because the first Kingslim `ProcessLigoGPS` already `delete`d
+    # `$$et{SET_GROUP1}` — BOTH the FMAS marker (`Doc3`) and the second Kingslim
+    # sample's timing (`Doc4`) ride the DEFAULT `QuickTime` group (ground-truth
+    # `-ee -G3:1`: `Doc1:Track1`-timing, `Doc2:LIGO`, `Doc3:QuickTime`-timing,
+    # `Doc4:QuickTime`-timing, `Doc5:LIGO`). ExifTool's `ProcessSamples` emits each
+    # sample in walk (= `Doc<N>`) order; exifast decodes the LigoGPS records and the
+    # timing markers into SEPARATE typed sinks, so this is the order-sensitive proof
+    # that the unified `gpmd` doc-ordered merge interleaves them (a Kingslim sample
+    # BEFORE *and* AFTER the FMAS marker, with the SET_GROUP1 group flip).
     for name, samples in [
         (
             "QuickTime_fmas_empty_then_valid.mov",
             [fmas_matched_empty_sample(), fmas_sample()],
         ),
         (
+            "QuickTime_gpmd_kingslim_pure.mov",
+            [kingslim_sample(), kingslim_sample()],
+        ),
+        (
             "QuickTime_gpmd_kingslim_fmas_mixed.mov",
             [kingslim_sample(), fmas_matched_empty_sample(), kingslim_sample()],
+        ),
+        # KINGSLIM-then-VALID-FMAS `gpmd` track (#328 Finding 1): a Kingslim
+        # (LigoGPS) sample FOLLOWED BY a VALID FMAS sample that decodes a REAL GPS
+        # fix (NOT an empty marker). The first Kingslim `ProcessLigoGPS` emits its
+        # fix (reaching LigoGPS.pm:266) and `delete`s `$$et{SET_GROUP1}` WITHOUT
+        # restoring `Track1`, so the FOLLOWING FMAS sample's `FoundSomething`
+        # timing AND its decoded GPS columns ride the DEFAULT `QuickTime` group —
+        # NOT `Track1`. Ground-truth bundled ExifTool 13.59 `-ee -G3:1`:
+        # `Doc1:Track1`-timing, `Doc2:LIGO`, then `Doc3:QuickTime:SampleTime`
+        # +`Doc3:QuickTime:GPSLatitude`/`GPSLongitude`/`GPSSpeed`/`GPSTrack`/
+        # `Accelerometer` (the FMAS fix, post-LigoGPS). At `-ee -G1` the `QuickTime`
+        # group's min-doc is the FMAS sample, so it keeps `QuickTime:SampleTime
+        # "1.00 s"` next to the FMAS `QuickTime:GPS*`; `Track1` keeps the Kingslim
+        # `"0 s"` + `LIGO:GPS*`. Proves the SET_GROUP1 flip reaches a DECODED fix,
+        # not only the matched-empty markers.
+        (
+            "QuickTime_gpmd_kingslim_fmas_valid.mov",
+            [kingslim_sample(), fmas_sample()],
+        ),
+        # KINGSLIM-MATCH-but-NO-LIGOGPS-OUTPUT then VALID-FMAS (#328 Finding 2):
+        # the first sample matches the Kingslim Condition + routes to
+        # `ProcessLigoGPS` (it has a `LIGOGPSINFO\0` block) but its record is
+        # unparseable, so NO fix is emitted and the `delete $$et{SET_GROUP1}`
+        # (LigoGPS.pm:266) NEVER runs. ExifTool opens only the sample's timing
+        # `Doc1` (no LigoGPS doc), so the FOLLOWING valid FMAS sample is `Doc2`
+        # and — because SET_GROUP1 stayed active — rides `Track1`. Ground-truth
+        # bundled `-ee -G3:1`: `Doc1:Track1`-timing, `Doc2:Track1`-timing +
+        # `Doc2:Track1` FMAS GPS (NO Doc skipped for an un-emitted LigoGPS, NO
+        # QuickTime flip). Proves the flag flips only AFTER LigoGPS actually ran.
+        (
+            "QuickTime_gpmd_kingslim_noligo_fmas.mov",
+            [kingslim_no_ligo_record_sample(), fmas_sample()],
         ),
     ]:
         data = build_gpmd_mov(samples)
