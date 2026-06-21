@@ -171,3 +171,86 @@ fn image_editing_string_keyed_173() {
     TagValue::Str("0 0 0 0".into())
   );
 }
+
+#[test]
+fn hue_p1_311() {
+  // 0x0067 Hue — Pentax.avi: raw 1 => "Normal" (text label); `-n` => 1.
+  let conv = PentaxPrintConv::Hash(super::super::tags::HUE);
+  assert_eq!(conv.apply(&u(&[1]), true), TagValue::Str("Normal".into()));
+  assert_eq!(conv.apply(&u(&[1]), false), TagValue::I64(1));
+  // An INTEGER label (`0 => -2`) is stored as decimal text; the JSON number gate
+  // renders it as the bare number -2 (not a quoted string).
+  let v = conv.apply(&u(&[0]), true);
+  assert_eq!(v, TagValue::Str("-2".into()));
+  assert!(
+    crate::value::escape_json_is_number(match &v {
+      TagValue::Str(s) => s,
+      _ => unreachable!(),
+    }),
+    "Hue integer label renders as a bare JSON number"
+  );
+  // 65535 => "None".
+  assert_eq!(conv.apply(&u(&[65535]), true), TagValue::Str("None".into()));
+}
+
+#[test]
+fn monochrome_filter_effect_and_toning_p1_311() {
+  // 0x0073 / 0x0074 — Pentax.avi: raw 65535 => "None"; `-n` => 65535.
+  let mfe = PentaxPrintConv::Hash(super::super::tags::MONOCHROME_FILTER_EFFECT);
+  assert_eq!(mfe.apply(&u(&[65535]), true), TagValue::Str("None".into()));
+  assert_eq!(mfe.apply(&u(&[65535]), false), TagValue::I64(65535));
+  assert_eq!(mfe.apply(&u(&[1]), true), TagValue::Str("Green".into()));
+  let mt = PentaxPrintConv::Hash(super::super::tags::MONOCHROME_TONING);
+  assert_eq!(mt.apply(&u(&[65535]), true), TagValue::Str("None".into()));
+  // Integer label `4 => 0` renders as the bare number 0.
+  assert_eq!(mt.apply(&u(&[4]), true), TagValue::Str("0".into()));
+  assert_eq!(mt.apply(&u(&[0]), true), TagValue::Str("-4".into()));
+}
+
+#[test]
+fn cross_process_p1_311() {
+  // 0x007b CrossProcess — Pentax.avi: raw 0 => "Off"; `-n` => 0.
+  let conv = PentaxPrintConv::Hash(super::super::tags::CROSS_PROCESS);
+  assert_eq!(conv.apply(&u(&[0]), true), TagValue::Str("Off".into()));
+  assert_eq!(conv.apply(&u(&[0]), false), TagValue::I64(0));
+  assert_eq!(
+    conv.apply(&u(&[33]), true),
+    TagValue::Str("Favorite 1".into())
+  );
+}
+
+#[test]
+fn high_low_key_adj_p1_311() {
+  // 0x006c HighLowKeyAdj — int16s Count 2, StringKeyedHash on the joined pair.
+  // Pentax.avi: [0,0] => "0" (bare number); `-n` => "0 0".
+  let conv = PentaxPrintConv::StringKeyedHash(HIGH_LOW_KEY_ADJ);
+  let raw = RawValue::I64(std::vec![0, 0]);
+  assert_eq!(conv.apply(&raw, true), TagValue::Str("0".into()));
+  assert_eq!(conv.apply(&raw, false), TagValue::Str("0 0".into()));
+  // A negative pair maps to its signed integer label.
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![-4, 0]), true),
+    TagValue::Str("-4".into())
+  );
+}
+
+#[test]
+fn string_leaves_preserve_trailing_spaces_p1_311() {
+  // 0x0230 FirmwareVersion — plain `string` via `None`: the trailing spaces the
+  // K-x writes survive (only the on-disk NUL terminator is trimmed by the
+  // Walker). The empty 0x022e/0x022f Artist/Copyright render as "".
+  let conv = PentaxPrintConv::None;
+  let fw = RawValue::Text {
+    text: "K-x Ver 1.00           ".into(),
+    raw: b"K-x Ver 1.00           ".to_vec().into_boxed_slice(),
+  };
+  assert_eq!(
+    conv.apply(&fw, true),
+    TagValue::Str("K-x Ver 1.00           ".into())
+  );
+  let empty = RawValue::Text {
+    text: std::string::String::new(),
+    raw: std::boxed::Box::default(),
+  };
+  assert_eq!(conv.apply(&empty, true), TagValue::Str("".into()));
+}

@@ -130,15 +130,19 @@ case "$FIX" in
   # `ISOBMFF_iso5_brand.mp4`: the `mvex/mehd` `MovieFragmentSequence` container
   # tag stays unported; the ported `ImageSize`/`Megapixels` are kept.
   ISOBMFF_iso5_brand.mp4) EXCLUDE_ARR+=(-x MovieFragmentSequence) ;;
-  # `Pentax.avi`: the Pentax-AVI MakerNote tail tags + `Composite:LensID` are
-  # unported (the AVI Pentax MakerNote subset); the ported ImageSize/Megapixels/
-  # Duration are kept.
+  # `Pentax.avi`: #311 P1 ports the nine UNCONDITIONAL `%Pentax::Main` scalar
+  # leaves the K-x AVI exercises — `Hue` (0x0067), `HighLowKeyAdj` (0x006c),
+  # `MonochromeFilterEffect` (0x0073), `MonochromeToning` (0x0074),
+  # `CrossProcess` (0x007b), `SerialNumber` (0x0229), `Artist` (0x022e),
+  # `Copyright` (0x022f), `FirmwareVersion` (0x0230) — so they are NO LONGER
+  # excluded (the golden now carries them). Still deferred (binary SubDirectory /
+  # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo leaves
+  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator` and the LensRec
+  # `ExtenderStatus`. The MakerNote-derived `Composite:LensID` stays the
+  # engine-wide deferral. The ported ImageSize/Megapixels/Duration are kept.
   Pentax.avi)
     EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
-                  -x Pentax:Artist -x Pentax:Copyright -x Pentax:CrossProcess \
-                  -x Pentax:ExtenderStatus -x Pentax:FirmwareVersion -x Pentax:HighLowKeyAdj \
-                  -x Pentax:Hue -x Pentax:LevelIndicator -x Pentax:MonochromeFilterEffect \
-                  -x Pentax:MonochromeToning -x Pentax:SerialNumber) ;;
+                  -x Pentax:ExtenderStatus -x Pentax:LevelIndicator) ;;
   # `QuickTime_gopro_gpmf.mp4`: the QuickTime GPSCoordinates Composites (the
   # `LocationInformation`-derived GPS) + the udta atoms this port does not decode
   # (`ItemList:all` = ©too Encoder, `UserData:all` = LocationInformation) + the
