@@ -313,7 +313,17 @@ case "$FIX" in
   # channel) emit byte-exact, so `-x PreviewIFD:all` is REMOVED. The raw SRW image
   # sub-IFDs `SubIFD:all`/`SubIFD1:all` stay deferred (the raw strips + the
   # embedded JpgFromRaw JPEG, not walked).
-  SamsungNX500.srw)
+  # SamsungNX1.srw (#210): the REAL Samsung NX1 raw — the SAME Type2 MakerNote
+  # surface as the NX500 (identical 45 `Samsung:*` leaves incl. the 16 decrypted
+  # #242 Crypt rows, the 8-tag PreviewIFD, and the ported EXIF+lens Composite
+  # chain), so it takes the SAME exclusions as the NX500 arm: drop the deferred
+  # raw SRW image sub-IFDs (`SubIFD:all`/`SubIFD1:all` — the raw strips +
+  # JpgFromRaw JPEG, not walked) and the MakerNote-synthesized Composites
+  # (`LensID`/`WB_RGGBLevels`/`RedBalance`/`BlueBalance`/`CFAPattern`, unported;
+  # `ImageSize`/`Megapixels`, whose `Require`d ImageWidth/Height live in the
+  # deferred `SubIFD1`). exifast emits the residual (IFD0/ExifIFD/Samsung/
+  # PreviewIFD/the 8 ported Composites) byte-exact vs bundled ExifTool 13.59.
+  SamsungNX500.srw | SamsungNX1.srw)
     EXCLUDE_ARR+=(-x SubIFD:all -x SubIFD1:all \
                   -x Composite:LensID -x Composite:WB_RGGBLevels \
                   -x Composite:RedBalance -x Composite:BlueBalance \
