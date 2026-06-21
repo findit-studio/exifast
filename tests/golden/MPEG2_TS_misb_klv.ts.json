@@ -1,0 +1,21 @@
+[
+  {
+    "ExifTool:ExifToolVersion": 13.55,
+    "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
+    "File:FileName": "MPEG2_TS_misb_klv.ts",
+    "File:Directory": "tests/fixtures",
+    "File:FileSize": 5224708,
+    "File:FileModifyDate": "2026:06:21 14:18:30+09:00",
+    "File:FileAccessDate": "2026:06:21 14:18:31+09:00",
+    "File:FileInodeChangeDate": "2026:06:21 14:18:30+09:00",
+    "File:FilePermissions": 100644,
+    "File:FileType": "M2T",
+    "File:FileTypeExtension": "M2T",
+    "File:MIMEType": "video/mpeg",
+    "H264:ImageWidth": 1280,
+    "H264:ImageHeight": 720,
+    "M2TS:Duration": 9.9,
+    "Composite:ImageSize": "1280 720",
+    "Composite:Megapixels": 0.9216
+  }
+]

@@ -11125,6 +11125,8 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_k1_conformance() {
+    check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.json", true);
+    check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.n.json", false);
   check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.json", true);
   check("JPEG_pentax_k1.jpg", "JPEG_pentax_k1.jpg.n.json", false);
 }
@@ -11133,6 +11135,8 @@ fn jpeg_pentax_k1_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_k3_conformance() {
+    check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.json", true);
+    check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.n.json", false);
   check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.json", true);
   check("JPEG_pentax_k3.jpg", "JPEG_pentax_k3.jpg.n.json", false);
 }
@@ -11141,6 +11145,8 @@ fn jpeg_pentax_k3_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_k5_ii_conformance() {
+    check("JPEG_pentax_k5_ii.jpg", "JPEG_pentax_k5_ii.jpg.json", true);
+    check("JPEG_pentax_k5_ii.jpg", "JPEG_pentax_k5_ii.jpg.n.json", false);
   check("JPEG_pentax_k5_ii.jpg", "JPEG_pentax_k5_ii.jpg.json", true);
   check(
     "JPEG_pentax_k5_ii.jpg",
@@ -11153,6 +11159,8 @@ fn jpeg_pentax_k5_ii_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_kp_conformance() {
+    check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.json", true);
+    check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.n.json", false);
   check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.json", true);
   check("JPEG_pentax_kp.jpg", "JPEG_pentax_kp.jpg.n.json", false);
 }
@@ -11161,6 +11169,8 @@ fn jpeg_pentax_kp_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_k70_conformance() {
+    check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.json", true);
+    check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.n.json", false);
   check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.json", true);
   check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.n.json", false);
 }
@@ -11169,6 +11179,32 @@ fn jpeg_pentax_k70_conformance() {
 #[test]
 #[ignore]
 fn jpeg_pentax_ks2_conformance() {
+    check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
+    check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
+}
+
+// #122 — Parrot Anafi drone MP4 with mett metadata track (GPS + flight telemetry)
+#[test]
+#[ignore]
+fn mp4_parrot_anafi_conformance() {
+    check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.json", true);
+    check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.n.json", false);
+}
+
+// #138 — Viofo A119 dashcam with LigoGPS freeGPS atom in MP4
+#[test]
+#[ignore]
+fn mp4_viofo_a119_gps_conformance() {
+    check("MP4_viofo_a119_gps.mp4", "MP4_viofo_a119_gps.mp4.json", true);
+    check("MP4_viofo_a119_gps.mp4", "MP4_viofo_a119_gps.mp4.n.json", false);
+}
+
+// #130 — MPEG-TS with MISB KLV metadata stream
+#[test]
+#[ignore]
+fn mpeg2_ts_misb_klv_conformance() {
+    check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.json", true);
+    check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
 }
