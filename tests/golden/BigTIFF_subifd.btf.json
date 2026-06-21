@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "BigTIFF_subifd.btf",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "BTF",
+  "File:FileTypeExtension": "btf",
+  "File:MIMEType": "image/x-tiff-big",
+  "IFD0:Make": "BigCam",
+  "IFD0:Model": "BTF-1",
+  "ExifOffset:ExposureTime": "1/200",
+  "ExifOffset:FNumber": 4.0,
+  "ExifOffset:ISO": 400,
+  "ExifOffset:ExifVersion": "0232",
+  "GPSInfo:InteropIndex": "Unknown (N)",
+  "GPSInfo:InteropVersion": "37 48 30",
+  "Composite:Aperture": 4.0,
+  "Composite:ShutterSpeed": "1/200",
+  "Composite:LightValue": 9.6
+}]
