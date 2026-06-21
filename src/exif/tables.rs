@@ -309,11 +309,15 @@ impl ExifTag {
   /// attributes rather than threading a field through all ~215 table literals
   /// (incl. the generated shadow, which the xtask owns).
   ///
-  /// Currently ONLY `ThumbnailOffset` (0x0201) — the camera-relevant IFD1
+  /// The id-DEFAULT spec — `ThumbnailOffset` (0x0201) → the camera-relevant IFD1
   /// thumbnail (`Exif.pm:1168-1171`, `OffsetPair => 0x202`,
-  /// `DataTag => 'ThumbnailImage'`). The other `DataTag` offsets in
-  /// `%Exif::Main` (`PreviewImageStart`/`JpgFromRawStart`/`OtherImageStart`,
-  /// `Exif.pm:649-679`) are P2/P3 follow-ups (#331); when ported, extend this.
+  /// `DataTag => 'ThumbnailImage'`). The CONDITIONAL `PreviewImage` arms — 0x111
+  /// in IFD0/CR2 and 0x201 in IFD0/ARW (`Exif.pm:645-661`/`:1226-1237`, #331-P2)
+  /// — depend on `$$self{TIFF_TYPE}` + `DIR_NAME`, so they live in the
+  /// context-aware [`exif_main_data_tag_spec_in_context`]; this id-only method
+  /// returns the default the walker uses when no context override applies. The
+  /// remaining `%Exif::Main` `DataTag` offsets (`JpgFromRawStart`/`OtherImageStart`,
+  /// `Exif.pm:674-679`) are P3 follow-ups (#331); when ported, extend both.
   #[must_use]
   #[inline]
   pub const fn data_tag_spec(&self) -> Option<DataTagSpec> {
@@ -325,6 +329,89 @@ impl ExifTag {
       _ => None,
     }
   }
+}
+
+/// The conditional `Name` override for a `%Exif::Main` offset/length leaf whose
+/// id is a `Condition`-list entry — `Exif.pm`'s `0x111`/`0x117`/`0x201`/`0x202`
+/// are CONDITIONAL TAG LISTS that resolve to a DIFFERENT name depending on
+/// `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}`. The port's static table carries the
+/// most-common name (`StripOffsets`/`StripByteCounts` for 0x111/0x117,
+/// `ThumbnailOffset`/`ThumbnailLength` for 0x201/0x202); this reproduces the two
+/// camera-relevant `PreviewImage` arms (#331-P2):
+///
+///  - 0x111 → `PreviewImageStart` / 0x117 → `PreviewImageLength` in **IFD0 of a
+///    CR2** (`Exif.pm:645-661`/`:742-758`, `Condition => '$$self{TIFF_TYPE} eq
+///    "CR2"'`). The DEFAULT `StripOffsets` arm explicitly EXCLUDES this case
+///    (`not ($$self{TIFF_TYPE} eq 'CR2' and $$self{DIR_NAME} eq 'IFD0')`,
+///    `Exif.pm:643`), so a CR2 IFD0 falls through to the `PreviewImageStart` arm.
+///  - 0x201 → `PreviewImageStart` / 0x202 → `PreviewImageLength` in **IFD0 of an
+///    ARW or SR2** (`Exif.pm:1226-1237`, `Condition => '$$self{DIR_NAME} eq
+///    "IFD0" and $$self{TIFF_TYPE} =~ /^(ARW|SR2)$/'`). The FIRST (ThumbnailOffset)
+///    arm matches only IFD1 / RIFF-MOV-IFD0, so an ARW IFD0 reaches this arm.
+///
+/// `None` ⇒ the table default name is correct (every IFD1 thumbnail keeps
+/// `ThumbnailOffset`/`Length`; the DNG SubIFD strips keep `StripOffsets`/
+/// `StripByteCounts` — its 0x111 has no `Compression=7`, so the plain
+/// `StripOffsets` arm wins, `Exif.pm:639-653`). Pure (id + the two `DataMember`
+/// gates), so the walker threads `in_ifd0`/`tiff_type` at the resolution site.
+#[must_use]
+#[inline]
+pub fn exif_main_offset_name_override(
+  tag_id: u16,
+  in_ifd0: bool,
+  tiff_type: Option<&str>,
+) -> Option<&'static str> {
+  if !in_ifd0 {
+    return None;
+  }
+  match tag_id {
+    0x0111 if tiff_type == Some("CR2") => Some("PreviewImageStart"),
+    0x0117 if tiff_type == Some("CR2") => Some("PreviewImageLength"),
+    0x0201 if matches!(tiff_type, Some("ARW" | "SR2")) => Some("PreviewImageStart"),
+    0x0202 if matches!(tiff_type, Some("ARW" | "SR2")) => Some("PreviewImageLength"),
+    _ => None,
+  }
+}
+
+/// The `%Exif::Main` `OffsetPair`/`DataTag` spec for an offset leaf, RESOLVED in
+/// the IFD's `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` context — the conditional
+/// analogue of [`ExifTag::data_tag_spec`] (which returns only the static
+/// `ThumbnailImage` default keyed by id). Mirrors the [`exif_main_offset_name_override`]
+/// rename:
+///
+///  - IFD0 of a CR2: 0x111 → `OffsetPair => 0x117`, `DataTag => 'PreviewImage'`
+///    (`Exif.pm:645-661`).
+///  - IFD0 of an ARW/SR2: 0x201 → `OffsetPair => 0x202`, `DataTag => 'PreviewImage'`
+///    (`Exif.pm:1226-1237`) — overriding the id-default `ThumbnailImage`.
+///  - otherwise: the id-default (`ThumbnailOffset` 0x201 → `ThumbnailImage`).
+///
+/// So an IFD1 thumbnail still yields `ThumbnailImage`; only a CR2/ARW/SR2 IFD0
+/// preview leaf yields `PreviewImage`. `None` ⇒ no `DataTag` binary for this id.
+#[must_use]
+#[inline]
+pub fn exif_main_data_tag_spec_in_context(
+  tag: &ExifTag,
+  in_ifd0: bool,
+  tiff_type: Option<&str>,
+) -> Option<DataTagSpec> {
+  if in_ifd0 {
+    match tag.id {
+      0x0111 if tiff_type == Some("CR2") => {
+        return Some(DataTagSpec {
+          offset_pair: 0x0117,
+          data_tag: "PreviewImage",
+        });
+      }
+      0x0201 if matches!(tiff_type, Some("ARW" | "SR2")) => {
+        return Some(DataTagSpec {
+          offset_pair: 0x0202,
+          data_tag: "PreviewImage",
+        });
+      }
+      _ => {}
+    }
+  }
+  tag.data_tag_spec()
 }
 
 /// `%Image::ExifTool::Nikon::PreviewIFD` (`Nikon.pm:5386-5438`) — the small

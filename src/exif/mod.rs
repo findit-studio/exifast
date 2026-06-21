@@ -6650,6 +6650,29 @@ impl Walker<'_, '_> {
       },
     };
 
+    // ExifTool's `0x111`/`0x117`/`0x201`/`0x202` are CONDITIONAL tag lists whose
+    // resolved `Name` depends on `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` — the
+    // static table holds the common name, so reapply the camera-relevant
+    // `PreviewImage` arms HERE (#331-P2): an IFD0 CR2 0x111/0x117 becomes
+    // `PreviewImageStart`/`Length` (`Exif.pm:645-661`/`:742-758`), and an IFD0
+    // ARW/SR2 0x201/0x202 becomes `PreviewImageStart`/`Length`
+    // (`Exif.pm:1226-1237`) instead of the default `ThumbnailOffset`/`Length`.
+    // CORE-EXIF-SCOPED: the override keys on `%Exif::Main` ids in a core IFD0
+    // walk; a GPS/vendor/PreviewIFD leaf (its own arm above) is untouched, and an
+    // IFD1 thumbnail / a DNG SubIFD strip (not IFD0, or no CR2/ARW `TIFF_TYPE`)
+    // keeps its table name. `tiff_type` is `$$self{TIFF_TYPE}` (the detected
+    // subtype the entry threads in, `ExifTool.pm:8715`, set BEFORE the IFD walk).
+    let name = if matches!(self.active_table, TableRef::Exif)
+      && let Some(renamed) = tables::exif_main_offset_name_override(
+        tag_id,
+        matches!(kind, IfdKind::Ifd0),
+        self.file_type.as_deref(),
+      ) {
+      renamed
+    } else {
+      name
+    };
+
     // `0x0035 PreviewIFD` (`Samsung.pm:307-327`, #242) — a SubDirectory descended
     // IN-WALK, here, while `self.base`/`self.value_offset_base` hold the
     // FixBase-corrected values the Samsung Type2 walk set (Samsung's absolute
@@ -6724,14 +6747,23 @@ impl Walker<'_, '_> {
       // (a) The OFFSET leaf (`ThumbnailOffset` 0x0201, `IsOffset` + `DataTag`).
       //     The offset is read from the post-`add_offset_base` `raw`, so it is
       //     already file-absolute — the `$val[0]` ExifTool hands `ExtractImage`.
-      //     The `DataTag` NAME is table-scoped: `%Exif::Main`'s 0x201 names
-      //     `ThumbnailImage`, but the SAME id under `%Nikon::PreviewIFD` names
-      //     `PreviewImage` (`Nikon.pm:5414`) — both reuse the `ExifTag` row type,
-      //     so the spec is chosen by ACTIVE table (#242), not by `t.id` alone.
+      //     The `DataTag` NAME is table-scoped AND `Condition`-scoped:
+      //       * `%Nikon::PreviewIFD`'s 0x201 names `PreviewImage` (`Nikon.pm:5414`,
+      //         selected by ACTIVE table, #242);
+      //       * `%Exif::Main`'s 0x201 names `ThumbnailImage` in IFD1 but
+      //         `PreviewImage` in IFD0 of an ARW/SR2 (`Exif.pm:1226-1237`), and
+      //         0x111 (no id-default spec) names `PreviewImage` in IFD0 of a CR2
+      //         (`Exif.pm:645-661`) — both selected by `TIFF_TYPE`+`DIR_NAME`
+      //         (#331-P2) via [`tables::exif_main_data_tag_spec_in_context`], which
+      //         falls back to the id-default for every other IFD0/IFD1 leaf.
       let spec = if self.active_table == TableRef::NikonPreviewIfd {
         tables::nikon_preview_ifd_data_tag_spec(tag_id)
       } else {
-        t.data_tag_spec()
+        tables::exif_main_data_tag_spec_in_context(
+          t,
+          matches!(kind, IfdKind::Ifd0),
+          self.file_type.as_deref(),
+        )
       };
       if let Some(spec) = spec
         && let Some(offset) = first_uint(&raw)
@@ -7057,14 +7089,25 @@ const fn is_offset_tag(tag_id: u16) -> bool {
 /// identity) so it can pair offset↔length without rescanning
 /// [`Walker::entries`].
 ///
-/// Currently only `ThumbnailLength` (0x0202), the pair of `ThumbnailOffset`
-/// 0x0201 (`OffsetPair => 0x202`, `Exif.pm:1170`). This is the LENGTH-side
-/// mirror of [`is_offset_tag`]; when a further `DataTag` offset is ported (its
-/// `OffsetPair` length added to `%Exif::Main`), extend BOTH in lockstep with
-/// [`tables::ExifTag::data_tag_spec`].
+/// The two LENGTH ids some [`tables::DataTagSpec::offset_pair`] points at:
+///  - `ThumbnailLength` 0x0202, the pair of `ThumbnailOffset` 0x0201
+///    (`OffsetPair => 0x202`, `Exif.pm:1170`) — ALSO the `PreviewImageLength`
+///    pair of the IFD0/ARW `PreviewImageStart` arm (#331-P2, `Exif.pm:1237`);
+///  - `StripByteCounts` 0x0117, the pair of `StripOffsets`/`PreviewImageStart`
+///    0x0111 (`OffsetPair => 0x117`) — the LENGTH side of the IFD0/CR2
+///    `PreviewImage` arm (#331-P2, `Exif.pm:742-758`).
+///
+/// Recording 0x0117 universally is harmless: the post-pass only CONSUMES a
+/// length when an offset leaf in the SAME emitted directory has a spec naming it
+/// (`length_tag_id`), and 0x0111→0x0117 is a `PreviewImage` pair ONLY for an
+/// IFD0 CR2 — a normal multi-strip `StripByteCounts` is collected but never
+/// paired (no `PreviewImage`/`ThumbnailImage` offset references it), so existing
+/// goldens are unaffected. This is the LENGTH-side mirror of [`is_offset_tag`];
+/// when a further `DataTag` offset is ported, extend BOTH in lockstep with
+/// [`tables::exif_main_data_tag_spec_in_context`].
 #[inline]
 const fn is_offset_pair_length_tag(tag_id: u16) -> bool {
-  matches!(tag_id, 0x0202)
+  matches!(tag_id, 0x0117 | 0x0202)
 }
 
 /// Add the offset base to each integer of an `IsOffset` tag's value

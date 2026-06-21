@@ -205,6 +205,16 @@ const NOT_ACTIVE: &[&str] = &[
   // emits only the structural moov/track scalars + the `Track1:Warning`
   // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
   "CanonRaw_ctmd.cr3",
+  // `DNG_preview_image.dng` (#352/#353) — the #331-P2 PreviewImage fixture set's
+  // DNG member. Its IFD0→SubIFD (0x014a) carries `SubfileType=1` + StripOffsets/
+  // StripByteCounts; the P2 PreviewImage gating is CORRECT (the DNG must — and
+  // does — emit NO PreviewImage, since 0x0111 takes the plain `StripOffsets` arm,
+  // `Exif.pm:639-653`). But exifast does not yet WALK the classic-TIFF `SubIFD`
+  // pointer, so it cannot emit the SubIFD's
+  // SubfileType/ImageWidth/ImageHeight/StripOffsets/StripByteCounts and the full
+  // `-G1` golden is not byte-exact. Accept-deferred to #352 (the SubIFD walk);
+  // the CR2 + ARW members of this set ARE active (the IFD0:PreviewImage proof).
+  "DNG_preview_image.dng",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
@@ -845,7 +855,13 @@ const NOT_ACTIVE: &[&str] = &[
 /// table with the already-active NX500 (different camera/lens/firmware values,
 /// e.g. `LensType` = "Samsung NX 16-50mm F2-2.8 S ED OIS", a populated
 /// `CameraTemperature` = "0.7513126037 C").
-const EXPECTED_ACTIVE_FIXTURES: usize = 558;
+/// 558 → 560 after the #331-P2 PreviewImage fixtures (#352/#353):
+/// `CR2_preview_image.cr2` (IFD0 0x0111/0x0117 → `IFD0:PreviewImage` for a CR2)
+/// and `ARW_preview_image.arw` (IFD0 0x0201/0x0202 → `IFD0:PreviewImage` for an
+/// ARW) both activate byte-exact — the IFD0:PreviewImage proof of the `DataTag`
+/// P2 wiring. The set's `DNG_preview_image.dng` is NOT_ACTIVE (its SubIFD walk is
+/// deferred to #352), so the bump is +2 (not +3).
+const EXPECTED_ACTIVE_FIXTURES: usize = 560;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
