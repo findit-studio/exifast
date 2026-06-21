@@ -64,6 +64,17 @@ pub enum TableRef {
   Pentax,
   /// `%Samsung::Type2`.
   Samsung,
+  /// `%Image::ExifTool::Nikon::PreviewIFD` (`Nikon.pm:5386-5438`) — the small
+  /// preview-image sub-IFD an SRW raw's Samsung `0x0035` SubDirectory descends
+  /// into (#242). The rows REUSE the `%Exif::Main` leaf type
+  /// ([`crate::exif::tables::ExifTag`] — they reference the standard EXIF
+  /// PrintConvs), so a resolved leaf rides in
+  /// [`ResolvedConv::Exif`](crate::exif::ResolvedConv::Exif) and renders through
+  /// the core Exif machinery; the table supplies only the renamed
+  /// `PreviewImageStart`/`Length` pair and its `DataTag => 'PreviewImage'`.
+  /// Walked under `ByteOrder => Unknown` with the family-1 group `PreviewIFD`
+  /// (applied by the Samsung capture, not the walker).
+  NikonPreviewIfd,
   /// One of `%Panasonic::Leica2`..`Leica9` — the Leica MakerNote variant
   /// tables (`Panasonic.pm:1604-2256`). The payload selects which of the SIX
   /// distinct tables (Leica7 reuses `%Leica6`, Leica8 reuses `%Leica5`); the

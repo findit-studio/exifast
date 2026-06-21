@@ -130,15 +130,19 @@ case "$FIX" in
   # `ISOBMFF_iso5_brand.mp4`: the `mvex/mehd` `MovieFragmentSequence` container
   # tag stays unported; the ported `ImageSize`/`Megapixels` are kept.
   ISOBMFF_iso5_brand.mp4) EXCLUDE_ARR+=(-x MovieFragmentSequence) ;;
-  # `Pentax.avi`: the Pentax-AVI MakerNote tail tags + `Composite:LensID` are
-  # unported (the AVI Pentax MakerNote subset); the ported ImageSize/Megapixels/
-  # Duration are kept.
+  # `Pentax.avi`: #311 P1 ports the nine UNCONDITIONAL `%Pentax::Main` scalar
+  # leaves the K-x AVI exercises — `Hue` (0x0067), `HighLowKeyAdj` (0x006c),
+  # `MonochromeFilterEffect` (0x0073), `MonochromeToning` (0x0074),
+  # `CrossProcess` (0x007b), `SerialNumber` (0x0229), `Artist` (0x022e),
+  # `Copyright` (0x022f), `FirmwareVersion` (0x0230) — so they are NO LONGER
+  # excluded (the golden now carries them). Still deferred (binary SubDirectory /
+  # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo leaves
+  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator` and the LensRec
+  # `ExtenderStatus`. The MakerNote-derived `Composite:LensID` stays the
+  # engine-wide deferral. The ported ImageSize/Megapixels/Duration are kept.
   Pentax.avi)
     EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
-                  -x Pentax:Artist -x Pentax:Copyright -x Pentax:CrossProcess \
-                  -x Pentax:ExtenderStatus -x Pentax:FirmwareVersion -x Pentax:HighLowKeyAdj \
-                  -x Pentax:Hue -x Pentax:LevelIndicator -x Pentax:MonochromeFilterEffect \
-                  -x Pentax:MonochromeToning -x Pentax:SerialNumber) ;;
+                  -x Pentax:ExtenderStatus -x Pentax:LevelIndicator) ;;
   # `QuickTime_gopro_gpmf.mp4`: the QuickTime GPSCoordinates Composites (the
   # `LocationInformation`-derived GPS) + the udta atoms this port does not decode
   # (`ItemList:all` = ©too Encoder, `UserData:all` = LocationInformation) + the
@@ -187,7 +191,7 @@ case "$FIX" in
   QuickTime_insta360_badstride.mp4 | QuickTime_insta360_chained.mp4 | \
   QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
   QuickTime_fmas_n2s.mov | QuickTime_wolfbox_redtiger_f9.mov | \
-  QuickTime_fmas_empty_then_valid.mov | \
+  QuickTime_fmas_empty_then_valid.mov | MP4_viofo_a119_gps.mp4 | \
   QuickTime_text_mini0806.mov | QuickTime_text_roadhawk.mov | \
   QuickTime_text_thinkware.mov | QuickTime_text_dji_telemetry.mov | \
   QuickTime_text_empty_then_valid.mov | \
@@ -307,10 +311,24 @@ case "$FIX" in
   #    so exifast has no bare `ImageWidth` to build them (it carries only
   #    `ExifIFD:ExifImageWidth`, a `Desire`). A documented sub-IFD deferral.
   # (NOT `-x Composite:all`, which the conformance `EXCLUDE` env previously used.)
-  # The non-Composite SRW/PreviewIFD sub-IFD deferrals (`PreviewIFD:all`/
-  # `SubIFD:all`/`SubIFD1:all`) are retained.
-  SamsungNX500.srw)
-    EXCLUDE_ARR+=(-x PreviewIFD:all -x SubIFD:all -x SubIFD1:all \
+  # #242: the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD is now WALKED — its 8
+  # tags (SubfileType/XResolution/YResolution/ResolutionUnit/PreviewImageStart/
+  # PreviewImageLength/YCbCrPositioning + the PreviewImage blob via the DataTag
+  # channel) emit byte-exact, so `-x PreviewIFD:all` is REMOVED. The raw SRW image
+  # sub-IFDs `SubIFD:all`/`SubIFD1:all` stay deferred (the raw strips + the
+  # embedded JpgFromRaw JPEG, not walked).
+  # SamsungNX1.srw (#210): the REAL Samsung NX1 raw — the SAME Type2 MakerNote
+  # surface as the NX500 (identical 45 `Samsung:*` leaves incl. the 16 decrypted
+  # #242 Crypt rows, the 8-tag PreviewIFD, and the ported EXIF+lens Composite
+  # chain), so it takes the SAME exclusions as the NX500 arm: drop the deferred
+  # raw SRW image sub-IFDs (`SubIFD:all`/`SubIFD1:all` — the raw strips +
+  # JpgFromRaw JPEG, not walked) and the MakerNote-synthesized Composites
+  # (`LensID`/`WB_RGGBLevels`/`RedBalance`/`BlueBalance`/`CFAPattern`, unported;
+  # `ImageSize`/`Megapixels`, whose `Require`d ImageWidth/Height live in the
+  # deferred `SubIFD1`). exifast emits the residual (IFD0/ExifIFD/Samsung/
+  # PreviewIFD/the 8 ported Composites) byte-exact vs bundled ExifTool 13.59.
+  SamsungNX500.srw | SamsungNX1.srw)
+    EXCLUDE_ARR+=(-x SubIFD:all -x SubIFD1:all \
                   -x Composite:LensID -x Composite:WB_RGGBLevels \
                   -x Composite:RedBalance -x Composite:BlueBalance \
                   -x Composite:CFAPattern -x Composite:ImageSize \

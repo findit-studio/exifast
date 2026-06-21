@@ -452,3 +452,60 @@ fn conditional_leaf_173_leaves_are_structurally_handled() {
   // so routing pre-#173 / unported ids through it does not change any output.
   assert!(!ConditionalLeaf::EmitUnported.is_suppressed());
 }
+
+/// #311 P1 — the nine UNCONDITIONAL `%Pentax::Main` scalar leaves the K-x
+/// `Pentax.avi` fixture exercises resolve via [`lookup`] with the right name,
+/// are plain leaves (no SubDirectory), and — having NO `Pentax.pm` `Condition`
+/// — route through the `conditional_leaf` catch-all as `EmitUnported` (which is
+/// NOT suppressed, so they emit unconditionally). The `pentax_tags_sorted_and_
+/// unique` test above proves their ids keep the table strictly sorted (the
+/// `lookup` binary-search precondition).
+#[test]
+fn pentax_p1_main_scalar_leaves() {
+  use crate::exif::ifd::Format;
+  let expected: &[(u16, &str)] = &[
+    (0x0067, "Hue"),
+    (0x006c, "HighLowKeyAdj"),
+    (0x0073, "MonochromeFilterEffect"),
+    (0x0074, "MonochromeToning"),
+    (0x007b, "CrossProcess"),
+    (0x0229, "SerialNumber"),
+    (0x022e, "Artist"),
+    (0x022f, "Copyright"),
+    (0x0230, "FirmwareVersion"),
+  ];
+  for &(id, name) in expected {
+    let tag = lookup(id).unwrap_or_else(|| panic!("{id:#06x} {name} row missing"));
+    assert_eq!(tag.name(), name, "{id:#06x} name");
+    assert_eq!(tag.sub_table(), None, "{id:#06x} is a plain leaf");
+    assert!(!tag.is_unknown(), "{id:#06x} not Unknown");
+    // No `Pentax.pm` Condition ⇒ the catch-all (`EmitUnported`), never suppressed.
+    assert_eq!(
+      conditional_leaf(id, 1, Some("PENTAX K-x"), None, Format::Int16u),
+      ConditionalLeaf::EmitUnported,
+      "{id:#06x} is unconditional"
+    );
+  }
+  // The five enum-hash leaves carry an int-keyed `Hash`; `HighLowKeyAdj` is the
+  // one space-joined `StringKeyedHash`; the four `string` leaves are `None`.
+  assert!(matches!(
+    lookup(0x0067).unwrap().conv,
+    PentaxPrintConv::Hash(_)
+  ));
+  assert!(matches!(
+    lookup(0x006c).unwrap().conv,
+    PentaxPrintConv::StringKeyedHash(_)
+  ));
+  assert!(matches!(
+    lookup(0x007b).unwrap().conv,
+    PentaxPrintConv::Hash(_)
+  ));
+  assert!(matches!(
+    lookup(0x0229).unwrap().conv,
+    PentaxPrintConv::None
+  ));
+  assert!(matches!(
+    lookup(0x0230).unwrap().conv,
+    PentaxPrintConv::None
+  ));
+}

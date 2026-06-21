@@ -73,7 +73,14 @@ fn lookup_resolves_key_leaves() {
     "Distortion (Unknown Crypt) deferred"
   );
   assert!(lookup(0x0011).is_none(), "OrientationInfo must be deferred");
-  assert!(lookup(0x0035).is_none(), "PreviewIFD must be deferred");
+  // 0x0035 PreviewIFD (#242) is now a SubDirectory pointer to %Nikon::PreviewIFD;
+  // the shared walker descends it (SRW-gated). It carries the `PreviewIfd`
+  // sub_table and no leaf conv of its own.
+  assert_eq!(lookup(0x0035).map(|t| t.name()), Some("PreviewIFD"));
+  assert_eq!(
+    lookup(0x0035).and_then(|t| t.sub_table()),
+    Some(SubTable::PreviewIfd)
+  );
   // 0xa002 SerialNumber is a PLAIN leaf (Phase 1, #210) — in the table; its
   // `$$valPt =~ /^\w{5}/` value-Condition is an emit-time gate
   // (`SamsungPrintConv::condition_holds`), NOT a lookup-time absence.

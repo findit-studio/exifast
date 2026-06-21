@@ -112,15 +112,26 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
-  // #342/#336: the 3 real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS,
-  // MISB KLV M2TS) ship full bundled goldens + #[ignore]'d conformance tests, but
-  // exifast does not yet emit the full tag set (the parsers need completion — #122
-  // Parrot, #138 LigoGPS, #130 MISB). Accept-deferred here until activated; #342
-  // added them but missed this NOT_ACTIVE entry, leaving main red on the
-  // auto-discovered active-fixture parity check.
+  // #345/#211: the GoPro HERO6 gpmd fixture ships a raw bundled golden
+  // (System tags) + #[ignore]'d conformance; exifast does not yet match its
+  // real gpmd GPS track (#211). Accept-deferred until driven.
+  // (#210 `SamsungNX1.srw` was here too but is now ACTIVE: its goldens are
+  // regenerated conventioned via the `gen_golden.sh SamsungNX1.srw` arm and
+  // exifast emits all 45 `Samsung:*` Type2 leaves — the SAME surface as the
+  // already-active NX500 — byte-exact vs bundled ExifTool 13.59.)
+  "QuickTime_gopro_hero6_gpmf.mp4",
+  // #342/#336: two real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS)
+  // ship full bundled goldens + #[ignore]'d conformance tests, but exifast does
+  // not yet emit the full tag set (the parsers need completion — #122 Parrot,
+  // #138 LigoGPS). Accept-deferred here until activated; #342 added them but
+  // missed this NOT_ACTIVE entry, leaving main red on the auto-discovered
+  // active-fixture parity check.
+  // (#130 MISB KLV M2TS was here too but is now ACTIVE: this fixture's PMT
+  // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
+  // PID — and the file carries no SMPTE/MISB universal label, so bundled
+  // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
   "MP4_parrot_anafi.mp4",
   "MP4_viofo_a119_gps.mp4",
-  "MPEG2_TS_misb_klv.ts",
   // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
   // bundled goldens for the #173 MakerNote conditional branches, but their
   // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
@@ -823,7 +834,18 @@ const NOT_ACTIVE: &[&str] = &[
 /// `gpmd`-handler `.mov`s (no-`ee` `.json`/`.n.json` = structural scalars + the
 /// `[minor]` EEWarn, byte-exact); the `-ee` group behavior is pinned in
 /// `tests/timed_metadata_conformance.rs`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 556;
+/// 557 → 558 after `SamsungNX1.srw` (#210) activated — the REAL Samsung NX1 raw
+/// whose goldens are regenerated conventioned (System tags dropped) via the
+/// `gen_golden.sh SamsungNX1.srw` arm (the SAME SubIFD/SubIFD1 + MakerNote-
+/// Composite exclusions as the NX500 arm). exifast emits its full Type2 surface
+/// — all 45 `Samsung:*` leaves (incl. the 16 decrypted #242 Crypt rows), the
+/// 8-tag PreviewIFD, and the 8 ported EXIF+lens Composites — byte-exact vs
+/// bundled in BOTH `.json` and `.n.json`. The Type2 port (#210 leaf + #242
+/// PreviewIFD/Crypt) needed NO gap-closing: the NX1 shares the identical 45-tag
+/// table with the already-active NX500 (different camera/lens/firmware values,
+/// e.g. `LensType` = "Samsung NX 16-50mm F2-2.8 S ED OIS", a populated
+/// `CameraTemperature` = "0.7513126037 C").
+const EXPECTED_ACTIVE_FIXTURES: usize = 558;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

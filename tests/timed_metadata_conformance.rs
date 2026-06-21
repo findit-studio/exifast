@@ -348,6 +348,45 @@ fn wolfbox_redtiger_f9_gpmd_ee_byte_exact() {
   );
 }
 
+// #138 — Viofo A119 dashcam: the LigoGPS freeGPS atom's timed GPS. The 7 GPS
+// samples (`Doc<N>:QuickTime:GPS…`, the LigoGPS embedded-in-freeGPS Type-5 path)
+// surface only under `-ee`; the GPS itself is byte-exact at both family-1 and
+// the `Doc<N>` axis.
+//
+// EXCLUDED — the `Track2:Handler*` triplet — is a PRE-EXISTING QuickTime
+// container divergence UNRELATED to LigoGPS (it is identical at no-`ee` and is
+// shared with the deferred `QuickTime_rove_r2_4k.MP4` sibling): this file's audio
+// `trak` carries BOTH a `mdia/hdlr` (`soun` → Media Handler / Audio Track /
+// SoundHandler) AND a nested `minf/hdlr` data-reference handler (`url ` → Data
+// Handler / URL / DataHandler, QuickTime.pm:7319). Bundled keeps the `url `
+// (dref) triplet for the AUDIO track yet keeps the `vide` (media) triplet for the
+// VIDEO track — a handler-dedup asymmetry exifast does not reproduce (it emits the
+// `mdia/hdlr` media triplet for both). Excluded here so the LigoGPS GPS proof is
+// not blocked by that container gap; see the report on #138 for the open blocker.
+const VIOFO_HANDLER_EXCL: &[&str] = &[
+  "Track2:HandlerClass",
+  "Track2:HandlerType",
+  "Track2:HandlerDescription",
+];
+
+#[test]
+fn viofo_a119_ligogps_ee_byte_exact() {
+  // `-ee -G1`: the LAST GPS sample's `QuickTime:GPS…` (movie-level, last-wins).
+  check_ee_excluding(
+    "MP4_viofo_a119_gps.mp4",
+    "MP4_viofo_a119_gps.mp4.ee.json",
+    false,
+    VIOFO_HANDLER_EXCL,
+  );
+  // `-ee -G3:1`: the 7 per-sample `Doc1..Doc7:QuickTime:GPS…` — byte-exact.
+  check_ee_excluding(
+    "MP4_viofo_a119_gps.mp4",
+    "MP4_viofo_a119_gps.mp4.ee.g3.json",
+    true,
+    VIOFO_HANDLER_EXCL,
+  );
+}
+
 // The no-`ee` default path: a `gpmd` trak is `meta`-handler ⇒ fully `-ee` gated,
 // so the only surfaced timed tag is the `Track1:Warning` ([minor] ExtractEmbedded
 // hint, QuickTime.pm `EEWarn`); NO GPS surfaces. Pins that the `gpmd`-variant GPS

@@ -327,6 +327,100 @@ impl ExifTag {
   }
 }
 
+/// `%Image::ExifTool::Nikon::PreviewIFD` (`Nikon.pm:5386-5438`) — the small
+/// preview-image sub-IFD an SRW raw's Samsung `0x0035` SubDirectory dispatches
+/// to (`Samsung.pm:307-327`, #242). The rows REUSE the standard `%Exif::Main`
+/// PrintConvs verbatim (`PrintConv => \%Image::ExifTool::Exif::subfileType` /
+/// `…::compression`, and inline `ResolutionUnit`/`YCbCrPositioning` maps equal
+/// to `%Exif`'s), so each leaf resolves through the SAME [`Conv`] machinery a
+/// core Exif IFD uses — what differs from `%Exif::Main` is only the renamed
+/// offset/length pair (`PreviewImageStart`/`Length`, not `ThumbnailOffset`/
+/// `Length`) and the `DataTag => 'PreviewImage'` it names. The table's
+/// `GROUPS => { 1 => PreviewIFD }` family-1 group is applied by the caller (the
+/// Samsung isolated walker's capture, [`crate::exif`]), not stored here. Sorted
+/// by tag id (binary-search-ready).
+pub const NIKON_PREVIEW_IFD_TAGS: &[ExifTag] = &[
+  // 0xfe SubfileType — `PrintConv => \%Image::ExifTool::Exif::subfileType`.
+  ExifTag {
+    id: 0x00fe,
+    name: "SubfileType",
+    conv: Conv::IntLabel(SUBFILE_TYPE),
+  },
+  // 0x103 Compression — `PrintConv => \%Image::ExifTool::Exif::compression`
+  // (absent from the NX500 body; ported for table completeness).
+  ExifTag {
+    id: 0x0103,
+    name: "Compression",
+    conv: Conv::IntLabel(COMPRESSION),
+  },
+  // 0x11a/0x11b XResolution/YResolution — bare `rational64u`, no PrintConv.
+  ExifTag {
+    id: 0x011a,
+    name: "XResolution",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x011b,
+    name: "YResolution",
+    conv: Conv::None,
+  },
+  // 0x128 ResolutionUnit — inline `{ 1=>None, 2=>inches, 3=>cm }` (== `%Exif`'s).
+  ExifTag {
+    id: 0x0128,
+    name: "ResolutionUnit",
+    conv: Conv::IntLabel(RESOLUTION_UNIT),
+  },
+  // 0x201 PreviewImageStart — `Flags => 'IsOffset'`, `OffsetPair => 0x202`,
+  // `DataTag => 'PreviewImage'`; the offset is paired with the 0x202 length via
+  // the post-IFD DataTag pass into the synthetic `PreviewIFD:PreviewImage`. The
+  // emitted leaf value itself is the bare int32u start offset.
+  ExifTag {
+    id: 0x0201,
+    name: "PreviewImageStart",
+    conv: Conv::None,
+  },
+  // 0x202 PreviewImageLength — `OffsetPair => 0x201`, `DataTag => 'PreviewImage'`.
+  ExifTag {
+    id: 0x0202,
+    name: "PreviewImageLength",
+    conv: Conv::None,
+  },
+  // 0x213 YCbCrPositioning — inline `{ 1=>Centered, 2=>Co-sited }` (== `%Exif`'s).
+  ExifTag {
+    id: 0x0213,
+    name: "YCbCrPositioning",
+    conv: Conv::IntLabel(YCBCR_POSITIONING),
+  },
+];
+
+/// Resolve a `%Nikon::PreviewIFD` tag by id (binary search over
+/// [`NIKON_PREVIEW_IFD_TAGS`]). `None` ⇒ an id not in the table — the walker's
+/// verbose-only omit (`Exif.pm:6757`).
+#[must_use]
+pub fn nikon_preview_ifd_lookup(id: u16) -> Option<&'static ExifTag> {
+  match NIKON_PREVIEW_IFD_TAGS.binary_search_by_key(&id, |t| t.id) {
+    Ok(i) => NIKON_PREVIEW_IFD_TAGS.get(i),
+    Err(_) => None,
+  }
+}
+
+/// The `%Nikon::PreviewIFD` `OffsetPair`/`DataTag` spec for `id`, if it is the
+/// `0x201 PreviewImageStart` offset leaf — `OffsetPair => 0x202`,
+/// `DataTag => 'PreviewImage'` (`Nikon.pm:5414-5421`). Distinct from
+/// [`ExifTag::data_tag_spec`], whose `0x201` names `ThumbnailImage` for
+/// `%Exif::Main`; the DataTag pass selects the spec by ACTIVE table (#242).
+#[must_use]
+#[inline]
+pub const fn nikon_preview_ifd_data_tag_spec(id: u16) -> Option<DataTagSpec> {
+  match id {
+    0x0201 => Some(DataTagSpec {
+      offset_pair: 0x0202,
+      data_tag: "PreviewImage",
+    }),
+    _ => None,
+  }
+}
+
 /// Static PrintConv slice — `%orientation` (`Exif.pm:291-299`).
 const ORIENTATION: &[(i64, &str)] = &[
   (1, "Horizontal (normal)"),
