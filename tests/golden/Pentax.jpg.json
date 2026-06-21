@@ -201,6 +201,7 @@
   "IFD1:ResolutionUnit": "inches",
   "IFD1:ThumbnailOffset": 2418,
   "IFD1:ThumbnailLength": 28,
+  "IFD1:ThumbnailImage": "(Binary data 28 bytes, use -b option to extract)",
   "Composite:Aperture": 13.0,
   "Composite:ImageSize": "8x8",
   "Composite:Megapixels": 0.000064,

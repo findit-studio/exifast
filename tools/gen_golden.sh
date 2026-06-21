@@ -217,45 +217,50 @@ case "$FIX" in
   # `AvgBitrate`). So these goldens KEEP the ported Composites and drop ONLY the
   # unported ones BY NAME (never `Composite:all`), byte-matching exifast — PLUS
   # any non-Composite port deferrals each golden already excluded (the IPTC/
-  # Thumbnail/XMP JPEG segments for `ExifGPS.jpg`/`DJIPhantom4.jpg`; the codec-
-  # config property atoms for `HEIF`/`AVIF`). `ExifGPS.tif` carries only GPS
+  # XMP JPEG segments for `ExifGPS.jpg`/`DJIPhantom4.jpg`; the codec-config
+  # property atoms for `HEIF`/`AVIF`). `IFD1:ThumbnailImage` is NO LONGER
+  # excluded — #331 emits it via the EXIF `DataTag` channel (the IFD1
+  # ThumbnailOffset/ThumbnailLength pair → the `(Binary data N bytes …)`
+  # placeholder), byte-matching bundled. `ExifGPS.tif` carries only GPS
   # Composites + no deferred segments → default path (no arm).
   ExifGPS.jpg)
-    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest -x IFD1:ThumbnailImage) ;;
+    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest) ;;
   # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
   # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). Only the
   # non-Composite port deferrals remain.
   DJIPhantom4.jpg)
-    EXCLUDE_ARR+=(-x XMP:all -x IFD1:ThumbnailImage) ;;
+    EXCLUDE_ARR+=(-x XMP:all) ;;
   # NEW PR-3 arms (these relied on a regen-time `EXCLUDE` env before — now baked
   # in so `tools/gen_golden.sh <fix>` reproduces them with no env). Each drops
   # only the unported lens/MakerNote Composites by name.
-  # NikonD2Hs also drops the non-Composite `PreviewIFD:all` / `IFD1:ThumbnailImage`
-  # / `ExifIFD:CFAPattern` the port defers (these were in its `EXCLUDE` env).
+  # NikonD2Hs also drops the non-Composite `PreviewIFD:all` / `ExifIFD:CFAPattern`
+  # the port defers (these were in its `EXCLUDE` env). `IFD1:ThumbnailImage` is
+  # NOW emitted via the #331 EXIF `DataTag` channel (no longer excluded).
   # PR 4: the full lens chain now builds (NIKON, NOT Canon — the simple
   # `$foc35/$focal` ScaleFactor path: 75/50 = 1.5). The MakerNote-derived
   # Composites (BlueBalance/RedBalance/AutoFocus/LensID/LensSpec) + the non-
   # Composite port deferrals remain.
   NikonD2Hs.jpg)
-    EXCLUDE_ARR+=(-x PreviewIFD:all -x IFD1:ThumbnailImage -x ExifIFD:CFAPattern \
+    EXCLUDE_ARR+=(-x PreviewIFD:all -x ExifIFD:CFAPattern \
                   -x Composite:BlueBalance -x Composite:RedBalance \
                   -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec) ;;
   # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
-  # extraction, unported) + `IFD1:ThumbnailImage` + `PrintIM:PrintIMVersion`
-  # (the same gaps the Nikon golden excludes) — all were in its `EXCLUDE` env.
+  # extraction, unported) + `PrintIM:PrintIMVersion`. `IFD1:ThumbnailImage` is
+  # NOW emitted via the #331 EXIF `DataTag` channel (no longer excluded; the
+  # Pentax:PreviewImage IsOffset binary stays deferred — P2/P3 of #331).
   # PR 4: the full lens chain now builds (PENTAX, NOT Canon — the simple
   # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). The MakerNote `Composite:
   # LensID` + the non-Composite port deferrals remain.
   Pentax.jpg)
     EXCLUDE_ARR+=(-x Pentax:PreviewImageStart -x Pentax:PreviewImage \
-                  -x IFD1:ThumbnailImage -x PrintIM:PrintIMVersion \
+                  -x PrintIM:PrintIMVersion \
                   -x Composite:LensID) ;;
-  # DJI_Matrice30T also drops `IFD1:ThumbnailImage` (was in its `EXCLUDE` env).
-  # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 40/9.1 = 4.3956043956044). No
-  # `Composite:LightValue` (its ISO/aperture combo yields no LV in bundled).
-  DJI_Matrice30T.jpg)
-    EXCLUDE_ARR+=(-x IFD1:ThumbnailImage) ;;
+  # DJI_Matrice30T.jpg: PR 4's full lens chain builds (DJI, NOT Canon — the
+  # simple `$foc35/$focal` ScaleFactor path: 40/9.1 = 4.3956043956044), no
+  # `Composite:LightValue` (its ISO/aperture combo yields no LV in bundled), and
+  # its ONLY former exclusion `IFD1:ThumbnailImage` is NOW emitted via the #331
+  # EXIF `DataTag` channel. With no remaining port deferral it takes the default
+  # path (NO arm) — its golden KEEPS the ThumbnailImage line.
   # The synthesized standalone-EXIF fixtures (#133 PR 3): exifast builds the
   # ported Tier-A Composites (Exif.tif → Aperture/ShutterSpeed; Exif_trailing_
   # space.tif → SubSecDateTimeOriginal) — EXIF is allow-listed. They KEEP those

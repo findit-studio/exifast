@@ -133,6 +133,7 @@
   "IFD1:ThumbnailOffset": 3202,
   "IFD1:ThumbnailLength": 28,
   "IFD1:YCbCrPositioning": 2,
+  "IFD1:ThumbnailImage": "(Binary data 28 bytes, use -b option to extract)",
   "Composite:Aperture": 4,
   "Composite:ImageSize": "8 8",
   "Composite:Megapixels": 6.4e-05,

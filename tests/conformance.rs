@@ -9886,11 +9886,14 @@ fn jpeg_unknown_header_conformance() {
   // the embedded Exif `Base` is rebased by `header_skip`. The golden's
   // `IFD1:ThumbnailOffset` is 90 — the raw IFD value 74 PLUS the TIFF block's
   // file offset 16 (4 junk + 2 `SOI` + 4 `APP1` hdr + 6 `Exif\0\0`), proving
-  // the `IsOffset` rebase still spans the skipped header. The golden is
-  // bundled `tools/gen_golden.sh` output with the deferred binary
-  // `IFD1:ThumbnailImage` body removed (offset/length ARE extracted — the
-  // same JPEG-container deferral as `ExifGPS.jpg`); it carries NO `File:*`
-  // triplet, only the recovered Exif tags + the unknown-header `Warning`.
+  // the `IsOffset` rebase still spans the skipped header — and the rebased
+  // `IFD1:ThumbnailImage` blob (`90 + 4 = 94`) lands inside the EXIF buffer, so
+  // the #331 `DataTag` channel emits the `(Binary data 4 bytes …)` placeholder.
+  // The golden is now PLAIN `tools/gen_golden.sh` output (the old hand-trim that
+  // removed the deferred `IFD1:ThumbnailImage` body is obsolete — it is emitted
+  // faithfully); it still carries NO `File:*` triplet (bundled `DeleteTag`s it
+  // for the unknown-header case), only the recovered Exif tags + the
+  // `IFD1:ThumbnailImage` + the unknown-header `Warning`.
   check(
     "JPEG_unknown_header.jpg",
     "JPEG_unknown_header.jpg.json",
