@@ -1,0 +1,29 @@
+[
+  {
+    "ExifTool:ExifToolVersion": 13.55,
+    "File:FileName": "CR2_preview_image.cr2",
+    "File:Directory": "tests/fixtures",
+    "File:FileSize": 176,
+    "File:FileModifyDate": "2026:06:21 17:33:05+09:00",
+    "File:FileAccessDate": "2026:06:21 17:33:06+09:00",
+    "File:FileInodeChangeDate": "2026:06:21 17:33:05+09:00",
+    "File:FilePermissions": 100644,
+    "File:FileType": "CR2",
+    "File:FileTypeExtension": "CR2",
+    "File:MIMEType": "image/x-canon-cr2",
+    "File:ExifByteOrder": "II",
+    "EXIF:ImageWidth": 100,
+    "EXIF:ImageHeight": 80,
+    "EXIF:Make": "Canon",
+    "EXIF:Model": "Canon EOS",
+    "EXIF:PreviewImageStart": 172,
+    "EXIF:PreviewImageLength": 4,
+    "EXIF:ExposureTime": 0.00625,
+    "EXIF:FNumber": 8,
+    "EXIF:PreviewImage": "(Binary data 4 bytes, use -b option to extract)",
+    "Composite:Aperture": 8,
+    "Composite:ImageSize": "100 80",
+    "Composite:Megapixels": 0.008,
+    "Composite:ShutterSpeed": 0.00625
+  }
+]

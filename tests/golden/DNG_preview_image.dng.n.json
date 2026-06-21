@@ -1,0 +1,26 @@
+[
+  {
+    "ExifTool:ExifToolVersion": 13.55,
+    "File:FileName": "DNG_preview_image.dng",
+    "File:Directory": "tests/fixtures",
+    "File:FileSize": 173,
+    "File:FileModifyDate": "2026:06:21 17:53:05+09:00",
+    "File:FileAccessDate": "2026:06:21 17:53:06+09:00",
+    "File:FileInodeChangeDate": "2026:06:21 17:53:05+09:00",
+    "File:FilePermissions": 100644,
+    "File:FileType": "DNG",
+    "File:FileTypeExtension": "DNG",
+    "File:MIMEType": "image/x-adobe-dng",
+    "File:ExifByteOrder": "II",
+    "EXIF:ImageWidth": 100,
+    "EXIF:ImageHeight": 80,
+    "EXIF:Make": "NIKON",
+    "EXIF:Model": "NIKON D850",
+    "EXIF:DNGVersion": "1 4 0 0",
+    "EXIF:SubfileType": 1,
+    "EXIF:StripOffsets": 169,
+    "EXIF:StripByteCounts": 4,
+    "Composite:ImageSize": "100 80",
+    "Composite:Megapixels": 0.008
+  }
+]
