@@ -829,6 +829,12 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // `Leica:LensType` on a Leica body — distinct from the Leica1/Leica10
     // cross-vendor routes (which emit `Panasonic:*` via `%Panasonic::Main`).
     TableRef::Leica(_) => Some("Leica"),
+    // `%Nikon::PreviewIFD` (#242) — `GROUPS => { 1 => 'PreviewIFD' }`
+    // (`Nikon.pm:5389`). The Samsung `0x0035` descent applies this group
+    // per-emission via [`VendorEmission::group1_override`] (the captured leaves
+    // do not flow through this default-group helper), but the mapping is declared
+    // here for completeness with the other vendor tables.
+    TableRef::NikonPreviewIfd => Some("PreviewIFD"),
     TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
@@ -975,6 +981,10 @@ enum MakerNoteValueConvDecode<'a> {
     order: ByteOrder,
     make: Option<smol_str::SmolStr>,
     model: Option<smol_str::SmolStr>,
+    /// The container's `$$self{TIFF_TYPE}` — the `0x0035 PreviewIFD`
+    /// `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (#242), retained so the
+    /// `-n` recompute descends (or skips) PreviewIFD identically to the `-j` pass.
+    file_type: Option<smol_str::SmolStr>,
   },
   /// Leica2..Leica9 — re-drive the SHARED `Walker`'s Leica variant walk +
   /// emission capture ([`leica_makernote_isolated`]) with `print_conv = false`
@@ -1194,13 +1204,15 @@ impl MakerNoteValueConvDecode<'_> {
         order,
         make,
         model,
+        file_type,
       } => {
         // The `-n` recompute is the isolated walk with `print_conv = false` and
         // the typed slot discarded (the `-n` path needs only the ValueConv
         // emissions), mirroring the other vendors (#210). A blob that walked in
-        // PrintConv walks the SAME way in ValueConv (the `detected` modes are
-        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
-        // the defensive empty `Vec` for the impossible `None`.
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes +
+        // `file_type` gate are PrintConv-independent), so `Some` always holds;
+        // `unwrap_or_default` is the defensive empty `Vec` for the impossible
+        // `None`.
         samsung_makernote_isolated(
           data,
           *mn_offset,
@@ -1209,6 +1221,7 @@ impl MakerNoteValueConvDecode<'_> {
           *order,
           make.as_deref(),
           model.as_deref(),
+          file_type.as_deref(),
           false,
         )
         .map(|(e, _)| e)
@@ -4381,6 +4394,9 @@ impl Walker<'_, '_> {
       // payload). An unknown id yields `None` (the deferred SubDirectory /
       // binary rows are absent from the tables), the verbose-only omit.
       TableRef::Leica(v) => makernotes::vendors::leica::tags::lookup(v, tag_id).map(|t| t.name()),
+      // `%Nikon::PreviewIFD` (#242) — the warning-form name resolves against the
+      // PreviewIFD table (its renamed `PreviewImageStart`/`Length` leaves).
+      TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -6315,8 +6331,12 @@ impl Walker<'_, '_> {
                 // the generic offset-correction one, not the PENTAX make arm).
                 let make = self.captured_make.as_deref();
                 let model = self.captured_model.as_deref();
+                // `$$self{TIFF_TYPE}` for the `0x0035 PreviewIFD`
+                // `Condition => '… eq "SRW"'` gate (#242). `self.file_type` is the
+                // finalized `$$self{FILE_TYPE}` (== `TIFF_TYPE` for SRW, `"SRW"`).
+                let tiff_type = self.file_type.as_deref();
                 if let Some((emi_pc, typed_pc)) = samsung_makernote_isolated(
-                  self.data, mn_offset, mn_len, detected, self.order, make, model, true,
+                  self.data, mn_offset, mn_len, detected, self.order, make, model, tiff_type, true,
                 ) {
                   meta.set_samsung(typed_pc);
                   cached_pc = emi_pc;
@@ -6328,6 +6348,7 @@ impl Walker<'_, '_> {
                     order: self.order,
                     make: make.map(smol_str::SmolStr::new),
                     model: model.map(smol_str::SmolStr::new),
+                    file_type: tiff_type.map(smol_str::SmolStr::new),
                   };
                 }
               }
@@ -6491,9 +6512,18 @@ impl Walker<'_, '_> {
     // `active_table = Gps`) and vendor walks; byte-identical for a normal TIFF
     // (where the IsOffset-bearing IFDs resolve against `Exif`/`Interop`).
     let raw = if self.base != 0
-      && matches!(self.active_table, TableRef::Exif | TableRef::Interop)
+      && matches!(
+        self.active_table,
+        TableRef::Exif | TableRef::Interop | TableRef::NikonPreviewIfd
+      )
       && is_offset_tag(tag_id)
     {
+      // `%Nikon::PreviewIFD`'s `0x201 PreviewImageStart` is `IsOffset`
+      // (`Nikon.pm:5416`), and Samsung's `0x0035` SubDirectory carries no `Base`
+      // ⇒ the child inherits the parent base, so a PreviewIFD reached from a
+      // base-shifted (e.g. JPEG-embedded) walk rebases its preview offset just as
+      // `%Exif::Main`'s `ThumbnailOffset` does. A standalone SRW has `base == 0`
+      // ⇒ a no-op.
       add_offset_base(raw, self.base)
     } else {
       raw
@@ -6602,11 +6632,77 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Leica(v, t)),
         None => return,
       },
+      // `%Nikon::PreviewIFD` (#242) — a small sub-IFD REUSING the `%Exif::Main`
+      // leaf type (the rows carry the standard EXIF PrintConvs), so the resolved
+      // leaf rides in `ResolvedConv::Exif` and renders via `emit_exif_value`
+      // exactly like a core Exif leaf. The PreviewIFD-specific names
+      // (`PreviewImageStart`/`Length`) come from the PreviewIFD table; its
+      // `DataTag => 'PreviewImage'` is selected by ACTIVE table in the DataTag
+      // collection below. An id not in the table is skipped (the verbose-only
+      // omit).
+      TableRef::NikonPreviewIfd => match tables::nikon_preview_ifd_lookup(tag_id) {
+        Some(t) => (t.name, ResolvedConv::Exif(t)),
+        None => return,
+      },
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
       },
     };
+
+    // `0x0035 PreviewIFD` (`Samsung.pm:307-327`, #242) — a SubDirectory descended
+    // IN-WALK, here, while `self.base`/`self.value_offset_base` hold the
+    // FixBase-corrected values the Samsung Type2 walk set (Samsung's absolute
+    // offsets are relative to the maker-note start, so the child IFD at
+    // `$val + Base` resolves only with the correction applied) — exactly as
+    // ExifTool descends the SubDirectory inside `ProcessExif`. The parent pointer
+    // emits NOTHING (`return` after descending), like ExifTool. The descent runs
+    // ONLY for the SRW gate:
+    //   * MAIN arm `$$self{TIFF_TYPE} eq "SRW" and $$self{Model} ne "EK-GN120"`
+    //     ⇒ `Start => '$val'`;
+    //   * EK-GN120 arm `$$self{TIFF_TYPE} eq "SRW"` ⇒ `Start => '$val - 36'`.
+    // `%Nikon::PreviewIFD` is walked under `ByteOrder => Unknown` (probe the child
+    // count word) with NO `Base` (the child inherits `self.base`). Its leaves
+    // resolve to `ResolvedConv::Exif`, appended to `self.entries` at this walk
+    // position; the `0x201`/`0x202` pair is collected into the DataTag channel and
+    // resolved by the post-IFD `finalize_data_tags` pass into `PreviewImage`.
+    if self.active_table == TableRef::Samsung
+      && let ResolvedConv::Samsung(stag) = &conv
+      && stag.sub_table() == Some(makernotes::vendors::samsung::SubTable::PreviewIfd)
+    {
+      if self.file_type.as_deref() == Some("SRW")
+        && let Some(val) = first_uint(&raw)
+      {
+        // `Start => '$val'` (main) / `'$val - 36'` (EK-GN120). `$val` is a
+        // maker-note-relative offset (Samsung's absolute-from-maker-note-start
+        // scheme); the file-absolute child IFD index into `self.data` is
+        // `$val + value_offset_base` — the SAME maker-note-relative → absolute
+        // mapping an out-of-line value pointer uses (`raw_off + value_offset_base`,
+        // `Exif.pm:6546`), since `$val` IS an offset. A degenerate EK-GN120
+        // underflow (`val < 36`) skips the descent (no walkable IFD).
+        let dir_start = if self.captured_model.as_deref() == Some("EK-GN120") {
+          val.checked_sub(36)
+        } else {
+          Some(val)
+        };
+        let abs = dir_start
+          .and_then(|d| i64::try_from(d).ok())
+          .map(|d| d.saturating_add(self.value_offset_base))
+          .and_then(|a| usize::try_from(a).ok());
+        if let Some(start) = abs {
+          self.process_subdir(
+            start,
+            kind,
+            TableRef::NikonPreviewIfd,
+            ByteOrderRule::Unknown,
+            FixBaseMode::No,
+            ProcessProc::Exif,
+          );
+        }
+      }
+      // The SubDirectory pointer itself is never emitted as a value.
+      return;
+    }
 
     // `%offsetInfo` collection (`Exif.pm:7173-7174`): the IFD's `DataTag`
     // offset/length pairs are DEFERRED to the post-IFD [`finalize_data_tags`]
@@ -6628,7 +6724,16 @@ impl Walker<'_, '_> {
       // (a) The OFFSET leaf (`ThumbnailOffset` 0x0201, `IsOffset` + `DataTag`).
       //     The offset is read from the post-`add_offset_base` `raw`, so it is
       //     already file-absolute — the `$val[0]` ExifTool hands `ExtractImage`.
-      if let Some(spec) = t.data_tag_spec()
+      //     The `DataTag` NAME is table-scoped: `%Exif::Main`'s 0x201 names
+      //     `ThumbnailImage`, but the SAME id under `%Nikon::PreviewIFD` names
+      //     `PreviewImage` (`Nikon.pm:5414`) — both reuse the `ExifTag` row type,
+      //     so the spec is chosen by ACTIVE table (#242), not by `t.id` alone.
+      let spec = if self.active_table == TableRef::NikonPreviewIfd {
+        tables::nikon_preview_ifd_data_tag_spec(tag_id)
+      } else {
+        t.data_tag_spec()
+      };
+      if let Some(spec) = spec
         && let Some(offset) = first_uint(&raw)
       {
         self.data_tag_pairs.push(DataTagPair {
@@ -7099,10 +7204,16 @@ impl ExifMeta<'_> {
                 emissions: &[makernotes::VendorEmission]| {
       out.reserve(emissions.len());
       for e in emissions {
+        // The family-1 group: the captured MakerNote's `group1` by default, OR
+        // the emission's own override when set — the Samsung `0x0035 PreviewIFD`
+        // descent emits its `%Nikon::PreviewIFD` leaves under `PreviewIFD`
+        // (`GROUPS => { 1 => PreviewIFD }`) while the sibling Samsung leaves keep
+        // `Samsung` (#242). The family-0 group is always `MakerNotes`.
+        let g1 = e.group1_override().unwrap_or(group1);
         // Carry the emission's `Priority => N` into the `EmittedTag` so the sink
         // applies the general duplicate-override rule (`ExifTool.pm:9544-9560`).
         out.push(crate::emit::EmittedTag::new_with_priority(
-          crate::value::Group::new("MakerNotes", group1),
+          crate::value::Group::new("MakerNotes", g1),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
@@ -7826,6 +7937,143 @@ impl ExifSink for VendorEmissionSink<'_> {
         value,
         unknown,
         priority,
+      ));
+    Ok(())
+  }
+}
+
+/// A CAPTURE sink that turns each CORE-Exif scalar write into a
+/// [`VendorEmission`](makernotes::VendorEmission) under a FIXED family-1 group
+/// override — the bridge letting a `ResolvedConv::Exif` sub-IFD (the Samsung
+/// `0x0035 PreviewIFD` → `%Nikon::PreviewIFD` descent, #242) render through the
+/// SAME `emit_exif_value` machinery a core EXIF leaf uses, yet land in the
+/// MakerNote's cached-emission `Vec` tagged `MakerNotes:PreviewIFD:*`.
+///
+/// Unlike [`VendorEmissionSink`] (whose scalar writers DROP the value — Canon
+/// emissions all go through `write_vendor_value`), THIS sink's scalar writers are
+/// the ACTIVE path: every PreviewIFD leaf plus the synthetic `PreviewImage`
+/// placeholder is a core scalar (`write_str`/`write_u64`/`write_f64`/…), captured
+/// as a [`VendorEmission::new_with_group1`] carrying [`group1`](Self::group1) so
+/// [`ExifMeta::push_maker_note_tags`] emits it under `("MakerNotes", group1)`. The
+/// `_group` argument the core writers pass (the kind-derived `IfdName`) is
+/// DISCARDED — the family-1 group is the fixed override, faithful to
+/// `%Nikon::PreviewIFD`'s `GROUPS => { 1 => PreviewIFD }`.
+#[cfg(feature = "alloc")]
+struct PreviewIfdSink<'v> {
+  /// The destination [`VendorEmission`] buffer (borrowed) — pushed in walk order.
+  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>,
+  /// The family-1 group every captured emission carries (`"PreviewIFD"`).
+  group1: &'static str,
+}
+
+#[cfg(feature = "alloc")]
+impl ExifSink for PreviewIfdSink<'_> {
+  #[inline(always)]
+  fn write_str(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::Str(smol_str::SmolStr::new(value)),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_i64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: i64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::I64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_u64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: u64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::U64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_f64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: f64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::F64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_bytes(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: &[u8],
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::Bytes(value.to_vec()),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_vendor_value_with_priority(
+    &mut self,
+    _family0: &str,
+    _family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+    _priority: u8,
+  ) -> Result<(), core::convert::Infallible> {
+    // Not reached for a `ResolvedConv::Exif` PreviewIFD leaf (those render via
+    // the scalar writers above); kept for trait completeness, applying the same
+    // family-1 override so a future vendor-valued PreviewIFD row would group
+    // correctly.
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        value,
+        unknown,
+        self.group1,
       ));
     Ok(())
   }
@@ -10371,6 +10619,11 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   parent_order: ByteOrder,
   make: Option<&str>,
   model: Option<&str>,
+  // The container's `$$self{TIFF_TYPE}` — the `0x0035 PreviewIFD` SubDirectory's
+  // `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (`Samsung.pm:309`, #242).
+  // `None` (the `from_blob` standalone-blob path / an embedded JPEG body) ⇒ the
+  // SRW gate fails, so PreviewIFD is not descended.
+  file_type: Option<&str>,
   print_conv: bool,
 ) -> Option<(
   std::vec::Vec<makernotes::VendorEmission>,
@@ -10459,8 +10712,11 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Samsung leaf reads `$$self{FILE_TYPE}`.
-    file_type: None,
+    // `$$self{TIFF_TYPE}` for the `0x0035 PreviewIFD`
+    // `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (#242), which
+    // [`Walker::emit`] reads to decide the in-walk PreviewIFD descent. `None` (the
+    // `from_blob` / embedded-JPEG path) ⇒ the SRW gate fails, so no descent.
+    file_type: file_type.map(smol_str::SmolStr::new),
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Samsung)` swaps it to
@@ -10489,9 +10745,26 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     fix_base_mode,
     ProcessProc::Unknown,
   );
+  // The `0x0035 PreviewIFD` SubDirectory (`Samsung.pm:307-327`, #242) is descended
+  // IN-WALK by [`Walker::emit`] — while `w.base`/`w.value_offset_base` hold the
+  // FixBase-corrected values the Type2 walk computed (Samsung's absolute offsets
+  // are relative to the maker-note start) — so the child IFD resolves correctly,
+  // exactly as ExifTool descends it inside `ProcessExif`. The `%Nikon::PreviewIFD`
+  // leaves (all `ResolvedConv::Exif`) land interleaved in `w.entries`; the capture
+  // loop below emits each `ResolvedConv::Exif` entry under the `PreviewIFD`
+  // family-1 group via [`PreviewIfdSink`].
+  //
+  // Resolve the PreviewIFD `0x201`/`0x202` offset pair the in-walk descent
+  // collected into the synthetic `PreviewIFD:PreviewImage` placeholder
+  // (`ExtractImage`, `Exif.pm:6216-6244`), appended to `w.entries`. Inert (a
+  // no-op) when no PreviewIFD was descended (non-SRW / absent / out-of-range) —
+  // `data_tag_pairs` is then empty.
+  w.finalize_data_tags();
   // Capture the walked `ResolvedConv::Samsung` leaves + the PictureWizard child
   // into the vendor-emission `Vec`; build the typed `MakerNotesSamsung` from the
-  // SAME entries (the typed leaf set is disjoint from PictureWizard).
+  // SAME entries (the typed leaf set is disjoint from PictureWizard). The
+  // interleaved `%Nikon::PreviewIFD` leaves (`ResolvedConv::Exif`) are emitted
+  // under the `PreviewIFD` group.
   let g1 = vendor_group1_of(TableRef::Samsung).unwrap_or("Samsung");
   let mut emissions = std::vec::Vec::new();
   let mut typed = MakerNotesSamsung::new();
@@ -10505,10 +10778,34 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     // `$key or return undef`).
     let mut encryption_key: std::vec::Vec<i64> = std::vec::Vec::new();
     for entry in &w.entries {
-      // Only `ResolvedConv::Samsung` entries live in this run; a defensive
-      // non-Samsung conv (never produced under `TableRef::Samsung`) is skipped.
-      let ResolvedConv::Samsung(samsung_tag) = entry.conv else {
-        continue;
+      // The walk produces `ResolvedConv::Samsung` Type2 leaves PLUS — when the
+      // `0x0035 PreviewIFD` SubDirectory was descended in-walk — the
+      // `%Nikon::PreviewIFD` leaves (`ResolvedConv::Exif`) and the synthetic
+      // `PreviewImage` (`&SYNTHETIC_DATA_TAG`, also `ResolvedConv::Exif`). Render a
+      // PreviewIFD `Exif` entry through the SAME `emit_exif_value` a core Exif leaf
+      // uses, capturing the value under the `PreviewIFD` family-1 group
+      // (`%Nikon::PreviewIFD`'s `GROUPS => { 1 => PreviewIFD }`). `parent_order` is
+      // irrelevant to these convs (no `ExifText` row), threaded for the signature.
+      let samsung_tag = match entry.conv {
+        ResolvedConv::Samsung(t) => t,
+        ResolvedConv::Exif(tag) => {
+          let mut pv = PreviewIfdSink {
+            emissions: &mut *sink.emissions,
+            group1: "PreviewIFD",
+          };
+          let Ok(()) = emit_exif_value(
+            "PreviewIFD",
+            entry.name,
+            entry.value.raw(),
+            tag.conv,
+            parent_order,
+            print_conv,
+            &mut pv,
+          );
+          continue;
+        }
+        // A defensive non-Samsung/non-Exif conv (never produced under this walk).
+        _ => continue,
       };
       if let Some(sub) = samsung_tag.sub_table() {
         match sub {
@@ -10524,6 +10821,11 @@ pub(in crate::exif) fn samsung_makernote_isolated(
             };
             samsung::emit_picture_wizard(members, print_conv, &mut *sink.emissions);
           }
+          // `0x0035 PreviewIFD` — the SubDirectory POINTER itself never reaches this
+          // loop: `Walker::emit` descends it in-walk and `return`s without pushing a
+          // `0x0035` entry. The descent's `%Nikon::PreviewIFD` leaves are the
+          // `ResolvedConv::Exif` entries handled above.
+          SubTable::PreviewIfd => {}
         }
         continue;
       }
@@ -19388,6 +19690,9 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         detected,
         ByteOrder::Little,
         Some("SAMSUNG"),
+        None,
+        // This crafted Type2 blob carries no `0x0035 PreviewIFD`; `None` keeps the
+        // SRW PreviewIFD descent inert (the test exercises SerialNumber).
         None,
         print_conv,
       )

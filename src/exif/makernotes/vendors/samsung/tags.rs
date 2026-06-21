@@ -35,6 +35,17 @@
 //! emitting the plaintext space-joined integers byte-exactly to bundled
 //! ExifTool (proven on `tests/fixtures/SamsungNX500.srw`).
 //!
+//! ## The `0x0035 PreviewIFD` SubDirectory (#242)
+//!
+//! `0x0035 PreviewIFD` (`Samsung.pm:307-327`) points (`Flags => 'SubIFD'`,
+//! `ByteOrder => Unknown`, `Start => '$val'`, `GROUPS => { 1 => PreviewIFD }`)
+//! at `%Image::ExifTool::Nikon::PreviewIFD`, gated `$$self{TIFF_TYPE} eq "SRW"`.
+//! The row carries [`SubTable::PreviewIfd`]; the shared `Walker` descends it
+//! IN-WALK (while the Type2 FixBase correction is live) under
+//! [`crate::exif::tables::NIKON_PREVIEW_IFD_TAGS`], emitting the 8 PreviewIFD
+//! tags (incl. the `0x201`/`0x202` → `PreviewIFD:PreviewImage` DataTag pair)
+//! byte-exactly to bundled (proven on `tests/fixtures/SamsungNX500.srw`).
+//!
 //! ## Deferred
 //!
 //! - **The `Unknown => 1` Crypt rows** `0xa048 RawData`, `0xa050 Distortion`,
@@ -42,10 +53,11 @@
 //!   `Hidden` `0xa055`-`0xa057` — every one is `Unknown => 1`, which
 //!   ExifTool suppresses from default `-j` output (`ExifTool.pm:9179-9185`), so
 //!   they are NOT among the 16 emitted and are simply ABSENT from the table.
-//! - **The remaining SubDirectory rows** `0x0011 OrientationInfo` (Gear 360
-//!   only) and `0x0035 PreviewIFD` (a Nikon-PreviewIFD sub-IFD that emits under
-//!   its own `PreviewIFD:` group) — deferred (neither is present in the NX500
-//!   fixture, so neither is camera-indexing-proven; crafted-input only).
+//! - **The remaining SubDirectory row** `0x0011 OrientationInfo` (Gear 360
+//!   only) — deferred (not present in the NX500 fixture, so not
+//!   camera-indexing-proven; crafted-input only). The `0x0035 PreviewIFD`
+//!   EK-GN120 alternate arm (`Start => '$val - 36'`) is handled but unproven
+//!   (no EK-GN120 fixture).
 //!
 //! ## The `0xa002 SerialNumber` value-`Condition`
 //!
@@ -183,6 +195,14 @@ pub enum SubTable {
   /// `ProcessBinaryData` record (`FORMAT => 'int16u'`, `FIRST_ENTRY => 0`)
   /// carrying PictureWizardMode/Color/Saturation/Sharpness/Contrast.
   PictureWizard,
+  /// `%Image::ExifTool::Nikon::PreviewIFD` at `0x0035` (`Samsung.pm:307-327`) —
+  /// a SUB-IFD (`Flags => 'SubIFD'`, `ByteOrder => Unknown`, `Start => '$val'`,
+  /// `GROUPS => { 1 => PreviewIFD }`), gated `$$self{TIFF_TYPE} eq "SRW"` (the
+  /// main arm also `&& Model ne "EK-GN120"`, whose alternate arm uses
+  /// `Start => '$val - 36'`). The Samsung isolated walker descends it on its own
+  /// walker so the child `0x201`/`0x202` offset pair flows through the post-IFD
+  /// DataTag pass into `PreviewIFD:PreviewImage` (#242).
+  PreviewIfd,
 }
 
 /// `%Samsung::Type2` (`Samsung.pm:129-648`) — Phase-1 plain leaves +
@@ -254,6 +274,21 @@ pub const SAMSUNG_TAGS: &[SamsungTag] = &[
     name: "LocationName",
     conv: SamsungPrintConv::None,
     sub_table: None,
+    unknown: false,
+    format: None,
+    crypt: None,
+  },
+  // 0x0035 PreviewIFD (Samsung.pm:307-327) — a SubIFD pointer to
+  // %Nikon::PreviewIFD (`Flags => 'SubIFD'`, `ByteOrder => Unknown`,
+  // `Start => '$val'`, `{ 1 => PreviewIFD }`), gated `TIFF_TYPE eq "SRW"`. NO
+  // `format` override: the on-disk int32u[1] value IS the `$val` start offset
+  // the isolated walker reads to descend the child IFD (#242). The parent
+  // pointer itself emits nothing (`emit_samsung_value` skips SubDirectory rows).
+  SamsungTag {
+    id: 0x0035,
+    name: "PreviewIFD",
+    conv: SamsungPrintConv::None,
+    sub_table: Some(SubTable::PreviewIfd),
     unknown: false,
     format: None,
     crypt: None,

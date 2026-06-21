@@ -598,6 +598,10 @@ impl MakerNotesMeta {
             parent_order,
             make,
             model,
+            // No container `TIFF_TYPE` here (`from_blob` is the standalone-blob
+            // path) ⇒ the `0x0035 PreviewIFD` SRW gate fails, so it is not
+            // descended — and `from_blob` only wants the typed slot anyway (#242).
+            None,
             true,
           )
           .map(|(_emissions, typed)| typed)
