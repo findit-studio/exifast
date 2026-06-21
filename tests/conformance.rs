@@ -11211,12 +11211,14 @@ fn mp4_viofo_a119_gps_conformance() {
   );
 }
 
-// #130 — MPEG-TS with MISB KLV metadata stream
+// #130 — MPEG-TS with MISB KLV metadata stream. This fixture's PMT declares
+// only a type-0x1b H.264 video stream (no type-0x15 packetized-metadata PID),
+// and the file carries no SMPTE/MISB universal label (06 0e 2b 34), so bundled
+// ExifTool 13.59 decodes no MISB KLV tags — even under `-ee`. The byte-exact
+// tag set is the standard M2TS/H264/Composite one exifast already emits (plus
+// the `ExtractEmbedded` Warning); there is nothing to MISB-decode here.
 #[test]
-#[ignore]
 fn mpeg2_ts_misb_klv_conformance() {
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.json", true);
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
-  check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
-  check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
 }
