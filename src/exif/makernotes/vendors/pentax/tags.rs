@@ -569,6 +569,52 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0067 Hue` (`Pentax.pm:2325-2341`) — int16u, unconditional enum hash.
+  PentaxTag {
+    id: 0x0067,
+    name: "Hue",
+    conv: PentaxPrintConv::Hash(HUE),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x006c HighLowKeyAdj` (`Pentax.pm:2371-2388`) — int16s `Count => 2`, a
+  // PrintConv keyed on the SPACE-JOINED `"adj 0"` pair (e.g. `"0 0" => 0`).
+  PentaxTag {
+    id: 0x006c,
+    name: "HighLowKeyAdj",
+    conv: PentaxPrintConv::StringKeyedHash(super::printconv::HIGH_LOW_KEY_ADJ),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0073 MonochromeFilterEffect` (`Pentax.pm:2471-2486`) — int16u enum hash.
+  PentaxTag {
+    id: 0x0073,
+    name: "MonochromeFilterEffect",
+    conv: PentaxPrintConv::Hash(MONOCHROME_FILTER_EFFECT),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0074 MonochromeToning` (`Pentax.pm:2487-2503`) — int16u enum hash.
+  PentaxTag {
+    id: 0x0074,
+    name: "MonochromeToning",
+    conv: PentaxPrintConv::Hash(MONOCHROME_TONING),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x007b CrossProcess` (`Pentax.pm:2565-2578`) — int8u enum hash.
+  PentaxTag {
+    id: 0x007b,
+    name: "CrossProcess",
+    conv: PentaxPrintConv::Hash(CROSS_PROCESS),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
   PentaxTag {
     id: 0x0200,
     name: "BlackPoint",
@@ -734,6 +780,50 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     name: "ColorInfo",
     conv: PentaxPrintConv::None,
     sub_table: Some(SubTable::ColorInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x0229 SerialNumber` (`Pentax.pm:3025-3029`) — `Writable => 'string'`, no
+  // PrintConv/ValueConv. The on-disk `string` is NUL-trimmed (`s/\0.*//s`) with
+  // trailing spaces preserved by the shared `Walker`, then passes through.
+  PentaxTag {
+    id: 0x0229,
+    name: "SerialNumber",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x022e Artist` (`Pentax.pm:3058-3062`) — `string` (K-5/K-x AVI videos;
+  // `Groups => { 2 => 'Author' }`, a family-2 axis not reflected in the
+  // family-1 `Pentax:` token). Left blank by the K-x ⇒ the empty string.
+  PentaxTag {
+    id: 0x022e,
+    name: "Artist",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x022f Copyright` (`Pentax.pm:3063-3067`) — `string`, `Groups => { 2 =>
+  // 'Author' }`. Blank on the K-x ⇒ the empty string.
+  PentaxTag {
+    id: 0x022f,
+    name: "Copyright",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0230 FirmwareVersion` (`Pentax.pm:3068-3076`) — `string`, videos only.
+  // The K-x value `"K-x Ver 1.00"` carries trailing spaces the `string` decode
+  // preserves (only the NUL terminator is trimmed), NOT the EXIF Make/Model/
+  // Software RawConv whitespace trim (that gate is EXIF-only).
+  PentaxTag {
+    id: 0x0230,
+    name: "FirmwareVersion",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
     unknown: false,
     format: None,
   },
@@ -1372,6 +1462,64 @@ pub const RAW_DEVELOPMENT_PROCESS: &[(i64, &str)] = &[
   (19, "19 (GR III)"),
   (20, "20 (K-3III)"),
   (21, "21 (K-3IIIMonochrome)"),
+];
+
+/// `0x0067 Hue` PrintConv (`Pentax.pm:2329-2340`) — sorted by key. The integer
+/// labels (`0 => -2`, …) are stored as their decimal text and render as BARE
+/// JSON numbers via the `EscapeJSON` number gate; the textual `Normal`/`None`
+/// labels render as strings.
+pub const HUE: &[(i64, &str)] = &[
+  (0, "-2"),
+  (1, "Normal"),
+  (2, "2"),
+  (3, "-1"),
+  (4, "1"),
+  (5, "-3"),
+  (6, "3"),
+  (7, "-4"),
+  (8, "4"),
+  (65535, "None"),
+];
+
+/// `0x0073 MonochromeFilterEffect` PrintConv (`Pentax.pm:2475-2485`) — sorted by
+/// key (ExifTool lists `65535` first; binary search requires ascending order).
+pub const MONOCHROME_FILTER_EFFECT: &[(i64, &str)] = &[
+  (1, "Green"),
+  (2, "Yellow"),
+  (3, "Orange"),
+  (4, "Red"),
+  (5, "Magenta"),
+  (6, "Blue"),
+  (7, "Cyan"),
+  (8, "Infrared"),
+  (65535, "None"),
+];
+
+/// `0x0074 MonochromeToning` PrintConv (`Pentax.pm:2491-2502`) — sorted by key.
+/// The integer labels (`0 => -4`, … `4 => 0`, …) render as bare JSON numbers.
+pub const MONOCHROME_TONING: &[(i64, &str)] = &[
+  (0, "-4"),
+  (1, "-3"),
+  (2, "-2"),
+  (3, "-1"),
+  (4, "0"),
+  (5, "1"),
+  (6, "2"),
+  (7, "3"),
+  (8, "4"),
+  (65535, "None"),
+];
+
+/// `0x007b CrossProcess` PrintConv (`Pentax.pm:2569-2577`) — sorted by key.
+pub const CROSS_PROCESS: &[(i64, &str)] = &[
+  (0, "Off"),
+  (1, "Random"),
+  (2, "Preset 1"),
+  (3, "Preset 2"),
+  (4, "Preset 3"),
+  (33, "Favorite 1"),
+  (34, "Favorite 2"),
+  (35, "Favorite 3"),
 ];
 
 #[cfg(test)]

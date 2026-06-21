@@ -1356,5 +1356,20 @@ pub(crate) const IMAGE_EDITING: &[(&str, &str)] = &[
   ("16 0 0 0", "Frame Synthesis?"),
 ];
 
+/// `0x006c HighLowKeyAdj` PrintConv (`Pentax.pm:2378-2386`) — int16s `Count =>
+/// 2`, keyed on the space-joined `"adj 0"` pair. The integer labels render as
+/// bare JSON numbers via the `EscapeJSON` number gate (`"0 0" => 0`, etc.).
+pub(crate) const HIGH_LOW_KEY_ADJ: &[(&str, &str)] = &[
+  ("-4 0", "-4"),
+  ("-3 0", "-3"),
+  ("-2 0", "-2"),
+  ("-1 0", "-1"),
+  ("0 0", "0"),
+  ("1 0", "1"),
+  ("2 0", "2"),
+  ("3 0", "3"),
+  ("4 0", "4"),
+];
+
 #[cfg(test)]
 mod tests;
