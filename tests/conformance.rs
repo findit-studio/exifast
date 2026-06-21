@@ -11222,3 +11222,19 @@ fn mpeg2_ts_misb_klv_conformance() {
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.json", true);
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
 }
+
+// #211 — Real GoPro HERO6 Black with live gpmd GPS track (from gopro/gpmf-parser)
+#[test]
+#[ignore]
+fn quicktime_gopro_hero6_gpmf_conformance() {
+    check("QuickTime_gopro_hero6_gpmf.mp4", "QuickTime_gopro_hero6_gpmf.mp4.json", true);
+    check("QuickTime_gopro_hero6_gpmf.mp4", "QuickTime_gopro_hero6_gpmf.mp4.n.json", false);
+}
+
+// #210 — Real Samsung NX1 SRW with populated Type2 MakerNote (DeviceType/SamsungModelID/LensType)
+#[test]
+#[ignore]
+fn makernotes_samsung_nx1_conformance() {
+    check("SamsungNX1.srw", "SamsungNX1.srw.json", true);
+    check("SamsungNX1.srw", "SamsungNX1.srw.n.json", false);
+}
