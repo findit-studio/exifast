@@ -245,7 +245,7 @@ static EXIF_TIMEZONEOFFSET: ExifTag = ExifTag {
 static EXIF_SENSITIVITYTYPE: ExifTag = ExifTag {
   id: 0x8830,
   name: "SensitivityType",
-  conv: Conv::None,
+  conv: Conv::IntLabel(super::SENSITIVITY_TYPE),
 };
 static EXIF_STANDARDOUTPUTSENSITIVITY: ExifTag = ExifTag {
   id: 0x8831,

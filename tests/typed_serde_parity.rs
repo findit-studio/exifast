@@ -138,19 +138,20 @@ const NOT_ACTIVE: &[&str] = &[
   // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
   // PID — and the file carries no SMPTE/MISB universal label, so bundled
   // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
-  // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
-  // bundled goldens for the #173 MakerNote conditional branches, but their
-  // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
-  // not yet emit the full ~245-tag MakerNote set bundled does (it emits ~118),
-  // so they are NOT byte-exact-active. Accept-deferred here until the Pentax port
-  // is extended (see #311). #318 added them but missed this NOT_ACTIVE entry,
-  // leaving main red on the auto-discovered active-fixture parity check.
+  // #318/#311: 5 of the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp) stay
+  // deferred — they select DIFFERENT MakerNote `$count`/model variant branches
+  // exifast does not yet emit byte-exact (k1/k3/kp use the model-keyed 0x000e/
+  // 0x000f AFPointSelected/AFPointsInFocus arms + AEInfo3 size-64 + LevelInfoK3III
+  // + the K-3III BatteryInfo re-layout; k5_ii/k70 add further AEInfo3/LensInfo4/
+  // SRInfo2 edges). `JPEG_pentax_ks2.jpg` IS active (#311 — the full 140-tag
+  // Pentax set is byte-exact: AEInfo3 size-48 + LensInfo5 + KelvinWB + the world-
+  // time/level/CAF/face/AWB/EV/filter sub-tables + the int16u BatteryInfo voltage
+  // variant + the parent-order CameraInfo).
   "JPEG_pentax_k1.jpg",
   "JPEG_pentax_k3.jpg",
   "JPEG_pentax_k5_ii.jpg",
   "JPEG_pentax_k70.jpg",
   "JPEG_pentax_kp.jpg",
-  "JPEG_pentax_ks2.jpg",
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
@@ -275,6 +276,20 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Composite:GPSLatitude",
       "Composite:GPSLongitude",
       "Composite:GPSPosition",
+    ],
+  ),
+  // #311 — the K-S2 deferred subsystems exifast does not emit (NOT Pentax — the
+  // `Composite:Flash`/`LensID`/`DateTimeCreated` Composites, the `PrintIM` IFD,
+  // and the `tiff:YCbCrSubSampling` `RawJoin`). Mirrors `conformance.rs::
+  // jpeg_pentax_ks2_conformance`. The golden keeps the faithful 13.59 dump.
+  (
+    "JPEG_pentax_ks2.jpg",
+    &[
+      "Composite:Flash",
+      "Composite:LensID",
+      "Composite:DateTimeCreated",
+      "PrintIM:PrintIMVersion",
+      "XMP-tiff:YCbCrSubSampling",
     ],
   ),
 ];
@@ -999,7 +1014,7 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// ChannelLayout` (LayoutFlags/AudioChannelTypes/NumChannelDescriptions),
 /// byte-exact at `-j`/`-n` with the no-`ee` `EEWarn`. The ported Composites are
 /// kept; `System:all` is the sole exclusion.
-const EXPECTED_ACTIVE_FIXTURES: usize = 567;
+const EXPECTED_ACTIVE_FIXTURES: usize = 568;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

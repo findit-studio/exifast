@@ -60,11 +60,43 @@
 
 #![deny(clippy::indexing_slicing)]
 
+use crate::exif::ifd::ByteOrder;
 use crate::value::TagValue;
 use smol_str::SmolStr;
 
 use super::super::VendorEmission;
 use super::printconv;
+
+/// Read an `int16u` at byte offset `at` in `order` byte order, or `None` past the
+/// end. Pentax binary sub-tables that declare no explicit `ByteOrder` inherit the
+/// parent MakerNote IFD order (the KS-2 parent is Little-endian); the few that
+/// declare `ByteOrder => 'BigEndian'` (`CameraSettings`/`BatteryInfo`/`AFInfo`)
+/// pass [`ByteOrder::Big`] regardless of the parent.
+#[inline]
+fn read_u16(block: &[u8], at: usize, order: ByteOrder) -> Option<u16> {
+  let end = at.checked_add(2)?;
+  match block.get(at..end) {
+    Some(&[a, b]) => Some(match order {
+      ByteOrder::Little => u16::from_le_bytes([a, b]),
+      ByteOrder::Big => u16::from_be_bytes([a, b]),
+    }),
+    _ => None,
+  }
+}
+
+/// Read an `int32u` at byte offset `at` in `order` byte order, or `None` past the
+/// end.
+#[inline]
+fn read_u32(block: &[u8], at: usize, order: ByteOrder) -> Option<u32> {
+  let end = at.checked_add(4)?;
+  match block.get(at..end) {
+    Some(&[a, b, c, d]) => Some(match order {
+      ByteOrder::Little => u32::from_le_bytes([a, b, c, d]),
+      ByteOrder::Big => u32::from_be_bytes([a, b, c, d]),
+    }),
+    _ => None,
+  }
+}
 
 /// `Image::ExifTool::Pentax::PentaxEv` (`Pentax.pm:6822-6835`).
 ///
@@ -719,6 +751,21 @@ pub(crate) fn emit_lens_info(
   // >= $size`); a record shorter than offset 4 itself yields `&[]` ⇒ no leaf
   // emits. Every per-leaf read below is additionally bounds-checked.
   let lens_data: &[u8] = block.get(4..21).or_else(|| block.get(4..)).unwrap_or(&[]);
+  emit_lens_data_leaves(lens_data, model, print_conv, out);
+}
+
+/// Decode the nested `%Pentax::LensData` (`Pentax.pm:4385-4577`) leaves from a
+/// 17-byte `LensData` slice. Shared by [`emit_lens_info`] (`%Pentax::LensInfo2`,
+/// `LensData` at offset 4) and [`emit_lens_info5`] (`%Pentax::LensInfo5`,
+/// `LensData` at offset 15) — the nested table is identical, only the parent
+/// offset differs. The K10D / K-S2 records use the OLD 17-byte `LensData`
+/// (`NewLensData` structurally false). Each leaf read is bounds-checked.
+fn emit_lens_data_leaves(
+  lens_data: &[u8],
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
   let b = |i: usize| lens_data.get(i).copied();
 
   // 0.3: LensFStops — `Mask => 0x70` (>>4); `Condition => 'not $$self{NewLensData}'`
@@ -976,22 +1023,6 @@ fn external_flash_guide_number(raw: i64) -> f64 {
   2.0_f64.powf(v / 16.0 + 4.0)
 }
 
-/// Read a BigEndian `int32u` at byte offset `at` in `block`, or `None` when the
-/// 4-byte field is out of range. `%Pentax::CameraInfo` is read in the inherited
-/// MakerNote (BigEndian) order — confirmed by `exiftool -v3` (the `0x0215`
-/// BinaryData directory is "Big-endian" for both the K10D `Pentax.jpg` and the
-/// K-x `Pentax.avi`, even though the AVI's other Pentax binary directories are
-/// LittleEndian) — matching the hardcoded-BigEndian reads in the sibling
-/// `CameraSettings`/`AEInfo` decoders.
-#[inline]
-fn be_u32(block: &[u8], at: usize) -> Option<u32> {
-  let end = at.checked_add(4)?;
-  match block.get(at..end) {
-    Some(&[a, b, c, d]) => Some(u32::from_be_bytes([a, b, c, d])),
-    _ => None,
-  }
-}
-
 /// `%Pentax::CameraInfo` `1 ManufactureDate` ValueConv (`Pentax.pm:4735-4740`):
 ///
 /// ```text
@@ -1024,7 +1055,13 @@ fn manufacture_date(raw: u32) -> SmolStr {
 }
 
 /// Decode `%Pentax::CameraInfo` (`0x0215`, `Pentax.pm:4717-4754`) — a fixed
-/// `int32u` (`FORMAT => 'int32u'`) binary record read in BigEndian order. The
+/// `int32u` (`FORMAT => 'int32u'`) binary record. The `0x0215` Main row declares
+/// NO explicit `ByteOrder`, so the record inherits the parent MakerNote IFD order
+/// (`order`): BigEndian for the K10D `Pentax.jpg` / K-x `Pentax.avi` (big-endian
+/// bodies), but **LittleEndian** for the K-S2 `JPEG_pentax_ks2.jpg` (a
+/// little-endian body — `exiftool -v3` shows the `0x0215` BinaryData directory as
+/// "Little-endian" there). Reading it BigEndian-hardcoded would mis-decode every
+/// scalar for a little-endian body; `order` is threaded from the walked IFD. The
 /// Main row (`Pentax.pm:2940`) is UNCONDITIONAL (no `Condition` / `$count` gate,
 /// no model variant), so — unlike the `$count`-gated `CameraSettings`/`AEInfo`/
 /// `LensInfo2`/`FlashInfo` decoders — there is no scope-fence; every Pentax body
@@ -1045,7 +1082,7 @@ fn manufacture_date(raw: u32) -> SmolStr {
 ///
 /// ## Bounds-checking
 ///
-/// Each int32u read is bounds-checked ([`be_u32`] returns `None` past the block
+/// Each int32u read is bounds-checked ([`read_u32`] returns `None` past the block
 /// end): a short / truncated `CameraInfo` emits only the in-range scalars and
 /// never panics, matching `ProcessBinaryData` reading whatever the record holds
 /// (`last if $entry >= $size`). `ProductionCode` (`int32u[2]`) needs BOTH 4-byte
@@ -1053,6 +1090,7 @@ fn manufacture_date(raw: u32) -> SmolStr {
 /// `ProductionCode`.
 pub(crate) fn emit_camera_info(
   block: &[u8],
+  order: ByteOrder,
   print_conv: bool,
   out: &mut std::vec::Vec<VendorEmission>,
 ) {
@@ -1060,7 +1098,7 @@ pub(crate) fn emit_camera_info(
 
   // offset 1 (byte 4): ManufactureDate (int32u). ValueConv only (no PrintConv) ⇒
   // the same value for -j and -n.
-  if let Some(v) = be_u32(block, 4) {
+  if let Some(v) = read_u32(block, 4, order) {
     push(out, "ManufactureDate", TagValue::Str(manufacture_date(v)));
   }
   // offset 2 (byte 8): ProductionCode (int32u[2]) — the default multi-element
@@ -1069,7 +1107,7 @@ pub(crate) fn emit_camera_info(
   // value starts with "8."; otherwise it is the bare dotted string (rendered as a
   // JSON number by the serializer's number gate, e.g. "2.1" → 2.1). Both int32u
   // elements must be present (byte 8 and byte 12).
-  if let (Some(a), Some(b)) = (be_u32(block, 8), be_u32(block, 12)) {
+  if let (Some(a), Some(b)) = (read_u32(block, 8, order), read_u32(block, 12, order)) {
     let dotted = std::format!("{a}.{b}");
     let value = if print_conv && dotted.starts_with("8.") {
       std::format!("{dotted} (camera has been serviced)")
@@ -1080,7 +1118,7 @@ pub(crate) fn emit_camera_info(
   }
   // offset 4 (byte 16): InternalSerialNumber (int32u) — no conv (direct). The
   // int32u value is emitted as an integer for both -j and -n.
-  if let Some(v) = be_u32(block, 16) {
+  if let Some(v) = read_u32(block, 16, order) {
     push(out, "InternalSerialNumber", int_value(i64::from(v)));
   }
 }
@@ -1202,10 +1240,20 @@ pub(crate) fn emit_battery_info(
   // The exact `$$self{Model}` regexes from the BatteryInfo table, per offset.
   let is_k3iii = is_k3_mark_iii(model);
   let body_state_k10d = is_body_state_k10d(model); // offset 1.1 variant A
+  // offset 1.1 variant B — `$$self{Model} !~ /(K110D|K2000|K-m|K-3 Mark III)\b/`
+  // (`Pentax.pm:4817-4827`), the 5-entry 'Close to Full' hash. Tried only when
+  // variant A fails (ExifTool's ordered Condition list): the K-S2 fails A and
+  // matches B ⇒ value 5 → 'Full'.
+  let body_state_other = !body_state_k10d && is_body_state_other(model);
   let grip_state_k10d = is_grip_state_k10d(model); // offset 1.2
   let body_ad_pc = is_body_ad_printconv(model); // offset 2/3 PrintConv variant (A)
   let body_ad_noload_raw = is_body_ad_noload_raw(model); // offset 2 raw variant (B)
   let body_ad_load_raw = is_body_ad_load_raw(model); // offset 3 raw variant (B)
+  // offset 2/4 `BodyBatteryVoltage1`/`Voltage2` (int16u, `$val/100`, `%.2f V`) —
+  // `/(645D|645Z|K-(1|01|3|5|7|30|50|70|500|r|x|S[12])|KP)\b/ and !~ /III/`
+  // (`Pentax.pm:4864`/`:4919`). The K-S2 matches (`K-S2`); these replace the
+  // int8u A/D byte reads at the SAME offsets for a voltage-reporting body.
+  let body_voltage = is_body_voltage(model);
   let grip_ad_noload = is_grip_ad_noload(model); // offset 4
   let grip_ad_load = is_grip_ad_load(model); // offset 5
   let b = |i: usize| block.get(i).copied();
@@ -1244,6 +1292,19 @@ pub(crate) fn emit_battery_info(
         ),
       );
     }
+  } else if body_state_other {
+    // 1.1 variant B (the 5-entry 'Close to Full' hash). The K-S2 falls here.
+    if let Some(v) = b(1) {
+      push(
+        out,
+        "BodyBatteryState",
+        hash(
+          print_conv,
+          mask(i64::from(v), 0xf0),
+          printconv::BODY_BATTERY_STATE_OTHER,
+        ),
+      );
+    }
   }
   // 1.2: GripBatteryState (mask 0x0f) — `/(K10D|GX10|K20D|GX20)\b/` only
   // (`Pentax.pm:4833`).
@@ -1266,7 +1327,17 @@ pub(crate) fn emit_battery_info(
   // For any OTHER model offset 2 is `BodyBatteryVoltage1` (int16u, `$val/100`)
   // or the K-3III `BodyBatteryState` — a DIFFERENT tag/format, DEFERRED ⇒ emit
   // nothing here (never the byte mis-read).
-  if let Some(v) = b(2) {
+  if body_voltage {
+    // offset 2 `BodyBatteryVoltage1` (int16u, BigEndian — the table's declared
+    // order) → `$val / 100`; PrintConv `sprintf("%.2f V", $val)`.
+    if let Some(v) = read_u16(block, 2, ByteOrder::Big) {
+      push(
+        out,
+        "BodyBatteryVoltage1",
+        battery_voltage(i64::from(v), print_conv),
+      );
+    }
+  } else if let Some(v) = b(2) {
     let n = i64::from(v);
     if body_ad_pc {
       push(
@@ -1304,7 +1375,17 @@ pub(crate) fn emit_battery_info(
   // 4: GripBatteryADNoLoad — `/(\*ist|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (no
   // PrintConv ⇒ raw int, `Pentax.pm:4913-4916`). Other models: `BodyBatteryVoltage2`
   // (int16u) / `BodyBatteryVoltage` (K-3III int32u) — DEFERRED.
-  if grip_ad_noload {
+  if body_voltage {
+    // offset 4 `BodyBatteryVoltage2` (int16u, BigEndian) → `$val / 100`;
+    // PrintConv `sprintf("%.2f V", $val)`.
+    if let Some(v) = read_u16(block, 4, ByteOrder::Big) {
+      push(
+        out,
+        "BodyBatteryVoltage2",
+        battery_voltage(i64::from(v), print_conv),
+      );
+    }
+  } else if grip_ad_noload {
     if let Some(v) = b(4) {
       push(out, "GripBatteryADNoLoad", int_value(i64::from(v)));
     }
@@ -1319,9 +1400,11 @@ pub(crate) fn emit_battery_info(
 }
 
 /// `true` when `model` matches `/K-3 Mark III/` (a plain substring — ExifTool's
-/// regex has no anchor/`\b`) — the gate that DESELECTS every non-K-3III
-/// BatteryInfo variant and SELECTS the deferred K-3III re-layout.
-fn is_k3_mark_iii(model: Option<&str>) -> bool {
+/// regex has no anchor/`\b`). The gate that DESELECTS every non-K-3III
+/// `BatteryInfo` variant, and the `0x022b` LevelInfo SubDirectory selector
+/// (`Pentax.pm:3046`) that routes a K-3III body to `%LevelInfoK3III`
+/// ([`emit_level_info_k3iii`]) instead of the K-5-style `%LevelInfo`.
+pub(crate) fn is_k3_mark_iii(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.contains("K-3 Mark III"))
 }
 
@@ -1347,6 +1430,47 @@ fn is_grip_state_k10d(model: Option<&str>) -> bool {
 /// variant (A) `/(K10D|GX10|K20D|GX20)\b/`.
 fn is_body_ad_printconv(model: Option<&str>) -> bool {
   model_matches_any(model, &["K10D", "GX10", "K20D", "GX20"])
+}
+
+/// `true` for the BatteryInfo `1.1 BodyBatteryState` variant B —
+/// `$$self{Model} !~ /(K110D|K2000|K-m|K-3 Mark III)\b/` (`Pentax.pm:4818`), the
+/// 5-entry 'Close to Full' hash for "most other models". A NEGATIVE gate: it
+/// matches every model EXCEPT those four. The caller already excludes variant A
+/// (tried first), so this fires for the K-S2 / K-5 / K-r / etc.
+fn is_body_state_other(model: Option<&str>) -> bool {
+  !model_matches_any(model, &["K110D", "K2000", "K-m", "K-3 Mark III"])
+}
+
+/// `true` for the BatteryInfo `2`/`4` `BodyBatteryVoltage1`/`Voltage2`
+/// `/(645D|645Z|K-(1|01|3|5|7|30|50|70|500|r|x|S[12])|KP)\b/ and !~ /III/`
+/// (`Pentax.pm:4864`/`:4919`). The K-S2 matches via `K-S2`.
+fn is_body_voltage(model: Option<&str>) -> bool {
+  let Some(m) = model else {
+    return false;
+  };
+  // The `and $$self{Model} !~ /III/` clause excludes the K-3 Mark III.
+  if m.contains("III") {
+    return false;
+  }
+  model_matches_any(
+    model,
+    &[
+      "645D", "645Z", "K-1", "K-01", "K-3", "K-5", "K-7", "K-30", "K-50", "K-70", "K-500", "K-r",
+      "K-x", "K-S1", "K-S2", "KP",
+    ],
+  )
+}
+
+/// `BodyBatteryVoltage1`/`Voltage2` value: `$val / 100`; PrintConv
+/// `sprintf("%.2f V", $val)` (`Pentax.pm:4866-4869`). `-n` ⇒ the post-ValueConv
+/// volts `f64`.
+fn battery_voltage(raw: i64, print_conv: bool) -> TagValue {
+  let v = raw as f64 / 100.0;
+  if print_conv {
+    TagValue::Str(SmolStr::from(std::format!("{v:.2} V")))
+  } else {
+    TagValue::F64(v)
+  }
 }
 
 /// `true` for the BatteryInfo `2 BodyBatteryADNoLoad` raw variant (B)
@@ -1495,6 +1619,629 @@ pub(crate) fn emit_color_info(
   }
   if let Some(v) = block.get(17) {
     push(out, "WBShiftGM", int_value(i64::from(*v as i8)));
+  }
+}
+
+/// Decode `%Pentax::AEInfo3` (`0x0206`, `Pentax.pm:4118-4183`) for the
+/// `$count == 48 or $count == 64` variant (`Pentax.pm:2812-2815`) — the
+/// auto-exposure record for the K-1mkII / K-3 / K-30 / K-50 / **K-S2 (K-S1,K-S2
+/// via RawDevelopmentProcess 15)** / K-70 / K-500 / KP. The K-S2 record is 48
+/// bytes (`$count == 48`). `%binaryDataAttrs` declares no `FORMAT` ⇒ default
+/// `int8u`, `FIRST_ENTRY 0`; the row declares no explicit `ByteOrder` ⇒ inherits
+/// the parent MakerNote IFD order (Little-endian for the K-S2), but every AEInfo3
+/// leaf is a single `int8u` byte, so the order is immaterial here.
+///
+/// A `count` outside `{48, 64}` is a deferred AEInfo / AEInfo2 / AEInfoUnknown
+/// variant ⇒ emit NOTHING (the scope-fence). The leaves sit at element offsets
+/// 16-31 (`AEExposureTime`, `AEAperture`, `AE_ISO`, then `AEMaxAperture`,
+/// `AEMaxAperture2`, `AEMinAperture`, `AEMinExposureTime` at 28-31).
+pub(crate) fn emit_aeinfo3(
+  block: &[u8],
+  count: usize,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  if count != 48 && count != 64 {
+    return;
+  }
+  let b = |i: usize| block.get(i).copied();
+  // 16: AEExposureTime — 24*exp(-($val-32)*ln2/8); PrintExposureTime.
+  if let Some(v) = b(16) {
+    let secs = 24.0 * (-(f64::from(v) - 32.0) * std::f64::consts::LN_2 / 8.0).exp();
+    push(out, "AEExposureTime", expo_value(secs, print_conv));
+  }
+  // 17: AEAperture — exp(($val-68)*ln2/16); sprintf("%.1f").
+  if let Some(v) = b(17) {
+    push(
+      out,
+      "AEAperture",
+      aperture_value(i64::from(v), print_conv, 1),
+    );
+  }
+  // 18: AE_ISO — 100*exp(($val-32)*ln2/8); int($val+0.5).
+  if let Some(v) = b(18) {
+    let f = 100.0 * ((f64::from(v) - 32.0) * std::f64::consts::LN_2 / 8.0).exp();
+    push(
+      out,
+      "AE_ISO",
+      if print_conv {
+        TagValue::I64((f + 0.5).trunc() as i64)
+      } else {
+        TagValue::F64(f)
+      },
+    );
+  }
+  // 28: AEMaxAperture — exp(($val-68)*ln2/16); sprintf("%.1f").
+  if let Some(v) = b(28) {
+    push(
+      out,
+      "AEMaxAperture",
+      aperture_value(i64::from(v), print_conv, 1),
+    );
+  }
+  // 29: AEMaxAperture2 — exp(($val-68)*ln2/16); sprintf("%.1f").
+  if let Some(v) = b(29) {
+    push(
+      out,
+      "AEMaxAperture2",
+      aperture_value(i64::from(v), print_conv, 1),
+    );
+  }
+  // 30: AEMinAperture — exp(($val-68)*ln2/16); sprintf("%.0f").
+  if let Some(v) = b(30) {
+    push(
+      out,
+      "AEMinAperture",
+      aperture_value(i64::from(v), print_conv, 0),
+    );
+  }
+  // 31: AEMinExposureTime — 24*exp(-($val-32)*ln2/8); PrintExposureTime.
+  if let Some(v) = b(31) {
+    let secs = 24.0 * (-(f64::from(v) - 32.0) * std::f64::consts::LN_2 / 8.0).exp();
+    push(out, "AEMinExposureTime", expo_value(secs, print_conv));
+  }
+}
+
+/// The shared `AEInfo*` aperture value: `exp(($val-68)*ln2/16)` then
+/// `sprintf("%.Nf", $val)` (`prec` = 1 for most, 0 for `AEMinAperture`). `-n` ⇒
+/// the post-ValueConv `f64`.
+fn aperture_value(raw: i64, print_conv: bool, prec: usize) -> TagValue {
+  let f = aperture_from_raw(raw);
+  if !print_conv {
+    return TagValue::F64(f);
+  }
+  TagValue::Str(SmolStr::from(match prec {
+    0 => std::format!("{f:.0}"),
+    _ => std::format!("{f:.1}"),
+  }))
+}
+
+/// Decode the nested `%Pentax::LensData` leaves from a `%Pentax::LensInfo5`
+/// record (`0x0207`, `Pentax.pm:4349-4382`) — the lens-info layout for the K-01
+/// and newer (K-30/K-50/K-500/K-3/K-3II/**K-S1/K-S2**/K-70/KP). Selected by the
+/// `0x0207` SubDirectory-list `Condition => '$count == 80 or $count == 128'`
+/// (`Pentax.pm:2847`); the K-S2 record is 128 bytes.
+///
+/// `LensInfo5` differs from `LensInfo2` ONLY in where the nested `LensData`
+/// `undef[17]` SubDirectory sits: offset **15** (`Pentax.pm:4377`) vs `LensInfo2`'s
+/// offset 4. The nested `%Pentax::LensData` table is identical, so this slices
+/// `block[15..32]` and runs the SAME leaf decode as [`emit_lens_info`] (the K-S2
+/// uses the OLD 17-byte `LensData`; `NewLensData` is set only by the size-18
+/// `LensInfo4` path, so it is structurally false here). Offset-1 `LensType` is NOT
+/// re-emitted — Phase 1's `0x003f LensRec` owns it.
+pub(crate) fn emit_lens_info5(
+  block: &[u8],
+  count: usize,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  if count != 80 && count != 128 {
+    return;
+  }
+  // `LensData` = `undef[17]` at LensInfo5 offset 15 — `block[15..32]`.
+  let lens_data: &[u8] = block.get(15..32).or_else(|| block.get(15..)).unwrap_or(&[]);
+  emit_lens_data_leaves(lens_data, model, print_conv, out);
+}
+
+/// Decode the K-1mkII/K-3/K-30/.../K-S2/K-70/KP `%Pentax::KelvinWB`
+/// (`0x0221`, `Pentax.pm:5233-5255`) — `FORMAT => 'int16u'`, so element offset N
+/// = byte 2N. The row declares no `ByteOrder` ⇒ inherits the parent IFD `order`
+/// (Little-endian for the K-S2). Each leaf is `%kelvinWB`: `int16u[4]` with
+/// ValueConv `(53190-a0) a1 (a2/8192) (a3/8192)` (`Pentax.pm`); there is no
+/// PrintConv, so the ValueConv string is emitted for BOTH `-j` and `-n`. Entries
+/// at element offsets 1, 5, 9, …, 65 (`KelvinWB_Daylight`, then `KelvinWB_01`
+/// … `KelvinWB_16`).
+pub(crate) fn emit_kelvin_wb(
+  block: &[u8],
+  order: ByteOrder,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // (name, element-offset). Element offset N is byte 2N (FORMAT int16u).
+  const ENTRIES: &[(&str, usize)] = &[
+    ("KelvinWB_Daylight", 1),
+    ("KelvinWB_01", 5),
+    ("KelvinWB_02", 9),
+    ("KelvinWB_03", 13),
+    ("KelvinWB_04", 17),
+    ("KelvinWB_05", 21),
+    ("KelvinWB_06", 25),
+    ("KelvinWB_07", 29),
+    ("KelvinWB_08", 33),
+    ("KelvinWB_09", 37),
+    ("KelvinWB_10", 41),
+    ("KelvinWB_11", 45),
+    ("KelvinWB_12", 49),
+    ("KelvinWB_13", 53),
+    ("KelvinWB_14", 57),
+    ("KelvinWB_15", 61),
+    ("KelvinWB_16", 65),
+  ];
+  for &(name, elem) in ENTRIES {
+    let byte = elem * 2;
+    // int16u[4] — four consecutive int16u in the parent order.
+    let (Some(a0), Some(a1), Some(a2), Some(a3)) = (
+      read_u16(block, byte, order),
+      read_u16(block, byte + 2, order),
+      read_u16(block, byte + 4, order),
+      read_u16(block, byte + 6, order),
+    ) else {
+      continue;
+    };
+    // ValueConv `(53190 - a0) . ' ' . a1 . ' ' . (a2/8192) . ' ' . (a3/8192)`.
+    let v0 = 53190i64 - i64::from(a0);
+    let g2 = crate::value::format_g(f64::from(a2) / 8192.0, 15);
+    let g3 = crate::value::format_g(f64::from(a3) / 8192.0, 15);
+    push(
+      out,
+      name,
+      TagValue::Str(SmolStr::from(std::format!("{v0} {a1} {g2} {g3}"))),
+    );
+  }
+}
+
+/// Decode `%Pentax::TimeInfo` (`0x006b`, `Pentax.pm:3305-3336`) — the world-time
+/// settings (`FORMAT` default `int8u`; inherits the parent IFD order, but all
+/// leaves are single bytes / masks). Emits WorldTimeLocation (mask 0x01),
+/// HometownDST (0x02), DestinationDST (0x04), HometownCity (byte 2), DestinationCity
+/// (byte 3).
+pub(crate) fn emit_time_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let b = |i: usize| block.get(i).copied();
+  if let Some(v) = b(0) {
+    let v = i64::from(v);
+    push(
+      out,
+      "WorldTimeLocation",
+      hash(print_conv, mask(v, 0x01), printconv::WORLD_TIME_LOCATION),
+    );
+    push(
+      out,
+      "HometownDST",
+      hash(print_conv, mask(v, 0x02), printconv::NO_YES),
+    );
+    push(
+      out,
+      "DestinationDST",
+      hash(print_conv, mask(v, 0x04), printconv::NO_YES),
+    );
+  }
+  if let Some(v) = b(2) {
+    push(out, "HometownCity", city(print_conv, i64::from(v)));
+  }
+  if let Some(v) = b(3) {
+    push(out, "DestinationCity", city(print_conv, i64::from(v)));
+  }
+}
+
+/// A `\%pentaxCities` PrintConv leaf (`HometownCity` / `DestinationCity`): the
+/// city name for `-j`, the raw index for `-n`, with the `Unknown (N)` fallback
+/// for an absent key.
+fn city(print_conv: bool, n: i64) -> TagValue {
+  if !print_conv {
+    return TagValue::I64(n);
+  }
+  match u16::try_from(n).ok().and_then(super::cities::lookup_name) {
+    Some(name) => TagValue::Str(name),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({n})"))),
+  }
+}
+
+/// Decode `%Pentax::LensCorr` (`0x007d`, `Pentax.pm:3339-3358`) — the lens
+/// distortion / aberration correction flags (`FORMAT` default `int8u`). Emits
+/// DistortionCorrection (@0), ChromaticAberrationCorrection (@1),
+/// PeripheralIlluminationCorr (@2), DiffractionCorrection (@3, `{0=>Off,16=>On}`).
+pub(crate) fn emit_lens_corr(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let b = |i: usize| block.get(i).copied();
+  if let Some(v) = b(0) {
+    push(
+      out,
+      "DistortionCorrection",
+      hash(print_conv, i64::from(v), printconv::OFF_ON),
+    );
+  }
+  if let Some(v) = b(1) {
+    push(
+      out,
+      "ChromaticAberrationCorrection",
+      hash(print_conv, i64::from(v), printconv::OFF_ON),
+    );
+  }
+  if let Some(v) = b(2) {
+    push(
+      out,
+      "PeripheralIlluminationCorr",
+      hash(print_conv, i64::from(v), printconv::OFF_ON),
+    );
+  }
+  if let Some(v) = b(3) {
+    push(
+      out,
+      "DiffractionCorrection",
+      hash(print_conv, i64::from(v), printconv::DIFFRACTION_CORRECTION),
+    );
+  }
+}
+
+/// Decode `%Pentax::FaceInfo` (`0x0060`, `Pentax.pm:2293-2297` Main row /
+/// `:3264-3280` table) — `FORMAT` default `int8u`. Emits FacesDetected (@0) and
+/// FacePosition (@2, `int8u[2]`, space-joined). The Main `0x0060` row carries NO
+/// `Condition` (it is a single `{...}`, not a model-variant ARRAY), so EVERY body
+/// — the K-3 Mark III included — routes 0x0060 through this `%FaceInfo` table;
+/// this emitter is therefore UNCONDITIONAL, matching ExifTool. The K-3III's
+/// distinct `%FaceInfoK3III` re-layout is a SEPARATE Main tag id (`0x040b`,
+/// `Pentax.pm:3154-3158`), NOT a 0x0060 variant; that tag is not yet ported (a
+/// deferred follow-up). Adding a model gate here would WRONGLY suppress FaceInfo
+/// for a K-3III body.
+pub(crate) fn emit_face_info(block: &[u8], out: &mut std::vec::Vec<VendorEmission>) {
+  if let Some(v) = block.first() {
+    push(out, "FacesDetected", int_value(i64::from(*v)));
+  }
+  // 2: FacePosition — int8u[2], the default space-joined pair.
+  if let (Some(&x), Some(&y)) = (block.get(2), block.get(3)) {
+    push(
+      out,
+      "FacePosition",
+      TagValue::Str(SmolStr::from(std::format!("{x} {y}"))),
+    );
+  }
+}
+
+/// Decode `%Pentax::AWBInfo` (`0x0068`, `Pentax.pm:3283-3302`) — the automatic
+/// white-balance settings (`FORMAT` default `int8u`). Emits
+/// WhiteBalanceAutoAdjustment (@0, `{0=>Off,1=>On}`) and TungstenAWB (@1,
+/// `{0=>'Subtle Correction',1=>'Strong Correction'}`, present only for the K-5 and
+/// later — a byte-1 record).
+pub(crate) fn emit_awb_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  if let Some(v) = block.first() {
+    push(
+      out,
+      "WhiteBalanceAutoAdjustment",
+      hash(print_conv, i64::from(*v), printconv::OFF_ON),
+    );
+  }
+  if let Some(v) = block.get(1) {
+    push(
+      out,
+      "TungstenAWB",
+      hash(print_conv, i64::from(*v), printconv::TUNGSTEN_AWB),
+    );
+  }
+}
+
+/// Decode `%Pentax::EVStepInfo` (`0x0224`, `Pentax.pm:5273-5294`) — `FORMAT`
+/// default `int8u`. Emits EVSteps (@0, `{0=>'1/2 EV Steps',1=>'1/3 EV Steps'}`),
+/// SensitivitySteps (@1, `{0=>'1 EV Steps',1=>'As EV Steps'}`) and LiveView (@3,
+/// `{0=>Off,1=>On}`).
+pub(crate) fn emit_evstep_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let b = |i: usize| block.get(i).copied();
+  if let Some(v) = b(0) {
+    push(
+      out,
+      "EVSteps",
+      hash(print_conv, i64::from(v), printconv::EV_STEPS_INFO),
+    );
+  }
+  if let Some(v) = b(1) {
+    push(
+      out,
+      "SensitivitySteps",
+      hash(print_conv, i64::from(v), printconv::SENSITIVITY_STEPS_INFO),
+    );
+  }
+  if let Some(v) = b(3) {
+    push(
+      out,
+      "LiveView",
+      hash(print_conv, i64::from(v), printconv::OFF_ON),
+    );
+  }
+}
+
+/// Decode `%Pentax::LevelInfo` (`0x022b`, `Pentax.pm:5701-5769`) — the electronic
+/// level info, `FORMAT => 'int8s'` (every leaf is a SIGNED byte). This is the
+/// K-5-style (non-K-3III) variant: the `0x022b` Main row is VARIANT-SELECTED on
+/// `$$self{Model}` (`Pentax.pm:3044-3051`) — a `/K-3 Mark III/` body reads the
+/// distinct `%LevelInfoK3III` re-layout ([`emit_level_info_k3iii`]), every OTHER
+/// body reads THIS table. The dispatcher applies that model gate, so this emitter
+/// runs only for non-K-3III bodies (the K-S2 / K-1 / K-3 / KP / K-70 / K-5 II
+/// fixtures). Emits LevelOrientation (mask 0x0f), CompositionAdjust (mask 0xf0),
+/// RollAngle (@1, -$val/2), PitchAngle (@2, -$val/2), CompositionAdjustX (@5,
+/// -$val), CompositionAdjustY (@6, -$val), CompositionAdjustRotation (@7, -$val/2).
+pub(crate) fn emit_level_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // int8s — each byte read SIGNED. The mask leaves apply the mask to the raw
+  // (unsigned-interpreted) byte; for byte 0 the masks 0x0f / 0xf0 select nibbles.
+  let raw = |i: usize| block.get(i).map(|&b| i64::from(b as i8));
+  let raw_u = |i: usize| block.get(i).copied().map(i64::from);
+  // 0: LevelOrientation (mask 0x0f). The mask reads the unsigned byte's low nibble.
+  if let Some(v) = raw_u(0) {
+    push(
+      out,
+      "LevelOrientation",
+      hash(print_conv, mask(v, 0x0f), printconv::LEVEL_ORIENTATION),
+    );
+    push(
+      out,
+      "CompositionAdjust",
+      hash(print_conv, mask(v, 0xf0), printconv::COMPOSITION_ADJUST),
+    );
+  }
+  // 1: RollAngle — ValueConv -$val/2 (no PrintConv ⇒ same for -j/-n).
+  if let Some(v) = raw(1) {
+    push(out, "RollAngle", angle_half(v));
+  }
+  // 2: PitchAngle — ValueConv -$val/2.
+  if let Some(v) = raw(2) {
+    push(out, "PitchAngle", angle_half(v));
+  }
+  // 5: CompositionAdjustX — ValueConv -$val.
+  if let Some(v) = raw(5) {
+    push(out, "CompositionAdjustX", neg_int(v));
+  }
+  // 6: CompositionAdjustY — ValueConv -$val.
+  if let Some(v) = raw(6) {
+    push(out, "CompositionAdjustY", neg_int(v));
+  }
+  // 7: CompositionAdjustRotation — ValueConv -$val/2.
+  if let Some(v) = raw(7) {
+    push(out, "CompositionAdjustRotation", angle_half(v));
+  }
+}
+
+/// Decode `%Pentax::LevelInfoK3III` (`0x022b`, `Pentax.pm:5771-5801`) — the
+/// K-3-Mark-III electronic-level re-layout, `FORMAT => 'int8s'`. The `0x022b`
+/// Main row selects THIS table when `$$self{Model} =~ /K-3 Mark III/`
+/// (`Pentax.pm:3044-3047`), in preference to the K-5-style [`emit_level_info`];
+/// the dispatcher applies the same model gate. `Format`-overridden leaves:
+/// CameraOrientation (`int8s` @ 1, PrintConv hash), RollAngle (`int16s` @ 3,
+/// -$val/2) and PitchAngle (`int16s` @ 5, -$val/2). The two `int16s` leaves carry
+/// no per-table `ByteOrder`, so they inherit the parent MakerNote IFD `order`
+/// (threaded as `order`) — exactly as the rest of `%Pentax::Main` does. No active
+/// fixture is a K-3 Mark III, so this path is unexercised by the goldens, but it
+/// keeps the variant SELECTION faithful (a K-3III record would otherwise mis-decode
+/// through the K-5 layout). No PrintConv on the angles ⇒ identical for `-j`/`-n`.
+pub(crate) fn emit_level_info_k3iii(
+  block: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // 1: CameraOrientation (int8s) — direct PrintConv hash.
+  if let Some(&b) = block.get(1) {
+    push(
+      out,
+      "CameraOrientation",
+      hash(
+        print_conv,
+        i64::from(b as i8),
+        printconv::CAMERA_ORIENTATION_K3III,
+      ),
+    );
+  }
+  // 3: RollAngle — Format `int16s`, ValueConv -$val/2 (inherits the parent order).
+  if let Some(v) = read_u16(block, 3, order) {
+    push(out, "RollAngle", angle_half(i64::from(v as i16)));
+  }
+  // 5: PitchAngle — Format `int16s`, ValueConv -$val/2.
+  if let Some(v) = read_u16(block, 5, order) {
+    push(out, "PitchAngle", angle_half(i64::from(v as i16)));
+  }
+}
+
+/// `-$val / 2` ValueConv (RollAngle / PitchAngle / CompositionAdjustRotation), no
+/// PrintConv ⇒ emitted for both modes. The serializer's number gate renders an
+/// integral `f64` without a trailing `.0`.
+fn angle_half(raw: i64) -> TagValue {
+  TagValue::F64(-(raw as f64) / 2.0)
+}
+
+/// `-$val` ValueConv (CompositionAdjustX/Y), no PrintConv. The negated signed
+/// byte is an integer.
+fn neg_int(raw: i64) -> TagValue {
+  TagValue::I64(-raw)
+}
+
+/// Decode `%Pentax::CAFPointInfo` (`0x0238`, `Pentax.pm:5202-5230`) — the
+/// contrast-detect AF-point info (`FORMAT` default `int8u`, `FIRST_ENTRY 0`).
+/// Emits NumCAFPoints (@1, `($val>>4)*($val&0x0f)`), CAFGridSize (@1.1,
+/// `(val>>4) (val&0x0f)` → `tr/ /x/`), and CAFPointsInFocus (@2) / CAFPointsSelected
+/// (@2.1), each a `DecodeAFPoints` over an `int8u[int((NumCAFPoints+3)/4)]` slice
+/// — for a record with `NumCAFPoints == 0` the slice is empty and `DecodeAFPoints`
+/// returns `'(none)'`.
+pub(crate) fn emit_caf_point_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let Some(v1) = block.get(1).copied().map(i64::from) else {
+    return;
+  };
+  // 1: NumCAFPoints — RawConv stores `($val & 0x0f) * ($val >> 4)`; ValueConv
+  // `($val >> 4) * ($val & 0x0f)` (same product). No PrintConv.
+  let num = (v1 >> 4) * (v1 & 0x0f);
+  push(out, "NumCAFPoints", int_value(num));
+  // 1.1: CAFGridSize — ValueConv `(val>>4) " " (val&0x0f)`; PrintConv `tr/ /x/`.
+  let grid = std::format!("{} {}", v1 >> 4, v1 & 0x0f);
+  push(
+    out,
+    "CAFGridSize",
+    if print_conv {
+      TagValue::Str(SmolStr::from(grid.replace(' ', "x")))
+    } else {
+      TagValue::Str(SmolStr::from(grid))
+    },
+  );
+  // 2 / 2.1: CAFPointsInFocus / CAFPointsSelected — `int8u[int((num+3)/4)]` then
+  // `DecodeAFPoints`. The slice starts at byte 2. For `-n` ExifTool emits the raw
+  // space-joined run (empty when `num == 0`).
+  let n_bytes = ((num.max(0) as usize) + 3) / 4;
+  let slice: &[u8] = block.get(2..2 + n_bytes).unwrap_or(&[]);
+  for (name, bit_val) in [("CAFPointsInFocus", 0x02u8), ("CAFPointsSelected", 0x03u8)] {
+    if print_conv {
+      push(
+        out,
+        name,
+        TagValue::Str(SmolStr::from(decode_af_points(slice, num, 2, bit_val))),
+      );
+    } else {
+      // `-n`: the default space-joined int8u run.
+      let joined = slice
+        .iter()
+        .map(u8::to_string)
+        .collect::<std::vec::Vec<_>>()
+        .join(" ");
+      push(out, name, TagValue::Str(SmolStr::from(joined)));
+    }
+  }
+}
+
+/// `Image::ExifTool::Pentax::DecodeAFPoints` (`Pentax.pm:6730-6754`): walk `num`
+/// AF points packed `bits`-per-point across `bytes`, listing the 1-based index of
+/// each point whose `bits`-wide field (high bits first) equals `bit_val`. An
+/// EMPTY byte slice returns `'(none)'`; otherwise a comma-joined index list (also
+/// `'(none)'`-displayed by the join when empty? — no, ExifTool joins to `''`, but
+/// the empty-slice early-return covers the K-S2's `num == 0`).
+fn decode_af_points(bytes: &[u8], num: i64, bits: u32, bit_val: u8) -> std::string::String {
+  let Some(&first) = bytes.first() else {
+    return "(none)".to_string();
+  };
+  let shift0 = 8i32 - bits as i32;
+  let mut i: i64 = 1;
+  let mut idx = 0usize;
+  let mut byte = i64::from(first);
+  let mut shift = shift0;
+  let mask_bits = (1i64 << bits) - 1;
+  let mut bit_list: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  loop {
+    if ((byte >> shift) & mask_bits) == i64::from(bit_val) {
+      bit_list.push(i.to_string());
+    }
+    i += 1;
+    if i > num {
+      break;
+    }
+    shift -= bits as i32;
+    if shift < 0 {
+      idx += 1;
+      let Some(&nb) = bytes.get(idx) else {
+        break;
+      };
+      byte = i64::from(nb);
+      shift += 8;
+    }
+  }
+  bit_list.join(",")
+}
+
+/// Decode `%Pentax::FilterInfo` (`0x022a`, `Pentax.pm:5660-5698`) — the digital
+/// filter info. The `0x022a` Main row is VARIANT-SELECTED on `$$self{Make}`
+/// (`Pentax.pm:3030-3043`): a RICOH body (`Make =~ /^RICOH/`) reads the table
+/// **LittleEndian**, every OTHER body reads it **BigEndian**. The forced order is
+/// NOT the parent IFD order — so the byte order is determined HERE from the
+/// threaded `make`, not from `resolved_subdir_order`. The K-S2 / K-1 / K-3 / KP /
+/// K-70 fixtures all report `Make => "RICOH IMAGING COMPANY, LTD."` ⇒ the
+/// LittleEndian variant; the K-5 II reports `Make => "PENTAX"` ⇒ the BigEndian
+/// variant. (For every fixture both leaves are 0, so the order is value-invisible,
+/// but the SELECTION must still be faithful — a non-zero record would byte-swap.)
+/// Emits SourceDirectoryIndex (`int16u` @ byte 0) and SourceFileIndex (`int16u` @
+/// byte 2); the 20 `DigitalFilterNN` blobs are deferred. `%FilterInfo` declares
+/// `FORMAT => 'int8u'` (`Pentax.pm:5663`), so a `ProcessBinaryData` row key is a
+/// BYTE offset (`key × sizeof(FORMAT) = key × 1`): `SourceDirectoryIndex` (key 0)
+/// at byte 0 and `SourceFileIndex` (key 2) at byte 2 — NOT an `int16u`-element
+/// index (which would put it at byte 4). The per-row `Format => 'int16u'`
+/// (`Pentax.pm:5672`/`:5676`) sets only how many bytes are READ at that offset,
+/// not the offset's stride.
+pub(crate) fn emit_filter_info(
+  block: &[u8],
+  make: Option<&str>,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // `Make =~ /^RICOH/` ⇒ LittleEndian; otherwise BigEndian (`Pentax.pm:3032-3041`).
+  let order = if is_ricoh_make(make) {
+    ByteOrder::Little
+  } else {
+    ByteOrder::Big
+  };
+  // `FORMAT => 'int8u'` ⇒ row key = byte offset: SourceDirectoryIndex (key 0) at
+  // byte 0, SourceFileIndex (key 2) at byte 2. Each is read as an `int16u`.
+  if let Some(v) = read_u16(block, 0, order) {
+    push(out, "SourceDirectoryIndex", int_value(i64::from(v)));
+  }
+  if let Some(v) = read_u16(block, 2, order) {
+    push(out, "SourceFileIndex", int_value(i64::from(v)));
+  }
+}
+
+/// `true` when `make` matches Perl `/^RICOH/` (a `^`-anchored, NON-`\b` prefix —
+/// `$$self{Make} =~ /^RICOH/`, `Pentax.pm:3032`). The Make strings are ASCII;
+/// `"RICOH IMAGING COMPANY, LTD."` matches, `"PENTAX"` / `"PENTAX Corporation"`
+/// do not.
+fn is_ricoh_make(make: Option<&str>) -> bool {
+  make.is_some_and(|m| m.starts_with("RICOH"))
+}
+
+/// Decode `%Pentax::SRInfo2` (`0x005c`, `Pentax.pm:3231-3261`) for the
+/// `$count == 2` variant — the shake-reduction info for the K-3 and newer
+/// (K-3/K-S1/**K-S2**/K-70/…), selected when the `0x005c` record is NOT 4 bytes
+/// (the `%Pentax::SRInfo` variant, `Pentax.pm:2258-2262`). Emits ShakeReduction
+/// (@1, the K-3 `#forum5425` hash); the offset-0 `SRResult` is `Unknown => 1`
+/// (an empty BITMASK) and is suppressed without `-U`.
+pub(crate) fn emit_sr_info2(
+  block: &[u8],
+  count: usize,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // `$count == 4` is the OLD `%Pentax::SRInfo` (handled by `emit_sr_info`); this
+  // SRInfo2 variant is the fall-through (any other count, in practice 2).
+  if count == 4 {
+    return;
+  }
+  if let Some(v) = block.get(1) {
+    push(
+      out,
+      "ShakeReduction",
+      hash(print_conv, i64::from(*v), printconv::SHAKE_REDUCTION2),
+    );
   }
 }
 

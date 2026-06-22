@@ -135,14 +135,16 @@ case "$FIX" in
   # `MonochromeFilterEffect` (0x0073), `MonochromeToning` (0x0074),
   # `CrossProcess` (0x007b), `SerialNumber` (0x0229), `Artist` (0x022e),
   # `Copyright` (0x022f), `FirmwareVersion` (0x0230) — so they are NO LONGER
-  # excluded (the golden now carries them). Still deferred (binary SubDirectory /
-  # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo leaves
-  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator` and the LensRec
-  # `ExtenderStatus`. The MakerNote-derived `Composite:LensID` stays the
-  # engine-wide deferral. The ported ImageSize/Megapixels/Duration are kept.
+  # excluded (the golden now carries them). #311 P2-P4 added the `0x003f LensRec`
+  # position-3 `ExtenderStatus` (the K-x AVI record is 4 bytes ⇒ 'Not attached'),
+  # so it is NO LONGER excluded either. Still deferred (binary SubDirectory /
+  # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo size-24 leaves
+  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator`. The MakerNote-derived
+  # `Composite:LensID` stays the engine-wide deferral. The ported
+  # ImageSize/Megapixels/Duration are kept.
   Pentax.avi)
     EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
-                  -x Pentax:ExtenderStatus -x Pentax:LevelIndicator) ;;
+                  -x Pentax:LevelIndicator) ;;
   # `QuickTime_gopro_gpmf.mp4`: the `LocationInformation`-derived QuickTime GPS
   # Composites (the same `%QuickTime::Composite` deferral as the SP2/anafi arms).
   # #361 — the udta atoms ARE now decoded byte-exact: `ItemList:Encoder` (©too),
