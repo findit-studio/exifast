@@ -95,6 +95,9 @@ pub(crate) mod render;
 // walker); the GPS sub-IFD is decoded through the same block.
 pub mod jpeg;
 mod jpeg_app;
+// JPEG IPTC (APP13 8BIM IIM) + the `COM` `File:Comment` — the Photoshop / IPTC
+// arm of `ProcessJPEG` and the IPTC IIM walker (`IPTC.pm`/`Photoshop.pm`).
+mod iptc;
 
 use std::{string::String, vec::Vec};
 
@@ -1744,6 +1747,16 @@ pub struct ExifMeta<'a> {
   /// [`ConvMode::ValueConv`](crate::emit::ConvMode); the print-conv vector
   /// otherwise.
   jpeg_app_tags_n: Vec<crate::emit::EmittedTag>,
+  /// The JPEG IPTC + `COM`-comment parse — the Photoshop / IPTC arm of
+  /// `ProcessJPEG` (`ExifTool.pm:8371-8400`) and the `COM` arm
+  /// (`ExifTool.pm:8429-8432`). Carries the `IPTC:*` ApplicationRecord tags (in
+  /// both conv modes, the values pre-rendered at decode time), the
+  /// `File:CurrentIPTCDigest` (the MD5 of the `0x0404` IPTC block,
+  /// `IPTC.pm:1075`), and each `File:Comment`. [`Taggable::tags`] emits the
+  /// `File:*` digest/comment in the `File`-group prefix and the `IPTC:*` tags
+  /// after the EXIF block. `None` for a JPEG carrying neither an `APP13`
+  /// Photoshop IRB nor a `COM` segment (and for every non-JPEG source).
+  iptc: Option<iptc::IptcMeta>,
   /// The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment — the
   /// `^http://ns.adobe.com/xap/1.0/\0` arm of `ProcessJPEG` (`ExifTool.pm:7794-
   /// 7819`, the `$$valPt =~ /^$xmpAPP1hdr/` branch → `Image::ExifTool::XMP`'s
@@ -2089,6 +2102,10 @@ impl<'a> ExifMeta<'a> {
       sof: None,
       jpeg_app_tags_pc: Vec::new(),
       jpeg_app_tags_n: Vec::new(),
+      // The IPTC + `COM` parse is attached AFTER this construction by the JPEG
+      // marker walk via [`set_jpeg_iptc`](Self::set_jpeg_iptc); a freshly merged
+      // JPEG `ExifMeta` starts with none.
+      iptc: None,
       // The embedded XMP `APP1` packet is decoded and attached AFTER this
       // construction by the JPEG marker walk via
       // [`set_jpeg_embedded_xmp`](Self::set_jpeg_embedded_xmp); a freshly
@@ -2164,6 +2181,16 @@ impl<'a> ExifMeta<'a> {
   ) {
     self.jpeg_app_tags_pc = pc;
     self.jpeg_app_tags_n = n;
+  }
+
+  /// Attach the JPEG IPTC + `COM`-comment parse decoded by
+  /// [`iptc::process_app13`] / [`iptc::IptcMeta::push_comment`] during the
+  /// marker walk. [`Taggable::tags`](crate::emit::Taggable::tags) emits its
+  /// `File:CurrentIPTCDigest`/`File:Comment` in the `File`-group prefix and its
+  /// `IPTC:*` ApplicationRecord tags after the EXIF block. (`pub(crate)`: a
+  /// JPEG-front-end construction-time internal.)
+  pub(crate) fn set_jpeg_iptc(&mut self, iptc: iptc::IptcMeta) {
+    self.iptc = Some(iptc);
   }
 
   /// Attach the embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
@@ -2820,6 +2847,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A standalone-TIFF walk is not a JPEG marker walk — no APP13 IPTC / `COM`.
+    iptc: None,
     // A standalone-TIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
     #[cfg(feature = "xmp")]
     embedded_xmp: None,
@@ -2967,6 +2996,8 @@ fn parse_bigtiff<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A BigTIFF walk is not a JPEG marker walk — no APP13 IPTC / `COM`.
+    iptc: None,
     // A BigTIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
     #[cfg(feature = "xmp")]
     embedded_xmp: None,
@@ -3155,6 +3186,8 @@ fn parse_tiff_with_base_shared<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // An embedded eXIf / CTMD block is not a JPEG marker walk — no IPTC / `COM`.
+    iptc: None,
     // An embedded eXIf / CTMD block is not a JPEG marker walk — no XMP `APP1`.
     #[cfg(feature = "xmp")]
     embedded_xmp: None,
@@ -7576,6 +7609,16 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
+    // The JPEG IPTC / `COM` `File:*` tags: `File:CurrentIPTCDigest` (the MD5 of
+    // the `0x0404` IPTC block, `FoundTag`'d inside `ProcessIPTC`,
+    // `IPTC.pm:1083`) and each `File:Comment` (`ExifTool.pm:8432`). Both are
+    // family-0 `File`, so they ride this prefix (object key order is
+    // conformance-insensitive — `src/jsondiff.rs`). `Comment` carries
+    // `Priority => 0` (`ExifTool.pm:1315`). `None` for a JPEG with neither an
+    // `APP13` Photoshop IRB nor a `COM` segment, and for every non-JPEG source.
+    if let Some(iptc) = &self.iptc {
+      iptc.push_file_tags(&mut tags);
+    }
     // The JPEG `File:*` Start-Of-Frame dimension tags (`ImageWidth`/
     // `ImageHeight`/`EncodingProcess`/`BitsPerSample`/`ColorComponents`/
     // `YCbCrSubSampling`). `HandleTag`'d in `ProcessJPEG` from the FIRST SOF
@@ -7655,6 +7698,17 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       &self.jpeg_app_tags_n
     };
     tags.extend(app_tags.iter().cloned());
+    // The JPEG IPTC ApplicationRecord tags (`IPTC:*`, the `0x0404` resource's
+    // IIM stream — `ProcessIPTC`, `IPTC.pm:1129-1263`). ExifTool `FoundTag`s
+    // these at the `APP13` `Marker:`-loop position (after the `APP1` EXIF block
+    // in the realistic camera layout), so appending them after the EXIF block
+    // reproduces that order; family-1 `IPTC` never collides with the EXIF
+    // `IFD0:*`/`GPS:*` family-1 keys in the `-G1` output. The PrintConv mode
+    // selects the pre-rendered vector (values converted at decode time). `None`
+    // for a JPEG with no IPTC block.
+    if let Some(iptc) = &self.iptc {
+      iptc.push_iptc_tags(print_conv, &mut tags);
+    }
     // The embedded XMP `APP1` packet (`ExifTool.pm:7794`, the
     // `$$valPt =~ /^$xmpAPP1hdr/` → `Image::ExifTool::XMP::ProcessXMP` arm). Its
     // `XMP-*` tags are produced by the shared XMP parser's own `Taggable` impl
