@@ -193,16 +193,20 @@ const NOT_ACTIVE: &[&str] = &[
   // `conformance.rs::quicktime_rove_r2_4k_conformance`.)
   "DJI_M3T_thermal.RJPEG",
   "Insta360ONE_equirectangular.jpg",
-  // The BlackVue DR770X (#213) dashcam fixture — dropped with goldens +
-  // #[ignore]d conformance test pending its port (BlackVue GPS/accelerometer/
-  // embedded-JSON). Its no-ee .json carries tags exifast does not yet emit, so
-  // accept-deferred here.
+  // (`MP4_blackvue_dr770x.mp4` (#362/#213) is now ACTIVE — the BlackVue DR770X
+  // PittaSoft port landed: the top-level `free`/`%QuickTime::Pittasoft`
+  // SubDirectory (Copyright/StartTime/OriginalFileName + PreviewImage/GPSLog
+  // binary placeholders + the no-`ee` first-record TimeCode/Accelerometer from
+  // `3gf `) and the audio `chan` `%QuickTime::ChannelLayout` (LayoutFlags/
+  // AudioChannelTypes/NumChannelDescriptions). Its no-`ee` `.json`/`.n.json` are
+  // byte-exact (the ported Composites kept; `System:all` excluded), see
+  // `conformance.rs::mp4_blackvue_dr770x_conformance`. No `.ee.*` golden — `-ee`
+  // surfaces no timed metadata for this file.)
   // (`MPEG2_TS_pruveeo_d90.ts` (#138/#129) is now ACTIVE — the M2TS LIGOGPSINFO
   // dashcam timed-GPS port landed: its no-`ee` `.json`/`.n.json` are byte-exact
   // (M2TS/H264 only; Composite-excluded per the QuickTime/MPEG precedent) and
   // the `-ee` LIGO GPS is pinned in
   // `tests/timed_metadata_conformance.rs::pruveeo_d90_ligogps_ee_byte_exact`.)
-  "MP4_blackvue_dr770x.mp4",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
@@ -986,7 +990,16 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// cross-table (`Keys:ContentCreateDate` from `\xa9day`, `Keys:GPSCoordinates`
 /// from `\xa9xyz`) and `Keys:Make` (`manu` UserData). Byte-exact at `-j`/`-n`;
 /// the 3 `Composite:GPS*` are the unported `%QuickTime::Composite` deferral.
-const EXPECTED_ACTIVE_FIXTURES: usize = 566;
+///
+/// 566 → 567 after `MP4_blackvue_dr770x.mp4` (#362) activated — the REAL
+/// BlackVue DR770X dashcam (PittaSoft): the top-level `free`/`%QuickTime::
+/// Pittasoft` SubDirectory (Copyright/StartTime/OriginalFileName + the
+/// PreviewImage/GPSLog binary placeholders + the no-`ee` first-record
+/// TimeCode/Accelerometer from `3gf `) and the audio `chan` `%QuickTime::
+/// ChannelLayout` (LayoutFlags/AudioChannelTypes/NumChannelDescriptions),
+/// byte-exact at `-j`/`-n` with the no-`ee` `EEWarn`. The ported Composites are
+/// kept; `System:all` is the sole exclusion.
+const EXPECTED_ACTIVE_FIXTURES: usize = 567;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

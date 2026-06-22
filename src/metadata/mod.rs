@@ -85,7 +85,7 @@ pub use png::{
 pub use project::Project;
 pub use quicktime::{
   AudioSampleDesc, Bitrate, ColorRepresentation, DataReferenceHandler, GenMediaInfo, HandlerBox,
-  HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeItemList, QuickTimeKeys,
+  HandlerKind, KodakFrea, MediaTrack, Pittasoft, QuickTimeGps, QuickTimeItemList, QuickTimeKeys,
   QuickTimeMeta, QuickTimeUserData, SampleDescRoute, TcMediaInfo, VisualSampleDesc,
 };
 pub use quicktime_brand::{

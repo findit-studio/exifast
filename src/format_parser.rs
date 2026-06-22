@@ -988,7 +988,13 @@ impl AnyMeta<'_> {
       };
       crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count, &ctx);
     }
-    crate::diagnostics::run_diagnostics(self, out);
+    // The document-level diagnostics drain, threaded with the `-ee` mode so a
+    // mode-sensitive doc warning (QuickTime's Pittasoft `3gf ` `EEWarn`, raised
+    // only at no-`ee`) participates in the SAME priority-0 / file-position
+    // first-wins ordering as every other doc `Warning` — via
+    // [`crate::diagnostics::Diagnose::diagnostics_with_options`], NOT a side
+    // hook that blindly leads the slot.
+    crate::diagnostics::run_diagnostics_with_options(self, extract_embedded, out);
     Ok(())
   }
 
@@ -1190,6 +1196,23 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
         feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => std::vec::Vec::new(),
+    }
+  }
+
+  /// The `-ee`-threaded drain. Only QuickTime's document-level stream depends on
+  /// `extract_embedded` (its Pittasoft `3gf ` `EEWarn` is no-`ee`-only), so that
+  /// arm forwards the flag; every other format's diagnostics are mode-invariant,
+  /// so they keep the default delegation to [`Self::diagnostics`].
+  fn diagnostics_with_options(
+    &self,
+    extract_embedded: bool,
+  ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    match self {
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => {
+        crate::diagnostics::Diagnose::diagnostics_with_options(m, extract_embedded)
+      }
+      _ => crate::diagnostics::Diagnose::diagnostics(self),
     }
   }
 }
