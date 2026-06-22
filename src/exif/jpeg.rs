@@ -82,6 +82,15 @@ use super::{ExifEntry, ExifMeta, MakerNote, SofInfo, parse_exif_block_with_base}
 /// `ExifTool.pm:7743` + `:7780`).
 const EXIF_APP1_HDR: &[u8] = b"Exif\0\0";
 
+/// `Image::ExifTool::xmpAPP1hdr` (`ExifTool.pm:1241`): the 29-byte namespace
+/// marker prefixing a standard XMP packet in a JPEG `APP1` segment. The
+/// `ProcessJPEG` arm `$$valPt =~ /^$xmpAPP1hdr/` (`ExifTool.pm:7794`) matches it,
+/// strips it (`substr`/`DirStart`), and hands the remainder to `ProcessXMP`. The
+/// SAME constant the PNG raw-profile-XMP path uses
+/// ([`crate::formats::png`]'s `XMP_APP1_HDR`).
+#[cfg(feature = "xmp")]
+const XMP_APP1_HDR: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+
 /// `ProcessTIFF` failure on an `APP1` Exif segment — bundled `ExifTool.pm:7783`
 /// `$self->ProcessTIFF(\%dirInfo) or $self->Warn('Malformed APP1 EXIF
 /// segment')`. A non-fatal `Warn`, NOT a container rejection.
@@ -206,6 +215,30 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // the MakerNote for JPEGs exactly as for a standalone TIFF (the seam #75+
   // consume). First-wins matches bundled keeping the PRIMARY MakerNote.
   let mut maker_note: Option<MakerNote<'_>> = None;
+  // The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
+  // (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm). A
+  // JPEG normally carries exactly one; a file with more than one is handled by
+  // seeding this slot with the first and absorbing each later packet
+  // ([`XmpMeta::absorb_additional_packet`]), matching ExifTool's per-`APP1`
+  // `ProcessXMP` + accumulating `FoundTag`. `XmpMeta` owns its strings (the `'a`
+  // is a `PhantomData` anchor), so it is stored `'static`. The marker walk runs
+  // ONCE (the XMP packet is conv-mode-independent — `XmpMeta::tags(opts)` renders
+  // for either mode at emit time), so a single parse serves both `-j` and `-n`.
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp: Option<crate::formats::xmp::XmpMeta<'static>> = None;
+  // The file (marker) offset of the FIRST warning-PRODUCING XMP `APP1` segment
+  // (`base_offset + payload start`) and of the FIRST EXIF `APP1` that warned —
+  // the two positions [`ExifMeta::diagnostics`] ranks the embedded-XMP `Warning`
+  // against the EXIF warnings by (first-by-marker-position wins, mirroring the
+  // QuickTime `uuid`-XMP `#361` / Pittasoft `#362` priority-0 model). ExifTool
+  // processes `APPn` markers in FILE ORDER, so the earlier `APP1`'s warning owns
+  // the bare `ExifTool:Warning`. `None` until the relevant warning fires;
+  // `get_or_insert` keeps the FIRST (the one that owns the bare slot). Threaded
+  // only under `xmp` (the EXIF offset is consulted solely for this ordering).
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp_offset: Option<u32> = None;
+  #[cfg(feature = "xmp")]
+  let mut exif_warning_offset: Option<u32> = None;
   // `true` while inside a deferred multi-segment (extended) EXIF chain — set
   // when bundled's discriminator (`ExifTool.pm:7764`) detects the chain START
   // and propagated across the continuation fragments (bundled keeps
@@ -293,9 +326,58 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
       };
       // Is this an `APP1` segment matching the Exif arm `^(.{0,4})Exif\0.`?
       let Some(garbage) = exif_arm_garbage(payload) else {
-        // A non-Exif APP1 (XMP / extended-XMP / QVCI / PARROT) — its arms are a
-        // deferred JPEG-container follow-up. Keep walking (`ExifTool.pm:7821`
-        // `next`). `$$self{Make}` is unchanged here (no IFD0 was parsed).
+        // A non-Exif APP1 — bundled's `ProcessJPEG` next tests the standard XMP
+        // arm `$$valPt =~ /^$xmpAPP1hdr/` (`ExifTool.pm:7794`, `$xmpAPP1hdr =
+        // 'http://ns.adobe.com/xap/1.0/\0'`). Strip the 29-byte namespace marker
+        // and route the remaining XMP packet to the shared XMP parser
+        // ([`crate::formats::xmp::parse_borrowed`]) — the same `ProcessXMP` a
+        // standalone `.xmp` sidecar / a QuickTime `uuid`-XMP box (#361) uses. A
+        // file with several XMP `APP1`s seeds the slot with the first and absorbs
+        // each later one (ExifTool runs `ProcessXMP` per matching `APP1` and
+        // `FoundTag` accumulates with no de-dup, `ExifTool.pm:7794`). `$$self
+        // {Make}` is unchanged (no IFD0 was parsed). The ExtendedXMP arm
+        // (`$$valPt =~ /^$xmpExtAPP1hdr/`, `'http://ns.adobe.com/xmp/extension/
+        // \0'`, the GUID/offset-reassembled overflow packets) is a separate
+        // follow-up — no test fixture carries one. The other non-Exif APP1 arms
+        // (QVCI / FLIR / PARROT) stay deferred.
+        #[cfg(feature = "xmp")]
+        if let Some(packet) = payload.strip_prefix(XMP_APP1_HDR) {
+          // `parse_borrowed` returns `XmpMeta<'_>` tied to `packet`, but the
+          // decoded XMP owns its strings (the `'a` is a `PhantomData` anchor), so
+          // `into_static` rebrands it to `'static` for storage on the
+          // independently-lifetimed `ExifMeta`.
+          let parsed = crate::formats::xmp::parse_borrowed(packet)
+            .map(crate::formats::xmp::XmpMeta::into_static);
+          // `true` when THIS XMP `APP1`'s packet produced the adopted
+          // `ExifTool:Warning` (the seed packet warned, OR every earlier packet
+          // was clean and this one warns — first-warning-wins by file order,
+          // mirroring the QuickTime `uuid`-XMP path and `FoundTag('Warning')`
+          // priority-0). `absorb_additional_packet` returns that for a later
+          // packet; for the seed, inspect its own `warning()`.
+          let this_packet_owns_warning = match (&mut embedded_xmp, parsed) {
+            (slot @ None, parsed) => {
+              let warned = parsed.as_ref().is_some_and(|p| p.warning().is_some());
+              *slot = parsed;
+              warned
+            }
+            (Some(existing), Some(parsed)) => existing.absorb_additional_packet(parsed),
+            (Some(_), None) => false,
+          };
+          // Record the file (marker) offset of the FIRST warning-producing XMP
+          // `APP1` so [`ExifMeta::diagnostics`] can rank its `Warning` against
+          // the EXIF warnings by position. The same `base_offset + payload start`
+          // unit the EXIF side uses, `u32`-saturated on a pathological rebase
+          // (a JPEG cannot place an `APP1` past 4 GiB) — matching the EXIF
+          // `base` arithmetic below.
+          if this_packet_owns_warning {
+            let off = base_offset
+              .checked_add(seg.payload_start)
+              .and_then(|s| u32::try_from(s).ok())
+              .unwrap_or(u32::MAX);
+            embedded_xmp_offset.get_or_insert(off);
+          }
+        }
+        // Keep walking (`ExifTool.pm:7821` `next`).
         break 'app1;
       };
 
@@ -338,6 +420,13 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
         .and_then(|s| s.checked_add(hdr_len))
         .and_then(|s| u32::try_from(s).ok())
         .unwrap_or(u32::MAX);
+
+      // The warning count BEFORE this `APP1`'s parse — so a grown count after
+      // attributes the new warning(s) to THIS segment's marker position
+      // (`exif_warning_offset`, recorded once for the FIRST warning-producing
+      // EXIF `APP1`; see below).
+      #[cfg(feature = "xmp")]
+      let warnings_before = warnings.len();
 
       // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')`
       // (`ExifTool.pm:7783`). A bad TIFF block is a non-fatal `Warn` — the JPEG
@@ -413,6 +502,20 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
         }
         None => {}
       }
+      // If this EXIF `APP1` contributed any warning (a `ProcessTIFF` walk warning
+      // OR the `Malformed APP1 EXIF segment` push), record its marker (file)
+      // position — but only the FIRST such, the one that owns the bare
+      // `ExifTool:Warning`. The SAME `base_offset + payload start` unit the XMP
+      // side uses (the APP1 segment position, NOT the `+ hdr_len` TIFF-block
+      // offset), so [`ExifMeta::diagnostics`] ranks the two by true marker order.
+      #[cfg(feature = "xmp")]
+      if warnings.len() > warnings_before {
+        let off = base_offset
+          .checked_add(seg.payload_start)
+          .and_then(|s| u32::try_from(s).ok())
+          .unwrap_or(u32::MAX);
+        exif_warning_offset.get_or_insert(off);
+      }
     }
     // Record the running `$$self{Make} eq 'DJI'` state AS OF this segment — after
     // this `APP1`'s own update (if it parsed), else carried forward unchanged.
@@ -443,6 +546,28 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     if !app_pc.is_empty() || !app_n.is_empty() {
       meta.set_jpeg_app_tags(app_pc, app_n);
     }
+  }
+  // The embedded XMP `APP1` packet (`ExifTool.pm:7794`), decoded once during the
+  // marker walk above. Attached for [`Taggable::tags`] to append after the EXIF
+  // block (its `XMP-*` tags) and for [`Diagnose`] to surface its `Warning`.
+  // `None` for a JPEG carrying no XMP `APP1`.
+  #[cfg(feature = "xmp")]
+  if embedded_xmp.is_some() {
+    meta.set_jpeg_embedded_xmp(embedded_xmp);
+  }
+  // The marker (file) positions of the warning-producing XMP `APP1` and the
+  // first warning-producing EXIF `APP1`, so [`ExifMeta::diagnostics`] ranks the
+  // embedded-XMP `Warning` against the EXIF warnings by file order (first-by-
+  // position wins, mirroring `#361`/`#362`). Each is `Some` only when the
+  // corresponding warning fired; a JPEG whose realistic camera layout puts the
+  // EXIF `APP1` first keeps the EXIF warnings leading, byte-identical.
+  #[cfg(feature = "xmp")]
+  if let Some(off) = embedded_xmp_offset {
+    meta.set_jpeg_embedded_xmp_offset(off);
+  }
+  #[cfg(feature = "xmp")]
+  if let Some(off) = exif_warning_offset {
+    meta.set_jpeg_exif_warning_offset(off);
   }
   // The `File:*` Start-Of-Frame dimension tags (`ExifTool.pm:7419-7462`): the
   // FIRST SOF segment yields `ImageWidth`/`ImageHeight`/`EncodingProcess`/
@@ -1338,6 +1463,96 @@ mod tests {
       meta2.warnings(),
       &[String::from(MALFORMED_APP1_WARNING)],
       "a non-II/MM marker is not a BigTIFF skip — it still warns"
+    );
+  }
+
+  /// The embedded-XMP `Warning` is ordered against the EXIF `APP1` warnings by
+  /// APP1 MARKER FILE POSITION — the FIRST warning-producing `APP1` (XMP or EXIF)
+  /// owns the bare `ExifTool:Warning` (the same first-by-position priority-0
+  /// model as the QuickTime `uuid`-XMP `#361` / Pittasoft `#362` doc warnings),
+  /// NOT always-after-EXIF. ExifTool processes JPEG `APPn` markers in file order
+  /// and `Warning` is a priority-0 `FoundTag` first-wins, so a warning-producing
+  /// XMP `APP1` placed BEFORE a malformed (warning-producing) EXIF `APP1`
+  /// surfaces the XMP warning first, and the reverse layout surfaces the EXIF
+  /// warning first. Ground-truthed vs bundled 13.59 `-G1 -j`.
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn embedded_xmp_warning_ordered_by_app1_marker_position() {
+    // A warning-producing XMP `APP1` payload: the `$xmpAPP1hdr` namespace marker
+    // + a UTF-8-BOM `<?xpacket>` whose `dc:title` carries a DOUBLE-encoded `é`
+    // (`\xc3\xa9`) — `ProcessXMP` decodes the double layer and raises
+    // `XMP is double UTF-encoded` (XMP.pm:4494), exactly the
+    // `xmp::tests` double-decode fixture.
+    let xmp_app1 = || -> Vec<u8> {
+      let head = b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">";
+      let tail = b"</rdf:li></rdf:Alt></dc:title></rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>";
+      let mut packet: Vec<u8> = std::vec![0xef, 0xbb, 0xbf]; // UTF-8 BOM → $double path
+      packet.extend_from_slice(head);
+      packet.extend_from_slice(b"\xc3\xa9"); // double-encoded é
+      packet.extend_from_slice(tail);
+      let mut app1: Vec<u8> = XMP_APP1_HDR.to_vec();
+      app1.extend_from_slice(&packet);
+      app1
+    };
+    // A warning-producing EXIF `APP1` payload: `Exif\0\0` + a non-TIFF block ⇒
+    // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')` (ExifTool.pm:7783).
+    let exif_app1 = || -> Vec<u8> {
+      let mut app1: Vec<u8> = b"Exif\0\0".to_vec();
+      app1.extend_from_slice(b"NOT-A-VALID-TIFF-BLOCK");
+      app1
+    };
+    // Wrap the given `APP1` payloads, in order, into a JPEG (`SOI` + each as an
+    // `0xff 0xe1` length-bearing segment + `EOI`). The byte order IS the marker
+    // (file) order the walk sees.
+    let jpeg_with_app1s = |payloads: &[Vec<u8>]| -> Vec<u8> {
+      let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+      for p in payloads {
+        j.push(0xff);
+        j.push(0xe1);
+        let len = (p.len() + 2) as u16;
+        j.extend_from_slice(&len.to_be_bytes());
+        j.extend_from_slice(p);
+      }
+      j.extend_from_slice(&[0xff, 0xd9]); // EOI
+      j
+    };
+    // The bare `ExifTool:Warning` is the FIRST document-level warning drained by
+    // `run_diagnostics` (TagMap::first_warning) — exactly bundled's priority-0
+    // first-wins `FoundTag('Warning')`.
+    let bare_warning = |j: &[u8]| -> (Option<String>, std::vec::Vec<String>) {
+      let meta = parse_jpeg_exif(j).expect("a valid JPEG is accepted");
+      let mut tm = crate::tagmap::TagMap::new();
+      crate::diagnostics::run_diagnostics(&meta, &mut tm);
+      (
+        tm.first_warning().map(str::to_string),
+        tm.warnings().to_vec(),
+      )
+    };
+
+    // XMP `APP1` BEFORE the malformed EXIF `APP1` → the EARLIER (XMP) warning
+    // owns the bare `Warning`; the EXIF warning still surfaces, after it.
+    let (bare, all) = bare_warning(&jpeg_with_app1s(&[xmp_app1(), exif_app1()]));
+    assert_eq!(
+      bare.as_deref(),
+      Some("XMP is double UTF-encoded"),
+      "the earlier (XMP) APP1's warning must own the bare ExifTool:Warning, got {all:?}"
+    );
+    assert!(
+      all.iter().any(|w| w == MALFORMED_APP1_WARNING),
+      "the later EXIF warning still surfaces (after the XMP one), got {all:?}"
+    );
+
+    // The REVERSE layout: the malformed EXIF `APP1` BEFORE the XMP `APP1` → the
+    // EARLIER (EXIF) warning owns the bare slot; the XMP warning trails.
+    let (bare_rev, all_rev) = bare_warning(&jpeg_with_app1s(&[exif_app1(), xmp_app1()]));
+    assert_eq!(
+      bare_rev.as_deref(),
+      Some(MALFORMED_APP1_WARNING),
+      "the earlier (EXIF) APP1's warning must own the bare ExifTool:Warning, got {all_rev:?}"
+    );
+    assert!(
+      all_rev.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the later XMP warning still surfaces (after the EXIF one), got {all_rev:?}"
     );
   }
 

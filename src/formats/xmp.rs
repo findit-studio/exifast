@@ -320,6 +320,23 @@ impl XmpMeta<'_> {
     self.warning = Some(msg);
   }
 
+  /// Rebrand the `'a` lifetime to `'static`. `XmpMeta` OWNS its decoded data
+  /// (every `tags` string is a transcoded owned `String`/`SmolStr`; the `'a` is
+  /// the `_input: PhantomData<&'a [u8]>` GAT anchor and binds nothing borrowed),
+  /// so this just moves the owned fields under a `'static` phantom — no data is
+  /// borrowed from the source buffer. Used by the JPEG front-end to store the
+  /// embedded-`APP1` XMP on the (independently-lifetimed) `ExifMeta` without
+  /// tying it to the JPEG byte slice. (`pub(crate)`: an internal storage seam.)
+  #[must_use]
+  pub(crate) fn into_static(self) -> XmpMeta<'static> {
+    XmpMeta {
+      tags: self.tags,
+      warning: self.warning,
+      nikon_nxd: self.nikon_nxd,
+      _input: core::marker::PhantomData,
+    }
+  }
+
   /// Absorb a SECOND XMP packet decoded from the SAME file (e.g. a second
   /// top-level `uuid`-XMP box in a QuickTime container — ExifTool's `ProcessMOV`
   /// atom walk dispatches EVERY `uuid` atom, with no de-dup, so a file may carry
