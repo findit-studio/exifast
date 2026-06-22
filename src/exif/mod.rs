@@ -11754,21 +11754,45 @@ fn emit_exif_value<S: ExifSink>(
       // seconds (no ValueConv), fed to `PrintExposureTime`. The
       // `RoundFloat(n/d, 10)` rounding is a property of the rational read, so it
       // is shape-specific (`rational_read`): a single `Rational` yields the
-      // rounded quotient or the `inf`/`undef` word; a single non-rational shape
-      // yields the UNROUNDED native scalar; a count>1 value is the space-joined
-      // `$val`.
+      // rounded quotient or the `inf`/`undef` word; a single non-rational scalar
+      // yields its EXACT `ReadValue` token (the unrounded native scalar — a
+      // `>2**53` integer stays exact, a non-finite float its titlecase word,
+      // #385); a count>1 value is the space-joined `$val`.
       match rational_read(raw) {
         Some(RationalRead::Finite(s)) if print_conv => {
           // `PrintExposureTime` of the read value (the 10-sig-fig quotient for a
-          // rational, e.g. `1/60` → `0.01666666667` → `"1/60"`; the unrounded
-          // scalar for a float/integer) → `1/724` (out of gate ⇒ string) or a
-          // whole/`%.1f` second count like `30` (in gate ⇒ a bare JSON number).
+          // rational, e.g. `1/60` → `0.01666666667` → `"1/60"`) → `1/724` (out of
+          // gate ⇒ string) or a whole/`%.1f` second count like `30` (in gate ⇒ a
+          // bare JSON number).
           emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
         }
         // `-n`: the read value, gated (a finite rational re-parses to the
         // 10-sig-fig f64 that also feeds `Composite:ShutterSpeed`/`LightValue`
-        // byte-exact; a float/integer keeps its unrounded scalar).
+        // byte-exact).
         Some(RationalRead::Finite(s)) => emit_gated_f64(group, name, s, out)?,
+        // A single NON-rational scalar (`int64u`/`int64s`/float/double): emit the
+        // EXACT `ReadValue` token. `-n` is the bare token (the exact integer —
+        // `>2**53` stays exact, never scientific; the `%.15g` float; the
+        // titlecase non-finite word) gated by `EscapeJSON` (a `>15`-digit integer
+        // / a non-finite word is out of gate ⇒ a quoted string, byte-identical to
+        // bundled). Print `PrintExposureTime` IsFloat-gates the token
+        // (`Exif.pm:5704`, `value.is_finite() == IsFloat(token)` here): an
+        // integer/finite-float token (`IsFloat` true) is `%.1f`/`1/N`-formatted on
+        // the NUMIFIED `value` (Perl numifies `$val` in `sprintf("%.1f", $val)`),
+        // a non-finite word token (`IsFloat` false) is returned verbatim — Perl's
+        // titlecase `Inf` casing (#385).
+        Some(RationalRead::Scalar { token, value }) if print_conv => {
+          if value.is_finite() {
+            emit_gated_number(group, name, &tables::print_exposure_time(value), out)?;
+          } else {
+            // `IsFloat($val)` false ⇒ `PrintExposureTime` returns `$secs` (the
+            // titlecase `Inf`/`-Inf`/`NaN` word) unchanged.
+            emit_gated_number(group, name, &token, out)?;
+          }
+        }
+        Some(RationalRead::Scalar { token, .. }) => {
+          emit_gated_number(group, name, &token, out)?;
+        }
         // The zero-denominator word `undef`/`inf`: `PrintExposureTime` returns a
         // non-float input verbatim (`Exif.pm:5704`) and `-n` is the same word, so
         // both modes emit the word; `emit_gated_number` quotes it (out of the
@@ -11801,6 +11825,12 @@ fn emit_exif_value<S: ExifSink>(
       // false ⇒ the ValueConv yields `0`.
       let secs = match rational_read(raw) {
         Some(RationalRead::Finite(apex)) => Some(shutter_speed_value_conv(apex)),
+        // A single NON-rational scalar's numeric `value` is the apex Perl numifies
+        // (#385): `IsFloat($val) && abs($val)<100 ? 2**(-$val) : 0`.
+        // `shutter_speed_value_conv` applies BOTH guards — a `>2**53` integer
+        // value (`abs >= 100`) and a non-finite `F64` value (whose token is the
+        // `IsFloat`-false word) both fall to `0`, matching ExifTool.
+        Some(RationalRead::Scalar { value, .. }) => Some(shutter_speed_value_conv(value)),
         // `IsFloat("inf"/"undef")` and `IsFloat(<space-joined>)` are both false ⇒
         // the ValueConv's `: 0` branch.
         Some(RationalRead::Degenerate(_) | RationalRead::Joined { .. }) => Some(0.0),
@@ -11883,6 +11913,12 @@ fn emit_exif_value<S: ExifSink>(
       // (Perl's leading-numeric-prefix coercion: `"4.339850027 5"` → `4.339…`).
       let apex = match rational_read(raw) {
         Some(RationalRead::Finite(apex)) => Some(apex),
+        // A single NON-rational scalar's numeric `value` is the apex the unguarded
+        // `2**($val/2)` numifies (#385): an integer's `f64` (a `>2**53` value
+        // exponentiates to `Inf`), the float verbatim, `+∞`→`2**∞ = Inf`,
+        // `NaN`→`NaN`. (The `token` matters only to `ExposureTime`; the apex math
+        // is on the numeric value.)
+        Some(RationalRead::Scalar { value, .. }) => Some(value),
         // Perl numifies the bare `GetRational*` word in `$val / 2`: a
         // non-numeric `"undef"` → `0`, `"inf"` → `+inf` (never `-inf`).
         Some(RationalRead::Degenerate("inf")) => Some(f64::INFINITY),
@@ -12615,8 +12651,12 @@ fn emit_int_label<S: ExifSink>(
 ///     `IsFloat($val)` guard yields `0`, `ApertureValue`'s unguarded `2 **`
 ///     numifies the word — `inf`→∞, `undef`→0);
 ///   * a single non-rational shape (crafted FLOAT/DOUBLE `[f]`, or integer
-///     `U64[n]`/`I64[n]`) → [`Self::Finite`] of the UNROUNDED native scalar
-///     (`GetFloat`/`GetDouble`/`Get…u`);
+///     `U64[n]`/`I64[n]`) → [`Self::Scalar`] carrying BOTH the EXACT `ReadValue`
+///     token (the UNROUNDED native scalar — `Get64u`/`Get64s`'s exact integer
+///     even above `2**53`, `GetFloat`/`GetDouble`'s `%.15g` / titlecase
+///     `Inf`/`-Inf`/`NaN`) AND its numeric `f64` value, so `ExposureTime`'s
+///     `-n`/verbatim keeps the exact token while the apex `2**` ValueConvs
+///     numify the value (#385);
 ///   * a COUNT>1 value of ANY numeric shape (multi `Rational`/`U64`/`I64`/`F64`)
 ///     → [`Self::Joined`] carrying BOTH the space-joined `$val` (the verbatim
 ///     `ReadValue` string — each element rendered as `emit_raw`/`GetRational`
@@ -12630,10 +12670,49 @@ fn emit_int_label<S: ExifSink>(
 ///     `None` (no scalar element), so the caller falls back to [`emit_raw`].
 enum RationalRead {
   /// A finite scalar value: the `RoundFloat`-rounded quotient of a single
-  /// `Rational`, or the unrounded native scalar of a single non-rational shape.
-  /// This is the numeric `$val` an arithmetic ValueConv (`2 ** -$val`,
-  /// `2 ** ($val/2)`) consumes, and the value `PrintExposureTime`/`-n` renders.
+  /// `Rational`. This is the numeric `$val` an arithmetic ValueConv
+  /// (`2 ** -$val`, `2 ** ($val/2)`) consumes, and the value
+  /// `PrintExposureTime`/`-n` renders.
+  ///
+  /// A single NON-rational scalar (`U64`/`I64`/`F64`) is [`Self::Scalar`]
+  /// instead — it must preserve the EXACT `ReadValue` token (an `int64u`/`int64s`
+  /// above `2**53` would lose its exact integer through an `f64` cast, and a
+  /// non-finite `F64` its titlecase print word) alongside the numeric value the
+  /// apex arithmetic consumes (#385).
   Finite(f64),
+  /// A single NON-rational on-disk scalar (`U64`/`I64`/`F64`), carrying BOTH the
+  /// EXACT `ReadValue` token (`&$proc` = `Get64u`/`Get64s`/`GetFloat`/`GetDouble`,
+  /// `ExifTool.pm:6322-6331`) AND the numeric value (#385). `ReadValue` returns
+  /// the bare native scalar — `Get64u`/`Get64s` an EXACT integer (Perl 64-bit IV,
+  /// never scientific even above `2**53`), `GetFloat`/`GetDouble` the NV that
+  /// stringifies `%.15g` (titlecase `Inf`/`-Inf`/`NaN` when non-finite). The
+  /// shapes differ:
+  ///   * a verbatim/`-n` PrintConv (`ExposureTime`) emits the `token` (the exact
+  ///     integer, the `%.15g` float, or the titlecase non-finite word) — NOT the
+  ///     `f64`-cast value, so a `>2**53` integer stays exact;
+  ///   * `PrintExposureTime` (`ExposureTime` print) IsFloat-gates the token
+  ///     (`Exif.pm:5704`): an integer/finite-float token (`IsFloat` true) is
+  ///     `%.1f`/`1/N`-formatted on the NUMIFIED `value`; a non-finite word token
+  ///     (`IsFloat` false) is returned verbatim — Perl's titlecase `Inf` casing;
+  ///   * an arithmetic ValueConv (`ShutterSpeedValue`/`ApertureValue`) consumes
+  ///     the numeric `value` (Perl numifies `$val`: the exact integer's `f64`,
+  ///     `Inf`→∞, `NaN`→NaN) and is itself `IsFloat`-guarded
+  ///     (`ShutterSpeedValue`) or not (`ApertureValue`).
+  ///
+  /// `value.is_finite()` is exactly `IsFloat(token)` here: a finite value always
+  /// yields an integer/finite-float token (`IsFloat` true), and the only way to a
+  /// non-finite value is a non-finite `F64`, whose token is the `IsFloat`-false
+  /// word. So the consuming arms gate on `value.is_finite()`.
+  Scalar {
+    /// The EXACT `ReadValue` scalar token — the exact integer string for
+    /// `U64`/`I64` (NOT `f64`-cast, so `>2**53` stays exact), the `%.15g` render
+    /// for a finite `F64`, the titlecase `Inf`/`-Inf`/`NaN` word for a non-finite
+    /// `F64`.
+    token: String,
+    /// The numeric `value` the apex arithmetic numifies (the integer's `f64`, the
+    /// float verbatim, `+∞`/`NaN` for a non-finite `F64`).
+    value: f64,
+  },
   /// A single `Rational` with a zero denominator: `GetRational*` returned the
   /// bare word `"undef"` (numerator 0) or `"inf"` (numerator ≠ 0 — always
   /// `'inf'`, never `'-inf'`). The consuming arm decides how its ValueConv treats
@@ -12691,8 +12770,11 @@ fn rational_read(raw: &RawValue) -> Option<RationalRead> {
     }),
     // A single non-rational on-disk shape (crafted FLOAT/DOUBLE/integer) is read
     // by its own getter WITHOUT the rational rounding — its native scalar,
-    // unrounded.
-    _ => first_scalar(raw).map(RationalRead::Finite),
+    // unrounded — carrying the EXACT `ReadValue` token (an `int64u`/`int64s`
+    // above `2**53` would lose its exact integer through an `f64` cast; a
+    // non-finite `F64` its titlecase print word) alongside the numeric value the
+    // apex arithmetic consumes (#385).
+    _ => scalar_token_value(raw).map(|(token, value)| RationalRead::Scalar { token, value }),
   }
 }
 
@@ -12743,6 +12825,40 @@ fn first_scalar(raw: &RawValue) -> Option<f64> {
     RawValue::F64(v) => v.first().copied(),
     RawValue::Rational(rs) => rs.first().map(rational_quotient),
     _ => None,
+  }
+}
+
+/// A single NON-rational scalar (`U64`/`I64`/`F64`) as its EXACT `ReadValue`
+/// token AND its numeric `f64` value (#385) — `None` for a `Rational` (handled
+/// by the rational arm) or a non-scalar (`Bytes`/`Text`) or empty list.
+///
+/// The token mirrors `ReadValue`'s bare native scalar (`ExifTool.pm:6322-6331`,
+/// `return $vals[0]`):
+///   * `U64`/`I64` → the EXACT integer string (`Get64u`/`Get64s` is a Perl
+///     64-bit IV; even above `2**53` it stringifies exactly, never scientific —
+///     an `f64` cast would lose it);
+///   * a finite `F64` → `%.15g` ([`crate::value::format_g`] with precision 15,
+///     Perl's default NV stringification — the same render `emit_gated_f64`
+///     applies, so a finite-float scalar's `-n` is byte-unchanged);
+///   * a non-finite `F64` → Perl's titlecase `Inf`/`-Inf`/`NaN`
+///     ([`crate::value::perl_nonfinite_str`]) — the print word `PrintExposureTime`
+///     returns verbatim (`IsFloat` false).
+///
+/// The `value` is the numeric scalar the apex `2**` ValueConvs numify (an
+/// integer's `f64`, the float verbatim, `+∞`/`NaN` for a non-finite `F64`).
+#[cfg(feature = "alloc")]
+fn scalar_token_value(raw: &RawValue) -> Option<(String, f64)> {
+  match raw {
+    RawValue::U64(v) => v.first().map(|&n| (std::format!("{n}"), n as f64)),
+    RawValue::I64(v) => v.first().map(|&n| (std::format!("{n}"), n as f64)),
+    RawValue::F64(v) => v.first().map(|&f| {
+      let token = crate::value::perl_nonfinite_str(f).map_or_else(
+        || crate::value::format_g(f, 15),
+        std::string::ToString::to_string,
+      );
+      (token, f)
+    }),
+    RawValue::Rational(_) | RawValue::Text { .. } | RawValue::Bytes(_) => None,
   }
 }
 
@@ -15227,6 +15343,179 @@ mod tests {
     // print mode → `PrintExposureTime` of the unrounded scalar still fractionizes
     // to `1/60` (both round and unrounded collapse there).
     assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/60");
+  }
+
+  // -- #385: a single non-rational scalar preserves its EXACT ReadValue token --
+  //
+  // `ReadValue` returns the bare native scalar for a count-1 non-rational shape
+  // (`ExifTool.pm:6322-6331`, `return $vals[0]`): `Get64u`/`Get64s` an EXACT Perl
+  // 64-bit integer (never scientific, even above `2**53`), `GetFloat`/`GetDouble`
+  // the NV stringified `%.15g` (titlecase `Inf`/`-Inf`/`NaN` when non-finite).
+  // The pre-#385 helper cast EVERY count-1 non-rational scalar through `first_
+  // scalar` → `f64`, so a `>2**53` `int64u`/`int64s` `ExposureTime` lost its
+  // exact integer (rendered `9.00719925474099e15` instead of the exact token) and
+  // a non-finite `F64` mishandled the print casing. These pin the token-preserving
+  // [`RationalRead::Scalar`]. Reachable: the EXIF walker reads a known tag's
+  // on-disk format unless a `Format` override applies, and `ExposureTime`/
+  // `ShutterSpeedValue`/`ApertureValue` have none. Verified against bundled
+  // `exiftool` 13.59 (`ReadValue` + `IsFloat` + `PrintExposureTime` + the apex
+  // ValueConvs).
+
+  /// A crafted `int64u` `ExposureTime` above `2**53` (`9007199254740993`,
+  /// malformed format / BigTIFF) reads via `Get64u` as the EXACT integer: `-n` is
+  /// the exact integer TOKEN, NOT the `f64`-cast `9.00719925474099e15` (the
+  /// pre-#385 scientific render). `EscapeJSON` quotes a `>15`-digit integer, so
+  /// the value is a JSON STRING `"9007199254740993"` (byte-identical to bundled).
+  /// Print `PrintExposureTime`: `IsFloat("9007199254740993")` is TRUE (the regex
+  /// matches a bare integer) ⇒ `sprintf("%.1f", $val)` NUMIFIES `$val` to `f64`
+  /// and strips `.0` → `9007199254740992` (the `f64`-rounded value, exactly what
+  /// bundled emits in print mode — `2**53` is the f64 integer limit).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_int64u_above_2pow53_keeps_exact_token() {
+    let raw = RawValue::U64(std::vec![9_007_199_254_740_993]);
+    // `-n`: the EXACT integer token, quoted (16 digits ⇒ out of the EscapeJSON
+    // gate). NOT `9.00719925474099e15`.
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "9007199254740993",
+      "a >2**53 int64u ExposureTime keeps its exact integer token at -n, not f64-scientific"
+    );
+    // print: `IsFloat` true ⇒ `sprintf(\"%.1f\", numify($val))` ⇒ the f64-rounded
+    // `9007199254740992` (== bundled `PrintExposureTime`).
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "9007199254740992"
+    );
+  }
+
+  /// A crafted `int64s` `ExposureTime` below `-2**53` (`-9007199254740993`) reads
+  /// via `Get64s` as the EXACT signed integer: `-n` is the exact token
+  /// `"-9007199254740993"` (quoted — `>15` significant digits), NOT the
+  /// `f64`-scientific `-9.00719925474099e15`. Print numifies to the f64-rounded
+  /// `-9007199254740992`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_int64s_below_neg_2pow53_keeps_exact_token() {
+    let raw = RawValue::I64(std::vec![-9_007_199_254_740_993]);
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "-9007199254740993",
+      "a <-2**53 int64s ExposureTime keeps its exact signed integer token at -n"
+    );
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "-9007199254740992"
+    );
+  }
+
+  /// A non-finite `F64` `ExposureTime` (a crafted double-stored `+Inf`/`-Inf`/
+  /// `NaN`) stringifies (Perl NV) as the titlecase word `Inf`/`-Inf`/`NaN`.
+  /// `IsFloat` is FALSE for that word ⇒ `PrintExposureTime` returns it verbatim
+  /// (`Exif.pm:5704`) — Perl's TITLECASE casing, NOT Rust's lowercase `inf`. `-n`
+  /// is the same word. Both modes emit the titlecase word, quoted (out of the
+  /// number gate).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_non_finite_f64_uses_titlecase_print_word() {
+    for (f, word) in [
+      (f64::INFINITY, "Inf"),
+      (f64::NEG_INFINITY, "-Inf"),
+      (f64::NAN, "NaN"),
+    ] {
+      let raw = RawValue::F64(std::vec![f]);
+      assert_eq!(
+        emit_conv(&raw, Conv::ExposureTime, true),
+        word,
+        "a non-finite F64 ExposureTime prints Perl's titlecase {word}, not lowercase"
+      );
+      assert_eq!(
+        emit_conv(&raw, Conv::ExposureTime, false),
+        word,
+        "a non-finite F64 ExposureTime -n is the titlecase {word} token"
+      );
+    }
+  }
+
+  /// A finite `F64` `ExposureTime` is byte-UNCHANGED by #385: the token is still
+  /// `%.15g` (`format_g(_, 15)`, exactly what the pre-#385 `emit_gated_f64`
+  /// emitted), so `-n` keeps the unrounded full-precision scalar and print
+  /// fractionizes the numified value. (Pins that token preservation did not
+  /// perturb the finite-float scalar path.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_finite_f64_scalar_token_is_unchanged() {
+    use crate::value::TagValue;
+    let raw = RawValue::F64(std::vec![0.005]);
+    // print → `1/200` (`$val < 0.25001` fraction branch on the numified value).
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/200");
+    // `-n` → `%.15g` = `0.005`, an in-gate bare number (`F64(0.005)`), byte-equal
+    // to the pre-#385 `emit_gated_f64` render.
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(map.get("IFD0", "T"), Some(&TagValue::F64(0.005)));
+  }
+
+  /// The apex `2**` ValueConvs consume the NUMERIC value of a single non-rational
+  /// scalar (#385) — token preservation must not break the apex math. A SMALL
+  /// `int32u` apex still exponentiates: `ShutterSpeedValue` `8` →
+  /// `IsFloat && abs<100 ? 2**(-8) : 0` = `0.00390625` (print `PrintExposureTime`
+  /// → `1/256`); `ApertureValue` `8` → `2**(8/2)` = `16.0` (print `%.1f` → `16.0`).
+  /// A `>2**53` integer apex still numifies to `f64`: `ShutterSpeedValue` `abs >=
+  /// 100` ⇒ `0`; `ApertureValue` `2**(4.5e15)` ⇒ `Inf`. All byte-identical to
+  /// bundled.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apex_scalar_numeric_value_still_exponentiates() {
+    use crate::value::TagValue;
+    let stored = |raw: &RawValue, conv: Conv, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value("IFD0", "T", raw, conv, ByteOrder::Big, print, &mut map).unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // -- small int apex does real arithmetic on the numeric value --
+    let small = RawValue::U64(std::vec![8]);
+    // ShutterSpeedValue 8 → 2**(-8) = 0.00390625; print → `1/256`.
+    assert_eq!(emit_conv(&small, Conv::ShutterSpeedApex, true), "1/256");
+    assert_eq!(
+      stored(&small, Conv::ShutterSpeedApex, false),
+      Some(TagValue::F64(0.003_906_25))
+    );
+    // ApertureValue 8 → 2**(8/2) = 16; print `%.1f` → `16.0` (JSON-faithful
+    // `F64(16.0)`; `-n` is the in-gate integer token `16` ⇒ `U64(16)`).
+    assert_eq!(
+      stored(&small, Conv::ApertureApex, true),
+      Some(TagValue::F64(16.0))
+    );
+    assert_eq!(
+      stored(&small, Conv::ApertureApex, false),
+      Some(TagValue::U64(16))
+    );
+    // -- a >2**53 integer apex still numifies to f64 (the token doesn't gate the
+    // math) --
+    let big = RawValue::U64(std::vec![9_007_199_254_740_993]);
+    // ShutterSpeedValue: `abs(value) >= 100` ⇒ the `: 0` branch ⇒ `0`.
+    assert_eq!(emit_conv(&big, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&big, Conv::ShutterSpeedApex, true), "0");
+    // ApertureValue: `2**(9007199254740992/2)` overflows to `Inf` ⇒ `-n` is the
+    // non-finite `F64(Inf)`; print `%.1f` of `Inf` is the titlecase `"Inf"` word.
+    assert_eq!(
+      stored(&big, Conv::ApertureApex, false),
+      Some(TagValue::F64(f64::INFINITY))
+    );
+    assert_eq!(
+      stored(&big, Conv::ApertureApex, true),
+      Some(TagValue::Str("Inf".into()))
+    );
   }
 
   // -- #380: the apex `2**` ValueConvs share the rational-read shape split ----
