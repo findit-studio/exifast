@@ -5248,6 +5248,27 @@ fn apply_audio_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadat
 /// other-length form. Returns `true` when either form resolved against ItemList
 /// or UserData.
 ///
+/// **Reversed-id form (QuickTime.pm:9812-9818).** ExifTool has samples where the
+/// key id is a BYTE-REVERSED ItemList/UserData id: after the forward ItemList +
+/// UserData lookups for the current `$tag` both miss, if `$tag =~ /^\w{3}\xa9$/`
+/// (3 word chars then `0xA9`) it byte-reverses the id (`pack('N', unpack('V',
+/// $tag))` — a plain 4-byte reversal) and tries ItemList THEN UserData once more,
+/// then `last`s unconditionally (line 9817). So `yad\xa9` (the reversed `\xa9day`)
+/// resolves to the ItemList `ContentCreateDate` (ground-truthed vs bundled 13.59).
+/// The reversed lookup is tried per-form, in the SAME `$tag = $short` then
+/// `$tag = $full` order as the forward attempts.
+///
+/// **Why the matched pattern always returns `true` (consumes the key).** ExifTool
+/// `last`s after the reversed attempt regardless of its outcome (line 9817), so on
+/// a reversed-id key it NEVER reaches the `$tag = $full` reset (the full form is
+/// not retried) NOR the normal unknown-key DERIVE on the stripped id. On a reversed
+/// MISS, the `$tag` carried into the derive gate (9844) is the reversed `\xa9xxx`,
+/// which ALWAYS fails it (`0xA9` is outside `[-\w. ]` and a `\xa9`+3-char id has no
+/// run of 4 word chars) ⇒ ExifTool emits nothing. So in BOTH the reversed-hit and
+/// reversed-miss sub-cases the key is CONSUMED here (the caller must not derive
+/// from the un-reversed stripped id); only the un-reversed forward path falls
+/// through to [`derive_keys_name`].
+///
 /// The RAW key bytes ([`KeyName::stripped_raw`]/[`full_raw`]) are matched, NOT the
 /// lossy `String` — a `0xA9`-prefixed 4-cc id (`\xa9day`/`\xa9xyz`/`\xa9too`, the
 /// `©`-symbol ItemList/UserData ids) is invalid UTF-8 whose `String` form is a
@@ -5261,15 +5282,40 @@ fn apply_keys_cross_table_either(
     if apply_keys_cross_table(cc, data, keys_out) {
       return true;
     }
+    // QuickTime.pm:9812-9818: the reversed-id ItemList/UserData lookup. A matched
+    // `^\w{3}\xa9$` id CONSUMES the key (ExifTool `last`s here, and a reversed
+    // miss derives nothing) — so the full-form lookup below is skipped too.
+    if let Some(rev) = reversed_a9_id(cc) {
+      apply_keys_cross_table(&rev, data, keys_out);
+      return true;
+    }
   }
   if key.full_raw != key.stripped_raw {
     if let Ok(cc) = <&[u8; 4]>::try_from(key.full_raw.as_slice()) {
       if apply_keys_cross_table(cc, data, keys_out) {
         return true;
       }
+      if let Some(rev) = reversed_a9_id(cc) {
+        apply_keys_cross_table(&rev, data, keys_out);
+        return true;
+      }
     }
   }
   false
+}
+
+/// The reversed-id transform of QuickTime.pm:9813-9814. Returns the BYTE-REVERSED
+/// 4-cc when `cc` matches `^\w{3}\xa9$` (bytes 0-2 are word chars `[A-Za-z0-9_]`
+/// and byte 3 is `0xA9`), else `None`. `pack('N', unpack('V', $tag))` reads the id
+/// little-endian and writes it big-endian — a plain 4-byte reversal — so
+/// `[a, b, c, 0xA9]` ⇒ `[0xA9, c, b, a]` (e.g. `yad\xa9` ⇒ `\xa9day`).
+fn reversed_a9_id(cc: &[u8; 4]) -> Option<[u8; 4]> {
+  let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+  if cc[3] == 0xA9 && is_word(cc[0]) && is_word(cc[1]) && is_word(cc[2]) {
+    Some([cc[3], cc[2], cc[1], cc[0]])
+  } else {
+    None
+  }
 }
 
 /// Resolve a single key NAME against `%QuickTime::AudioKeys` (the audio-track
@@ -6723,6 +6769,7 @@ impl Meta<'_> {
     use crate::metadata::{CameraInfo, GpsLocation};
     let ud = self.qt.user_data();
     let keys = self.qt.keys();
+    let item_list = self.qt.item_list();
 
     // ── CameraInfo (make / model / software) — Keys over UserData ──────
     if md.camera().is_none() {
@@ -6744,20 +6791,46 @@ impl Meta<'_> {
 
     // ── Capture date (CreationDate / ContentCreateDate) ────────────────
     // `MediaInfo::created` is set by `from_quicktime` from the `mvhd`
-    // CreateDate; the explicit camera capture date (the iOS `creationdate`,
-    // else `©day`) is a higher-quality signal, so override it here.
-    if let Some(date) = keys.creation_date().or_else(|| ud.content_create_date()) {
+    // CreateDate; the explicit camera capture date is a higher-quality signal,
+    // so override it here. Precedence follows the ExifTool tag chain:
+    //   1. `Keys:CreationDate` (the dedicated iOS `com.apple.quicktime.
+    //      creationdate`, with timezone) — the single best capture timestamp.
+    //   2. ContentCreateDate (the `©day` tag NAME, shared by the ItemList /
+    //      UserData / Keys tables) in PREFERRED order: ItemList (PREFERRED => 2,
+    //      QuickTime.pm:3486) over UserData (PREFERRED => 1, QuickTime.pm:1591)
+    //      over the cross-table `Keys:ContentCreateDate` (the reversed-id /
+    //      raw-`\xa9day` keys landing, no PREFERRED). So an Android / drone file
+    //      whose capture date lives ONLY in `ItemList:ContentCreateDate`
+    //      (e.g. the Parrot ANAFI — a LOCAL-time `©day`, distinct from the UTC
+    //      `mvhd` CreateDate) surfaces that local capture date here.
+    if let Some(date) = keys
+      .creation_date()
+      .or_else(|| item_list.content_create_date())
+      .or_else(|| ud.content_create_date())
+      .or_else(|| keys.content_create_date())
+    {
       md.media_mut().update_created(Some(date.to_string()));
     }
 
-    // ── GpsLocation — Keys `location.ISO6709` over `©xyz` ──────────────
-    // Only a DECODED coordinate (numeric lat/lon) projects a `GpsLocation`; a
-    // present-but-undecodable value still emits the `GPSCoordinates` tag (the
-    // raw string) but carries no usable lat/lon, so it is skipped here.
+    // ── GpsLocation — GPSCoordinates across the ItemList / UserData / Keys
+    //    tables ─────────────────────────────────────────────────────────
+    // `GPSCoordinates` is the SAME tag NAME in all three tables (ItemList
+    // `\xa9xyz` QuickTime.pm:6590, UserData `\xa9xyz` :1659, Keys
+    // `location.ISO6709` :6702), so its read-priority is the PREFERRED order:
+    // ItemList (2) over
+    // UserData (1) over Keys (0) — i.e. the Composite `GPSPosition`'s
+    // `QuickTime:GPSCoordinates` resolves to the ItemList value when present.
+    // (`keys.gps()` is BOTH `location.ISO6709` and the cross-table `\xa9xyz`
+    // landing.) Only a DECODED coordinate (numeric lat/lon) projects a
+    // `GpsLocation`; a present-but-undecodable value still emits the
+    // `GPSCoordinates` tag (the raw string) but carries no usable lat/lon, so it
+    // is skipped here. So a file whose GPS lives ONLY in `ItemList:GPSCoordinates`
+    // (the Parrot ANAFI) surfaces its location through the public projection.
     if md.gps().is_none()
-      && let Some((lat, lon, alt)) = keys
+      && let Some((lat, lon, alt)) = item_list
         .gps()
         .or_else(|| ud.gps())
+        .or_else(|| keys.gps())
         .and_then(QuickTimeGps::coords)
     {
       let mut loc = GpsLocation::new();
@@ -16938,6 +17011,264 @@ mod tests {
       k.gps().is_some(),
       "\\xa9xyz must resolve to the ItemList GPSCoordinates slot"
     );
+  }
+
+  /// #363 — the REVERSED-id cross-table form (QuickTime.pm:9812-9818). A `keys` id
+  /// of the shape `^\w{3}\xa9$` (3 word chars then `0xA9`) is a BYTE-REVERSED
+  /// ItemList/UserData id: after the forward ItemList + UserData lookups miss,
+  /// ExifTool reverses the 4 bytes (`pack('N', unpack('V', $tag))`) and retries
+  /// ItemList then UserData. So `yad\xa9` (the reversed `\xa9day`) resolves to the
+  /// ItemList `ContentCreateDate` — ground-truthed vs bundled 13.59
+  /// (`exiftool -Keys:all` on a crafted MP4 with a `yad\xa9` keys id surfaces
+  /// `Keys:ContentCreateDate`). exifast handled the forward `\xa9`-prefix form
+  /// (#361) but DROPPED this reversed form before this fix.
+  #[test]
+  fn reversed_a9_key_resolves_itemlist_through_cross_table() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // A raw `mdta` 4-cc key id with the 4th byte = literal `0xA9` (no `com.`
+    // prefix on these ids ⇒ stripped == full), built exactly as `parse_keys_box`
+    // does (the leading 3 bytes are ASCII word chars; the lossy `String` view is
+    // a 6-byte U+FFFD sequence, never matching a 4-byte id — so the cross-table
+    // gates on the RAW bytes).
+    let rev_key = |prefix: &[u8; 3]| {
+      let raw = [prefix[0], prefix[1], prefix[2], 0xA9u8];
+      let s = String::from_utf8_lossy(&raw).into_owned();
+      KeyName {
+        stripped: s.clone(),
+        full: s,
+        stripped_raw: raw.to_vec(),
+        full_raw: raw.to_vec(),
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // --- Movie-level Keys path: yad\xa9 (reverse of \xa9day) ⇒ ContentCreateDate
+    //     (the ItemList ValueConv applied at the reversed lookup). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &rev_key(b"yad"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    assert_eq!(
+      k.content_create_date(),
+      Some("2024:05:06 07:08:09-05:00"),
+      "yad\\xa9 must byte-reverse to \\xa9day and resolve ItemList ContentCreateDate"
+    );
+
+    // --- AudioKeys path: the SAME reversed id resolves under the active group. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &rev_key(b"yad"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    assert_eq!(k.content_create_date(), Some("2024:05:06 07:08:09-05:00"));
+
+    // --- zyx\xa9 (reverse of \xa9xyz) ⇒ GPSCoordinates (ConvertISO6709 slot). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&rev_key(b"zyx"), &str_data("+12.3456-098.7654/"), &mut k);
+    assert!(
+      k.gps().is_some(),
+      "zyx\\xa9 must byte-reverse to \\xa9xyz and resolve GPSCoordinates"
+    );
+
+    // --- A `\w{3}\xa9` id whose REVERSE is not a table id emits NOTHING: ExifTool
+    //     `last`s after the reversed miss, and the derive gate then sees the
+    //     reversed `\xa9zzz` (a `0xA9`+3-char id), which fails `/^[-\w. ]+$/` and
+    //     has no `\w{4}` run ⇒ no tag. So the key is fully consumed — NOT derived
+    //     from the un-reversed `zzz\xa9` stripped id (which would wrongly yield
+    //     `Keys:Zzz`). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&rev_key(b"zzz"), &str_data("v"), &mut k);
+    assert!(
+      k.content_create_date().is_none() && k.gps().is_none() && k.convless().is_empty(),
+      "a reversed-id pattern key with a non-table reverse must emit nothing (not derive Zzz)"
+    );
+
+    // --- The reversed transform requires exactly 3 WORD chars then 0xA9: an id
+    //     with 0xA9 NOT in the last position does not trigger it (no false
+    //     reverse). `\xa9day` itself (0xA9 FIRST) takes the FORWARD path, not the
+    //     reverse — covered by `raw_a9_key_resolves_itemlist_through_cross_table`;
+    //     here a `da\xa9y` (0xA9 in the middle) reverses-pattern-misses. ---
+    let mid = KeyName {
+      stripped: String::from_utf8_lossy(b"da\xa9y").into_owned(),
+      full: String::from_utf8_lossy(b"da\xa9y").into_owned(),
+      stripped_raw: b"da\xa9y".to_vec(),
+      full_raw: b"da\xa9y".to_vec(),
+    };
+    let mut k = QuickTimeKeys::new();
+    apply_key(&mid, &str_data("2024-05-06T07:08:09-0500"), &mut k);
+    assert!(
+      k.content_create_date().is_none(),
+      "0xA9 not in the last byte must NOT trigger the reversed-id transform"
+    );
+
+    // A 4-cc that hits the FORWARD cross-table is unaffected by the reversed
+    // branch (the forward hit returns before the reverse is considered): `manu`
+    // ⇒ UserData Make.
+    let manu = KeyName {
+      stripped: "manu".to_string(),
+      full: "manu".to_string(),
+      stripped_raw: b"manu".to_vec(),
+      full_raw: b"manu".to_vec(),
+    };
+    let mut k = QuickTimeKeys::new();
+    apply_key(&manu, &str_data("Acme"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Make".into(), TagValue::Str("Acme".into()))]
+    );
+  }
+
+  /// [`reversed_a9_id`] ports the QuickTime.pm:9813-9814 byte-reversal: `^\w{3}
+  /// \xa9$` ⇒ the 4 bytes reversed (`[a,b,c,0xA9]` ⇒ `[0xA9,c,b,a]`), else `None`.
+  #[test]
+  fn reversed_a9_id_transform() {
+    assert_eq!(reversed_a9_id(b"yad\xa9"), Some(*b"\xa9day"));
+    assert_eq!(reversed_a9_id(b"zyx\xa9"), Some(*b"\xa9xyz"));
+    assert_eq!(reversed_a9_id(b"oot\xa9"), Some(*b"\xa9too"));
+    // `_` IS a word char (`\w`).
+    assert_eq!(reversed_a9_id(b"a_b\xa9"), Some(*b"\xa9b_a"));
+    // Last byte not 0xA9 ⇒ no transform.
+    assert_eq!(reversed_a9_id(b"\xa9day"), None);
+    assert_eq!(reversed_a9_id(b"manu"), None);
+    // A non-word char among the first 3 ⇒ no transform (the `\w{3}` gate).
+    assert_eq!(reversed_a9_id(b"a.b\xa9"), None);
+    assert_eq!(reversed_a9_id(b"a b\xa9"), None);
+  }
+
+  /// Parse a `tests/fixtures` MP4/MOV through the production entry and build its
+  /// public [`crate::metadata::MediaMetadata`] projection (`media_metadata`).
+  fn media_metadata_for_fixture(name: &str) -> crate::metadata::MediaMetadata {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read {name}: {e}"));
+    parse_borrowed(&bytes)
+      .unwrap_or_else(|| panic!("{name} parsed"))
+      .media_metadata()
+  }
+
+  /// #364 — the L2 projection must consume the `\xa9day` ContentCreateDate /
+  /// `\xa9xyz` GPSCoordinates landing in the `ItemList` and (cross-table) `Keys`
+  /// slots, so the public `media_metadata()` surfaces the real capture date /
+  /// location for a file whose date+GPS live ONLY there — NOT the stale `mvhd`
+  /// CreateDate / no GPS. Precedence is the ExifTool tag chain: `Keys:CreationDate`
+  /// over ContentCreateDate (ItemList PREFERRED=2 > UserData=1 > cross-table Keys),
+  /// and GPSCoordinates ItemList > UserData > Keys. Both fixtures are ground-truthed
+  /// vs bundled 13.59 (the #361 `MP4_movie_keys.mov` Keys-only and the real-device
+  /// `MP4_parrot_anafi.mp4` ItemList-only goldens).
+  #[test]
+  fn project_sp2_consumes_itemlist_and_cross_table_keys_date_gps() {
+    // --- ItemList-only (Parrot ANAFI): date+GPS live ONLY in ItemList. The
+    //     projected `created` is the LOCAL ItemList ContentCreateDate
+    //     `17:22:10-04:00`, NOT the UTC `mvhd` `21:22:10` — and the GPS comes from
+    //     `ItemList:GPSCoordinates` (previously dropped ⇒ no GpsLocation). ---
+    let md = media_metadata_for_fixture("MP4_parrot_anafi.mp4");
+    assert_eq!(
+      md.media().created(),
+      Some("2025:07:03 17:22:10-04:00"),
+      "ItemList ContentCreateDate must override the mvhd CreateDate"
+    );
+    let gps = md
+      .gps()
+      .expect("ItemList GPSCoordinates must project a GpsLocation");
+    assert!(
+      (gps.latitude().unwrap() - 39.830_642).abs() < 1e-4
+        && (gps.longitude().unwrap() - -81.738_328).abs() < 1e-4,
+      "ItemList GPS lat/lon mismatch: got ({:?}, {:?})",
+      gps.latitude(),
+      gps.longitude()
+    );
+    assert!(
+      (gps.altitude_m().unwrap() - 326.39).abs() < 1e-2,
+      "ItemList GPS altitude mismatch: {:?}",
+      gps.altitude_m()
+    );
+
+    // --- Keys-only (crafted `MP4_movie_keys.mov`): the cross-table `Keys:Content
+    //     CreateDate` (raw-0xA9 / reversed-id landing) + `Keys:GPSCoordinates`
+    //     project when no ItemList/UserData/CreationDate source is present. ---
+    let md = media_metadata_for_fixture("MP4_movie_keys.mov");
+    assert_eq!(
+      md.media().created(),
+      Some("2023:11:12 13:14:15-08:00"),
+      "cross-table Keys:ContentCreateDate must override the mvhd CreateDate"
+    );
+    let gps = md
+      .gps()
+      .expect("Keys:GPSCoordinates must project a GpsLocation");
+    assert!(
+      (gps.latitude().unwrap() - 48.8584).abs() < 1e-4
+        && (gps.longitude().unwrap() - 2.2945).abs() < 1e-4,
+      "Keys GPS lat/lon mismatch: got ({:?}, {:?})",
+      gps.latitude(),
+      gps.longitude()
+    );
+    assert!(
+      gps.altitude_m().is_none(),
+      "the Keys GPS carries no altitude"
+    );
+  }
+
+  /// #364 — a MALFORMED nested `ilst` item atom inside a movie-`meta`(`mdta`)
+  /// `keys`/`ilst` directory (and the audio-track equivalent) must surface the
+  /// `walk_atoms` "Invalid atom size" warning through the diagnostics channel —
+  /// the `keys` resolution does not silently swallow a structurally-invalid item.
+  /// Matches ExifTool's per-directory `ProcessMOV` size check (the same `$warnStr`
+  /// path verified in `walk_atoms_surfaces_contained_malformed_warning`).
+  #[test]
+  fn walk_meta_keys_surfaces_malformed_nested_ilst_warning() {
+    // A 1-entry `keys` box: version/flags(4) + count(4) + entry[ size(4) ns(4)
+    // key ] — `\xa9day` under the `mdta` namespace (size = 8 + 4 = 12).
+    let mut keys_payload = vec![0u8; 8];
+    wr(&mut keys_payload, 4, &1u32.to_be_bytes()); // entry count = 1
+    keys_payload.extend_from_slice(&12u32.to_be_bytes());
+    keys_payload.extend_from_slice(b"mdta");
+    keys_payload.extend_from_slice(b"\xa9day");
+    let keys = atom(b"keys", &keys_payload);
+
+    // A malformed `ilst`: one child whose declared `size == 4` (< 8) is a
+    // structurally-invalid atom ⇒ `walk_atoms` ends the directory with the
+    // warning instead of decoding the item.
+    let mut bad_item = 4u32.to_be_bytes().to_vec(); // declared size 4
+    bad_item.extend_from_slice(&1u32.to_be_bytes()); // index 1 (as the 4-cc)
+    let ilst = atom(b"ilst", &bad_item);
+
+    let mut meta_payload = keys.clone();
+    meta_payload.extend_from_slice(&ilst);
+
+    // Movie-level Keys path ([`walk_meta`]).
+    let mut warn: Option<String> = None;
+    let mut qt = crate::metadata::QuickTimeMeta::new();
+    walk_meta(0, &meta_payload, &mut warn, &mut qt);
+    assert_eq!(
+      warn.as_deref(),
+      Some("Invalid atom size"),
+      "a malformed nested ilst item in the movie Keys directory must warn"
+    );
+    assert!(
+      qt.keys().is_empty(),
+      "the malformed item must not yield a Keys tag"
+    );
+
+    // Audio-track Keys path ([`walk_meta_audio_keys`]) — same directory shape.
+    let mut warn: Option<String> = None;
+    let mut qt = crate::metadata::QuickTimeMeta::new();
+    walk_meta_audio_keys(0, &meta_payload, &mut warn, &mut qt);
+    assert_eq!(
+      warn.as_deref(),
+      Some("Invalid atom size"),
+      "a malformed nested ilst item in the AudioKeys directory must warn"
+    );
+    assert!(qt.audio_keys().is_empty());
   }
 
   /// [`derive_keys_name`] ports ExifTool's `ProcessKeys` unknown-key name
