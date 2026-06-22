@@ -11280,9 +11280,17 @@ fn jpeg_pentax_ks2_conformance() {
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
 }
 
-// #122 — Parrot Anafi drone MP4 with mett metadata track (GPS + flight telemetry)
+// #122 — Parrot Anafi drone MP4. The `mett` metadata track carries no per-sample
+// timed telemetry that bundled ExifTool 13.59 surfaces (`-ee` output is
+// byte-identical to the base — there is no `.ee.*` golden), so the conventioned
+// base goldens fully pin the parity. exifast emits the QuickTime/Track structure
+// + the `udta` Parrot `UserData:Make`/`Model` + the ported ImageSize/Megapixels/
+// AvgBitrate/Rotation Composites byte-exact; the unported subsystems (the
+// QuickTime-embedded XMP packet, the `udta/meta`(`mdir`) ItemList/`ilst` atoms +
+// their `HandlerVendorID`, the `meta`(`mdta`) Keys, `AudioKeys:Balance`, the
+// `UserData:LocationInformation` struct, and the GPSCoordinates-derived
+// `Composite:GPS*`) are excluded by name in `tools/gen_golden.sh` (see that arm).
 #[test]
-#[ignore]
 fn mp4_parrot_anafi_conformance() {
   check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.json", true);
   check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.n.json", false);

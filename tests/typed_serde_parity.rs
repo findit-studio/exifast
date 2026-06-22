@@ -122,10 +122,15 @@ const NOT_ACTIVE: &[&str] = &[
   // ExifTool 13.59. The base `.json`/`.n.json` are byte-exact in
   // `conformance.rs::quicktime_gopro_hero6_gpmf_conformance`; the `-ee` `.ee.json`
   // in `timed_metadata_conformance.rs::gopro_hero6_gpmd_ee_byte_exact`.)
-  // #342/#336: the Parrot Anafi mett fixture ships a full bundled golden +
-  // #[ignore]'d conformance test, but exifast does not yet emit its full tag set
-  // (the #122 Parrot parser needs completion). Accept-deferred here until
-  // activated.
+  // (#122 `MP4_parrot_anafi.mp4` (Parrot Anafi drone) was here too but is now
+  // ACTIVE: its `mett` metadata track carries no per-sample timed telemetry that
+  // bundled 13.59 surfaces (`-ee` == base), so the conventioned base goldens —
+  // which exclude the unported subsystems by name (the QuickTime-embedded XMP
+  // packet, the `udta/meta`(`mdir`) ItemList/`ilst` atoms + `HandlerVendorID`,
+  // the `meta`(`mdta`) Keys, `AudioKeys:Balance`, the `UserData:LocationInformation`
+  // struct, and the GPSCoordinates-derived `Composite:GPS*`; see the
+  // `tools/gen_golden.sh` arm) — are byte-exact, see
+  // `conformance.rs::mp4_parrot_anafi_conformance`.)
   // (#138 `MP4_viofo_a119_gps.mp4` was here too but is now ACTIVE — the #348
   // dual-`hdlr` per-track Handler dedup landed, so its no-`ee` `.json`/`.n.json`
   // are byte-exact, see `conformance.rs::mp4_viofo_a119_gps_conformance`.)
@@ -133,7 +138,6 @@ const NOT_ACTIVE: &[&str] = &[
   // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
   // PID — and the file carries no SMPTE/MISB universal label, so bundled
   // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
-  "MP4_parrot_anafi.mp4",
   // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
   // bundled goldens for the #173 MakerNote conditional branches, but their
   // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
@@ -880,7 +884,16 @@ const NOT_ACTIVE: &[&str] = &[
 /// `Composite:GPS*` drops) and exifast's `gpmd`/`fdsc` GPMF emission (the typed
 /// `GoProTag` surface + generic-tag table) matches the full real timed block
 /// byte-exact, the same emission path the active hero8 fixture already exercises.
-const EXPECTED_ACTIVE_FIXTURES: usize = 563;
+///
+/// 563 → 564 after `MP4_parrot_anafi.mp4` (#122) activated — its raw 13.55
+/// goldens are regenerated conventioned (the `tools/gen_golden.sh` arm dropping
+/// the unported XMP/ItemList(+`HandlerVendorID`)/Keys/AudioKeys/
+/// `UserData:LocationInformation`/`Composite:GPS*` subsystems by name) and
+/// exifast's QuickTime/Track structure + `udta` Parrot `Make`/`Model` + ported
+/// ImageSize/Megapixels/AvgBitrate/Rotation Composites match the residual
+/// byte-exact. The `mett` metadata track surfaces no per-sample timed telemetry
+/// in bundled 13.59 (`-ee` == base), so there is no `.ee.*` golden.
+const EXPECTED_ACTIVE_FIXTURES: usize = 564;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
