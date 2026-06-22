@@ -276,24 +276,16 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Composite:GPSPosition",
     ],
   ),
-  // #311 — the K-S2 deferred subsystems exifast does not emit (NOT Pentax — the
-  // `Composite:Flash`/`LensID`/`DateTimeCreated` Composites, the `PrintIM` IFD,
-  // and the `tiff:YCbCrSubSampling` `RawJoin`). Mirrors `conformance.rs::
+  // #311 — the K-S2. #381 ported the four cross-cutting Composites/IFD
+  // (`Composite:Flash`/`LensID`/`DateTimeCreated` + `PrintIM:PrintIMVersion`) —
+  // now emitted byte-exact, so they are NO LONGER excluded. The sole remaining
+  // deferral is the `tiff:YCbCrSubSampling` `RawJoin`. Mirrors `conformance.rs::
   // jpeg_pentax_ks2_conformance`. The golden keeps the faithful 13.59 dump.
-  (
-    "JPEG_pentax_ks2.jpg",
-    &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "Composite:DateTimeCreated",
-      "PrintIM:PrintIMVersion",
-      "XMP-tiff:YCbCrSubSampling",
-    ],
-  ),
-  // #311/#318 — the 5 additional Pentax body fixtures. Each shares KS-2's
-  // cross-cutting deferred subsystems (`Composite:Flash`/`LensID`,
-  // `PrintIM:PrintIMVersion`, `XMP-tiff:YCbCrSubSampling`) MINUS the body-absent
-  // `Composite:DateTimeCreated`, PLUS the per-body `Pentax:*` model-variant /
+  ("JPEG_pentax_ks2.jpg", &["XMP-tiff:YCbCrSubSampling"]),
+  // #311/#318 — the 5 additional Pentax body fixtures. #381 ported their
+  // `Composite:Flash`/`LensID` + `PrintIM:PrintIMVersion` (now emitted
+  // byte-exact, no longer excluded); the remaining exclusions are
+  // `XMP-tiff:YCbCrSubSampling` PLUS the per-body `Pentax:*` model-variant /
   // `$count`-gated SubDirectory residuals the #379 port does not yet emit for
   // these bodies (deferred, NOT mis-decoded — exifast emits nothing, the golden
   // keeps the bundled value). These lists MIRROR EXACTLY the per-fixture
@@ -302,9 +294,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   (
     "JPEG_pentax_k1.jpg",
     &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
       "Pentax:AFPointSelected",
       "Pentax:AFPointsInFocus",
@@ -324,9 +313,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   (
     "JPEG_pentax_k3.jpg",
     &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
       "Pentax:AFPointSelected",
       "Pentax:ContrastHighlight",
@@ -340,9 +326,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   (
     "JPEG_pentax_k5_ii.jpg",
     &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
       "Pentax:BodyBatteryVoltage3",
       "Pentax:BodyBatteryVoltage4",
@@ -388,9 +371,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   (
     "JPEG_pentax_k70.jpg",
     &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
       "Pentax:AFPointsInFocus",
       "Pentax:AFPointsSelected",
@@ -408,9 +388,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   (
     "JPEG_pentax_kp.jpg",
     &[
-      "Composite:Flash",
-      "Composite:LensID",
-      "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
       "Pentax:AFPointSelected",
       "Pentax:AFPointsInFocus",

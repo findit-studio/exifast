@@ -8,5 +8,6 @@
   "XMP-tiff:PhotometricInterpretation": 6,
   "XMP-exif:LightSource": 10,
   "XMP-exif:MeteringMode": 5,
-  "XMP-exif:Flash": 5
+  "XMP-exif:Flash": 5,
+  "Composite:Flash": 0
 }]

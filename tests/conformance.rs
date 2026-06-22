@@ -11278,11 +11278,12 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
 // `*_DEFERRED` residuals are dropped from BOTH sides (the goldens keep the
 // faithful full 13.59 dump).
 //
-// EVERY `*_DEFERRED` list shares the FOUR cross-cutting subsystems KS-2 also
-// drops (minus `Composite:DateTimeCreated` — these bodies carry no IPTC date):
-//   * `Composite:Flash`           — the multi-field flash Composite (unported);
-//   * `Composite:LensID`          — the lens-resolution Composite (unported);
-//   * `PrintIM:PrintIMVersion`    — exifast parses no PrintIM IFD;
+// `Composite:Flash` (the XMP-Flash bitmask Composite), `Composite:LensID` (the
+// unambiguous-Pentax-LensType resolution Composite) and `PrintIM:PrintIMVersion`
+// (the IFD0 `0xc4a5` PrintIM directory) are NOW PORTED (#381) — emitted
+// byte-exact for these bodies, so they are NO LONGER in the `*_DEFERRED` lists.
+// EVERY `*_DEFERRED` list still shares ONE cross-cutting deferral (plus KS-2's
+// `Composite:DateTimeCreated`, which needs an IPTC date these bodies lack):
 //   * `XMP-tiff:YCbCrSubSampling` — the unported `RawJoin`/`%JPEG::
 //                                   yCbCrSubSampling` PrintConv (`xmp/tables.rs`).
 //
@@ -11328,9 +11329,6 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
 // Contrast/ISOAutoMinSpeed/ShutterType/SkinToneCorrection/ExposureCompensation
 // residuals.
 const K1_DEFERRED: &[&str] = &[
-  "Composite:Flash",
-  "Composite:LensID",
-  "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
   "Pentax:AFPointSelected",
   "Pentax:AFPointsInFocus",
@@ -11350,9 +11348,6 @@ const K1_DEFERRED: &[&str] = &[
 // K-3: the K-3 AFPointSelected model variant + TempInfo (SensorTemperature) +
 // Contrast/ISOAutoMinSpeed residuals.
 const K3_DEFERRED: &[&str] = &[
-  "Composite:Flash",
-  "Composite:LensID",
-  "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
   "Pentax:AFPointSelected",
   "Pentax:ContrastHighlight",
@@ -11368,9 +11363,6 @@ const K3_DEFERRED: &[&str] = &[
 // TempInfo) + the AFPointInfo/PixelShiftInfo/Contrast residuals + the IsOffset
 // PreviewImageStart.
 const K5_II_DEFERRED: &[&str] = &[
-  "Composite:Flash",
-  "Composite:LensID",
-  "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
   "Pentax:BodyBatteryVoltage3",
   "Pentax:BodyBatteryVoltage4",
@@ -11411,9 +11403,6 @@ const K5_II_DEFERRED: &[&str] = &[
 // AFPointInfo/PixelShiftInfo/Contrast/ISOAutoMinSpeed/ShutterType/
 // SkinToneCorrection/ExposureCompensation).
 const KP_DEFERRED: &[&str] = &[
-  "Composite:Flash",
-  "Composite:LensID",
-  "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
   "Pentax:AFPointSelected",
   "Pentax:AFPointsInFocus",
@@ -11445,9 +11434,6 @@ const KP_DEFERRED: &[&str] = &[
 // propagates byte-exact to the two Composites. The remaining entries are only
 // unimplemented Pentax leaves, so K-70 now activates honestly.
 const K70_DEFERRED: &[&str] = &[
-  "Composite:Flash",
-  "Composite:LensID",
-  "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
   "Pentax:AFPointsInFocus",
   "Pentax:AFPointsSelected",
@@ -11567,25 +11553,19 @@ fn jpeg_pentax_k70_conformance() {
 // FaceDetect/ColorMatrixA2/B2/AFPointSelected[2-element]/AFPointsInFocus/
 // FlashExposureComp[int8s array]/… + ExtenderStatus).
 //
-// The excluded keys are DEFERRED SUBSYSTEMS exifast does not implement (NOT
-// Pentax-specific — none is emitted byte-exact by any other active fixture
-// either): the `Composite:Flash` (the multi-field flash Composite, see
-// `xmp/tables.rs:41`), `Composite:LensID` (the lens-resolution Composite),
-// `Composite:DateTimeCreated` (the IPTC date Composite), `PrintIM:PrintIMVersion`
-// (exifast parses no PrintIM IFD), and `XMP-tiff:YCbCrSubSampling` (exifast emits
-// the raw `[2,1]` — the `tiff:YCbCrSubSampling` field is DOCUMENTED as needing the
-// unported `RawJoin` + `%JPEG::yCbCrSubSampling` PrintConv, `xmp/tables.rs:47`).
-// The golden keeps them (faithful 242-tag 13.59 dump); they are dropped from BOTH
-// sides so the Pentax set + the rest are verified byte-exact.
+// `Composite:Flash` (the XMP-Flash bitmask Composite), `Composite:LensID` (the
+// unambiguous-Pentax-LensType resolution Composite), `Composite:DateTimeCreated`
+// (the IPTC `DateCreated`+`TimeCreated` Composite) and `PrintIM:PrintIMVersion`
+// (the IFD0 `0xc4a5` PrintIM directory) are NOW PORTED (#381) — emitted
+// byte-exact, so they are NO LONGER excluded. The sole remaining deferral is
+// `XMP-tiff:YCbCrSubSampling` (exifast emits the raw `[2,1]` — the
+// `tiff:YCbCrSubSampling` field is DOCUMENTED as needing the unported `RawJoin`
+// + `%JPEG::yCbCrSubSampling` PrintConv, `xmp/tables.rs:47`). The golden keeps
+// it (faithful 242-tag 13.59 dump); it is dropped from BOTH sides so the Pentax
+// set + the four newly-emitted cross-cutting tags + the rest verify byte-exact.
 #[test]
 fn jpeg_pentax_ks2_conformance() {
-  const DEFERRED: &[&str] = &[
-    "Composite:Flash",
-    "Composite:LensID",
-    "Composite:DateTimeCreated",
-    "PrintIM:PrintIMVersion",
-    "XMP-tiff:YCbCrSubSampling",
-  ];
+  const DEFERRED: &[&str] = &["XMP-tiff:YCbCrSubSampling"];
   check_excluding(
     "JPEG_pentax_ks2.jpg",
     "JPEG_pentax_ks2.jpg.json",

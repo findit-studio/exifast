@@ -8,5 +8,6 @@
   "XMP-tiff:PhotometricInterpretation": "YCbCr",
   "XMP-exif:LightSource": "Cloudy",
   "XMP-exif:MeteringMode": "Multi-segment",
-  "XMP-exif:Flash": 5
+  "XMP-exif:Flash": 5,
+  "Composite:Flash": "No Flash"
 }]
