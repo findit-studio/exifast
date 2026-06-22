@@ -720,11 +720,15 @@ const GAIN_CONTROL: &[(i64, &str)] = &[
   (4, "High gain down"),
 ];
 
-/// `Contrast` / `Sharpness` PrintConv (`Exif.pm:2941-2954`).
+/// `Contrast` PrintConv (`Exif.pm:2924-2932`).
 const CONTRAST: &[(i64, &str)] = &[(0, "Normal"), (1, "Low"), (2, "High")];
 
-/// `Saturation` PrintConv (`Exif.pm:2956-2961`).
+/// `Saturation` PrintConv (`Exif.pm:2936-2944`).
 const SATURATION: &[(i64, &str)] = &[(0, "Normal"), (1, "Low"), (2, "High")];
+
+/// `Sharpness` PrintConv (`Exif.pm:2946-2954`) — DISTINCT from `Contrast`:
+/// `1 => 'Soft'`, `2 => 'Hard'` (not `Low`/`High`).
+const SHARPNESS: &[(i64, &str)] = &[(0, "Normal"), (1, "Soft"), (2, "Hard")];
 
 /// `SubjectDistanceRange` PrintConv (`Exif.pm:2965-2969`).
 const SUBJECT_DISTANCE_RANGE: &[(i64, &str)] =
@@ -1174,7 +1178,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0xa40a,
     name: "Sharpness",
-    conv: Conv::IntLabel(CONTRAST),
+    conv: Conv::IntLabel(SHARPNESS),
   },
   // 0xa40b `DeviceSettingDescription` — `Binary => 1` (`Exif.pm:2957-2961`).
   ExifTag {

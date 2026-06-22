@@ -596,7 +596,7 @@ static EXIF_SATURATION: ExifTag = ExifTag {
 static EXIF_SHARPNESS: ExifTag = ExifTag {
   id: 0xa40a,
   name: "Sharpness",
-  conv: Conv::IntLabel(super::CONTRAST),
+  conv: Conv::IntLabel(super::SHARPNESS),
 };
 static EXIF_DEVICESETTINGDESCRIPTION: ExifTag = ExifTag {
   id: 0xa40b,
@@ -664,7 +664,7 @@ static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
   conv: Conv::CompositeImageExposureTimes,
 };
 
-/// `Exif::Main` — the generated shadow (115 ids: the ported hand subset + the
+/// `Exif::Main` — the generated shadow (118 ids: the ported hand subset + the
 /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
 /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
 /// in the hand table) is the only one this fallback actually returns.

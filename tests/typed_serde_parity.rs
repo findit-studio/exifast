@@ -138,20 +138,17 @@ const NOT_ACTIVE: &[&str] = &[
   // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
   // PID — and the file carries no SMPTE/MISB universal label, so bundled
   // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
-  // #318/#311: 5 of the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp) stay
-  // deferred — they select DIFFERENT MakerNote `$count`/model variant branches
-  // exifast does not yet emit byte-exact (k1/k3/kp use the model-keyed 0x000e/
-  // 0x000f AFPointSelected/AFPointsInFocus arms + AEInfo3 size-64 + LevelInfoK3III
-  // + the K-3III BatteryInfo re-layout; k5_ii/k70 add further AEInfo3/LensInfo4/
-  // SRInfo2 edges). `JPEG_pentax_ks2.jpg` IS active (#311 — the full 140-tag
-  // Pentax set is byte-exact: AEInfo3 size-48 + LensInfo5 + KelvinWB + the world-
-  // time/level/CAF/face/AWB/EV/filter sub-tables + the int16u BatteryInfo voltage
-  // variant + the parent-order CameraInfo).
-  "JPEG_pentax_k1.jpg",
-  "JPEG_pentax_k3.jpg",
-  "JPEG_pentax_k5_ii.jpg",
-  "JPEG_pentax_k70.jpg",
-  "JPEG_pentax_kp.jpg",
+  // (#318/#311 FOUR of the five additional Pentax body fixtures (k1/k3/k5_ii/kp)
+  // were here too but are now ACTIVE: the #379 body-agnostic sub-tables
+  // (model-gated by `is_k3_mark_iii`/`is_af_points_in_focus_excluded`/
+  // `is_body_voltage`/…) decode them byte-exact vs bundled 13.59 — the full Pentax
+  // tag set proven on `JPEG_pentax_ks2.jpg`, across the per-body MakerNote variant
+  // branches and both byte orders (k1/k3/kp little-endian; k5_ii BIG-endian), see
+  // `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,kp}_conformance`. Their goldens drop
+  // the same cross-cutting deferred subsystems as KS-2 minus the body-absent
+  // `Composite:DateTimeCreated`, PLUS only unimplemented `Pentax:*` leaves, see
+  // `FIXTURE_EXCLUDED_KEYS`. The FIFTH body — `JPEG_pentax_k70.jpg` — stays
+  // NOT_ACTIVE (deferred on #380), listed below.)
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
@@ -229,6 +226,19 @@ const NOT_ACTIVE: &[&str] = &[
   // `-G1` golden is not byte-exact. Accept-deferred to #352 (the SubIFD walk);
   // the CR2 + ARW members of this set ARE active (the IFD0:PreviewImage proof).
   "DNG_preview_image.dng",
+  // `JPEG_pentax_k70.jpg` (#311/#318) — deferred on #380 (the core EXIF rational
+  // `%.10g` precision limitation). This is the only one of the five additional
+  // Pentax bodies whose ExposureTime is NOT a clean rational: its `1/60`
+  // `rational64u` renders full-f64 (`0.0166666666666667`) vs ExifTool 13.59's
+  // `%.10g` (`0.01666666667`), and the same rounding propagates through
+  // `Composite:ShutterSpeed` and `CalculateLV` → `Composite:LightValue`. Those are
+  // CORE EXIF/composite values (not unimplemented Pentax leaves); excluding them to
+  // claim byte-exactness would overstate coverage, so K-70 is accept-deferred until
+  // the EXIF read pipeline carries rationals as the `sig=10` `Rational` type. The
+  // fresh 13.59 golden is kept; `conformance.rs::jpeg_pentax_k70_conformance` is
+  // `#[ignore]`d on #380. Re-activate (drop this entry + the `#[ignore]`, restore
+  // its `FIXTURE_EXCLUDED_KEYS`, 572→573) once #380 lands.
+  "JPEG_pentax_k70.jpg",
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
@@ -290,6 +300,124 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Composite:DateTimeCreated",
       "PrintIM:PrintIMVersion",
       "XMP-tiff:YCbCrSubSampling",
+    ],
+  ),
+  // #311/#318 — the 5 additional Pentax body fixtures. Each shares KS-2's
+  // cross-cutting deferred subsystems (`Composite:Flash`/`LensID`,
+  // `PrintIM:PrintIMVersion`, `XMP-tiff:YCbCrSubSampling`) MINUS the body-absent
+  // `Composite:DateTimeCreated`, PLUS the per-body `Pentax:*` model-variant /
+  // `$count`-gated SubDirectory residuals the #379 port does not yet emit for
+  // these bodies (deferred, NOT mis-decoded — exifast emits nothing, the golden
+  // keeps the bundled value). These lists MIRROR EXACTLY the per-fixture
+  // `*_DEFERRED` consts in `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,k70,kp}_
+  // conformance` (see the detailed rationale there).
+  (
+    "JPEG_pentax_k1.jpg",
+    &[
+      "Composite:Flash",
+      "Composite:LensID",
+      "PrintIM:PrintIMVersion",
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:AFPointSelected",
+      "Pentax:AFPointsInFocus",
+      "Pentax:AFPointsSelected",
+      "Pentax:AFPointsSpecial",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ExposureCompensation",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:NumAFPoints",
+      "Pentax:PixelShiftResolution",
+      "Pentax:ShutterType",
+      "Pentax:SkinToneCorrection",
+    ],
+  ),
+  (
+    "JPEG_pentax_k3.jpg",
+    &[
+      "Composite:Flash",
+      "Composite:LensID",
+      "PrintIM:PrintIMVersion",
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:AFPointSelected",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:SensorTemperature",
+      "Pentax:SensorTemperature2",
+    ],
+  ),
+  (
+    "JPEG_pentax_k5_ii.jpg",
+    &[
+      "Composite:Flash",
+      "Composite:LensID",
+      "PrintIM:PrintIMVersion",
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:BodyBatteryVoltage3",
+      "Pentax:BodyBatteryVoltage4",
+      "Pentax:CameraOrientation",
+      "Pentax:CameraTemperature4",
+      "Pentax:CameraTemperature5",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:FocusRangeIndex",
+      "Pentax:ISOAuto",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:LensFocalLength",
+      "Pentax:LevelIndicator",
+      "Pentax:LinkAEToAFPoint",
+      "Pentax:MaxAperture",
+      "Pentax:MinFocusDistance",
+      "Pentax:NominalMaxAperture",
+      "Pentax:NominalMinAperture",
+      "Pentax:PreviewImageStart",
+      "Pentax:SensitivitySteps",
+      "Pentax:SensorSize",
+      "Pentax:SensorTemperature",
+      "Pentax:SensorTemperature2",
+      "Pentax:WB_RGGBLevelsCloudy",
+      "Pentax:WB_RGGBLevelsDaylight",
+      "Pentax:WB_RGGBLevelsFlash",
+      "Pentax:WB_RGGBLevelsFluorescentD",
+      "Pentax:WB_RGGBLevelsFluorescentL",
+      "Pentax:WB_RGGBLevelsFluorescentN",
+      "Pentax:WB_RGGBLevelsFluorescentW",
+      "Pentax:WB_RGGBLevelsShade",
+      "Pentax:WB_RGGBLevelsTungsten",
+      "Pentax:WB_RGGBLevelsUserSelected",
+    ],
+  ),
+  // NOTE: `JPEG_pentax_k70.jpg` is intentionally ABSENT here — it is NOT_ACTIVE
+  // (deferred on #380; see the `NOT_ACTIVE` entry). NOT_ACTIVE fixtures carry no
+  // `FIXTURE_EXCLUDED_KEYS` entry (this map is consulted only for active fixtures).
+  // K-70's exclusions would include the CORE `ExifIFD:ExposureTime` /
+  // `Composite:ShutterSpeed` / `Composite:LightValue` (the #380 rational-precision
+  // divergence) — masking those to claim byte-exactness is exactly why K-70 stays
+  // deferred. Restore this entry when re-activating (572→573, see `NOT_ACTIVE`).
+  (
+    "JPEG_pentax_kp.jpg",
+    &[
+      "Composite:Flash",
+      "Composite:LensID",
+      "PrintIM:PrintIMVersion",
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:AFPointSelected",
+      "Pentax:AFPointsInFocus",
+      "Pentax:AFPointsSelected",
+      "Pentax:AFPointsSpecial",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ExposureCompensation",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:NumAFPoints",
+      "Pentax:PixelShiftResolution",
+      "Pentax:ShutterType",
+      "Pentax:SkinToneCorrection",
     ],
   ),
 ];
@@ -1014,7 +1142,19 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// ChannelLayout` (LayoutFlags/AudioChannelTypes/NumChannelDescriptions),
 /// byte-exact at `-j`/`-n` with the no-`ee` `EEWarn`. The ported Composites are
 /// kept; `System:all` is the sole exclusion.
-const EXPECTED_ACTIVE_FIXTURES: usize = 568;
+///
+/// 567 → 572 after FOUR of the five additional Pentax body fixtures (#311/#318)
+/// activated — `JPEG_pentax_{k1,k3,k5_ii,kp}.jpg`. The #379 body-agnostic Pentax
+/// sub-tables decode them byte-exact vs bundled 13.59 (the full set proven on
+/// `JPEG_pentax_ks2.jpg`), across the per-body MakerNote variant branches and both
+/// byte orders (k1/k3/kp little-endian; k5_ii BIG-endian). Each drops only the
+/// KS-2 cross-cutting deferrals (minus the body-absent `Composite:DateTimeCreated`)
+/// PLUS unimplemented `Pentax:*` leaves — NO core-EXIF values. The FIFTH body,
+/// `JPEG_pentax_k70.jpg`, stays NOT_ACTIVE (deferred on #380 — its non-clean `1/60`
+/// ExposureTime would force masking the CORE `ExifIFD:ExposureTime` /
+/// `Composite:ShutterSpeed` / `Composite:LightValue`, the rational `%.10g`-precision
+/// divergence; it activates 572 → 573 once #380 lands).
+const EXPECTED_ACTIVE_FIXTURES: usize = 572;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
