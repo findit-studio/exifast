@@ -170,6 +170,37 @@ case "$FIX" in
     EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
                   -x Composite:GPSLatitude -x Composite:GPSLongitude \
                   -x Composite:GPSPosition) ;;
+  # `MP4_parrot_anafi.mp4` (#122): real Parrot Anafi drone MP4. exifast emits the
+  # full QuickTime/Track structure + the `udta` Parrot `manu`/`modl`
+  # (`UserData:Make`/`Model`) + the ported ImageSize/Megapixels/AvgBitrate/
+  # Rotation Composites byte-exact. The `-ee` output is byte-IDENTICAL to the
+  # base (the `mett` metadata track carries NO per-sample timed telemetry that
+  # bundled 13.59 surfaces — verified `-ee` == base), so there is no `.ee.*`
+  # golden. Dropped by name (unported subsystems, NOT `*:all` blanket):
+  #  * `XMP:all` — the QuickTime-embedded XMP packet (the `uuid`/`XMP_` payload,
+  #    18 `XMP-*` tags) is not decoded by this port;
+  #  * `ItemList:all` — the `moov/udta/meta`(`mdir`) ItemList/`ilst` atoms
+  #    (Title/Artist/ContentCreateDate/Encoder/CoverArt/GPSCoordinates) are not
+  #    walked, AND with them the udta-`meta` `mdir` handler's
+  #    `QuickTime:HandlerVendorID` (`appl` → "Apple") — exifast walks only the
+  #    `moov/meta`(`mdta`) handler (emitting `HandlerType` = "Metadata Tags", no
+  #    VendorID), so the VendorID is dropped with the ItemList container it
+  #    belongs to;
+  #  * `Keys:all` — the `moov/meta`(`mdta`) Keys table
+  #    (CompatibleBrands/MajorBrand/Balance) is not decoded;
+  #  * `AudioKeys:all` — the `AudioKeys:Balance` Keys leaf;
+  #  * `UserData:LocationInformation` — the `©xyz`/`loci`-derived structured
+  #    LocationInformation (exifast keeps the ported `UserData:Make`/`Model`);
+  #  * the `GPSCoordinates`-derived `Composite:GPS*` (Lat/Lon/Alt/AltRef/Lat&
+  #    LonRef/Position) — the unported QuickTime.pm:8668 GPSCoordinates Composite
+  #    table, the same deferral as the GoPro/SP2 arms.
+  MP4_parrot_anafi.mp4)
+    EXCLUDE_ARR+=(-x XMP:all -x ItemList:all -x Keys:all -x AudioKeys:all \
+                  -x UserData:LocationInformation -x QuickTime:HandlerVendorID \
+                  -x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
+                  -x Composite:GPSPosition) ;;
   # The SP2 `Keys`/`UserData` GPSCoordinates fixtures: ExifTool's QuickTime
   # GPSCoordinates Composites (GPSLatitude/Longitude/Altitude/AltitudeRef/Position)
   # are unported; the ported ImageSize/Megapixels/AvgBitrate/Rotation are kept.
