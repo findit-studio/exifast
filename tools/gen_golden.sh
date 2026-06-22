@@ -155,6 +155,21 @@ case "$FIX" in
                   -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition \
                   -x ItemList:all -x UserData:all \
                   -x 1QuickTime:HandlerType -x 1QuickTime:HandlerVendorID) ;;
+  # `QuickTime_gopro_hero6_gpmf.mp4` (#211): real GoPro HERO6 Black with the live
+  # `gpmd` timed-GPS/sensor track (Track4) + the `fdsc` identity track (Track5).
+  # UNLIKE `QuickTime_gopro_gpmf.mp4`, the moov-level GPS is the simple `udta`
+  # `GPSCoordinates` string (a `gps `-box ISO6709 → `UserData:GPSCoordinates`)
+  # that exifast DOES emit, so `UserData:all` is NOT dropped — only the
+  # `GPSCoordinates`-derived Composites (`GPSLatitude`/`Longitude`/`Altitude`/
+  # `AltitudeRef` + the dependent `GPSPosition`, the unported QuickTime.pm:8668
+  # GPSCoordinates Composite table) are dropped by name. There is no moov-level
+  # `meta` handler nor `ItemList`. The ported ImageSize/Megapixels/AvgBitrate/
+  # Rotation are kept. The `-ee` timed GPMF (Track4 sensor/GPS + Track5 fdsc) is
+  # byte-exact with the same exclusions (`EE=1`).
+  QuickTime_gopro_hero6_gpmf.mp4)
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSPosition) ;;
   # The SP2 `Keys`/`UserData` GPSCoordinates fixtures: ExifTool's QuickTime
   # GPSCoordinates Composites (GPSLatitude/Longitude/Altitude/AltitudeRef/Position)
   # are unported; the ported ImageSize/Megapixels/AvgBitrate/Rotation are kept.

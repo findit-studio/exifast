@@ -112,14 +112,16 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
-  // #345/#211: the GoPro HERO6 gpmd fixture ships a raw bundled golden
-  // (System tags) + #[ignore]'d conformance; exifast does not yet match its
-  // real gpmd GPS track (#211). Accept-deferred until driven.
-  // (#210 `SamsungNX1.srw` was here too but is now ACTIVE: its goldens are
-  // regenerated conventioned via the `gen_golden.sh SamsungNX1.srw` arm and
-  // exifast emits all 45 `Samsung:*` Type2 leaves — the SAME surface as the
-  // already-active NX500 — byte-exact vs bundled ExifTool 13.59.)
-  "QuickTime_gopro_hero6_gpmf.mp4",
+  // (#345/#211 `QuickTime_gopro_hero6_gpmf.mp4` was here too but is now ACTIVE:
+  // its three goldens are regenerated conventioned via the
+  // `gen_golden.sh QuickTime_gopro_hero6_gpmf.mp4` arm and exifast emits the
+  // full real `gpmd` timed-GPS/sensor `Doc<N>` block — Accelerometer/Gyroscope
+  // binary placeholders, the camera-vision streams FaceNumbers/FaceDetected/
+  // ISOSpeeds/ExposureTimes/ColorTemperatures/WhiteBalanceRGB/CameraTemperature,
+  // the GPS5 scalars, and the Track5 `fdsc` identity — byte-exact vs bundled
+  // ExifTool 13.59. The base `.json`/`.n.json` are byte-exact in
+  // `conformance.rs::quicktime_gopro_hero6_gpmf_conformance`; the `-ee` `.ee.json`
+  // in `timed_metadata_conformance.rs::gopro_hero6_gpmd_ee_byte_exact`.)
   // #342/#336: the Parrot Anafi mett fixture ships a full bundled golden +
   // #[ignore]'d conformance test, but exifast does not yet emit its full tag set
   // (the #122 Parrot parser needs completion). Accept-deferred here until
@@ -872,7 +874,13 @@ const NOT_ACTIVE: &[&str] = &[
 /// FileType decision keys on the file-global `HasHandler` set) makes both dashcam
 /// MP4s' no-`ee` `.json`/`.n.json` byte-exact; rove also needed the `©fmt`/`©inf`
 /// (Format/Information) conv-less `udta` atoms (NOVATEK chipset).
-const EXPECTED_ACTIVE_FIXTURES: usize = 562;
+///
+/// 562 → 563 after `QuickTime_gopro_hero6_gpmf.mp4` (#211) activated — its raw
+/// 13.55 goldens are regenerated conventioned (`-G1 -x System:all`, the
+/// `Composite:GPS*` drops) and exifast's `gpmd`/`fdsc` GPMF emission (the typed
+/// `GoProTag` surface + generic-tag table) matches the full real timed block
+/// byte-exact, the same emission path the active hero8 fixture already exercises.
+const EXPECTED_ACTIVE_FIXTURES: usize = 563;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
