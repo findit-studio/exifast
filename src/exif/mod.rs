@@ -11749,24 +11749,65 @@ fn emit_exif_value<S: ExifSink>(
       }
       emit_raw(group, name, raw, out)
     }
-    Conv::ExposureTime | Conv::ShutterSpeedApex => {
-      // ExposureTime: raw rational seconds → PrintExposureTime.
-      // ShutterSpeedValue: ValueConv `2 ** -$val` first (Exif.pm:2346),
-      // then PrintExposureTime. `-n` mode emits the post-ValueConv scalar.
-      let secs = match conv {
-        // `ShutterSpeedValue` ValueConv `2 ** -$val` over the 10-sig-fig-rounded
-        // rational input (`RoundFloat($num/$den, 10)`, `Exif.pm:6112`), matching
-        // `ApertureApex`. `ExposureTime` keeps the raw rational seconds (its own
-        // value IS the rational, with no `2**` ValueConv).
-        Conv::ShutterSpeedApex => first_scalar(raw)
-          .map(round_float_10)
-          .map(shutter_speed_value_conv),
-        _ => first_scalar(raw),
+    Conv::ExposureTime => {
+      // `ExposureTime` (0x829a) is a `rational64u` — its value IS the rational
+      // seconds (no ValueConv), fed to `PrintExposureTime`. The
+      // `RoundFloat(n/d, 10)` rounding is a property of the rational read, so it
+      // is shape-specific (`rational_read`): a single `Rational` yields the
+      // rounded quotient or the `inf`/`undef` word; a single non-rational shape
+      // yields the UNROUNDED native scalar; a count>1 value is the space-joined
+      // `$val`.
+      match rational_read(raw) {
+        Some(RationalRead::Finite(s)) if print_conv => {
+          // `PrintExposureTime` of the read value (the 10-sig-fig quotient for a
+          // rational, e.g. `1/60` → `0.01666666667` → `"1/60"`; the unrounded
+          // scalar for a float/integer) → `1/724` (out of gate ⇒ string) or a
+          // whole/`%.1f` second count like `30` (in gate ⇒ a bare JSON number).
+          emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
+        }
+        // `-n`: the read value, gated (a finite rational re-parses to the
+        // 10-sig-fig f64 that also feeds `Composite:ShutterSpeed`/`LightValue`
+        // byte-exact; a float/integer keeps its unrounded scalar).
+        Some(RationalRead::Finite(s)) => emit_gated_f64(group, name, s, out)?,
+        // The zero-denominator word `undef`/`inf`: `PrintExposureTime` returns a
+        // non-float input verbatim (`Exif.pm:5704`) and `-n` is the same word, so
+        // both modes emit the word; `emit_gated_number` quotes it (out of the
+        // number gate), identical to the no-conv `emit_raw` single-rational path.
+        Some(RationalRead::Degenerate(word)) => emit_gated_number(group, name, word, out)?,
+        // A count>1 (malformed) `ExposureTime`: `$val` is the space-joined read
+        // (`ExifTool.pm:6330`). `IsFloat($val)` is false (the space) ⇒
+        // `PrintExposureTime` returns it verbatim (`Exif.pm:5704`), and `-n` is
+        // the same `$val`. Both modes emit `joined`; `emit_gated_number` quotes
+        // it (the space is out of the number gate).
+        Some(RationalRead::Joined { joined, .. }) => {
+          emit_gated_number(group, name, &joined, out)?;
+        }
+        None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::ShutterSpeedApex => {
+      // `ShutterSpeedValue` (0x9201) ValueConv `IsFloat($val) && abs($val)<100 ?
+      // 2**(-$val) : 0` (Exif.pm:2346); the result feeds `PrintExposureTime`, and
+      // `-n` emits the post-ValueConv scalar. `$val` is the `rational64s` read,
+      // so the `RoundFloat($num/$den, 10)` rounding (`Exif.pm:6112`) is a property
+      // of the RATIONAL read alone (`rational_read`): a single `Rational` rounds
+      // its quotient, but a wrong-format FLOAT/DOUBLE `ShutterSpeedValue` is read
+      // by `GetFloat`/`GetDouble` WITHOUT that rounding (the rounded apex is then
+      // exponentiated + feeds `Composite:ShutterSpeed`/`LightValue`, so an
+      // over-broad round changes a crafted double-stored value's bytes). A
+      // zero-denominator rational reads as the word `inf`/`undef`, and a count>1
+      // value is the space-joined `$val` — both non-float ⇒ `IsFloat($val)` is
+      // false ⇒ the ValueConv yields `0`.
+      let secs = match rational_read(raw) {
+        Some(RationalRead::Finite(apex)) => Some(shutter_speed_value_conv(apex)),
+        // `IsFloat("inf"/"undef")` and `IsFloat(<space-joined>)` are both false ⇒
+        // the ValueConv's `: 0` branch.
+        Some(RationalRead::Degenerate(_) | RationalRead::Joined { .. }) => Some(0.0),
+        None => None,
       };
       match secs {
         Some(s) if print_conv => {
-          // PrintExposureTime → `1/724` (out of gate ⇒ string) or a whole/`%.1f`
-          // second count like `30` (in gate ⇒ a bare JSON number). Gate it.
           emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
         }
         Some(s) => emit_gated_f64(group, name, s, out)?,
@@ -11825,25 +11866,50 @@ fn emit_exif_value<S: ExifSink>(
       Some(_) | None => emit_raw(group, name, raw, out),
     },
     Conv::ApertureApex => {
-      // ValueConv `2 ** ($val / 2)` (Exif.pm:2356); PrintConv
-      // `sprintf("%.1f",$val)` (Exif.pm:2358). ExifTool reads the input
-      // `rational64u`/`s` via `RoundFloat($num/$den, 10)` (`Exif.pm:6112`/`:6119`),
-      // so `$val` is the 10-sig-fig-rounded quotient BEFORE the ValueConv — e.g.
-      // `16205/3734` → `4.339850027`, NOT the full-precision `4.33985002678`. The
-      // `2**` of the rounded value (`4.50000003760988`) differs from the
-      // full-precision result in the low bits, so round the apex the same way to
-      // stay byte-exact at `-n` (`first_scalar`'s rational quotient is unrounded).
-      match first_scalar(raw).map(round_float_10) {
+      // `ApertureValue`/`MaxApertureValue` ValueConv `2 ** ($val / 2)`
+      // (Exif.pm:2356); PrintConv `sprintf("%.1f",$val)` (Exif.pm:2358). `$val` is
+      // the `rational64u`/`s` read, so the `RoundFloat($num/$den, 10)` rounding
+      // (`Exif.pm:6112`/`:6119`) is a property of the RATIONAL read alone
+      // (`rational_read`): a single `Rational` rounds its quotient — e.g.
+      // `16205/3734` → `4.339850027`, NOT the full-precision `4.33985002678`, and
+      // `2**(4.339850027/2) = 4.50000003760988` differs from the full-precision
+      // result in the low bits — but a wrong-format FLOAT/DOUBLE apex is read by
+      // `GetFloat`/`GetDouble` WITHOUT that rounding (the rounded apex is then
+      // exponentiated + feeds `Composite:Aperture`/`LightValue`, so an over-broad
+      // round changes a crafted double-stored value's bytes). The unguarded `2**`
+      // NUMIFIES a non-float `$val` the way Perl coerces a string scalar: a
+      // zero-denominator word — `"inf"` → ∞ ⇒ `2**(∞/2) = Inf`; `"undef"` → 0 ⇒
+      // `2**(0/2) = 1` — and a count>1 space-joined `$val` to its LEADING token
+      // (Perl's leading-numeric-prefix coercion: `"4.339850027 5"` → `4.339…`).
+      let apex = match rational_read(raw) {
+        Some(RationalRead::Finite(apex)) => Some(apex),
+        // Perl numifies the bare `GetRational*` word in `$val / 2`: a
+        // non-numeric `"undef"` → `0`, `"inf"` → `+inf` (never `-inf`).
+        Some(RationalRead::Degenerate("inf")) => Some(f64::INFINITY),
+        Some(RationalRead::Degenerate(_)) => Some(0.0),
+        // A count>1 join: `$val / 2` numifies the leading token (already the
+        // first element's `Get…` read coerced to `f64` — `undef`→0, `inf`→∞).
+        Some(RationalRead::Joined { leading, .. }) => Some(leading),
+        None => None,
+      };
+      match apex {
         Some(apex) => {
           let v = 2f64.powf(apex / 2.0);
           if print_conv {
             // PrintConv `sprintf("%.1f",$val)` → `16.0` — an in-gate JSON
-            // number. Gate it (the `%.1f` text is always in-gate, but the
-            // gate keeps every numeric path uniform).
-            emit_gated_number(group, name, &std::format!("{v:.1}"), out)?;
+            // number. Gate it (the `%.1f` text is always in-gate, but the gate
+            // keeps every numeric path uniform). A non-finite `$val` is Perl's
+            // titlecase word (`sprintf("%.1f",Inf)` == `"Inf"`, not Rust's
+            // lowercase `"inf"`), out of gate ⇒ quoted; `perl_nonfinite_str`
+            // matches `EscapeJSON`'s quoted `Inf`/`-Inf`/`NaN`.
+            match crate::value::perl_nonfinite_str(v) {
+              Some(word) => emit_gated_number(group, name, word, out)?,
+              None => emit_gated_number(group, name, &std::format!("{v:.1}"), out)?,
+            }
           } else {
             // `-n` ⇒ the post-ValueConv scalar, gated as ExifTool would
-            // stringify-then-`EscapeJSON` it.
+            // stringify-then-`EscapeJSON` it (`emit_gated_f64` routes a
+            // non-finite value through the same titlecase serializer).
             emit_gated_f64(group, name, v, out)?;
           }
           Ok(())
@@ -12517,6 +12583,157 @@ fn emit_int_label<S: ExifSink>(
   }
 }
 
+/// The single value ExifTool's `ReadValue` hands a scalar EXIF conv, modelling
+/// the shape-specific `Get…` read for the tags whose `RoundFloat(n/d, sig)`
+/// rounding is a property of the *rational* read alone (`ExposureTime`,
+/// `ShutterSpeedValue`, `ApertureValue`/`MaxApertureValue`).
+///
+/// ExifTool's `RoundFloat($num/$den, $sig)` rounding (`ExifTool.pm:6098`/`6105`/
+/// `6112`/`6119`) is applied by `GetRational32*`/`GetRational64*` — the rational
+/// reader — NOT as a post-coercion step. A tag stored as a different on-disk
+/// shape is read by its own getter (a FLOAT/DOUBLE by `GetFloat`/`GetDouble`, an
+/// integer by `Get…u`, `ExifTool.pm:6085-6086`) WITHOUT that rounding. And the
+/// rational reader returns the bare word `'undef'` (numerator 0) / `'inf'`
+/// (numerator ≠ 0) for a zero denominator (`… or return $ratNumer ? 'inf' :
+/// 'undef'`), NOT a float.
+///
+/// `ReadValue` joins a COUNT>1 value with single spaces (`ExifTool.pm:6330`
+/// `return join(' ', @vals) if @vals > 1`) — each element first reduced to its
+/// own `Get…` read (`@vals`: a rational element is its `RoundFloat`-rounded
+/// decimal or the `inf`/`undef` word; an int/float element its native scalar
+/// string). The joined `$val` then carries a space, so `IsFloat($val)` is FALSE
+/// and an arithmetic ValueConv numifies only its LEADING token (Perl's string→
+/// number coercion takes the leading numeric prefix). This enum therefore covers
+/// EVERY `RawValue` shape the EXIF value path produces:
+///   * a single `Rational` with a non-zero denominator → [`Self::Finite`] of the
+///     `RoundFloat(n/d, sig)`-rounded quotient (`exiftool_val_str` re-parsed,
+///     carrying the rational's own 7-/10-sig width — the dominant EXIF apex
+///     width is `rational64` ⇒ the 10-sig `RoundFloat($num/$den, 10)`);
+///   * a single `Rational` with a zero denominator → [`Self::Degenerate`] of the
+///     `inf`/`undef` word (each consuming arm renders it per its own ValueConv:
+///     `ExposureTime` emits the word verbatim, `ShutterSpeedValue`'s
+///     `IsFloat($val)` guard yields `0`, `ApertureValue`'s unguarded `2 **`
+///     numifies the word — `inf`→∞, `undef`→0);
+///   * a single non-rational shape (crafted FLOAT/DOUBLE `[f]`, or integer
+///     `U64[n]`/`I64[n]`) → [`Self::Finite`] of the UNROUNDED native scalar
+///     (`GetFloat`/`GetDouble`/`Get…u`);
+///   * a COUNT>1 value of ANY numeric shape (multi `Rational`/`U64`/`I64`/`F64`)
+///     → [`Self::Joined`] carrying BOTH the space-joined `$val` (the verbatim
+///     `ReadValue` string — each element rendered as `emit_raw`/`GetRational`
+///     would) AND the Perl-numified leading token (the first element's `Get…`
+///     read coerced to `f64`: a finite quotient/scalar, `undef`→0, `inf`→∞),
+///     so the `IsFloat`-false PrintConv (`ExposureTime`) emits the join verbatim,
+///     the `IsFloat`-guarded ValueConv (`ShutterSpeedValue`) collapses to `0`,
+///     and the unguarded `2 **` ValueConv (`ApertureValue`) exponentiates the
+///     leading token — each byte-identical to bundled `exiftool`;
+///   * a non-scalar shape (`Text`/`Bytes`) or an EMPTY (count-0) numeric list →
+///     `None` (no scalar element), so the caller falls back to [`emit_raw`].
+enum RationalRead {
+  /// A finite scalar value: the `RoundFloat`-rounded quotient of a single
+  /// `Rational`, or the unrounded native scalar of a single non-rational shape.
+  /// This is the numeric `$val` an arithmetic ValueConv (`2 ** -$val`,
+  /// `2 ** ($val/2)`) consumes, and the value `PrintExposureTime`/`-n` renders.
+  Finite(f64),
+  /// A single `Rational` with a zero denominator: `GetRational*` returned the
+  /// bare word `"undef"` (numerator 0) or `"inf"` (numerator ≠ 0 — always
+  /// `'inf'`, never `'-inf'`). The consuming arm decides how its ValueConv treats
+  /// the non-float word.
+  Degenerate(&'static str),
+  /// A COUNT>1 numeric value: the space-joined `$val` `ReadValue` returns
+  /// (`join(' ', @vals)`, each element a `Get…`-read string), plus the
+  /// `leading` token Perl numifies (the first element's `Get…` read as an
+  /// `f64`). The join carries a space ⇒ `IsFloat($val)` is false, so each
+  /// consuming arm decides: a verbatim-string PrintConv emits `joined`, an
+  /// `IsFloat`-guarded ValueConv collapses to `0`, an unguarded `2 **`
+  /// ValueConv exponentiates `leading`.
+  Joined {
+    /// The verbatim space-joined `$val` (`ReadValue`'s `join(' ', @vals)`).
+    joined: String,
+    /// The first element's `Get…` read coerced to `f64` (Perl's numify of the
+    /// join's leading token): a finite quotient/native scalar, `undef`→`0.0`,
+    /// `inf`→`+∞`.
+    leading: f64,
+  },
+}
+
+/// Read a [`RawValue`] as the single `$val` ExifTool's `ReadValue` hands a
+/// scalar EXIF conv, with the shape-specific `RoundFloat`-is-a-rational-read
+/// semantics and the count>1 space-join (see [`RationalRead`]). `None` for a
+/// value with no scalar element (an empty numeric list or a `Bytes`/`Text`
+/// shape) — the caller falls back to [`emit_raw`].
+fn rational_read(raw: &RawValue) -> Option<RationalRead> {
+  // A COUNT>1 numeric value: `ReadValue` joins `@vals` with spaces
+  // (`ExifTool.pm:6330`). The joined `$val` carries a space ⇒ the consuming
+  // ValueConv sees a non-float; carry the verbatim join AND the Perl-numified
+  // leading token so each arm applies its own ValueConv faithfully.
+  if raw.count() > 1 {
+    let joined = value_space_joined(raw)?;
+    return Some(RationalRead::Joined {
+      joined,
+      leading: numify_leading(raw),
+    });
+  }
+  match raw {
+    // A single rational IS the `GetRational*` read: a finite quotient is
+    // `RoundFloat(n/d, sig)`-rounded (`exiftool_val_str` for a non-zero
+    // denominator == `format_g(n/d, sig)`), a zero denominator is the
+    // `inf`/`undef` word.
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => Some(if r.denominator() == 0 {
+      RationalRead::Degenerate(if r.numerator() != 0 { "inf" } else { "undef" })
+    } else {
+      // `exiftool_val_str` of a non-zero-denominator rational is the
+      // `RoundFloat(n/d, sig)` decimal; it always re-parses to a finite f64.
+      RationalRead::Finite(
+        r.exiftool_val_str()
+          .parse()
+          .unwrap_or_else(|_| rational_quotient(r)),
+      )
+    }),
+    // A single non-rational on-disk shape (crafted FLOAT/DOUBLE/integer) is read
+    // by its own getter WITHOUT the rational rounding — its native scalar,
+    // unrounded.
+    _ => first_scalar(raw).map(RationalRead::Finite),
+  }
+}
+
+/// Perl's numeric coercion of the LEADING token of a count>1 value's joined
+/// `$val` (`ReadValue`'s `join(' ', @vals)`) — what an arithmetic ValueConv
+/// (`2 ** ($val / 2)`) consumes when `$val` carries a space (`IsFloat` false).
+/// Perl numifies a string by its leading numeric prefix, so `$val / 2` reduces
+/// to the FIRST element's `Get…` read coerced to `f64`. Computed from that
+/// first element directly (rather than re-parsing the join) so it is exactly
+/// the value Perl numifies for EVERY shape: a finite rational element is its
+/// `RoundFloat`-rounded quotient string re-parsed (byte-identical to the join's
+/// rounded leading token), a zero-denominator rational the word `undef`→`0.0`
+/// or `inf`→`+∞` (Perl: `"undef"+0 == 0`, `"inf"+0 == Inf`), an integer its
+/// value, a float its `%.15g` render re-parsed (matching the join's lossy
+/// leading token, which can differ from the raw `f64` in the last ULP). A
+/// count-0 list (no leading token) numifies the empty string ⇒ `0.0`.
+fn numify_leading(raw: &RawValue) -> f64 {
+  match raw {
+    RawValue::Rational(rs) => match rs.first() {
+      Some(r) if r.denominator() == 0 => {
+        if r.numerator() != 0 {
+          f64::INFINITY
+        } else {
+          0.0
+        }
+      }
+      // The rounded decimal string the join's leading token holds, re-parsed.
+      Some(r) => r.exiftool_val_str().parse().unwrap_or(0.0),
+      None => 0.0,
+    },
+    RawValue::U64(v) => v.first().map_or(0.0, |&n| n as f64),
+    RawValue::I64(v) => v.first().map_or(0.0, |&n| n as f64),
+    // The `%.15g` token the join holds, re-parsed — Perl numifies that text, not
+    // the raw `f64`, so round-trip through `format_g(_, 15)` to match it.
+    RawValue::F64(v) => v.first().map_or(0.0, |&f| {
+      crate::value::format_g(f, 15).parse().unwrap_or(0.0)
+    }),
+    RawValue::Text { .. } | RawValue::Bytes(_) => 0.0,
+  }
+}
+
 /// The first scalar of a [`RawValue`] as an `f64` — for the scalar-conv
 /// paths (FNumber/ExposureTime/etc.). A `Rational` yields its quotient.
 fn first_scalar(raw: &RawValue) -> Option<f64> {
@@ -12598,21 +12815,6 @@ fn rational_quotient(r: &crate::value::Rational) -> f64 {
     };
   }
   r.numerator() as f64 / r.denominator() as f64
-}
-
-/// `RoundFloat($val, 10)` (`ExifTool.pm:5960-5964`) = `sprintf("%.10g", $val)`
-/// re-parsed — the 10-significant-figure rounding ExifTool applies to a
-/// `rational64u`/`s` value when reading it (`Exif.pm:6112`/`:6119`) BEFORE it
-/// reaches a ValueConv. Used by the `ApertureApex` / `ShutterSpeedApex` `2 **`
-/// ValueConvs so their input matches ExifTool's rounded `$val` byte-exact at
-/// `-n`. A non-finite value (`inf`/`NaN` from a degenerate rational) passes
-/// through unchanged (`%.10g` of `inf` is `"inf"`, which would not re-parse — so
-/// it is returned verbatim).
-fn round_float_10(val: f64) -> f64 {
-  if !val.is_finite() {
-    return val;
-  }
-  crate::value::format_g(val, 10).parse().unwrap_or(val)
 }
 
 /// `PrintLensInfo` (`Exif.pm:5800-5817`) — 4 rationals → the lens string.
@@ -14935,6 +15137,430 @@ mod tests {
     // mm"`, the value verbatim).
     let frac = RawValue::Rational(std::vec![crate::value::Rational::rational64(75, 2)]);
     assert_eq!(emit_conv(&frac, conv, true), "37.5 mm");
+  }
+
+  // -- #380: ExposureTime rounding is RATIONAL-READ-shape-specific -----------
+
+  /// A finite `rational64u` `ExposureTime` (`1/60`, the K-70 happy path) is
+  /// read via `GetRational64u` = `RoundFloat(n/d, 10)` (`ExifTool.pm:6114-6120`)
+  /// BEFORE the PrintConv: `-n` is the 10-sig-fig quotient `0.01666666667` (NOT
+  /// the full-precision `0.0166666666666667`), and `PrintExposureTime` of that
+  /// rounded value fractionizes to `1/60`. (The same rounded value feeds
+  /// `Composite:ShutterSpeed`/`LightValue`, kept byte-exact by the golden.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_finite_rational_rounds_to_10_sig_figs() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 60)]);
+    // print mode → `PrintExposureTime(0.01666666667)` → `"1/60"`.
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/60");
+    // `-n` mode → the 10-sig-fig-rounded f64 (in-gate ⇒ a bare number), NOT the
+    // unrounded `0.0166666666666667`.
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.016_666_666_67)),
+      "a finite rational ExposureTime is RoundFloat(n/d, 10)-rounded at -n"
+    );
+  }
+
+  /// A zero-denominator `rational64u` `ExposureTime` is NOT a float: the
+  /// rational reader returns the bare word `undef` (numerator 0) or `inf`
+  /// (numerator ≠ 0) — `... or return $ratNumer ? 'inf' : 'undef'`
+  /// (`ExifTool.pm:6118-6119`). `PrintExposureTime` returns a non-float input
+  /// verbatim (`Exif.pm:5704`), and `-n` is the same word. Rounding the raw
+  /// quotient unconditionally would coerce `0/0` to `NaN` and leak `"NaN"`;
+  /// the shape-specific rational read preserves the faithful token.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_zero_denominator_rational_keeps_undef_inf_token() {
+    // `0/0` → the word `undef` (both print and `-n`), a quoted JSON string.
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(emit_conv(&undef, Conv::ExposureTime, true), "undef");
+    assert_eq!(emit_conv(&undef, Conv::ExposureTime, false), "undef");
+    // `1/0` (numerator ≠ 0) → the word `inf`.
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(emit_conv(&inf, Conv::ExposureTime, true), "inf");
+    assert_eq!(emit_conv(&inf, Conv::ExposureTime, false), "inf");
+  }
+
+  /// A crafted `ExposureTime` stored as a FLOAT/DOUBLE (the tag has no `Format`
+  /// override forcing rational64) is read by `GetFloat`/`GetDouble`
+  /// (`ExifTool.pm:6085-6086`) WITHOUT the rational read's `RoundFloat(n/d, 10)`.
+  /// So `-n` keeps the full-precision scalar (`0.0166666666666667`), NOT the
+  /// 10-sig-fig `0.01666666667` the over-broad R1 fix would have produced. The
+  /// integer path is likewise unrounded (a no-op for whole values).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    // A 16-significant-digit float ExposureTime. `-n` renders `%.15g` =
+    // `0.0166666666666667` (in-gate ⇒ a bare number) — the UNROUNDED value. The
+    // rational-read rounding would instead give `0.01666666667`.
+    let raw = RawValue::F64(std::vec![0.016_666_666_666_666_7]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.016_666_666_666_666_7)),
+      "a float/double ExposureTime must NOT be rational-rounded at -n"
+    );
+    // print mode → `PrintExposureTime` of the unrounded scalar still fractionizes
+    // to `1/60` (both round and unrounded collapse there).
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/60");
+  }
+
+  // -- #380: the apex `2**` ValueConvs share the rational-read shape split ----
+  //
+  // `ShutterSpeedValue`/`ApertureValue`/`MaxApertureValue` exponentiate `$val`
+  // (the APEX), so the `RoundFloat(n/d, 10)` rational read must NOT be applied to
+  // a non-rational shape: a crafted FLOAT/DOUBLE-stored apex is read by
+  // `GetFloat`/`GetDouble` UNROUNDED, and the `2**` of the unrounded value differs
+  // in the low bits from the rounded-rational path (the value that also feeds
+  // `Composite:ShutterSpeed`/`Aperture`/`LightValue`). These pin the same
+  // shape-split the over-broad `first_scalar.map(round)` violated for `ExposureTime`.
+
+  /// A finite `rational64s` `ShutterSpeedValue` is the `GetRational64s` read =
+  /// `RoundFloat(n/d, 10)` BEFORE the ValueConv `2**(-$val)`: `16205/3734`
+  /// rounds to `4.339850027`, so `-n` is `2**(-4.339850027) = 0.0493827152239257`
+  /// (the 10-sig-fig path), and `PrintExposureTime` of that fractionizes to
+  /// `1/20`. NOT the full-precision `2**(-4.33985002678093) = 0.0493827152314243`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_finite_rational_rounds_before_2pow() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(16205, 3734)]);
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, true), "1/20");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ShutterSpeedApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.049_382_715_223_925_7)),
+      "a finite rational ShutterSpeedValue rounds (RoundFloat,10) before 2**(-val)"
+    );
+  }
+
+  /// A crafted FLOAT/DOUBLE `ShutterSpeedValue` (the apex stored full-precision)
+  /// is read by `GetFloat`/`GetDouble` WITHOUT the rational `RoundFloat(n/d, 10)`,
+  /// so `2**(-$val)` consumes the UNROUNDED apex: `-n` is `2**(-4.33985002678093)
+  /// = 0.0493827152314243`, byte-different from the rounded-rational
+  /// `0.0493827152239257` above. (The over-broad pre-fix rounded the float too.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    // The full-precision apex `16205/3734` as an on-disk double.
+    let raw = RawValue::F64(std::vec![16205.0 / 3734.0]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ShutterSpeedApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.049_382_715_231_424_3)),
+      "a float/double ShutterSpeedValue apex must NOT be rational-rounded before 2**(-val)"
+    );
+  }
+
+  /// A zero-denominator `ShutterSpeedValue` reads as the word `inf`/`undef`,
+  /// which is not a float ⇒ `IsFloat($val)` is false ⇒ the ValueConv's `: 0`
+  /// branch: `-n` and print are both `0` (`PrintExposureTime(0)` → `"0"`). The
+  /// over-broad path coerced the rational to `NaN`/`inf` first, but the
+  /// `IsFloat`-guarded conv collapses both to `0` regardless.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_zero_denominator_yields_zero() {
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(emit_conv(&undef, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&undef, Conv::ShutterSpeedApex, true), "0");
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(emit_conv(&inf, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&inf, Conv::ShutterSpeedApex, true), "0");
+  }
+
+  /// A finite `rational64u` `ApertureValue` is the `GetRational64u` read =
+  /// `RoundFloat(n/d, 10)` BEFORE the ValueConv `2**($val/2)`: `16205/3734`
+  /// rounds to `4.339850027`, so `-n` is `2**(4.339850027/2) = 4.50000003760988`
+  /// (the active-golden value), print `%.1f` is `4.5`. NOT the full-precision
+  /// `2**(4.33985002678093/2) = 4.50000003726823`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_finite_rational_rounds_before_2pow() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(16205, 3734)]);
+    assert_eq!(emit_conv(&raw, Conv::ApertureApex, true), "4.5");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_609_88)),
+      "a finite rational ApertureValue rounds (RoundFloat,10) before 2**(val/2)"
+    );
+  }
+
+  /// A crafted FLOAT/DOUBLE `ApertureValue` (the apex stored full-precision) is
+  /// read by `GetFloat`/`GetDouble` WITHOUT the rational `RoundFloat(n/d, 10)`,
+  /// so `2**($val/2)` consumes the UNROUNDED apex: `-n` is
+  /// `2**(4.33985002678093/2) = 4.50000003726823`, byte-different from the
+  /// rounded-rational `4.50000003760988` above.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    let raw = RawValue::F64(std::vec![16205.0 / 3734.0]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_268_23)),
+      "a float/double ApertureValue apex must NOT be rational-rounded before 2**(val/2)"
+    );
+  }
+
+  /// A zero-denominator `ApertureValue` reads as the word `inf`/`undef`, which
+  /// the UNGUARDED `2**($val/2)` NUMIFIES the Perl way: `"undef"` → `0` ⇒
+  /// `2**(0/2) = 1`; `"inf"` → ∞ ⇒ `2**(∞/2) = Inf`. (`MaxApertureValue` shares
+  /// this conv.) Assertions are on the stored `TagValue` — the JSON writer's
+  /// faithful input (`F64(1.0)`→`1.0`, `Str("Inf")`→quoted `"Inf"`) — NOT the
+  /// `get_str` Display, which collapses `1.0`→`1` and lowercases `inf`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_zero_denominator_numifies_word() {
+    use crate::value::TagValue;
+    // Drive one tag through `emit_exif_value` in the given mode and take the
+    // stored `TagValue` (the value the JSON serializer renders).
+    let stored = |raw: &RawValue, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value(
+        "IFD0",
+        "T",
+        raw,
+        Conv::ApertureApex,
+        ByteOrder::Big,
+        print,
+        &mut map,
+      )
+      .unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // `0/0` → word `undef` → numifies to 0 → `2**0 = 1`. `-n`: the in-gate
+    // integer token `1` ⇒ `U64(1)`. Print `%.1f` → `"1.0"`, an in-gate
+    // non-integer ⇒ `F64(1.0)` (serialized as `1.0`, matching ExifTool's `1.0`).
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(stored(&undef, false), Some(TagValue::U64(1)));
+    assert_eq!(stored(&undef, true), Some(TagValue::F64(1.0)));
+    // `1/0` → word `inf` → numifies to ∞ → `2**∞ = Inf`. `-n`: the non-finite
+    // f64 ⇒ `F64(Inf)` (serialized titlecase `"Inf"`). Print `%.1f` of `Inf` is
+    // Perl's titlecase word `"Inf"` (NOT Rust's lowercase `"inf"`), out of the
+    // number gate ⇒ a quoted `Str("Inf")`.
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(stored(&inf, false), Some(TagValue::F64(f64::INFINITY)));
+    assert_eq!(stored(&inf, true), Some(TagValue::Str("Inf".into())));
+  }
+
+  // -- #380 (comprehensive close): the COUNT>1 space-join shape --------------
+  //
+  // `ReadValue` joins a count>1 value with single spaces (`ExifTool.pm:6330`
+  // `return join(' ', @vals) if @vals > 1`), each element first reduced to its
+  // own `Get…` read (a rational element its `RoundFloat`-rounded decimal or the
+  // `inf`/`undef` word). The joined `$val` carries a space, so `IsFloat($val)`
+  // is false and an arithmetic ValueConv numifies only its LEADING token. These
+  // pin every arm's faithful count>1 behaviour so a malformed multi-rational
+  // (or multi-int/multi-float) apex/exposure tag is not silently reduced to its
+  // leading quotient by `first_scalar` (the pre-fix bug). Verified against
+  // bundled `exiftool` 13.59 (`ReadValue` + each ValueConv).
+
+  /// A count>1 `ExposureTime` (`rational64u[2]` `1/60 1/30`): `$val` is the
+  /// space-joined read `"0.01666666667 0.03333333333"` (each element
+  /// `RoundFloat(n/d, 10)`). `IsFloat($val)` is false ⇒ `PrintExposureTime`
+  /// returns it verbatim (`Exif.pm:5704`) and `-n` is the same `$val`. Both
+  /// modes emit the join (the space is out of the number gate ⇒ a quoted
+  /// string). The pre-fix path emitted only the leading `0.01666666667`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_multi_rational_joins_with_spaces() {
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(1, 60),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "0.01666666667 0.03333333333"
+    );
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "0.01666666667 0.03333333333"
+    );
+  }
+
+  /// A count>1 `ExposureTime` of an integer (`int32u[2]` `2 3`) and a float
+  /// (`double[2]`) shape likewise space-join verbatim (`2 3` / the `%.15g`
+  /// join), `IsFloat`-false in both modes — the shape table's multi-int /
+  /// multi-float exposure rows.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_multi_int_and_float_join_with_spaces() {
+    let ints = RawValue::U64(std::vec![2, 3]);
+    assert_eq!(emit_conv(&ints, Conv::ExposureTime, true), "2 3");
+    assert_eq!(emit_conv(&ints, Conv::ExposureTime, false), "2 3");
+    // `%.15g` join of `16205/3734` and `5.5` (the leading element is rendered to
+    // `4.33985002678093`, exactly as `ReadValue`'s `@vals[0]`).
+    let floats = RawValue::F64(std::vec![16205.0 / 3734.0, 5.5]);
+    assert_eq!(
+      emit_conv(&floats, Conv::ExposureTime, false),
+      "4.33985002678093 5.5"
+    );
+  }
+
+  /// A count>1 `ShutterSpeedValue` (`rational64s[2]` `3/1 4/1`): `$val` is the
+  /// space-joined `"3 4"`, `IsFloat($val)` is false ⇒ the ValueConv's `: 0`
+  /// branch ⇒ both modes are `0` (`PrintExposureTime(0)` → `"0"`), exactly the
+  /// degenerate-rational result. (The pre-fix path fed the leading `3` to
+  /// `2**(-3) = 0.125`, a wrong non-zero value.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_multi_rational_yields_zero() {
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(3, 1),
+      crate::value::Rational::rational64(4, 1),
+    ]);
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, true), "0");
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, false), "0");
+    // A multi-int ShutterSpeedValue (`6 7`) is likewise `IsFloat`-false ⇒ `0`.
+    let ints = RawValue::U64(std::vec![6, 7]);
+    assert_eq!(emit_conv(&ints, Conv::ShutterSpeedApex, false), "0");
+  }
+
+  /// A count>1 `ApertureValue`/`MaxApertureValue` ValueConv `2 ** ($val / 2)`
+  /// numifies the space-joined `$val`'s LEADING token (Perl's leading-numeric-
+  /// prefix coercion). `rational64u[2]` `16205/3734 5/1` → `$val =
+  /// "4.339850027 5"` → `2**(4.339850027/2) = 4.50000003760988` (the leading
+  /// element's `RoundFloat`-rounded read, byte-identical to the count-1 rational
+  /// `16205/3734`); print `%.1f` is `4.5`. (The pre-fix path read the same
+  /// leading quotient but via `first_scalar`'s UNROUNDED quotient — byte-wrong.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_multi_rational_numifies_leading_rounded_token() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(16205, 3734),
+      crate::value::Rational::rational64(5, 1),
+    ]);
+    assert_eq!(emit_conv(&raw, Conv::ApertureApex, true), "4.5");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_609_88)),
+      "a count>1 ApertureValue numifies the leading RoundFloat-rounded token before 2**(val/2)"
+    );
+  }
+
+  /// The count>1 `ApertureValue` leading-token numify covers the degenerate +
+  /// multi-int leading elements exactly as Perl coerces a string scalar: a
+  /// leading `undef` (`0/0 …`) → `0` ⇒ `2**0 = 1`; a leading `inf` (`1/0 …`) →
+  /// ∞ ⇒ `2**∞ = Inf`; a multi-int leading `4` (`4 9`) → `2**(4/2) = 4`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_multi_leading_degenerate_and_int() {
+    use crate::value::TagValue;
+    let stored = |raw: &RawValue, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value(
+        "IFD0",
+        "T",
+        raw,
+        Conv::ApertureApex,
+        ByteOrder::Big,
+        print,
+        &mut map,
+      )
+      .unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // Leading `undef` (`0/0`) → numifies to 0 → `2**0 = 1`.
+    let undef = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(0, 0),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(stored(&undef, false), Some(TagValue::U64(1)));
+    assert_eq!(stored(&undef, true), Some(TagValue::F64(1.0)));
+    // Leading `inf` (`1/0`) → numifies to ∞ → `2**∞ = Inf`.
+    let inf = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(1, 0),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(stored(&inf, false), Some(TagValue::F64(f64::INFINITY)));
+    assert_eq!(stored(&inf, true), Some(TagValue::Str("Inf".into())));
+    // Multi-int leading `4` (`4 9`) → `2**(4/2) = 4`. `-n`: the in-gate integer
+    // token `4` ⇒ `U64(4)`; print `%.1f` → `"4.0"`, an in-gate non-integer ⇒
+    // `F64(4.0)` (the JSON-faithful value `4.0`; `get_str` Display would collapse
+    // it to `4`, so assert the stored `TagValue` like the degenerate test above).
+    let ints = RawValue::U64(std::vec![4, 9]);
+    assert_eq!(stored(&ints, false), Some(TagValue::U64(4)));
+    assert_eq!(stored(&ints, true), Some(TagValue::F64(4.0)));
   }
 
   // -- Fix 7: Conv::Version strips only TRAILING NULs ------------------------

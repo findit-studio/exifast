@@ -11430,34 +11430,25 @@ const KP_DEFERRED: &[&str] = &[
   "Pentax:SkinToneCorrection",
 ];
 
-// K-70: RETAINED for the deferred `jpeg_pentax_k70_conformance` (`#[ignore]`d on
-// #380 — see that test). Like K-1/KP but NO 0x000e AFPointSelected (the K-70
-// 0x000e is the unrelated CAFPointInfo internal, already emitted) and NO
+// K-70 deferred Pentax leaves. Like K-1/KP but NO 0x000e AFPointSelected (the
+// K-70 0x000e is the unrelated CAFPointInfo internal, already emitted) and NO
 // ISOAutoMinSpeed in the bundled dump — the AFPointInfo/PixelShiftInfo/Contrast/
 // ShutterType/SkinToneCorrection/ExposureCompensation/AFPointsInFocus residuals.
 //
-// PLUS three EXIF-rational-PRECISION residuals UNIQUE to this body's `1/60`
-// ExposureTime (NOT Pentax-specific): `ExifIFD:ExposureTime`, `Composite:
-// ShutterSpeed` (selects ExposureTime verbatim), and `Composite:LightValue`
-// (its formula consumes the shutter). exifast renders the `rational64u` `1/60`
-// at full f64 precision (`0.0166666666666667`), but ExifTool's `ConvertRational`
-// formats it at `%.10g` (`0.01666666667`); the two differ as f64. The same `%.10g`
-// rounding feeds ExifTool's `CalculateLV`, so its LightValue (`10.90689059532`)
-// differs from exifast's full-precision `10.9068905956085`. Every OTHER active
-// fixture's ExposureTime is a CLEAN rational (integer, `1/100`, `1/2`, `3/10` —
-// identical at 10g and full precision), so this is the FIRST fixture to surface
-// it. Faithfully matching it needs the EXIF read pipeline to carry rationals as
-// the `sig=10` `Rational` type through to emission (a core-value-pipeline change,
-// out of scope here) — a tracked deferral, not a mis-decode (the golden keeps the
-// bundled `%.10g` values).
+// #380 RESOLVED: the three EXIF-rational-PRECISION residuals this body's `1/60`
+// ExposureTime once surfaced (`ExifIFD:ExposureTime`, `Composite:ShutterSpeed`
+// which selects it verbatim, and `Composite:LightValue` whose `CalculateLV`
+// consumes the shutter) are no longer deferred. `Conv::ExposureTime` now rounds
+// the `rational64u` quotient via `RoundFloat($num/$den, 10)` (`Exif.pm:6114`),
+// exactly as ExifTool's `GetRational64u` reader does, so `-n` prints
+// `0.01666666667` (not full-f64 `0.0166666666666667`) and the rounded value
+// propagates byte-exact to the two Composites. The remaining entries are only
+// unimplemented Pentax leaves, so K-70 now activates honestly.
 const K70_DEFERRED: &[&str] = &[
   "Composite:Flash",
   "Composite:LensID",
   "PrintIM:PrintIMVersion",
   "XMP-tiff:YCbCrSubSampling",
-  "ExifIFD:ExposureTime",
-  "Composite:ShutterSpeed",
-  "Composite:LightValue",
   "Pentax:AFPointsInFocus",
   "Pentax:AFPointsSelected",
   "Pentax:AFPointsSpecial",
@@ -11543,31 +11534,15 @@ fn jpeg_pentax_kp_conformance() {
 
 // #311 — Pentax K-70 MakerNote (AFPointSelected, BatteryVoltage).
 //
-// DEFERRED on #380 — the core EXIF rational `%.10g` precision limitation. Unlike
-// the other four bodies, K-70's `K70_DEFERRED` would have to strip three CORE
-// EXIF/composite values — `ExifIFD:ExposureTime`, `Composite:ShutterSpeed`, and
-// `Composite:LightValue` — to pass: this body's `1/60` `rational64u` ExposureTime
-// is the first active fixture whose shutter is NOT a clean rational, so exifast's
-// full-f64 render (`0.0166666666666667`) diverges from ExifTool 13.59's `%.10g`
-// (`0.01666666667`), and the same rounding propagates through ShutterSpeed and
-// CalculateLV → LightValue. Excluding those core values to claim byte-exactness
-// would OVERSTATE coverage (the divergence is a real, unfixed limitation, not an
-// unimplemented Pentax leaf), so K-70 stays `#[ignore]`d (NOT_ACTIVE in
-// typed_serde_parity) until the EXIF read pipeline carries rationals as the
-// `sig=10` `Rational` type through to emission. The fresh 13.59 golden + the
-// `K70_DEFERRED` const are kept so K-70 activates cleanly (count 572→573) once
-// #380 lands. The other four bodies (K-1/K-3/K-5 II/KP) exclude ONLY unimplemented
-// Pentax leaves, so they activate honestly.
-#[ignore = "blocked on #380 — core EXIF rational %.10g precision: this body's \
-            non-clean `1/60` ExposureTime makes ExifIFD:ExposureTime / \
-            Composite:ShutterSpeed / Composite:LightValue diverge (full-f64 \
-            vs ExifTool's %.10g). Excluding those CORE values would overstate \
-            byte-exact coverage, so K-70 stays deferred (NOT_ACTIVE in \
-            typed_serde_parity) — the other four Pentax bodies exclude only \
-            unimplemented Pentax leaves and ARE active. Re-activate (drop \
-            #[ignore] + the NOT_ACTIVE entry, restore FIXTURE_EXCLUDED_KEYS, \
-            572→573) once the rational pipeline carries the sig=10 Rational \
-            type through to emission."]
+// ACTIVATED by #380: this body's `1/60` `rational64u` ExposureTime was the first
+// active fixture whose shutter is NOT a clean rational. `Conv::ExposureTime` now
+// rounds the quotient via `RoundFloat($num/$den, 10)` (`Exif.pm:6114`) exactly as
+// ExifTool's `GetRational64u` reader does, so `ExifIFD:ExposureTime` renders
+// `0.01666666667` (not full-f64 `0.0166666666666667`) and the rounded value
+// propagates byte-exact to `Composite:ShutterSpeed` (selects it verbatim) and
+// `Composite:LightValue` (`CalculateLV` consumes the shutter). `K70_DEFERRED` now
+// strips ONLY unimplemented Pentax leaves, so K-70 activates honestly alongside
+// the other four bodies (NOT_ACTIVE entry dropped, count 572→573).
 #[test]
 fn jpeg_pentax_k70_conformance() {
   check_excluding(
