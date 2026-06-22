@@ -44,6 +44,52 @@ fn check(fixture: &str, golden: &str, print_on: bool) {
   }
 }
 
+/// Strip a set of FULLY-QUALIFIED `-j -G1` keys (exact `Family1:Name`, e.g.
+/// `"Composite:GPSAltitude"`) from every object in the document. Used where
+/// exifast emits a tag whose VALUE diverges from bundled because a dependent
+/// subsystem is deferred — a golden-only `-x` would leave exifast's extra, so
+/// that EXACT tag is dropped from BOTH sides.
+///
+/// Matching is EXACT (not an `:tail` suffix): excluding `Composite:GPSAltitude`
+/// must NOT also strip the distinct `XMP-exif:GPSAltitude` (a same-named tag in
+/// a different family-1 group). Over-broad suffix matching previously masked
+/// the embedded-XMP GPS values from the comparison — the `XMP-exif:GPS*` tags
+/// are part of the #361 byte-exact fix and MUST stay in the comparison so their
+/// byte-exactness is actually verified.
+fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
+  let mut v: serde_json::Value = serde_json::from_str(doc).expect("valid JSON document");
+  if let Some(arr) = v.as_array_mut() {
+    for el in arr {
+      if let Some(obj) = el.as_object_mut() {
+        obj.retain(|k, _| !exact_keys.iter().any(|t| k == t));
+      }
+    }
+  }
+  serde_json::to_string(&v).expect("re-serialize document")
+}
+
+/// Like [`check`] but compares with `excluded` FULLY-QUALIFIED keys removed from
+/// BOTH the exifast output and the golden — for a tag exifast emits whose value
+/// diverges from bundled under a deferred subsystem (the golden keeps the
+/// matching `-x`). Keys are matched EXACTLY by their `Family1:Name` (see
+/// [`drop_keys`]).
+fn check_excluding(fixture: &str, golden: &str, print_on: bool, excluded: &[&str]) {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+    .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
+  let want = std::fs::read_to_string(format!("{root}/tests/golden/{golden}"))
+    .unwrap_or_else(|e| panic!("read golden {golden}: {e}"));
+  let got = drop_keys(&extract_info(fixture, &data, print_on), excluded);
+  let want = drop_keys(&want, excluded);
+  if let Err(e) = json_equivalent(&got, &want) {
+    panic!(
+      "{fixture} vs {golden} [excluding {excluded:?}]: value mismatch: {}\n--- got ---\n{got}\n\
+       --- want ---\n{want}",
+      e.message()
+    );
+  }
+}
+
 /// Pin `TZ=UTC` before the first `jiff::tz::TimeZone::system()` call
 /// (Codex R2 F1). The binary-plist `<date>` path ports the faithful
 /// `ConvertUnixTime(_, 1)` localtime branch — its offset is OS-TZ dependent.
@@ -11280,20 +11326,144 @@ fn jpeg_pentax_ks2_conformance() {
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
 }
 
-// #122 — Parrot Anafi drone MP4. The `mett` metadata track carries no per-sample
-// timed telemetry that bundled ExifTool 13.59 surfaces (`-ee` output is
-// byte-identical to the base — there is no `.ee.*` golden), so the conventioned
-// base goldens fully pin the parity. exifast emits the QuickTime/Track structure
-// + the `udta` Parrot `UserData:Make`/`Model` + the ported ImageSize/Megapixels/
-// AvgBitrate/Rotation Composites byte-exact; the unported subsystems (the
-// QuickTime-embedded XMP packet, the `udta/meta`(`mdir`) ItemList/`ilst` atoms +
-// their `HandlerVendorID`, the `meta`(`mdta`) Keys, `AudioKeys:Balance`, the
-// `UserData:LocationInformation` struct, and the GPSCoordinates-derived
-// `Composite:GPS*`) are excluded by name in `tools/gen_golden.sh` (see that arm).
+// #122 / #361 — Parrot Anafi drone MP4. The `mett` metadata track carries no
+// per-sample timed telemetry that bundled ExifTool 13.59 surfaces (`-ee` output
+// is byte-identical to the base — there is no `.ee.*` golden), so the base
+// goldens fully pin the parity. exifast emits the QuickTime/Track structure +
+// the `udta` Parrot `UserData:Make`/`Model` + the ported ImageSize/Megapixels/
+// AvgBitrate/Rotation Composites byte-exact.
+//
+// #361 — the embedded XMP packet (`uuid`-XMP → the shared XMP parser, 21 `XMP-*`
+// tags), the `udta/meta`(`mdir`) ItemList/`ilst` (Title/Artist/ContentCreateDate/
+// Encoder/CoverArt/GPSCoordinates) + its `QuickTime:HandlerVendorID` ("Apple"),
+// the `moov/meta`(`mdta`) Keys (CompatibleBrands/MajorBrand/Balance), the audio
+// `trak/meta`(`mdta`) `AudioKeys:Balance`, and the `UserData:LocationInformation`
+// (`loci`) struct are ALL now decoded byte-exact (33 tags that were previously
+// dropped by name).
+//
+// The ONLY remaining deferral is `Composite:GPS*`: bundled's `Composite:
+// GPSLatitude`/`Longitude`/`Altitude`/`AltitudeRef` come from the unported
+// `%QuickTime::Composite` `GPSCoordinates`/`LocationInformation` tables
+// (QuickTime.pm:8668-8728), which OVERRIDE the XMP-derived ones; plus the XMP
+// `Composite:GPSLatitudeRef`/`GPSLongitudeRef` and the composite-on-composite
+// `Composite:GPSPosition`. Porting that `%QuickTime::Composite` GPS table is the
+// port-wide deferral the GoPro/SP2 arms also carry (it would change ~12 goldens
+// + needs same-name composite override resolution). exifast DOES emit one
+// XMP-derived `Composite:GPSAltitude` (byte-exact vs bundled for an XMP-only
+// file, but diverging here because the QT composite is missing to override it),
+// so the seven `Composite:GPS*` keys are dropped from BOTH sides (the golden
+// keeps the matching `-x` in `tools/gen_golden.sh`).
+//
+// The exclusion is the EXACT, FULLY-QUALIFIED `Composite:GPS*` key set bundled
+// emits for this fixture (`perl exiftool -G1 -j` lists exactly these seven);
+// the distinct `XMP-exif:GPS{Altitude,AltitudeRef,Latitude,Longitude}` tags
+// (also part of the #361 fix) are NOT excluded and so are verified byte-exact
+// in this comparison — a regression in the embedded-XMP GPS parse would fail
+// here rather than be masked by an over-broad `:tail` match.
 #[test]
 fn mp4_parrot_anafi_conformance() {
-  check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.json", true);
-  check("MP4_parrot_anafi.mp4", "MP4_parrot_anafi.mp4.n.json", false);
+  const GPS_COMPOSITES: &[&str] = &[
+    "Composite:GPSAltitude",
+    "Composite:GPSAltitudeRef",
+    "Composite:GPSLatitude",
+    "Composite:GPSLatitudeRef",
+    "Composite:GPSLongitude",
+    "Composite:GPSLongitudeRef",
+    "Composite:GPSPosition",
+  ];
+  check_excluding(
+    "MP4_parrot_anafi.mp4",
+    "MP4_parrot_anafi.mp4.json",
+    true,
+    GPS_COMPOSITES,
+  );
+  check_excluding(
+    "MP4_parrot_anafi.mp4",
+    "MP4_parrot_anafi.mp4.n.json",
+    false,
+    GPS_COMPOSITES,
+  );
+}
+
+// #361 R4/R6 — the audio-track `meta`(`mdta`) `keys` must resolve through the
+// COMPLETE `ProcessKeys` order (QuickTime.pm:9806-9854): active `%QuickTime::
+// AudioKeys` (QuickTime.pm:6895) → `%ItemList` → `%UserData` → derive — NOT the
+// generic `%QuickTime::Keys`. `MP4_audiokeys_mute.mp4` is a CRAFTED audio-only
+// MP4 whose `soun` `trak` carries every flavor:
+//   - `Balance` (shared with `%Keys`) + `Mute` (the AudioKeys SOLE conv —
+//     `Format => int8u` + `PrintConv => { 0 => 'Off', 1 => 'On' }`: `On` at `-j`,
+//     `1` at `-n`) — the active-table arm;
+//   - `manu` / `modl` — UserData 4-cc aliases (QuickTime.pm:1879/1885) the
+//     cross-table arm resolves to `AudioKeys:Make` / `AudioKeys:Model` (the
+//     UserData NAME under the ACTIVE AudioKeys group, NOT a derived
+//     `AudioKeys:Manu`/`Modl`). Conv-less — the UserData RawConv (Canon-prefix
+//     strip) is NOT copied by ProcessKeys (verified vs bundled 13.59: a clean
+//     ASCII value passes through verbatim);
+//   - three NON-table keys — `make`, `creationdate`, `acme.totally.bogus.zzz` —
+//     the DERIVE arm emits (`AudioKeys:Make`/`Creationdate`/`AcmeTotallyBogusZzz`,
+//     CONV-LESS — `Creationdate` is the RAW string, NOT the `%Keys` date
+//     ValueConv, proving the AudioKeys table is consulted, not `%Keys`);
+//   - (#361 R7) two RAW `0xA9`-prefixed 4-cc ids `\xa9day` / `\xa9too` whose RAW
+//     key bytes must reach the cross-table (a UTF-8 decode mangles the `0xA9`
+//     into a 6-byte U+FFFD that can never match the 4-byte ItemList id) →
+//     `AudioKeys:ContentCreateDate` (the ItemList `%iso8601Date` ValueConv —
+//     "2024:05:06 07:08:09-05:00", the ItemList NAME, NOT the `creationdate`
+//     `CreationDate`) and `AudioKeys:Encoder`. `AudioKeys:Make` stays `CanonManu`
+//     (the `manu` cross-table id), unchanged by the additions.
+// No exclusion beyond `System:all`: the ported `Composite:AvgBitrate` is
+// verified byte-exact.
+#[test]
+fn mp4_audiokeys_mute_conformance() {
+  check(
+    "MP4_audiokeys_mute.mp4",
+    "MP4_audiokeys_mute.mp4.json",
+    true,
+  );
+  check(
+    "MP4_audiokeys_mute.mp4",
+    "MP4_audiokeys_mute.mp4.n.json",
+    false,
+  );
+}
+
+// #361 R7 — the MOVIE-LEVEL `moov/meta`(`mdta`) `keys` box runs the GENERIC
+// `%QuickTime::Keys` resolver (a video trak, so NOT AudioKeys) through the
+// COMPLETE `ProcessKeys` order (QuickTime.pm:9806-9854): active `%Keys` →
+// `%ItemList` → `%UserData` → DERIVE. `MP4_movie_keys.mov` exercises the two real
+// gaps R6 left open:
+//   - the DERIVE step ([high] fix): a NON-table movie key
+//     `com.apple.quicktime.acme.totally.bogus.zzz` ⇒ `Keys:AcmeTotallyBogusZzz`
+//     (previously DROPPED — `apply_key` ignored the cross-table miss and had no
+//     derive fallback, unlike the AudioKeys path);
+//   - the RAW `0xA9` cross-table resolution: `\xa9day` ⇒ `Keys:ContentCreateDate`
+//     (ItemList `%iso8601Date` — the ItemList NAME, distinct from the `%Keys`
+//     `creationdate` `CreationDate`) and `\xa9xyz` ⇒ `Keys:GPSCoordinates`
+//     (ItemList `ConvertISO6709` + `PrintGPSCoordinates`); `manu` ⇒ `Keys:Make`
+//     (UserData). All ground-truthed vs bundled 13.59.
+// The 3 `Composite:GPS*` bundled synthesizes from `Keys:GPSCoordinates` (the
+// unported `%QuickTime::Composite` table, QuickTime.pm:8668) are excluded BY NAME
+// from BOTH sides (the SAME port-wide GPS-composite deferral as the SP2/anafi
+// arms); the ported `Composite:ImageSize`/`Megapixels`/`AvgBitrate`/`Rotation`
+// are verified byte-exact.
+#[test]
+fn mp4_movie_keys_conformance() {
+  const GPS_COMPOSITES: &[&str] = &[
+    "Composite:GPSLatitude",
+    "Composite:GPSLongitude",
+    "Composite:GPSPosition",
+  ];
+  check_excluding(
+    "MP4_movie_keys.mov",
+    "MP4_movie_keys.mov.json",
+    true,
+    GPS_COMPOSITES,
+  );
+  check_excluding(
+    "MP4_movie_keys.mov",
+    "MP4_movie_keys.mov.n.json",
+    false,
+    GPS_COMPOSITES,
+  );
 }
 
 // #138 / #348 — Viofo A119 dashcam with LigoGPS freeGPS atom in MP4. The non-`ee`

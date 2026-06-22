@@ -87,6 +87,16 @@ const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 /// the SAME budget instead of inventing a second cap.
 pub(crate) const MAX_ATOM_DEPTH: u32 = 100;
 
+/// The 16-byte UUID that flags an XMP packet stored in a top-level `uuid` box —
+/// the canonical XMP-in-MP4 location (QuickTime.pm:155-163 `%QuickTime::Main`
+/// `uuid` Condition `$$valPt=~/^\xbe\x7a\xcf\xcb…/`, "this is where ExifTool
+/// writes XMP in MP4 videos as per the XMP spec"). The XMP packet bytes follow
+/// the 16-byte UUID; they are routed to the shared [`crate::formats::xmp`]
+/// parser exactly like a standalone `.xmp` sidecar.
+const XMP_UUID: [u8; 16] = [
+  0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac,
+];
+
 // ===========================================================================
 // SP2 supplementary conv-less camera-atom map (xtask `--kind quicktime`)
 // ===========================================================================
@@ -1400,6 +1410,35 @@ fn text_font_value(v: u16, print_conv: bool) -> crate::value::TagValue {
   match v {
     0 => TagValue::Str("System".into()),
     _ => TagValue::Str(std::format!("Unknown ({v})").into()),
+  }
+}
+
+/// Render the `%QuickTime::AudioKeys` `Mute` value (QuickTime.pm:6912-6916) for
+/// `print_conv`: the `PrintConv => { 0 => 'Off', 1 => 'On' }` hash at `-j`, the
+/// raw pre-PrintConv value at `-n`. `value` is the stored `data`-atom read (an
+/// int8u number for a numeric flag, or a decoded string for a string flag —
+/// [`read_audio_mute`]). The hash lookup mirrors Perl's string-keyed
+/// `$$conv{$val}` (so a numeric `0`/`1` AND a string `"0"`/`"1"` both map), with
+/// the `Unknown ($val)` default on a miss (ExifTool.pm:3633). Conv-bearing ⇒
+/// this is the SOLE AudioKeys tag whose `-j`/`-n` outputs differ.
+fn audio_mute_value(value: &crate::value::TagValue, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return value.clone();
+  }
+  // Key the hash on the value's canonical string form (Perl hash keys are
+  // strings): a numeric `0`/`1` and a string `"0"`/`"1"` both hit `Off`/`On`.
+  // [`read_audio_mute`] only ever yields `U64` (int8u flag) or `Str` (string
+  // flag), so those two carry the lookup; any other variant cannot occur.
+  let key: std::borrow::Cow<'_, str> = match value {
+    TagValue::U64(n) => std::borrow::Cow::Owned(n.to_string()),
+    TagValue::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
+    _ => return value.clone(),
+  };
+  match key.as_ref() {
+    "0" => TagValue::Str("Off".into()),
+    "1" => TagValue::Str("On".into()),
+    raw => TagValue::Str(std::format!("Unknown ({raw})").into()),
   }
 }
 
@@ -3704,11 +3743,209 @@ fn decode_moov_udta_meta(
     payload.len(),
     warning,
     |atom, body, w| match &atom.atom_type {
-      b"udta" => walk_udta(depth + 1, body, w, qt.user_data_mut()),
+      b"udta" => {
+        // The `%QuickTime::Movie` `moov/udta` UserData walk: the camera/GPS/
+        // capture-identity atoms (Make/Model/©xyz/…) into `user_data`. This pass
+        // surfaces any `udta`-internal truncation warning.
+        walk_udta(depth + 1, body, w, qt.user_data_mut());
+        // The `moov/udta` `loci` LocationInformation box + the nested `meta`
+        // (`mdir`) ItemList / Handler box — `%QuickTime::UserData` `loci`
+        // (QuickTime.pm:1775) + `meta` `Start => 4` (QuickTime.pm:1690-1691).
+        // A SECOND pass over the SAME `udta` body (each tag family is
+        // group-bucketed at emit, so cross-family order is immaterial); it
+        // discards its walk warnings (`&mut None`) since the first `walk_udta`
+        // pass already surfaced any `udta` truncation (no double-report).
+        walk_udta_loci_meta(depth + 1, body, &mut None, qt);
+      }
+      // The `moov/meta`(`mdta`) box — `%QuickTime::Movie` `meta` (offset 0): the
+      // `keys`-resolved ItemList → group `Keys`, plus the Handler box.
       b"meta" => walk_meta(depth + 1, body, w, qt),
+      // A `trak`: an audio track's `meta`(`mdta`) `keys` route through
+      // `%QuickTime::AudioKeys` (the `keys` Condition `$$self{MediaType} eq
+      // "soun"`, QuickTime.pm:2867-2870) → movie-level group `AudioKeys`. Decoded
+      // in Pass 1 here (alongside the moov-level meta/udta) into `qt.audio_keys`;
+      // the Pass-2 `trak` walk handles the structural track fields separately —
+      // and OWNS the trak's warnings (a truncated `tkhd`/`mdhd` surfaces a
+      // `Track<N>:Warning` there), so this supplementary AudioKeys scan discards
+      // its own walk warnings (`&mut None`) to avoid a DUPLICATE document-level
+      // `ExifTool:Warning`.
+      b"trak" => decode_trak_audio_keys(depth + 1, body, qt),
       _ => {}
     },
   );
+}
+
+/// Scan one `trak` for an AUDIO-track `meta`(`mdta`) `keys` box and decode its
+/// `keys`-resolved `ilst` into `qt.audio_keys` (group `AudioKeys`). ExifTool's
+/// `%QuickTime::Meta` `keys` is a Condition list (QuickTime.pm:2867-2878):
+/// `AudioKeys` when the track's `$$self{MediaType}` is `"soun"`, `VideoKeys` for
+/// `"vide"`, else `Keys`. This port wires the AUDIO case (the common
+/// `player.movie.audio.balance` → `AudioKeys:Balance`); a video-track or
+/// other-type `meta/keys` is left undecoded (the `VideoKeys` table / a
+/// track-level `Keys` are not yet modeled and no fixture needs them).
+///
+/// The track's `MediaType` is the `mdia/hdlr` 4-cc (`soun`/`vide`); a real
+/// audio track lists `mdia` before the `meta` box (the `meta` keys carry no
+/// `MediaType` of their own), so a single child walk that records the media
+/// handler first and decodes a soun-track `meta` after is faithful.
+fn decode_trak_audio_keys(depth: u32, payload: &[u8], qt: &mut QuickTimeMeta) {
+  // Discard structural walk warnings — the Pass-2 `trak` walk owns the trak's
+  // warnings (see the call site), so this scan must not double-report them.
+  let mut sink: Option<String> = None;
+  let mut media_type: Option<[u8; 4]> = None;
+  walk_atoms(
+    depth,
+    payload,
+    0,
+    payload.len(),
+    &mut sink,
+    |atom, body, w| {
+      match &atom.atom_type {
+        // `mdia/hdlr` HandlerType (`$$self{MediaType}`, QuickTime.pm:8413) — only a
+        // `Media`-parent `hdlr` sets it (the `mdia` child, not a `minf`/`meta` one).
+        b"mdia" => {
+          walk_atoms(depth + 1, body, 0, body.len(), w, |inner, ibody, _iw| {
+            if &inner.atom_type == b"hdlr"
+              && let Some(code) = ibody.get(8..12).and_then(|s| s.try_into().ok())
+            {
+              media_type = Some(code);
+            }
+          });
+        }
+        // An audio-track `meta`(`mdta`) box: decode its `keys`-resolved `ilst`
+        // into `audio_keys`. `%QuickTime::Track` `meta` has NO `Start` ⇒ offset 0.
+        b"meta" if media_type.as_ref() == Some(b"soun") => {
+          walk_meta_audio_keys(depth + 1, body, w, qt);
+        }
+        _ => {}
+      }
+    },
+  );
+}
+
+/// Walk an audio-track `meta`(`mdta`) box (offset 0): decode its `keys` +
+/// `keys`-resolved `ilst` into `qt.audio_keys`, faithful to `%QuickTime::
+/// AudioKeys`. Mirrors [`walk_meta`]'s single-pass `keys`/`ilst` resolution (the
+/// `KeysCount.index` lookup), but each resolved key is routed through the
+/// AudioKeys-specific [`apply_audio_key`] (NOT the generic [`apply_key`]): the
+/// `keys` `Condition => '$$self{MediaType} eq "soun"'` (QuickTime.pm:2867-2870)
+/// selects `%QuickTime::AudioKeys`, a DISTINCT 6-key table, so its members
+/// (`AudioGain`/`Treble`/`Bass`/`Balance`/`PitchShift`/`Mute`) resolve via that
+/// table (`Mute` keeps its int8u Format + `Off`/`On` PrintConv) and ANY other
+/// key takes `ProcessKeys`' unknown-key DERIVE path (a conv-less tag named from
+/// the key id — NOT the generic `%Keys` conversions). All emitted under group
+/// `AudioKeys`. The Handler box is NOT re-extracted here (the movie-level
+/// `meta_handler_*` come from the moov/udta meta boxes; an audio-track `mdta`
+/// hdlr carries an empty vendor and would not change them).
+fn walk_meta_audio_keys(
+  depth: u32,
+  payload: &[u8],
+  w: &mut Option<String>,
+  qt: &mut QuickTimeMeta,
+) {
+  let mut key_names: std::vec::Vec<KeyName> = std::vec::Vec::new();
+  walk_atoms(
+    depth,
+    payload,
+    0,
+    payload.len(),
+    w,
+    |atom, body, w| match &atom.atom_type {
+      b"keys" => key_names = parse_keys_box(body),
+      b"ilst" => {
+        walk_atoms(depth + 1, body, 0, body.len(), w, |item, item_body, iw| {
+          let index = u32::from_be_bytes(item.atom_type) as usize;
+          let Some(key) = index.checked_sub(1).and_then(|i| key_names.get(i)) else {
+            return;
+          };
+          let Some(data) = decode_ilst_data(depth + 2, item_body, iw) else {
+            return;
+          };
+          apply_audio_key(key, &data, qt.audio_keys_mut());
+        });
+      }
+      _ => {}
+    },
+  );
+}
+
+/// Walk a `moov/udta` (or `trak/udta`) body for the `loci` LocationInformation
+/// box and the nested `meta`(`mdir`) ItemList / Handler box — the
+/// `%QuickTime::UserData` `loci` (QuickTime.pm:1775-1818) and `meta` (the
+/// `Start => 4` SubDirectory through `%QuickTime::Meta`, QuickTime.pm:1690-1691).
+/// Separate from [`walk_udta`] (which decodes the camera atoms into
+/// `user_data`) because these targets live on the enclosing [`QuickTimeMeta`]
+/// (`loci` → `user_data.location_information`; the `meta/ilst` → `item_list`
+/// under group `ItemList`; the `meta/hdlr` → the `meta_handler_*` fields, which
+/// is where a `mdir`+`appl` `HandlerVendorID` comes from).
+fn walk_udta_loci_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickTimeMeta) {
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
+    match &atom.atom_type {
+      // `loci` LocationInformation (the 3gp location box). Decoded by the
+      // `loci` RawConv; emitted under `QuickTime:UserData`.
+      b"loci" => {
+        qt.user_data_mut()
+          .set_location_information(Some(decode_loci(body)));
+      }
+      // The `moov/udta/meta`(`mdir`) box: the `ilst` ItemList (direct-4cc
+      // atoms → group `ItemList`) + the Handler box (`mdir`+`appl` →
+      // `QuickTime:HandlerVendorID`). The `%QuickTime::UserData` `meta` is
+      // `Start => 4` (a 4-byte ISO version/flags prefix before the children).
+      b"meta" => {
+        let inner = body.get(4..).unwrap_or_default();
+        walk_udta_meta_box(depth + 1, inner, w, qt);
+      }
+      _ => {}
+    }
+  });
+}
+
+/// Walk a `udta/meta`(`mdir`) box's children (AFTER its 4-byte ISO version/flags
+/// prefix): the `hdlr` Handler box and the `ilst` ItemList. The `ilst` items are
+/// resolved by their LITERAL 4-character-code against `%QuickTime::ItemList`
+/// (`HasData => 1`, QuickTime.pm:2814-2819) and emitted under group `ItemList`
+/// (the `MOV-Movie-Track-UserData-Meta-ItemList` group-derivation). The `hdlr`
+/// shares the `%QuickTime::Handler` table with the `moov/meta` one — so a
+/// `mdir` HandlerType / an `appl` HandlerVendorID set the SAME movie-level
+/// `meta_handler_*` fields (last-wins, but an UNDEFINED field — an all-zero
+/// VendorID — does NOT clobber a prior defined one, faithful to ExifTool's
+/// `FoundTag`-only-when-defined RawConv).
+fn walk_udta_meta_box(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickTimeMeta) {
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
+    match &atom.atom_type {
+      // The Handler box — same `%QuickTime::Handler` table as `moov/meta/hdlr`.
+      // HandlerType last-wins; HandlerVendorID / HandlerClass / HandlerDescription
+      // only OVERWRITE when defined (an all-zero RawConv ⇒ `None` ⇒ no FoundTag ⇒
+      // the prior value stays), so a later empty-vendor `mdta` box does not erase
+      // this box's `appl`→"Apple".
+      b"hdlr" => {
+        if let Some(c) = decode_hdlr_class(body) {
+          qt.set_meta_handler_class(Some(c));
+        }
+        if let Some(code) = decode_hdlr(body) {
+          qt.set_meta_handler_type(Some(code));
+        }
+        if let Some(v) = decode_hdlr_vendor_id(body) {
+          qt.set_meta_handler_vendor_id(Some(v));
+        }
+        if let Some(d) = decode_hdlr_description(body) {
+          qt.set_meta_handler_description(Some(d));
+        }
+      }
+      // The ItemList: each item atom's 4-cc is a literal `%QuickTime::ItemList`
+      // tag id (`\xa9nam`, `covr`, …), NOT a `keys`-index. Decode its `data`
+      // atom and project onto the `item_list` (group `ItemList`).
+      b"ilst" => {
+        walk_atoms(depth + 1, body, 0, body.len(), w, |item, item_body, iw| {
+          let Some(data) = decode_ilst_data(depth + 2, item_body, iw) else {
+            return;
+          };
+          apply_item_list(&item.atom_type, &data, qt.item_list_mut());
+        });
+      }
+      _ => {}
+    }
+  });
 }
 
 /// Mirror ExifTool's LigoGPS `udta` SubDirectory Conditions in the
@@ -3959,6 +4196,101 @@ fn decode_manu_modl(body: &[u8]) -> String {
   String::from_utf8_lossy(s).into_owned()
 }
 
+/// Strip a leading NUL-terminated string off `data`, returning `(decoded,
+/// rest)` — the `loci` RawConv's `$val =~ s/^(\xfe\xff(.{2})*?)\0\0//s` (UTF-16BE
+/// when a `\xfe\xff` BOM leads) / `s/^(.*?)\0//s` (UTF-8) consume-and-decode
+/// (QuickTime.pm:1790-1796 / 1807-1816). A UTF-16BE run ends at the first
+/// `\0\0` 2-byte-aligned terminator; a UTF-8 run at the first `\0`. Returns
+/// `None` when no terminator is found (the Perl `s///` fails to match — the
+/// caller maps that to `<err>` for the name, or stops appending for body/notes).
+fn loci_take_string(val: &[u8]) -> Option<(String, &[u8])> {
+  if val.first() == Some(&0xfe) && val.get(1) == Some(&0xff) {
+    // UTF-16BE: scan from offset 2 for a 2-byte-aligned `\0\0`.
+    let mut i = 2;
+    while i + 1 < val.len() {
+      if val.get(i) == Some(&0) && val.get(i + 1) == Some(&0) {
+        let text = decode_utf16be(val.get(2..i).unwrap_or_default());
+        return Some((text, val.get(i + 2..).unwrap_or_default()));
+      }
+      i += 2;
+    }
+    None
+  } else {
+    let nul = val.iter().position(|&b| b == 0)?;
+    let text = String::from_utf8_lossy(val.get(..nul).unwrap_or_default()).into_owned();
+    Some((text, val.get(nul + 1..).unwrap_or_default()))
+  }
+}
+
+/// Decode a `loci` LocationInformation box body — the `%QuickTime::UserData`
+/// `loci` RawConv (QuickTime.pm:1788-1817). Layout after the box's leading
+/// 6-byte version/flags+lang header (the `data`-atom header is stripped by the
+/// caller, like ExifTool's `Start`): a NUL-terminated `name` string (UTF-16BE if
+/// `\xfe\xff`-prefixed, else UTF-8), then `int8u role`, `fixed32s lon`,
+/// `fixed32s lat`, `fixed32s alt`, then NUL-terminated `body` + `notes` strings.
+/// Returns the assembled `"<name> Role=… Lat=%.5f Lon=%.5f Alt=%.2f Body=…
+/// Notes=…"` string (or `"<err>"` on a malformed box, faithful to the RawConv's
+/// `return '<err>'`). An empty name renders as `(none)`.
+fn decode_loci(body: &[u8]) -> String {
+  // The 3gp `loci` box has a 6-byte prefix (4-byte version/flags + 2-byte
+  // language) before the name string (QuickTime.pm: the IText=6 / the box's own
+  // header). ExifTool's `loci` is decoded directly from the box value, where the
+  // 4-byte version/flags + 2-byte pad precede the string.
+  let Some(after_hdr) = body.get(6..) else {
+    return "<err>".to_string();
+  };
+  // Strip the leading name string. A `s///` failure (no terminator) ⇒ `<err>`.
+  let Some((name, rest)) = loci_take_string(after_hdr) else {
+    return "<err>".to_string();
+  };
+  let mut out = if name.is_empty() {
+    "(none)".to_string()
+  } else {
+    name
+  };
+  // `return '<err>' if length $val < 13` (role + 3 fixed32s = 13 bytes).
+  if rest.len() < 13 {
+    return "<err>".to_string();
+  }
+  let role = rest.first().copied().unwrap_or(0);
+  let read_fixed = |off: usize| -> f64 {
+    let raw = rest
+      .get(off..off + 4)
+      .and_then(|b| b.try_into().ok())
+      .map_or(0, i32::from_be_bytes);
+    get_fixed32s(raw)
+  };
+  let lon = read_fixed(1);
+  let lat = read_fixed(5);
+  let alt = read_fixed(9);
+  let role_str = match role {
+    0 => "shooting",
+    1 => "real",
+    2 => "fictional",
+    3 => "reserved",
+    _ => "",
+  };
+  if role_str.is_empty() {
+    out.push_str(&std::format!(" Role=unknown({role})"));
+  } else {
+    out.push_str(" Role=");
+    out.push_str(role_str);
+  }
+  out.push_str(&std::format!(" Lat={lat:.5} Lon={lon:.5} Alt={alt:.2}"));
+  // `$val = substr($val, 13)` then the Body + Notes strings (each optional).
+  let mut tail = rest.get(13..).unwrap_or_default();
+  if let Some((bodytext, after)) = loci_take_string(tail) {
+    out.push_str(" Body=");
+    out.push_str(&bodytext);
+    tail = after;
+  }
+  if let Some((notes, _)) = loci_take_string(tail) {
+    out.push_str(" Notes=");
+    out.push_str(&notes);
+  }
+  out
+}
+
 /// One `data` value decoded from an `ilst` item, with its format flags.
 struct IlstData {
   /// The `data`-atom flags `int32u` (the high byte selects the value format —
@@ -4024,11 +4356,28 @@ fn ilst_data_string(data: &IlstData) -> Option<String> {
 /// loop). Carrying both lets [`apply_key`] reproduce that fallback so keys NOT
 /// in the `com.apple.quicktime` namespace — e.g. `com.android.manufacturer`,
 /// whose table id keeps the `com.` prefix — still resolve.
+///
+/// **Raw vs decoded.** ExifTool's `$tag` is the RAW key BYTES throughout
+/// `ProcessKeys` (QuickTime.pm:9798-9842 — `GetTagInfo` keys the table by the
+/// byte string). A `\xa9`-prefixed 4-cc key id (e.g. `\xa9day` = `0xA9 d a y`,
+/// the `©`-copyright-symbol ItemList/UserData ids) is NOT valid UTF-8, so the
+/// `String` (`from_utf8_lossy`) views replace the `0xA9` with U+FFFD (3 bytes) —
+/// which can NEVER match the literal 4-byte ItemList/UserData id. The cross-table
+/// resolver therefore gates on the RAW byte forms ([`stripped_raw`]/[`full_raw`],
+/// the un-decoded key id), while the `%Keys`/`%AudioKeys` NAME lookups (and the
+/// derive transform, which deletes any non-`[-\w. ]` byte) use the `String`
+/// views — those tables only carry ASCII ids, where the lossy view is identical.
 struct KeyName {
-  /// The key after the `mdta` `s/^com\.(apple\.quicktime\.)?//` strip.
+  /// The key after the `mdta` `s/^com\.(apple\.quicktime\.)?//` strip, as a
+  /// (lossy) `String` for the name-keyed `%Keys`/`%AudioKeys` lookups.
   stripped: String,
-  /// The key as written (before stripping).
+  /// The key as written (before stripping), as a (lossy) `String`.
   full: String,
+  /// The RAW stripped key bytes (no lossy decode) — the literal id the
+  /// ItemList/UserData cross-table is keyed by (preserves a leading `0xA9`).
+  stripped_raw: std::vec::Vec<u8>,
+  /// The RAW full (un-stripped) key bytes.
+  full_raw: std::vec::Vec<u8>,
 }
 
 /// Parse the `keys` box payload into the ordered list of key names
@@ -4053,13 +4402,24 @@ fn parse_keys_box(payload: &[u8]) -> std::vec::Vec<KeyName> {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let truncated = raw.get(..end).unwrap_or_default();
     let full = String::from_utf8_lossy(truncated).into_owned();
-    // QuickTime.pm:9803 — strip the apple quicktime domain for mdta keys.
-    let stripped = if ns == b"mdta" {
-      strip_apple_quicktime_prefix(&full)
+    let full_raw = truncated.to_vec();
+    // QuickTime.pm:9803 — strip the apple quicktime domain for mdta keys. The
+    // strip prefixes are pure ASCII, so the byte strip mirrors the `String` one
+    // (and preserves a non-ASCII `0xA9`-prefixed id for the cross-table gate).
+    let (stripped, stripped_raw) = if ns == b"mdta" {
+      (
+        strip_apple_quicktime_prefix(&full),
+        strip_apple_quicktime_prefix_bytes(truncated).to_vec(),
+      )
     } else {
-      full.clone()
+      (full.clone(), full_raw.clone())
     };
-    keys.push(KeyName { stripped, full });
+    keys.push(KeyName {
+      stripped,
+      full,
+      stripped_raw,
+      full_raw,
+    });
     pos += len;
   }
   keys
@@ -4075,6 +4435,17 @@ fn strip_apple_quicktime_prefix(tag: &str) -> String {
   } else {
     tag.to_string()
   }
+}
+
+/// The byte-level twin of [`strip_apple_quicktime_prefix`] (QuickTime.pm:9803,
+/// operating on the raw key bytes ExifTool's `$tag` holds). Used for the literal
+/// id the ItemList/UserData cross-table is keyed by, so a `0xA9`-prefixed 4-cc id
+/// survives un-decoded (the `String` form would lossily mangle the `0xA9`).
+fn strip_apple_quicktime_prefix_bytes(tag: &[u8]) -> &[u8] {
+  tag
+    .strip_prefix(b"com.apple.quicktime.".as_slice())
+    .or_else(|| tag.strip_prefix(b"com.".as_slice()))
+    .unwrap_or(tag)
 }
 
 /// Walk one `moov/meta` atom payload in a **single, file-order pass**, decoding
@@ -4112,12 +4483,24 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
       // HandlerType = subtype at body offset 8; HandlerVendorID = offset 12
       // (all-zero ⇒ None); HandlerDescription = offset 24 to end (Pascal/C-string).
       b"hdlr" => {
-        qt.set_meta_handler_class(decode_hdlr_class(body));
+        // Each field FoundTag's only when its RawConv yields a DEFINED value, so
+        // a later all-zero field does NOT clobber an earlier defined one (a file
+        // with both a `mdir`+`appl` `udta/meta` box and an empty-vendor `mdta`
+        // `moov/meta` box keeps `HandlerVendorID = "Apple"`). HandlerType is the
+        // exception ExifTool already had (always defined for a known subtype) ⇒
+        // last-wins, which is the existing `if let Some` behavior.
+        if let Some(c) = decode_hdlr_class(body) {
+          qt.set_meta_handler_class(Some(c));
+        }
         if let Some(code) = decode_hdlr(body) {
           qt.set_meta_handler_type(Some(code));
         }
-        qt.set_meta_handler_vendor_id(decode_hdlr_vendor_id(body));
-        qt.set_meta_handler_description(decode_hdlr_description(body));
+        if let Some(v) = decode_hdlr_vendor_id(body) {
+          qt.set_meta_handler_vendor_id(Some(v));
+        }
+        if let Some(d) = decode_hdlr_description(body) {
+          qt.set_meta_handler_description(Some(d));
+        }
       }
       // A `keys` box REPLACES the active key list (see the multi-box note above).
       b"keys" => key_names = parse_keys_box(body),
@@ -4140,9 +4523,65 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
   });
 }
 
-/// Project one resolved `keys` entry onto [`crate::metadata::QuickTimeKeys`],
-/// faithful to the `%QuickTime::Keys` table (QuickTime.pm:6651-6770). Only the
-/// camera/GPS/capture-identity keys are decoded.
+/// Resolve one `moov/udta/meta` `ilst` item by its literal 4-character-code
+/// against the modeled subset of `%QuickTime::ItemList`
+/// (QuickTime.pm:3481-6623), projecting onto [`crate::metadata::QuickTimeItemList`]
+/// (group `ItemList`). Returns `true` when the 4-cc matched a modeled tag.
+///
+/// Two tags are CONV-BEARING (typed fields): `\xa9day` ContentCreateDate
+/// (`%iso8601Date`, QuickTime.pm:3511) and `\xa9xyz` GPSCoordinates
+/// (`ConvertISO6709` + `PrintGPSCoordinates`, QuickTime.pm:6589-6595) — fed the
+/// pre-ValueConv `data`-atom value ([`ilst_data_valueconv_str`]). EVERY OTHER
+/// modeled tag is conv-less (a plain `string`, or — `covr` `Binary => 1` / a
+/// non-string `data` flag — the binary placeholder), routed through the conv-less
+/// `data`-atom cascade ([`ilst_data_convless`]) and stored by table Name.
+fn apply_item_list(
+  item_4cc: &[u8; 4],
+  data: &IlstData,
+  out: &mut crate::metadata::QuickTimeItemList,
+) -> bool {
+  // The conv-less string/binary ItemList tags this port models, keyed by the
+  // literal 4-cc (the `©`-prefixed bytes carry the 0xA9 copyright symbol). All
+  // are plain `'Name'` entries in `%QuickTime::ItemList` with no Format/ValueConv
+  // (or `Binary => 1` for `covr`), so the data-atom flag governs the value.
+  let convless_name: Option<&'static str> = match item_4cc {
+    b"\xa9nam" => Some("Title"),    // QuickTime.pm:3520
+    b"\xa9ART" => Some("Artist"),   // QuickTime.pm:3505
+    b"\xa9too" => Some("Encoder"),  // QuickTime.pm:3521
+    b"\xa9alb" => Some("Album"),    // QuickTime.pm:3506
+    b"\xa9cmt" => Some("Comment"),  // QuickTime.pm:3508
+    b"\xa9gen" => Some("Genre"),    // (plain — the gnre int form is separate)
+    b"\xa9wrt" => Some("Composer"), // QuickTime.pm
+    b"covr" => Some("CoverArt"),    // QuickTime.pm:3549 (Binary => 1)
+    b"desc" => Some("Description"), // QuickTime.pm
+    _ => None,
+  };
+  if let Some(name) = convless_name {
+    out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  match item_4cc {
+    // `\xa9day` ContentCreateDate — `%iso8601Date` (ConvertXMPDate). Fed the
+    // pre-ValueConv data-atom value; a non-date passes through verbatim.
+    b"\xa9day" => {
+      out.set_content_create_date(Some(convert_iso8601_date(&ilst_data_valueconv_str(data))));
+      true
+    }
+    // `\xa9xyz` GPSCoordinates — ConvertISO6709 + PrintGPSCoordinates.
+    b"\xa9xyz" => {
+      out.set_gps(Some(parse_iso6709(&ilst_data_valueconv_str(data))));
+      true
+    }
+    _ => false,
+  }
+}
+
+/// Project one resolved movie-level `keys` entry onto
+/// [`crate::metadata::QuickTimeKeys`] (group `Keys`) through the COMPLETE
+/// `ProcessKeys` order (QuickTime.pm:9806-9854) with `$tagTablePtr =
+/// %QuickTime::Keys`: active `%Keys` table → `%ItemList` → `%UserData` → derive —
+/// the SAME four-step order as the audio-track path ([`apply_audio_key`]), only
+/// with `%Keys` (not `%AudioKeys`) as the active table.
 ///
 /// **Stripped-then-full key fallback (QuickTime.pm:9807-9824).** ExifTool tries
 /// the `mdta`-stripped key first, then the FULL (un-stripped) key. So the
@@ -4151,14 +4590,37 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
 /// (`com.android.version` / `com.android.manufacturer` / `com.android.model`,
 /// whose table ids keep the `com.` prefix) match only the FULL key — the bare
 /// `com.` strip yields `android.*`, which is not a table id.
+///
+/// **Derive on the double-miss (QuickTime.pm:9844-9854).** A movie-level key that
+/// matches NEITHER `%Keys` NOR the ItemList/UserData cross-table is NOT dropped —
+/// `ProcessKeys` derives a CamelCased name from the stripped id and emits it
+/// CONV-LESS under `Keys` (e.g. `acme.totally.bogus.zzz` ⇒
+/// `Keys:AcmeTotallyBogusZzz`), exactly as the AudioKeys path does for `AudioKeys`
+/// (verified vs bundled 13.59).
 fn apply_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadata::QuickTimeKeys) {
+  // (1) The active `%QuickTime::Keys` table: stripped key, then full key.
   if apply_key_name(&key.stripped, data, keys_out) {
     return;
   }
-  // Stripped key did not match a modeled tag — fall back to the FULL key
-  // (skip the redundant retry when stripping was a no-op).
-  if key.full != key.stripped {
-    apply_key_name(&key.full, data, keys_out);
+  if key.full != key.stripped && apply_key_name(&key.full, data, keys_out) {
+    return;
+  }
+  // (2)/(3) ItemList then UserData by the literal 4-cc (QuickTime.pm:9810-9811),
+  // before the derive — the SAME complete ProcessKeys order as the AudioKeys
+  // path. A key whose stripped form is a literal table id (e.g. `manu`/`modl`)
+  // resolves to the ItemList/UserData Name (Make/Model) under the active `Keys`
+  // group, NOT a derived `Keys:Manu`/`Modl`.
+  if apply_keys_cross_table_either(key, data, keys_out) {
+    return;
+  }
+  // (4) Unknown-key auto-tag (QuickTime.pm:9844-9854): a movie-level `%Keys` key
+  // matching NONE of the above is NOT dropped — `ProcessKeys` DERIVES a tag name
+  // from the (stripped) key id and emits it CONV-LESS under group `Keys`, EXACTLY
+  // like the AudioKeys path ([`apply_audio_key`]). So a movie-level
+  // `acme.totally.bogus.zzz` ⇒ `Keys:AcmeTotallyBogusZzz` (verified vs bundled
+  // 13.59). `None` only when the id fails the reasonable-id gate.
+  if let Some(name) = derive_keys_name(&key.stripped) {
+    keys_out.push_convless(name, ilst_data_convless(data));
   }
 }
 
@@ -4222,6 +4684,29 @@ fn apply_key_name(
     "software" => {
       keys_out.push_convless("Software", ilst_data_convless(data));
     }
+    // The ShutterEncoder "preserve metadata" Keys (QuickTime.pm:6830-6832) —
+    // `MajorBrand`/`MinorVersion`/`CompatibleBrands`. `Avoid => 1` (a WRITE
+    // hint only) with no Format/ValueConv ⇒ conv-less. Their `data` atoms store
+    // the human-readable strings directly (`"MP4 v2 [ISO 14496-14]"` /
+    // `"mp42, mp41, …"`), so the cascade yields them verbatim.
+    "major_brand" => {
+      keys_out.push_convless("MajorBrand", ilst_data_convless(data));
+    }
+    "minor_version" => {
+      keys_out.push_convless("MinorVersion", ilst_data_convless(data));
+    }
+    "compatible_brands" => {
+      keys_out.push_convless("CompatibleBrands", ilst_data_convless(data));
+    }
+    // `player.movie.audio.balance` Balance (QuickTime.pm:6745). This is the
+    // MOVIE-level `meta` (`%QuickTime::Keys`) `Keys:Balance` — `player.movie.*`
+    // tuning keys CAN appear in the movie-level Keys box. The audio-TRACK `meta`
+    // resolves Balance through the SEPARATE `%QuickTime::AudioKeys` table
+    // ([`apply_audio_key_name`]), NOT this generic resolver. Conv-less ⇒ the
+    // numeric `data` flag yields the bare number.
+    "player.movie.audio.balance" => {
+      keys_out.push_convless("Balance", ilst_data_convless(data));
+    }
     // Conv-less keys NOT in the com.apple.quicktime namespace (full-key
     // fallback): the table id keeps the `com.`/vendor prefix, so the stripped
     // form does not match and the FULL key resolves here.
@@ -4260,6 +4745,404 @@ fn apply_key_name(
     },
   }
   true
+}
+
+/// ProcessKeys cross-table resolution (QuickTime.pm:9810-9811): after the active
+/// `keys` table (AudioKeys / Keys) misses, ExifTool tries the SAME (stripped)
+/// key id as a literal tag id against `%QuickTime::ItemList` THEN
+/// `%QuickTime::UserData` before deriving an unknown name. So a key whose
+/// stripped form is a literal 4-cc atom id — e.g. `manu` (UserData Make,
+/// QuickTime.pm:1879) or `modl` (UserData Model, QuickTime.pm:1885) — resolves to
+/// that table's tag NAME, NOT a derived `Manu`/`Modl`.
+///
+/// **Group (QuickTime.pm:9826-9842).** The matched ItemList/UserData tagInfo is
+/// COPIED into a fresh Keys tag whose family-1 group is forced to the active keys
+/// group (`Keys` at 9842, overridden to `AudioKeys` by TAG_EXTRA G1 for a `soun`
+/// track). So the resolved tag carries the ItemList/UserData **Name** but the
+/// ACTIVE keys group — here, whichever typed slot / `convless` Name the caller
+/// emits under `audio_group()` / `keys_group()`. This function pushes onto the
+/// shared [`QuickTimeKeys`] sink, so the caller's group is automatically applied.
+///
+/// **Conversions (QuickTime.pm:9826-9833).** The copy takes `Name`, `Format`,
+/// `ValueConv`, `PrintConv` (and `SubDirectory`) — but NOT `RawConv`. So the
+/// UserData `manu`/`modl` RawConv (`s/^\0{4}..//s; s/\0.*//`, the Canon-prefix
+/// strip) is DROPPED: Make/Model carry no Format/ValueConv/PrintConv either, so
+/// the resolved key is CONV-LESS and its value flows through the same
+/// string→numeric→binary `data`-atom cascade ([`ilst_data_convless`]) as any
+/// conv-less key — verified vs bundled 13.59 (`AudioKeys:Make` = the raw atom
+/// value, the 6-byte Canon prefix INTACT, i.e. no RawConv). The two CONV-BEARING
+/// ItemList tags (`\xa9day` ContentCreateDate `%iso8601Date`, `\xa9xyz`
+/// GPSCoordinates `ConvertISO6709`+`PrintGPSCoordinates`) DO copy their ValueConv
+/// ⇒ routed to [`QuickTimeKeys`]'s typed `creation_date` / `gps` slots (which
+/// apply the same conversion at emit under the active group).
+///
+/// Returns `true` when the 4-cc matched an ItemList or UserData tag id (so the
+/// caller does NOT fall through to [`derive_keys_name`]); `false` otherwise.
+fn apply_keys_cross_table(
+  four_cc: &[u8; 4],
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  // (2) %ItemList first (QuickTime.pm:9810). The two CONV-BEARING tags copy their
+  //     ValueConv ⇒ the typed slots; every other modeled ItemList tag is conv-less.
+  match four_cc {
+    // `\xa9day` ContentCreateDate — `%iso8601Date` (ConvertXMPDate). The copied
+    // ValueConv runs on the pre-ValueConv `data` value, emitted under the active
+    // keys group via the `content_create_date` slot. NOTE: this is the ItemList
+    // tag NAME "ContentCreateDate" — DISTINCT from the `%Keys` `creationdate`
+    // ("CreationDate", the `creation_date` slot) — so it must NOT reuse that
+    // slot (ground-truthed vs bundled 13.59: `Keys:ContentCreateDate` /
+    // `AudioKeys:ContentCreateDate`, not `CreationDate`).
+    b"\xa9day" => {
+      keys_out.set_content_create_date(Some(convert_iso8601_date(&ilst_data_valueconv_str(data))));
+      return true;
+    }
+    // `\xa9xyz` GPSCoordinates — ConvertISO6709 + PrintGPSCoordinates (copied
+    // ValueConv) ⇒ the typed `gps` slot.
+    b"\xa9xyz" => {
+      keys_out.set_gps(Some(parse_iso6709(&ilst_data_valueconv_str(data))));
+      return true;
+    }
+    _ => {}
+  }
+  // The conv-less ItemList tags (plain `'Name'`, no copied conversion — `covr` is
+  // `Binary => 1`): emit the Name via the conv-less `data`-atom cascade under the
+  // active keys group. Same id→Name set as [`apply_item_list`]'s conv-less arm.
+  let item_list_name: Option<&'static str> = match four_cc {
+    b"\xa9nam" => Some("Title"),
+    b"\xa9ART" => Some("Artist"),
+    b"\xa9too" => Some("Encoder"),
+    b"\xa9alb" => Some("Album"),
+    b"\xa9cmt" => Some("Comment"),
+    b"\xa9gen" => Some("Genre"),
+    b"\xa9wrt" => Some("Composer"),
+    b"covr" => Some("CoverArt"),
+    b"desc" => Some("Description"),
+    _ => None,
+  };
+  if let Some(name) = item_list_name {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  // (3) %UserData (QuickTime.pm:9811). The plain-4-cc identity tags from
+  //     [`walk_udta`] — their RawConv / `string`-NUL-decode is NOT copied by
+  //     ProcessKeys, so each is CONV-LESS here and emits its Name through the
+  //     same `data`-atom cascade. (The `©`-prefixed international-text UserData
+  //     atoms can be keys too, so the generated map and the hand 0xA9 names are
+  //     consulted alongside the plain ids.)
+  let user_data_name: Option<&'static str> = match four_cc {
+    // Canon SX280 / Samsung GT-S8530 (QuickTime.pm:1879/1885) — the central case.
+    b"manu" => Some("Make"),
+    b"modl" => Some("Model"),
+    // Other plain-string identity ids resolved by [`walk_udta`].
+    b"cmnm" | b"CNMN" => Some("Model"),
+    b"slno" | b"SNum" => Some("SerialNumber"),
+    b"CNFV" | b"info" | b"FIRM" => Some("FirmwareVersion"),
+    b"CNCV" => Some("CompressorVersion"),
+    b"cmid" => Some("CameraID"),
+    // The `©`-prefixed plain-Name UserData atoms hand-ported in [`walk_udta`]
+    // (the generated map covers `©mal`/`©gpt`/`©gyw`/`©grl`/`©fmt`/`©inf` etc.).
+    b"\xa9mak" => Some("Make"),
+    b"\xa9mod" | b"\xa9mdl" => Some("Model"),
+    b"\xa9swr" => Some("Software"),
+    b"\xa9nam" => Some("Title"),
+    b"\xa9cmt" => Some("Comment"),
+    b"\xa9cpy" => Some("Copyright"),
+    _ => None,
+  };
+  if let Some(name) = user_data_name {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  // The generated conv-less UserData map (`GoPr`/`LENS`/`FOV\0` + the `©…`
+  // international-text names): a bare `'Name'` ⇒ conv-less, same cascade.
+  if let Some(name) = userdata_convless_name(four_cc) {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  false
+}
+
+/// Resolve one audio-track `meta`(`mdta`) `keys` entry through
+/// `%QuickTime::AudioKeys` (QuickTime.pm:6895-6917) — the SEPARATE table the
+/// `keys` `Condition => '$$self{MediaType} eq "soun"'` (QuickTime.pm:2867-2870)
+/// selects for a `soun` track. This mirrors `ProcessKeys` (QuickTime.pm:9795-
+/// 9868) with `$tagTablePtr = %AudioKeys`, NOT the generic `%QuickTime::Keys`
+/// resolver ([`apply_key_name`]):
+///
+///   1. **AudioKeys table lookup** (stripped key, then full key — the
+///      QuickTime.pm:9807-9824 `for(;;)` fallback): the 6 members resolve via
+///      [`apply_audio_key_name`] (`Mute` keeps its int8u Format + `Off`/`On`
+///      PrintConv; the other five are conv-less).
+///   2. **Cross-table ItemList/UserData lookup** (QuickTime.pm:9810-9811): the
+///      same (stripped, then full) key id is tried as a literal tag id against
+///      `%QuickTime::ItemList` then `%QuickTime::UserData` BEFORE deriving — see
+///      [`apply_keys_cross_table`]. A key whose stripped form is a literal 4-cc
+///      atom id (e.g. `manu`/`modl`) resolves to the ItemList/UserData **Name**
+///      (Make/Model), emitted under the ACTIVE `AudioKeys` group (NOT a derived
+///      `AudioKeys:Manu`/`Modl`).
+///   3. **Unknown-key auto-tag** (QuickTime.pm:9844-9854): a key matching NONE of
+///      the above is NOT dropped — `ProcessKeys` DERIVES a tag name from the
+///      (stripped) key id ([`derive_keys_name`]) and emits it CONV-LESS under
+///      group `AudioKeys` (the `for(;;)` loop resets `$tag` to the stripped
+///      `$short` before the `AddTagToTable`, line 9819-9822). So `make` ⇒
+///      `AudioKeys:Make`, `creationdate` ⇒ `AudioKeys:Creationdate` (the RAW
+///      string — NOT the `%Keys` date ValueConv), `acme.totally.bogus.zzz` ⇒
+///      `AudioKeys:AcmeTotallyBogusZzz` — verified vs bundled 13.59. This is the
+///      key difference from the generic `%Keys` resolver, which would apply the
+///      `%Keys` conversions and drop non-identity keys.
+fn apply_audio_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadata::QuickTimeKeys) {
+  // 1. AudioKeys table: stripped key, then full key (the `for(;;)` fallback).
+  if apply_audio_key_name(&key.stripped, data, keys_out) {
+    return;
+  }
+  if key.full != key.stripped && apply_audio_key_name(&key.full, data, keys_out) {
+    return;
+  }
+  // 2. ItemList then UserData, by the literal 4-cc — stripped key, then full key
+  //    (the `for(;;)` loop runs the cross-table lookup with both forms). Only an
+  //    exactly-4-byte key id can be a literal table id. The resolved Name is
+  //    emitted under the active `AudioKeys` group (the shared `keys_out` sink).
+  if apply_keys_cross_table_either(key, data, keys_out) {
+    return;
+  }
+  // 3. No table matched ⇒ derive the name from the STRIPPED key (the `$short` the
+  //    loop restores, QuickTime.pm:9805/9819-9822) and emit conv-less. `None`
+  //    only when the id fails the reasonable-id gate.
+  if let Some(name) = derive_keys_name(&key.stripped) {
+    keys_out.push_convless(name, ilst_data_convless(data));
+  }
+}
+
+/// The cross-table lookup ([`apply_keys_cross_table`]) over BOTH key forms — the
+/// `mdta`-stripped id first, then the full id — mirroring ExifTool's `for(;;)`
+/// loop (QuickTime.pm:9806-9824), which re-runs `GetTagInfo($itemList/$userData,
+/// $tag)` once with `$tag = $short` and once with `$tag = $full`. A literal table
+/// id is exactly 4 bytes, so only a 4-byte key form can match; the gate skips any
+/// other-length form. Returns `true` when either form resolved against ItemList
+/// or UserData.
+///
+/// The RAW key bytes ([`KeyName::stripped_raw`]/[`full_raw`]) are matched, NOT the
+/// lossy `String` — a `0xA9`-prefixed 4-cc id (`\xa9day`/`\xa9xyz`/`\xa9too`, the
+/// `©`-symbol ItemList/UserData ids) is invalid UTF-8 whose `String` form is a
+/// 6-byte U+FFFD sequence that could never match the 4-byte table id.
+fn apply_keys_cross_table_either(
+  key: &KeyName,
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  if let Ok(cc) = <&[u8; 4]>::try_from(key.stripped_raw.as_slice()) {
+    if apply_keys_cross_table(cc, data, keys_out) {
+      return true;
+    }
+  }
+  if key.full_raw != key.stripped_raw {
+    if let Ok(cc) = <&[u8; 4]>::try_from(key.full_raw.as_slice()) {
+      if apply_keys_cross_table(cc, data, keys_out) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Resolve a single key NAME against `%QuickTime::AudioKeys` (the audio-track
+/// `keys` table, QuickTime.pm:6907-6916). Returns `true` when the name matched a
+/// table entry. The five plain entries (`AudioGain`/`Treble`/`Bass`/`Balance`/
+/// `PitchShift`, QuickTime.pm:6907-6911) are bare `'Name'` mappings — NO Format,
+/// NO ValueConv ⇒ conv-less, routed through the SAME full string→numeric→binary
+/// `data`-atom cascade as the Keys table ([`ilst_data_convless`]). `Mute`
+/// (QuickTime.pm:6912-6916) is the SOLE conv-bearing entry: `Format => 'int8u'`
+/// + `PrintConv => { 0 => 'Off', 1 => 'On' }`, read via [`read_audio_mute`] and
+/// rendered with the PrintConv at emit. A name NOT in this 6-key set returns
+/// `false` so the caller falls through to the unknown-key derive path.
+fn apply_audio_key_name(
+  name: &str,
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  match name {
+    // The five conv-less AudioKeys (bare `'Name'`, no Format/ValueConv). Each
+    // shares the `player.movie.audio.*` key strings with `%QuickTime::Keys`
+    // (QuickTime.pm:6742-6746), but is resolved HERE under group `AudioKeys`.
+    "player.movie.audio.gain" => {
+      keys_out.push_convless("AudioGain", ilst_data_convless(data));
+    }
+    "player.movie.audio.treble" => {
+      keys_out.push_convless("Treble", ilst_data_convless(data));
+    }
+    "player.movie.audio.bass" => {
+      keys_out.push_convless("Bass", ilst_data_convless(data));
+    }
+    "player.movie.audio.balance" => {
+      keys_out.push_convless("Balance", ilst_data_convless(data));
+    }
+    "player.movie.audio.pitchshift" => {
+      keys_out.push_convless("PitchShift", ilst_data_convless(data));
+    }
+    // `player.movie.audio.mute` Mute — `Format => 'int8u'`, `PrintConv => { 0 =>
+    // 'Off', 1 => 'On' }`. Store the pre-PrintConv read (int8u number for a
+    // numeric flag, decoded string for a string flag); the PrintConv is applied
+    // at emit. Last-wins (a second `mute` overwrites), matching the single typed
+    // FoundTag slot. A `data` atom with no usable read yields `None` ⇒ no tag.
+    "player.movie.audio.mute" => {
+      if let Some(v) = read_audio_mute(data) {
+        keys_out.set_mute(Some(v));
+      }
+    }
+    _ => return false,
+  }
+  true
+}
+
+/// Derive a Keys/AudioKeys tag NAME from an unknown (table-miss) key id, faithful
+/// to `ProcessKeys` (QuickTime.pm:9844-9854). The id is the `mdta`-STRIPPED key.
+/// Returns `None` when the id fails ExifTool's reasonable-id gate
+/// (`/^[-\w. ]+$/ or /\w{4}/`, line 9844) — such a key adds no tag.
+///
+/// The transform (QuickTime.pm:9846-9851), in order:
+///   1. `ucfirst` the id.
+///   2. `tr/-0-9a-zA-Z_. //dc` — DELETE every char not in `[-0-9A-Za-z_. ]`.
+///   3. `s/[. ]+(.?)/\U$1/g` — collapse runs of `.`/space, upper-casing the next
+///      char (CamelCase the dotted/spaced path; a trailing run drops to "").
+///   4. `s/_([a-z])/_\U$1/g` — upper-case a lower-case char right after `_`.
+///   5. `s/([a-z])_([A-Z])/$1$2/g` — drop a `_` between a lower and an upper.
+///   6. `"Tag_$name"` when the result is shorter than 2 chars.
+fn derive_keys_name(stripped: &str) -> Option<String> {
+  // An empty stripped key would be `Tag_$ns` (= `Tag_mdta`) at QuickTime.pm:9804
+  // before the gate; reproduce that so an empty audio key still tags.
+  if stripped.is_empty() {
+    return Some("Tag_mdta".to_string());
+  }
+  // Reasonable-id gate (QuickTime.pm:9844): all chars in `[-\w. ]`, OR there is
+  // a run of >=4 word chars somewhere. `\w` is `[A-Za-z0-9_]`.
+  let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+  let all_reasonable = stripped
+    .chars()
+    .all(|c| is_word(c) || c == '-' || c == '.' || c == ' ');
+  let has_word4 = stripped.as_bytes().windows(4).any(|w| {
+    w.iter()
+      .all(|&b| (b as char).is_ascii_alphanumeric() || b == b'_')
+  });
+  if !all_reasonable && !has_word4 {
+    return None;
+  }
+
+  // 1. ucfirst.
+  let mut name = String::with_capacity(stripped.len());
+  {
+    let mut chars = stripped.chars();
+    if let Some(first) = chars.next() {
+      name.extend(first.to_uppercase());
+      name.push_str(chars.as_str());
+    }
+  }
+  // 2. tr/-0-9a-zA-Z_. //dc — keep only `[-0-9A-Za-z_. ]`.
+  name.retain(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '));
+  // 3. s/[. ]+(.?)/\U$1/g — collapse `.`/space runs, upper-casing the next char.
+  name = collapse_dot_space_upper(&name);
+  // 4. s/_([a-z])/_\U$1/g — upper-case the char after `_`.
+  name = upper_after_underscore(&name);
+  // 5. s/([a-z])_([A-Z])/$1$2/g — drop `_` between a lower and an upper.
+  name = drop_underscore_between_lower_upper(&name);
+  // 6. `Tag_` prefix when < 2 chars (QuickTime.pm:9851).
+  if name.chars().count() < 2 {
+    name = std::format!("Tag_{name}");
+  }
+  Some(name)
+}
+
+/// `s/[. ]+(.?)/\U$1/g` — replace each maximal run of `.`/space (plus the single
+/// following char, if any) with the upper-cased following char.
+fn collapse_dot_space_upper(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  let mut chars = s.chars().peekable();
+  while let Some(c) = chars.next() {
+    if c == '.' || c == ' ' {
+      // Consume the rest of the `[. ]+` run.
+      while matches!(chars.peek(), Some('.') | Some(' ')) {
+        chars.next();
+      }
+      // `(.?)` — the next char (any), upper-cased; an end-of-string run vanishes.
+      if let Some(next) = chars.next() {
+        out.extend(next.to_uppercase());
+      }
+    } else {
+      out.push(c);
+    }
+  }
+  out
+}
+
+/// `s/_([a-z])/_\U$1/g` — upper-case an ASCII lower-case char immediately after `_`.
+fn upper_after_underscore(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  let mut chars = s.chars().peekable();
+  while let Some(c) = chars.next() {
+    out.push(c);
+    if c == '_'
+      && let Some(&n) = chars.peek()
+      && n.is_ascii_lowercase()
+    {
+      out.push(n.to_ascii_uppercase());
+      chars.next();
+    }
+  }
+  out
+}
+
+/// `s/([a-z])_([A-Z])/$1$2/g` — drop a `_` sitting between an ASCII lower-case
+/// and an ASCII upper-case char (non-overlapping, left-to-right like Perl `/g`).
+fn drop_underscore_between_lower_upper(s: &str) -> String {
+  let chars: std::vec::Vec<char> = s.chars().collect();
+  let mut out = String::with_capacity(s.len());
+  let mut i = 0usize;
+  while let Some(&c) = chars.get(i) {
+    // A lower `_` Upper triple collapses to lower+Upper (drop the `_`); Perl's
+    // non-overlapping `/g` then resumes AFTER the matched triple.
+    if c.is_ascii_lowercase()
+      && chars.get(i + 1) == Some(&'_')
+      && chars.get(i + 2).is_some_and(|n| n.is_ascii_uppercase())
+    {
+      out.push(c);
+      if let Some(&up) = chars.get(i + 2) {
+        out.push(up);
+      }
+      i += 3;
+    } else {
+      out.push(c);
+      i += 1;
+    }
+  }
+  out
+}
+
+/// Read a `%QuickTime::AudioKeys` `Mute` (`Format => 'int8u'`) `data`-atom value
+/// into its pre-PrintConv [`TagValue`], faithful to `ProcessMOV`'s Format-aware
+/// branch (QuickTime.pm:10396-10410). A `%stringEncoding` flag decodes as a
+/// string (QuickTime.pm:10396-10400 — the table `Format` is bypassed for a
+/// string flag); otherwise the explicit `int8u` Format reads via `ReadValue`,
+/// length-adjusted (QuickTime.pm:10404-10410: `{1=>int8,2=>int16,4=>int32}` —
+/// `int8u` stays `int8u` for a 1-byte atom and reads byte 0). Returns `None`
+/// when neither a string nor a usable integer can be read (an empty `data`), so
+/// the caller records no tag.
+fn read_audio_mute(data: &IlstData) -> Option<crate::value::TagValue> {
+  use crate::value::TagValue;
+  // String-encoding flag ⇒ the decoded string (Format bypassed, QuickTime.pm:10396).
+  if let Some(s) = ilst_data_string(data) {
+    return Some(TagValue::Str(s.into()));
+  }
+  // Otherwise `int8u` via `ReadValue`, length-adjusted EXACTLY as ExifTool:
+  // `{ 1=>int8, 2=>int16, 4=>int32 }->{$len}` (QuickTime.pm:10406) — len 1
+  // reads int8u, len 2 int16u, len 4 int32u. For ANY OTHER length (0/3/5/…)
+  // `$fmt` is undef so `$format` STAYS the table `int8u` and `ReadValue` reads a
+  // single int8u = byte 0 (so a 3-byte atom reads its first byte, not nothing).
+  let read_len = match data.bytes.len() {
+    2 => 2,
+    4 => 4,
+    _ => 1,
+  };
+  read_be_int_unsigned(&data.bytes, read_len).map(TagValue::U64)
 }
 
 /// Decode a conv-less `Keys`/`ItemList` `data`-atom value — a tag with NO
@@ -5135,6 +6018,31 @@ pub struct Meta<'a> {
   /// Surfaces as an `ExifTool:Warning` so the gap is visible (see
   /// `docs/tracking.md`).
   embedded_exif_deferred: bool,
+  /// The embedded XMP packet decoded from a top-level `uuid` box (the canonical
+  /// XMP-in-MP4 location, QuickTime.pm:155-163 `%QuickTime::Main` `uuid` → the
+  /// `Image::ExifTool::XMP::Main` SubDirectory). Routed to the shared
+  /// [`crate::formats::xmp`] parser exactly like a `.xmp` sidecar, so its
+  /// `XMP-*` tags (`XMP-tiff:Make`, `XMP-exif:GPSLatitude`, …) ride QuickTime's
+  /// `tags()` under family-0 `XMP`. `None` when the file carries no XMP `uuid`
+  /// box (the common case). `XmpMeta` owns its decoded strings (the input is
+  /// transcoded to owned `String`s); the `'a` is the GAT lifetime anchor only.
+  #[cfg(feature = "xmp")]
+  embedded_xmp: Option<crate::formats::xmp::XmpMeta<'a>>,
+  /// The absolute file offset of the FIRST warning-producing top-level
+  /// `uuid`-XMP atom (`None` when no XMP `uuid` box warned). Lets
+  /// [`Self::diagnostics`] rank an embedded-XMP `ProcessXMP` warning against the
+  /// other document-level warnings: ExifTool sets `PRIORITY_DIR = 'XMP'` in
+  /// `ProcessMOV` for every container EXCEPT `HEIC` (QuickTime.pm:10016), so the
+  /// XMP `Warning` is priority-1 (and unconditionally owns the bare
+  /// `ExifTool:Warning`) for MP4/MOV/HEIF/AVIF/… but priority-0 (competes by
+  /// this walk offset, first-wins) for `HEIC`. The bare XMP `Warning` is
+  /// first-wins by file order across multiple packets; this offset follows the
+  /// SAME order (the first packet that warns owns BOTH the text and the
+  /// position), so an intervening non-XMP doc warning can outrank a later XMP
+  /// warning on `HEIC` — NOT the first XMP atom's offset, which would
+  /// misplace the warning earlier than where `ProcessXMP` actually raised it.
+  #[cfg(feature = "xmp")]
+  embedded_xmp_offset: Option<u64>,
   /// The detected file type + MIME, derived from `ftyp` (or the MOV
   /// default). Drives [`crate::format_parser::FileTypeFinalize`].
   file_type: &'static str,
@@ -5801,6 +6709,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // at the offending atom — so a single check after the per-atom decode (plus
   // capture in the early-`break` error arms) records the right position.
   let mut warning_offset: Option<u64> = None;
+  // The embedded XMP packet from a top-level `uuid` box (QuickTime.pm:155-163),
+  // decoded in file order at its atom position. `None` until an XMP-signature
+  // `uuid` is reached.
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp: Option<crate::formats::xmp::XmpMeta<'a>> = None;
+  // The first WARNING-PRODUCING XMP `uuid` atom's body offset — see
+  // [`Meta::embedded_xmp_offset`].
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp_offset: Option<u64> = None;
   let mut pos = 0usize;
   while pos < scan_end {
     match read_atom_header(scan_data, pos, true) {
@@ -5853,6 +6770,61 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // `'ver '` Version + `thma` ThumbnailImage. A non-SkipInfo `skip`
           // (plain padding) is a no-op (the Condition fails inside `decode_skip`).
           b"skip" => decode_skip(body, &mut qt, &mut warning),
+          // The top-level `uuid` XMP box (QuickTime.pm:155-163 `%QuickTime::Main`
+          // `uuid` Condition `$$valPt=~/^\xbe\x7a\xcf\xcb…/` → the
+          // `Image::ExifTool::XMP::Main` SubDirectory — "this is where ExifTool
+          // writes XMP in MP4 videos as per the XMP spec"). The XMP packet
+          // follows the 16-byte UUID; route it to the shared XMP parser, exactly
+          // like a `.xmp` sidecar. A non-XMP `uuid` (Canon CR3, C2PA, …) is left
+          // to the brand walkers / the embedded-Exif detector below.
+          //
+          // ExifTool's `ProcessMOV` atom loop (QuickTime.pm:10032) has NO
+          // `uuid` de-dup — it dispatches EVERY top-level `uuid` atom through the
+          // tag table (`uuid` is even listed in `%dupTagOK`, QuickTime.pm:506),
+          // running `XMP::ProcessXMP` once per XMP packet and ACCUMULATING the
+          // tags (`FoundTag` never drops a duplicate, ExifTool.pm:9514-9596). So
+          // a file with >1 XMP `uuid` is faithful only if ALL packets are
+          // processed: parse each and APPEND its tags in file order (the first
+          // seeds `embedded_xmp`; each later one is absorbed via
+          // [`XmpMeta::absorb_additional_packet`], which concatenates tags so the
+          // downstream last-wins dedup reproduces ExifTool's equal-priority
+          // "later atom owns the bare tag key" resolution). Real files normally
+          // carry exactly one (the anafi fixture has one); the multi-packet path
+          // is covered by `xmp::tests::absorb_additional_packet_*`.
+          #[cfg(feature = "xmp")]
+          b"uuid" if body.get(..16) == Some(&XMP_UUID[..]) => {
+            if let Some(packet) = body.get(16..) {
+              // `true` when THIS `uuid` atom's packet is the one that produced the
+              // adopted `ExifTool:Warning` (the seed packet warned, OR every
+              // earlier packet was clean and this one warns — first-warning-wins
+              // by file order, mirroring `FoundTag('Warning')` priority-0).
+              let this_packet_owns_warning = match (
+                &mut embedded_xmp,
+                crate::formats::xmp::parse_borrowed(packet),
+              ) {
+                (slot @ None, parsed) => {
+                  let warned = parsed.as_ref().is_some_and(|p| p.warning().is_some());
+                  *slot = parsed;
+                  warned
+                }
+                (Some(existing), Some(parsed)) => existing.absorb_additional_packet(parsed),
+                (Some(_), None) => false,
+              };
+              // Record the offset of the FIRST warning-PRODUCING XMP `uuid` atom
+              // (NOT merely the first XMP atom) so `diagnostics` can rank an
+              // embedded-XMP `ProcessXMP` warning against the other doc-level
+              // warnings by file position when the container is `HEIC` (the
+              // priority-0 case; QuickTime.pm:10016). The bare `Warning` is
+              // first-wins by file order; its offset must follow the SAME order —
+              // so when packet 1 is clean and packet 3 warns, the recorded
+              // position is packet 3's atom, letting an intervening HEIF `iinf`
+              // warning correctly outrank the later XMP warning. For non-`HEIC`
+              // the XMP warning is priority-1 and wins regardless of offset.
+              if this_packet_owns_warning {
+                embedded_xmp_offset.get_or_insert(header.payload_start as u64);
+              }
+            }
+          }
           b"mdat" => {
             // QuickTime.pm:10158-10160 — the synthetic `mdat-size`/`mdat-offset`
             // tags: payload byte count + absolute payload file offset.
@@ -6506,6 +7478,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     cr3: cr3_meta,
     jp2: jp2_meta,
     embedded_exif_deferred,
+    #[cfg(feature = "xmp")]
+    embedded_xmp,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset,
     file_type,
     mime,
     warning,
@@ -6692,9 +7668,11 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// `Track<N>:Warning`, not here (R6/F2); (b) the LigoGPS
   /// decoder warning (`Unrecognized data in LigoGPS trailer` /
   /// `LIGOGPSINFO coordinates out of range` / `LIGOGPSINFO format error` / the
-  /// decrypt-failure deferral); (c) the SP3 embedded-Exif-hop deferral notice
-  /// when an Exif/TIFF block was detected (`embedded_exif_deferred`, awaiting
-  /// the Exif+GPS port).
+  /// decrypt-failure deferral); (c) the embedded `uuid`-XMP `ProcessXMP`
+  /// warning (`XMP is double UTF-encoded`, …), ranked by PRIORITY then walk
+  /// position (see below — priority-1 for non-`HEIC`, priority-0 for `HEIC`);
+  /// (d) the SP3 embedded-Exif-hop deferral notice when an Exif/TIFF block was
+  /// detected (`embedded_exif_deferred`, awaiting the Exif+GPS port).
   ///
   /// The LigoGPS warning is **document-level** (`ExifTool:Warning`), NOT a
   /// group-scoped `LIGO:Warning`. ExifTool only sets `$$et{SET_GROUP1} = 'LIGO'`
@@ -6723,40 +7701,74 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
     //
     // **#159** — the consumer (`diagnostics.rs` `TagMap`) keeps the FIRST
     // document-level `Warning` (ExifTool emits `Warning` priority-0 first-wins
-    // ⇒ the earliest by WALK POSITION). The `ProcessMOV` warning
-    // (`Meta::warning`) and the HEIF `meta`-box walk warning
-    // (`HeifMeta::warning`) are raised at DIFFERENT file positions: the HEIF
-    // `meta` box at its atom offset, the `ProcessMOV` warning at its offending
-    // top-level atom. So the two are pushed in ASCENDING offset order — a HEIF
-    // `iinf` out-of-order warning (early `meta` box) must outrank a LATER
-    // malformed top-level atom's warning, and vice-versa. A `ProcessMOV`
-    // warning with NO recorded offset (`warning_offset == None`) does not
-    // outrank the HEIF one (push HEIF first). The CR3 walker has no warning
-    // producer yet but the drain is wired for symmetry / future hardening.
-    let heif_first = match (self.warning_offset(), self.heif().warning_offset()) {
-      // Both positioned: the smaller offset wins the first-wins slot. A tie
-      // keeps the `ProcessMOV` warning first (HEIF's `meta` box is the SAME
-      // top-level atom as the surrounding walk, never strictly earlier).
-      (Some(self_off), Some(heif_off)) => heif_off < self_off,
-      // The `ProcessMOV` warning has no position but HEIF does: HEIF (a
-      // located walk warning) is not outranked by an offset-less one.
-      (None, Some(_)) => true,
-      // HEIF has no position (no HEIF warning, or — defensively — an
-      // unpositioned one): keep the existing `self`-then-HEIF order.
-      (_, None) => false,
-    };
-    if !heif_first && let Some(w) = self.warning() {
+    // ⇒ the earliest by WALK POSITION among equal-priority warnings). The
+    // `ProcessMOV` warning (`Meta::warning`) and the HEIF `meta`-box walk
+    // warning (`HeifMeta::warning`) are raised at DIFFERENT file positions: the
+    // HEIF `meta` box at its atom offset, the `ProcessMOV` warning at its
+    // offending top-level atom. So the priority-0 warnings are emitted in
+    // ASCENDING offset order — a HEIF `iinf` out-of-order warning (early `meta`
+    // box) must outrank a LATER malformed top-level atom's warning, and
+    // vice-versa. A `ProcessMOV` warning with NO recorded offset
+    // (`warning_offset == None`) does not outrank a located one. The CR3 walker
+    // has no warning producer yet but the drain is wired for symmetry / future
+    // hardening.
+    //
+    // The embedded XMP packet's `ProcessXMP` `$et->Warn` (`XMP is double
+    // UTF-encoded` / `X is not a structure!` / …; document-level — XMP sets no
+    // `SET_GROUP1`) joins this ranking, but at a DIFFERENT priority: ExifTool
+    // sets `$$et{PRIORITY_DIR} = 'XMP'` in `ProcessMOV` for every container
+    // EXCEPT `HEIC` (QuickTime.pm:10016 `unless $fileType eq 'HEIC'`). So for
+    // MP4 / MOV / M4A / HEIF / AVIF / CR3 / … the XMP `Warning` is PRIORITY-1
+    // (ExifTool.pm:9555 promotes the priority-0 tag in the priority dir) and
+    // unconditionally owns the bare `ExifTool:Warning` over the priority-0
+    // `ProcessMOV` / HEIF / LigoGPS warnings — regardless of file order
+    // (ground-truthed vs bundled 13.59: an EARLY `moov`-child truncation FOLLOWED
+    // BY a `uuid`-XMP double-encode still reports the XMP warning as the bare
+    // `Warning`). For `HEIC` the XMP dir is NOT promoted, so the XMP `Warning`
+    // is priority-0 and competes by walk position like the others (an EARLY HEIF
+    // `iinf` out-of-order warning keeps the slot over a LATER `uuid`-XMP).
+    #[cfg(feature = "xmp")]
+    let xmp_warning = self.embedded_xmp.as_ref().and_then(|x| x.warning());
+    #[cfg(not(feature = "xmp"))]
+    let xmp_warning: Option<&str> = None;
+    // The priority-1 XMP case (non-`HEIC`): the XMP `Warning` outranks every
+    // priority-0 document warning, so it leads the stream (→ the bare
+    // `ExifTool:Warning`). On `HEIC` it stays in the priority-0 race below.
+    let xmp_priority1 = xmp_warning.is_some() && self.file_type() != "HEIC";
+    if xmp_priority1 && let Some(w) = xmp_warning {
       out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    // The priority-0 document warnings, ranked by ascending walk position
+    // (first-wins, #159): each carries its raising offset (`u64::MAX` when
+    // unpositioned — an offset-less `ProcessMOV` warning never outranks a
+    // located one, and the post-walk LigoGPS warning always trails the atom-walk
+    // warnings). A STABLE sort preserves the producer insertion order on a tie
+    // (e.g. a same-offset HEIF `meta` box keeps the surrounding `ProcessMOV`
+    // warning first; the offset-less LigoGPS trails). The list is empty unless a
+    // warning fired, so a file with no warning is byte-identical.
+    let mut priority0: std::vec::Vec<(u64, &str)> = std::vec::Vec::new();
+    if let Some(w) = self.warning() {
+      priority0.push((self.warning_offset().unwrap_or(u64::MAX), w));
     }
     if let Some(w) = self.heif().warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
-    }
-    if heif_first && let Some(w) = self.warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
+      priority0.push((self.heif().warning_offset().unwrap_or(u64::MAX), w));
     }
     if let Some(w) = self.ligogps().warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
+      priority0.push((u64::MAX, w));
     }
+    // `HEIC`: the embedded-XMP warning is priority-0 — rank it by the `uuid`
+    // atom's walk offset alongside the others (inserted LAST so a tie keeps the
+    // structural producers ahead).
+    #[cfg(feature = "xmp")]
+    if !xmp_priority1 && let Some(w) = xmp_warning {
+      priority0.push((self.embedded_xmp_offset.unwrap_or(u64::MAX), w));
+    }
+    priority0.sort_by_key(|&(off, _)| off);
+    out.extend(
+      priority0
+        .into_iter()
+        .map(|(_, w)| crate::diagnostics::Diagnostic::warn(w)),
+    );
     if self.embedded_exif_deferred() {
       out.push(crate::diagnostics::Diagnostic::warn(
         "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
@@ -9704,6 +10716,101 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // `loci` LocationInformation (`%QuickTime::UserData`, QuickTime.pm:1775).
+      // Group `QuickTime:UserData`, mode-invariant (the RawConv is the only conv).
+      if let Some(loc) = ud.location_information() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "LocationInformation".into(),
+          TagValue::Str(loc.into()),
+          false,
+        ));
+      }
+    }
+
+    // ── ItemList (`moov/udta/meta`(`mdir`) `ilst`, QuickTime.pm:3481-6623) ──
+    // Group `QuickTime:ItemList` (family-1 `ItemList` — the `MOV-Movie-Track-
+    // UserData-Meta-ItemList` group-derivation). The two CONV-BEARING tags
+    // (`ContentCreateDate` `%iso8601Date`, `GPSCoordinates` ConvertISO6709 +
+    // PrintGPSCoordinates) are emitted typed; every other ItemList tag rides the
+    // conv-less `convless` loop (string / binary-placeholder, mode-invariant).
+    let item_list = self.qt.item_list();
+    if !item_list.is_empty() {
+      let item_group = || Group::new("QuickTime", "ItemList");
+      if let Some(date) = item_list.content_create_date() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          "ContentCreateDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      if let Some(gps) = item_list.gps() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
+      for (name, value) in item_list.convless() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          name.clone(),
+          value.clone(),
+          false,
+        ));
+      }
+    }
+
+    // ── AudioKeys (the audio-track `meta`(`mdta`) `keys`, QuickTime.pm:6895) ──
+    // Group `QuickTime:AudioKeys` (family-1 `AudioKeys`). The five plain AudioKeys
+    // (`AudioGain`/`Treble`/`Bass`/`Balance`/`PitchShift`) AND the unknown-key
+    // DERIVE tags (`Make`/`Creationdate`/… — see [`apply_audio_key`]) are
+    // conv-less ⇒ the shared `convless` loop. `Mute` (QuickTime.pm:6912-6916) is
+    // the SOLE conv-bearing entry: `Format => 'int8u'` + `PrintConv => { 0 =>
+    // 'Off', 1 => 'On' }`, rendered via [`audio_mute_value`] (the `Off`/`On`/
+    // `Unknown ($val)` label at `-j`, the raw int at `-n`).
+    let audio_keys = self.qt.audio_keys();
+    if !audio_keys.is_empty() {
+      let audio_group = || Group::new("QuickTime", "AudioKeys");
+      for (name, value) in audio_keys.convless() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          name.clone(),
+          value.clone(),
+          false,
+        ));
+      }
+      if let Some(mute) = audio_keys.mute() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "Mute".into(),
+          audio_mute_value(mute, print_conv),
+          false,
+        ));
+      }
+      // The CONV-BEARING ItemList tags resolved through the cross-table
+      // (QuickTime.pm:9810: `\xa9day` ContentCreateDate `%iso8601Date`, `\xa9xyz`
+      // GPSCoordinates `ConvertISO6709` + `PrintGPSCoordinates`) emit by their
+      // ItemList NAME under the ACTIVE `AudioKeys` group (verified vs bundled
+      // 13.59: `AudioKeys:ContentCreateDate` / `AudioKeys:GPSCoordinates`).
+      if let Some(date) = audio_keys.content_create_date() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "ContentCreateDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      if let Some(gps) = audio_keys.gps() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
     }
 
     // ── SP2: moov/meta Keys/ItemList (QuickTime.pm:6651-6760) ──────────
@@ -9723,6 +10830,18 @@ impl crate::emit::Taggable for Meta<'_> {
         tags.push(EmittedTag::new(
           keys_group(),
           "CreationDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      // The cross-table `\xa9day` ItemList ContentCreateDate (QuickTime.pm:9810)
+      // — the ItemList NAME, DISTINCT from the `%Keys` `creationdate`
+      // ("CreationDate") above — under the active `Keys` group (verified vs
+      // bundled 13.59: `Keys:ContentCreateDate`).
+      if let Some(date) = keys.content_create_date() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "ContentCreateDate".into(),
           TagValue::Str(date.into()),
           false,
         ));
@@ -9816,6 +10935,19 @@ impl crate::emit::Taggable for Meta<'_> {
         TagValue::U64(u64::from(h)),
         false,
       ));
+    }
+
+    // The embedded XMP packet (top-level `uuid`, QuickTime.pm:155-163 → the
+    // `Image::ExifTool::XMP::Main` SubDirectory). Its `XMP-*` tags are produced
+    // by the shared XMP parser's own `Taggable` impl (family-0 `XMP`, family-1
+    // the namespace group — `XMP-tiff` / `XMP-exif` / `XMP-x` / …), already
+    // rendered for the active conv mode. Emitting via that impl keeps the
+    // QuickTime path byte-identical to a standalone `.xmp` sidecar — exactly
+    // what bundled does (one shared `ProcessXMP`). The XMP `Warning` (if any)
+    // rides the sibling `Diagnose` channel, not this stream.
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      tags.extend(crate::emit::Taggable::tags(xmp, opts));
     }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
@@ -14930,6 +16062,444 @@ mod tests {
     assert_eq!(k.convless(), [("Make".into(), TagValue::U64(300))]);
   }
 
+  /// The audio-track `keys` resolve through `%QuickTime::AudioKeys`
+  /// ([`apply_audio_key`]), NOT the generic `%Keys` resolver. The 6 table members
+  /// resolve via the table (`Mute` keeps its int8u Format + `Off`/`On` PrintConv;
+  /// the 5 plain ones are conv-less); every OTHER key takes `ProcessKeys`'
+  /// unknown-key DERIVE path (a conv-less tag named from the id) — NOT the `%Keys`
+  /// conversions, and NOT dropped. Ground-truthed vs bundled 13.59 in the
+  /// `MP4_audiokeys_mute.mp4` conformance fixture.
+  #[test]
+  fn audio_keys_resolve_through_audiokeys_table_not_generic_keys() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    let strkey = |s: &str| {
+      let full = std::format!("com.apple.quicktime.{s}");
+      KeyName {
+        stripped: s.to_string(),
+        stripped_raw: s.as_bytes().to_vec(),
+        full_raw: full.as_bytes().to_vec(),
+        full,
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // `Mute` int8u flag (0x16, byte 0x01) ⇒ pre-PrintConv U64(1) stored; `On` at
+    // `-j`, `1` at `-n`.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &strkey("player.movie.audio.mute"),
+      &IlstData {
+        flags: 0x16,
+        bytes: vec![0x01],
+      },
+      &mut k,
+    );
+    assert_eq!(k.mute(), Some(&TagValue::U64(1)));
+    assert_eq!(
+      audio_mute_value(k.mute().unwrap(), true),
+      TagValue::Str("On".into())
+    );
+    assert_eq!(audio_mute_value(k.mute().unwrap(), false), TagValue::U64(1));
+    // Mute=0 ⇒ Off; Mute=2 ⇒ Unknown (2).
+    assert_eq!(
+      audio_mute_value(&TagValue::U64(0), true),
+      TagValue::Str("Off".into())
+    );
+    assert_eq!(
+      audio_mute_value(&TagValue::U64(2), true),
+      TagValue::Str("Unknown (2)".into())
+    );
+
+    // The 5 plain AudioKeys are conv-less under their AudioKeys names.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &strkey("player.movie.audio.balance"),
+      &str_data("0"),
+      &mut k,
+    );
+    apply_audio_key(&strkey("player.movie.audio.gain"), &str_data("3"), &mut k);
+    apply_audio_key(
+      &strkey("player.movie.audio.pitchshift"),
+      &str_data("x"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [
+        ("Balance".into(), TagValue::Str("0".into())),
+        ("AudioGain".into(), TagValue::Str("3".into())),
+        ("PitchShift".into(), TagValue::Str("x".into())),
+      ]
+    );
+    assert_eq!(k.mute(), None);
+
+    // A NON-AudioKeys key is NOT dropped and is NOT date-converted: `make` ⇒
+    // conv-less `Make`, `creationdate` ⇒ conv-less `Creationdate` (the RAW
+    // string — the `%Keys` ValueConv is NOT applied), `acme.totally.bogus.zzz`
+    // (stripped from `com.acme.…`) ⇒ derived `AcmeTotallyBogusZzz`.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&strkey("make"), &str_data("SHOULD_DROP"), &mut k);
+    apply_audio_key(
+      &strkey("creationdate"),
+      &str_data("2025-07-03T17:22:10-0400"),
+      &mut k,
+    );
+    apply_audio_key(
+      &KeyName {
+        stripped: "acme.totally.bogus.zzz".to_string(),
+        full: "com.acme.totally.bogus.zzz".to_string(),
+        stripped_raw: b"acme.totally.bogus.zzz".to_vec(),
+        full_raw: b"com.acme.totally.bogus.zzz".to_vec(),
+      },
+      &str_data("ARBVAL"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("SHOULD_DROP".into())),
+        (
+          "Creationdate".into(),
+          TagValue::Str("2025-07-03T17:22:10-0400".into())
+        ),
+        ("AcmeTotallyBogusZzz".into(), TagValue::Str("ARBVAL".into())),
+      ]
+    );
+    assert!(
+      k.creation_date().is_none(),
+      "AudioKeys creationdate must NOT take the %Keys date-ValueConv path"
+    );
+  }
+
+  /// #361 R6 — the COMPLETE `ProcessKeys` order (QuickTime.pm:9806-9854): active
+  /// table → `%ItemList` → `%UserData` → derive. A `keys` id whose stripped form
+  /// is a literal UserData/ItemList 4-cc (`manu`/`modl`, QuickTime.pm:1879/1885)
+  /// resolves to the UserData NAME (Make/Model) under the ACTIVE keys group —
+  /// `AudioKeys` for the audio path, `Keys` for the movie path — NOT a derived
+  /// `Manu`/`Modl`. The UserData RawConv is NOT copied by ProcessKeys ⇒ conv-less
+  /// (a clean ASCII value passes through verbatim). Ground-truthed vs bundled
+  /// 13.59 in the `MP4_audiokeys_mute.mp4` fixture (`manu`/`modl` items).
+  #[test]
+  fn keys_cross_table_resolves_itemlist_userdata_before_derive() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // An `mdta` key whose stripped form is exactly the 4-cc (no `com.` prefix on
+    // these literal ids, so stripped == full).
+    let cc_key = |s: &str| KeyName {
+      stripped: s.to_string(),
+      full: s.to_string(),
+      stripped_raw: s.as_bytes().to_vec(),
+      full_raw: s.as_bytes().to_vec(),
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // --- AudioKeys path: manu ⇒ Make, modl ⇒ Model (UserData names). ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("manu"), &str_data("CanonManu"), &mut k);
+    apply_audio_key(&cc_key("modl"), &str_data("EOS SX280"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("CanonManu".into())),
+        ("Model".into(), TagValue::Str("EOS SX280".into())),
+      ],
+      "manu/modl must resolve to the UserData Make/Model name, NOT a derived Manu/Modl"
+    );
+
+    // --- The SAME resolution on the movie-level Keys path ([`apply_key`]). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&cc_key("manu"), &str_data("Acme"), &mut k);
+    apply_key(&cc_key("modl"), &str_data("Z1"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("Acme".into())),
+        ("Model".into(), TagValue::Str("Z1".into())),
+      ]
+    );
+
+    // --- ItemList 4-cc (the cross-table tries ItemList first): `desc` ⇒
+    //     Description (conv-less ItemList name) under the active group. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("desc"), &str_data("a clip"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Description".into(), TagValue::Str("a clip".into()))]
+    );
+
+    // --- The RawConv is NOT copied (the central faithfulness point): a `manu`
+    //     value with a leading `\0\0\0\0..` Canon prefix is NOT stripped — the
+    //     conv-less cascade emits the raw atom value, NOT `decode_manu_modl`'s
+    //     prefix-stripped form. (A `\0`-prefixed UTF-8 atom string-decodes
+    //     lossily and is then trailing-NUL-trimmed only, so the leading prefix
+    //     and the inner `Canon` survive — proving no `s/^\0{4}..//` strip ran.) ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &cc_key("manu"),
+      &IlstData {
+        flags: 0x01,
+        bytes: b"\x00\x00\x00\x00ABCanon".to_vec(),
+      },
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [(
+        "Make".into(),
+        TagValue::Str("\u{0}\u{0}\u{0}\u{0}ABCanon".into())
+      )],
+      "the UserData RawConv (Canon 6-byte prefix strip) must NOT be applied to the keys-context value"
+    );
+
+    // --- A 4-cc that is NOT a table id still DERIVES (the order's last step):
+    //     `zzzz` ⇒ AudioKeys:Zzzz. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("zzzz"), &str_data("v"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Zzzz".into(), TagValue::Str("v".into()))],
+      "a non-table 4-cc must fall through to the derive path"
+    );
+
+    // --- A non-4-byte id can never be a literal table id ⇒ straight to derive
+    //     (no spurious cross-table hit): the dotted `make` still derives `Make`. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &KeyName {
+        stripped: "make".to_string(),
+        full: "com.apple.quicktime.make".to_string(),
+        stripped_raw: b"make".to_vec(),
+        full_raw: b"com.apple.quicktime.make".to_vec(),
+      },
+      &str_data("x"),
+      &mut k,
+    );
+    assert_eq!(k.convless(), [("Make".into(), TagValue::Str("x".into()))]);
+  }
+
+  /// The MOVIE-level `%Keys` path ([`apply_key`]) runs the COMPLETE `ProcessKeys`
+  /// order — active `%Keys` → ItemList → UserData → DERIVE (QuickTime.pm:9844-
+  /// 9854) — exactly like the AudioKeys path. A movie-level key matching NONE of
+  /// the tables is NOT dropped: it derives a CONV-LESS `Keys:*` tag from the
+  /// stripped id. Ground-truthed vs bundled 13.59 (a movie-level
+  /// `com.apple.quicktime.acme.totally.bogus.zzz` ⇒ `Keys:AcmeTotallyBogusZzz`),
+  /// the `MP4_movie_keys.mov` conformance fixture.
+  #[test]
+  fn movie_keys_derive_on_double_miss() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    let mdta_key = |stripped: &str| {
+      let full = std::format!("com.apple.quicktime.{stripped}");
+      KeyName {
+        stripped: stripped.to_string(),
+        stripped_raw: stripped.as_bytes().to_vec(),
+        full_raw: full.as_bytes().to_vec(),
+        full,
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // A non-table movie key DERIVES (the [high] fix — previously dropped).
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &mdta_key("acme.totally.bogus.zzz"),
+      &str_data("BOGUSVAL"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [(
+        "AcmeTotallyBogusZzz".into(),
+        TagValue::Str("BOGUSVAL".into())
+      )],
+      "a movie-level non-table key must DERIVE Keys:* (not be dropped)"
+    );
+
+    // A movie key failing the reasonable-id gate (a non-`[-\w. ]` id with no run
+    // of 4 word chars) still adds nothing — the derive returns `None`.
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &KeyName {
+        stripped: "a!b".to_string(),
+        full: "a!b".to_string(),
+        stripped_raw: b"a!b".to_vec(),
+        full_raw: b"a!b".to_vec(),
+      },
+      &str_data("v"),
+      &mut k,
+    );
+    assert!(
+      k.convless().is_empty(),
+      "a gate-failing movie key derives nothing"
+    );
+  }
+
+  /// A RAW `0xA9`-prefixed 4-cc key id (`\xa9day`/`\xa9xyz`/`\xa9too` — the
+  /// `©`-copyright-symbol ItemList/UserData ids) must reach the cross-table as the
+  /// 4 RAW bytes, so the literal lookup matches. Its `String` view is a 6-byte
+  /// U+FFFD sequence (`from_utf8_lossy` mangles the invalid `0xA9`) that could
+  /// never match the 4-byte table id — hence the cross-table gates on the RAW
+  /// bytes ([`KeyName::stripped_raw`]). Ground-truthed vs bundled 13.59 in both
+  /// the `MP4_audiokeys_mute.mp4` (AudioKeys) and `MP4_movie_keys.mov` (Keys)
+  /// fixtures: a `\xa9day` keys id resolves to the ItemList `ContentCreateDate`
+  /// (its `%iso8601Date` ValueConv applied), `\xa9too` to `Encoder`, `\xa9xyz` to
+  /// `GPSCoordinates`.
+  #[test]
+  fn raw_a9_key_resolves_itemlist_through_cross_table() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // A raw `mdta` 4-cc key whose first byte is the literal `0xA9` (no `com.`
+    // prefix on these ids ⇒ stripped == full). The `String` views go through
+    // `from_utf8_lossy` exactly as `parse_keys_box` builds them.
+    let a9_key = |suffix: &[u8; 3]| {
+      let raw = [0xA9u8, suffix[0], suffix[1], suffix[2]];
+      let s = String::from_utf8_lossy(&raw).into_owned();
+      KeyName {
+        stripped: s.clone(),
+        full: s,
+        stripped_raw: raw.to_vec(),
+        full_raw: raw.to_vec(),
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // The lossy `String` view is indeed un-matchable (6 bytes, not 4) — the very
+    // reason the raw plumbing is required.
+    assert_eq!(a9_key(b"day").stripped.len(), 6);
+
+    // --- AudioKeys path: \xa9day ⇒ ContentCreateDate (ValueConv), \xa9too ⇒
+    //     Encoder (conv-less). ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &a9_key(b"day"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    apply_audio_key(&a9_key(b"too"), &str_data("MyEncoder"), &mut k);
+    assert_eq!(
+      k.content_create_date(),
+      Some("2024:05:06 07:08:09-05:00"),
+      "\\xa9day must resolve to the ItemList ContentCreateDate ValueConv"
+    );
+    assert_eq!(
+      k.convless(),
+      [("Encoder".into(), TagValue::Str("MyEncoder".into()))],
+      "\\xa9too must resolve to the ItemList Encoder name"
+    );
+
+    // --- Movie-level Keys path ([`apply_key`]): \xa9xyz ⇒ GPSCoordinates
+    //     (ConvertISO6709 typed slot), proving the SAME raw-byte plumbing. ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&a9_key(b"xyz"), &str_data("+12.3456-098.7654/"), &mut k);
+    assert!(
+      k.gps().is_some(),
+      "\\xa9xyz must resolve to the ItemList GPSCoordinates slot"
+    );
+  }
+
+  /// [`derive_keys_name`] ports ExifTool's `ProcessKeys` unknown-key name
+  /// transform (QuickTime.pm:9844-9854) — ucfirst, drop-non-id-chars, CamelCase
+  /// the dotted/spaced path, `_`-handling, `Tag_` for <2 chars. Pinned against
+  /// the bundled-Perl transform output.
+  #[test]
+  fn derive_keys_name_matches_processkeys_transform() {
+    assert_eq!(derive_keys_name("make").as_deref(), Some("Make"));
+    assert_eq!(
+      derive_keys_name("creationdate").as_deref(),
+      Some("Creationdate")
+    );
+    assert_eq!(
+      derive_keys_name("acme.totally.bogus.zzz").as_deref(),
+      Some("AcmeTotallyBogusZzz")
+    );
+    assert_eq!(
+      derive_keys_name("player.movie.audio.foo").as_deref(),
+      Some("PlayerMovieAudioFoo")
+    );
+    // `_` after a lower stays/upper-cases per s/_([a-z])/_\U$1/; an upper after
+    // `_` between lower/upper drops the `_`.
+    assert_eq!(derive_keys_name("foo_bar").as_deref(), Some("FooBar"));
+    assert_eq!(derive_keys_name("x_y").as_deref(), Some("X_Y"));
+    assert_eq!(
+      derive_keys_name("hello world.test").as_deref(),
+      Some("HelloWorldTest")
+    );
+    // A single-char id ⇒ `Tag_` prefix (length < 2).
+    assert_eq!(derive_keys_name("a").as_deref(), Some("Tag_A"));
+    assert_eq!(derive_keys_name("ab").as_deref(), Some("Ab"));
+    // An empty stripped key ⇒ `Tag_mdta` (QuickTime.pm:9804).
+    assert_eq!(derive_keys_name("").as_deref(), Some("Tag_mdta"));
+    // Trailing/consecutive `.` runs (the `(.?)` end-of-string run vanishes); a
+    // `_` before a lower upper-cases it; a lower`_`Upper triple drops the `_`.
+    // Each pinned against the bundled-Perl transform.
+    assert_eq!(derive_keys_name("foo.").as_deref(), Some("Foo"));
+    assert_eq!(derive_keys_name("foo..bar").as_deref(), Some("FooBar"));
+    assert_eq!(derive_keys_name("_lead").as_deref(), Some("_Lead"));
+    assert_eq!(
+      derive_keys_name("mix_ed.Case").as_deref(),
+      Some("MixEdCase")
+    );
+    assert_eq!(
+      derive_keys_name("UPPER.lower").as_deref(),
+      Some("UPPERLower")
+    );
+  }
+
+  /// `read_audio_mute` ports `Mute`'s int8u Format read (QuickTime.pm:10404-10410):
+  /// a numeric flag reads int8u length-adjusted (byte 0 for len 1/3, the int16u/
+  /// int32u for len 2/4); a string flag decodes as a string (Format bypassed); an
+  /// empty atom yields `None`.
+  #[test]
+  fn read_audio_mute_reads_int8u_or_string() {
+    use crate::value::TagValue;
+    // int8u (0x16, 1 byte).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01]
+      }),
+      Some(TagValue::U64(1))
+    );
+    // A 3-byte atom: ExifTool keeps int8u (the `{1,2,4}` length-map misses 3) and
+    // reads byte 0.
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0xff, 0xff]
+      }),
+      Some(TagValue::U64(1))
+    );
+    // String flag (0x01) ⇒ decoded string (Format bypassed).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x01,
+        bytes: b"1".to_vec()
+      }),
+      Some(TagValue::Str("1".into()))
+    );
+    // Empty atom ⇒ None (no usable read).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x00,
+        bytes: vec![]
+      }),
+      None
+    );
+  }
+
   /// `ilst_data_convless` implements the FULL conv-less `data`-atom cascade
   /// (QuickTime.pm:10396-10416): a `%stringEncoding` flag ⇒ a string; else a
   /// `QuickTimeFormat` numeric flag ⇒ a number; else (no usable format, no
@@ -17852,6 +19422,272 @@ mod tests {
       warnings.first().map(String::as_str),
       Some("Invalid atom size"),
       "the atom warning must surface when there is no meta warning, got {warnings:?}"
+    );
+  }
+
+  /// A top-level `uuid`-XMP atom whose packet is DOUBLE UTF-8-encoded (a byte-0
+  /// `\xef\xbb\xbf` BOM directly before `<?xpacket begin=`, XMP.pm:4351) — so
+  /// `ProcessXMP` both extracts the `XMP-dc:Title` AND raises `XMP is double
+  /// UTF-encoded` (XMP.pm:4493). The 16-byte XMP UUID precedes the packet.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  fn double_encoded_xmp_uuid() -> Vec<u8> {
+    let mut packet = std::vec::Vec::new();
+    packet
+      .extend_from_slice(b"\xef\xbb\xbf<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
+    packet.extend_from_slice(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+    packet.extend_from_slice(b"<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Hi</rdf:li></rdf:Alt></dc:title></rdf:Description>");
+    packet.extend_from_slice(b"</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    let mut body = std::vec::Vec::new();
+    body.extend_from_slice(&XMP_UUID);
+    body.extend_from_slice(&packet);
+    atom(b"uuid", &body)
+  }
+
+  /// A CLEAN top-level `uuid`-XMP atom — the same packet as
+  /// [`double_encoded_xmp_uuid`] but WITHOUT the leading `\xef\xbb\xbf` BOM, so
+  /// `ProcessXMP` extracts `XMP-dc:Title` and raises NO warning. Its `dc:title`
+  /// is `"Clean"` so a later packet's duplicate `Title` proves last-wins.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  fn clean_xmp_uuid() -> Vec<u8> {
+    let mut packet = std::vec::Vec::new();
+    packet.extend_from_slice(b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
+    packet.extend_from_slice(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+    packet.extend_from_slice(b"<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Clean</rdf:li></rdf:Alt></dc:title></rdf:Description>");
+    packet.extend_from_slice(b"</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    let mut body = std::vec::Vec::new();
+    body.extend_from_slice(&XMP_UUID);
+    body.extend_from_slice(&packet);
+    atom(b"uuid", &body)
+  }
+
+  /// #361 R2 — the embedded `uuid`-XMP `ProcessXMP` warning must obey ExifTool's
+  /// priority-0 `Warning` first-wins ordering, NOT always land last. For a NON-
+  /// `HEIC` container ExifTool sets `PRIORITY_DIR = 'XMP'` (QuickTime.pm:10016),
+  /// so the XMP `Warning` is PRIORITY-1 and owns the bare `ExifTool:Warning` over
+  /// a priority-0 `ProcessMOV` atom warning — even when the atom warning sits
+  /// LATER in the file. Ground-truthed vs bundled ExifTool 13.59: an MP4 with an
+  /// EARLY double-encoded `uuid`-XMP + a LATER size-4 `junk` atom reports
+  /// `ExifTool:Warning = "XMP is double UTF-encoded"` (the XMP one), with
+  /// "Invalid atom size" still present under `-a`.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_wins_priority1_over_later_atom_warning() {
+    // ftyp(mp42) + EARLY double-encoded uuid-XMP + LATER size-4 junk atom.
+    let mut data = atom(b"ftyp", b"mp42\0\0\0\0mp42isom");
+    data.extend(double_encoded_xmp_uuid());
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"junk");
+
+    let meta = parse_inner(&data, None).expect("accepted as MP4");
+    // Sanity: BOTH warnings were produced, and the XMP packet's tag extracted.
+    assert_eq!(meta.file_type(), "MP4");
+    assert_eq!(meta.warning(), Some("Invalid atom size"));
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+
+    // The priority-1 XMP warning owns the bare `ExifTool:Warning` slot even
+    // though the `ProcessMOV` atom warning sits LATER in the file.
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "the priority-1 XMP warning must win the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "Invalid atom size"),
+      "the atom warning still surfaces (after the XMP one), got {warnings:?}"
+    );
+  }
+
+  /// #361 R2 (reverse order) — the priority-1 XMP warning wins the bare slot even
+  /// when an EARLIER priority-0 `ProcessMOV` warning was extracted first. An MP4
+  /// with a `moov` whose `mvhd` child is truncated (warning at the EARLY `moov`
+  /// atom) FOLLOWED BY a double-encoded `uuid`-XMP (warning at a LATER atom) still
+  /// reports `ExifTool:Warning = "XMP is double UTF-encoded"` (ground-truthed vs
+  /// bundled 13.59: PRIORITY_DIR='XMP' promotion beats file order).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_wins_priority1_even_after_earlier_atom_warning() {
+    // ftyp(mp42) + EARLY moov{truncated mvhd} + LATER double-encoded uuid-XMP.
+    let mut moov_body = 100u32.to_be_bytes().to_vec(); // declared size 100
+    moov_body.extend_from_slice(b"mvhd");
+    moov_body.extend_from_slice(b"XXXX"); // only 4 of 92 payload bytes
+    let mut data = atom(b"ftyp", b"mp42\0\0\0\0mp42isom");
+    data.extend(atom(b"moov", &moov_body));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as MP4");
+    assert_eq!(
+      meta.warning(),
+      Some("Truncated 'mvhd' data (missing 88 bytes)")
+    );
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "the priority-1 XMP warning wins even when extracted later, got {warnings:?}"
+    );
+    assert!(
+      warnings
+        .iter()
+        .any(|w| w == "Truncated 'mvhd' data (missing 88 bytes)"),
+      "the earlier atom warning still surfaces, got {warnings:?}"
+    );
+  }
+
+  /// #361 R2 (`HEIC` exception) — for a `HEIC` container ExifTool does NOT set
+  /// `PRIORITY_DIR = 'XMP'` (QuickTime.pm:10016 `unless $fileType eq 'HEIC'`), so
+  /// the embedded-XMP `Warning` is PRIORITY-0 and competes by walk position. An
+  /// EARLY HEIF `iinf` out-of-order warning therefore keeps the bare slot over a
+  /// LATER double-encoded `uuid`-XMP (ground-truthed vs bundled 13.59 — contrast
+  /// the `mif1`/non-`HEIC` HEIF case, where XMP would win).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_is_priority0_under_heic_loses_to_earlier_heif_warning() {
+    // ftyp(heic) + EARLY meta{iinf out-of-order} + LATER double-encoded uuid-XMP.
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    assert_eq!(meta.file_type(), "HEIC");
+    assert_eq!(
+      meta.heif().warning(),
+      Some("Item info entries are out of order")
+    );
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    // PRIORITY-0 on HEIC: the EARLIER HEIF warning (lower offset) keeps the slot.
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Item info entries are out of order"),
+      "on HEIC the earlier priority-0 HEIF warning wins over the later XMP, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the XMP warning still surfaces (after the HEIF one), got {warnings:?}"
+    );
+  }
+
+  /// #361 R3 (multi-XMP `HEIC` ordering) — the embedded-XMP `Warning`'s OFFSET
+  /// must follow the WARNING-PRODUCING packet, NOT the first XMP atom. A `HEIC`
+  /// shaped `[CLEAN uuid-XMP, meta{iinf out-of-order}, double-encoded uuid-XMP]`
+  /// raises the XMP `XMP is double UTF-encoded` warning at the LATER (double-
+  /// encoded) atom — AFTER the HEIF `iinf` warning. On `HEIC` the XMP `Warning`
+  /// is priority-0 (ranked by walk offset), so the EARLIER HEIF warning wins the
+  /// bare `ExifTool:Warning`. The pre-fix bug recorded the FIRST (clean) XMP
+  /// atom's offset (BEFORE the meta box), which wrongly ranked the XMP warning
+  /// first. Ground-truthed vs bundled 13.59: bare `Warning = "Item info entries
+  /// are out of order"` (the HEIF one); the later packet's `Title` dup wins
+  /// last-wins. Contrast the `mif1`/non-`HEIC` shape (priority-1 →
+  /// XMP wins regardless of offset, asserted by the sibling case below).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_offset_follows_warning_producing_packet_on_heic() {
+    // ftyp(heic) + CLEAN uuid-XMP (no warning) + meta{iinf out-of-order} +
+    // double-encoded uuid-XMP (the warning is raised at THIS later atom).
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    data.extend(clean_xmp_uuid());
+    let meta_off = data.len() as u64;
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    let double_off = data.len() as u64;
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    assert_eq!(meta.file_type(), "HEIC");
+    // The clean packet seeded the XMP; the double-encoded packet's warning was
+    // ADOPTED (first-warning-wins) and its tag accumulated.
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    assert_eq!(
+      meta.heif().warning(),
+      Some("Item info entries are out of order")
+    );
+    // THE FIX: the recorded XMP-warning offset is the LATER (double-encoded)
+    // atom's body offset, NOT the first (clean) XMP atom's — so it is GREATER
+    // than the meta-box offset and the HEIF warning outranks it.
+    assert_eq!(meta.embedded_xmp_offset, Some(double_off + 8));
+    assert!(
+      meta.embedded_xmp_offset > Some(meta.heif().warning_offset().unwrap()),
+      "the XMP warning offset must follow the meta-box warning (not precede it via the clean first atom)"
+    );
+    assert_eq!(meta.heif().warning_offset(), Some(meta_off + 8));
+
+    // PRIORITY-0 on HEIC, ranked by the CORRECT (later) offset: the EARLIER HEIF
+    // warning wins the bare `ExifTool:Warning` (ground-truth: bundled 13.59).
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Item info entries are out of order"),
+      "the intervening HEIF warning must win over the later XMP warning, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the XMP warning still surfaces (after the HEIF one), got {warnings:?}"
+    );
+    // The later (double-encoded) packet's duplicate `Title` ("Hi") accumulates
+    // AFTER the clean packet's ("Clean") in file order, so last-wins picks it.
+    let title = meta
+      .embedded_xmp
+      .as_ref()
+      .map(crate::formats::xmp::XmpMeta::tags_slice)
+      .into_iter()
+      .flatten()
+      .filter(|t| t.name() == "Title")
+      .filter_map(|t| t.value_ref().scalar_ref())
+      .map(crate::formats::xmp::XmpScalar::text)
+      .next_back();
+    assert_eq!(title, Some("Hi"));
+  }
+
+  /// #361 R3 (multi-XMP non-`HEIC` parity) — the same `[clean, HEIF-warn,
+  /// double-encoded]` shape under a `mif1` (non-`HEIC`) brand: the XMP `Warning`
+  /// is PRIORITY-1 (`PRIORITY_DIR='XMP'`, QuickTime.pm:10016) and owns the bare
+  /// `ExifTool:Warning` regardless of offset, even though it is raised at the
+  /// LATER atom. Ground-truthed vs bundled 13.59: bare `Warning = "XMP is double
+  /// UTF-encoded"` (FileType `HEIF`). Confirms the offset fix is HEIC-scoped and
+  /// does not disturb the priority-1 path.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_priority1_wins_for_multi_xmp_non_heic() {
+    let mut data = atom(b"ftyp", b"mif1\0\0\0\0mif1heic");
+    data.extend(clean_xmp_uuid());
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIF");
+    assert_eq!(meta.file_type(), "HEIF");
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "non-HEIC: the priority-1 XMP warning wins regardless of its (later) offset, got {warnings:?}"
+    );
+    assert!(
+      warnings
+        .iter()
+        .any(|w| w == "Item info entries are out of order"),
+      "the HEIF warning still surfaces (after the XMP one), got {warnings:?}"
     );
   }
 

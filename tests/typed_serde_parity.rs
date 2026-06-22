@@ -226,6 +226,83 @@ const NOT_ACTIVE: &[&str] = &[
   "DNG_preview_image.dng",
 ];
 
+/// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
+/// dependent subsystem is deferred — the tag is dropped from BOTH the
+/// typed-serde/writer output AND the golden (the golden keeps the matching `-x`
+/// in `tools/gen_golden.sh`, exifast emits a diverging value, so a golden-only
+/// `-x` would leave exifast's extra). Mirrors `conformance.rs::check_excluding`
+/// + `timed_metadata_conformance.rs::drop_keys`. Each entry is
+/// `(fixture, &[FULLY-QUALIFIED "Family1:Name" keys])`.
+///
+/// - `MP4_parrot_anafi.mp4` (#361): exifast emits the XMP-derived
+///   `Composite:GPSAltitude` (byte-exact vs bundled for an XMP-only file), but
+///   bundled's anafi `Composite:GPS*` come from the unported
+///   `%QuickTime::Composite` `GPSCoordinates`/`LocationInformation` tables
+///   (QuickTime.pm:8668-8728) which OVERRIDE the XMP one — the same port-wide
+///   GPS-composite deferral the GoPro/SP2 arms carry. So the seven exact
+///   `Composite:GPS*` keys are dropped here while that table is unported (every
+///   other anafi tag — the 33 newly-decoded XMP/ItemList/Keys/AudioKeys/
+///   LocationInformation/HandlerVendorID tags included — is byte-exact). The
+///   distinct `XMP-exif:GPS*` tags are NOT excluded (exact-key matching, not a
+///   `:tail` suffix), so the embedded-XMP GPS byte-exactness is verified here.
+/// - `MP4_movie_keys.mov` (#361 R7): the crafted movie-level `keys` fixture's
+///   `\xa9xyz` ⇒ `Keys:GPSCoordinates` seeds the unported `%QuickTime::Composite`
+///   table (QuickTime.pm:8668) that bundled uses to synthesize
+///   `Composite:GPSLatitude`/`Longitude`/`GPSPosition` — the same port-wide GPS-
+///   composite deferral. exifast emits none, so those three are dropped here
+///   (every Keys/ItemList/UserData tag + the ported ImageSize/Megapixels/
+///   AvgBitrate/Rotation Composites stay byte-exact).
+const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
+  (
+    "MP4_parrot_anafi.mp4",
+    &[
+      "Composite:GPSAltitude",
+      "Composite:GPSAltitudeRef",
+      "Composite:GPSLatitude",
+      "Composite:GPSLatitudeRef",
+      "Composite:GPSLongitude",
+      "Composite:GPSLongitudeRef",
+      "Composite:GPSPosition",
+    ],
+  ),
+  (
+    "MP4_movie_keys.mov",
+    &[
+      "Composite:GPSLatitude",
+      "Composite:GPSLongitude",
+      "Composite:GPSPosition",
+    ],
+  ),
+];
+
+/// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
+/// none).
+fn excluded_keys_for(fixture: &str) -> &'static [&'static str] {
+  FIXTURE_EXCLUDED_KEYS
+    .iter()
+    .find(|(f, _)| *f == fixture)
+    .map_or(&[], |(_, keys)| *keys)
+}
+
+/// Strip a set of FULLY-QUALIFIED keys (exact `Family1:Name`) from every object
+/// in a `-j -G1`/`-n` JSON document. A no-op when `exact_keys` is empty.
+/// Matching is EXACT (not an `:tail` suffix) so excluding
+/// `Composite:GPSAltitude` does NOT also strip the distinct `XMP-exif:GPSAltitude`.
+fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
+  if exact_keys.is_empty() {
+    return doc.to_string();
+  }
+  let mut v: serde_json::Value = serde_json::from_str(doc).expect("valid JSON document");
+  if let Some(arr) = v.as_array_mut() {
+    for el in arr {
+      if let Some(obj) = el.as_object_mut() {
+        obj.retain(|k, _| !exact_keys.iter().any(|t| k == t));
+      }
+    }
+  }
+  serde_json::to_string(&v).expect("re-serialize document")
+}
+
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
 /// with paired `.json` + `.n.json` goldens, minus [`NOT_ACTIVE`]). Bumped per
 /// Codex round; see the long comment block in
@@ -893,7 +970,23 @@ const NOT_ACTIVE: &[&str] = &[
 /// ImageSize/Megapixels/AvgBitrate/Rotation Composites match the residual
 /// byte-exact. The `mett` metadata track surfaces no per-sample timed telemetry
 /// in bundled 13.59 (`-ee` == base), so there is no `.ee.*` golden.
-const EXPECTED_ACTIVE_FIXTURES: usize = 564;
+///
+/// 564 → 565 after `MP4_audiokeys_mute.mp4` (#361 R4) activated — a crafted
+/// audio-only MP4 pinning the `%QuickTime::AudioKeys` resolution (`Mute`'s int8u
+/// `Off`/`On` PrintConv + the unknown-key DERIVE path for `Make`/`Creationdate`/
+/// `AcmeTotallyBogusZzz`); byte-exact at both `-j` and `-n` (only `System:all`
+/// excluded — the ported `Composite:AvgBitrate` is verified). (`MP4_audiokeys_mute.mp4`
+/// is later EXTENDED in place by #361 R7 with two raw-`0xA9` ItemList ids — no
+/// new fixture, the count is unchanged by that extension.)
+///
+/// 565 → 566 after `MP4_movie_keys.mov` (#361 R7) activated — a crafted
+/// movie-level `moov/meta`(`mdta`) `keys` fixture pinning the GENERIC
+/// `%QuickTime::Keys` ProcessKeys order: the unknown-key DERIVE
+/// (`Keys:AcmeTotallyBogusZzz` — the movie-level [high] fix) plus the raw-`0xA9`
+/// cross-table (`Keys:ContentCreateDate` from `\xa9day`, `Keys:GPSCoordinates`
+/// from `\xa9xyz`) and `Keys:Make` (`manu` UserData). Byte-exact at `-j`/`-n`;
+/// the 3 `Composite:GPS*` are the unported `%QuickTime::Composite` deferral.
+const EXPECTED_ACTIVE_FIXTURES: usize = 566;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -2041,9 +2134,15 @@ fn typed_serde_path_equals_writer_path_and_golden_all_337() {
     let golden_n = std::fs::read_to_string(format!("{root}/tests/golden/{fixture}.n.json"))
       .unwrap_or_else(|e| panic!("read golden {fixture}.n.json: {e}"));
 
+    // Tags whose value diverges from bundled under a deferred subsystem are
+    // dropped from BOTH sides (the golden keeps the matching `-x`); see
+    // [`FIXTURE_EXCLUDED_KEYS`]. Empty for the vast majority of fixtures.
+    let excluded = excluded_keys_for(fixture);
+
     for (mode, print_on, golden) in [("j", true, &golden_j), ("n", false, &golden_n)] {
-      let typed = typed_serde_document(fixture, &data, print_on);
-      let writer = extract_info(fixture, &data, print_on);
+      let typed = drop_keys(&typed_serde_document(fixture, &data, print_on), excluded);
+      let writer = drop_keys(&extract_info(fixture, &data, print_on), excluded);
+      let golden = drop_keys(golden, excluded);
 
       // typed serde == writer path.
       if let Err(e) = json_equivalent(&typed, &writer) {
@@ -2053,7 +2152,7 @@ fn typed_serde_path_equals_writer_path_and_golden_all_337() {
         ));
       }
       // typed serde == golden.
-      if let Err(e) = json_equivalent(&typed, golden) {
+      if let Err(e) = json_equivalent(&typed, &golden) {
         failures.push(format!(
           "[{mode}] {fixture}: typed-serde != golden: {}\n  typed:  {typed}\n  golden: {golden}",
           e.message()
