@@ -313,15 +313,16 @@ case "$FIX" in
   # MakerNote-derived `LensID`/`LensSpec`/`AutoFocus`/`RedBalance`/`BlueBalance`/
   # `AvgBitrate`). So these goldens KEEP the ported Composites and drop ONLY the
   # unported ones BY NAME (never `Composite:all`), byte-matching exifast — PLUS
-  # any non-Composite port deferrals each golden already excluded (the IPTC/
-  # XMP JPEG segments for `ExifGPS.jpg`/`DJIPhantom4.jpg`; the codec-config
-  # property atoms for `HEIF`/`AVIF`). `IFD1:ThumbnailImage` is NO LONGER
-  # excluded — #331 emits it via the EXIF `DataTag` channel (the IFD1
+  # any non-Composite port deferrals each golden already excluded (the
+  # codec-config property atoms for `HEIF`/`AVIF`). `IFD1:ThumbnailImage` is NO
+  # LONGER excluded — #331 emits it via the EXIF `DataTag` channel (the IFD1
   # ThumbnailOffset/ThumbnailLength pair → the `(Binary data N bytes …)`
   # placeholder), byte-matching bundled. `ExifGPS.tif` carries only GPS
-  # Composites + no deferred segments → default path (no arm).
-  ExifGPS.jpg)
-    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest) ;;
+  # Composites + no deferred segments → default path (no arm). `ExifGPS.jpg`
+  # NOW emits its `IPTC:*` ApplicationRecord tags + `File:CurrentIPTCDigest`
+  # byte-exact (the JPEG IPTC port — `IPTC.pm`/`Photoshop.pm` APP13 8BIM IIM +
+  # the in-crate RFC-1321 MD5), so the former `-x IPTC:all -x
+  # File:CurrentIPTCDigest` exclusion is dropped and it takes the DEFAULT path.
   # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
   # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). The XMP `APP1`
   # packet (`http://ns.adobe.com/xap/1.0/\0` → `ProcessXMP`, #37) is NOW emitted
