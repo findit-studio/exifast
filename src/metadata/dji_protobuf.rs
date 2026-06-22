@@ -350,6 +350,10 @@ pub struct DjiTelemetrySample {
   /// `TimeStamp` microsecond counter (Avata 2 / Mavic 3 Pro / 4 Pro
   /// etc.; DJI.pm:430-432).
   time_stamp_us: Option<u64>,
+  /// `FrameNumber` (`3-1-1`) — a `Format => 'unsigned'` per-frame counter
+  /// declared on all 16 protocol arms (DJI.pm:279 etc., `#forum17996`). No
+  /// ValueConv/PrintConv ⇒ the raw varint, emitted as `Protobuf:DJI:FrameNumber`.
+  frame_number: Option<u64>,
   /// `ISO` (float in the wire).
   iso: Option<f64>,
   /// `ShutterSpeed` seconds — a `Format => 'rational'` reading (the num/den
@@ -432,6 +436,7 @@ impl DjiTelemetrySample {
       gps_date_time: None,
       synth_gps_date_time: None,
       time_stamp_us: None,
+      frame_number: None,
       iso: None,
       shutter_speed_s: None,
       f_number: None,
@@ -539,6 +544,13 @@ impl DjiTelemetrySample {
   #[must_use]
   pub const fn time_stamp_us(&self) -> Option<u64> {
     self.time_stamp_us
+  }
+
+  /// `FrameNumber` (`3-1-1`) — the raw `Format => 'unsigned'` per-frame counter.
+  #[inline(always)]
+  #[must_use]
+  pub const fn frame_number(&self) -> Option<u64> {
+    self.frame_number
   }
 
   /// `ISO`.
@@ -746,6 +758,7 @@ impl DjiTelemetrySample {
       && self.relative_altitude_m.is_none()
       && self.gps_date_time.is_none()
       && self.time_stamp_us.is_none()
+      && self.frame_number.is_none()
       && self.iso.is_none()
       && self.shutter_speed_s.is_none()
       && self.f_number.is_none()
@@ -811,6 +824,11 @@ impl DjiTelemetrySample {
   #[inline(always)]
   pub(crate) const fn set_time_stamp_us(&mut self, v: Option<u64>) -> &mut Self {
     self.time_stamp_us = v;
+    self
+  }
+  #[inline(always)]
+  pub(crate) const fn set_frame_number(&mut self, v: Option<u64>) -> &mut Self {
+    self.frame_number = v;
     self
   }
   #[inline(always)]
@@ -1355,6 +1373,7 @@ mod tests {
     s.set_relative_altitude_m(Some(50.2));
     s.set_gps_date_time(Some(SmolStr::from("2025:01:15 12:34:56")));
     s.set_time_stamp_us(Some(1_234_567_890));
+    s.set_frame_number(Some(4242));
     s.set_iso(Some(100.0));
     s.set_shutter_speed_s(Some(RationalValue::Num(1.0 / 60.0)));
     s.set_f_number(Some(RationalValue::Num(2.8)));
@@ -1377,6 +1396,7 @@ mod tests {
     assert_eq!(s.relative_altitude_m(), Some(50.2));
     assert_eq!(s.gps_date_time(), Some("2025:01:15 12:34:56"));
     assert_eq!(s.time_stamp_us(), Some(1_234_567_890));
+    assert_eq!(s.frame_number(), Some(4242));
     assert_eq!(s.iso(), Some(100.0));
     assert_eq!(s.shutter_speed_s(), Some(1.0 / 60.0));
     assert_eq!(s.f_number(), Some(2.8));

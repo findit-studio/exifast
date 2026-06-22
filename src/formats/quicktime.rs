@@ -13373,6 +13373,10 @@ fn dji_push_sample_tags(
   if let Some(r) = s.frame_rate() {
     push(scratch, "FrameRate", TagValue::F64(r));
   }
+  // ── FrameNumber (3-1-1) — Format => 'unsigned', no conv ⇒ raw integer ────
+  if let Some(fno) = s.frame_number() {
+    push(scratch, "FrameNumber", TagValue::U64(fno));
+  }
   // ── TimeStamp (3-1-2) — ValueConv `$val / 1e6` seconds, raw number ───────
   if let Some(us) = s.time_stamp_us() {
     #[allow(clippy::cast_precision_loss)]
