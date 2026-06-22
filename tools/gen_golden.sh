@@ -323,10 +323,12 @@ case "$FIX" in
   ExifGPS.jpg)
     EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest) ;;
   # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). Only the
-  # non-Composite port deferrals remain.
-  DJIPhantom4.jpg)
-    EXCLUDE_ARR+=(-x XMP:all) ;;
+  # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). The XMP `APP1`
+  # packet (`http://ns.adobe.com/xap/1.0/\0` → `ProcessXMP`, #37) is NOW emitted
+  # byte-exact via the shared XMP parser — all 23 `XMP-*` tags (`XMP-drone-dji`/
+  # `XMP-crs`/`XMP-tiff`/`XMP-dc`/`XMP-xmp`/`XMP-rdf`), so the former `-x XMP:all`
+  # is dropped and DJIPhantom4 takes the DEFAULT path (no arm) — its golden KEEPS
+  # the full XMP packet (like DJI_Matrice30T.jpg, which has no XMP `APP1`).
   # NEW PR-3 arms (these relied on a regen-time `EXCLUDE` env before — now baked
   # in so `tools/gen_golden.sh <fix>` reproduces them with no env). Each drops
   # only the unported lens/MakerNote Composites by name.

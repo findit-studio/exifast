@@ -1744,6 +1744,70 @@ pub struct ExifMeta<'a> {
   /// [`ConvMode::ValueConv`](crate::emit::ConvMode); the print-conv vector
   /// otherwise.
   jpeg_app_tags_n: Vec<crate::emit::EmittedTag>,
+  /// The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment — the
+  /// `^http://ns.adobe.com/xap/1.0/\0` arm of `ProcessJPEG` (`ExifTool.pm:7794-
+  /// 7819`, the `$$valPt =~ /^$xmpAPP1hdr/` branch → `Image::ExifTool::XMP`'s
+  /// `ProcessXMP`). The 29-byte `$xmpAPP1hdr` namespace marker is stripped and
+  /// the remaining XMP packet routed to the shared XMP parser
+  /// ([`crate::formats::xmp::parse_borrowed`]) exactly like a standalone `.xmp`
+  /// sidecar / a QuickTime `uuid`-XMP box (#361) — one shared `ProcessXMP`.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) appends its `XMP-*:*` tags
+  /// (family-0 `XMP`, family-1 the namespace group) via the XMP module's own
+  /// `Taggable` impl, already rendered for the active conv mode; its `Warning`
+  /// (if any) rides the sibling [`Diagnose`](crate::diagnostics::Diagnose)
+  /// channel. `XmpMeta` OWNS its decoded strings (the `'a` is a `PhantomData`
+  /// anchor — the input is transcoded to owned `String`s), so it is stored
+  /// `'static`, independent of the JPEG buffer. `None` for a JPEG carrying no
+  /// XMP `APP1` (and for every non-JPEG source).
+  ///
+  /// A JPEG may carry MULTIPLE XMP `APP1` packets (ExifTool's `Marker:` loop
+  /// runs `ProcessXMP` once per matching `APP1` and `FoundTag` ACCUMULATES, with
+  /// no de-dup, `ExifTool.pm:7794`); the first seeds the slot and each later one
+  /// is absorbed via
+  /// [`XmpMeta::absorb_additional_packet`](crate::formats::xmp::XmpMeta::absorb_additional_packet)
+  /// (concatenate tags + first-wins `Warning`), so the downstream last-wins
+  /// `TagMap` reproduces ExifTool's equal-priority resolution — the same path
+  /// the QuickTime multi-`uuid` case uses. The ExtendedXMP (`http://ns.adobe.com/
+  /// xmp/extension/\0`) APP1 segments are a separate follow-up (no test fixture
+  /// carries one).
+  #[cfg(feature = "xmp")]
+  embedded_xmp: Option<crate::formats::xmp::XmpMeta<'static>>,
+  /// The file (marker) offset of the warning-PRODUCING embedded-XMP `APP1`
+  /// segment — the byte position (`base_offset + segment payload start`) of the
+  /// XMP `APP1` whose `ProcessXMP` raised the adopted `Warning`. `None` when no
+  /// XMP packet warned (a clean XMP, or no XMP at all). It exists ONLY to RANK
+  /// the embedded-XMP `Warning` against the EXIF `APP1`'s warnings by file
+  /// position in [`Diagnose::diagnostics`](crate::diagnostics::Diagnose): ExifTool
+  /// processes JPEG `APPn` markers in FILE ORDER and `Warning` is a priority-0
+  /// `FoundTag` (FIRST by marker position owns the bare `ExifTool:Warning` —
+  /// QuickTime.pm `uuid`-XMP #361 / Pittasoft #362), so a warning-producing XMP
+  /// `APP1` placed BEFORE a malformed/warning EXIF `APP1` must surface its
+  /// warning first, and vice-versa. There is no JPEG `PRIORITY_DIR` promotion
+  /// for XMP (contrast the QuickTime non-`HEIC` path), so it competes purely by
+  /// offset. The first warning-producing packet's position is recorded
+  /// (`get_or_insert`), mirroring [`embedded_xmp`](Self::embedded_xmp)'s
+  /// first-wins `Warning`. `u32` matches the JPEG offset arithmetic (a JPEG
+  /// cannot place an `APP1` past 4 GiB; the capture saturates on a pathological
+  /// rebase). `None` for every non-JPEG source.
+  #[cfg(feature = "xmp")]
+  embedded_xmp_offset: Option<u32>,
+  /// The file (marker) offset of the FIRST EXIF `APP1` segment that contributed
+  /// a `Warning` — the byte position (`base_offset + segment payload start`) of
+  /// the earliest `APP1` whose `ProcessTIFF` walk warned (an IFD-bounds /
+  /// suspicious-offset `$et->Warn`) OR that raised `Malformed APP1 EXIF segment`
+  /// (`ExifTool.pm:7783`). All [`warnings`](Self::warnings) on a merged JPEG
+  /// `ExifMeta` originate from EXIF `APP1` block(s), so this single position is
+  /// the EXIF warnings' file location — the comparator the embedded-XMP
+  /// `Warning` is ranked against in
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) (first-by-position
+  /// wins; see [`embedded_xmp_offset`](Self::embedded_xmp_offset)). `None` when
+  /// no EXIF `APP1` warned (the EXIF warning list is then empty, so the XMP
+  /// warning — if any — leads unconditionally). Recorded ONLY when the `xmp`
+  /// feature is built (the offset is consulted solely for the XMP-vs-EXIF
+  /// ordering); without `xmp` the diagnostics are EXIF-only and need no
+  /// position. `None` for every non-JPEG source.
+  #[cfg(feature = "xmp")]
+  exif_warning_offset: Option<u32>,
   /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — `Some("CRW")`
   /// for a CIFF/CRW raw, the standalone-TIFF candidate's `Parent`
   /// (`"TIFF"`/`"DNG"`/`"NEF"`/`"CR2"`/…) for a standalone TIFF, `None` for an
@@ -2025,6 +2089,22 @@ impl<'a> ExifMeta<'a> {
       sof: None,
       jpeg_app_tags_pc: Vec::new(),
       jpeg_app_tags_n: Vec::new(),
+      // The embedded XMP `APP1` packet is decoded and attached AFTER this
+      // construction by the JPEG marker walk via
+      // [`set_jpeg_embedded_xmp`](Self::set_jpeg_embedded_xmp); a freshly
+      // built JPEG `ExifMeta` starts with none.
+      #[cfg(feature = "xmp")]
+      embedded_xmp: None,
+      // The XMP/EXIF warning marker offsets are recorded by the JPEG marker
+      // walk AFTER this construction (via
+      // [`set_jpeg_embedded_xmp_offset`](Self::set_jpeg_embedded_xmp_offset) /
+      // [`set_jpeg_exif_warning_offset`](Self::set_jpeg_exif_warning_offset)),
+      // so they rank the embedded-XMP `Warning` against the EXIF warnings by
+      // file position; a freshly built JPEG `ExifMeta` has neither yet.
+      #[cfg(feature = "xmp")]
+      embedded_xmp_offset: None,
+      #[cfg(feature = "xmp")]
+      exif_warning_offset: None,
       // A JPEG container's `APP1` Exif block is embedded — `$$self{FILE_TYPE}`
       // is the JPEG ("JPEG"), never "CRW", so the ShotInfo pos-22 CRW clause is
       // correctly off. We model that as `None` (no CRW), matching the embedded
@@ -2084,6 +2164,46 @@ impl<'a> ExifMeta<'a> {
   ) {
     self.jpeg_app_tags_pc = pc;
     self.jpeg_app_tags_n = n;
+  }
+
+  /// Attach the embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
+  /// (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm),
+  /// already parsed by the shared XMP module
+  /// ([`crate::formats::xmp::parse_borrowed`]) during the marker walk. Its
+  /// `XMP-*:*` tags are emitted by [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// (via the XMP module's own `Taggable` impl) and its `Warning` by
+  /// [`Diagnose`](crate::diagnostics::Diagnose). `None` clears any prior packet.
+  /// (`pub(crate)`: a JPEG-front-end construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_embedded_xmp(
+    &mut self,
+    xmp: Option<crate::formats::xmp::XmpMeta<'static>>,
+  ) {
+    self.embedded_xmp = xmp;
+  }
+
+  /// Record the file (marker) offset of the warning-producing embedded-XMP
+  /// `APP1` segment ([`embedded_xmp_offset`](Self::embedded_xmp_offset)) so
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) can rank the XMP
+  /// `Warning` against the EXIF warnings by file position (first-by-marker-
+  /// position wins, mirroring the QuickTime `uuid`-XMP `#361` / Pittasoft `#362`
+  /// model). Called by the JPEG marker walk for the FIRST XMP `APP1` whose
+  /// `ProcessXMP` raised the adopted warning. (`pub(crate)`: a JPEG-front-end
+  /// construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_embedded_xmp_offset(&mut self, offset: u32) {
+    self.embedded_xmp_offset = Some(offset);
+  }
+
+  /// Record the file (marker) offset of the first EXIF `APP1` that contributed a
+  /// `Warning` ([`exif_warning_offset`](Self::exif_warning_offset)) — the
+  /// comparator the embedded-XMP `Warning` is ranked against in
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose). Called by the JPEG
+  /// marker walk once, for the earliest warning-producing EXIF `APP1`.
+  /// (`pub(crate)`: a JPEG-front-end construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_exif_warning_offset(&mut self, offset: u32) {
+    self.exif_warning_offset = Some(offset);
   }
 
   /// Record the marker (file) position of the EXIF metadata block — the index
@@ -2700,6 +2820,13 @@ fn parse_tiff_with_base_no_raf<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A standalone-TIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     file_type,
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
@@ -2840,6 +2967,13 @@ fn parse_bigtiff<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A BigTIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) FORCES the file
     // type to `BTF` on the 0x2b magic, REGARDLESS of extension — so a BigTIFF
     // named `.tif` / dotless still finalizes `File:FileType = BTF`. Carry that
@@ -3021,6 +3155,13 @@ fn parse_tiff_with_base_shared<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // An embedded eXIf / CTMD block is not a JPEG marker walk — no XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
@@ -7514,6 +7655,27 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       &self.jpeg_app_tags_n
     };
     tags.extend(app_tags.iter().cloned());
+    // The embedded XMP `APP1` packet (`ExifTool.pm:7794`, the
+    // `$$valPt =~ /^$xmpAPP1hdr/` → `Image::ExifTool::XMP::ProcessXMP` arm). Its
+    // `XMP-*` tags are produced by the shared XMP parser's own `Taggable` impl
+    // (family-0 `XMP`, family-1 the namespace group — `XMP-tiff` / `XMP-dc` /
+    // `XMP-drone-dji` / `XMP-crs` / …), already rendered for the active conv
+    // mode. Emitting via that impl keeps the JPEG path byte-identical to a
+    // standalone `.xmp` sidecar / the QuickTime `uuid`-XMP box (#361) — exactly
+    // what bundled does (one shared `ProcessXMP`). XMP is equal-priority with
+    // EXIF/MakerNote in `FoundTag`, and ExifTool reaches the EXIF `APP1` BEFORE
+    // the XMP `APP1` in `Marker:`-loop file order (the realistic camera layout),
+    // so a same-named tag's EXIF value is FoundTag'd first; appending the XMP
+    // tags here (after the EXIF block) reproduces that order, and the downstream
+    // last-wins `TagMap` then keeps the later same-named XMP value only where
+    // ExifTool would (a bare same-name key in the same priority class) — but the
+    // `XMP-*` family-1 groups never collide with the EXIF `IFD0:*`/`ExifIFD:*`
+    // family-1 keys in the `-G1` output, so in practice both coexist. The XMP
+    // `Warning` (if any) rides the sibling `Diagnose` channel, not this stream.
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      tags.extend(crate::emit::Taggable::tags(xmp, opts));
+    }
     tags.into_iter()
   }
 }
@@ -7522,7 +7684,23 @@ impl crate::emit::Taggable for ExifMeta<'_> {
 impl crate::diagnostics::Diagnose for ExifMeta<'_> {
   /// The EXIF `$et->Warn(...)` corpus (IFD-bounds checks, `Malformed APP1 EXIF
   /// segment`, suspicious-offset, …) as [`Diagnostic`](crate::diagnostics::Diagnostic)
-  /// warnings, in emission order. `File:ExifByteOrder` is a real TAG emitted by
+  /// warnings, in emission order, INTERLEAVED with the embedded JPEG `APP1` XMP
+  /// packet's own decode/walk `$et->Warn` (if any — `ProcessXMP` records at most
+  /// one first-occurrence warning, e.g. `XMP is double UTF-encoded`
+  /// XMP.pm:4491) BY APP1 MARKER FILE POSITION. ExifTool processes JPEG `APPn`
+  /// markers in FILE ORDER and `Warning` is a priority-0 `FoundTag` (the FIRST
+  /// warning by marker position owns the bare `ExifTool:Warning` — the same
+  /// first-by-position model as the QuickTime `uuid`-XMP `#361` and the
+  /// Pittasoft `3gf ` `#362` doc warnings), so the warning of whichever `APP1`
+  /// (EXIF or XMP) is EARLIER in the file leads. There is no JPEG `PRIORITY_DIR`
+  /// promotion for XMP (contrast the QuickTime non-`HEIC` path), so the two
+  /// compete purely by offset:
+  /// [`exif_warning_offset`](Self::exif_warning_offset) (the EXIF warnings' file
+  /// position) vs [`embedded_xmp_offset`](Self::embedded_xmp_offset) (the
+  /// warning-producing XMP `APP1`'s). The realistic camera layout (EXIF `APP1`
+  /// before XMP `APP1`) keeps the EXIF warnings first — and no golden fixture
+  /// carries the XMP-warns-before-EXIF-warns combination, so all stay
+  /// byte-identical. `File:ExifByteOrder` is a real TAG emitted by
   /// [`tags`](crate::emit::Taggable::tags) (not a diagnostic), so only the
   /// warnings appear here — the same loop the retired `AnyMeta::drain_diagnostics`
   /// EXIF arm ran. EXIF raises no `$et->Error` (a rejected block returns
@@ -7541,18 +7719,42 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
       self.warnings_ignorable.len(),
       "warnings/warnings_ignorable must stay index-aligned",
     );
-    self
-      .warnings()
-      .iter()
-      .enumerate()
-      .map(
-        |(i, w)| match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+    let exif_warnings = || {
+      self.warnings().iter().enumerate().map(|(i, w)| {
+        match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
           1 => Diagnostic::warn_minor(w.as_str()),
           2 => Diagnostic::warn_minor_behavioral(w.as_str()),
           _ => Diagnostic::warn(w.as_str()),
-        },
-      )
-      .collect()
+        }
+      })
+    };
+    // Interleave the embedded JPEG `APP1` XMP packet's warning with the EXIF
+    // warnings by APP1 marker file position (first-by-position wins, mirroring
+    // `#361`/`#362`). The XMP `Diagnose` impl yields at most one document-level
+    // warning, raised at `embedded_xmp_offset`; the EXIF warnings all originate
+    // from EXIF `APP1` block(s) and so share `exif_warning_offset`. An
+    // unpositioned side saturates to `u32::MAX` (it then trails). When the XMP
+    // `APP1` is EARLIER than the warning-producing EXIF `APP1`, the XMP warning
+    // leads — owning the bare `ExifTool:Warning`; otherwise the EXIF warnings
+    // lead (the realistic camera order, byte-identical to before).
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      let xmp_diags = crate::diagnostics::Diagnose::diagnostics(xmp);
+      // Only a warning-producing XMP packet competes for position (an empty
+      // diagnostics list — a clean XMP — leaves the EXIF warnings untouched).
+      let xmp_is_earlier = !xmp_diags.is_empty()
+        && self.embedded_xmp_offset.unwrap_or(u32::MAX)
+          < self.exif_warning_offset.unwrap_or(u32::MAX);
+      if xmp_is_earlier {
+        let mut out = xmp_diags;
+        out.extend(exif_warnings());
+        return out;
+      }
+      let mut out: std::vec::Vec<Diagnostic> = exif_warnings().collect();
+      out.extend(xmp_diags);
+      return out;
+    }
+    exif_warnings().collect()
   }
 }
 
