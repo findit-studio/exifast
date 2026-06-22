@@ -659,6 +659,12 @@ enum FieldKind {
   SerialNumber2,
   /// `1-1-10` Model — LEN ASCII string (DJI.pm:273 etc.).
   Model,
+  /// `FrameNumber` (`3-1-1`), `Format => 'unsigned'` (a VARINT) — a per-frame
+  /// counter declared on all 16 protocol arms (DJI.pm:279/:320/:361/:404 etc.,
+  /// `#forum17996`). No ValueConv/PrintConv ⇒ emitted as the raw integer. Lives
+  /// in the per-frame `3-1` message alongside [`Self::TimeStamp`] (`3-1-2`), so
+  /// it lands PER `djmd` sample (one `Doc<N>` each), not clip-level.
+  FrameNumber,
   /// `ISO`, `Format => 'float'` (an I32 float wire value).
   Iso,
   /// `ShutterSpeed`, `Format => 'rational'` (a LEN packed rational, seconds).
@@ -1356,6 +1362,13 @@ fn apply_leaf(
       {
         let converted: String = v.chars().map(|c| if c == '-' { ':' } else { c }).collect();
         s.set_gps_date_time(Some(SmolStr::new(converted)));
+      }
+    }
+    FieldKind::FrameNumber => {
+      // `3-1-1` FrameNumber, Format => 'unsigned' (VARINT), no conversions
+      // (DJI.pm:279 etc.). Per-frame counter — kept as the raw `u64`.
+      if let Some(v) = varint_value(rec) {
+        s.set_frame_number(Some(v));
       }
     }
     FieldKind::TimeStamp => {
@@ -2380,6 +2393,56 @@ mod tests {
     let mut dji_st = DjiTrackState::new();
     process_djmd(&buf, &mut dji_st, &mut out);
     assert_eq!(out.samples()[0].time_stamp_us(), Some(1_234_567_890));
+  }
+
+  #[test]
+  fn field_lookup_frame_number_all_protocols() {
+    // `3-1-1` FrameNumber (Format => 'unsigned') is a NAMED, default-extracted
+    // leaf on EVERY protocol arm (DJI.pm:279/:320/:361/:404/:446/:479/:515/:558/
+    // :598/:639/:677/:721/:744/:782/:833/:868, `#forum17996`).
+    for kp in [
+      "dvtm_ac203",
+      "dvtm_ac204",
+      "dvtm_ac206",
+      "dvtm_AVATA2",
+      "dvtm_wm265e",
+      "dvtm_pm320",
+      "dvtm_Mini4_Pro",
+      "dvtm_dji_neo",
+      "dvtm_Air3",
+      "dvtm_Air3s",
+      "dvtm_oq101",
+      "dvtm_PP-101",
+      "dvtm_wa345e",
+      "dvtm_wm261",
+      "dvtm_Mavic4",
+      "dvtm_Mini5Pro",
+    ] {
+      let p = protocol_for(kp).unwrap();
+      assert_eq!(
+        field_for(p, &[3, 1, 1]),
+        Some(FieldKind::FrameNumber),
+        "{kp} 3-1-1 must map to FrameNumber"
+      );
+    }
+  }
+
+  #[test]
+  fn djmd_frame_number_decodes_per_sample() {
+    // FrameNumber `3-1-1` (unsigned VARINT) lands on the per-sample row (one
+    // `Doc<N>` each), like TimeStamp `3-1-2`. Decode an ac203 sample carrying a
+    // `3-1-1` varint and assert the raw counter on the sample.
+    let lvl31 = nest(1, &[rec_varint(1, 1701)]); // 3-1-1 FrameNumber
+    let lvl3 = nest(3, &[lvl31]);
+    let proto = proto_block("dvtm_ac203.proto");
+    let mut buf = Vec::new();
+    buf.extend(proto);
+    buf.extend(lvl3);
+
+    let mut out = DjiProtobufMeta::new();
+    let mut dji_st = DjiTrackState::new();
+    process_djmd(&buf, &mut dji_st, &mut out);
+    assert_eq!(out.samples()[0].frame_number(), Some(1701));
   }
 
   #[test]
