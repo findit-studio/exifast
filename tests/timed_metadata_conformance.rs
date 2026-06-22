@@ -291,6 +291,33 @@ fn gopro_hero8_gpmd_ee_byte_exact() {
   );
 }
 
+/// Real GoPro HERO6 Black MP4 (from gopro/gpmf-parser, 8.8 MB, 23.6 s) — the
+/// `gpmd` timed-GPS/sensor `Doc<N>` port (#211). Like hero8, the `gpmd` `trak`
+/// (Track4) carries one GPMF `DEVC` per sample and the `fdsc` `trak` (Track5)
+/// the per-sample identity. At `-ee -G1` the doc axis collapses first-wins to
+/// the first sample's block, emitted under `Track4:` / `Track5:`. Unlike hero8,
+/// this HERO6 sample exercises the camera-vision GPMF streams hero8 lacks —
+/// `FaceNumbers` (FCNM int32u count list), `FaceDetected` (FACE `?`-format face
+/// box), `ISOSpeeds` (ISOE int32u list), `ExposureTimes` (SHUT `1/x` rational
+/// render), `ColorTemperatures` (WBAL 16-bit list), `WhiteBalanceRGB` (WRGB
+/// binary placeholder), `CameraTemperature` (TMPC `" C"` suffix) — plus the
+/// shared `Accelerometer` (ACCL) / `Gyroscope` (GYRO) binary placeholders and
+/// the `GPS5` scalars (GPS5/GPSU/GPSF/GPSP). Byte-exact vs bundled
+/// ExifTool 13.59. No `.ee.g3.json` is pinned (the single collapsed `-G1` block
+/// is the document of interest; the base `.json`/`.n.json` are the activation
+/// gate in `conformance.rs`).
+#[test]
+fn gopro_hero6_gpmd_ee_byte_exact() {
+  // `-ee -G1`: Track4's first `DEVC` block (DeviceName, the sensor/camera-vision
+  // streams, the GPS scalars + first `GPS5` row's lat/lon/alt/speed) + Track5's
+  // `fdsc` identity — byte-exact.
+  check_ee(
+    "QuickTime_gopro_hero6_gpmf.mp4",
+    "QuickTime_gopro_hero6_gpmf.mp4.ee.json",
+    false,
+  );
+}
+
 // ── Track<N>: gpmd dashcam variants (FMAS / Wolfbox — per-sample Track<N>) ───
 // The `gpmd` MetaFormat Condition cascade (QuickTimeStream.pl:181-212) routes
 // the self-contained dashcam variants to their `freeGPS` process-procs:

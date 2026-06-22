@@ -11345,9 +11345,15 @@ fn mpeg2_ts_misb_klv_conformance() {
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
 }
 
-// #211 — Real GoPro HERO6 Black with live gpmd GPS track (from gopro/gpmf-parser)
+// #211 — Real GoPro HERO6 Black with a live `gpmd` GPS/sensor track (from
+// gopro/gpmf-parser). The DEFAULT (no-`ee`) `.json`/`.n.json` are byte-exact:
+// the `gpmd`/`fdsc` traks are `meta`-handler ⇒ fully `-ee` gated, so the base
+// document is the container + the moov-level `udta` `GoPro:*`/`UserData:*`
+// identity (incl. the simple `UserData:GPSCoordinates` ISO6709 string) + the
+// ported ImageSize/Megapixels/AvgBitrate/Rotation Composites. The timed GPMF
+// `Doc<N>` block surfaces only under `-ee` —
+// `timed_metadata_conformance.rs::gopro_hero6_gpmd_ee_byte_exact` pins it.
 #[test]
-#[ignore]
 fn quicktime_gopro_hero6_gpmf_conformance() {
   check(
     "QuickTime_gopro_hero6_gpmf.mp4",
