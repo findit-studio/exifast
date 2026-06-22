@@ -2761,6 +2761,7 @@ fn parse_tiff_with_base_no_raf<'a>(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -2927,6 +2928,7 @@ fn parse_bigtiff<'a>(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -3122,6 +3124,7 @@ fn parse_tiff_with_base_shared<'a>(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -3317,6 +3320,15 @@ struct Walker<'a, 'g> {
   data: &'a [u8],
   /// The TIFF byte order.
   order: ByteOrder,
+  /// The RESOLVED (probed) byte order of the most recent `ProcessProc::Unknown`
+  /// SubDirectory walk — the order [`process_subdir`] used INSIDE the sub-walk,
+  /// captured here (unlike [`Self::order`], which `process_subdir` restores to
+  /// the parent order on return). The Pentax `%Main` binary sub-tables that
+  /// declare no explicit `ByteOrder` inherit THIS order (e.g. the K-x `Pentax.avi`
+  /// MakerNote IFD probes to BigEndian even though its RIFF parent is
+  /// LittleEndian; the K-S2 JPEG probes to LittleEndian). `None` until a
+  /// `ProcessUnknown` walk resolves one.
+  resolved_subdir_order: Option<ByteOrder>,
   /// ExifTool's `$base` for the walk (`Exif.pm:6287` `$base = $$dirInfo{Base}
   /// || 0`). All IFD offsets remain relative to the start of `data`, but an
   /// `IsOffset` value tag (`StripOffsets` 0x0111, `ThumbnailOffset` 0x0201,
@@ -5618,6 +5630,14 @@ impl Walker<'_, '_> {
     self.dir_len = self.dir_len.map(|d| d.saturating_sub(locate_delta));
     self.active_table = table;
     self.order = resolved_order;
+    // Capture the resolved order for an inheriting binary sub-table read AFTER the
+    // walk returns (the Pentax `%Main` sub-tables) — `self.order` is restored
+    // below, but `resolved_subdir_order` persists. Only a `ProcessUnknown` walk
+    // (the maker-note probe path) records it; the core `Exif`/`Canon`/`BinaryData`
+    // sub-IFDs leave it untouched (their `resolved_order == self.order` anyway).
+    if matches!(process, ProcessProc::Unknown) {
+      self.resolved_subdir_order = Some(resolved_order);
+    }
     let _ = self.walk_one_ifd(ifd_start, kind);
     self.dir_len = saved_dir_len;
     self.warn_count = saved_warn_count;
@@ -9538,6 +9558,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
   let mut w = Walker {
     data: blob,
     order,
+    resolved_subdir_order: None,
     // `%Apple::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value — `base: 0` resolves an out-of-line offset at `blob[off]`,
     // byte-identical to the oracle's `Base => '$start - 14'` blob-relative read.
@@ -9738,6 +9759,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // Both Main variants inherit the parent base (no `Base =>` override), so the
     // walk never adds `base` to a value — `base: 0` resolves an out-of-line offset
     // at `data[off]`, byte-identical to the oracle's TIFF-relative read.
@@ -10019,6 +10041,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // `%Panasonic::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value — `base: 0`. The DC-FT7 `Base => 12` out-of-line shift is
     // the SEPARATE `value_offset_base` below (the `$dataPos`-shift addend), NOT
@@ -10296,6 +10319,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
   let mut w = Walker {
     data: walk_data,
     order,
+    resolved_subdir_order: None,
     base: 0,
     // ★ CRUX #1 — the out-of-line value base: 10 for type-3 (embedded-TIFF
     // `Base => '$start - 8'`), 0 for type-2 / headerless. Reproduces the oracle's
@@ -10632,6 +10656,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -10718,6 +10743,15 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     }
   }
   {
+    // The RESOLVED Pentax `%Main` IFD byte order — a Pentax binary sub-table that
+    // declares no explicit `ByteOrder` inherits it (e.g. `CameraInfo`/`KelvinWB`/
+    // `LevelInfo`/`FilterInfo`). `w.order` is restored to the PARENT order after
+    // the walk, so it is wrong for the K-x `Pentax.avi` (RIFF-LittleEndian parent,
+    // but the MakerNote IFD probes to BigEndian); `resolved_subdir_order` holds the
+    // probed order the entries were actually walked with (BE for the K10D JPEG +
+    // the K-x AVI, LE for the K-S2 JPEG). The tables that declare `ByteOrder =>
+    // 'BigEndian'` (`BatteryInfo`/`AFInfo`) pass `ByteOrder::Big` regardless.
+    let parent_order = w.resolved_subdir_order.unwrap_or(w.order);
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
       // Only `ResolvedConv::Pentax` entries live in this run; a defensive
@@ -10760,9 +10794,15 @@ pub(in crate::exif) fn pentax_makernote_isolated(
               &mut *sink.emissions,
             );
           }
+          // `%Pentax::AEInfo` (0x0206) is a `$count`-keyed variant LIST. The K10D
+          // `$count <= 25` records use `emit_aeinfo`; the `$count == 48 or 64`
+          // records (K-1mkII/K-3/K-30/K-50/K-S2/K-70/KP) use `%Pentax::AEInfo3`
+          // (`emit_aeinfo3`). Each emitter re-checks its `$count` gate, so only the
+          // matching variant emits (the K-S2 record is 48 ⇒ AEInfo3).
           SubTable::AEInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_aeinfo(block, count, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_aeinfo3(block, count, print_conv, &mut *sink.emissions);
           }
           // The nested `%Pentax::LensData` SubDirectory inside `%Pentax::LensInfo2`
           // (#262 Phase 2b). `emit_lens_info` re-checks the K10D `$count`
@@ -10770,9 +10810,21 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // emits nothing), slices the offset-4 `undef[17]` `LensData` span, and
           // emits ONLY the five nested lens-detail leaves. The offset-0 `LensType`
           // is NOT re-emitted — Phase 1's `0x003f LensRec` owns it.
+          // `%Pentax::LensInfo` (0x0207) is a `$count`-keyed variant LIST.
+          // `emit_lens_info` handles the K10D `%LensInfo2` (`LensData` at offset
+          // 4); `emit_lens_info5` handles the `$count == 80 or 128` `%LensInfo5`
+          // (K-01/K-30/K-50/K-3/K-S1/K-S2/K-70/KP — `LensData` at offset 15). Each
+          // re-checks its `$count` gate; the K-S2 record is 128 ⇒ LensInfo5.
           SubTable::LensInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_lens_info(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+            pentax::subtables::emit_lens_info5(
               block,
               count,
               model,
@@ -10791,14 +10843,21 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // InternalSerialNumber); the offset-0 PentaxModelID is owned by the
           // Phase-1 0x0005 leaf and is NOT re-emitted here.
           SubTable::CameraInfo => {
-            pentax::subtables::emit_camera_info(block, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_camera_info(
+              block,
+              parent_order,
+              print_conv,
+              &mut *sink.emissions,
+            );
           }
-          // `%Pentax::SRInfo` (0x005c) — the `$count == 4` variant gate
-          // (`Pentax.pm:2260`); a 2-byte K-3 record (`SRInfo2`) emits nothing
-          // (the scope-fence). #173.
+          // `%Pentax::SRInfo` (0x005c) is a `$count`-keyed pair. `emit_sr_info`
+          // handles the `$count == 4` `%SRInfo`; `emit_sr_info2` handles the
+          // 2-byte `%SRInfo2` (K-3/K-S1/K-S2/K-70 — ShakeReduction only). Each
+          // re-checks its gate; the K-S2 record is 2 bytes ⇒ SRInfo2. #173.
           SubTable::SrInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_sr_info(block, count, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_sr_info2(block, count, print_conv, &mut *sink.emissions);
           }
           // `%Pentax::BatteryInfo` (0x0216) — UNCONDITIONAL (BigEndian); its
           // leaves are `$$self{Model}`-gated, so the threaded `model` selects the
@@ -10819,6 +10878,67 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // Emits WBShiftAB / WBShiftGM. #173.
           SubTable::ColorInfo => {
             pentax::subtables::emit_color_info(block, print_conv, &mut *sink.emissions);
+          }
+          // The #311 world-time / lens-correction / face / AWB / EV-step / level /
+          // Kelvin-WB / CAF / filter sub-tables. Per-table byte-order rule
+          // (`Pentax.pm`): `KelvinWB` (int16u[4]) and the K-3III `LevelInfo`
+          // (int16s) declare NO `ByteOrder` ⇒ inherit `parent_order`; `FilterInfo`
+          // (int16u) is `$$self{Make}`-FORCED (RICOH→LE / else→BE, NOT the parent
+          // order); the int8u/int8s tables are order-immaterial. The K-S2 selects
+          // them via its IFD.
+          SubTable::TimeInfo => {
+            pentax::subtables::emit_time_info(block, print_conv, &mut *sink.emissions);
+          }
+          SubTable::LensCorr => {
+            pentax::subtables::emit_lens_corr(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::FaceInfo` (0x0060) — UNCONDITIONAL, unlike the model-variant
+          // `LevelInfo` arm below. The Main `0x0060` row (`Pentax.pm:2293-2297`)
+          // is a single `{...}` with NO `Condition`, so every body (the K-3 Mark
+          // III included) routes 0x0060 through `%FaceInfo`. The K-3III's distinct
+          // `%FaceInfoK3III` is a SEPARATE Main tag id (0x040b), not a 0x0060
+          // model variant — so there is correctly no `is_k3_mark_iii` gate here.
+          SubTable::FaceInfo => {
+            pentax::subtables::emit_face_info(block, &mut *sink.emissions);
+          }
+          SubTable::AwbInfo => {
+            pentax::subtables::emit_awb_info(block, print_conv, &mut *sink.emissions);
+          }
+          SubTable::EvStepInfo => {
+            pentax::subtables::emit_evstep_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::LevelInfo` (0x022b) is `$$self{Model}`-VARIANT-SELECTED
+          // (`Pentax.pm:3044-3051`): a `/K-3 Mark III/` body reads the distinct
+          // `%LevelInfoK3III` re-layout; every OTHER body reads `%LevelInfo`. The
+          // K3III `int16s` RollAngle/PitchAngle carry no per-table `ByteOrder`, so
+          // they inherit the probed parent IFD order (`parent_order`). No active
+          // fixture is a K-3III, so the normal path serves all goldens, but the
+          // selection mirrors ExifTool's condition ORDER faithfully.
+          SubTable::LevelInfo => {
+            if pentax::subtables::is_k3_mark_iii(model) {
+              pentax::subtables::emit_level_info_k3iii(
+                block,
+                parent_order,
+                print_conv,
+                &mut *sink.emissions,
+              );
+            } else {
+              pentax::subtables::emit_level_info(block, print_conv, &mut *sink.emissions);
+            }
+          }
+          SubTable::KelvinWb => {
+            pentax::subtables::emit_kelvin_wb(block, parent_order, &mut *sink.emissions);
+          }
+          SubTable::CafPointInfo => {
+            pentax::subtables::emit_caf_point_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::FilterInfo` (0x022a) byte order is `$$self{Make}`-FORCED, NOT
+          // the parent order: RICOH bodies read LittleEndian, all others BigEndian
+          // (`Pentax.pm:3030-3043`). `emit_filter_info` decides from the threaded
+          // `make`. (The K-S2 / K-1 / K-3 / KP / K-70 report `Make => "RICOH …"`
+          // ⇒ LE; the K-5 II reports `"PENTAX"` ⇒ BE.)
+          SubTable::FilterInfo => {
+            pentax::subtables::emit_filter_info(block, make, &mut *sink.emissions);
           }
         }
         continue;
@@ -10991,6 +11111,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -11286,6 +11407,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -11456,6 +11578,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // Canon's `%Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value (`is_offset_tag` matches only 0x0111/0x0201, absent from
     // `%Canon::Main`) — `base: 0` is byte-identical to the parent-context walk.
@@ -11631,7 +11754,13 @@ fn emit_exif_value<S: ExifSink>(
       // ShutterSpeedValue: ValueConv `2 ** -$val` first (Exif.pm:2346),
       // then PrintExposureTime. `-n` mode emits the post-ValueConv scalar.
       let secs = match conv {
-        Conv::ShutterSpeedApex => first_scalar(raw).map(shutter_speed_value_conv),
+        // `ShutterSpeedValue` ValueConv `2 ** -$val` over the 10-sig-fig-rounded
+        // rational input (`RoundFloat($num/$den, 10)`, `Exif.pm:6112`), matching
+        // `ApertureApex`. `ExposureTime` keeps the raw rational seconds (its own
+        // value IS the rational, with no `2**` ValueConv).
+        Conv::ShutterSpeedApex => first_scalar(raw)
+          .map(round_float_10)
+          .map(shutter_speed_value_conv),
         _ => first_scalar(raw),
       };
       match secs {
@@ -11697,8 +11826,14 @@ fn emit_exif_value<S: ExifSink>(
     },
     Conv::ApertureApex => {
       // ValueConv `2 ** ($val / 2)` (Exif.pm:2356); PrintConv
-      // `sprintf("%.1f",$val)` (Exif.pm:2358).
-      match first_scalar(raw) {
+      // `sprintf("%.1f",$val)` (Exif.pm:2358). ExifTool reads the input
+      // `rational64u`/`s` via `RoundFloat($num/$den, 10)` (`Exif.pm:6112`/`:6119`),
+      // so `$val` is the 10-sig-fig-rounded quotient BEFORE the ValueConv — e.g.
+      // `16205/3734` → `4.339850027`, NOT the full-precision `4.33985002678`. The
+      // `2**` of the rounded value (`4.50000003760988`) differs from the
+      // full-precision result in the low bits, so round the apex the same way to
+      // stay byte-exact at `-n` (`first_scalar`'s rational quotient is unrounded).
+      match first_scalar(raw).map(round_float_10) {
         Some(apex) => {
           let v = 2f64.powf(apex / 2.0);
           if print_conv {
@@ -12463,6 +12598,21 @@ fn rational_quotient(r: &crate::value::Rational) -> f64 {
     };
   }
   r.numerator() as f64 / r.denominator() as f64
+}
+
+/// `RoundFloat($val, 10)` (`ExifTool.pm:5960-5964`) = `sprintf("%.10g", $val)`
+/// re-parsed — the 10-significant-figure rounding ExifTool applies to a
+/// `rational64u`/`s` value when reading it (`Exif.pm:6112`/`:6119`) BEFORE it
+/// reaches a ValueConv. Used by the `ApertureApex` / `ShutterSpeedApex` `2 **`
+/// ValueConvs so their input matches ExifTool's rounded `$val` byte-exact at
+/// `-n`. A non-finite value (`inf`/`NaN` from a degenerate rational) passes
+/// through unchanged (`%.10g` of `inf` is `"inf"`, which would not re-parse — so
+/// it is returned verbatim).
+fn round_float_10(val: f64) -> f64 {
+  if !val.is_finite() {
+    return val;
+  }
+  crate::value::format_g(val, 10).parse().unwrap_or(val)
 }
 
 /// `PrintLensInfo` (`Exif.pm:5800-5817`) — 4 rationals → the lens string.
@@ -14533,6 +14683,7 @@ mod tests {
     Walker {
       data,
       order: ByteOrder::Big,
+      resolved_subdir_order: None,
       base: 0,
       value_offset_base: 0,
       entries: Vec::new(),

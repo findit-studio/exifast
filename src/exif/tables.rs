@@ -566,6 +566,25 @@ const SUBFILE_TYPE: &[(i64, &str)] = &[
   (16, "Enhanced image data"),
 ];
 
+/// `0x8830 SensitivityType` PrintConv (`Exif.pm`, the `applies to EXIF:ISO tag`
+/// row). Sorted by key for binary search.
+const SENSITIVITY_TYPE: &[(i64, &str)] = &[
+  (0, "Unknown"),
+  (1, "Standard Output Sensitivity"),
+  (2, "Recommended Exposure Index"),
+  (3, "ISO Speed"),
+  (
+    4,
+    "Standard Output Sensitivity and Recommended Exposure Index",
+  ),
+  (5, "Standard Output Sensitivity and ISO Speed"),
+  (6, "Recommended Exposure Index and ISO Speed"),
+  (
+    7,
+    "Standard Output Sensitivity, Recommended Exposure Index and ISO Speed",
+  ),
+];
+
 /// `ResolutionUnit` / `FocalPlaneResolutionUnit` PrintConv
 /// (`Exif.pm:879-883`).
 const RESOLUTION_UNIT: &[(i64, &str)] = &[(1, "None"), (2, "inches"), (3, "cm")];
@@ -905,7 +924,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0x8830,
     name: "SensitivityType",
-    conv: Conv::None,
+    conv: Conv::IntLabel(SENSITIVITY_TYPE),
   },
   ExifTag {
     id: 0x8832,

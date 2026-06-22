@@ -55,6 +55,7 @@
   "Pentax:PictureMode": "255 4 1",
   "Pentax:DriveMode": "255 255 0 255",
   "Pentax:LensType": "7 222",
+  "Pentax:ExtenderStatus": 0,
   "Pentax:ImageTone": 0,
   "Pentax:SRResult": 31,
   "Pentax:ShakeReduction": 7,

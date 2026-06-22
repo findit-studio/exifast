@@ -244,6 +244,32 @@ pub(crate) fn emit_lens_rec(
     false,
     0,
   ));
+  // Position 3: `ExtenderStatus` (`Pentax.pm:4208-4212`, `{0=>'Not attached',
+  // 1=>'Attached'}`). Bounds-checked: the K10D `Pentax.jpg` LensRec is only 3
+  // bytes (byte 3 absent ⇒ no emit), but the K-S2 record is 4 bytes ⇒ byte 3 = 0
+  // → 'Not attached'. `-n` ⇒ the raw int.
+  if let Some(&ext) = block.get(3) {
+    let value = if print_conv {
+      crate::value::TagValue::Str(SmolStr::new_static(match ext {
+        0 => "Not attached",
+        1 => "Attached",
+        _ => "",
+      }))
+    } else {
+      crate::value::TagValue::I64(i64::from(ext))
+    };
+    // A miss (ext not 0/1) renders the decimal `Unknown (N)` fallback under -j.
+    let value = if print_conv && !matches!(ext, 0 | 1) {
+      crate::value::TagValue::Str(SmolStr::from(std::format!("Unknown ({ext})")))
+    } else {
+      value
+    };
+    emissions.push(super::VendorEmission::new(
+      "ExtenderStatus".into(),
+      value,
+      false,
+    ));
+  }
 }
 
 /// Populate the typed lens identity from the LensRec byte pair — the typed-slot

@@ -11325,12 +11325,45 @@ fn jpeg_pentax_k70_conformance() {
   check("JPEG_pentax_k70.jpg", "JPEG_pentax_k70.jpg.n.json", false);
 }
 
-// #311 — Pentax K-S2 MakerNote (AFPointSelected, AFPointsInFocus)
+// #311 — Pentax K-S2 MakerNote. Full Pentax tag set (140 tags) byte-exact vs
+// bundled 13.59: the AEInfo3/LensInfo5/KelvinWB/TimeInfo/LensCorr/FaceInfo/
+// AWBInfo/EVStepInfo/LevelInfo/CAFPointInfo/FilterInfo sub-tables + the
+// BodyBatteryVoltage1/2 BatteryInfo variant + the parent-order-threaded
+// CameraInfo + the Main-table leaves (AspectRatio/HDR/DynamicRangeExpansion/
+// FaceDetect/ColorMatrixA2/B2/AFPointSelected[2-element]/AFPointsInFocus/
+// FlashExposureComp[int8s array]/… + ExtenderStatus).
+//
+// The excluded keys are DEFERRED SUBSYSTEMS exifast does not implement (NOT
+// Pentax-specific — none is emitted byte-exact by any other active fixture
+// either): the `Composite:Flash` (the multi-field flash Composite, see
+// `xmp/tables.rs:41`), `Composite:LensID` (the lens-resolution Composite),
+// `Composite:DateTimeCreated` (the IPTC date Composite), `PrintIM:PrintIMVersion`
+// (exifast parses no PrintIM IFD), and `XMP-tiff:YCbCrSubSampling` (exifast emits
+// the raw `[2,1]` — the `tiff:YCbCrSubSampling` field is DOCUMENTED as needing the
+// unported `RawJoin` + `%JPEG::yCbCrSubSampling` PrintConv, `xmp/tables.rs:47`).
+// The golden keeps them (faithful 242-tag 13.59 dump); they are dropped from BOTH
+// sides so the Pentax set + the rest are verified byte-exact.
 #[test]
-#[ignore]
 fn jpeg_pentax_ks2_conformance() {
-  check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
-  check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
+  const DEFERRED: &[&str] = &[
+    "Composite:Flash",
+    "Composite:LensID",
+    "Composite:DateTimeCreated",
+    "PrintIM:PrintIMVersion",
+    "XMP-tiff:YCbCrSubSampling",
+  ];
+  check_excluding(
+    "JPEG_pentax_ks2.jpg",
+    "JPEG_pentax_ks2.jpg.json",
+    true,
+    DEFERRED,
+  );
+  check_excluding(
+    "JPEG_pentax_ks2.jpg",
+    "JPEG_pentax_ks2.jpg.n.json",
+    false,
+    DEFERRED,
+  );
 }
 
 // #122 / #361 — Parrot Anafi drone MP4. The `mett` metadata track carries no

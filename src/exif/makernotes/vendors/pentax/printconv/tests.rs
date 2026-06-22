@@ -254,3 +254,100 @@ fn string_leaves_preserve_trailing_spaces_p1_311() {
   };
   assert_eq!(conv.apply(&empty, true), TagValue::Str("".into()));
 }
+
+#[test]
+fn interval_shooting_off_and_shot_count() {
+  // 0x0092 IntervalShooting — int16u Count 2. `'0 0' => 'Off'`; the K-S2 golden
+  // value (default state). The added branches do NOT change this output.
+  let conv = PentaxPrintConv::IntervalShooting;
+  assert_eq!(conv.apply(&u(&[0, 0]), true), TagValue::Str("Off".into()));
+  // `-n`: the raw space-joined run (no ValueConv) — unchanged from the old
+  // StringKeyedHash behaviour, so the K-S2 `-n` golden is byte-identical.
+  assert_eq!(conv.apply(&u(&[0, 0]), false), TagValue::Str("0 0".into()));
+  // The OTHER => sub forward branch `s/(\d+) (\d+)/Shot $1 of $2/`: a non-'0 0'
+  // pair renders "Shot <shot> of <total>" (previously rendered "Unknown (3 10)").
+  assert_eq!(
+    conv.apply(&u(&[3, 10]), true),
+    TagValue::Str("Shot 3 of 10".into())
+  );
+  assert_eq!(
+    conv.apply(&u(&[1, 5]), true),
+    TagValue::Str("Shot 1 of 5".into())
+  );
+  // `-n` still the raw run for a non-default value.
+  assert_eq!(
+    conv.apply(&u(&[3, 10]), false),
+    TagValue::Str("3 10".into())
+  );
+  // A single-element value has no `\d+ \d+` pair ⇒ Perl's substitution is a
+  // no-op and the value passes through unchanged.
+  assert_eq!(conv.apply(&u(&[7]), true), TagValue::Str("7".into()));
+}
+
+#[test]
+fn clarity_control_off_signed_and_unknown() {
+  // 0x0096 ClarityControl — int8s Count 2. `'0 0' => 'Off'`; the K-S2 golden
+  // value (default state). The added branches do NOT change this output.
+  let conv = PentaxPrintConv::ClarityControl;
+  let off = RawValue::I64(std::vec![0, 0]);
+  assert_eq!(conv.apply(&off, true), TagValue::Str("Off".into()));
+  // `-n`: the raw space-joined run (no ValueConv) — byte-identical to the old
+  // StringKeyedHash behaviour, so the K-S2 `-n` golden is unchanged.
+  assert_eq!(conv.apply(&off, false), TagValue::Str("0 0".into()));
+  // The OTHER => sub forward branch `^1 (-?\d+)$ → $1 ? sprintf('%+d') : 0`:
+  // a negative offset renders the signed integer string.
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![1, -2]), true),
+    TagValue::Str("-2".into())
+  );
+  // A positive offset renders with the explicit `+` sign.
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![1, 3]), true),
+    TagValue::Str("+3".into())
+  );
+  // `$1 ? ... : 0` — a zero offset yields the bare integer `0` (a JSON number),
+  // NOT "+0" and NOT "Off".
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![1, 0]), true),
+    TagValue::I64(0)
+  );
+  // A value not of the `1 N` shape falls to the else arm ⇒ "Unknown (...)".
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![2, 5]), true),
+    TagValue::Str("Unknown (2 5)".into())
+  );
+  // `-n` for a non-default value is still the raw run.
+  assert_eq!(
+    conv.apply(&RawValue::I64(std::vec![1, -2]), false),
+    TagValue::Str("1 -2".into())
+  );
+}
+
+#[test]
+fn af_points_in_focus_ks2_bottom_row_bits() {
+  // 0x000f AFPointsInFocus (K-3/K-S1/K-S2 variant) — int32u, PrintHex, a
+  // `{0 => '(none)', BITMASK => {0..26}}` DecodeBits PrintConv.
+  let conv = PentaxPrintConv::AfPointsInFocus;
+  // Zero ⇒ the explicit '(none)' key.
+  assert_eq!(conv.apply(&u(&[0]), true), TagValue::Str("(none)".into()));
+  // The K-S2 golden value: bit 13 = "Center" (0x2000). The full table does NOT
+  // change this — the golden stays byte-identical.
+  assert_eq!(
+    conv.apply(&u(&[0x2000]), true),
+    TagValue::Str("Center".into())
+  );
+  // Bit 24 ("Bottom") was previously MISSING from the table (it only had bits
+  // 0..21) and rendered "[24]"; the appended bits 22..26 now resolve it.
+  assert_eq!(
+    conv.apply(&u(&[1 << 24]), true),
+    TagValue::Str("Bottom".into())
+  );
+  // The two endpoints of the previously-missing run: bit 22 "Bottom-left",
+  // bit 26 "Bottom-right" (DecodeBits joins set bits with ", ").
+  assert_eq!(
+    conv.apply(&u(&[(1 << 22) | (1 << 26)]), true),
+    TagValue::Str("Bottom-left, Bottom-right".into())
+  );
+  // `-n`: the raw int.
+  assert_eq!(conv.apply(&u(&[1 << 24]), false), TagValue::I64(1 << 24));
+}

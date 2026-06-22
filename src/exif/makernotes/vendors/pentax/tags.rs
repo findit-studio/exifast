@@ -181,6 +181,49 @@ pub enum SubTable {
   /// `ProcessBinaryData` record with `FORMAT => 'int8s'`. UNCONDITIONAL. Emits
   /// the two white-balance-shift leaves WBShiftAB (@ 16) and WBShiftGM (@ 17).
   ColorInfo,
+  /// `%Pentax::TimeInfo` at `0x006b` (`Pentax.pm:2366-2370`, `:3305-3336`) — the
+  /// world-time settings (`int8u`, inherits the parent IFD order). Emits
+  /// WorldTimeLocation / HometownDST / DestinationDST / HometownCity /
+  /// DestinationCity.
+  TimeInfo,
+  /// `%Pentax::LensCorr` at `0x007d` (`Pentax.pm:2580-2584`, `:3339-3358`) — the
+  /// lens distortion / aberration correction flags (`int8u`). Emits
+  /// DistortionCorrection / ChromaticAberrationCorrection /
+  /// PeripheralIlluminationCorr / DiffractionCorrection.
+  LensCorr,
+  /// `%Pentax::FaceInfo` at `0x0060` (`Pentax.pm:2293-2297`, `:3264-3280`) — face
+  /// detection (`int8u`). Emits FacesDetected (@0) + FacePosition (@2, int8u[2]).
+  /// The Main `0x0060` row has NO `Condition` (a single `{...}`, applied to every
+  /// body, K-3 Mark III included), so the dispatch is UNCONDITIONAL — there is no
+  /// model gate here. The K-3III's distinct `%FaceInfoK3III` is a SEPARATE tag id
+  /// (`0x040b`), not a 0x0060 variant, and is a deferred (unported) follow-up.
+  FaceInfo,
+  /// `%Pentax::AWBInfo` at `0x0068` (`Pentax.pm:2343-2347`, `:3283-3302`) — the
+  /// automatic white-balance settings (`int8u`). Emits WhiteBalanceAutoAdjustment
+  /// (@0) + TungstenAWB (@1, K-5 and later).
+  AwbInfo,
+  /// `%Pentax::EVStepInfo` at `0x0224` (`Pentax.pm:3006-3009`, `:5273-5294`) —
+  /// `int8u`. Emits EVSteps (@0) / SensitivitySteps (@1) / LiveView (@3).
+  EvStepInfo,
+  /// `%Pentax::LevelInfo` at `0x022b` (`Pentax.pm:3044-3052`, `:5701-5769`) — the
+  /// electronic-level info, `FORMAT => 'int8s'`. The non-K-3III variant. Emits
+  /// LevelOrientation / CompositionAdjust / RollAngle / PitchAngle /
+  /// CompositionAdjustX / CompositionAdjustY / CompositionAdjustRotation.
+  LevelInfo,
+  /// `%Pentax::KelvinWB` at `0x0221` (`Pentax.pm:2949-2952`, `:5233-5255`) — the
+  /// Kelvin white-balance gains, `FORMAT => 'int16u'` (inherits the parent IFD
+  /// order). Emits KelvinWB_Daylight + KelvinWB_01..16 (each int16u[4] via the
+  /// `%kelvinWB` ValueConv).
+  KelvinWb,
+  /// `%Pentax::CAFPointInfo` at `0x0238` (`Pentax.pm:3087-3090`, `:5202-5230`) —
+  /// the contrast-detect AF-point info (`int8u`). Emits NumCAFPoints / CAFGridSize
+  /// / CAFPointsInFocus / CAFPointsSelected.
+  CafPointInfo,
+  /// `%Pentax::FilterInfo` at `0x022a` (`Pentax.pm:3030-3043`, `:5660-...`) — the
+  /// digital-filter info. The non-RICOH (BigEndian) variant. Emits
+  /// SourceDirectoryIndex (@byte 0) + SourceFileIndex (@byte 2); the 20
+  /// `DigitalFilterNN` blobs are deferred.
+  FilterInfo,
 }
 
 /// The ported `%Pentax::Main` rows — sorted by `id` for binary search.
@@ -267,11 +310,26 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
   },
   PentaxTag {
     id: 0x000e,
+    // The "other models" variant (`Pentax.pm:1375-1408`) the K-S2 selects: an
+    // int16u[N] ARRAY PrintConv, NOT the single 11-point hash. The element count
+    // is derived from the on-disk byte size — the K10D `Pentax.jpg` is
+    // int16u[1] (`'Center'`), the K-S2 int16u[2] (`'Center; Single Point'`) — so
+    // NO format override (the on-disk format is already int16u).
     name: "AFPointSelected",
-    conv: PentaxPrintConv::Hash(AF_POINT_SELECTED),
+    conv: PentaxPrintConv::AfPointSelected,
     sub_table: None,
     unknown: false,
     format: None,
+  },
+  PentaxTag {
+    id: 0x000f,
+    // The `/K-(3|S1|S2)\b/` variant (`Pentax.pm:1409-1446`): int32u, PrintHex,
+    // `{0=>'(none)', BITMASK=>{...}}`. The K-S2 value 0x2000 → 'Center'.
+    name: "AFPointsInFocus",
+    conv: PentaxPrintConv::AfPointsInFocus,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int32u, Some(1))),
   },
   PentaxTag {
     id: 0x0012,
@@ -561,6 +619,15 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0060 FaceInfo` (`Pentax.pm:2293-2297`) — `Format => 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x0060,
+    name: "FaceInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::FaceInfo),
+    unknown: false,
+    format: None,
+  },
   PentaxTag {
     id: 0x0062,
     name: "RawDevelopmentProcess",
@@ -578,12 +645,72 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0068 AWBInfo` (`Pentax.pm:2343-2347`) — `Format => 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x0068,
+    name: "AWBInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::AwbInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x0069 DynamicRangeExpansion` (`Pentax.pm:2349-2364`) — `Format => 'int8u',
+  // Count => 4`; a 2-positioned ARRAY PrintConv (`'Off; Auto; 0; 0'`).
+  PentaxTag {
+    id: 0x0069,
+    name: "DynamicRangeExpansion",
+    conv: PentaxPrintConv::ArrayHash(super::printconv::DYNAMIC_RANGE_EXPANSION),
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int8u, Some(4))),
+  },
+  // `0x006b TimeInfo` (`Pentax.pm:2366-2370`) — `Format => 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x006b,
+    name: "TimeInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::TimeInfo),
+    unknown: false,
+    format: None,
+  },
   // `0x006c HighLowKeyAdj` (`Pentax.pm:2371-2388`) — int16s `Count => 2`, a
   // PrintConv keyed on the SPACE-JOINED `"adj 0"` pair (e.g. `"0 0" => 0`).
   PentaxTag {
     id: 0x006c,
     name: "HighLowKeyAdj",
     conv: PentaxPrintConv::StringKeyedHash(super::printconv::HIGH_LOW_KEY_ADJ),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0070 FineSharpness` (`Pentax.pm:2433-2443`) — int8u `Count => -1` (1 for
+  // K20/K200, 2 for K-5+); a 2-positioned ARRAY PrintConv (`'Off; Normal'`). The
+  // element count is derived from the on-disk byte size (no count override).
+  PentaxTag {
+    id: 0x0070,
+    name: "FineSharpness",
+    conv: PentaxPrintConv::ArrayHash(super::printconv::FINE_SHARPNESS),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0071 HighISONoiseReduction` (`Pentax.pm:2445-2467`) — `Format => 'int8u'`
+  // (no `Count`); a 3-positioned ARRAY PrintConv (`'Auto; Inactive'` for the
+  // K-S2's 2 values). The explicit `Format` re-reads the entry as `int8u[N]`
+  // regardless of the on-disk TIFF type (`Exif.pm:6735-6744`).
+  PentaxTag {
+    id: 0x0071,
+    name: "HighISONoiseReduction",
+    conv: PentaxPrintConv::ArrayHash(super::printconv::HIGH_ISO_NOISE_REDUCTION),
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int8u, None)),
+  },
+  // `0x0072 AFAdjustment` (`Pentax.pm:2468-2470`) — int16s, no conv.
+  PentaxTag {
+    id: 0x0072,
+    name: "AFAdjustment",
+    conv: PentaxPrintConv::None,
     sub_table: None,
     unknown: false,
     format: None,
@@ -606,11 +733,98 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0076 FaceDetect` (`Pentax.pm:2505-2522`) — int8u, a 2-entry CODE PrintConv
+  // array (`'Off; 0 faces detected; 0'`); the trailing element passes through raw.
+  PentaxTag {
+    id: 0x0076,
+    name: "FaceDetect",
+    conv: PentaxPrintConv::FaceDetect,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0077 FaceDetectFrameSize` (`Pentax.pm:2524-2528`) — int16u `Count => 2`,
+  // the default space-joined pair (`'0 0'`).
+  PentaxTag {
+    id: 0x0077,
+    name: "FaceDetectFrameSize",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0079 ShadowCorrection` (`Pentax.pm:2530-2543`) — int8u `Count => -1`, a
+  // run-keyed hash (`'2 4' => 'Auto'`).
+  PentaxTag {
+    id: 0x0079,
+    name: "ShadowCorrection",
+    conv: PentaxPrintConv::StringKeyedHash(super::printconv::SHADOW_CORRECTION),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
   // `0x007b CrossProcess` (`Pentax.pm:2565-2578`) — int8u enum hash.
   PentaxTag {
     id: 0x007b,
     name: "CrossProcess",
     conv: PentaxPrintConv::Hash(CROSS_PROCESS),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x007d LensCorr` (`Pentax.pm:2580-2584`) — `Format => 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x007d,
+    name: "LensCorr",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::LensCorr),
+    unknown: false,
+    format: None,
+  },
+  // `0x007f BleachBypassToning` (`Pentax.pm:2585-2607`) — int16u enum hash.
+  PentaxTag {
+    id: 0x007f,
+    name: "BleachBypassToning",
+    conv: PentaxPrintConv::Hash(super::printconv::BLEACH_BYPASS_TONING),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0080 AspectRatio` (`Pentax.pm:2609-2617`) — int8u enum hash.
+  PentaxTag {
+    id: 0x0080,
+    name: "AspectRatio",
+    conv: PentaxPrintConv::Hash(super::printconv::ASPECT_RATIO),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0085 HDR` (`Pentax.pm:2637-...`) — `Format => 'int8u', Count => 4`; a
+  // 3-positioned ARRAY PrintConv (`'Off; Auto-align Off; n/a; 0'`).
+  PentaxTag {
+    id: 0x0085,
+    name: "HDR",
+    conv: PentaxPrintConv::ArrayHash(super::printconv::HDR),
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int8u, Some(4))),
+  },
+  // `0x0092 IntervalShooting` (`Pentax.pm:2690-2707`) — int16u `Count => 2`:
+  // `'0 0' => 'Off'` plus the `OTHER => sub` (`s/(\d+) (\d+)/Shot $1 of $2/`).
+  PentaxTag {
+    id: 0x0092,
+    name: "IntervalShooting",
+    conv: PentaxPrintConv::IntervalShooting,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0096 ClarityControl` (`Pentax.pm:2727-2745`) — int8s `Count => 2`:
+  // `'0 0' => 'Off'` plus the `OTHER => sub` (`^1 (-?\d+)$ → %+d` / `0`).
+  PentaxTag {
+    id: 0x0096,
+    name: "ClarityControl",
+    conv: PentaxPrintConv::ClarityControl,
     sub_table: None,
     unknown: false,
     format: None,
@@ -663,29 +877,38 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0209 AEMeteringSegments` (`Pentax.pm:5360-...`) — `Format => 'int8u',
+  // Count => -1` (variable: 16 segments on the K10D, 77 on the K-5, 4050 on the
+  // K-3). `Count => -1` ⇒ NO bundled count (the walker recomputes
+  // `int(size/1)` from the on-disk byte span, `Exif.pm:6743`); the explicit
+  // `Format` re-reads as `int8u[N]` regardless of the on-disk TIFF type.
   PentaxTag {
     id: 0x0209,
     name: "AEMeteringSegments",
     conv: PentaxPrintConv::MeteringSegments,
     sub_table: None,
     unknown: false,
-    format: None,
+    format: Some(FormatOverride::new(Format::Int8u, None)),
   },
+  // `0x020a FlashMeteringSegments` (`Pentax.pm`) — `Format => 'int8u', Count =>
+  // -1` (variable-length, as 0x0209).
   PentaxTag {
     id: 0x020a,
     name: "FlashMeteringSegments",
     conv: PentaxPrintConv::MeteringSegments,
     sub_table: None,
     unknown: false,
-    format: None,
+    format: Some(FormatOverride::new(Format::Int8u, None)),
   },
+  // `0x020b SlaveFlashMeteringSegments` (`Pentax.pm`) — `Format => 'int8u',
+  // Count => -1` (variable-length, as 0x0209).
   PentaxTag {
     id: 0x020b,
     name: "SlaveFlashMeteringSegments",
     conv: PentaxPrintConv::MeteringSegments,
     sub_table: None,
     unknown: false,
-    format: None,
+    format: Some(FormatOverride::new(Format::Int8u, None)),
   },
   PentaxTag {
     id: 0x020d,
@@ -767,11 +990,38 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x021c ColorMatrixA2` (`Pentax.pm:2968-2972`) — `Format => 'int16s', Count
+  // => 9`, the default space-joined run (no conv). `0x021d ColorMatrixB2` likewise.
+  PentaxTag {
+    id: 0x021c,
+    name: "ColorMatrixA2",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16s, Some(9))),
+  },
+  PentaxTag {
+    id: 0x021d,
+    name: "ColorMatrixB2",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16s, Some(9))),
+  },
   PentaxTag {
     id: 0x021f,
     name: "AFInfo",
     conv: PentaxPrintConv::None,
     sub_table: Some(SubTable::AfInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x0221 KelvinWB` (`Pentax.pm:2949-2952`) — `Format => 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x0221,
+    name: "KelvinWB",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::KelvinWb),
     unknown: false,
     format: None,
   },
@@ -783,6 +1033,16 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0224 EVStepInfo` (`Pentax.pm:3006-3009`) — `Format => 'undef'`
+  // SubDirectory.
+  PentaxTag {
+    id: 0x0224,
+    name: "EVStepInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::EvStepInfo),
+    unknown: false,
+    format: None,
+  },
   // `0x0229 SerialNumber` (`Pentax.pm:3025-3029`) — `Writable => 'string'`, no
   // PrintConv/ValueConv. The on-disk `string` is NUL-trimmed (`s/\0.*//s`) with
   // trailing spaces preserved by the shared `Walker`, then passes through.
@@ -791,6 +1051,27 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     name: "SerialNumber",
     conv: PentaxPrintConv::None,
     sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x022a FilterInfo` (`Pentax.pm:3030-3043`) — the non-RICOH (BigEndian)
+  // `Format => 'undef'` SubDirectory. Only SourceDirectoryIndex / SourceFileIndex
+  // are ported (the 20 DigitalFilter blobs are deferred).
+  PentaxTag {
+    id: 0x022a,
+    name: "FilterInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::FilterInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x022b LevelInfo` (`Pentax.pm:3044-3052`) — the non-K-3III `Format =>
+  // 'undef'` SubDirectory.
+  PentaxTag {
+    id: 0x022b,
+    name: "LevelInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::LevelInfo),
     unknown: false,
     format: None,
   },
@@ -824,6 +1105,26 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     name: "FirmwareVersion",
     conv: PentaxPrintConv::None,
     sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0231 ContrastDetectAFArea` (`Pentax.pm:3066-3084`) — int16u `Count => 4`,
+  // the default space-joined run (no conv).
+  PentaxTag {
+    id: 0x0231,
+    name: "ContrastDetectAFArea",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0238 CAFPointInfo` (`Pentax.pm:3087-3090`) — `Format => 'undef'`
+  // SubDirectory.
+  PentaxTag {
+    id: 0x0238,
+    name: "CAFPointInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::CafPointInfo),
     unknown: false,
     format: None,
   },
@@ -891,36 +1192,46 @@ pub fn is_implicit_undef_subdir(id: u16) -> bool {
 /// `GetTagInfo` Condition scan) and only the variant the ported decoder
 /// faithfully implements is allowed to emit.
 ///
-/// # The structural invariant (EXHAUSTIVE — every #173 Main leaf is enumerated)
+/// # The structural invariant (EXHAUSTIVE — every conditioned Main leaf is enumerated)
 ///
 /// [`conditional_leaf`] matches on the FULL set of `%Pentax::Main` LEAF ids the
-/// #173 commit ported. Each leaf is EXPLICITLY one of:
+/// #173 + #311 commits ported that carry a `Pentax.pm` `Condition`. Each leaf is
+/// EXPLICITLY one of:
 ///
-/// * **gated** — the leaf carries a `Condition` in `Pentax.pm`; the arm emits
-///   ONLY for the exact `(count, Make, Model, on-disk format)` the ported
-///   decoder was transcribed and VERIFIED against (the `Pentax.jpg` K10D and/or
-///   `Pentax.avi` K-x fixtures), and returns [`ConditionalLeaf::Suppress`] for
-///   every OTHER context so the leaf emits NOTHING — never the ported variant's
-///   layout/`ValueConv`/decoder flattened onto a Make/Model/count/format it was
-///   not decoded for; OR
+/// * **gated** — the leaf carries a `Condition` in `Pentax.pm` (a `$$self{Model}`
+///   regex, a `$$self{Make}` regex, a `$count` gate, an on-disk `$format` gate,
+///   or an ARRAY of variants selected by such a `Condition`); the arm emits ONLY
+///   for the exact `(count, Make, Model, on-disk format)` the ported decoder was
+///   transcribed and VERIFIED against (the `Pentax.jpg` K10D / `Pentax.avi` K-x /
+///   `JPEG_pentax_ks2.jpg` K-S2 fixtures), and returns
+///   [`ConditionalLeaf::Suppress`] for every OTHER context so the leaf emits
+///   NOTHING — never the ported variant's layout/`ValueConv`/decoder flattened
+///   onto a Make/Model/count/format it was not decoded for; OR
 /// * **confirmed unconditional** — the leaf has NO `Condition` in `Pentax.pm`
 ///   (a `Count => N` element-count is NOT a `Condition`; it fixes the array
 ///   length, not the variant), verified against the source, so it emits for
 ///   every context (`ConditionalLeaf::Emit`).
 ///
-/// All 13 #173 Main leaf ids have an EXPLICIT arm (the 7 gated + the 5
-/// confirmed-unconditional `Emit` + `0x005d ShutterCount`); the catch-all
+/// All conditioned/enumerated Main LEAF ids have an EXPLICIT arm — the #173 set
+/// (7 gated + 5 confirmed-unconditional + `0x005d ShutterCount`) PLUS the #311
+/// `0x000f AFPointsInFocus` model-BITMASK gate; the catch-all
 /// `_ => EmitUnported` is reserved for the pre-#173 Phase-1/2 leaves (audited in
-/// their own phases) and unported ids. The invariant is therefore STRUCTURAL,
-/// not comment-dependent: a `EmitUnported` outcome PROVES the id is not a #173
-/// leaf, so reclassifying a leaf (or a future audit error) cannot silently route
-/// a #173 leaf through the default and emit the ported decoder. The
-/// [`conditional_leaf_173_leaves_are_structurally_handled`] test fails if any of
-/// the 13 ids is covered only by the fallback. Adding a new conditional leaf
+/// their own phases) and unported ids. (The two #311 conditioned SubDirectory
+/// rows — `0x022a FilterInfo` `Make`-forced byte order, `0x022b LevelInfo` /
+/// `LevelInfoK3III` model variant — are NOT leaves: their `Condition` selects an
+/// axis at the subdirectory-dispatch site in `exif/mod.rs`, not here, so they do
+/// not need a `conditional_leaf` arm.) The invariant is therefore STRUCTURAL,
+/// not comment-dependent: a `EmitUnported` outcome PROVES the id is not an
+/// enumerated conditioned leaf, so reclassifying a leaf (or a future audit error)
+/// cannot silently route one through the default and emit the ported decoder. The
+/// [`conditional_leaf_173_leaves_are_structurally_handled`] and
+/// [`conditional_leaf_311_leaves_are_structurally_handled`] tests fail if any
+/// enumerated id is covered only by the fallback. Adding a new conditional leaf
 /// must add its explicit arm here.
 ///
 /// The remaining model-/count-specific variants are DEFERRED (suppressed)
-/// pending a real fixture for each (see the #173 multi-model follow-up issue).
+/// pending a real fixture for each (see the #173/#311 multi-model follow-up
+/// issue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionalLeaf {
   /// Not a conditional leaf, or the entry matches the ported variant — apply
@@ -1012,6 +1323,29 @@ fn is_optio_div10_focal_length(model: &str) -> bool {
   false
 }
 
+/// `true` when the `%Pentax::Main` `0x000f AFPointsInFocus` int32u BITMASK variant
+/// (`Pentax.pm:1409-1446`) is selected: `$$self{Model} =~ /K-(3|S1|S2)\b/` — the
+/// K-3, K-S1 and K-S2 bodies (`Notes => 'K-3, K-S1 and K-S2 only'`). The port
+/// implements ONLY this variant; the second `Notes => 'other models'` int16u enum
+/// variant (`Pentax.pm:1447-1465`) is DEFERRED, so a model NOT matching this regex
+/// MUST suppress (its 0x000f is a 10-entry enum, NOT the 27-bit bitmask).
+///
+/// The Perl alternation `(3|S1|S2)` follows the literal `K-`, and the `\b` pins
+/// the END of the chosen token: `K-3\b` matches `"PENTAX K-3"` and `"PENTAX K-3
+/// Mark III"` (the `3` is followed by a space) but NOT `"PENTAX K-30"` (the `3` is
+/// followed by the word char `0`); `K-S1\b` / `K-S2\b` likewise. The `K-` prefix
+/// is NOT itself `\b`-anchored at its left (Perl scans for the substring), so a
+/// `"PENTAX K-3"` matches via the embedded `K-3`.
+fn is_afpoints_in_focus_bitmask(model: &str) -> bool {
+  // `/K-(3|S1|S2)\b/` — find `K-`, then one of `3` / `S1` / `S2` pinned by a
+  // trailing `\b` (end-of-string or a non-`[A-Za-z0-9_]` char). Reuse
+  // `model_word_match` per fully-expanded alternative so the `\b` and the
+  // substring scan stay token-for-token faithful.
+  model_word_match(model, "K-3")
+    || model_word_match(model, "K-S1")
+    || model_word_match(model, "K-S2")
+}
+
 /// Select the ExifTool `Condition` branch for a count-/`Make`-/`Model`-/on-disk-
 /// `$format`-conditioned `%Pentax::Main` LEAF and report whether the ported
 /// decoder may emit it.
@@ -1038,6 +1372,13 @@ fn is_optio_div10_focal_length(model: &str) -> bool {
 ///   K-1/645Z and K-3/KP model variants (different point hashes) and the count-2
 ///   second positional element (the Single-Point/Expanded-Area hash) are
 ///   DEFERRED.
+/// * `0x000f AFPointsInFocus` (`Pentax.pm:1409-1465`, #311) — variant 1, the
+///   int32u 27-bit BITMASK, `Condition => '$$self{Model} =~ /K-(3|S1|S2)\b/'`
+///   (`Notes => 'K-3, K-S1 and K-S2 only'`). A model NOT matching — INCLUDING a
+///   `None` model (undef `=~` is false) — ⇒ `Suppress`, because its 0x000f is the
+///   DEFERRED variant 2 (`Notes => 'other models'`, the int16u 10-entry enum
+///   `{0xffff=>'None', 0=>'Fixed Center or Multiple', …}`), never the bitmask
+///   flattened onto a foreign layout.
 /// * `0x0016 ExposureCompensation` (`Pentax.pm:1593-1614`) — variant 1
 ///   `Condition => '$count == 1'` (int16u, `($val-50)/10`). The count-2 variant
 ///   (a 2nd, meaning-unknown value) is DEFERRED.
@@ -1093,16 +1434,32 @@ pub fn conditional_leaf(
     // (videos) is `!~ /^Asahi/` ⇒ emit.
     0x000d => gate(make.is_none_or(|m| !make_prefix_match(m, "Asahi"))),
     // The "other models" variant — selected when the model is NOT K-1/645Z and
-    // NOT K-3/KP — and only for a single-element value (the ported decoder reads
-    // just element 0; a 2nd element carries the Single-Point/Expanded-Area hash
-    // the port does not implement). A `None` model can only be the non-K-1/3
-    // arm, but is still gated to count == 1.
+    // NOT K-3/KP (those use the deferred model-keyed 0x000e arms). The
+    // [`PentaxPrintConv::AfPointSelected`] conv now renders the FULL int16u[N]
+    // array (element 0 the 11-point hash, element 1 the Single-Point/Expanded-Area
+    // hash), so BOTH the K10D single-element (`'Center'`) and the K-S2
+    // two-element (`'Center; Single Point'`) records emit. A `None` model can only
+    // be the non-K-1/3 arm.
     0x000e => {
       let is_k1_645z =
         model.is_some_and(|m| model_word_match(m, "K-1") || model_word_match(m, "645Z"));
       let is_k3_kp = model.is_some_and(|m| model_word_match(m, "K-3") || model_word_match(m, "KP"));
-      gate(!is_k1_645z && !is_k3_kp && count == 1)
+      gate(!is_k1_645z && !is_k3_kp)
     }
+    // `0x000f AFPointsInFocus` (`Pentax.pm:1409-1465`) — TWO variants selected by
+    // `Condition`. The port implements variant 1, the int32u 27-bit BITMASK
+    // (`PrintHex`, `{0=>'(none)', BITMASK=>{...}}`), whose `Condition` is
+    // `$$self{Model} =~ /K-(3|S1|S2)\b/` (`Notes => 'K-3, K-S1 and K-S2 only'`).
+    // A model NOT matching ⇒ suppress: its 0x000f is variant 2 (the int16u
+    // `Notes => 'other models'` 10-entry enum, `{0xffff=>'None', 0=>'Fixed
+    // Center or Multiple', …}`), a DIFFERENT layout/PrintConv that is DEFERRED, so
+    // it must NOT be flattened onto the 27-bit bitmask. A `None` model (videos)
+    // cannot match the regex (undef `=~` is false) ⇒ suppress. Only the K-3 /
+    // K-S2 bodies carry a Main 0x000f (the K-1/KP/K-70 0x000f is the unrelated
+    // `0x0238 CAFPointInfo` undef[17] internal; the K10D/K-x/K-5 II have no Main
+    // 0x000f — their `AFPointsInFocus` is the separate `0x021f AFInfo` leaf), so
+    // this gate is byte-identical across every active and held fixture.
+    0x000f => gate(model.is_some_and(is_afpoints_in_focus_bitmask)),
     // `$count == 1` selects the ported int16u variant; the count-2 variant is
     // deferred.
     0x0016 => gate(count == 1),
@@ -1114,9 +1471,11 @@ pub fn conditional_leaf(
     // `$format eq "int32u"` variant is deferred, and any other on-disk format
     // matches NEITHER ExifTool variant ⇒ suppress.
     0x002d => gate(matches!(on_disk_format, Format::Int16u)),
-    // `$count == 1` selects the ported int32s variant; the count-2 K-3 int8s
-    // array variant is deferred.
-    0x004d => gate(count == 1),
+    // `0x004d FlashExposureComp` — BOTH variants are ported: the `$count == 1`
+    // int32s (`$val/256`) and the `Count => 2` int8s array (`$val/6`).
+    // [`PentaxPrintConv::FlashExposureComp`] branches on the element count, so the
+    // leaf emits unconditionally (every record matches one variant).
+    0x004d => ConditionalLeaf::Emit,
     // `$$self{Make} =~ /^(PENTAX|RICOH)/` rules out Kodak (which reuses this
     // id); a non-PENTAX/RICOH Make — including a `None` Make — ⇒ suppress.
     0x0062 => {

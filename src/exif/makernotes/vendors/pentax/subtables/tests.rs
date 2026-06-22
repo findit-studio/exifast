@@ -609,7 +609,7 @@ fn camera_info_k10d_print_conv_byte_exact() {
   // `exiftool -G1 -j Pentax.jpg`: ManufactureDate "2007:09:13",
   // ProductionCode 2.1, InternalSerialNumber 132352.
   let mut em = Vec::new();
-  emit_camera_info(CAMERAINFO_K10D, true, &mut em);
+  emit_camera_info(CAMERAINFO_K10D, ByteOrder::Big, true, &mut em);
   assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
   // ProductionCode is the dotted ValueConv string "2.1" (renders as a JSON number);
   // the "(camera has been serviced)" suffix applies only to an 8.x value.
@@ -632,7 +632,7 @@ fn camera_info_k10d_value_conv() {
   // -n (ValueConv) — ManufactureDate has no PrintConv (same string), ProductionCode
   // is the bare dotted string, InternalSerialNumber the raw int.
   let mut em = Vec::new();
-  emit_camera_info(CAMERAINFO_K10D, false, &mut em);
+  emit_camera_info(CAMERAINFO_K10D, ByteOrder::Big, false, &mut em);
   assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
   assert_eq!(find(&em, "ProductionCode"), Some(&s("2.1")));
   assert_eq!(
@@ -653,7 +653,7 @@ fn camera_info_kx_avi_byte_exact() {
     0x00, 0x7a, 0x30, 0x2d,
   ];
   let mut em = Vec::new();
-  emit_camera_info(CAMERAINFO_KX, true, &mut em);
+  emit_camera_info(CAMERAINFO_KX, ByteOrder::Big, true, &mut em);
   assert_eq!(find(&em, "ManufactureDate"), Some(&s("2009:09:04")));
   assert_eq!(find(&em, "ProductionCode"), Some(&s("2.3")));
   assert_eq!(
@@ -676,14 +676,14 @@ fn camera_info_production_code_serviced_suffix() {
     0x00, 0x00, 0x00, 0x05, // offset 4 InternalSerialNumber = 5
   ];
   let mut em = Vec::new();
-  emit_camera_info(block, true, &mut em);
+  emit_camera_info(block, ByteOrder::Big, true, &mut em);
   assert_eq!(
     find(&em, "ProductionCode"),
     Some(&s("8.1 (camera has been serviced)"))
   );
   // -n: the bare dotted string, no suffix.
   let mut emn = Vec::new();
-  emit_camera_info(block, false, &mut emn);
+  emit_camera_info(block, ByteOrder::Big, false, &mut emn);
   assert_eq!(find(&emn, "ProductionCode"), Some(&s("8.1")));
 }
 
@@ -713,7 +713,7 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // 8 bytes: only ManufactureDate (byte 4) is fully in range; ProductionCode needs
   // bytes 8-15, InternalSerialNumber needs byte 16 — both skipped.
   let mut em8 = Vec::new();
-  emit_camera_info(&CAMERAINFO_K10D[..8], true, &mut em8);
+  emit_camera_info(&CAMERAINFO_K10D[..8], ByteOrder::Big, true, &mut em8);
   assert_eq!(find(&em8, "ManufactureDate"), Some(&s("2007:09:13")));
   assert!(
     find(&em8, "ProductionCode").is_none(),
@@ -725,7 +725,7 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // 12 bytes: ManufactureDate in range, but ProductionCode's SECOND int32u (byte
   // 12-15) is out of range ⇒ ProductionCode skipped (both elements required).
   let mut em12 = Vec::new();
-  emit_camera_info(&CAMERAINFO_K10D[..12], true, &mut em12);
+  emit_camera_info(&CAMERAINFO_K10D[..12], ByteOrder::Big, true, &mut em12);
   assert_eq!(find(&em12, "ManufactureDate"), Some(&s("2007:09:13")));
   assert!(
     find(&em12, "ProductionCode").is_none(),
@@ -736,7 +736,7 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // 16 bytes: ManufactureDate + ProductionCode in range; InternalSerialNumber
   // (byte 16) skipped.
   let mut em16 = Vec::new();
-  emit_camera_info(&CAMERAINFO_K10D[..16], true, &mut em16);
+  emit_camera_info(&CAMERAINFO_K10D[..16], ByteOrder::Big, true, &mut em16);
   assert_eq!(find(&em16, "ManufactureDate"), Some(&s("2007:09:13")));
   assert_eq!(find(&em16, "ProductionCode"), Some(&s("2.1")));
   assert!(find(&em16, "InternalSerialNumber").is_none());
@@ -744,12 +744,12 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
 
   // 3 bytes: nothing in range (byte 4 absent) ⇒ zero emissions, no panic.
   let mut em3 = Vec::new();
-  emit_camera_info(&CAMERAINFO_K10D[..3], true, &mut em3);
+  emit_camera_info(&CAMERAINFO_K10D[..3], ByteOrder::Big, true, &mut em3);
   assert!(em3.is_empty(), "a block shorter than byte 4 emits nothing");
 
   // Empty block ⇒ zero emissions, no panic.
   let mut em0 = Vec::new();
-  emit_camera_info(&[], true, &mut em0);
+  emit_camera_info(&[], ByteOrder::Big, true, &mut em0);
   assert!(em0.is_empty());
 }
 
@@ -899,9 +899,14 @@ fn battery_info_kx_does_not_emit_k10d_ad_layout() {
     );
   }
   // PowerSource IS emitted for the K-x (its `Model !~ /K-3 Mark III/` gate
-  // holds); BodyBatteryState variant A does NOT match the K-x ⇒ suppressed.
+  // holds). The K-x fails BodyBatteryState variant A but matches variant B (the
+  // 5-entry "Close to Full" hash, `!~ /(K110D|K2000|K-m|K-3 Mark III)/`), so it
+  // emits BodyBatteryState (#311) — byte 1 mask 0xf0 = 4 → 'Close to Full'.
   assert!(find(&em, "PowerSource").is_some());
-  assert!(find(&em, "BodyBatteryState").is_none());
+  assert_eq!(
+    find(&em, "BodyBatteryState"),
+    Some(&TagValue::Str("Close to Full".into()))
+  );
 }
 
 #[test]
@@ -940,8 +945,14 @@ fn battery_info_istd_uses_raw_ad_variant() {
   assert!(find(&emn, "BodyBatteryADLoad").is_none());
   assert!(find(&emn, "GripBatteryADNoLoad").is_none());
   assert!(find(&emn, "GripBatteryADLoad").is_none());
-  assert!(find(&emn, "BodyBatteryState").is_none());
   assert!(find(&emn, "GripBatteryState").is_none());
+  // A `None` model fails variant A (`=~` on undef = false) but matches variant
+  // B's NEGATIVE gate (`!~ /(K110D|K2000|K-m|K-3 Mark III)/` on undef = TRUE), so
+  // BodyBatteryState emits — exactly as ExifTool would for an undef Model.
+  assert_eq!(
+    find(&emn, "BodyBatteryState"),
+    Some(&TagValue::Str("Close to Full".into()))
+  );
 }
 
 #[test]
@@ -1080,13 +1091,18 @@ fn battery_info_non_k10d_model_suppresses_ad_layout() {
     "GripBatteryADNoLoad",
     "GripBatteryADLoad",
     "GripBatteryState",
-    "BodyBatteryState",
   ] {
     assert!(
       find(&em, wrong).is_none(),
       "a K-5 must suppress the K10D BatteryInfo leaf {wrong}"
     );
   }
+  // BodyBatteryState is NOT a K10D-byte AD leaf — the K-5 matches variant B (the
+  // 5-entry hash), so it emits (byte 1 mask 0xf0 = 4 → 'Close to Full', #311).
+  assert_eq!(
+    find(&em, "BodyBatteryState"),
+    Some(&TagValue::Str("Close to Full".into()))
+  );
 }
 
 #[test]
@@ -1102,4 +1118,196 @@ fn lens_data_no_comment_only_gate_for_unconditional_leaves() {
   assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
   assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
   assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+}
+
+/// A crafted `%Pentax::FilterInfo` (`0x022a`) block with NON-ZERO
+/// SourceDirectoryIndex / SourceFileIndex. `%FilterInfo` is `FORMAT => 'int8u'`
+/// (`Pentax.pm:5663`), so the row keys are BYTE offsets: SourceDirectoryIndex (key
+/// 0) is the `int16u` at bytes 0-1 and SourceFileIndex (key 2) the `int16u` at
+/// bytes 2-3 — NOT element index 2 (which would be byte 4). Bytes
+/// `12 34 56 78 ab cd ..`: BigEndian → SourceDirectoryIndex `0x1234`,
+/// SourceFileIndex `0x5678`; LittleEndian → `0x3412` / `0x7856`. The two
+/// interpretations are DISTINCT, so the byte order is observable (unlike every
+/// real fixture, where both leaves are 0 and a wrong order is invisible).
+///
+/// Bytes 4-5 (`ab cd`) are a DECOY at the WRONG `int16u`-element-index offset the
+/// pre-fix code read SourceFileIndex from: they must NEVER appear in any emitted
+/// value, guarding against the element-index layout creeping back.
+const FILTERINFO_NONZERO: &[u8] = &[0x12, 0x34, 0x56, 0x78, 0xab, 0xcd, 0x00, 0x00];
+
+#[test]
+fn filter_info_non_ricoh_body_reads_big_endian() {
+  // `0x022a` is `$$self{Make}`-VARIANT-SELECTED (`Pentax.pm:3030-3043`): a
+  // non-RICOH body (here `Make => "PENTAX"`, the K-5 II) reads `%FilterInfo`
+  // BigEndian — NOT the parent IFD order. With a non-zero block, BE yields the
+  // raw values; this is the case the all-zero K-S2 record cannot exercise (the
+  // byte-order bug it would otherwise mask).
+  let mut em = Vec::new();
+  emit_filter_info(FILTERINFO_NONZERO, Some("PENTAX"), &mut em);
+  assert_eq!(
+    find(&em, "SourceDirectoryIndex"),
+    Some(&TagValue::I64(0x1234)),
+    "a non-RICOH body must read FilterInfo BigEndian"
+  );
+  // SourceFileIndex (key 2) is the int16u at BYTE 2 (FORMAT int8u ⇒ key = byte
+  // offset), so BE bytes 2-3 (`56 78`) ⇒ 0x5678 — NOT bytes 4-5 (`ab cd`).
+  assert_eq!(
+    find(&em, "SourceFileIndex"),
+    Some(&TagValue::I64(0x5678)),
+    "SourceFileIndex must read byte offset 2 (int8u-FORMAT key), not element index 2 (byte 4)"
+  );
+  // Regression: the pre-fix code read SourceFileIndex from bytes 4-5 (the decoy
+  // `ab cd`). No emitted value may equal that BE/LE decoy.
+  for e in &em {
+    assert_ne!(
+      e.value(),
+      &TagValue::I64(0xabcd),
+      "{}: bytes 4-5 (the element-index offset) must be IGNORED",
+      e.name()
+    );
+    assert_ne!(
+      e.value(),
+      &TagValue::I64(0xcdab),
+      "{}: bytes 4-5 (the element-index offset) must be IGNORED",
+      e.name()
+    );
+  }
+}
+
+#[test]
+fn filter_info_ricoh_body_reads_little_endian() {
+  // The RICOH arm (`Make =~ /^RICOH/`) reads `%FilterInfo` LittleEndian
+  // (`Pentax.pm:3032-3036`). The K-S2 / K-1 / K-3 / KP / K-70 fixtures all report
+  // `Make => "RICOH IMAGING COMPANY, LTD."` ⇒ this arm. With the same non-zero
+  // block the byte-swapped values prove the LE selection — distinct from the BE
+  // values above.
+  let mut em = Vec::new();
+  emit_filter_info(
+    FILTERINFO_NONZERO,
+    Some("RICOH IMAGING COMPANY, LTD."),
+    &mut em,
+  );
+  assert_eq!(
+    find(&em, "SourceDirectoryIndex"),
+    Some(&TagValue::I64(0x3412)),
+    "a RICOH body must read FilterInfo LittleEndian"
+  );
+  // SourceFileIndex at byte 2, LittleEndian ⇒ LE bytes 2-3 (`56 78`) → 0x7856.
+  assert_eq!(
+    find(&em, "SourceFileIndex"),
+    Some(&TagValue::I64(0x7856)),
+    "a RICOH body must read FilterInfo LittleEndian at byte offset 2"
+  );
+}
+
+#[test]
+fn filter_info_byte_order_is_make_forced_not_parent_order() {
+  // The bug the reviewer flagged: the old replay threaded the (LittleEndian) K-S2
+  // PARENT order. A PENTAX body whose parent IFD is LittleEndian must STILL read
+  // BigEndian — the order is forced by `$$self{Make}`, never inherited. Proven by
+  // the BE result for `Make => "PENTAX"` differing from the LE-parent value.
+  let mut be = Vec::new();
+  emit_filter_info(FILTERINFO_NONZERO, Some("PENTAX"), &mut be);
+  let mut le = Vec::new();
+  emit_filter_info(
+    FILTERINFO_NONZERO,
+    Some("RICOH IMAGING COMPANY, LTD."),
+    &mut le,
+  );
+  assert_ne!(
+    find(&be, "SourceDirectoryIndex"),
+    find(&le, "SourceDirectoryIndex"),
+    "RICOH and non-RICOH must decode the same bytes differently"
+  );
+  // A missing Make defaults to the non-RICOH (BigEndian) arm (`/^RICOH/` fails).
+  let mut none = Vec::new();
+  emit_filter_info(FILTERINFO_NONZERO, None, &mut none);
+  assert_eq!(
+    find(&none, "SourceDirectoryIndex"),
+    Some(&TagValue::I64(0x1234)),
+    "absent Make falls to the non-RICOH BigEndian arm"
+  );
+}
+
+/// A crafted `%Pentax::LevelInfoK3III` (`0x022b`) block (`int8s`): byte 1 =
+/// CameraOrientation; bytes 3-4 / 5-6 = RollAngle / PitchAngle (`int16s`,
+/// parent-order). `.. 03 .. 00 10 ff f0`: CameraOrientation raw 3 ("Rotate 90
+/// CW"); BigEndian RollAngle `0x0010`=16 → -8.0; PitchAngle `0xfff0`=-16 → +8.0.
+const LEVELINFO_K3III: &[u8] = &[0x00, 0x03, 0x00, 0x00, 0x10, 0xff, 0xf0, 0x00];
+
+#[test]
+fn level_info_k3iii_decodes_orientation_and_int16s_angles() {
+  // `%LevelInfoK3III` (`Pentax.pm:5771-5801`) — the K-3-III re-layout. The int16s
+  // RollAngle/PitchAngle honour the threaded parent order (here BigEndian). No
+  // PrintConv on the angles ⇒ the value is identical for `-j`/`-n`.
+  let mut em = Vec::new();
+  emit_level_info_k3iii(LEVELINFO_K3III, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "CameraOrientation"), Some(&s("Rotate 90 CW")));
+  assert_eq!(find(&em, "RollAngle"), Some(&TagValue::F64(-8.0)));
+  assert_eq!(find(&em, "PitchAngle"), Some(&TagValue::F64(8.0)));
+  // The K3III table has NO LevelOrientation / CompositionAdjust* leaves — they are
+  // the K-5-style `%LevelInfo`'s, and must NOT appear here.
+  assert!(find(&em, "LevelOrientation").is_none());
+  assert!(find(&em, "CompositionAdjustX").is_none());
+}
+
+#[test]
+fn level_info_k3iii_int16s_angles_follow_parent_order() {
+  // The int16s angles carry no per-table ByteOrder ⇒ inherit the parent order. A
+  // LittleEndian parent reads the SAME bytes byte-swapped (RollAngle `0x1000` =
+  // 4096 → -2048.0), proving the order is actually threaded (not hard-coded BE).
+  let mut em = Vec::new();
+  emit_level_info_k3iii(LEVELINFO_K3III, ByteOrder::Little, true, &mut em);
+  assert_eq!(find(&em, "RollAngle"), Some(&TagValue::F64(-2048.0)));
+  // PitchAngle bytes `ff f0` LE = `0xf0ff` = -3841 → -(-3841)/2 = 1920.5.
+  assert_eq!(find(&em, "PitchAngle"), Some(&TagValue::F64(1920.5)));
+}
+
+#[test]
+fn level_info_k3iii_model_gate_selects_variant() {
+  // The `0x022b` selector (`Pentax.pm:3044-3051`): only `/K-3 Mark III/` routes to
+  // `%LevelInfoK3III`. `is_k3_mark_iii` is the dispatcher's gate — a bare "PENTAX
+  // K-3" (the active fixture) must NOT match (no "Mark III"), so it stays on the
+  // K-5-style `%LevelInfo`.
+  assert!(is_k3_mark_iii(Some("PENTAX K-3 Mark III")));
+  assert!(!is_k3_mark_iii(Some("PENTAX K-3")));
+  assert!(!is_k3_mark_iii(Some("PENTAX K-S2")));
+  assert!(!is_k3_mark_iii(None));
+}
+
+#[test]
+fn face_info_decodes_faces_detected_and_position() {
+  // `%Pentax::FaceInfo` (0x0060, `Pentax.pm:3264-3280`): FacesDetected @0 (int8u),
+  // FacePosition @2 (int8u[2], space-joined "x y"). No PrintConv ⇒ identical for
+  // `-j`/`-n`.
+  let block: &[u8] = &[0x02, 0x00, 0x32, 0x28, 0x00];
+  let mut em = Vec::new();
+  emit_face_info(block, &mut em);
+  assert_eq!(find(&em, "FacesDetected"), Some(&TagValue::I64(2)));
+  assert_eq!(find(&em, "FacePosition"), Some(&s("50 40")));
+}
+
+#[test]
+fn face_info_0x0060_is_unconditional_not_k3iii_gated() {
+  // REGRESSION: the Main `0x0060` row (`Pentax.pm:2293-2297`) is a single `{...}`
+  // with NO `Condition` — UNLIKE the `0x022b` LevelInfo variant ARRAY. So 0x0060
+  // is decoded through `%FaceInfo` for EVERY body, the K-3 Mark III included; the
+  // K-3III's `%FaceInfoK3III` is a SEPARATE tag id (0x040b), not a 0x0060 model
+  // variant. `emit_face_info` therefore takes NO model argument: a K-3III's 0x0060
+  // must still emit FacesDetected/FacePosition (it is NOT suppressed, and is never
+  // re-decoded through the K3III int32u layout). Adding an `is_k3_mark_iii` gate to
+  // the 0x0060 dispatch arm would be a DIVERGENCE from ExifTool and would wrongly
+  // drop FaceInfo for a K-3III body — this test guards against that.
+  let block: &[u8] = &[0x01, 0x00, 0x10, 0x20, 0x00];
+  // The K3III gate that DOES apply to LevelInfo (0x022b) must NOT be consulted for
+  // FaceInfo: there is no code path that suppresses 0x0060 for a K-3III, so the
+  // emission is byte-identical whatever the body would be. We assert the K-5-style
+  // `%FaceInfo` decode is produced (FacesDetected present).
+  let mut em = Vec::new();
+  emit_face_info(block, &mut em);
+  assert_eq!(find(&em, "FacesDetected"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "FacePosition"), Some(&s("16 32")));
+  // Sanity: a body that WOULD match the LevelInfo K3III gate is still a normal
+  // FaceInfo producer at 0x0060 — the gate is unrelated to this table.
+  assert!(is_k3_mark_iii(Some("PENTAX K-3 Mark III")));
 }
