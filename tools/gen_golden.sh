@@ -143,18 +143,18 @@ case "$FIX" in
   Pentax.avi)
     EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
                   -x Pentax:ExtenderStatus -x Pentax:LevelIndicator) ;;
-  # `QuickTime_gopro_gpmf.mp4`: the QuickTime GPSCoordinates Composites (the
-  # `LocationInformation`-derived GPS) + the udta atoms this port does not decode
-  # (`ItemList:all` = ©too Encoder, `UserData:all` = LocationInformation) + the
-  # MOVIE-LEVEL `1QuickTime:HandlerType`/`HandlerVendorID` (the `1` prefix is
-  # ExifTool's family-1 qualifier — drops ONLY the moov-level "Metadata" handler
-  # exifast does not emit, KEEPING the `Track<N>:HandlerType` it does). The ported
+  # `QuickTime_gopro_gpmf.mp4`: the `LocationInformation`-derived QuickTime GPS
+  # Composites (the same `%QuickTime::Composite` deferral as the SP2/anafi arms).
+  # #361 — the udta atoms ARE now decoded byte-exact: `ItemList:Encoder` (©too),
+  # `UserData:LocationInformation` (`loci`), and the moov-level
+  # `QuickTime:HandlerType` ("Metadata", `mdir`) + `HandlerVendorID` ("Apple",
+  # `appl`). So `ItemList:all`/`UserData:all`/`1QuickTime:Handler*` are NO LONGER
+  # excluded. exifast emits NO `Composite:GPS*` here (no XMP altitude to seed the
+  # XMP composite), so a golden-only `-x` suffices. The ported
   # ImageSize/Megapixels/AvgBitrate/Rotation are kept.
   QuickTime_gopro_gpmf.mp4)
     EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
-                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition \
-                  -x ItemList:all -x UserData:all \
-                  -x 1QuickTime:HandlerType -x 1QuickTime:HandlerVendorID) ;;
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition) ;;
   # `QuickTime_gopro_hero6_gpmf.mp4` (#211): real GoPro HERO6 Black with the live
   # `gpmd` timed-GPS/sensor track (Track4) + the `fdsc` identity track (Track5).
   # UNLIKE `QuickTime_gopro_gpmf.mp4`, the moov-level GPS is the simple `udta`
@@ -176,28 +176,62 @@ case "$FIX" in
   # Rotation Composites byte-exact. The `-ee` output is byte-IDENTICAL to the
   # base (the `mett` metadata track carries NO per-sample timed telemetry that
   # bundled 13.59 surfaces — verified `-ee` == base), so there is no `.ee.*`
-  # golden. Dropped by name (unported subsystems, NOT `*:all` blanket):
-  #  * `XMP:all` — the QuickTime-embedded XMP packet (the `uuid`/`XMP_` payload,
-  #    18 `XMP-*` tags) is not decoded by this port;
-  #  * `ItemList:all` — the `moov/udta/meta`(`mdir`) ItemList/`ilst` atoms
-  #    (Title/Artist/ContentCreateDate/Encoder/CoverArt/GPSCoordinates) are not
-  #    walked, AND with them the udta-`meta` `mdir` handler's
-  #    `QuickTime:HandlerVendorID` (`appl` → "Apple") — exifast walks only the
-  #    `moov/meta`(`mdta`) handler (emitting `HandlerType` = "Metadata Tags", no
-  #    VendorID), so the VendorID is dropped with the ItemList container it
-  #    belongs to;
-  #  * `Keys:all` — the `moov/meta`(`mdta`) Keys table
-  #    (CompatibleBrands/MajorBrand/Balance) is not decoded;
-  #  * `AudioKeys:all` — the `AudioKeys:Balance` Keys leaf;
-  #  * `UserData:LocationInformation` — the `©xyz`/`loci`-derived structured
-  #    LocationInformation (exifast keeps the ported `UserData:Make`/`Model`);
-  #  * the `GPSCoordinates`-derived `Composite:GPS*` (Lat/Lon/Alt/AltRef/Lat&
-  #    LonRef/Position) — the unported QuickTime.pm:8668 GPSCoordinates Composite
-  #    table, the same deferral as the GoPro/SP2 arms.
+  # golden.
+  #
+  # #361: the embedded XMP packet, the udta/meta ItemList + HandlerVendorID, the
+  # moov/meta Keys, the audio-track AudioKeys, and the `loci` LocationInformation
+  # are ALL now decoded byte-exact (the `uuid`-XMP routes to the shared XMP
+  # parser; the `udta/meta`(`mdir`) `ilst` resolves via `%QuickTime::ItemList`;
+  # the `moov/meta`(`mdta`) `keys` add CompatibleBrands/MajorBrand/Balance; the
+  # audio `trak/meta`(`mdta`) `keys` → `AudioKeys:Balance`; `loci` →
+  # `UserData:LocationInformation`). So NONE of those are excluded anymore.
+  #
+  # ONLY the `Composite:GPS*` remain deferred: bundled synthesizes
+  # `Composite:GPSLatitude`/`Longitude`/`Altitude`/`AltitudeRef` from the
+  # `%QuickTime::Composite` `GPSCoordinates`/`LocationInformation` tables
+  # (QuickTime.pm:8668-8728) — NOT ported — which OVERRIDE the XMP-derived ones;
+  # plus `Composite:GPSLatitudeRef`/`GPSLongitudeRef` (the XMP composites) and the
+  # composite-on-composite `Composite:GPSPosition`. This is the SAME port-wide
+  # `%QuickTime::Composite` GPS deferral the GoPro/SP2 arms carry (it changes ~12
+  # goldens and needs same-name composite override resolution). exifast DOES
+  # emit one XMP-derived `Composite:GPSAltitude` (`326.3 m Above Sea Level`,
+  # byte-exact vs bundled for an XMP-only file but OVERRIDDEN here by the QT
+  # `326.39 m`), so the conformance test drops the `Composite:GPS*` from BOTH
+  # sides via its `excluded` arg (a golden-only `-x` would leave exifast's
+  # diverging value); the golden itself keeps the `-x` so the bundled side
+  # matches.
+  # `MP4_audiokeys_mute.mp4` (#361 R4/R7): a CRAFTED audio-only MP4 whose `soun`
+  # `trak/meta`(`mdta`) `keys` carries the full `%QuickTime::AudioKeys` spread —
+  # `Balance` (shared with `%Keys`), `Mute` (the int8u `Off`/`On` PrintConv
+  # entry, the table's SOLE conv), three NON-AudioKeys keys (`make`,
+  # `creationdate`, `acme.totally.bogus.zzz`) that `ProcessKeys` emits via its
+  # unknown-key DERIVE path (`AudioKeys:Make`/`Creationdate`/`AcmeTotallyBogusZzz`,
+  # conv-less — NOT the `%Keys` date conversion), the `manu`/`modl` UserData
+  # cross-table ids (`AudioKeys:Make`=CanonManu / `Model`), AND (#361 R7) two RAW
+  # `0xA9`-prefixed 4-cc ids `\xa9day`/`\xa9too` whose raw bytes reach the
+  # ItemList cross-table → `AudioKeys:ContentCreateDate` (`%iso8601Date`) /
+  # `AudioKeys:Encoder`. No GPS/XMP, so only the ported `Composite:AvgBitrate` is
+  # synthesized and KEPT (byte-exact). `System:all` is the sole exclusion.
+  MP4_audiokeys_mute.mp4) EXCLUDE_ARR+=(-x System:all) ;;
+  # `MP4_movie_keys.mov` (#361 R7): a CRAFTED movie-level `moov/meta`(`mdta`)
+  # `keys` box → the GENERIC `%QuickTime::Keys` resolver (a video trak, so NOT
+  # AudioKeys). Exercises the COMPLETE `ProcessKeys` order for the movie path:
+  #  * `com.apple.quicktime.acme.totally.bogus.zzz` → `Keys:AcmeTotallyBogusZzz`
+  #    (the unknown-key DERIVE — previously DROPPED, the [high] fix);
+  #  * raw `\xa9day` → `Keys:ContentCreateDate` (ItemList, `%iso8601Date`);
+  #  * raw `\xa9xyz` → `Keys:GPSCoordinates` (ItemList, ConvertISO6709 +
+  #    PrintGPSCoordinates);
+  #  * `manu` → `Keys:Make` (UserData, conv-less).
+  # As with the SP2/anafi arms, the unported `%QuickTime::Composite` GPS table
+  # (QuickTime.pm:8668, `Require => QuickTime:GPSCoordinates`) synthesizes
+  # `Composite:GPSLatitude`/`Longitude`/`GPSPosition` from `Keys:GPSCoordinates`;
+  # exifast emits none, so they are dropped by name. The ported
+  # ImageSize/Megapixels/AvgBitrate/Rotation are KEPT.
+  MP4_movie_keys.mov)
+    EXCLUDE_ARR+=(-x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSPosition) ;;
   MP4_parrot_anafi.mp4)
-    EXCLUDE_ARR+=(-x XMP:all -x ItemList:all -x Keys:all -x AudioKeys:all \
-                  -x UserData:LocationInformation -x QuickTime:HandlerVendorID \
-                  -x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
                   -x Composite:GPSLatitude -x Composite:GPSLongitude \
                   -x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
                   -x Composite:GPSPosition) ;;

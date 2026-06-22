@@ -2626,6 +2626,12 @@ pub struct QuickTimeUserData {
   /// GPSCoordinates — the copyright-symbol `xyz`, decoded from ISO 6709
   /// (QuickTime.pm:1657-1664).
   gps: Option<QuickTimeGps>,
+  /// `loci` LocationInformation — the 3gp location box decoded by the
+  /// `%QuickTime::UserData` `loci` RawConv (QuickTime.pm:1775-1818, group2
+  /// `Location`): the post-RawConv string `"<name> Role=… Lat=… Lon=… Alt=…
+  /// Body=… Notes=…"`. Mode-invariant (the RawConv is the only conversion).
+  /// Emitted under `QuickTime:UserData`.
+  location_information: Option<String>,
   /// `CAME` SerialNumberHash (QuickTime.pm:2120-2125, GoPro Hero4): the
   /// `ValueConv => 'unpack("H*",$val)'` result — the lower-case hex of the raw
   /// bytes. Code-valued, so HAND-ported (not in the generated conv-less map).
@@ -2670,6 +2676,7 @@ impl QuickTimeUserData {
       content_create_date: None,
       date_time_original: None,
       gps: None,
+      location_information: None,
       serial_number_hash: None,
       media_uid: None,
       convless: Vec::new(),
@@ -2768,6 +2775,13 @@ impl QuickTimeUserData {
     self.gps.as_ref()
   }
 
+  /// `loci` LocationInformation (the post-RawConv 3gp location string).
+  #[inline(always)]
+  #[must_use]
+  pub fn location_information(&self) -> Option<&str> {
+    self.location_information.as_deref()
+  }
+
   /// `CAME` SerialNumberHash (the `unpack("H*")` hex of the raw bytes).
   #[inline(always)]
   #[must_use]
@@ -2808,6 +2822,7 @@ impl QuickTimeUserData {
       && self.content_create_date.is_none()
       && self.date_time_original.is_none()
       && self.gps.is_none()
+      && self.location_information.is_none()
       && self.serial_number_hash.is_none()
       && self.media_uid.is_none()
       && self.convless.is_empty()
@@ -2936,6 +2951,13 @@ impl QuickTimeUserData {
     self
   }
 
+  /// Set `loci` LocationInformation (the post-RawConv 3gp location string).
+  #[inline(always)]
+  pub fn set_location_information(&mut self, v: Option<String>) -> &mut Self {
+    self.location_information = v;
+    self
+  }
+
   /// Set `CAME` SerialNumberHash (the `unpack("H*")` hex string).
   #[inline(always)]
   pub fn set_serial_number_hash(&mut self, v: Option<String>) -> &mut Self {
@@ -2986,7 +3008,16 @@ pub struct QuickTimeKeys {
   /// `location.ISO6709` GPSCoordinates, decoded from ISO 6709
   /// (QuickTime.pm:6701-6712). CONV-BEARING (`ConvertISO6709` + the
   /// `PrintGPSCoordinates` print-conv), so it is decoded into a typed field.
+  /// Also the sink for a cross-table `\xa9xyz` ItemList GPSCoordinates id (same
+  /// tag NAME + ValueConv), QuickTime.pm:9810/6589-6595.
   gps: Option<QuickTimeGps>,
+  /// `\xa9day` ContentCreateDate, ISO-8601 normalized (`%iso8601Date`,
+  /// QuickTime.pm:3511) — populated ONLY by the ItemList cross-table resolution
+  /// (QuickTime.pm:9810: an mdta `keys` id whose literal 4-cc is the
+  /// `©`-copyright `\xa9day` ItemList id). Distinct from [`Self::creation_date`]
+  /// because the ItemList tag NAME ("ContentCreateDate") differs from the
+  /// `%Keys` `creationdate` NAME ("CreationDate"); both copy `%iso8601Date`.
+  content_create_date: Option<String>,
   /// Every CONV-LESS `%QuickTime::Keys` atom (no `Format`, no `ValueConv`), as
   /// `(Name, value)` in walk order — the camera-identity keys
   /// (`Make`/`Model`/`Software`/`AndroidMake`/`AndroidModel`/`AndroidVersion`/
@@ -3007,6 +3038,16 @@ pub struct QuickTimeKeys {
   /// a number, an `AndroidCaptureFPS` written with a string flag emits the
   /// string — whereas the prior per-key typed fields handled only one flavor.
   convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
+  /// `player.movie.audio.mute` Mute (`%QuickTime::AudioKeys` ONLY,
+  /// QuickTime.pm:6912-6916) — the SOLE conv-BEARING AudioKeys entry: `Format =>
+  /// 'int8u'` + `PrintConv => { 0 => 'Off', 1 => 'On' }`. Stored as the
+  /// pre-PrintConv `data`-atom read (an int8u number for a numeric flag, or the
+  /// decoded string for a string flag — faithful to `ProcessMOV`'s Format-vs-
+  /// stringEncoding branch, QuickTime.pm:10396-10410); the `Off`/`On`/`Unknown
+  /// ($val)` PrintConv is applied at emit (mode-dependent, raw int at `-n`).
+  /// Only ever set on the audio-track `meta` path (the movie-level `%Keys` is
+  /// resolved through the separate generic resolver); `None` otherwise.
+  mute: Option<crate::value::TagValue>,
 }
 
 impl QuickTimeKeys {
@@ -3017,7 +3058,9 @@ impl QuickTimeKeys {
     Self {
       creation_date: None,
       gps: None,
+      content_create_date: None,
       convless: Vec::new(),
+      mute: None,
     }
   }
 
@@ -3125,7 +3168,15 @@ impl QuickTimeKeys {
     self.creation_date.as_deref()
   }
 
-  /// `location.ISO6709` GPSCoordinates.
+  /// The cross-table `\xa9day` ContentCreateDate (ISO-8601 normalized) — the
+  /// ItemList tag NAME distinct from [`Self::creation_date`].
+  #[inline(always)]
+  #[must_use]
+  pub fn content_create_date(&self) -> Option<&str> {
+    self.content_create_date.as_deref()
+  }
+
+  /// `location.ISO6709` GPSCoordinates (also the cross-table `\xa9xyz` sink).
   #[inline(always)]
   #[must_use]
   pub const fn gps(&self) -> Option<&QuickTimeGps> {
@@ -3146,7 +3197,28 @@ impl QuickTimeKeys {
   #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.creation_date.is_none() && self.gps.is_none() && self.convless.is_empty()
+    self.creation_date.is_none()
+      && self.gps.is_none()
+      && self.content_create_date.is_none()
+      && self.convless.is_empty()
+      && self.mute.is_none()
+  }
+
+  /// `player.movie.audio.mute` Mute — the pre-PrintConv `data`-atom read value
+  /// (an int8u number, or a decoded string for a string flag), `None` unless an
+  /// audio-track `meta` AudioKeys `mute` key was decoded. The `Off`/`On`/`Unknown
+  /// ($val)` PrintConv is applied by the emitter (see the field doc).
+  #[inline(always)]
+  #[must_use]
+  pub const fn mute(&self) -> Option<&crate::value::TagValue> {
+    self.mute.as_ref()
+  }
+
+  /// Set `player.movie.audio.mute` Mute (the pre-PrintConv `data`-atom value).
+  #[inline(always)]
+  pub fn set_mute(&mut self, v: Option<crate::value::TagValue>) -> &mut Self {
+    self.mute = v;
+    self
   }
 
   /// Set `creationdate` CreationDate.
@@ -3156,7 +3228,14 @@ impl QuickTimeKeys {
     self
   }
 
-  /// Set `location.ISO6709` GPSCoordinates.
+  /// Set the cross-table `\xa9day` ContentCreateDate.
+  #[inline(always)]
+  pub fn set_content_create_date(&mut self, v: Option<String>) -> &mut Self {
+    self.content_create_date = v;
+    self
+  }
+
+  /// Set `location.ISO6709` GPSCoordinates (also the cross-table `\xa9xyz` sink).
   #[inline(always)]
   pub fn set_gps(&mut self, v: Option<QuickTimeGps>) -> &mut Self {
     self.gps = v;
@@ -3178,6 +3257,116 @@ impl QuickTimeKeys {
 }
 
 impl Default for QuickTimeKeys {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The `moov/udta/meta` ItemList metadata (`%QuickTime::ItemList`,
+/// QuickTime.pm:3481-6623), decoded from the `ilst` `data`-atom items by their
+/// literal 4-character-code (`\xa9nam` Title, `\xa9ART` Artist, `\xa9day`
+/// ContentCreateDate, `\xa9too` Encoder, `covr` CoverArt, `\xa9xyz`
+/// GPSCoordinates …). Emitted under family-1 group `ItemList` (the
+/// `MOV-Movie-Track-UserData-Meta-ItemList` group-derivation, QuickTime.pm:374),
+/// distinct from the `moov/meta`(`mdta`) `keys`-resolved `ilst` that lands under
+/// `Keys` (QuickTime.pm:373).
+///
+/// Two tags carry a conversion and are decoded into typed fields: ContentCreateDate
+/// (`%iso8601Date`) and GPSCoordinates (`ConvertISO6709` + `PrintGPSCoordinates`).
+/// EVERY OTHER modeled ItemList tag is conv-less under the `FORMAT => 'string'`
+/// table (a plain string, or — `covr` / a binary `data` flag — the
+/// `(Binary data N bytes…)` placeholder), so it follows the same conv-less
+/// `data`-atom cascade as the UserData/Keys conv-less atoms and is stored in
+/// [`Self::convless`] by table Name in walk order.
+///
+/// **D8 — no public fields, accessors only.**
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickTimeItemList {
+  /// `\xa9day` ContentCreateDate, ISO-8601 normalized (`%iso8601Date`,
+  /// QuickTime.pm:3511). Conv-bearing ⇒ a typed field.
+  content_create_date: Option<String>,
+  /// `\xa9xyz` GPSCoordinates, decoded from ISO 6709 (QuickTime.pm:6589-6595).
+  /// Conv-bearing (`ConvertISO6709` + `PrintGPSCoordinates`) ⇒ a typed field.
+  gps: Option<QuickTimeGps>,
+  /// Every CONV-LESS ItemList `data` atom (Title / Artist / Encoder / CoverArt /
+  /// …) as `(Name, value)` in walk order. The `%QuickTime::ItemList` table is
+  /// `FORMAT => 'string'`, so a plain `data` atom reads as a string
+  /// ([`crate::value::TagValue::Str`]); a `Binary => 1` tag (`covr`) or a
+  /// non-string/non-numeric `data` flag yields the binary scalar-ref placeholder
+  /// ([`crate::value::TagValue::Bytes`]). Emitted verbatim under
+  /// `QuickTime:ItemList`.
+  convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
+}
+
+impl QuickTimeItemList {
+  /// An empty ItemList block (no item decoded).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      content_create_date: None,
+      gps: None,
+      convless: Vec::new(),
+    }
+  }
+
+  /// `\xa9day` ContentCreateDate (ISO-8601 normalized).
+  #[inline(always)]
+  #[must_use]
+  pub fn content_create_date(&self) -> Option<&str> {
+    self.content_create_date.as_deref()
+  }
+
+  /// `\xa9xyz` GPSCoordinates.
+  #[inline(always)]
+  #[must_use]
+  pub const fn gps(&self) -> Option<&QuickTimeGps> {
+    self.gps.as_ref()
+  }
+
+  /// The conv-less ItemList atoms, as `(Name, value)` in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn convless(&self) -> &[(smol_str::SmolStr, crate::value::TagValue)] {
+    &self.convless
+  }
+
+  /// `true` when no item was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.content_create_date.is_none() && self.gps.is_none() && self.convless.is_empty()
+  }
+
+  /// Set `\xa9day` ContentCreateDate.
+  #[inline(always)]
+  pub fn set_content_create_date(&mut self, v: Option<String>) -> &mut Self {
+    self.content_create_date = v;
+    self
+  }
+
+  /// Set `\xa9xyz` GPSCoordinates.
+  #[inline(always)]
+  pub fn set_gps(&mut self, v: Option<QuickTimeGps>) -> &mut Self {
+    self.gps = v;
+    self
+  }
+
+  /// Record a conv-less ItemList atom by its tag NAME and decoded value,
+  /// preserving walk order.
+  #[inline(always)]
+  pub fn push_convless(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    value: crate::value::TagValue,
+  ) -> &mut Self {
+    self.convless.push((name.into(), value));
+    self
+  }
+}
+
+impl Default for QuickTimeItemList {
   #[inline(always)]
   fn default() -> Self {
     Self::new()
@@ -3293,8 +3482,18 @@ pub struct QuickTimeMeta {
   meta_handler_description: Option<String>,
   /// **SP2** — the `moov/udta` camera/metadata atoms. [`QuickTimeUserData`].
   user_data: QuickTimeUserData,
-  /// **SP2** — the `moov/meta` Keys/ItemList camera/metadata. [`QuickTimeKeys`].
+  /// **SP2** — the `moov/meta`(`mdta`) `keys`-resolved metadata, emitted under
+  /// family-1 group `Keys`. [`QuickTimeKeys`].
   keys: QuickTimeKeys,
+  /// The `moov/udta/meta`(`mdir`) `ilst` ItemList metadata (direct-4cc atoms),
+  /// emitted under family-1 group `ItemList`. [`QuickTimeItemList`].
+  item_list: QuickTimeItemList,
+  /// The audio-track `meta`(`mdta`) `keys`-resolved metadata (`%QuickTime::
+  /// AudioKeys`, QuickTime.pm:6895 — the `keys` Condition `MediaType eq "soun"`,
+  /// QuickTime.pm:2867-2870), emitted under family-1 group `AudioKeys`. Reuses
+  /// the [`QuickTimeKeys`] conv-less model (the AudioKeys table is also conv-less
+  /// apart from `Mute`). Empty for a file with no audio-track Keys box.
+  audio_keys: QuickTimeKeys,
 }
 
 impl QuickTimeMeta {
@@ -3334,6 +3533,8 @@ impl QuickTimeMeta {
       meta_handler_description: None,
       user_data: QuickTimeUserData::new(),
       keys: QuickTimeKeys::new(),
+      item_list: QuickTimeItemList::new(),
+      audio_keys: QuickTimeKeys::new(),
     }
   }
 
@@ -3824,6 +4025,32 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub const fn keys_mut(&mut self) -> &mut QuickTimeKeys {
     &mut self.keys
+  }
+
+  /// The decoded `moov/udta/meta` ItemList metadata (group `ItemList`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn item_list(&self) -> &QuickTimeItemList {
+    &self.item_list
+  }
+
+  /// Mutable access to the ItemList block (decode seam).
+  #[inline(always)]
+  pub const fn item_list_mut(&mut self) -> &mut QuickTimeItemList {
+    &mut self.item_list
+  }
+
+  /// The decoded audio-track Keys metadata (group `AudioKeys`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_keys(&self) -> &QuickTimeKeys {
+    &self.audio_keys
+  }
+
+  /// Mutable access to the audio-track Keys block (decode seam).
+  #[inline(always)]
+  pub const fn audio_keys_mut(&mut self) -> &mut QuickTimeKeys {
+    &mut self.audio_keys
   }
 
   /// **SP2** — set the `moov/meta` HandlerType (`hdlr` subtype).
