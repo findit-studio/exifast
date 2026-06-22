@@ -1413,6 +1413,149 @@ fn text_font_value(v: u16, print_conv: bool) -> crate::value::TagValue {
   }
 }
 
+/// The `%QuickTime::ChannelLayout` `AudioChannelTypes` BITMASK labels
+/// (QuickTime.pm:7996-8019), in bit order, for `DecodeBits`. The PrintConv hash
+/// is `{ BITMASK => {...} }` (NO direct `0 =>` key), so a value of `0` renders
+/// `(none)` and each set bit `n` renders its label (or `[n]` for an unlabeled
+/// bit), joined with `", "`. Default 32-bit word (no `BitsPerWord`).
+const AUDIO_CHANNEL_TYPE_BITS: &[(u8, &str)] = &[
+  (0, "Left"),
+  (1, "Right"),
+  (2, "Center"),
+  (3, "LFEScreen"),
+  (4, "LeftSurround"),
+  (5, "RightSurround"),
+  (6, "LeftCenter"),
+  (7, "RightCenter"),
+  (8, "CenterSurround"),
+  (9, "LeftSurroundDirect"),
+  (10, "RightSurroundDirect"),
+  (11, "TopCenterSurround"),
+  (12, "VerticalHeightLeft"),
+  (13, "VerticalHeightCenter"),
+  (14, "VerticalHeightRight"),
+  (15, "TopBackLeft"),
+  (16, "TopBackCenter"),
+  (17, "TopBackRight"),
+];
+
+/// Render the `chan` `AudioChannelTypes` `int32u` for `print_conv`
+/// (QuickTime.pm:7996-8019): the `{ BITMASK => {...} }` PrintConv → `DecodeBits`
+/// (`(none)` for `0`, the `", "`-joined labels otherwise). The bare raw int
+/// rides at `-n`.
+fn audio_channel_types_value(v: u32, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  TagValue::Str(
+    crate::convert::decode_bits(&std::format!("{v}"), Some(AUDIO_CHANNEL_TYPE_BITS), 0).into(),
+  )
+}
+
+/// Render the `chan` `LayoutFlags` `int16u` for `print_conv` (the
+/// `%QuickTime::ChannelLayout` PrintConv hash, QuickTime.pm:7893-7986): a direct
+/// key → its name, else `Unknown ($val)` (decimal, ExifTool.pm:3633). The bare
+/// raw int rides at `-n`. The hash covers `0`/`1` (UseDescriptions/UseBitmap),
+/// the `100..=183` named layouts, and `0xffff` (Unknown).
+fn layout_flags_value(v: u16, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  let name = match v {
+    0 => "UseDescriptions",
+    1 => "UseBitmap",
+    100 => "Mono",
+    101 => "Stereo",
+    102 => "StereoHeadphones",
+    103 => "MatrixStereo",
+    104 => "MidSide",
+    105 => "XY",
+    106 => "Binaural",
+    107 => "Ambisonic_B_Format",
+    108 => "Quadraphonic",
+    109 => "Pentagonal",
+    110 => "Hexagonal",
+    111 => "Octagonal",
+    112 => "Cube",
+    113 => "MPEG_3_0_A",
+    114 => "MPEG_3_0_B",
+    115 => "MPEG_4_0_A",
+    116 => "MPEG_4_0_B",
+    117 => "MPEG_5_0_A",
+    118 => "MPEG_5_0_B",
+    119 => "MPEG_5_0_C",
+    120 => "MPEG_5_0_D",
+    121 => "MPEG_5_1_A",
+    122 => "MPEG_5_1_B",
+    123 => "MPEG_5_1_C",
+    124 => "MPEG_5_1_D",
+    125 => "MPEG_6_1_A",
+    126 => "MPEG_7_1_A",
+    127 => "MPEG_7_1_B",
+    128 => "MPEG_7_1_C",
+    129 => "Emagic_Default_7_1",
+    130 => "SMPTE_DTV",
+    131 => "ITU_2_1",
+    132 => "ITU_2_2",
+    133 => "DVD_4",
+    134 => "DVD_5",
+    135 => "DVD_6",
+    136 => "DVD_10",
+    137 => "DVD_11",
+    138 => "DVD_18",
+    139 => "AudioUnit_6_0",
+    140 => "AudioUnit_7_0",
+    141 => "AAC_6_0",
+    142 => "AAC_6_1",
+    143 => "AAC_7_0",
+    144 => "AAC_Octagonal",
+    145 => "TMH_10_2_std",
+    146 => "TMH_10_2_full",
+    147 => "DiscreteInOrder",
+    148 => "AudioUnit_7_0_Front",
+    149 => "AC3_1_0_1",
+    150 => "AC3_3_0",
+    151 => "AC3_3_1",
+    152 => "AC3_3_0_1",
+    153 => "AC3_2_1_1",
+    154 => "AC3_3_1_1",
+    155 => "EAC_6_0_A",
+    156 => "EAC_7_0_A",
+    157 => "EAC3_6_1_A",
+    158 => "EAC3_6_1_B",
+    159 => "EAC3_6_1_C",
+    160 => "EAC3_7_1_A",
+    161 => "EAC3_7_1_B",
+    162 => "EAC3_7_1_C",
+    163 => "EAC3_7_1_D",
+    164 => "EAC3_7_1_E",
+    165 => "EAC3_7_1_F",
+    166 => "EAC3_7_1_G",
+    167 => "EAC3_7_1_H",
+    168 => "DTS_3_1",
+    169 => "DTS_4_1",
+    170 => "DTS_6_0_A",
+    171 => "DTS_6_0_B",
+    172 => "DTS_6_0_C",
+    173 => "DTS_6_1_A",
+    174 => "DTS_6_1_B",
+    175 => "DTS_6_1_C",
+    176 => "DTS_7_0",
+    177 => "DTS_7_1",
+    178 => "DTS_8_0_A",
+    179 => "DTS_8_0_B",
+    180 => "DTS_8_1_A",
+    181 => "DTS_8_1_B",
+    182 => "DTS_6_1_D",
+    183 => "AAC_7_1_B",
+    0xffff => "Unknown",
+    _ => return TagValue::Str(std::format!("Unknown ({v})").into()),
+  };
+  TagValue::Str(name.into())
+}
+
 /// Render the `%QuickTime::AudioKeys` `Mute` value (QuickTime.pm:6912-6916) for
 /// `print_conv`: the `PrintConv => { 0 => 'Off', 1 => 'On' }` hash at `-j`, the
 /// raw pre-PrintConv value at `-n`. `value` is the stored `data`-atom read (an
@@ -2612,6 +2755,37 @@ fn decode_btrt(body: &[u8]) -> Option<Bitrate> {
   Some(b)
 }
 
+/// Decode a `chan` `AudioChannelLayout` sub-atom via `%QuickTime::ChannelLayout`
+/// (QuickTime.pm:7886-8090, `ProcessBinaryData`). `body` is the atom payload
+/// after the `[size][type]` header (offset 0 = the version+flags word).
+///
+/// Faithful tag subset (the BlackVue/`UseBitmap` path):
+///  - `LayoutFlags` (offset 4, `int16u`) — always read; stashed as the
+///    `$$self{LayoutFlags}` `DATAMEMBER` that conditions the rest.
+///  - `AudioChannelTypes` (offset 8, `int32u`) — `Condition => '$$self{LayoutFlags}
+///    == 1'` (the bitmap form). The non-bitmap `AudioChannels` (offset 6,
+///    `Condition => 'LayoutFlags != 0 and != 1'`) and the `UseDescriptions`
+///    per-channel arrays are NOT in scope here (BlackVue is `LayoutFlags == 1`).
+///  - `NumChannelDescriptions` (offset 12, `int32u`) — same `LayoutFlags == 1`
+///    condition; gates the (here-empty) `Channel<N>Label`/… description tags.
+///
+/// Each field read is independent and bounds-checked (a short box leaves the
+/// missing fields `None`); `ReadValue` would `return undef` past the end too.
+fn decode_chan(body: &[u8], a: &mut AudioSampleDesc) {
+  // LayoutFlags — `int16u` at offset 4 (QuickTime.pm:7892, the DATAMEMBER).
+  let layout_flags = be_u16(body, 4);
+  a.set_channel_layout_flags(layout_flags);
+  // The conditional tags fire ONLY for the bitmap layout (`LayoutFlags == 1`,
+  // QuickTime.pm:7997/8022). A `LayoutFlags` of 0 (UseDescriptions) or a named
+  // enum (>= 100) leaves AudioChannelTypes/NumChannelDescriptions `None`.
+  if layout_flags == Some(1) {
+    // AudioChannelTypes — `int32u` at offset 8 (BITMASK PrintConv).
+    a.set_audio_channel_types(be_u32(body, 8));
+    // NumChannelDescriptions — `int32u` at offset 12 (no conversion).
+    a.set_num_channel_descriptions(be_u32(body, 12));
+  }
+}
+
 /// Read a fixed-count `int16u[n]` array at byte `off` and join the values with
 /// single spaces (the ExifTool `join(" ", unpack ...)` ValueConv shape —
 /// `OpColor` / `GenOpColor` / `TextColor` / `BackgroundColor` are all
@@ -2903,10 +3077,17 @@ fn decode_audio_child_atoms(entry: &[u8], child_pos: Option<usize>, a: &mut Audi
     entry.len(),
     &mut sink,
     |atom, body, _w| {
-      if &atom.atom_type == b"btrt"
-        && let Some(b) = decode_btrt(body)
-      {
-        a.fold_bitrate_priority0(b);
+      match &atom.atom_type {
+        b"btrt" => {
+          if let Some(b) = decode_btrt(body) {
+            a.fold_bitrate_priority0(b);
+          }
+        }
+        // `chan` AudioChannelLayout (`%QuickTime::ChannelLayout`,
+        // QuickTime.pm:7566-7568) — the audio sample-entry child carrying the
+        // LayoutFlags / AudioChannelTypes / NumChannelDescriptions.
+        b"chan" => decode_chan(body, a),
+        _ => {}
       }
     },
   );
@@ -3013,6 +3194,151 @@ fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<Stri
       // `scra` PreviewImage — `Binary => 1` (Kodak.pm:2989).
       b"scra" => {
         frea.set_preview_len(Some(ibody.len() as u64));
+      }
+      _ => {}
+    }
+  });
+}
+
+/// The `%QuickTime::Main` `free` atom's Pittasoft Condition (QuickTime.pm:572):
+/// `$$valPt =~ /^\0\0..(cprt|sttm|ptnm|ptrh|thum|gps |3gf )/s` — the BlackVue
+/// dashcam "free" data. The first two bytes are `\0\0` (the high half of the
+/// first child atom's big-endian size) and bytes 4..8 are one of the known
+/// Pittasoft child types. A `free` atom that fails this is plain padding (or
+/// the Kodak `Seri` / DJI-thermal variants — out of scope here).
+fn looks_like_pittasoft(body: &[u8]) -> bool {
+  // `^\0\0` then any two bytes, then a 4cc at offset 4 in the known set.
+  match body {
+    [0, 0, _, _, t0, t1, t2, t3, ..] => matches!(
+      &[*t0, *t1, *t2, *t3],
+      b"cprt" | b"sttm" | b"ptnm" | b"ptrh" | b"thum" | b"gps " | b"3gf "
+    ),
+    _ => false,
+  }
+}
+
+/// Decode the top-level `free` atom as the Pittasoft BlackVue dashcam
+/// SubDirectory (`%QuickTime::Pittasoft`, QuickTime.pm:570-573, 8488-8546) when
+/// its body matches [`looks_like_pittasoft`]. ExifTool re-uses `ProcessMOV` to
+/// walk it, so each child is a standard `[size:4][type:4][payload]` box. The
+/// decoded values land on [`QuickTimeMeta::pittasoft`]:
+///
+///  - `cprt` → **Copyright** (a plain string tag — trailing NULs stripped).
+///  - `sttm` → **StartTime** (`int64u` ms since 1970; `ConvertUnixTime` +
+///    `.%03d` fractional ms; mode-invariant).
+///  - `ptnm` → **OriginalFileName** (`ValueConv => 'substr($val, 4, -1)'`).
+///  - `thum` → **PreviewImage** (`Binary => 1`; the RawConv strips a leading
+///    4-byte big-endian length and yields that many image bytes → placeholder).
+///  - `gps ` → **GPSLog** (`Binary => 1`; trailing-NUL-stripped → placeholder.
+///    Its `ExtractEmbedded`-only GPS re-parse is the timed-metadata path, NOT
+///    reached here).
+///  - `3gf ` → **AccelData** → `Process_3gf` (QuickTimeStream.pl:2686-2708): at
+///    no-`ee` the box is truncated to its first 10-byte record (and raises the
+///    `EEWarn`), so the base path emits one `TimeCode` + one `Accelerometer`.
+///  - `ptrh` (a recursive container of `ptvi`/`ptso`) and `lte ` (unknown) emit
+///    nothing.
+fn decode_free_pittasoft(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
+    let pit = qt.pittasoft_mut();
+    match &inner.atom_type {
+      // `cprt` Copyright (QuickTime.pm:8491) — a plain string tag. Strip
+      // trailing NULs (the `s/\0+$//` a NUL-terminated MOV string carries) and
+      // emit the rest verbatim (the leading space is part of the value).
+      b"cprt" => {
+        let s = core::str::from_utf8(ibody)
+          .unwrap_or("")
+          .trim_end_matches('\0');
+        if !s.is_empty() {
+          pit.set_copyright(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `sttm` StartTime (QuickTime.pm:8536-8545) — `Format => 'int64u'` (8-byte
+      // big-endian ms since 1970, local TZ). ValueConv: `secs = int($val/1000)`,
+      // `ConvertUnixTime($secs) . sprintf(".%03d", $val - secs*1000)`. PrintConv
+      // `ConvertDateTime` reproduces the same string, so it is mode-invariant.
+      b"sttm" => {
+        if let Some(ms) = be_u64(ibody, 0) {
+          let secs = ms / 1000;
+          let frac = ms - secs * 1000;
+          // `convert_unix_time` takes the Unix-epoch seconds; the BlackVue value
+          // fits an `i64` (a 2026 timestamp). Append the fixed 3-digit ms.
+          let date = convert_unix_time(secs as i64);
+          let s = std::format!("{date}.{frac:03}");
+          pit.set_start_time(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `ptnm` OriginalFileName (QuickTime.pm:8504-8507) — `ValueConv =>
+      // 'substr($val, 4, -1)'`: drop the 4-byte `\x01\0\0\0` prefix AND the last
+      // byte (the trailing NUL). Perl `substr($val, 4, -1)` = bytes `[4 .. len-1)`.
+      b"ptnm" => {
+        if ibody.len() > 5
+          && let Some(slice) = ibody.get(4..ibody.len() - 1)
+          && let Ok(s) = core::str::from_utf8(slice)
+        {
+          pit.set_original_file_name(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `thum` PreviewImage (QuickTime.pm:8492-8503) — `Binary => 1`; RawConv:
+      // `return undef unless length $val > 4; $len = unpack('N',$val); return
+      // undef unless length $val >= 4 + $len; return substr($val, 4, $len)`. We
+      // record the DECODED image length ($len) for the placeholder.
+      b"thum" => {
+        if ibody.len() > 4
+          && let Some(len) = be_u32(ibody, 0)
+          && ibody.len() as u64 >= 4 + u64::from(len)
+        {
+          pit.set_preview_image_len(Some(u64::from(len)));
+        }
+      }
+      // `gps ` GPSLog (QuickTime.pm:8514-8525) — `Binary => 1`; RawConv strips
+      // trailing NULs (`$val =~ s/\0+$//`). The remaining byte count feeds the
+      // `(Binary data N bytes…)` placeholder. The `ExtractEmbedded` GPS re-parse
+      // (`ProcessGPSLog`) is the timed path; the base path emits the placeholder.
+      b"gps " => {
+        // `$val =~ s/\0+$//` — the byte count after trailing NULs are removed.
+        let stripped = ibody.len() - ibody.iter().rev().take_while(|&&b| b == 0).count();
+        if stripped > 0 {
+          pit.set_gps_log_len(Some(stripped as u64));
+        }
+      }
+      // `3gf ` AccelData (QuickTime.pm:8527-8534) → `Process_3gf`
+      // (QuickTimeStream.pl:2686-2708). 10-byte records `[tc:int32u]
+      // [x:int16s][y:int16s][z:int16s]`, x/y/z scaled by 1/10; a `0xffffffff`
+      // timecode terminates. Without `-ee` the directory is truncated to its
+      // FIRST record (and the `EEWarn` fires when there is more than one) — so
+      // the base path emits exactly one `TimeCode`/`Accelerometer` pair.
+      b"3gf " => {
+        // `Process_3gf` (QuickTimeStream.pl:2686-2708) reads 10-byte records
+        // `[timecode:int32u][x:int16s][y:int16s][z:int16s]` while
+        // `pos + RECORD_SIZE <= length` (the `while` loop, :2700). A partial
+        // trailing/first record is NEVER processed — so the no-`ee` base path
+        // must require a COMPLETE first record before emitting any tag.
+        const REC: usize = 10;
+        // QuickTimeStream.pl:2693 — `$dirLen > $recLen` (no `-ee`) sets the
+        // doc-level EEWarn (rendered as the base `ExifTool:Warning`).
+        if ibody.len() > REC {
+          pit.set_ee_warn(true);
+        }
+        // The first record (the only one the no-`ee` truncation keeps). Require
+        // the FULL 10-byte record present (`pos + REC <= len`, matching the
+        // stream decoder's strictness) — a truncated 4-9-byte box decodes NO
+        // record, so neither `TimeCode` nor `Accelerometer` is fabricated. Bounds
+        // -safe reads of every axis (no `unwrap_or(0)` filling a missing axis). A
+        // `0xffffffff` terminator first record emits nothing (the loop `last`s).
+        if ibody.len() >= REC
+          && let Some(tc) = be_u32(ibody, 0)
+          && tc != 0xffff_ffff
+          && let Some(x_raw) = be_i16(ibody, 4)
+          && let Some(y_raw) = be_i16(ibody, 6)
+          && let Some(z_raw) = be_i16(ibody, 8)
+        {
+          pit.set_time_code(Some(f64::from(tc) / 1000.0));
+          let x = f64::from(x_raw) / 10.0;
+          let y = f64::from(y_raw) / 10.0;
+          let z = f64::from(z_raw) / 10.0;
+          pit.set_accelerometer(Some(smol_str::SmolStr::new(std::format!("{x} {y} {z}"))));
+        }
       }
       _ => {}
     }
@@ -6764,6 +7090,40 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // Pass 1 so `KodakVersion` is populated BEFORE the `mdat` freeGPS
           // scan (which reads it to apply the Type-17b lat/lon scaling).
           b"frea" => decode_frea(body, &mut qt, &mut warning),
+          // The top-level `free` atom (QuickTime.pm:563-573 `%QuickTime::Main`
+          // Condition list). The in-scope arm is `Pittasoft` (BlackVue dashcam
+          // "free" data) — gated by [`looks_like_pittasoft`] (the KodakFree
+          // `Seri` and DJI-thermal `mdat` arms precede it but are out of scope).
+          // A non-Pittasoft `free` (plain padding / a freeGPS-bearing block the
+          // `mdat` scan handles) is a no-op here.
+          b"free" if looks_like_pittasoft(body) => {
+            // #159/#361 — the `3gf ` no-`ee` `EEWarn` is a DOCUMENT-level warning
+            // raised during this `free`/Pittasoft subdirectory walk. Stamp the
+            // file offset so `Meta::diagnostics` ranks it against a LATER
+            // truncated-`mdat` `ProcessMOV` warning by file position (the free
+            // atom precedes `mdat`, so the earlier EEWarn wins the bare
+            // `ExifTool:Warning`). The doc-level channel — NOT a `Track<N>` group —
+            // because the `free` atom is not a `trak` (no `SET_GROUP1` active).
+            //
+            // ExifTool's `Warn` adds each warning message ONCE, at the first
+            // call site (ExifTool.pm:5635-5639 — a repeat hits the `WAS_WARNED`
+            // cache and only bumps the count, never re-`FoundTag`s). So the
+            // `EEWarn`'s bare-`Warning` position is the offset of the FIRST
+            // `free`/Pittasoft atom whose `3gf ` actually RAISES it. Because
+            // `ee_warn` is sticky, stamp the offset ONLY when THIS atom is the
+            // raiser — the `false→true` transition across this decode — and only
+            // while still unset (`is_none`, a first-wins guard so a later raiser
+            // never overwrites the first); mirroring the embedded-XMP `uuid`
+            // first-warning-wins `get_or_insert` offset below.
+            let raised_before = qt.pittasoft().ee_warn();
+            decode_free_pittasoft(body, &mut qt, &mut warning);
+            if qt.pittasoft().ee_warn()
+              && !raised_before
+              && qt.pittasoft().ee_warn_offset().is_none()
+            {
+              qt.pittasoft_mut().set_ee_warn_offset(Some(pos as u64));
+            }
+          }
           // The top-level `skip` atom (QuickTime.pm:631-636 `%QuickTime::Main`
           // Condition list ⇒ `Image::ExifTool::QuickTime::SkipInfo` for a body
           // that looks like a QuickTime atom header) — the 70mai/Viofo A119
@@ -7691,7 +8051,38 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// (LigoGPS warnings fire DURING extraction — the trailer loop / `ScanMediaData`
   /// freeGPS pass — i.e. after the atom-walk `ProcessMOV` warning) keeps the
   /// earlier-extracted document warning, matching ExifTool's file order.
+  ///
+  /// The no-`ee` base mode (the faithful default the 2-arg
+  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) drives); the
+  /// `-ee`-sensitive Pittasoft `3gf ` `EEWarn` is folded in by
+  /// [`Self::diagnostics_with_options`].
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.diagnostics_inner(false)
+  }
+
+  /// `-ee`-threaded variant — the serializer's single mode-carrying entry. At
+  /// no-`ee` it adds the Pittasoft `3gf ` `EEWarn` (QuickTimeStream.pl:2693) to
+  /// the priority-0 / file-position first-wins `priority0` race at the
+  /// `free`/Pittasoft atom's offset, so it competes against the `ProcessMOV` /
+  /// HEIF / LigoGPS document warnings exactly like every other one (the
+  /// EARLIER-positioned warning becomes the bare `ExifTool:Warning`). At `-ee`
+  /// ExifTool processes every record and raises no `EEWarn`, so it is omitted.
+  fn diagnostics_with_options(
+    &self,
+    extract_embedded: bool,
+  ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.diagnostics_inner(extract_embedded)
+  }
+}
+
+impl Meta<'_> {
+  /// Build the document-level diagnostics for the given `-ee` mode (shared by
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) and
+  /// [`Diagnose::diagnostics_with_options`](crate::diagnostics::Diagnose)).
+  fn diagnostics_inner(
+    &self,
+    extract_embedded: bool,
+  ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     let mut out = std::vec::Vec::new();
     // SP4: the `ftyp`-dispatched brand walkers raise their own non-fatal walk
     // warnings (truncated iloc/iinf/ipma + `Item info entries are out of order`
@@ -7755,6 +8146,23 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
     }
     if let Some(w) = self.ligogps().warning() {
       priority0.push((u64::MAX, w));
+    }
+    // The Pittasoft BlackVue `3gf ` no-`ee` `EEWarn` (QuickTimeStream.pl:2693) —
+    // a DOCUMENT-level priority-0 `Warning` (the `free` atom is not a `trak`, so
+    // no `SET_GROUP1`). It is raised at the `free`/Pittasoft atom's file offset,
+    // which precedes `mdat`, so it joins THIS offset-ordered race: an EARLIER
+    // `free` `EEWarn` outranks a LATER truncated-`mdat` `ProcessMOV` warning,
+    // while a `ProcessMOV` warning positioned BEFORE the `free` atom (a
+    // walk-stopping truncation can't reach `free`, but an earlier-offset
+    // non-fatal one could) still leads. Gated on `!extract_embedded`: under `-ee`
+    // ExifTool processes every record and raises no `EEWarn`. `EE_WARNING`
+    // already carries the literal `[minor] ` prefix, so it rides `warn`
+    // (ignorable 0) verbatim — matching the in-stream `Track<N>:Warning` text.
+    if !extract_embedded && self.qt.pittasoft().ee_warn() {
+      priority0.push((
+        self.qt.pittasoft().ee_warn_offset().unwrap_or(u64::MAX),
+        EE_WARNING,
+      ));
     }
     // `HEIC`: the embedded-XMP warning is priority-0 — rank it by the `uuid`
     // atom's walk offset alongside the others (inserted LAST so a tie keeps the
@@ -8214,6 +8622,88 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+    }
+
+    // ── free / Pittasoft (BlackVue dashcam — QuickTime.pm:8488-8546) ────
+    // The top-level `free` atom's `%QuickTime::Pittasoft` SubDirectory tags. The
+    // table has no `GROUPS` override, so family-0/1 default to `QuickTime` (the
+    // `main()` group), verified vs the bundled `-G1` oracle. Emitted in the
+    // child file order (cprt → sttm → ptnm → thum → gps → 3gf). Every tag is a
+    // known table key ⇒ `unknown: false`.
+    let pit = self.qt.pittasoft();
+    if !pit.is_empty() {
+      // `cprt` Copyright — the raw string (mode-invariant).
+      if let Some(s) = pit.copyright() {
+        tags.push(EmittedTag::new(
+          main(),
+          "Copyright".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `sttm` StartTime — the pre-formatted `YYYY:MM:DD HH:MM:SS.sss` date
+      // (mode-invariant: ValueConv and PrintConv produce the same string).
+      if let Some(s) = pit.start_time() {
+        tags.push(EmittedTag::new(
+          main(),
+          "StartTime".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `ptnm` OriginalFileName — `substr($val, 4, -1)` (mode-invariant).
+      if let Some(s) = pit.original_file_name() {
+        tags.push(EmittedTag::new(
+          main(),
+          "OriginalFileName".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `thum` PreviewImage — `Binary => 1` ⇒ the `(Binary data N bytes…)`
+      // placeholder (the DECODED image length) in BOTH modes.
+      if let Some(len) = pit.preview_image_len() {
+        tags.push(EmittedTag::new(
+          main(),
+          "PreviewImage".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
+      // `gps ` GPSLog — `Binary => 1` ⇒ the placeholder (the NUL-stripped
+      // length) in BOTH modes.
+      if let Some(len) = pit.gps_log_len() {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSLog".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
+      // `3gf ` AccelData → the no-`ee` first-record TimeCode + Accelerometer
+      // (`Process_3gf`). TimeCode is a bare number; Accelerometer a string. Both
+      // mode-invariant (no PrintConv on either Stream-table tag).
+      if let Some(tc) = pit.time_code() {
+        tags.push(EmittedTag::new(
+          main(),
+          "TimeCode".into(),
+          TagValue::F64(tc),
+          false,
+        ));
+      }
+      if let Some(s) = pit.accelerometer() {
+        tags.push(EmittedTag::new(
+          main(),
+          "Accelerometer".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // The Pittasoft `3gf ` no-`ee` `EEWarn` is NOT a tag — it is a
+      // DOCUMENT-level `Warning` raised at the `free`/Pittasoft atom offset, so
+      // it flows through the offset-ordered priority-0 first-wins drain in
+      // `Meta::diagnostics_with_options` (the same #159/#361 race as the
+      // `ProcessMOV`/HEIF/LigoGPS warnings), not the tag stream here.
     }
 
     // ── per-track (tkhd / mdhd / hdlr) ─────────────────────────────────
@@ -9104,6 +9594,42 @@ impl crate::emit::Taggable for Meta<'_> {
         // first-wins handling as the visual btrt.
         if let Some(bt) = a.bitrate() {
           emit_bitrate(&mut tags, &track_group, &mut first_seen, grp, bt);
+        }
+        // `chan` AudioChannelLayout (`%QuickTime::ChannelLayout`, QuickTime.pm:
+        // 7886-8090) — the sample-entry child's LayoutFlags / AudioChannelTypes /
+        // NumChannelDescriptions, in the table's byte order. LayoutFlags is the
+        // `int16u` enum; AudioChannelTypes/NumChannelDescriptions are present
+        // only for the `LayoutFlags == 1` (UseBitmap) form (decoded conditionally
+        // in `decode_chan`).
+        if let Some(lf) = a.channel_layout_flags()
+          && first_seen(grp, "LayoutFlags")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "LayoutFlags".into(),
+            layout_flags_value(lf, print_conv),
+            false,
+          ));
+        }
+        if let Some(act) = a.audio_channel_types()
+          && first_seen(grp, "AudioChannelTypes")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioChannelTypes".into(),
+            audio_channel_types_value(act, print_conv),
+            false,
+          ));
+        }
+        if let Some(ncd) = a.num_channel_descriptions()
+          && first_seen(grp, "NumChannelDescriptions")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "NumChannelDescriptions".into(),
+            TagValue::U64(u64::from(ncd)),
+            false,
+          ));
         }
       }
       // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
@@ -19422,6 +19948,246 @@ mod tests {
       warnings.first().map(String::as_str),
       Some("Invalid atom size"),
       "the atom warning must surface when there is no meta warning, got {warnings:?}"
+    );
+  }
+
+  /// Build a top-level Pittasoft `free` atom whose sole child is a `3gf ` box
+  /// carrying `gf_payload` (the Condition wants `\0\0` then a known 4cc at
+  /// offset 4 — `atom(b"3gf ", …)` already starts `[0,0,0,size,'3','g','f',' ']`).
+  #[cfg(feature = "alloc")]
+  fn pittasoft_free_with_3gf(gf_payload: &[u8]) -> std::vec::Vec<u8> {
+    atom(b"free", &atom(b"3gf ", gf_payload))
+  }
+
+  /// FINDING 1 — a TRUNCATED first `3gf ` record (4-9 bytes: a readable 4-byte
+  /// timecode but no complete 10-byte record) must emit NEITHER `TimeCode` NOR
+  /// `Accelerometer`. `Process_3gf` (QuickTimeStream.pl:2700) reads records while
+  /// `pos + RECORD_SIZE <= length`; a partial first record is never processed, so
+  /// the no-`ee` base path must not fabricate the missing accel axes via a
+  /// zero-fill. Covers every short length 4..=9 (each has a decodable timecode).
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn truncated_3gf_first_record_emits_no_timecode_or_accelerometer() {
+    for len in 4..=9usize {
+      // A non-terminator timecode in the first 4 bytes + however many accel
+      // bytes the short length carries (an incomplete record).
+      let mut gf = std::vec::Vec::new();
+      gf.extend_from_slice(&1234u32.to_be_bytes()); // timecode (not 0xffffffff)
+      gf.extend(std::iter::repeat_n(0x11u8, len - 4)); // 0..5 stray accel bytes
+      assert_eq!(gf.len(), len);
+      let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+      data.extend(pittasoft_free_with_3gf(&gf));
+      let meta = parse_inner(&data, None).expect("accepted");
+      let pit = meta.quicktime().pittasoft();
+      assert_eq!(
+        pit.time_code(),
+        None,
+        "a truncated {len}-byte 3gf record must NOT emit TimeCode"
+      );
+      assert_eq!(
+        pit.accelerometer(),
+        None,
+        "a truncated {len}-byte 3gf record must NOT emit Accelerometer (no zero-fill)"
+      );
+      // The single short record is NOT "more than one record" ⇒ no EEWarn.
+      assert!(
+        !pit.ee_warn(),
+        "a single short 3gf record raises no no-ee EEWarn"
+      );
+    }
+
+    // Control: a COMPLETE 10-byte first record DOES emit both (no regression).
+    let mut gf = std::vec::Vec::new();
+    gf.extend_from_slice(&0u32.to_be_bytes()); // timecode 0 ⇒ TimeCode 0.0
+    gf.extend_from_slice(&(-126i16).to_be_bytes()); // x = -12.6
+    gf.extend_from_slice(&2i16.to_be_bytes()); // y = 0.2
+    gf.extend_from_slice(&31i16.to_be_bytes()); // z = 3.1
+    assert_eq!(gf.len(), 10);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend(pittasoft_free_with_3gf(&gf));
+    let meta = parse_inner(&data, None).expect("accepted");
+    let pit = meta.quicktime().pittasoft();
+    assert_eq!(pit.time_code(), Some(0.0), "complete record emits TimeCode");
+    assert_eq!(
+      pit.accelerometer(),
+      Some("-12.6 0.2 3.1"),
+      "complete record emits Accelerometer"
+    );
+  }
+
+  /// FINDING 2 — the Pittasoft `3gf ` no-`ee` `EEWarn` participates in the
+  /// document-level offset-ordered priority-0 first-wins drain (#159/#361): a
+  /// file whose EARLY `free`/Pittasoft atom raises the `EEWarn` (a multi-record
+  /// `3gf `) FOLLOWED BY a LATER truncated `mdat` (→ the `ProcessMOV` `Truncated
+  /// 'mdat' data` warning) must surface the EARLIER `EEWarn` as the bare
+  /// `ExifTool:Warning` — exactly the offset model, NOT a side hook that blindly
+  /// leads the slot. At `-ee` the `EEWarn` is absent (ExifTool processes every
+  /// record), so the later `mdat` warning leads instead.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn pittasoft_3gf_eewarn_orders_by_offset_against_later_mdat_warning() {
+    // EARLY: a `free`/Pittasoft with a TWO-record `3gf ` (20 bytes > 10 ⇒ EEWarn).
+    let mut gf = std::vec::Vec::new();
+    for tc in [10u32, 20u32] {
+      gf.extend_from_slice(&tc.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+    }
+    assert_eq!(gf.len(), 20);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let free_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&gf));
+    // LATER: a truncated `mdat` — declared size overruns EOF ⇒ a `ProcessMOV`
+    // `Truncated 'mdat' data …` warning at this (higher) offset.
+    let mdat_off = data.len();
+    data.extend_from_slice(&64u32.to_be_bytes()); // declared 64-byte atom …
+    data.extend_from_slice(b"mdat");
+    data.extend_from_slice(&[0u8; 8]); // … but only 8 payload bytes present
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    let mdat_warning = meta.warning().expect("truncated mdat warns").to_string();
+    // Sanity: the EEWarn fired and is stamped at the EARLIER `free` offset; the
+    // `mdat` truncation is a LATER `ProcessMOV` warning.
+    assert!(
+      meta.quicktime().pittasoft().ee_warn(),
+      "the two-record 3gf raises the no-ee EEWarn"
+    );
+    assert_eq!(
+      meta.quicktime().pittasoft().ee_warn_offset(),
+      Some(free_off),
+      "the EEWarn is stamped at the free/Pittasoft atom offset"
+    );
+    assert!(
+      mdat_warning.starts_with("Truncated 'mdat' data"),
+      "the mdat truncation warns, got {mdat_warning:?}"
+    );
+    assert_eq!(meta.warning_offset(), Some(mdat_off as u64));
+    assert!(
+      free_off < mdat_off as u64,
+      "the free/Pittasoft EEWarn is positioned earlier than the mdat warning"
+    );
+
+    // No-`ee`: the EARLIER EEWarn wins the bare `ExifTool:Warning`, the `mdat`
+    // warning still surfaces (just after it).
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some(EE_WARNING),
+      "the earlier 3gf EEWarn must win the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.contains(&mdat_warning),
+      "the later mdat warning still surfaces, got {warnings:?}"
+    );
+
+    // `-ee`: ExifTool raises no EEWarn (it processes every record), so the LATER
+    // `mdat` warning leads and the EEWarn is absent entirely.
+    let mut ee = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics_with_options(&meta, true, &mut ee);
+    assert_eq!(
+      ee.first_warning(),
+      Some(mdat_warning.as_str()),
+      "at -ee the EEWarn is gone and the mdat warning leads"
+    );
+    assert!(
+      !ee.warnings().iter().any(|w| w == EE_WARNING),
+      "at -ee no 3gf EEWarn is emitted at all"
+    );
+  }
+
+  /// FINDING (R2-follow-up, mirrors #361 R4) — with MULTIPLE `free`/Pittasoft
+  /// atoms the `EEWarn` offset must follow the FIRST atom whose `3gf ` actually
+  /// RAISES it, never a later one. ExifTool's `Warn` `FoundTag`s each message
+  /// once (ExifTool.pm:5635-5639 — a repeat only bumps the `WAS_WARNED` count),
+  /// so the bare-`Warning`'s file position is the FIRST raiser's offset. A later
+  /// `free` (whether it raises the `EEWarn` again or carries a clean single
+  /// record) must NOT overwrite the earlier raiser's stamp — otherwise the
+  /// `EEWarn` would mis-rank against the offset-ordered doc-warning race.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn pittasoft_eewarn_offset_is_first_raiser_across_multiple_free_atoms() {
+    // A `3gf ` payload of `n` complete 10-byte records (all zero accel).
+    let three_gf = |n: usize| {
+      let mut gf = std::vec::Vec::new();
+      for tc in 0..n as u32 {
+        gf.extend_from_slice(&(10 * (tc + 1)).to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+      }
+      gf
+    };
+
+    // EARLY `free`/Pittasoft: a TWO-record `3gf ` (20 > 10 ⇒ raises the EEWarn).
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let early_free_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&three_gf(2)));
+    // A LATER `free`/Pittasoft that ALSO raises (a three-record `3gf `): a later
+    // raiser must NOT overwrite the earlier first-raiser's offset.
+    let later_raiser_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&three_gf(3)));
+    // A LATER truncated `mdat` ⇒ a `ProcessMOV` warning at this higher offset.
+    let mdat_off = data.len() as u64;
+    data.extend_from_slice(&64u32.to_be_bytes()); // declared 64-byte atom …
+    data.extend_from_slice(b"mdat");
+    data.extend_from_slice(&[0u8; 8]); // … but only 8 payload bytes present
+    assert!(early_free_off < later_raiser_off && later_raiser_off < mdat_off);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      meta.quicktime().pittasoft().ee_warn(),
+      "a multi-record 3gf raises the no-ee EEWarn"
+    );
+    // The crux: the offset is the FIRST (earliest) raising `free` atom — the
+    // later raiser did NOT overwrite it.
+    assert_eq!(
+      meta.quicktime().pittasoft().ee_warn_offset(),
+      Some(early_free_off),
+      "the EEWarn offset must follow the FIRST raising free atom, not a later one"
+    );
+    // And it correctly wins the bare first-wins `ExifTool:Warning` at that early
+    // position over the LATER `mdat` `ProcessMOV` warning.
+    let mdat_warning = meta.warning().expect("truncated mdat warns").to_string();
+    assert!(mdat_warning.starts_with("Truncated 'mdat' data"));
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some(EE_WARNING),
+      "the early-raiser EEWarn wins the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.contains(&mdat_warning),
+      "the later mdat warning still surfaces"
+    );
+
+    // The complementary case: an EARLY raiser followed by a LATER NON-raising
+    // `free` (a clean SINGLE-record `3gf `). The non-raiser must not stamp/move
+    // the offset — it stays at the early raiser.
+    let mut data2 = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let early_off2 = data2.len() as u64;
+    data2.extend(pittasoft_free_with_3gf(&three_gf(2))); // raises
+    data2.extend(pittasoft_free_with_3gf(&three_gf(1))); // single record, no EEWarn
+    let meta2 = parse_inner(&data2, None).expect("accepted");
+    assert!(meta2.quicktime().pittasoft().ee_warn());
+    assert_eq!(
+      meta2.quicktime().pittasoft().ee_warn_offset(),
+      Some(early_off2),
+      "a later non-raising free atom must not overwrite the first-raiser offset"
+    );
+
+    // Mirror-image control: a NON-raising free FIRST, then a raising free — the
+    // offset follows the raiser (the non-raiser left it unstamped).
+    let mut data3 = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data3.extend(pittasoft_free_with_3gf(&three_gf(1))); // single record, no EEWarn
+    let raiser_off3 = data3.len() as u64;
+    data3.extend(pittasoft_free_with_3gf(&three_gf(2))); // raises
+    let meta3 = parse_inner(&data3, None).expect("accepted");
+    assert!(meta3.quicktime().pittasoft().ee_warn());
+    assert_eq!(
+      meta3.quicktime().pittasoft().ee_warn_offset(),
+      Some(raiser_off3),
+      "the offset follows the first RAISING free atom (the earlier non-raiser stamps nothing)"
     );
   }
 

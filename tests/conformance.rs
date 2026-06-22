@@ -11224,9 +11224,18 @@ fn png_rawprofile_xmp_conformance() {
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
 
-// #213 — BlackVue DR770X dashcam (PittaSoft): GPS, accelerometer, embedded JSON.
+// #362 / #213 — BlackVue DR770X dashcam (PittaSoft). The top-level
+// `free`/`%QuickTime::Pittasoft` SubDirectory (Copyright/StartTime/
+// OriginalFileName + the PreviewImage/GPSLog binary placeholders + the no-`ee`
+// first-record TimeCode/Accelerometer from `3gf `) and the audio `chan`
+// `%QuickTime::ChannelLayout` (LayoutFlags/AudioChannelTypes/
+// NumChannelDescriptions) are byte-exact at both `-j`/`-n`, plus the no-`ee`
+// `EEWarn` (the `3gf ` multi-record truncation, which outranks the later
+// truncated-`mdat` doc warning by file position). The ported Composites
+// (ImageSize/Megapixels/AvgBitrate/Rotation) are kept; only `System:all` is
+// excluded (the gen_golden arm). No `.ee.*` golden — `-ee` surfaces no timed
+// metadata for this file.
 #[test]
-#[ignore = "port gap: BlackVue PittaSoft GPS / accelerometer / embedded-JSON; see #213"]
 fn mp4_blackvue_dr770x_conformance() {
   check(
     "MP4_blackvue_dr770x.mp4",

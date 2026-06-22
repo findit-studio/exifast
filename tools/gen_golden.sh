@@ -213,6 +213,18 @@ case "$FIX" in
   # `AudioKeys:Encoder`. No GPS/XMP, so only the ported `Composite:AvgBitrate` is
   # synthesized and KEPT (byte-exact). `System:all` is the sole exclusion.
   MP4_audiokeys_mute.mp4) EXCLUDE_ARR+=(-x System:all) ;;
+  # `MP4_blackvue_dr770x.mp4` (#362): the REAL BlackVue DR770X dashcam (Pittasoft).
+  # exifast decodes the top-level `free`/`%QuickTime::Pittasoft` SubDirectory
+  # (Copyright/StartTime/OriginalFileName + the PreviewImage/GPSLog binary
+  # placeholders + the no-`ee` first-record TimeCode/Accelerometer from `3gf `)
+  # AND the audio `chan` `%QuickTime::ChannelLayout` (LayoutFlags/
+  # AudioChannelTypes/NumChannelDescriptions), byte-exact at both `-j`/`-n`. The
+  # ported `Composite:ImageSize`/`Megapixels`/`AvgBitrate`/`Rotation` are KEPT
+  # (no GPS Composite — the `gps ` GPSLog stays a binary placeholder, bundled
+  # surfaces no timed GPS even at `-ee`). `System:all` is the sole exclusion. No
+  # `.ee.*` golden: `-ee` adds no timed metadata (the only `-ee` delta is the
+  # `mdat`-trailer warning, which the no-`ee` `EEWarn` outranks at base).
+  MP4_blackvue_dr770x.mp4) EXCLUDE_ARR+=(-x System:all) ;;
   # `MP4_movie_keys.mov` (#361 R7): a CRAFTED movie-level `moov/meta`(`mdta`)
   # `keys` box → the GENERIC `%QuickTime::Keys` resolver (a video trak, so NOT
   # AudioKeys). Exercises the COMPLETE `ProcessKeys` order for the movie path:

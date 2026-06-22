@@ -989,6 +989,26 @@ pub struct AudioSampleDesc {
   /// so an `mp4a` descriptor's `btrt` surfaces here. `PRIORITY => 0`. `None`
   /// when the entry carries no `btrt`.
   bitrate: Option<Bitrate>,
+  /// `chan` `LayoutFlags` (`%QuickTime::ChannelLayout` offset 4, `int16u`,
+  /// QuickTime.pm:7892-7986). The `AudioChannelLayout` (`chan`) sample-entry
+  /// child decodes through `ProcessBinaryData`; `LayoutFlags` is its first tag
+  /// (a `DATAMEMBER` stashed for the conditional later tags). PrintConv maps the
+  /// known layout enums (`1 => 'UseBitmap'`, `100 => 'Mono'`, …); `-n` keeps the
+  /// raw `int16u`. `None` when the entry carries no `chan`.
+  channel_layout_flags: Option<u16>,
+  /// `chan` `AudioChannelTypes` (`%QuickTime::ChannelLayout` offset 8, `int32u`,
+  /// QuickTime.pm:7996-8019). Decoded ONLY when `LayoutFlags == 1` (the bitmap
+  /// channel-layout form); `PrintConv => { BITMASK => {...} }` (`Left`/`Right`/
+  /// `Center`/…, `DecodeBits`). `None` when there is no `chan` or
+  /// `LayoutFlags != 1`.
+  audio_channel_types: Option<u32>,
+  /// `chan` `NumChannelDescriptions` (`%QuickTime::ChannelLayout` offset 12,
+  /// `int32u`, QuickTime.pm:8021-8025). Decoded ONLY when `LayoutFlags == 1`;
+  /// no conversion (bare int both modes). It gates the per-channel description
+  /// tags (`Channel<N>Label`/…) — none of which BlackVue carries
+  /// (`NumChannelDescriptions == 0`). `None` when there is no `chan` or
+  /// `LayoutFlags != 1`.
+  num_channel_descriptions: Option<u32>,
 }
 
 impl AudioSampleDesc {
@@ -1003,6 +1023,9 @@ impl AudioSampleDesc {
       bits_per_sample: None,
       sample_rate: None,
       bitrate: None,
+      channel_layout_flags: None,
+      audio_channel_types: None,
+      num_channel_descriptions: None,
     }
   }
 
@@ -1047,6 +1070,29 @@ impl AudioSampleDesc {
   #[must_use]
   pub const fn bitrate(&self) -> Option<&Bitrate> {
     self.bitrate.as_ref()
+  }
+
+  /// `chan` `LayoutFlags` (raw `int16u`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn channel_layout_flags(&self) -> Option<u16> {
+    self.channel_layout_flags
+  }
+
+  /// `chan` `AudioChannelTypes` (raw `int32u`; present only when
+  /// `LayoutFlags == 1`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_channel_types(&self) -> Option<u32> {
+    self.audio_channel_types
+  }
+
+  /// `chan` `NumChannelDescriptions` (raw `int32u`; present only when
+  /// `LayoutFlags == 1`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn num_channel_descriptions(&self) -> Option<u32> {
+    self.num_channel_descriptions
   }
 
   /// Set `AudioFormat`.
@@ -1103,6 +1149,27 @@ impl AudioSampleDesc {
     }
   }
 
+  /// Set the `chan` `LayoutFlags`.
+  #[inline(always)]
+  pub const fn set_channel_layout_flags(&mut self, v: Option<u16>) -> &mut Self {
+    self.channel_layout_flags = v;
+    self
+  }
+
+  /// Set the `chan` `AudioChannelTypes`.
+  #[inline(always)]
+  pub const fn set_audio_channel_types(&mut self, v: Option<u32>) -> &mut Self {
+    self.audio_channel_types = v;
+    self
+  }
+
+  /// Set the `chan` `NumChannelDescriptions`.
+  #[inline(always)]
+  pub const fn set_num_channel_descriptions(&mut self, v: Option<u32>) -> &mut Self {
+    self.num_channel_descriptions = v;
+    self
+  }
+
   /// Fold a later `stsd` entry's Audio Sample Description into `self` with
   /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics (see
   /// [`VisualSampleDesc::merge_from`]): a `Some` field in `other` overrides,
@@ -1129,6 +1196,17 @@ impl AudioSampleDesc {
     // `btrt` is PRIORITY 0 (per-field first-wins), NOT last-wins.
     if let Some(other_bitrate) = other.bitrate {
       self.fold_bitrate_priority0(other_bitrate);
+    }
+    // `chan` ChannelLayout — a plain `ProcessBinaryData` SubDirectory (no
+    // PRIORITY override), so per-tag LAST-WINS like the fixed audio fields.
+    if other.channel_layout_flags.is_some() {
+      self.channel_layout_flags = other.channel_layout_flags;
+    }
+    if other.audio_channel_types.is_some() {
+      self.audio_channel_types = other.audio_channel_types;
+    }
+    if other.num_channel_descriptions.is_some() {
+      self.num_channel_descriptions = other.num_channel_descriptions;
     }
   }
 }
@@ -2444,6 +2522,234 @@ impl KodakFrea {
   }
 }
 
+/// Pittasoft BlackVue dashcam `free`-atom metadata
+/// (`%Image::ExifTool::QuickTime::Pittasoft`, QuickTime.pm:8488-8546). The
+/// top-level `free` atom whose body matches the Pittasoft Condition
+/// (QuickTime.pm:572 — `^\0\0..(cprt|sttm|ptnm|ptrh|thum|gps |3gf )`) is walked
+/// as a `ProcessMOV` SubDirectory; its child atoms decode to these `QuickTime`-
+/// grouped tags (the table has no `GROUPS` override → family-0/1 default
+/// `QuickTime`). `ptrh` is a recursive container (`ptvi`/`ptso`) ExifTool emits
+/// nothing from, and `lte ` is an unknown sibling — neither surfaces a tag.
+///
+/// **D8 — no public fields, accessors only.**
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Pittasoft {
+  /// `cprt` Copyright (QuickTime.pm:8491) — the raw string value (a plain
+  /// string tag, NUL-truncated). For BlackVue this is the leading-space nested
+  /// JSON status blob (`{"model":"DR770X",…}`), emitted verbatim in both modes.
+  copyright: Option<smol_str::SmolStr>,
+  /// `sttm` StartTime (QuickTime.pm:8536-8545) — the FORMATTED date string.
+  /// `Format => 'int64u'` (ms since 1970 local), `ValueConv` =
+  /// `ConvertUnixTime(int($val/1000)) . sprintf(".%03d", $val - secs*1000)`,
+  /// `PrintConv => ConvertDateTime` (which reproduces the same `YYYY:MM:DD
+  /// HH:MM:SS.sss`), so the value is mode-invariant. Stored pre-formatted.
+  start_time: Option<smol_str::SmolStr>,
+  /// `ptnm` OriginalFileName (QuickTime.pm:8504-8507) — `ValueConv =>
+  /// 'substr($val, 4, -1)'` (skip the 4-byte `\x01\0\0\0` prefix, drop the
+  /// trailing NUL). Mode-invariant.
+  original_file_name: Option<smol_str::SmolStr>,
+  /// `thum` PreviewImage (QuickTime.pm:8492-8503) — `Binary => 1`; the RawConv
+  /// strips a leading 4-byte big-endian length and returns that many image
+  /// bytes. We store the DECODED image byte length for the `(Binary data N
+  /// bytes …)` placeholder (the bytes are not retained). `None` when the
+  /// payload is too short or the declared length overruns it (the RawConv
+  /// `return undef`).
+  preview_image_len: Option<u64>,
+  /// `gps ` GPSLog (QuickTime.pm:8514-8525) — `Binary => 1` (an ASCII NMEA
+  /// track log). The RawConv strips trailing NULs and returns the remainder
+  /// (separately parsed to GPS only under `ExtractEmbedded`; for this fixture
+  /// `-ee` surfaces no extra GPS). We store the trailing-NUL-stripped byte
+  /// length for the placeholder.
+  gps_log_len: Option<u64>,
+  /// `3gf ` AccelData → the FIRST record's `TimeCode` (`Process_3gf`,
+  /// QuickTimeStream.pl:2703 — `$tc / 1000`). Without `-ee`, `Process_3gf`
+  /// truncates the box to its first 10-byte record (and raises the document
+  /// `EEWarn`), so the no-`ee` base path emits exactly this one value. `None`
+  /// when the box has no decodable record (or its first record is the
+  /// `0xffffffff` terminator).
+  time_code: Option<f64>,
+  /// `3gf ` AccelData → the FIRST record's `Accelerometer` (`Process_3gf`,
+  /// QuickTimeStream.pl:2704 — `"$x $y $z"`, each int16s/10). Paired with
+  /// [`Self::time_code`]; mode-invariant string.
+  accelerometer: Option<smol_str::SmolStr>,
+  /// `true` once a `3gf ` box was seen with MORE than one record at no-`ee` —
+  /// ExifTool's `EEWarn` ("[minor] The ExtractEmbedded option may find more
+  /// tags in the media data", QuickTimeStream.pl:2693-2694), the doc-level
+  /// `Warning` BlackVue raises in the base path. Tracked so the emitter can
+  /// surface it (priority-0 first-wins) without `-ee`.
+  ee_warn: bool,
+  /// The absolute file offset of the top-level `free`/Pittasoft atom whose
+  /// `3gf ` child raised [`Self::ee_warn`] (`None` when no EEWarn). The free
+  /// atom precedes `mdat` in file order, so this lets the document-level
+  /// diagnostics drain rank the `3gf ` `EEWarn` against a LATER truncated-`mdat`
+  /// `ProcessMOV` warning by file position — ExifTool emits `Warning` tags
+  /// priority-0 first-wins, so the EARLIER-positioned warning becomes the public
+  /// `ExifTool:Warning` (the #159/#361 offset-ordered first-wins mechanism).
+  ee_warn_offset: Option<u64>,
+}
+
+impl Pittasoft {
+  /// A fresh, empty Pittasoft decode (no `free`/Pittasoft sub-atom seen).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      copyright: None,
+      start_time: None,
+      original_file_name: None,
+      preview_image_len: None,
+      gps_log_len: None,
+      time_code: None,
+      accelerometer: None,
+      ee_warn: false,
+      ee_warn_offset: None,
+    }
+  }
+
+  /// `cprt` Copyright — the raw (NUL-truncated) string.
+  #[inline(always)]
+  #[must_use]
+  pub fn copyright(&self) -> Option<&str> {
+    self.copyright.as_deref()
+  }
+
+  /// `sttm` StartTime — the pre-formatted `YYYY:MM:DD HH:MM:SS.sss` string.
+  #[inline(always)]
+  #[must_use]
+  pub fn start_time(&self) -> Option<&str> {
+    self.start_time.as_deref()
+  }
+
+  /// `ptnm` OriginalFileName.
+  #[inline(always)]
+  #[must_use]
+  pub fn original_file_name(&self) -> Option<&str> {
+    self.original_file_name.as_deref()
+  }
+
+  /// `thum` PreviewImage — decoded image byte length (for the placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn preview_image_len(&self) -> Option<u64> {
+    self.preview_image_len
+  }
+
+  /// `gps ` GPSLog — trailing-NUL-stripped byte length (for the placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn gps_log_len(&self) -> Option<u64> {
+    self.gps_log_len
+  }
+
+  /// `3gf ` first-record TimeCode (`$tc / 1000`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn time_code(&self) -> Option<f64> {
+    self.time_code
+  }
+
+  /// `3gf ` first-record Accelerometer (`"$x $y $z"`).
+  #[inline(always)]
+  #[must_use]
+  pub fn accelerometer(&self) -> Option<&str> {
+    self.accelerometer.as_deref()
+  }
+
+  /// `true` when a multi-record `3gf ` box raised the no-`ee` `EEWarn`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn ee_warn(&self) -> bool {
+    self.ee_warn
+  }
+
+  /// The top-level `free`/Pittasoft atom file offset that raised the no-`ee`
+  /// `EEWarn` (`None` when no EEWarn) — the offset the document diagnostics
+  /// drain ranks against the other doc-level `Warning`s (#159/#361 first-wins).
+  #[inline(always)]
+  #[must_use]
+  pub const fn ee_warn_offset(&self) -> Option<u64> {
+    self.ee_warn_offset
+  }
+
+  /// `true` when no Pittasoft tag was decoded (the `free` atom was not a
+  /// Pittasoft container, or it carried only `ptrh`/`lte `).
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    self.copyright.is_none()
+      && self.start_time.is_none()
+      && self.original_file_name.is_none()
+      && self.preview_image_len.is_none()
+      && self.gps_log_len.is_none()
+      && self.time_code.is_none()
+      && self.accelerometer.is_none()
+  }
+
+  /// Record the `cprt` Copyright string.
+  #[inline(always)]
+  pub fn set_copyright(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.copyright = v;
+    self
+  }
+
+  /// Record the `sttm` StartTime (pre-formatted date string).
+  #[inline(always)]
+  pub fn set_start_time(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.start_time = v;
+    self
+  }
+
+  /// Record the `ptnm` OriginalFileName.
+  #[inline(always)]
+  pub fn set_original_file_name(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.original_file_name = v;
+    self
+  }
+
+  /// Record the `thum` PreviewImage decoded byte length.
+  #[inline(always)]
+  pub const fn set_preview_image_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.preview_image_len = v;
+    self
+  }
+
+  /// Record the `gps ` GPSLog (NUL-stripped) byte length.
+  #[inline(always)]
+  pub const fn set_gps_log_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.gps_log_len = v;
+    self
+  }
+
+  /// Record the `3gf ` first-record TimeCode.
+  #[inline(always)]
+  pub const fn set_time_code(&mut self, v: Option<f64>) -> &mut Self {
+    self.time_code = v;
+    self
+  }
+
+  /// Record the `3gf ` first-record Accelerometer.
+  #[inline(always)]
+  pub fn set_accelerometer(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.accelerometer = v;
+    self
+  }
+
+  /// Record that a multi-record `3gf ` box raised the no-`ee` `EEWarn`.
+  #[inline(always)]
+  pub const fn set_ee_warn(&mut self, v: bool) -> &mut Self {
+    self.ee_warn = v;
+    self
+  }
+
+  /// Record the top-level `free`/Pittasoft atom file offset that raised the
+  /// no-`ee` `EEWarn` (for the document-level offset-ordered first-wins drain).
+  #[inline(always)]
+  pub const fn set_ee_warn_offset(&mut self, v: Option<u64>) -> &mut Self {
+    self.ee_warn_offset = v;
+    self
+  }
+}
+
 /// **SP2** — a QuickTime GPS coordinate from an ISO 6709 string (`©xyz` /
 /// `com.apple.quicktime.location.ISO6709`). Mirrors `ConvertISO6709`
 /// (QuickTime.pm:8884-8909): [`Self::value_conv`] is the faithful ValueConv
@@ -3458,6 +3764,10 @@ pub struct QuickTimeMeta {
   /// (Kodak PixPro / Rexing — Kodak.pm:2977-2990). Empty for the common case
   /// (no `frea` atom). See [`KodakFrea`].
   kodak_frea: KodakFrea,
+  /// The top-level Pittasoft BlackVue `free`-atom tags
+  /// (`%QuickTime::Pittasoft`, QuickTime.pm:8488-8546). Empty for the common
+  /// case (no Pittasoft `free` atom). See [`Pittasoft`].
+  pittasoft: Pittasoft,
   /// One [`MediaTrack`] per `trak` atom, in file order.
   tracks: Vec<MediaTrack>,
   /// **SP2** — the `moov/meta` Metadata-handler HandlerType (the `hdlr`
@@ -3526,6 +3836,7 @@ impl QuickTimeMeta {
       skip_version: None,
       skip_thumbnail_len: None,
       kodak_frea: KodakFrea::new(),
+      pittasoft: Pittasoft::new(),
       tracks: Vec::new(),
       meta_handler_type: None,
       meta_handler_class: None,
@@ -3669,6 +3980,14 @@ impl QuickTimeMeta {
   #[must_use]
   pub const fn kodak_frea(&self) -> &KodakFrea {
     &self.kodak_frea
+  }
+
+  /// The top-level Pittasoft BlackVue `free`-atom [`Pittasoft`] tags. Empty
+  /// (`Pittasoft::is_empty`) when no Pittasoft `free` atom was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn pittasoft(&self) -> &Pittasoft {
+    &self.pittasoft
   }
 
   /// `mvhd` MovieHeaderVersion.
@@ -3909,6 +4228,14 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub const fn kodak_frea_mut(&mut self) -> &mut KodakFrea {
     &mut self.kodak_frea
+  }
+
+  /// Mutable access to the [`Pittasoft`] tags — used by the `free` atom
+  /// handler ([`crate::formats::quicktime`]) to record the Pittasoft
+  /// `cprt`/`sttm`/`ptnm`/`thum`/`gps `/`3gf ` children as they are decoded.
+  #[inline(always)]
+  pub const fn pittasoft_mut(&mut self) -> &mut Pittasoft {
+    &mut self.pittasoft
   }
 
   /// Set the `mvhd` MovieHeaderVersion.
