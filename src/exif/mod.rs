@@ -98,6 +98,9 @@ mod jpeg_app;
 // JPEG IPTC (APP13 8BIM IIM) + the `COM` `File:Comment` — the Photoshop / IPTC
 // arm of `ProcessJPEG` and the IPTC IIM walker (`IPTC.pm`/`Photoshop.pm`).
 mod iptc;
+// PrintIM (Print Image Matching) — the EXIF IFD0 `0xc4a5` SubDirectory reader
+// (`PrintIM.pm`'s `ProcessPrintIM`), emitting `PrintIM:PrintIMVersion`.
+mod printim;
 
 use std::{string::String, vec::Vec};
 
@@ -1706,6 +1709,12 @@ pub struct ExifMeta<'a> {
   /// parsing is deferred to the MakerNotes wave. Borrows from the input
   /// TIFF block — the sole reason `ExifMeta` carries a lifetime.
   maker_note: Option<MakerNote<'a>>,
+  /// The `PrintIMVersion` strings parsed from each PrintIM (`0xc4a5`)
+  /// SubDirectory the IFD walk reached (`PrintIM.pm`'s `ProcessPrintIM`), in walk
+  /// order. [`Taggable::tags`](crate::emit::Taggable::tags) emits each as a
+  /// `PrintIM:PrintIMVersion` tag ([`push_printim_tags`](Self::push_printim_tags)).
+  /// EMPTY for the common no-PrintIM case.
+  printim_versions: Vec<smol_str::SmolStr>,
   /// The synthesized `File:PageCount` value when this `ExifMeta` is the
   /// outer result of a standalone-TIFF walk that triggered the multi-page
   /// gate (`ExifTool.pm:8756-8757`). `Some(n)` ⇒ `serialize_tags` emits
@@ -2083,6 +2092,7 @@ impl<'a> ExifMeta<'a> {
     warnings_ignorable: Vec<u8>,
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
+    printim_versions: Vec<smol_str::SmolStr>,
   ) -> Self {
     // JPEG `APP1` Exif blocks come through `ProcessTIFF` with
     // `Parent='APP1'` (`ExifTool.pm:7779-7783`), so `TIFF_TYPE='APP1'` and
@@ -2094,6 +2104,7 @@ impl<'a> ExifMeta<'a> {
       warnings,
       warnings_ignorable,
       byte_order,
+      printim_versions,
       maker_note,
       multi_page_count: None,
       // The SOF dimension tags are attached AFTER construction by the JPEG
@@ -2310,12 +2321,13 @@ impl<'a> ExifMeta<'a> {
       })
   }
 
-  /// Decompose this `ExifMeta` into `(entries, warnings, byte_order,
-  /// maker_note)` — the inverse of [`from_jpeg_parts`](Self::from_jpeg_parts),
-  /// used by the JPEG front-end to merge one decoded `APP1` Exif block into
-  /// the accumulating JPEG-level parts. The `MakerNote` borrows from the input
-  /// TIFF block (the `'a` lifetime), so it threads through the merge unchanged.
-  /// (`pub(crate)`: a merge-time internal, not API surface.)
+  /// Decompose this `ExifMeta` into `(entries, warnings, warnings_ignorable,
+  /// byte_order, maker_note, printim_versions)` — the inverse of
+  /// [`from_jpeg_parts`](Self::from_jpeg_parts), used by the JPEG front-end to
+  /// merge one decoded `APP1` Exif block into the accumulating JPEG-level parts.
+  /// The `MakerNote` borrows from the input TIFF block (the `'a` lifetime), so
+  /// it threads through the merge unchanged. (`pub(crate)`: a merge-time
+  /// internal, not API surface.)
   #[must_use]
   pub(crate) fn into_jpeg_parts(
     self,
@@ -2325,17 +2337,21 @@ impl<'a> ExifMeta<'a> {
     Vec<u8>,
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
+    Vec<smol_str::SmolStr>,
   ) {
     // `multi_page_count` is dropped — the JPEG-merge path constructs the
     // merged `ExifMeta` via `from_jpeg_parts`, which always sets
     // `multi_page_count = None` (`Parent='APP1'`, not 'TIFF', so bundled
-    // suppresses the emit). Restoring it on merge would be incorrect.
+    // suppresses the emit). Restoring it on merge would be incorrect. The
+    // PrintIM versions (IFD0 `0xc4a5`) DO thread through — a JPEG carries its
+    // PrintIM in the `APP1` Exif block, so it must survive the merge.
     (
       self.entries,
       self.warnings,
       self.warnings_ignorable,
       self.byte_order,
       self.maker_note,
+      self.printim_versions,
     )
   }
 }
@@ -2769,6 +2785,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     // COMMON path: a fresh per-block set ⇒ silent trailing-chain revisit
@@ -2842,6 +2859,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     multi_page_count,
     // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
     // has no JPEG SOF segment.
@@ -2936,6 +2954,7 @@ fn parse_bigtiff<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
@@ -2982,6 +3001,7 @@ fn parse_bigtiff<'a>(
     // local `order`.
     byte_order: None,
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     // `File:PageCount` IS emitted for a BigTIFF whose IFD chain tripped `MultiPage`
     // (a `SubfileType == 2` / `OldSubfileType == 3` `RawConv` tap in `Walker::emit`,
     // `Exif.pm:456`/`:473`) — the `:8667` `FoundTag` gates on `$$self{MultiPage}`
@@ -3132,6 +3152,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     // SHARED path: the external `$$et{PROCESSED}` map. A chain-IFD revisit —
@@ -3182,6 +3203,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
     multi_page_count: None,
@@ -3380,6 +3402,13 @@ struct Walker<'a, 'g> {
   warnings_ignorable: Vec<u8>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
+  /// The `PrintIMVersion` strings parsed from each PrintIM SubDirectory
+  /// (`0xc4a5` in a core IFD, `PrintIM.pm`'s `ProcessPrintIM`) reached during the
+  /// walk, in walk order. ExifTool's `%PrintIM::Main` emits `PrintIMVersion`
+  /// under `GROUPS => { 0 => 'PrintIM', 1 => 'PrintIM' }`; the engine surfaces
+  /// each as a `PrintIM:PrintIMVersion` tag ([`ExifMeta::push_printim_tags`]).
+  /// Almost always EMPTY (no PrintIM) or a single `"0300"`/`"0250"`.
+  printim_versions: Vec<smol_str::SmolStr>,
   /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
   /// the MakerNotes dispatcher (`MakerNotes.pm`'s `$$self{Make}`
   /// conditions) sees it when the ExifIFD's 0x927c is reached. For a
@@ -3614,6 +3643,16 @@ impl Walker<'_, '_> {
   fn warn(&mut self, message: String) {
     self.warnings.push(message);
     self.warnings_ignorable.push(0);
+  }
+
+  /// Record a MINOR `$et->Warn(msg, 1)` (ignorable `1` ⇒ `[minor]`, applied by
+  /// `run_diagnostics`), keeping [`warnings`](Self::warnings) and
+  /// [`warnings_ignorable`](Self::warnings_ignorable) index-aligned. Used for
+  /// the `ProcessPrintIM` empty-block warning (`PrintIM.pm:52`,
+  /// `$et->Warn('Empty PrintIM data', 1)`).
+  fn warn_minor(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(1);
   }
 
   /// Record a MINOR-WITH-BEHAVIOURAL-CHANGE `$et->Warn(msg, 2)` (ignorable
@@ -4970,6 +5009,66 @@ impl Walker<'_, '_> {
       self.dispatch_subdir(sub, value_offset, read_len, format, count);
       // The SubDirectory was dispatched (recursed/captured) — a normal entry:
       // [`Step::Keep`].
+      return Step::Keep;
+    }
+
+    // ---- PrintIM (`0xc4a5`) SubDirectory -------------------------------------
+    // `%Exif::Main` `0xc4a5` is a `SubDirectory => { TagTable => PrintIM::Main }`
+    // (Exif.pm:3280) carried in a CORE IFD (IFD0 in practice). It is NOT an
+    // IFD-chain pointer (so `sub_dir_for` returns `None` and it falls through
+    // here), but a self-contained binary block. Parse it via `ProcessPrintIM`
+    // (`printim::parse_version`) and record the `PrintIMVersion`; the engine
+    // emits it as `PrintIM:PrintIMVersion` (`ExifMeta::push_printim_tags`). Read
+    // the value SPAN exactly as the MakerNote / Canon-special paths do —
+    // `value_offset .. value_offset + read_len` (the out-of-line / inline value
+    // pointer + on-disk byte size, already bounds-resolved above). The vendor
+    // MakerNote `0x0e00` PrintIM is handled inside each vendor body, not here.
+    //
+    // The gate is the `%Exif::Main` table SCOPE, NOT [`is_core_ifd`] — the
+    // `0xc4a5` PrintIM SubDirectory lives ONLY in `%Exif::Main` (Exif.pm:3280),
+    // never in `%GPS::Main` (`is_core_ifd` would also fire for [`TableRef::Gps`],
+    // where a crafted `0xc4a5` entry is just an unknown GPS tag — parsing it as
+    // PrintIM would emit a spurious `[minor] Empty PrintIM data`). `%Exif::Main`
+    // is the table for IFD0/IFD1/ExifIFD/SubIFDs ([`TableRef::Exif`]) AND the
+    // Interop IFD, which reuses `%Exif::Main` ([`TableRef::Interop`],
+    // Exif.pm:6939) — so ExifTool would parse a `0xc4a5` there too. GPS is
+    // excluded.
+    if matches!(self.active_table, TableRef::Exif | TableRef::Interop) && tag_id == 0xc4a5 {
+      let end = value_offset.saturating_add(read_len).min(self.data.len());
+      // Resolve the `ProcessPrintIM` outcome BEFORE touching `&mut self`: the
+      // window borrow of `self.data` must end before `self.warn`/the version
+      // push (which need `&mut self`). The `Err` is a `&'static str`, the `Ok` an
+      // owned `SmolStr`, so the resolved `Result` carries no borrow.
+      let outcome = self
+        .data
+        .get(value_offset..end)
+        .map(|bytes| printim::parse_version(bytes, self.order));
+      match outcome {
+        // A structurally-valid block: record the `PrintIMVersion`; the engine
+        // emits it as `PrintIM:PrintIMVersion`.
+        Some(Ok(version)) => self.printim_versions.push(version),
+        // A malformed block: surface ExifTool's faithful file-level Warning on
+        // the shared warning channel at its EXACT `sub Warn` level, emitting NO
+        // version (`ProcessPrintIM` returns 0 without `HandleTag`). The empty
+        // case is `$et->Warn('Empty PrintIM data', 1)` (PrintIM.pm:52) — a MINOR
+        // warning (`[minor] ` prefix) routed to `warn_minor`; the other three
+        // ('Bad PrintIM data' / 'Invalid PrintIM header' / 'Bad PrintIM size')
+        // are plain `$et->Warn(msg)` (level 0) → `warn`.
+        Some(Err(warning)) => {
+          let message = String::from(warning.message());
+          if warning.is_minor() {
+            self.warn_minor(message);
+          } else {
+            self.warn(message);
+          }
+        }
+        // An out-of-bounds value window (the pointer/size did not resolve to a
+        // readable span) — nothing to parse or warn, matching the prior gate.
+        None => {}
+      }
+      // The PrintIM SubDirectory was processed (or rejected) — a normal entry,
+      // its pointer leaf is not separately emitted (ExifTool drops the
+      // SubDirectory tag itself): [`Step::Keep`].
       return Step::Keep;
     }
 
@@ -7406,6 +7505,29 @@ impl ExifMeta<'_> {
     }
   }
 
+  /// Append the captured PrintIM versions as `PrintIM:PrintIMVersion`
+  /// [`EmittedTag`](crate::emit::EmittedTag)s — the `%PrintIM::Main`
+  /// `PrintIMVersion` tag (PrintIM.pm:24-27, `GROUPS => { 0 => 'PrintIM',
+  /// 1 => 'PrintIM' }`, `PrintConv => undef` so identical in `-j`/`-n`).
+  ///
+  /// Family-0 AND family-1 are both `"PrintIM"`; the value is the raw 4-char
+  /// version string (`"0300"`/`"0250"`). `unknown:false` (a real extracted tag).
+  /// Emitted right after the EXIF/MakerNote block — ExifTool reaches the IFD0
+  /// `0xc4a5` SubDirectory mid-IFD-walk, but the `-G1 -j` conformance compares
+  /// the key MULTISET (`src/jsondiff.rs`), so the exact position is insensitive.
+  /// Almost always EMPTY (no PrintIM) or a single version.
+  fn push_printim_tags(&self, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    out.reserve(self.printim_versions.len());
+    for version in &self.printim_versions {
+      out.push(crate::emit::EmittedTag::new(
+        crate::value::Group::new("PrintIM", "PrintIM"),
+        smol_str::SmolStr::new_static("PrintIMVersion"),
+        crate::value::TagValue::Str(version.clone()),
+        false,
+      ));
+    }
+  }
+
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
   /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Emitted
@@ -7705,6 +7827,10 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       self.push_exif_tags(print_conv, &mut tags);
       self.push_maker_note_tags(print_conv, &mut tags);
     }
+    // The PrintIM `PrintIM:PrintIMVersion` (IFD0 `0xc4a5`) — emitted after the
+    // EXIF/MakerNote block (the key MULTISET is position-insensitive). EMPTY for
+    // the common no-PrintIM case.
+    self.push_printim_tags(&mut tags);
     // The JPEG auxiliary `APP`-segment tags (JFIF / MPF / DJI thermal) decoded
     // by [`jpeg_app::process_app_markers`] — appended after the EXIF block. The
     // `-G1 -j` conformance compares the key MULTISET (`src/jsondiff.rs`), so
@@ -9573,6 +9699,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // The parent IFD0 `Make`, threaded from the dispatch — the format-16
     // (`int64u`) Apple carve-out in the per-entry gate requires
     // `captured_make == Some("Apple")` (`Exif.pm:6464` `$$et{Make} eq 'Apple'`),
@@ -9774,6 +9901,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the four conditional-ARRAY AF tags + the single-HASH
     // `Condition` rows; the Sony walk itself reads no model-conditional structure,
@@ -10063,6 +10191,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` selects the 0x0f AFAreaMode / 0x2c ContrastMode branches; the
     // Panasonic walk itself reads no model-conditional structure, but the captured
@@ -10332,6 +10461,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the AFInfo BigEndian read + the LensData Z telemetry;
     // it is threaded into the capture-loop emitters (NOT the walk), so leave it
@@ -10665,6 +10795,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the FixBase heuristic
     // (`GetMakerNoteOffset`'s `make.starts_with("PENTAX")` absolute-addressing
     // arm, `MakerNotes.pm:1215-1220`) the AOC/Asahi primaries run via
@@ -11120,6 +11251,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
     // Samsung walk reads no model-conditional structure (no PENTAX-style make
     // arm), but thread them for parity with the other vendors.
@@ -11416,6 +11548,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
     // leaf reads Make.
     captured_make: None,
@@ -11593,6 +11726,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` (the conditional `SerialNumber` PrintConv is `-j`-only, but
     // the model also gates the 0x96 SerialInfo LIST + ShotInfo branches the `-n`
@@ -14740,6 +14874,132 @@ mod tests {
     );
   }
 
+  /// THROUGH-THE-WALKER (`#381` Codex [medium]): a malformed PrintIM
+  /// SubDirectory (`0xc4a5`) in IFD0 surfaces ExifTool's `ProcessPrintIM`
+  /// warning at its EXACT `sub Warn` severity on the document diagnostic
+  /// channel. ExifTool's empty-block guard is `$et->Warn('Empty PrintIM data',
+  /// 1)` (PrintIM.pm:52) — the trailing `1` ⇒ MINOR, so `run_diagnostics`
+  /// renders `[minor] Empty PrintIM data`; the other guards
+  /// (`$et->Warn('Invalid PrintIM header')`, PrintIM.pm:60) are plain `Warn` ⇒
+  /// NORMAL (no prefix). Drive the FULL TIFF walker (`parse_exif_block`) then
+  /// the document `run_diagnostics` drain (the `sub Warn` analogue that applies
+  /// the prefix), not just `parse_version`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn printim_empty_block_warns_minor_through_the_walker() {
+    // A single IFD0 entry: PrintIM (0xc4a5), format undef (7), count 0 ⇒ size 0
+    // ⇒ INLINE, a zero-length value window. `ProcessPrintIM`'s `unless ($size)`
+    // fires ⇒ `$et->Warn('Empty PrintIM data', 1)` (minor).
+    let empty = entry(0xc4a5, 7 /* undef */, 0, [0u8; 4]);
+    let t = tiff_with_entries(&[empty]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // The document drain applies the `[minor] ` prefix from the ignorable level.
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert_eq!(
+      tm.first_warning(),
+      Some("[minor] Empty PrintIM data"),
+      "the empty-block guard is `Warn(.., 1)` ⇒ a [minor] warning; warnings = {:?}",
+      tm.warnings()
+    );
+  }
+
+  /// THROUGH-THE-WALKER companion to the empty-block test: a `0xc4a5` block with
+  /// a bad header surfaces a NORMAL (unprefixed) `Invalid PrintIM header`
+  /// (PrintIM.pm:60, plain `$et->Warn(msg)`), confirming only the empty case is
+  /// minor.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn printim_bad_header_warns_normal_through_the_walker() {
+    // PrintIM (0xc4a5), format undef (7), count 20 ⇒ size 20 (> 4) ⇒ OUT-OF-LINE
+    // at offset 26 (header 8 + count 2 + entry 12 + nextIFD 4). The 20 bytes do
+    // NOT start with "PrintIM" ⇒ `Invalid PrintIM header`.
+    let val_off: u32 = 26;
+    let bad = entry(0xc4a5, 7 /* undef */, 20, val_off.to_be_bytes());
+    let mut t = tiff_with_entries(&[bad]);
+    assert_eq!(t.len(), val_off as usize, "out-of-line region starts at 26");
+    t.extend_from_slice(&[0u8; 20]); // 20 bytes, header "PrintIM" absent
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert_eq!(
+      tm.first_warning(),
+      Some("Invalid PrintIM header"),
+      "a bad-header block is a NORMAL `Warn(msg)` (no [minor]); warnings = {:?}",
+      tm.warnings()
+    );
+  }
+
+  /// GPS-IFD REGRESSION (`#381` Codex [medium]): the `0xc4a5` PrintIM
+  /// SubDirectory lives ONLY in `%Exif::Main` (Exif.pm:3280), NEVER in
+  /// `%GPS::Main` — so a `0xc4a5` entry walked under the GPS table
+  /// ([`TableRef::Gps`], via [`parse_gps_block`]) must be treated as an ordinary
+  /// unknown GPS tag, NOT parsed as PrintIM. The gate was previously
+  /// `is_core_ifd()`, which ALSO matches `TableRef::Gps`, so a crafted GPS
+  /// `0xc4a5` would mis-parse: an EMPTY (count 0) block ⇒ a spurious `[minor]
+  /// Empty PrintIM data`, and a structurally-valid block ⇒ a spurious
+  /// `PrintIM:PrintIMVersion`. Both must be absent now that the gate is the
+  /// `%Exif::Main` table scope (`TableRef::Exif | TableRef::Interop`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn gps_ifd_c4a5_is_not_parsed_as_printim() {
+    // (a) A STRUCTURALLY-VALID PrintIM block (16 bytes: "PrintIM\0" header,
+    //     version "0300" at +8, num=0 at +14 ⇒ size 16 >= 16) at offset 26 in a
+    //     GPS top-level IFD. Under `%Exif::Main` this would push
+    //     `PrintIMVersion="0300"`; under `%GPS::Main` it must NOT (no PrintIM
+    //     SubDirectory there). `0xc4a5`, format undef (7), count 16 ⇒ OUT-OF-LINE.
+    let val_off: u32 = 26;
+    let valid = entry(0xc4a5, 7 /* undef */, 16, val_off.to_be_bytes());
+    let mut t = tiff_with_entries(&[valid]);
+    assert_eq!(t.len(), val_off as usize, "out-of-line region starts at 26");
+    t.extend_from_slice(b"PrintIM\0"); // 8-byte header
+    t.extend_from_slice(b"0300"); // version at +8
+    t.extend_from_slice(&[0u8, 0u8]); // +12 (unused)
+    t.extend_from_slice(&[0u8, 0u8]); // +14 num = 0 ⇒ size 16 >= 16 + 0
+    // Walk the TOP-LEVEL IFD as a GPS IFD (`TableRef::Gps`) — the CR3 `CMT4`
+    // path. Were the gate `is_core_ifd()`, this would parse as PrintIM.
+    let meta = parse_gps_block(&t).expect("valid TIFF");
+    assert!(
+      meta.printim_versions.is_empty(),
+      "a GPS-table 0xc4a5 must NOT be parsed as PrintIM (no PrintIMVersion); \
+       versions = {:?}",
+      meta.printim_versions
+    );
+    // No PrintIM warning either (the valid block emits none, but assert the
+    // channel is clear of any PrintIM diagnostic).
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert!(
+      !tm.warnings().iter().any(|w| w.contains("PrintIM")),
+      "no PrintIM diagnostic for a GPS-table 0xc4a5; warnings = {:?}",
+      tm.warnings()
+    );
+
+    // (b) An EMPTY (count 0 ⇒ inline, zero-length window) `0xc4a5` GPS entry —
+    //     the case that under the buggy `is_core_ifd()` gate hit
+    //     `ProcessPrintIM`'s `unless ($size)` ⇒ `$et->Warn('Empty PrintIM data',
+    //     1)`. The GPS table has no PrintIM SubDirectory ⇒ NO such warning.
+    let empty = entry(0xc4a5, 7 /* undef */, 0, [0u8; 4]);
+    let te = tiff_with_entries(&[empty]);
+    let meta_e = parse_gps_block(&te).expect("valid TIFF");
+    assert!(
+      meta_e.printim_versions.is_empty(),
+      "an empty GPS-table 0xc4a5 emits no PrintIMVersion; versions = {:?}",
+      meta_e.printim_versions
+    );
+    let mut tm_e = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta_e, &mut tm_e);
+    assert!(
+      !tm_e
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Empty PrintIM data")),
+      "an empty GPS-table 0xc4a5 must NOT warn `[minor] Empty PrintIM data`; \
+       warnings = {:?}",
+      tm_e.warnings()
+    );
+  }
+
   #[test]
   #[cfg(feature = "alloc")]
   fn excessive_count_does_not_apply_to_string_or_undef() {
@@ -15008,6 +15268,7 @@ mod tests {
       warnings: Vec::new(),
       warnings_ignorable: Vec::new(),
       maker_note: None,
+      printim_versions: Vec::new(),
       captured_make: None,
       captured_model: None,
       chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),

@@ -103,10 +103,22 @@ case "$FIX" in
   # its derived composites (`CircleOfConfusion`/`FOV`/`FocalLength35efl`/
   # `HyperfocalDistance`) stay excluded with it. Drop only the unported lens/
   # MakerNote Composites by name (NOT `Composite:all`). Precede the generic `XMP*`.
+  # #381: `Composite:Flash` is NOW emitted (the XMP-Flash bitmask from the
+  # structured `XMP-exif:Flash` `{Mode=2,…}` ⇒ 16 ⇒ "Off, Did not fire") — no
+  # longer excluded. The unported lens chain (`ScaleFactor35efl` +
+  # `CircleOfConfusion`/`FOV`/`FocalLength35efl`/`HyperfocalDistance`) stays
+  # dropped (the Canon-rational ScaleFactor deferral above).
   XMP.xmp)
-    EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl -x Composite:Flash \
+    EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl \
                   -x Composite:CircleOfConfusion -x Composite:FOV \
                   -x Composite:FocalLength35efl -x Composite:HyperfocalDistance) ;;
+  # #381: `XMP_exif_printconv.xmp` / `XMP_nodeid_flash.xmp` carry ONLY a
+  # `Composite:Flash` (no other composite) — bundled emits it from the XMP flash
+  # fields ("No Flash" from the scalar `exif:Flash=5`; "On, Fired" from the
+  # `{Fired=True,Mode=1}` nodeID-recombined struct). exifast now emits the same,
+  # so these two keep `Composite:Flash` (NOT the generic `XMP*` `Composite:all`
+  # strip). They must precede the generic `XMP*` arm (first match wins).
+  XMP_exif_printconv.xmp | XMP_nodeid_flash.xmp) : ;;
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
   # The PNG raw-profile fixtures (#179): #133 PR 5 flips PNG into the Composite
   # allow-list, so exifast NOW emits `Composite:ImageSize`/`Megapixels` (from the
@@ -139,11 +151,12 @@ case "$FIX" in
   # position-3 `ExtenderStatus` (the K-x AVI record is 4 bytes ⇒ 'Not attached'),
   # so it is NO LONGER excluded either. Still deferred (binary SubDirectory /
   # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo size-24 leaves
-  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator`. The MakerNote-derived
-  # `Composite:LensID` stays the engine-wide deferral. The ported
-  # ImageSize/Megapixels/Duration are kept.
+  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator`. #381: `Composite:LensID`
+  # is NOW emitted (the unambiguous K-x LensType `7 222` ⇒ "smc PENTAX-DA L
+  # 18-55mm F3.5-5.6" IS the resolved name `$prt[0]`) — no longer excluded. The
+  # ported ImageSize/Megapixels/Duration are kept.
   Pentax.avi)
-    EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
+    EXCLUDE_ARR+=(-x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
                   -x Pentax:LevelIndicator) ;;
   # `QuickTime_gopro_gpmf.mp4`: the `LocationInformation`-derived QuickTime GPS
   # Composites (the same `%QuickTime::Composite` deferral as the SP2/anafi arms).
@@ -347,15 +360,19 @@ case "$FIX" in
                   -x Composite:BlueBalance -x Composite:RedBalance \
                   -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec) ;;
   # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
-  # extraction, unported) + `PrintIM:PrintIMVersion`. `IFD1:ThumbnailImage` is
-  # NOW emitted via the #331 EXIF `DataTag` channel (no longer excluded; the
-  # Pentax:PreviewImage IsOffset binary stays deferred — P2/P3 of #331).
+  # extraction, unported). `IFD1:ThumbnailImage` is NOW emitted via the #331 EXIF
+  # `DataTag` channel (no longer excluded; the Pentax:PreviewImage IsOffset binary
+  # stays deferred — P2/P3 of #331). `PrintIM:PrintIMVersion` is NOW emitted (the
+  # IFD0 `0xc4a5` PrintIM directory, #381) — no longer excluded.
   # PR 4: the full lens chain now builds (PENTAX, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). The MakerNote `Composite:
-  # LensID` + the non-Composite port deferrals remain.
+  # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). `Composite:LensID` STAYS
+  # excluded: the K10D LensType `3 44` is the AMBIGUOUS `%pentaxLensTypes` "Sigma
+  # or Tamron Lens (3 44)" — bundled disambiguates to "Sigma AF 10-20mm F4-5.6 EX
+  # DC" via `PrintLensID`'s focal-length matching, which the #381 unambiguous-
+  # LensType subset DEFERS (exifast emits no LensID here). The non-Composite port
+  # deferrals remain.
   Pentax.jpg)
     EXCLUDE_ARR+=(-x Pentax:PreviewImageStart -x Pentax:PreviewImage \
-                  -x PrintIM:PrintIMVersion \
                   -x Composite:LensID) ;;
   # DJI_Matrice30T.jpg: PR 4's full lens chain builds (DJI, NOT Canon — the
   # simple `$foc35/$focal` ScaleFactor path: 40/9.1 = 4.3956043956044), no
@@ -425,9 +442,15 @@ case "$FIX" in
   # `ImageSize`/`Megapixels`, whose `Require`d ImageWidth/Height live in the
   # deferred `SubIFD1`). exifast emits the residual (IFD0/ExifIFD/Samsung/
   # PreviewIFD/the 8 ported Composites) byte-exact vs bundled ExifTool 13.59.
+  # #381: `Composite:LensID` is NOW emitted (the unambiguous Samsung LensType —
+  # `Samsung NX 45mm F1.8` / `Samsung NX 16-50mm F2-2.8 S ED OIS` — IS the
+  # resolved name `$prt[0]`, no disambiguation needed), so it is NO LONGER
+  # excluded. The other MakerNote-derived Composites (`WB_RGGBLevels`/`RedBalance`/
+  # `BlueBalance`/`CFAPattern`) + the `SubIFD1`-deferred `ImageSize`/`Megapixels`
+  # stay dropped.
   SamsungNX500.srw | SamsungNX1.srw)
     EXCLUDE_ARR+=(-x SubIFD:all -x SubIFD1:all \
-                  -x Composite:LensID -x Composite:WB_RGGBLevels \
+                  -x Composite:WB_RGGBLevels \
                   -x Composite:RedBalance -x Composite:BlueBalance \
                   -x Composite:CFAPattern -x Composite:ImageSize \
                   -x Composite:Megapixels) ;;

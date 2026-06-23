@@ -226,6 +226,10 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // the MakerNote for JPEGs exactly as for a standalone TIFF (the seam #75+
   // consume). First-wins matches bundled keeping the PRIMARY MakerNote.
   let mut maker_note: Option<MakerNote<'_>> = None;
+  // The PrintIM versions (IFD0 `0xc4a5`) accumulated across the merged `APP1`
+  // Exif blocks — a JPEG carries its PrintIM in the `APP1` Exif block's IFD0, so
+  // the merge must preserve it (the engine emits `PrintIM:PrintIMVersion`).
+  let mut printim_versions: Vec<smol_str::SmolStr> = Vec::new();
   // The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
   // (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm). A
   // JPEG normally carries exactly one; a file with more than one is handled by
@@ -497,6 +501,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
             &mut warnings_ignorable,
             &mut byte_order,
             &mut maker_note,
+            &mut printim_versions,
             exif,
           );
         }
@@ -543,6 +548,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     warnings_ignorable,
     byte_order,
     maker_note,
+    printim_versions,
   );
   // The JPEG auxiliary `APP`-segment tags: JFIF (`APP0`), MPF (`APP2`) and the
   // DJI thermal arms (`APP3`/`APP4`/`APP5`/`APP7`). Decoded for BOTH print-conv
@@ -1167,10 +1173,17 @@ fn merge_exif_block<'a>(
   warnings_ignorable: &mut Vec<u8>,
   byte_order: &mut Option<ByteOrder>,
   maker_note: &mut Option<MakerNote<'a>>,
+  printim_versions: &mut Vec<smol_str::SmolStr>,
   block: ExifMeta<'a>,
 ) {
-  let (block_entries, block_warnings, block_warnings_ignorable, block_order, block_maker_note) =
-    block.into_jpeg_parts();
+  let (
+    block_entries,
+    block_warnings,
+    block_warnings_ignorable,
+    block_order,
+    block_maker_note,
+    block_printim_versions,
+  ) = block.into_jpeg_parts();
   if byte_order.is_none() {
     *byte_order = block_order;
   }
@@ -1183,6 +1196,9 @@ fn merge_exif_block<'a>(
   warnings.extend(block_warnings);
   // Keep the parallel ignorable levels index-aligned with `warnings`.
   warnings_ignorable.extend(block_warnings_ignorable);
+  // The PrintIM versions accumulate across blocks (in block order), faithful to
+  // ExifTool emitting each PrintIM's `PrintIMVersion` as the IFD walk reaches it.
+  printim_versions.extend(block_printim_versions);
 }
 
 /// `true` when `block` begins with a BigTIFF header — a valid TIFF byte-order

@@ -1667,6 +1667,154 @@ mod exif {
     );
   }
 
+  /// Drive `Composite:LensID` through the registry fixpoint from a `(val, prt)`
+  /// pair of input triples — `val` carries the raw `$val[i]` (LensType + the
+  /// disambiguator ingredients), `prt` the PrintConv `$prt[i]` (the resolved
+  /// lens name). Returns the `-j` (PrintConv) LensID, or `None` when deferred.
+  fn lens_id_pj(
+    val_entries: &[(&str, &str, TagValue)],
+    prt_entries: &[(&str, &str, TagValue)],
+  ) -> Option<String> {
+    let mut prt = map_with(prt_entries);
+    let mut val = map_with(val_entries);
+    build_into(
+      REGISTRY,
+      &mut prt,
+      Some(&mut val),
+      ConvMode::PrintConv,
+      0,
+      &ctx0(),
+    );
+    composite(&prt, "LensID").map(|v| emit(&v))
+  }
+
+  #[test]
+  fn lens_id_unambiguous_lenstype_emits() {
+    // The Samsung NX1 case (`SamsungNX1.srw`): LensType raw 13, PrintConv the
+    // resolved name; NO LensType2 / RFLensType / converter ingredient ⇒ the
+    // plain-LensType path emits the name (ValueConv `$val` = 13, PrintConv the
+    // name). The byte-exact in-tree fixture goldens depend on this still firing.
+    let name = "Samsung NX 16-50mm F2-2.8 S ED OIS";
+    let got = lens_id_pj(
+      &[("Samsung", "LensType", TagValue::U64(13))],
+      &[("Samsung", "LensType", TagValue::Str(name.into()))],
+    );
+    assert_eq!(got.as_deref(), Some(&*std::format!("\"{name}\"")));
+  }
+
+  #[test]
+  fn lens_id_inactive_rf_lens_type_still_emits() {
+    // The `CanonRaw_ctmd.cr3` case: a Canon RFLensType IS present but its RAW
+    // `$val[12]` is `0` (PrintConv "n/a"). ExifTool's `if ($val[12])` is FALSE
+    // (0 is falsy) ⇒ the Canon RF branch does NOT fire ⇒ the plain-LensType
+    // LensID emits (byte-exact with the fixture's "Canon EF-M …" golden).
+    let name = "Canon EF-M 15-45mm f/3.5-6.3 IS STM";
+    let got = lens_id_pj(
+      &[
+        ("Track1", "LensType", TagValue::U64(4153)),
+        ("Track1", "RFLensType", TagValue::U64(0)),
+      ],
+      &[
+        ("Track1", "LensType", TagValue::Str(name.into())),
+        ("Track1", "RFLensType", TagValue::Str("n/a".into())),
+      ],
+    );
+    assert_eq!(got.as_deref(), Some(&*std::format!("\"{name}\"")));
+  }
+
+  #[test]
+  fn lens_id_active_rf_lens_type_defers() {
+    // A Canon RFLensType with a TRUTHY raw `$val[12]` (e.g. 61182) makes
+    // ExifTool substitute the RFLensType base + Canon RF PrintConv — a different
+    // lens DB exifast can't reproduce. The plain LensType name would be STALE,
+    // so the derive defers (returns `None`), emitting no Composite:LensID.
+    let got = lens_id_pj(
+      &[
+        ("Exif", "LensType", TagValue::U64(4153)),
+        ("Exif", "RFLensType", TagValue::U64(61182)),
+      ],
+      &[
+        (
+          "Exif",
+          "LensType",
+          TagValue::Str("Canon EF-M 15-45mm f/3.5-6.3 IS STM".into()),
+        ),
+        (
+          "Exif",
+          "RFLensType",
+          TagValue::Str("Canon RF 24-105mm F4 L IS USM".into()),
+        ),
+      ],
+    );
+    assert_eq!(got, None, "an active RFLensType defers LensID");
+  }
+
+  #[test]
+  fn lens_id_active_lens_type2_defers() {
+    // A Sony LensType2 whose raw `$val[9]` has bit 0x8000 set (an E-mount lens
+    // ID) fires `if (defined $val[9] and ($val[9] & 0x8000 or $val[9] == 0))`:
+    // ExifTool swaps in the LensType2 base + Sony PrintConv. exifast can't, so
+    // it defers. (`$val[9] == 0` — a 3rd-party E-mount — fires the same branch.)
+    let got = lens_id_pj(
+      &[
+        ("Exif", "LensType", TagValue::U64(0)),
+        ("Exif", "LensType2", TagValue::U64(32790)), // 0x8016 — 0x8000 set
+      ],
+      &[
+        (
+          "Exif",
+          "LensType",
+          TagValue::Str("Sony E 18-55mm F3.5-5.6 OSS".into()),
+        ),
+        (
+          "Exif",
+          "LensType2",
+          TagValue::Str("Sony FE 24-70mm F2.8 GM".into()),
+        ),
+      ],
+    );
+    assert_eq!(got, None, "an active LensType2 (0x8000 set) defers LensID");
+  }
+
+  #[test]
+  fn lens_id_pentax_converter_defers() {
+    // The Pentax converter branch appends a `+ Nx converter` suffix only when
+    // `$conv = $val[1] / $val[11] > 1.1` (FocalLength / LensFocalLength). Here
+    // 300 / 200 = 1.5 > 1.1 ⇒ a real teleconverter; ExifTool appends the suffix
+    // exifast can't compute, so the derive defers (no bare name emitted).
+    let got = lens_id_pj(
+      &[
+        ("Exif", "LensType", TagValue::Str("8 61".into())),
+        ("Exif", "FocalLength", TagValue::F64(300.0)),
+        ("Exif", "LensFocalLength", TagValue::F64(200.0)),
+      ],
+      &[(
+        "Exif",
+        "LensType",
+        TagValue::Str("smc PENTAX-DA* 200mm F2.8 ED [IF] SDM".into()),
+      )],
+    );
+    assert_eq!(got, None, "a >1.1 converter ratio defers LensID");
+  }
+
+  #[test]
+  fn lens_id_pentax_no_converter_ratio_still_emits() {
+    // The `JPEG_pentax_k70` case: BOTH LensFocalLength and FocalLength present
+    // but their ratio is ≈ 1 (28 / 27.5 = 1.018, NOT > 1.1) ⇒ ExifTool appends
+    // NOTHING ⇒ the plain LensType name emits, byte-exact with the fixture's
+    // golden. A present-but-inactive converter must NOT defer.
+    let name = "smc PENTAX-DA 18-135mm F3.5-5.6 ED AL [IF] DC WR";
+    let got = lens_id_pj(
+      &[
+        ("Pentax", "LensType", TagValue::Str("8 215".into())),
+        ("Pentax", "FocalLength", TagValue::F64(28.0)),
+        ("Pentax", "LensFocalLength", TagValue::F64(27.5)),
+      ],
+      &[("Pentax", "LensType", TagValue::Str(name.into()))],
+    );
+    assert_eq!(got.as_deref(), Some(&*std::format!("\"{name}\"")));
+  }
+
   #[test]
   fn focal_length_35efl_falls_back_to_focal_only_without_scale_factor() {
     // ExifGPS.jpg: FocalLength=0, no FocalLengthIn35mmFormat ⇒ ScaleFactor NOT
