@@ -351,3 +351,93 @@ fn af_points_in_focus_ks2_bottom_row_bits() {
   // `-n`: the raw int.
   assert_eq!(conv.apply(&u(&[1 << 24]), false), TagValue::I64(1 << 24));
 }
+
+#[test]
+fn af_point_selected_model_special_high_values() {
+  // 0x000e AFPointSelected — the model-keyed element-0 hashes carry the
+  // `0xfffb`-`0xffff` SPECIAL selections (Pentax.pm:1225-1230 K-1, 1302-1306
+  // K-3/KP, 1382-1387 "other models"). The 6 body fixtures only ever exercise a
+  // normal point (the K-3/KP fixture is raw 14 = "Center"), so these specials are
+  // unexercised by the goldens — assert them directly via the model dispatcher.
+  // Same defect class as `af_points_in_focus_ks2_bottom_row_bits` (a PrintConv
+  // table missing the high values the fixtures don't hit).
+
+  // K-3 / KP variant (AF_POINT_SELECTED_K3): the five specials previously MISSING
+  // from the table rendered "Unknown (6553x)"; they now resolve.
+  let kp = Some("PENTAX KP");
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xffff]), true, kp),
+    TagValue::Str("Auto".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffe]), true, kp),
+    TagValue::Str("Fixed Center".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffc]), true, Some("PENTAX K-3 Mark III")),
+    TagValue::Str("Face Detect AF".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffb]), true, Some("PENTAX K-3")),
+    TagValue::Str("AF Select".into())
+  );
+  // The K-3/KP fixture value (raw 14 = the normal "Center" point) is UNCHANGED by
+  // the appended specials — the golden stays byte-identical.
+  assert_eq!(
+    af_point_selected_for_model(&u(&[14]), true, kp),
+    TagValue::Str("Center".into())
+  );
+  // The K-3/KP hash has NO `0xfffa` (that is the "other models" 'Auto 2' only) ⇒
+  // a K-3 raw 0xfffa misses ⇒ decimal "Unknown (N)" (no PrintHex on this leaf).
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffa]), true, kp),
+    TagValue::Str("Unknown (65530)".into())
+  );
+
+  // K-1 / 645Z variant (AF_POINT_SELECTED_K1): the same five specials, plus its
+  // own 33-point geometry (raw 17 = "Center" here, NOT 14).
+  let k1 = Some("PENTAX K-1");
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xffff]), true, k1),
+    TagValue::Str("Auto".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffd]), true, Some("PENTAX 645Z")),
+    TagValue::Str("Automatic Tracking AF".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[17]), true, k1),
+    TagValue::Str("Center".into())
+  );
+
+  // "other models" variant (AF_POINT_SELECTED): already had all six specials,
+  // INCLUDING `0xfffa` 'Auto 2'. The K10D fixture is the single-element record.
+  let k10d = Some("PENTAX K10D");
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffa]), true, k10d),
+    TagValue::Str("Auto 2".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xffff]), true, k10d),
+    TagValue::Str("Auto".into())
+  );
+
+  // The count-2 record threads the element-1 AREA hash (a special in element 0,
+  // an Expanded-Area size in element 1, joined "; "). K-3/KP element 1 = the
+  // 27-point ladder; K-1 element 1 = the 33-point ladder.
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xffff, 5]), true, kp),
+    TagValue::Str("Auto; Expanded Area 27-point (L)".into())
+  );
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xfffe, 5]), true, k1),
+    TagValue::Str("Fixed Center; Expanded Area 33-point (L)".into())
+  );
+
+  // `-n` (print_conv = false) is the space-joined raw run for every model, so a
+  // special value is NOT label-decoded.
+  assert_eq!(
+    af_point_selected_for_model(&u(&[0xffff]), false, kp),
+    TagValue::Str("65535".into())
+  );
+}

@@ -282,29 +282,28 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // deferral is the `tiff:YCbCrSubSampling` `RawJoin`. Mirrors `conformance.rs::
   // jpeg_pentax_ks2_conformance`. The golden keeps the faithful 13.59 dump.
   ("JPEG_pentax_ks2.jpg", &["XMP-tiff:YCbCrSubSampling"]),
-  // #311/#318 — the 5 additional Pentax body fixtures. #381 ported their
-  // `Composite:Flash`/`LensID` + `PrintIM:PrintIMVersion` (now emitted
-  // byte-exact, no longer excluded); the remaining exclusions are
-  // `XMP-tiff:YCbCrSubSampling` PLUS the per-body `Pentax:*` model-variant /
-  // `$count`-gated SubDirectory residuals the #379 port does not yet emit for
-  // these bodies (deferred, NOT mis-decoded — exifast emits nothing, the golden
-  // keeps the bundled value). These lists MIRROR EXACTLY the per-fixture
-  // `*_DEFERRED` consts in `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,k70,kp}_
-  // conformance` (see the detailed rationale there).
+  // #311/#318 — the 5 additional Pentax body fixtures. #311 ported the per-body
+  // multi-model Main conditional branches: the `/(K-1|645Z)\b/` + `/(K-3|KP)\b/`
+  // AFPointSelected (0x000e) model point-hashes, the count-2 ExposureCompensation
+  // (0x0016), the `%Pentax::BatteryInfo` BodyBatteryVoltage3/4 (K-5 II), and the
+  // `%Pentax::AFPointInfo` (0x0245) subdir (NumAFPoints + AFPointsInFocus/Selected/
+  // Special via `DecodeAFPoints`) — all now emitted byte-exact, no longer excluded.
+  // The remaining exclusions are `XMP-tiff:YCbCrSubSampling` PLUS the NON-#311
+  // per-body `Pentax:*` residuals the port does not yet emit (Contrast* /
+  // ISOAutoMinSpeed / ShutterType / SkinToneCorrection Main leaves; the `0x0243
+  // PixelShiftInfo`, `0x03ff TempInfo` and K-5-II `$count`/offset SubDirectory
+  // variants) — deferred, NOT mis-decoded (exifast emits nothing, the golden keeps
+  // the bundled value). These lists MIRROR EXACTLY the per-fixture `*_DEFERRED`
+  // consts in `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,k70,kp}_conformance` (see
+  // the detailed rationale there).
   (
     "JPEG_pentax_k1.jpg",
     &[
       "XMP-tiff:YCbCrSubSampling",
-      "Pentax:AFPointSelected",
-      "Pentax:AFPointsInFocus",
-      "Pentax:AFPointsSelected",
-      "Pentax:AFPointsSpecial",
       "Pentax:ContrastHighlight",
       "Pentax:ContrastHighlightShadowAdj",
       "Pentax:ContrastShadow",
-      "Pentax:ExposureCompensation",
       "Pentax:ISOAutoMinSpeed",
-      "Pentax:NumAFPoints",
       "Pentax:PixelShiftResolution",
       "Pentax:ShutterType",
       "Pentax:SkinToneCorrection",
@@ -314,7 +313,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
     "JPEG_pentax_k3.jpg",
     &[
       "XMP-tiff:YCbCrSubSampling",
-      "Pentax:AFPointSelected",
       "Pentax:ContrastHighlight",
       "Pentax:ContrastHighlightShadowAdj",
       "Pentax:ContrastShadow",
@@ -327,8 +325,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
     "JPEG_pentax_k5_ii.jpg",
     &[
       "XMP-tiff:YCbCrSubSampling",
-      "Pentax:BodyBatteryVoltage3",
-      "Pentax:BodyBatteryVoltage4",
       "Pentax:CameraOrientation",
       "Pentax:CameraTemperature4",
       "Pentax:CameraTemperature5",
@@ -372,14 +368,9 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
     "JPEG_pentax_k70.jpg",
     &[
       "XMP-tiff:YCbCrSubSampling",
-      "Pentax:AFPointsInFocus",
-      "Pentax:AFPointsSelected",
-      "Pentax:AFPointsSpecial",
       "Pentax:ContrastHighlight",
       "Pentax:ContrastHighlightShadowAdj",
       "Pentax:ContrastShadow",
-      "Pentax:ExposureCompensation",
-      "Pentax:NumAFPoints",
       "Pentax:PixelShiftResolution",
       "Pentax:ShutterType",
       "Pentax:SkinToneCorrection",
@@ -389,16 +380,10 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
     "JPEG_pentax_kp.jpg",
     &[
       "XMP-tiff:YCbCrSubSampling",
-      "Pentax:AFPointSelected",
-      "Pentax:AFPointsInFocus",
-      "Pentax:AFPointsSelected",
-      "Pentax:AFPointsSpecial",
       "Pentax:ContrastHighlight",
       "Pentax:ContrastHighlightShadowAdj",
       "Pentax:ContrastShadow",
-      "Pentax:ExposureCompensation",
       "Pentax:ISOAutoMinSpeed",
-      "Pentax:NumAFPoints",
       "Pentax:PixelShiftResolution",
       "Pentax:ShutterType",
       "Pentax:SkinToneCorrection",

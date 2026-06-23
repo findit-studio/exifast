@@ -1397,6 +1397,30 @@ pub(crate) fn emit_battery_info(
       push(out, "GripBatteryADLoad", int_value(i64::from(v)));
     }
   }
+  // 6: BodyBatteryVoltage3 (int16u, BigEndian) — `/(K-5|K-r|645D)\b/`
+  // (`Pentax.pm:4941-4950`). `$val / 100`; PrintConv `sprintf("%.2f V", $val)`.
+  // The K-5 II matches (`K-5\b`); offset 6/7 is out of the 6-byte K10D record so a
+  // non-voltage body never reads here.
+  if is_body_voltage3(model) {
+    if let Some(v) = read_u16(block, 6, ByteOrder::Big) {
+      push(
+        out,
+        "BodyBatteryVoltage3",
+        battery_voltage(i64::from(v), print_conv),
+      );
+    }
+  }
+  // 8: BodyBatteryVoltage4 (int16u, BigEndian) — `/(K-5|K-r)\b/`
+  // (`Pentax.pm:4951-4960`). The K-5 II matches.
+  if is_body_voltage4(model) {
+    if let Some(v) = read_u16(block, 8, ByteOrder::Big) {
+      push(
+        out,
+        "BodyBatteryVoltage4",
+        battery_voltage(i64::from(v), print_conv),
+      );
+    }
+  }
 }
 
 /// `true` when `model` matches `/K-3 Mark III/` (a plain substring — ExifTool's
@@ -1459,6 +1483,18 @@ fn is_body_voltage(model: Option<&str>) -> bool {
       "K-x", "K-S1", "K-S2", "KP",
     ],
   )
+}
+
+/// `true` for the BatteryInfo `6 BodyBatteryVoltage3` `/(K-5|K-r|645D)\b/`
+/// (`Pentax.pm:4943`). The K-5 II matches via `K-5\b`.
+fn is_body_voltage3(model: Option<&str>) -> bool {
+  model_matches_any(model, &["K-5", "K-r", "645D"])
+}
+
+/// `true` for the BatteryInfo `8 BodyBatteryVoltage4` `/(K-5|K-r)\b/`
+/// (`Pentax.pm:4953`). The K-5 II matches via `K-5\b`.
+fn is_body_voltage4(model: Option<&str>) -> bool {
+  model_matches_any(model, &["K-5", "K-r"])
 }
 
 /// `BodyBatteryVoltage1`/`Voltage2` value: `$val / 100`; PrintConv
@@ -2115,12 +2151,19 @@ pub(crate) fn emit_caf_point_info(
   // space-joined run (empty when `num == 0`).
   let n_bytes = ((num.max(0) as usize) + 3) / 4;
   let slice: &[u8] = block.get(2..2 + n_bytes).unwrap_or(&[]);
-  for (name, bit_val) in [("CAFPointsInFocus", 0x02u8), ("CAFPointsSelected", 0x03u8)] {
+  // CAFPointsInFocus: `DecodeAFPoints($val,$num,2,0x02)`; CAFPointsSelected:
+  // `DecodeAFPoints($val,$num,2,0x03)` — both with `$bitVal` undef (mask-truthy).
+  for (name, point_mask) in [
+    ("CAFPointsInFocus", 0x02i64),
+    ("CAFPointsSelected", 0x03i64),
+  ] {
     if print_conv {
       push(
         out,
         name,
-        TagValue::Str(SmolStr::from(decode_af_points(slice, num, 2, bit_val))),
+        TagValue::Str(SmolStr::from(decode_af_points(
+          slice, num, 2, point_mask, None,
+        ))),
       );
     } else {
       // `-n`: the default space-joined int8u run.
@@ -2134,13 +2177,95 @@ pub(crate) fn emit_caf_point_info(
   }
 }
 
+/// `true` when `model` matches the AFPointInfo offset-4 regex `/K(P|-1|-70)\b/`
+/// (`Pentax.pm:6081`/`:6088`/`:6095`) — the K-1, K-70 and KP. The Perl alternation
+/// is `K` then `(P|-1|-70)` pinned by a trailing `\b`: `KP\b`, `K-1\b`, `K-70\b`
+/// (so `K-1` matches `"PENTAX K-1"` but the embedded `K-1` of a longer token is
+/// boundary-checked). No other model writes these three leaves.
+fn is_af_point_info_decoded(model: Option<&str>) -> bool {
+  model_matches_any(model, &["KP", "K-1", "K-70"])
+}
+
+/// Decode `%Pentax::AFPointInfo` (`0x0245`, `Pentax.pm:6067-6100`) — the K-1-style
+/// AF-point info (`FORMAT` default `int8u`, inherits the resolved MakerNote byte
+/// order for the int16u `NumAFPoints`). Emits NumAFPoints (@2, int16u, a
+/// `DATAMEMBER`) and — for the `/K(P|-1|-70)\b/` bodies — AFPointsInFocus (@4),
+/// AFPointsSelected (@4.1) and AFPointsSpecial (@4.2), each a `DecodeAFPoints` over
+/// the same `int8u[int((NumAFPoints+3)/4)]` slice at byte 4:
+///   * AFPointsInFocus  — `DecodeAFPoints($val,$num,2,0x02)`      (mask-truthy)
+///   * AFPointsSelected — `DecodeAFPoints($val,$num,2,0x03)`      (mask-truthy)
+///   * AFPointsSpecial  — `DecodeAFPoints($val,$num,2,0x03,0x03)` (== 0x03)
+/// The offset-0 int16u (a version?) is undocumented and not emitted. A model NOT
+/// in the `/K(P|-1|-70)\b/` list still emits the UNCONDITIONAL NumAFPoints but none
+/// of the three decoded leaves; no active fixture carries that case (only K-1/KP/
+/// K-70 write a 0x0245 subdir), but the gate is faithful to the per-leaf Condition.
+pub(crate) fn emit_af_point_info(
+  block: &[u8],
+  order: ByteOrder,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // 2: NumAFPoints — `Format => 'int16u'`, `RawConv => '$$self{NumAFPoints} =
+  // $val'`. UNCONDITIONAL. Read in the inherited MakerNote order. No PrintConv.
+  let Some(num_u) = read_u16(block, 2, order) else {
+    return;
+  };
+  let num = i64::from(num_u);
+  push(out, "NumAFPoints", int_value(num));
+  // 4/4.1/4.2: AFPointsInFocus / AFPointsSelected / AFPointsSpecial — the
+  // `/K(P|-1|-70)\b/`-gated `int8u[int((NumAFPoints+3)/4)]` slice at byte 4.
+  if !is_af_point_info_decoded(model) {
+    return;
+  }
+  let n_bytes = ((num.max(0) as usize) + 3) / 4;
+  let slice: &[u8] = block.get(4..4 + n_bytes).unwrap_or(&[]);
+  for (name, point_mask, bit_val) in [
+    ("AFPointsInFocus", 0x02i64, None),
+    ("AFPointsSelected", 0x03i64, None),
+    ("AFPointsSpecial", 0x03i64, Some(0x03i64)),
+  ] {
+    if print_conv {
+      push(
+        out,
+        name,
+        TagValue::Str(SmolStr::from(decode_af_points(
+          slice, num, 2, point_mask, bit_val,
+        ))),
+      );
+    } else {
+      // `-n`: the default space-joined int8u run (the Writable=>0 leaves still
+      // print their raw bytes under `-n`, matching ExifTool's `-G1 -n`).
+      let joined = slice
+        .iter()
+        .map(u8::to_string)
+        .collect::<std::vec::Vec<_>>()
+        .join(" ");
+      push(out, name, TagValue::Str(SmolStr::from(joined)));
+    }
+  }
+}
+
 /// `Image::ExifTool::Pentax::DecodeAFPoints` (`Pentax.pm:6730-6754`): walk `num`
 /// AF points packed `bits`-per-point across `bytes`, listing the 1-based index of
-/// each point whose `bits`-wide field (high bits first) equals `bit_val`. An
-/// EMPTY byte slice returns `'(none)'`; otherwise a comma-joined index list (also
-/// `'(none)'`-displayed by the join when empty? — no, ExifTool joins to `''`, but
-/// the empty-slice early-return covers the K-S2's `num == 0`).
-fn decode_af_points(bytes: &[u8], num: i64, bits: u32, bit_val: u8) -> std::string::String {
+/// each point whose `bits`-wide field (high bits first), `mask`ed, matches.
+///
+/// Faithful to the Perl `($val,$num,$bits,$mask,$bitVal)` signature: when
+/// `bit_val` is `Some(v)`, a point is listed iff `(($byte >> $shift) & $mask) ==
+/// v` (the `AFPointsSpecial` `0x03,0x03` call); when `None`, iff `($byte >>
+/// $shift) & $mask` is non-zero (the `AFPointsInFocus 0x02` / `AFPointsSelected
+/// 0x03` calls, where `$bitVal` is `undef`). `mask` is the explicit Perl `$mask`
+/// — NOT `(1<<bits)-1` — because the `0x02` calls mask a single bit out of the
+/// 2-bit field. An EMPTY byte slice returns `'(none)'`; otherwise a comma-joined
+/// 1-based index list (empty-displayed as `''`, which the empty-slice early-return
+/// only short-circuits for `num == 0`).
+fn decode_af_points(
+  bytes: &[u8],
+  num: i64,
+  bits: u32,
+  mask: i64,
+  bit_val: Option<i64>,
+) -> std::string::String {
   let Some(&first) = bytes.first() else {
     return "(none)".to_string();
   };
@@ -2149,10 +2274,14 @@ fn decode_af_points(bytes: &[u8], num: i64, bits: u32, bit_val: u8) -> std::stri
   let mut idx = 0usize;
   let mut byte = i64::from(first);
   let mut shift = shift0;
-  let mask_bits = (1i64 << bits) - 1;
   let mut bit_list: std::vec::Vec<std::string::String> = std::vec::Vec::new();
   loop {
-    if ((byte >> shift) & mask_bits) == i64::from(bit_val) {
+    let field = (byte >> shift) & mask;
+    let hit = match bit_val {
+      Some(v) => field == v,
+      None => field != 0,
+    };
+    if hit {
       bit_list.push(i.to_string());
     }
     i += 1;
