@@ -1101,16 +1101,27 @@ fn empty_value(format: Format) -> RawValue {
   }
 }
 
-/// Decode a TIFF `string`-format byte slice to a Rust `String`. ExifTool
-/// treats `string` as bytes under the `CharsetEXIF` charset (default UTF-8 —
-/// `ExifTool.pm:6296-6300`); for byte-equivalence with the JSON oracle we
-/// keep valid UTF-8 verbatim and `from_utf8_lossy`-replace the rare invalid
-/// byte (no bundled camera fixture exercises a non-UTF-8 EXIF string).
+/// Decode a TIFF `string`/`utf8`-format byte slice to the display `String` that
+/// becomes the emitted `TagValue::Str` (Make/Model/Software/UserComment/…).
+///
+/// ExifTool treats `string` as bytes under the `CharsetEXIF` charset (default
+/// UTF-8 — `ExifTool.pm:6296-6300`) and applies its `FixUTF8` ONLY at the JSON
+/// serialization boundary (`exiftool:3823` `EscapeJSON` →
+/// `Image::ExifTool::XMP::FixUTF8(\$str)`, default `$bad = '?'`). exifast has no
+/// per-string FixUTF8 pass in the `-j` serializer (`JsonTagValue` emits a
+/// non-numeric `Str` verbatim), so the FixUTF8 must be applied HERE, at decode,
+/// where the resulting bytes are byte-identical to ExifTool's late JSON pass for
+/// any value that survives to output.
+///
+/// A valid-UTF-8 string passes through verbatim (the all-ASCII camera-fixture
+/// case is unchanged); an INVALID byte/sequence is replaced with the single
+/// ASCII `?` (`0x3F`) per `XMP.pm:2969` — NOT the Unicode REPLACEMENT CHARACTER
+/// U+FFFD that `from_utf8_lossy` would substitute (bundled `-j` on a crafted
+/// `Make = A\xFF\xFEB` emits `"A??B"`, not `"A\u{FFFD}\u{FFFD}B"`; #200).
+/// [`crate::convert::fix_utf8`] is the shared byte-walker port of `FixUTF8`
+/// (overlong/surrogate/non-character handling included).
 fn lossy_string(raw: &[u8]) -> std::string::String {
-  match core::str::from_utf8(raw) {
-    Ok(s) => s.to_string(),
-    Err(_) => std::string::String::from_utf8_lossy(raw).into_owned(),
-  }
+  crate::convert::fix_utf8(raw)
 }
 
 #[cfg(test)]
