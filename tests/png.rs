@@ -1555,6 +1555,120 @@ fn engine_iccp_binary_chunk_does_not_reset_second_exif_blocked() {
   );
 }
 
+// ===========================================================================
+// #205 — raw-profile XMP diagnostics WALK-ORDER. ExifTool dispatches `Raw
+// profile type xmp` (PNG.pm:746) via `ProcessProfile` → `ProcessXMP` AT the
+// chunk's walk position, so its `XMP is double UTF-encoded` warning (XMP.pm:4494)
+// interleaves with every other chunk's warning in serial chunk order. Because
+// `Warning` is `Priority=0` FIRST-wins (ExifTool.pm:5404-5417), the document
+// `ExifTool:Warning` surface is the EARLIEST-walked warning. The PNG port
+// previously drained the raw-profile-XMP decode warning dead-last, surfacing a
+// LATER chunk's warning instead; the unified ordered diagnostic replay
+// (`PngMeta::diag_order`) fixes this. Both orderings are oracle-verified against
+// local bundled 13.59 (`perl exiftool -warning -a -G1`).
+// ===========================================================================
+
+/// A double-UTF-encoded XMP packet: a RAW leading UTF-8 BOM (`\xef\xbb\xbf`)
+/// DIRECTLY before `<?xpacket`, which trips ExifTool's double-encoding probe
+/// (XMP.pm:4310) → the `XMP is double UTF-encoded` warning (XMP.pm:4494). The
+/// re-decoded body is valid UTF-8, so the `XMP-dc:Format` tag is still emitted.
+#[cfg(feature = "xmp")]
+fn double_utf_xmp_packet() -> Vec<u8> {
+  let mut v = vec![0xef, 0xbb, 0xbf];
+  v.extend_from_slice(
+    b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>\
+      <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+      <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+      <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+      <dc:format>image/png</dc:format>\
+      </rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>",
+  );
+  v
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn engine_raw_profile_xmp_warning_before_bad_exif_surfaces_xmp_warning_first() {
+  // FORWARD — `Raw profile type xmp` (malformed: double-UTF) THEN a bad `eXIf`.
+  // The XMP chunk is walked FIRST, so `XMP is double UTF-encoded` is the document
+  // FIRST `ExifTool:Warning` — NOT the later `Invalid eXIf chunk` (the #205 bug).
+  // Oracle (local 13.59, `-warning -a -G1`): the warnings are emitted in the
+  // order [XMP is double UTF-encoded, Invalid eXIf chunk].
+  let body = raw_profile_body(
+    "xmp",
+    &double_utf_xmp_packet(),
+    double_utf_xmp_packet().len(),
+  );
+  let mut text = b"Raw profile type xmp\0".to_vec();
+  text.extend_from_slice(&body);
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"tEXt", &text),
+    chunk(b"eXIf", b"XXXXbadexifheader"),
+  ]);
+  let json = extract_info(
+    "rp_xmp_warnorder_fwd.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  // The document first-warning is the XMP one (the earlier chunk).
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"XMP is double UTF-encoded\""),
+    "the earlier XMP raw-profile warning must surface as the first ExifTool:Warning, got {json}",
+  );
+  // The later eXIf warning must NOT be the surfaced first-warning (it is the
+  // SECOND walked, so first-wins keeps the XMP one).
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"Invalid eXIf chunk\""),
+    "the LATER eXIf warning must not win first-occurrence over the earlier XMP one, got {json}",
+  );
+  // The XMP packet still decoded (valid after the BOM strip).
+  assert!(
+    json.contains("\"XMP-dc:Format\":\"image/png\""),
+    "got {json}"
+  );
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn engine_bad_exif_before_raw_profile_xmp_warning_surfaces_exif_warning_first() {
+  // REVERSE — a bad `eXIf` THEN `Raw profile type xmp` (double-UTF). Now the
+  // eXIf chunk is walked FIRST, so `Invalid eXIf chunk` is the document FIRST
+  // `ExifTool:Warning` (this proves the fix is a genuine walk-order interleave,
+  // not a blanket "XMP wins" — the symmetric case must invert).
+  // Oracle (local 13.59, `-warning -a -G1`): the warnings are emitted in the
+  // order [Invalid eXIf chunk, XMP is double UTF-encoded].
+  let body = raw_profile_body(
+    "xmp",
+    &double_utf_xmp_packet(),
+    double_utf_xmp_packet().len(),
+  );
+  let mut text = b"Raw profile type xmp\0".to_vec();
+  text.extend_from_slice(&body);
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"eXIf", b"XXXXbadexifheader"),
+    chunk(b"tEXt", &text),
+  ]);
+  let json = extract_info(
+    "rp_xmp_warnorder_rev.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"Invalid eXIf chunk\""),
+    "the earlier eXIf warning must surface as the first ExifTool:Warning, got {json}",
+  );
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"XMP is double UTF-encoded\""),
+    "the LATER XMP warning must not win first-occurrence over the earlier eXIf one, got {json}",
+  );
+  assert!(
+    json.contains("\"XMP-dc:Format\":\"image/png\""),
+    "got {json}"
+  );
+}
+
 #[test]
 fn engine_single_exif_chunk_source_matches_oracle() {
   // Single native eXIf source — one source, always processed.

@@ -2133,50 +2133,84 @@ impl crate::emit::Taggable for PngMeta<'_> {
 
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for PngMeta<'_> {
-  /// PNG's diagnostics in the retired drain order:
-  /// (a) the PNG walker's own accumulated warnings (`Truncated PNG image`
-  ///     PNG.pm:1486, `Text/EXIF chunk(s) found after …` PNG.pm:1598, the zlib
-  ///     inflate-error warnings, the `Invalid eXIf chunk` / `Improper "Exif00"
-  ///     header …` warnings, …) BEFORE the eXIf dispatch;
-  /// (b) the embedded eXIf / Raw-profile EXIF sub-Metas' diagnostics, IN CHUNK
-  ///     ORDER via the SAME shared-`$$et{PROCESSED}` event replay `tags()` /
-  ///     `project()` use ([`replay_exif_events`], `ExifTool.pm:9061-9072` +
-  ///     `PNG.pm:1193`). For each EXIF event: its own EXIF warnings (via the
-  ///     parsed [`ExifMeta`](crate::exif::ExifMeta)'s `Diagnose` impl), then the
-  ///     cross-source cycle-guard warning(s) the walk raised
-  ///     (`ExifTool.pm:9068`).
-  /// The PNG-level warnings always precede the EXIF ones (PNG walks first), so
-  /// the document-level `first_warning` is unchanged. Byte-identical net
-  /// `TagMap`.
+  /// PNG's document diagnostics, replayed at their CHUNK-WALK position via the
+  /// ordered [`PngMeta::diag_order`](crate::metadata::png::PngMeta) interleave —
+  /// the SAME serial order ExifTool's chunk walk (`PNG.pm:1410-1685`) emits them
+  /// in. Three sources fold onto one walk axis (each [`PngDiagStep`] advancing
+  /// one cursor):
+  /// (a) the PNG walker's own warnings (`Truncated PNG image` PNG.pm:1486,
+  ///     `Text/EXIF chunk(s) found after …` PNG.pm:1598, the zlib inflate-error
+  ///     warnings, `Invalid eXIf chunk` / `Improper "Exif00" header …`, the
+  ///     raw-profile `… is wrong size` / `Unknown raw profile …` warnings, …);
+  /// (b) the embedded eXIf / Raw-profile EXIF sub-Metas' diagnostics, via the
+  ///     SAME shared-`$$et{PROCESSED}` event replay `tags()` / `project()` use
+  ///     ([`replay_exif_events`], `ExifTool.pm:9061-9072` + `PNG.pm:1193`) — for
+  ///     each EXIF event: its own EXIF warnings (the parsed
+  ///     [`ExifMeta`](crate::exif::ExifMeta)'s `Diagnose`), then the cross-source
+  ///     cycle-guard warning(s) the walk raised (`ExifTool.pm:9068`);
+  /// (c) the raw-profile XMP sub-Metas' decode warnings (`ProcessXMP` records at
+  ///     most one first-occurrence `$et->Warn`, e.g. `XMP is double UTF-encoded`
+  ///     XMP.pm:4491), each dispatched at its `Raw profile type {xmp,exif,APP1}`
+  ///     chunk position (`PNG.pm:746`/`:1236`).
+  ///
+  /// Folding (c) onto the walk axis (rather than draining it dead-last, the #205
+  /// bug) is load-bearing: `Warning` is `Priority=0` first-wins
+  /// (`ExifTool.pm:5404-5417`), so a malformed XMP raw-profile that precedes a
+  /// later chunk's warning must surface as the document FIRST `ExifTool:Warning`
+  /// — exactly as bundled. The three cursors consume their streams in push order,
+  /// so each source's internal order is preserved while the sources interleave at
+  /// their true chunk positions. For a PNG whose only diagnostics are PNG-level
+  /// (no embedded EXIF, no XMP raw-profile) the result is byte-identical to the
+  /// pre-#205 flat `self.warnings()` drain (the `diag_order` is then all
+  /// `Warning` steps in push order).
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    use crate::metadata::png::PngDiagStep;
     let mut out = std::vec::Vec::new();
-    out.extend(
-      self
-        .warnings()
-        .iter()
-        .map(crate::diagnostics::Diagnostic::warn),
-    );
+    // Precompute the EXIF event replays once (one per event, IN ORDER); the
+    // `ExifEvent` cursor walks them in lockstep with the event push order.
+    // `png` chains `exif` (`Cargo.toml`), so this file always builds with
+    // `feature = "exif"` — the guard mirrors the rest of the module.
     #[cfg(feature = "exif")]
-    for replay in replay_exif_events(self.exif_events()) {
-      if let Some(exif_meta) = replay.meta() {
-        out.extend(crate::diagnostics::Diagnose::diagnostics(exif_meta));
-      }
-      out.extend(
-        replay
-          .cycle_guard_warnings()
-          .iter()
-          .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
-      );
-    }
-    // Raw-profile XMP sub-Metas' own decode/walk warnings (`ProcessXMP` records
-    // at most one first-occurrence `$et->Warn`, e.g. `XMP is double UTF-encoded`
-    // XMP.pm:4491). These follow the PNG-level + EXIF warnings (XMP profiles are
-    // dispatched after the chunk walk), so the document-level first-warning is
-    // unchanged.
+    let replays = replay_exif_events(self.exif_events());
+    #[cfg(feature = "exif")]
+    let mut event_cursor = replays.iter();
+    let mut warn_cursor = self.warnings().iter();
     #[cfg(feature = "xmp")]
-    for packet in self.xmp_profiles() {
-      if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
-        out.extend(crate::diagnostics::Diagnose::diagnostics(&xmp_meta));
+    let mut xmp_cursor = self.xmp_profiles().iter();
+
+    for step in self.diag_order() {
+      match step {
+        PngDiagStep::Warning => {
+          if let Some(w) = warn_cursor.next() {
+            out.push(crate::diagnostics::Diagnostic::warn(w));
+          }
+        }
+        // `png` chains `exif` (`Cargo.toml`), so this arm always runs; the
+        // `cfg` mirrors the rest of the module's belt-and-suspenders gating.
+        #[cfg(feature = "exif")]
+        PngDiagStep::ExifEvent => {
+          if let Some(replay) = event_cursor.next() {
+            if let Some(exif_meta) = replay.meta() {
+              out.extend(crate::diagnostics::Diagnose::diagnostics(exif_meta));
+            }
+            out.extend(
+              replay
+                .cycle_guard_warnings()
+                .iter()
+                .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+            );
+          }
+        }
+        #[cfg(not(feature = "exif"))]
+        PngDiagStep::ExifEvent => {}
+        #[cfg(feature = "xmp")]
+        PngDiagStep::Xmp => {
+          if let Some(packet) = xmp_cursor.next()
+            && let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet)
+          {
+            out.extend(crate::diagnostics::Diagnose::diagnostics(&xmp_meta));
+          }
+        }
       }
     }
     out

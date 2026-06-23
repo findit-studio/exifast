@@ -389,6 +389,15 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Pentax:SkinToneCorrection",
     ],
   ),
+  // #205 — the PNG raw-profile-XMP diagnostics walk-order fixture. The invalid
+  // `eXIf` chunk (whose body is neither `II`/`MM`/`\0`) makes bundled emit a
+  // `PNG:eXIf = (Binary data 17 bytes, …)` placeholder the PNG port suppresses
+  // (the pre-existing eXIf-suppression deferral — exifast decodes EXIF blocks,
+  // not the raw-chunk binary placeholder). Dropped from BOTH sides; the document
+  // FIRST-`ExifTool:Warning` ORDER (the earlier XMP `XMP is double UTF-encoded`,
+  // not the later `Invalid eXIf chunk`) is what this fixture pins. Mirrors
+  // `conformance.rs::png_rawprofile_xmp_conformance`'s `check_excluding`.
+  ("PNG_rawprofile_xmp_warnorder.png", &["PNG:eXIf"]),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1146,7 +1155,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `$$self{TIFF_TYPE}` is set (`ExifTool.pm:8668`/`:8715`), so `TIFF_TYPE == ''`
 /// and the `/^(DNG|TIFF)$/` gate is false. Byte-exact at `-j`/`-n` vs bundled
 /// 13.59; no `Composite:*` (IFD0-only, no FNumber/ExposureTime).
-const EXPECTED_ACTIVE_FIXTURES: usize = 575;
+///
+/// 575 → 576 after `PNG_rawprofile_xmp_warnorder.png` (#205): a malformed `Raw
+/// profile type xmp` chunk (double-UTF packet → `XMP is double UTF-encoded`)
+/// positioned BEFORE a later bad `eXIf` (→ `Invalid eXIf chunk`). Pins that the
+/// PNG port now drains each document `ExifTool:Warning` at its chunk-walk
+/// position (the unified `PngMeta::diag_order` replay) so the EARLIER XMP
+/// warning wins first-occurrence — the typed-serde path matches the writer +
+/// golden (`PNG:eXIf` is the sole dropped key, the eXIf-suppression deferral).
+const EXPECTED_ACTIVE_FIXTURES: usize = 576;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
