@@ -837,3 +837,150 @@ fn bigtiff_magic_forces_btf_regardless_of_extension() {
   // Dotless — likewise BTF.
   assert_triplet_no_pagecount("renamed", &data, "BTF", "btf", "image/x-tiff-big");
 }
+
+// ===========================================================================
+// #331-P2 (Codex [medium]): the Sony DSLR-A100 `0x014a` raw-data defer must key
+// on the DETECTION-TIME base `$$self{FILE_TYPE}` (`'TIFF'` for the whole
+// TIFF-rooted family), NOT the finalized subtype. A real A100 raw is an `.arw`,
+// so the engine finalizes `File:FileType = ARW` and threads `file_type =
+// Some("ARW")` into the EXIF walker — yet ExifTool's `0x014a` `Condition`
+// (`Exif.pm:1014` `$$self{FILE_TYPE} ne 'TIFF'`) still holds (`$$self{FILE_TYPE}`
+// is the base `'TIFF'`, never overwritten by `SetARW`'s `OverrideFileType('ARW')`
+// which only touches `$$self{FileType}`). So the defer MUST fire for the `.arw`
+// subtype path. This END-TO-END test drives `extract_info` (the engine
+// candidate loop + `File:*` finalization), NOT the `parse_standalone_tiff_with_base`
+// helper with a hand-passed `Some("TIFF")`, to prove the base-vs-subtype
+// threading is correct through the real dispatch.
+// ===========================================================================
+
+/// A 12-byte little-endian IFD entry `tag | type | count | value/offset`.
+fn a100_le_entry(tag: u16, typ: u16, count: u32, value: [u8; 4]) -> [u8; 12] {
+  let mut e = [0u8; 12];
+  e[0..2].copy_from_slice(&tag.to_le_bytes());
+  e[2..4].copy_from_slice(&typ.to_le_bytes());
+  e[4..8].copy_from_slice(&count.to_le_bytes());
+  e[8..12].copy_from_slice(&value);
+  e
+}
+
+/// Build a little-endian classic-TIFF A100-shaped raw: IFD0 (ascending tag ids)
+/// = `NewSubfileType`(0x00fe)=1, `Compression`(0x0103)=6, `Make`(0x010f)="SONY\0"
+/// (out-of-line), `Model`(0x0110)=`model`+`\0` (out-of-line), `0x014a` = a 4-byte
+/// LONG pointing at `raw_target`. The Make/Model strings + the `0x014a` target
+/// region are appended after the IFD0 block. `raw_target` is appended last and
+/// `0x014a` points at it; when it is NOT a valid IFD (`ValidateIFD`), `SetARW`
+/// returns false ⇒ the A100 raw-data arm (defer). The crafted target here is a
+/// structurally-VALID 1-entry SubIFD (`ImageWidth=4242`): `ValidateIFD` rejects
+/// it (`numEntries > 1` fails) so the defer is correct, yet WITHOUT the defer the
+/// generic walker WOULD happily emit `SubIFD:ImageWidth=4242` — the observable
+/// discriminator.
+fn build_a100_arw(model: &[u8]) -> Vec<u8> {
+  // IFD0: count(2) + 5 entries(60) + next(4) = 66 ⇒ ends at 8 + 66 = 74.
+  let make_off = 74u32;
+  let model_off = make_off + 5; // "SONY\0" = 5 bytes
+  let raw_off = model_off + u32::try_from(model.len() + 1).expect("fits u32"); // model + "\0"
+
+  let subfile = a100_le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+  let comp = a100_le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+  let make = a100_le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+  let model_e = a100_le_entry(
+    0x0110,
+    2,
+    u32::try_from(model.len() + 1).expect("fits u32"),
+    model_off.to_le_bytes(),
+  );
+  let subifd = a100_le_entry(0x014a, 4, 1, raw_off.to_le_bytes());
+  let entries = [subfile, comp, make, model_e, subifd];
+
+  let mut out: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+  out.extend_from_slice(
+    &u16::try_from(entries.len())
+      .expect("fits u16")
+      .to_le_bytes(),
+  );
+  for e in &entries {
+    out.extend_from_slice(e);
+  }
+  out.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+  assert_eq!(out.len(), 74, "IFD0 must end at 74");
+  // Trailing region: Make, Model, then the `0x014a` target (a 1-entry SubIFD —
+  // structurally walkable, but NOT a valid IFD per `ValidateIFD`).
+  out.extend_from_slice(b"SONY\0");
+  out.extend_from_slice(model);
+  out.push(0);
+  out.extend_from_slice(&1u16.to_le_bytes()); // numEntries = 1 (ValidateIFD rejects)
+  out.extend_from_slice(&a100_le_entry(0x0100, 4, 1, 4242u32.to_le_bytes()));
+  out.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+  out
+}
+
+/// END-TO-END (`extract_info`): a crafted Sony DSLR-A100 raw presented as an
+/// `.arw` finalizes to `File:FileType = ARW` (so the EXIF walker's
+/// `file_type == Some("ARW")`), yet the `0x014a` A100 raw-data DEFER STILL FIRES
+/// — proving the gate keys on the detection-time base `$$self{FILE_TYPE} = 'TIFF'`
+/// (the `.arw` is a TIFF-rooted container), not the finalized subtype. No
+/// `SubIFD:*` tag is emitted (the raw-data offset is not walked as a directory).
+///
+/// The companion `non_a100_sony_arw_*` case is the discriminator: an IDENTICAL
+/// shape with `Model = DSLR-A700` (NOT the A100) ⇒ `SetARW` returns 1 immediately
+/// ⇒ the `0x014a` IS walked as a SubIFD, so `SubIFD:ImageWidth = 4242` DOES
+/// appear. That proves the harness genuinely emits the SubIFD leaf when the defer
+/// does not fire, so the A100 case's ABSENCE of `SubIFD:*` is meaningful.
+///
+/// Ground-truthed on ExifTool 13.59: a DSLR-A100 `.arw` with a 1-entry (invalid)
+/// `0x014a` → `A100DataOffset`, FileType `ARW`, no `SubIFD:*`.
+#[test]
+fn a100_defer_fires_for_arw_subtype_end_to_end() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+
+    // --- The real A100 case: file_type finalizes to ARW, defer FIRES. ---
+    let a100 = build_a100_arw(b"DSLR-A100");
+    let o = doc("alpha.arw", &a100, print_on);
+    // The finalized subtype is ARW — exactly the state that made the OLD
+    // `self.file_type == Some("TIFF")` gate FALSE (the bug). The `.arw` magic is
+    // classic TIFF, so the detection base `$$self{FILE_TYPE}` is `'TIFF'`.
+    assert_eq!(
+      o.get("File:FileType").and_then(Value::as_str),
+      Some("ARW"),
+      "alpha.arw ({mode}): a TIFF-rooted .arw finalizes File:FileType = ARW: {o:?}"
+    );
+    // The A100 defer FIRED: the `0x014a` raw-data offset was NOT walked, so no
+    // SubIFD-family tag (and in particular not the target's ImageWidth = 4242).
+    let subifd_keys: Vec<&String> = o
+      .keys()
+      .filter(|k| k.starts_with("SubIFD") && k.contains(':'))
+      .collect();
+    assert!(
+      subifd_keys.is_empty(),
+      "alpha.arw ({mode}): the A100 0x014a raw-data offset must NOT be walked as a \
+       SubIFD even though File:FileType = ARW (the defer keys on the base TIFF \
+       container, not the subtype): stray {subifd_keys:?} in {o:?}"
+    );
+    // The IFD0 Make/Model still emit (the walk itself proceeded normally; only
+    // the `0x014a` descent was deferred).
+    assert_eq!(
+      o.get("IFD0:Make").and_then(Value::as_str),
+      Some("SONY"),
+      "alpha.arw ({mode}): IFD0:Make still emits: {o:?}"
+    );
+
+    // --- Discriminator: a non-A100 Sony .arw DOES walk the 0x014a SubIFD. ---
+    let a700 = build_a100_arw(b"DSLR-A700");
+    let o2 = doc("alpha.arw", &a700, print_on);
+    // `SetARW` returns 1 for a non-A100 model ⇒ the `0x014a` IS a SubIFD ⇒ the
+    // 1-entry target's `ImageWidth = 4242` is emitted under SubIFD. This proves
+    // the harness emits the SubIFD leaf when the defer does NOT fire, so the A100
+    // case's absence above is a real signal (not a harness that never walks it).
+    let has_subifd_imagewidth = o2.iter().any(|(k, v)| {
+      k.starts_with("SubIFD")
+        && k.ends_with(":ImageWidth")
+        && (v.as_u64() == Some(4242) || v.as_str() == Some("4242"))
+    });
+    assert!(
+      has_subifd_imagewidth,
+      "alpha.arw/DSLR-A700 ({mode}): a non-A100 Sony 0x014a IS walked as a SubIFD \
+       (SetARW returns 1), so SubIFD:ImageWidth = 4242 must appear: {o2:?}"
+    );
+  }
+}

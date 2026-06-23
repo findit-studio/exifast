@@ -1138,7 +1138,30 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `rational64u` ExposureTime now rounds via `RoundFloat($num/$den, 10)` (exactly
 /// as ExifTool's `GetRational64u` reader), so the CORE `ExifIFD:ExposureTime` /
 /// `Composite:ShutterSpeed` / `Composite:LightValue` match bundled byte-exact.
-const EXPECTED_ACTIVE_FIXTURES: usize = 573;
+///
+/// 573 → 574 after `TIFF_jpgfromraw.tif` (#331-P2 / #352): the crafted
+/// SubIFD2:JpgFromRaw verifier. A minimal little-endian TIFF whose IFD0 0x014a
+/// SubIFD pointer carries THREE offsets (descended as `SubIFD`/`SubIFD1`/
+/// `SubIFD2` via the new classic-TIFF multi-offset SubIFD walk); SubIFD2's
+/// `SubfileType=1` + `Compression=7` + 0x0111/0x0117 resolve to
+/// `JpgFromRawStart`/`JpgFromRawLength` and drive the synthetic
+/// `SubIFD2:JpgFromRaw = (Binary data 4 bytes, …)` through the EXIF DataTag
+/// channel (`Exif.pm:673-684`/`:769-778`), byte-exact at `-j`/`-n` vs bundled
+/// 13.59. SubIFD0's plain `StripOffsets`/`StripByteCounts` (no Compression) emit
+/// NO DataTag — the SubIFD-context StripOffsets path P1 could not reach. The
+/// ported `Composite:ImageSize`/`Megapixels` are KEPT (TIFF is not a
+/// RAW-ImageSize subtype); `System:all` is the sole exclusion.
+///
+/// 574 → 575 after `BigTIFF_jpegpreview.btf`: the BigTIFF counterpart of the
+/// `TIFF_jpgfromraw.tif` verifier, pinning that a BigTIFF does NOT take the
+/// `PreviewImage`/`JpgFromRaw` arms. A crafted little-endian BigTIFF (version 43)
+/// whose IFD0 carries the SAME JPEG-preview shape (`SubfileType=1` +
+/// `Compression=7` + 0x0111/0x0117) keeps the DEFAULT `IFD0:StripOffsets`/
+/// `IFD0:StripByteCounts` arm — `ProcessBTF` `return 1`s before
+/// `$$self{TIFF_TYPE}` is set (`ExifTool.pm:8668`/`:8715`), so `TIFF_TYPE == ''`
+/// and the `/^(DNG|TIFF)$/` gate is false. Byte-exact at `-j`/`-n` vs bundled
+/// 13.59; no `Composite:*` (IFD0-only, no FNumber/ExposureTime).
+const EXPECTED_ACTIVE_FIXTURES: usize = 575;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

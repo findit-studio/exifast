@@ -108,7 +108,7 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   recovery::Step,
 };
-use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value};
+use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value, read_value_count};
 use makernotes::subdir::{ByteOrderRule, FixBaseMode, ProcessProc, TableRef};
 use tables::Conv;
 
@@ -169,6 +169,22 @@ pub enum IfdKind {
   /// `InteropVersion` in `%Exif::Main`); an ASCII-numeric pointer recurses too
   /// (`split ' '` numifies the string, no integer-format gate).
   BigSubIfd(SubDirKind, u32),
+  /// A classic-TIFF SubIFD reached by the `0x014a SubIFD` pointer's
+  /// `SubDirectory => { Start => '$val', MaxSubdirs => 10 }` (`Exif.pm:1006-1027`)
+  /// — the DNG/TIFF preview/raw sub-IFD tower. The pointer carries MULTIPLE
+  /// offsets (`@values = split ' ', $val`, `Exif.pm:6930`); each is walked as
+  /// its own directory whose family-1 `DirName` is the pointer's
+  /// `Groups => { 1 => 'SubIFD' }` with the directory NUMBER appended for the
+  /// 2nd+ (`$subdirInfo{DirName} =~ s/\d*$/$dirNum/ if $dirNum`, `Exif.pm:7076`).
+  /// So the payload is `$dirNum`: `0 → "SubIFD"`, `1 → "SubIFD1"`,
+  /// `2 → "SubIFD2"`, … ([`as_str`](Self::as_str) renders it via
+  /// [`IfdName::sub_ifd`]). The table is forced to `%Exif::Main`
+  /// ([`table_for_ifd_kind`]) — the pointer carries no `SubDirectory{TagTable}`
+  /// redirect, so the child reuses the inherited Exif table (`Exif.pm:6943`,
+  /// `$newTagTable = $tagTablePtr`). `DIR_NAME eq "SubIFD2"` is what selects the
+  /// `JpgFromRawStart`/`JpgFromRawLength` arms of the `0x111`/`0x117` conditional
+  /// tag lists (`Exif.pm:673-684`/`:769-778`, #331-P2).
+  SubIfd(u32),
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -304,6 +320,52 @@ impl IfdName {
     }
   }
 
+  /// Render a classic-TIFF SubIFD family-1 group name: `"SubIFD"` for the
+  /// FIRST offset (`dirNum == 0`), then `"SubIFD{dirNum}"` for the 2nd+ —
+  /// the faithful `$subdirInfo{DirName} = 'SubIFD'; $subdirInfo{DirName} =~
+  /// s/\d*$/$dirNum/ if $dirNum` (`Exif.pm:7074-7076`): `dirNum 0 → "SubIFD"`
+  /// (the `if $dirNum` guard skips the substitution), `1 → "SubIFD1"`,
+  /// `2 → "SubIFD2"`, … The widest is `"SubIFD"` (6) + `u32::MAX` (10 digits)
+  /// = 16 <= 24 = `buf.len()`.
+  #[must_use]
+  fn sub_ifd(dir_num: u32) -> Self {
+    if dir_num == 0 {
+      return Self::literal("SubIFD");
+    }
+    let bytes = b"SubIFD";
+    let mut buf = [0u8; 24];
+    let n = bytes.len();
+    if let Some(dst) = buf.get_mut(..n) {
+      dst.copy_from_slice(bytes);
+    }
+    // Decimal-render `dir_num` (most-significant first) after the `"SubIFD"`
+    // prefix, into a scratch buffer then a checked copy — the same panic-safe
+    // shape as [`Self::ifd`]/[`Self::literal_suffixed`]. `dir_num > 0` here, so
+    // at least one digit is written.
+    let mut digits = [0u8; 10];
+    let mut value = dir_num;
+    let mut ndigits = 0usize;
+    for slot in &mut digits {
+      *slot = b'0' + (value % 10) as u8;
+      value /= 10;
+      ndigits += 1;
+      if value == 0 {
+        break;
+      }
+    }
+    // `n + ndigits <= 6 + 10 = 16 <= 24`, so `buf.get_mut(n..n+ndigits)` is
+    // `Some`; the unreachable `None` arm leaves the suffix unwritten.
+    if let (Some(src), Some(dst)) = (digits.get(..ndigits), buf.get_mut(n..n + ndigits)) {
+      for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+        *d = *s;
+      }
+    }
+    Self {
+      buf,
+      len: (n + ndigits) as u8,
+    }
+  }
+
   /// The rendered name as a `&str`.
   #[must_use]
   #[inline]
@@ -378,6 +440,10 @@ impl IfdKind {
       // appended for the 2nd+ offset of a multi-offset pointer (`$i = 0` -> no
       // suffix, the dominant single-offset camera shape).
       IfdKind::BigSubIfd(sub, i) => IfdName::literal_suffixed(sub.tag_name(), i),
+      // `$subdirInfo{DirName} = 'SubIFD'` then `s/\d*$/$dirNum/ if $dirNum`
+      // (`Exif.pm:7074-7076`): the classic-TIFF SubIFD tower's `$dirNum`-th
+      // directory is `SubIFD`/`SubIFD1`/`SubIFD2`/…
+      IfdKind::SubIfd(dir_num) => IfdName::sub_ifd(dir_num),
     }
   }
 
@@ -408,6 +474,10 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     // {TagTable}`) — even a `GPSInfo` BigTIFF SubIFD (`Exif::Main`, not
     // `%GPS::Main`). So every payload maps to `Exif`, regardless of the pointer.
     IfdKind::BigSubIfd(_, _) => TableRef::Exif,
+    // A classic-TIFF SubIFD reuses the inherited `%Exif::Main` — the `0x014a`
+    // pointer's SubDirectory carries no `TagTable` redirect, so `$newTagTable =
+    // $tagTablePtr` (`Exif.pm:6943`).
+    IfdKind::SubIfd(_) => TableRef::Exif,
   }
 }
 
@@ -440,6 +510,15 @@ pub enum SubDirKind {
   /// captures the raw bytes. This variant IS the plug-in seam: a MakerNotes
   /// port adds the per-vendor dispatch behind it.
   MakerNote,
+  /// `SubIFD` (0x014a) — the classic-TIFF preview/raw sub-IFD pointer
+  /// (`Exif.pm:1006-1027`, `Flags => 'SubIFD'`, `SubDirectory => { Start =>
+  /// '$val', MaxSubdirs => 10 }`). UNLIKE the single-offset ExifIFD/GPS/Interop
+  /// pointers, this carries MULTIPLE offsets (`@values = split ' ', $val`); the
+  /// walker descends each as an [`IfdKind::SubIfd`] directory (`SubIFD`,
+  /// `SubIFD1`, `SubIFD2`, …) reusing the inherited `%Exif::Main` table. The
+  /// multi-offset descent path is bespoke (see [`Walker::dispatch_classic_subifd`]),
+  /// not the single-offset [`Walker::dispatch_subdir`] arm.
+  SubIfd,
 }
 
 impl SubDirKind {
@@ -458,7 +537,7 @@ impl SubDirKind {
   pub const fn is_sub_ifd(self) -> bool {
     matches!(
       self,
-      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop
+      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop | SubDirKind::SubIfd
     )
   }
 
@@ -476,6 +555,7 @@ impl SubDirKind {
       SubDirKind::Gps => "GPSInfo",
       SubDirKind::Interop => "InteropOffset",
       SubDirKind::MakerNote => "MakerNote",
+      SubDirKind::SubIfd => "SubIFD",
     }
   }
 }
@@ -2379,13 +2459,28 @@ impl FormatParser for ProcessExif {
   /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
   /// synthesis (`ExifTool.pm:8756-8757`) is active.
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    // Direct standalone-TIFF lib entry: no candidate `Parent` context (the
-    // engine path through `AnyParser::Exif` carries the real type via
-    // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
-    // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
+    // Direct standalone-TIFF lib entry with no candidate `Parent` context. The
+    // finalized subtype `$$self{TIFF_TYPE}` for a plain `.tif` with no `Parent`
+    // is `"TIFF"` (`finalized_tiff_file_type("TIFF", "", _)`: `$t` undef ⇒ the
+    // detected base name stays `"TIFF"`, `ExifTool.pm:8685-8704`) — the SAME
+    // string the engine path threads in for a plain TIFF — so `file_type =
+    // Some("TIFF")`, matching the engine dispatch (`format_parser.rs`). This
+    // enables the DNG/TIFF JPEG-preview gate (`$$self{TIFF_TYPE} =~
+    // /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) for direct callers, so a SubIFD2
+    // JPEG strip resolves `0x111`/`0x117` to `JpgFromRaw` exactly as
+    // `extract_info` does. A `.tif` is never a CRW, so the ShotInfo pos-22 CRW
+    // clause stays off (`"TIFF" ne "CRW"`), and the Samsung2 SRW clause stays
+    // off (`"TIFF" ne "SRW"`) — `Some("TIFF")` keys no other consumer that
+    // `None` did not. The DETECTION-TIME base `$$self{FILE_TYPE}` for a
+    // TIFF-magic file IS `'TIFF'` (`ExifTool.pm:3048`), so `base_file_type =
+    // Some("TIFF")` — the Sony-A100 `0x014a` gate is reachable from this direct
+    // entry exactly as ExifTool would reach it for raw A100 bytes.
     parse_tiff(
-      data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
-      /* file_type */ None,
+      data,
+      /* tiff_type_is_tiff */ true,
+      /* standalone_tiff */ true,
+      /* file_type */ Some("TIFF"),
+      /* base_file_type */ Some("TIFF"),
     )
   }
 }
@@ -2399,11 +2494,21 @@ impl FormatParser for ProcessExif {
 /// tags on the returned [`ExifMeta`], never as a fatal error.
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
-  // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
-  // None` (see [`ProcessExif::parse`]).
+  // Direct standalone-TIFF lib entry — no candidate `Parent`, so the finalized
+  // subtype `$$self{TIFF_TYPE}` is `"TIFF"` (the plain-`.tif` finalization, the
+  // SAME value the engine threads in), hence `file_type = Some("TIFF")`. This
+  // matches the engine path and enables the DNG/TIFF JPEG-preview / `JpgFromRaw`
+  // gate (`Exif.pm:635`/`:735`) for direct callers; `"TIFF"` keys no consumer
+  // beyond that gate (not the `"CRW"` ShotInfo nor the `"SRW"` Samsung2 clause).
+  // The detection-time base `$$self{FILE_TYPE}` is `'TIFF'` (`ExifTool.pm:3048`),
+  // so `base_file_type = Some("TIFF")` (the Sony-A100 `0x014a` gate) (see
+  // [`ProcessExif::parse`]).
   parse_tiff(
-    data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
-    /* file_type */ None,
+    data,
+    /* tiff_type_is_tiff */ true,
+    /* standalone_tiff */ true,
+    /* file_type */ Some("TIFF"),
+    /* base_file_type */ Some("TIFF"),
   )
 }
 
@@ -2433,11 +2538,13 @@ pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
 pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (QuickTime/RIFF/PNG/MakerNotes seam) — the container's
   // `$$self{FILE_TYPE}` is the OUTER type, never "CRW", so `file_type = None`
-  // (the ShotInfo pos-22 CRW clause stays off). `standalone_tiff = false`: an
-  // embedded block has no `$raf`, so the CR2 magic is NOT checked here.
+  // (the ShotInfo pos-22 CRW clause stays off) and `base_file_type = None` (the
+  // outer type is never `'TIFF'`, so the Sony-A100 `0x014a` gate stays off).
+  // `standalone_tiff = false`: an embedded block has no `$raf`, so the CR2 magic
+  // is NOT checked here.
   parse_tiff(
     block, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
-    /* file_type */ None,
+    /* file_type */ None, /* base_file_type */ None,
   )
 }
 
@@ -2455,12 +2562,13 @@ pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 #[must_use]
 pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (JPEG `APP1`, etc.) — the OUTER container type is never
-  // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off).
-  // `standalone_tiff = false`: an embedded `APP1` TIFF has no `$raf`, so the CR2
-  // magic is NOT checked here (a JPEG's embedded TIFF must never become CR2).
+  // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off) and
+  // never `'TIFF'`, so `base_file_type = None` (the Sony-A100 `0x014a` gate stays
+  // off). `standalone_tiff = false`: an embedded `APP1` TIFF has no `$raf`, so the
+  // CR2 magic is NOT checked here (a JPEG's embedded TIFF must never become CR2).
   parse_tiff_with_base(
     block, base, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
-    /* file_type */ None,
+    /* file_type */ None, /* base_file_type */ None,
   )
 }
 
@@ -2479,13 +2587,26 @@ pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_
 /// candidate (`ExifTool.pm:3026-3034`). The `MultiPage` flag itself comes from
 /// the SubfileType / OldSubfileType `RawConv` (`Exif.pm:456`/`:473`).
 ///
-/// `file_type` is that same candidate `Parent` (`$$self{FILE_TYPE}`,
-/// `ExifTool.pm:8715`) — stored on the resulting [`ExifMeta`] and threaded to
-/// the Canon MakerNote decoder for the `Canon::ShotInfo` pos-22 CRW-allows-0
-/// RawConv (`Canon.pm:2977`/`:2990`). The engine dispatch passes
-/// `Some(parent_type)`; it is WRITE-ONLY apart from that single pos-22 read.
-/// (A standalone TIFF/RAW is never a CRW — the CRW path is the unported CIFF
-/// front-end — so this changes no output today.)
+/// `file_type` is the FINALIZED subtype `$$self{TIFF_TYPE}` /
+/// `$$self{FileType}` (`ExifTool.pm:8546`/`:8715`) — the candidate `Parent` run
+/// through `SetFileType` (so a `.arw` is `"ARW"`). Stored on the resulting
+/// [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
+/// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`). The
+/// engine dispatch passes the resolved `File:FileType`; it is WRITE-ONLY apart
+/// from that single pos-22 read. (A standalone TIFF/RAW is never a CRW — the CRW
+/// path is the unported CIFF front-end — so this changes no output today.)
+///
+/// `base_file_type` is the DETECTION-TIME base `$$self{FILE_TYPE}`
+/// (`ExifTool.pm:3048`) — NEVER overwritten by `SetFileType`/`OverrideFileType`,
+/// so it is `Some("TIFF")` for the WHOLE TIFF-rooted family (TIFF/ARW/SRW/DNG/…)
+/// even when `file_type` is the `SetARW`-overridden `Some("ARW")`. The engine
+/// dispatch and the direct lib `.tif` entries pass `Some("TIFF")`; the embedded
+/// CTMD MakerNote re-dispatch passes `None` (its outer `$$self{FILE_TYPE}` is the
+/// container type, never `'TIFF'`). The sole reader is the Sony DSLR-A100
+/// `0x014a` `Condition` (`Exif.pm:1014` `$$self{FILE_TYPE} ne 'TIFF'`,
+/// [`Walker::a100_data_offset_condition`]): it must fire for a real A100 in any
+/// TIFF-rooted container (the real case is an `.arw`, `file_type == "ARW"`), so
+/// the gate keys on the BASE type, NOT the finalized subtype.
 ///
 /// `standalone_tiff` is the CR2-magic `$raf` gate (`ExifTool.pm:8629`): the
 /// genuine top-level standalone-TIFF dispatch passes `true` (the CR2 magic IS
@@ -2501,11 +2622,19 @@ pub fn parse_standalone_tiff_with_base<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   // The returned `ExifMeta<'a>` borrows ONLY from `block` (the IFD bytes); the
-  // `file_type` is copied into an owned `SmolStr` inside `parse_tiff_with_base`,
-  // so its lifetime is independent and need not appear in the return type.
-  parse_tiff_with_base(block, base, tiff_type_is_tiff, standalone_tiff, file_type)
+  // `file_type` / `base_file_type` are copied into owned `SmolStr`s inside
+  // `parse_tiff_with_base`, so their lifetimes are independent of the return.
+  parse_tiff_with_base(
+    block,
+    base,
+    tiff_type_is_tiff,
+    standalone_tiff,
+    file_type,
+    base_file_type,
+  )
 }
 
 /// The Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD re-dispatch
@@ -2533,6 +2662,10 @@ pub fn parse_ctmd_exif_ifd_redispatch(block: &[u8]) -> Option<ExifMeta<'_>> {
     /* tiff_type_is_tiff */ false,
     /* standalone_tiff */ false,
     /* file_type */ None,
+    // The embedded CTMD `0x8769` block's `$$self{FILE_TYPE}` is the outer
+    // container type, never `'TIFF'` ⇒ the Sony-A100 `0x014a` gate stays off.
+    /* base_file_type */
+    None,
     /* no_raf */ true,
     /* ifd0_kind */ IfdKind::Ifd0,
   )
@@ -2560,6 +2693,11 @@ pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
     /* tiff_type_is_tiff */ false,
     /* standalone_tiff */ false,
     /* file_type */ None,
+    // The embedded CR3 `CMT4` GPS block's `$$self{FILE_TYPE}` is the outer
+    // QuickTime/CR3 type, never `'TIFF'` ⇒ the Sony-A100 `0x014a` gate stays off
+    // (and a GPS-table top IFD never carries `0x014a` anyway).
+    /* base_file_type */
+    None,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Gps,
   )
@@ -2591,8 +2729,16 @@ fn parse_tiff<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
-  parse_tiff_with_base(data, 0, tiff_type_is_tiff, standalone_tiff, file_type)
+  parse_tiff_with_base(
+    data,
+    0,
+    tiff_type_is_tiff,
+    standalone_tiff,
+    file_type,
+    base_file_type,
+  )
 }
 
 /// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
@@ -2616,19 +2762,36 @@ fn parse_tiff<'a>(
 /// callers — DISTINCT from `tiff_type_is_tiff` (see
 /// [`parse_tiff_with_base_no_raf`]).
 ///
-/// `file_type` is the container's detected `$$self{FILE_TYPE}` — stored on the
-/// resulting [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
-/// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
-/// The standalone-TIFF dispatch passes the candidate `Parent`
-/// (`"TIFF"`/`"DNG"`/…); the embedded-block callers pass `None` (a JPEG/PNG
-/// container is never "CRW"). It is otherwise WRITE-ONLY — it changes no
-/// other tag, and no reachable input is a CRW today (no CIFF/CRW parser).
+/// `file_type` is the container's FINALIZED subtype `$$self{TIFF_TYPE}` /
+/// `$$self{FileType}` (`ExifTool.pm:8546`/`:8715`) — stored on the resulting
+/// [`ExifMeta`] and threaded into the walk as `$$self{TIFF_TYPE}` everywhere a
+/// `Condition` reads it: the conditional `0x111`/`0x117`/`0x201`/`0x202`
+/// offset-tag resolution (the DNG/TIFF `JpgFromRaw`/`PreviewImage` and CR2/ARW
+/// preview arms — [`OffsetTagContext::tiff_type`](tables::OffsetTagContext),
+/// `Exif.pm:601-779`/`:1148-1294`), the `Canon::ShotInfo` pos-22 CRW-allows-0
+/// RawConv (`Canon.pm:2977`/`:2990`), and the `MakerNoteSamsung2` SRW clause
+/// (`MakerNotes.pm:969`). The standalone-TIFF dispatch AND the direct lib `.tif`
+/// entries ([`ProcessExif::parse`] / [`parse_borrowed`]) pass the resolved
+/// `File:FileType` (`"TIFF"`/`"DNG"`/`"ARW"`/…, `"TIFF"` for a plain `.tif`);
+/// the embedded-block callers pass `None` (a JPEG/PNG container is never "CRW"
+/// nor "TIFF"). No reachable input is a CRW today (no CIFF/CRW parser).
+///
+/// `base_file_type` is the DETECTION-TIME base `$$self{FILE_TYPE}`
+/// (`ExifTool.pm:3048`), which `ProcessTIFF`/`SetFileType`/`OverrideFileType`
+/// never overwrite — so it stays `Some("TIFF")` for the WHOLE TIFF-rooted family
+/// (TIFF/ARW/SRW/DNG/…), DISTINCT from the `SetARW`-overridden `file_type`. The
+/// standalone-TIFF dispatch (and the direct lib `.tif` entries) pass
+/// `Some("TIFF")`; the embedded-block callers pass `None` (the outer container
+/// type is never `'TIFF'`). The sole reader is the Sony DSLR-A100 `0x014a`
+/// `Condition` (`Exif.pm:1014`), which must fire for a real A100 in any
+/// TIFF-rooted container (the real case is an `.arw`, `file_type == "ARW"`).
 fn parse_tiff_with_base<'a>(
   data: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   parse_tiff_with_base_no_raf(
     data,
@@ -2636,6 +2799,7 @@ fn parse_tiff_with_base<'a>(
     tiff_type_is_tiff,
     standalone_tiff,
     file_type,
+    base_file_type,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Ifd0,
   )
@@ -2672,6 +2836,7 @@ fn parse_tiff_with_base_no_raf<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
   no_raf: bool,
   ifd0_kind: IfdKind,
 ) -> Option<ExifMeta<'a>> {
@@ -2706,7 +2871,15 @@ fn parse_tiff_with_base_no_raf<'a>(
     if !standalone_tiff {
       return None;
     }
-    return parse_bigtiff(data, order, base, file_type, no_raf, ifd0_kind);
+    return parse_bigtiff(
+      data,
+      order,
+      base,
+      file_type,
+      base_file_type,
+      no_raf,
+      ifd0_kind,
+    );
   }
   // `my $offset = Get32u($dataPt, 4); $offset >= 8 or return 0`.
   let ifd0_offset = get_u32(data, 4, order)? as usize;
@@ -2770,10 +2943,12 @@ fn parse_tiff_with_base_no_raf<'a>(
     && data.get(8..16).is_some()
     && data.get(8..12) == Some(b"CR\x02\0".as_slice());
 
-  // The container `$$self{FILE_TYPE}` — owned once so it can be both threaded
-  // to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk time)
-  // and stored on the resulting `ExifMeta`.
+  // The container subtype `$$self{TIFF_TYPE}` — owned once so it can be both
+  // threaded to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk
+  // time) and stored on the resulting `ExifMeta`.
   let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
+  // The detection-time base `$$self{FILE_TYPE}` (the Sony-A100 `0x014a` gate).
+  let base_file_type: Option<smol_str::SmolStr> = base_file_type.map(smol_str::SmolStr::new);
   let mut w = Walker {
     data,
     order,
@@ -2796,7 +2971,10 @@ fn parse_tiff_with_base_no_raf<'a>(
     page_count: 0,
     multi_page: false,
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
     file_type: file_type.clone(),
+    base_file_type,
     // RAF-backed framing — every caller of this function has an effective RAF
     // (the block IS the whole readable buffer). The no-RAF CTMD `0x8769` hop
     // uses [`parse_ctmd_exif_ifd_redispatch`] instead.
@@ -2922,6 +3100,7 @@ fn parse_bigtiff<'a>(
   order: ByteOrder,
   base: u32,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
   no_raf: bool,
   ifd0_kind: IfdKind,
 ) -> Option<ExifMeta<'a>> {
@@ -2942,7 +3121,31 @@ fn parse_bigtiff<'a>(
   // `>= 8`; `ProcessBigIFD`'s seek/read bounds-check it.)
   let ifd0_offset = usize::try_from(get_u64(data, 8, order)?).ok()?;
 
-  let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
+  // `$$self{TIFF_TYPE}` is the EMPTY STRING (`''`) for the WHOLE BigTIFF walk, so
+  // the caller's container `file_type` candidate is DELIBERATELY IGNORED here
+  // (the walker's `file_type` below is forced to `None` ≡ `''`). `ProcessBTF` /
+  // `ProcessBigIFD` (`BigTIFF.pm`) is dispatched from `DoProcessTIFF`'s
+  // `$identifier == 0x2b` arm and `return 1`s at `ExifTool.pm:8668` BEFORE
+  // `$$self{TIFF_TYPE} = $fileType` (`:8715`), so `TIFF_TYPE` stays its
+  // constructor default `''` (`:4369`) — it is NEVER set to `'TIFF'`/`'BTF'`
+  // during the BigTIFF walk. (`SetFileType('BTF')` at `BigTIFF.pm:246` sets only
+  // `$$self{FileType}`, the `File:FileType` tag, not `TIFF_TYPE`.) Verified on
+  // bundled 13.59: a BigTIFF's internal `TIFF_TYPE` is empty for `.btf`/`.tif`/
+  // dotless alike. This makes the `0x111`/`0x117` DNG/TIFF JPEG-preview gate
+  // (`$$self{TIFF_TYPE} =~ /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) FALSE, so a
+  // SubfileType=1 + Compression=7 strip keeps the default `StripOffsets`/
+  // `StripByteCounts` arm instead of being renamed `PreviewImage`/`JpgFromRaw`.
+  let _ = file_type;
+  // BigTIFF's detection-time base `$$self{FILE_TYPE}` is `'BTF'` for a `.btf`
+  // extension but `'TIFF'` for a `.tif`/dotless BigTIFF (the TIFF magic `(II|MM)`
+  // matches first in the detection loop — verified on bundled 13.59); the engine
+  // / direct entries thread the literal `'TIFF'` detection base, matching the
+  // `.tif`/dotless case. Either way the Sony-A100 `0x014a` gate (`base_file_type
+  // eq 'TIFF'`) is UNREACHABLE here — BigTIFF walks via `walk_big_ifd_chain`, not
+  // the classic `0x014a` SubIFD dispatch — so `base_file_type` has no behavioral
+  // effect on the BigTIFF walk; it is threaded only for parity with the classic
+  // walker's struct.
+  let base_file_type: Option<smol_str::SmolStr> = base_file_type.map(smol_str::SmolStr::new);
   let mut w = Walker {
     data,
     order,
@@ -2963,7 +3166,16 @@ fn parse_bigtiff<'a>(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    file_type: file_type.clone(),
+    captured_compression: None,
+    captured_subfile_type: None,
+    // `$$self{TIFF_TYPE} == ''` for a BigTIFF walk (the dispatch `return 1`s
+    // before `ExifTool.pm:8715`) ⇒ `None` (the `''` sentinel), NOT the inherited
+    // caller candidate — so the `0x111`/`0x117` DNG/TIFF JPEG-preview gate is
+    // false (see the `let _ = file_type` rationale above). The ExifMeta below
+    // still finalizes `File:FileType = BTF` (`SetFileType('BTF')`), a SEPARATE
+    // signal from this walk-time `TIFF_TYPE`.
+    file_type: None,
+    base_file_type,
     no_raf,
     warn_count: 0,
     // The BigTIFF walker keys its leaf lookup off `kind` directly
@@ -3033,8 +3245,10 @@ fn parse_bigtiff<'a>(
     // signal HERE (the ExifMeta's `file_type`), overriding the passed detection
     // candidate (which is `TIFF` for a `.tif` BigTIFF); `finalize_file_type`'s
     // `AnyMeta::Exif` arm maps a `Some("BTF")` signal to an explicit BTF type +
-    // `image/x-tiff-big` MIME. (The WALKER above keeps the passed container
-    // `file_type` for the Canon-CRW RawConv gate — `BTF` ≠ `CRW`, so unaffected.)
+    // `image/x-tiff-big` MIME. This is the `File:FileType` output signal, SEPARATE
+    // from the walk-time `$$self{TIFF_TYPE}` (the WALKER above uses `None` ≡ the
+    // `''` TIFF_TYPE, so the JPEG-preview gate is off — a `BTF`/`TIFF` TIFF_TYPE is
+    // NEVER seen during the BigTIFF walk).
     file_type: Some(smol_str::SmolStr::new("BTF")),
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
@@ -3170,9 +3384,14 @@ fn parse_tiff_with_base_shared<'a>(
     // PNG `eXIf` / CTMD `0x8769` parse, never the standalone-TIFF dispatch, so
     // the DNG override (gated on `FILE_TYPE eq 'TIFF'`) is unreachable from it.
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
     // Embedded block (PNG `eXIf`): `$$self{FILE_TYPE}` is "PNG", never "CRW",
     // so the ShotInfo pos-22 CRW clause is off — model it as `None`.
     file_type: None,
+    // PNG `eXIf`: the detection base `$$self{FILE_TYPE}` is "PNG", never "TIFF",
+    // so the Sony-A100 `0x014a` gate (`base_file_type eq 'TIFF'`) is off — `None`.
+    base_file_type: None,
     // PNG `eXIf` is a self-contained block read into memory; its value offsets
     // resolve within the block (an effective RAF, like the standalone path), so
     // the RAF-backed framing is faithful. Only the CTMD `0x8769` hop is no-RAF.
@@ -3502,13 +3721,73 @@ struct Walker<'a, 'g> {
   /// [`RawValue::is_perl_truthy`](crate::exif::ifd::RawValue::is_perl_truthy)
   /// (a count-0 / scalar-`0` `DNGVersion` is falsy → not set) but never emitted.
   dng_version: bool,
-  /// The container's detected `$$self{FILE_TYPE}` (`ExifTool.pm:8715`).
-  /// Threaded into the Canon MakerNote decoder so `Canon::ShotInfo` position
-  /// 22's RawConv (`Canon.pm:2977`/`:2990`) can keep a raw-0 ExposureTime for
-  /// a CRW container. `None` for an embedded Exif block (PNG `eXIf`, JPEG
-  /// `APP1` — never "CRW") or when the type is unknown. WRITE-ONLY apart from
-  /// that single pos-22 read; it influences no other tag.
+  /// `$$self{Compression}` DataMember (`Exif.pm:512-528`, `Compression` 0x0103's
+  /// `RawConv` `return $$self{Compression} = $val`) — the LAST-decoded
+  /// `Compression` value in the CURRENT IFD, stored as the EXACT post-`ReadValue`
+  /// scalar STRING `$val` (`join(' ', @vals)`: a count-1 value is `"7"`, a count>1
+  /// value is the space-joined `"7 8"`). RESET to `None` at the start of every
+  /// directory body ([`walk_one_ifd_body`]), mirroring ExifTool's per-`ProcessExif`
+  /// `$$self{Compression} = '' ` (`Exif.pm:6447`, "make sure that Compression and
+  /// SubfileType are defined for this IFD (for Condition's)"). The `0x111`/`0x117`
+  /// conditional tag lists read it with STRING `eq`: the `PreviewImage`/
+  /// `JpgFromRaw` arms require `$$self{Compression} eq '7'`
+  /// (`Exif.pm:635`/`:735`/`:616`/`:624`, #331-P2). `None` ≡ ExifTool's `''`
+  /// (the empty-string sentinel — a `Compression eq '7'` test is false). The
+  /// scalar-string form is load-bearing: a count>1 `Compression` `int16u[2]` of
+  /// `7, 8` stringifies to `"7 8"`, and `'7 8' eq '7'` is FALSE, so the
+  /// JPEG-preview gate misses and the plain `StripOffsets` arm fires — exactly as
+  /// ExifTool 13.59 (a stored `Some(7)` integer would WRONGLY match `eq '7'`).
+  captured_compression: Option<smol_str::SmolStr>,
+  /// `$$self{SubfileType}` DataMember (`Exif.pm:444-461`, `SubfileType` 0x00fe's
+  /// `RawConv` `$$self{SubfileType} = $val`) — the LAST-decoded `SubfileType`
+  /// value in the CURRENT IFD, stored as the EXACT post-`ReadValue` scalar STRING
+  /// `$val` (the space-joined `join(' ', @vals)`, like
+  /// [`captured_compression`](Self::captured_compression)). RESET to `None` per
+  /// directory ([`walk_one_ifd_body`]) (the same `Exif.pm:6447` reset). The plain
+  /// `StripOffsets` arm's EXCLUSION reads it with STRING `ne`
+  /// (`not (… $$self{Compression} eq '7' and $$self{SubfileType} ne '0')`,
+  /// `Exif.pm:635`/`:735`): the JPEG-preview/JpgFromRaw arms fire only when
+  /// `SubfileType ne '0'`. `None` ≡ ExifTool's `''` sentinel (a `SubfileType ne
+  /// '0'` test is TRUE for `''`, matching Perl string inequality); only an exact
+  /// `Some("0")` fails it — a count>1 `"0 1"` SATISFIES `ne '0'` (the arm fires),
+  /// which a stored `Some(0)` integer would WRONGLY suppress. The `SubfileType ==
+  /// 1` Sony-A100 gate ([`Walker::a100_data_offset_condition`]) coerces this string
+  /// in Perl-numeric context. This is the SAME 0x00fe value the PageCount tap
+  /// reads; tracked separately because the PageCount counter is a file-level
+  /// running total, not the per-IFD condition member.
+  captured_subfile_type: Option<smol_str::SmolStr>,
+  /// The container's FINALIZED subtype — `$$self{TIFF_TYPE}` /
+  /// `$$self{VALUE}{FileType}` (`ExifTool.pm:8546`/`:8715`): the candidate
+  /// `Parent` (`"TIFF"`/`"DNG"`/`"ARW"`/…) the engine resolves to the emitted
+  /// `File:FileType`. Threaded into the Canon MakerNote decoder so
+  /// `Canon::ShotInfo` position 22's RawConv (`Canon.pm:2977`/`:2990`) can keep
+  /// a raw-0 ExposureTime for a CRW container. `None` for an embedded Exif block
+  /// (PNG `eXIf`, JPEG `APP1` — never "CRW") or when the type is unknown.
+  /// WRITE-ONLY apart from that single pos-22 read; it influences no other tag.
+  ///
+  /// DISTINCT from [`base_file_type`](Self::base_file_type): for an `.arw` A100
+  /// this is `Some("ARW")` (the `SetARW`-overridden subtype) while the base
+  /// detection type is `Some("TIFF")`.
   file_type: Option<smol_str::SmolStr>,
+  /// The container's DETECTION-TIME base `$$self{FILE_TYPE}` (`ExifTool.pm:3048`
+  /// `$$self{FILE_TYPE} = $type`) — the type the file was first identified as,
+  /// NEVER overwritten by `ProcessTIFF`/`SetFileType`/`OverrideFileType` (which
+  /// touch only `$$self{FileType}` / `$$self{TIFF_TYPE}`, `ExifTool.pm:9712`/
+  /// `:9727`). For EVERY TIFF-rooted container (TIFF/ARW/SRW/DNG/NEF/CR2/…) the
+  /// classic-TIFF magic resolves `$type = 'TIFF'`, so this is `Some("TIFF")` for
+  /// the whole family — even when [`file_type`](Self::file_type) is the
+  /// `SetARW`-overridden `Some("ARW")`. `None` for an embedded Exif block
+  /// (JPEG `APP1` / PNG `eXIf` / QuickTime `EXIF` / a MakerNote / GPS
+  /// re-dispatch — `$$self{FILE_TYPE}` is then the OUTER container type, which is
+  /// never `'TIFF'` for those, so `None` faithfully fails the `eq 'TIFF'` test).
+  ///
+  /// The sole reader is the Sony DSLR-A100 `0x014a` `Condition`
+  /// (`Exif.pm:1014` `$$self{FILE_TYPE} ne 'TIFF'`,
+  /// [`a100_data_offset_condition`](Self::a100_data_offset_condition)): it must
+  /// fire for a real A100 in ANY TIFF-rooted container (the real case is an
+  /// `.arw`, [`file_type`](Self::file_type) `Some("ARW")`), so the gate keys on
+  /// the BASE type, NOT the finalized subtype.
+  base_file_type: Option<smol_str::SmolStr>,
   /// `true` when this TIFF block is re-dispatched FROM MEMORY with NO RAF —
   /// the Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD hop (`Canon.pm:10745`
   /// → `ProcessTIFF` with `$dataPt` = the embedded block, no `RAF`). ExifTool's
@@ -3858,6 +4137,19 @@ impl Walker<'_, '_> {
     // reuses ONE `Walker` across the whole chain + every sub-IFD recursion, so
     // the field is shared state that must be re-zeroed per directory).
     self.warn_count = 0;
+    // `$$et{Compression} = $$et{SubfileType} = ''` (`Exif.pm:6447`, "make sure
+    // that Compression and SubfileType are defined for this IFD (for
+    // Condition's)") — `ProcessExif` clears these DataMembers at the START of
+    // every directory so a `0x111`/`0x117` Condition (`PreviewImage`/`JpgFromRaw`
+    // vs plain `StripOffsets`, #331-P2) tests THIS IFD's `Compression`/
+    // `SubfileType`, not a sibling/parent's stale value. `None` is the port's
+    // `''` sentinel; the per-entry `emit` taps re-populate them as the
+    // `SubfileType` (0xfe) / `Compression` (0x103) leaves are walked. (Reset only
+    // here, the classic `ProcessExif` body — `ProcessBigIFD`, the BigTIFF walk,
+    // has no such reset, matching ExifTool, so a BigTIFF SubIFD inherits the
+    // member like ExifTool's object-level state.)
+    self.captured_compression = None;
+    self.captured_subfile_type = None;
     // `$numEntries = Get16u($dataPt, $dirStart)` (Exif.pm:6344). The count
     // is readable only when `$dirStart <= $dataLen-2` (Exif.pm:6343); if
     // not, `$dirSize` is left undef and — with no RAF to read the IFD
@@ -5006,7 +5298,47 @@ impl Walker<'_, '_> {
         // is NOT walked: [`Step::Skip`].
         return Step::Skip;
       }
-      self.dispatch_subdir(sub, value_offset, read_len, format, count);
+      // `0x014a SubIFD` (`Exif.pm:1006-1027`) — a MULTI-offset SubDirectory
+      // (`MaxSubdirs => 10`, `@values = split ' ', $val`), descended via the
+      // bespoke [`dispatch_classic_subifd`]; the single-offset ExifIFD/GPS/
+      // Interop/MakerNote pointers stay on [`dispatch_subdir`].
+      if matches!(sub, SubDirKind::SubIfd) {
+        // DEFERRED for SRW: a Samsung `.srw` raw's `0x014a` SubIFD is the RAW
+        // image sub-IFD chain whose `%Exif::Main` rows resolve to SRW-SPECIFIC
+        // names the port has not yet ported — `0x0101`/`0x0102` are
+        // `JpgFromRawStart`/`JpgFromRawLength` in a SUBIFD of an SRW
+        // (`Exif.pm:1202-1257`, `Condition => DIR_NAME eq "SubIFD"`), NOT the
+        // default `ThumbnailOffset`/`Length`, plus `SamsungRawPointers`/
+        // `SamsungRawByteOrder` (`Exif.pm:834-848`). Walking it generically would
+        // emit DIVERGING tags (wrongly named `ThumbnailOffset` + a spurious
+        // `ThumbnailImage`), so the SRW raw SubIFD stays DEFERRED (the SamsungNX
+        // goldens drop `SubIFD:all`/`SubIFD1:all` for exactly this reason). The
+        // separate `%Nikon::PreviewIFD` path (the Samsung `0x0035` SubDirectory,
+        // #242) still emits `PreviewIFD:*`. This `#331-P2` SubIFD walk targets the
+        // DNG/TIFF preview/`JpgFromRaw` tower; the SRW raw SubIFD sub-tables are a
+        // separate port. The pointer itself emits no leaf (`Step::Keep`), exactly
+        // as before this walk landed (`0x014a` was an unhandled — thus dropped —
+        // tag for the SRW).
+        //
+        // DEFERRED for the Sony DSLR-A100: `0x014a` is a CONDITIONAL tag list
+        // (`Exif.pm:1006-1037`). Its SECOND arm (`#16 A100DataOffset`,
+        // `Exif.pm:1028-1036`) is selected when the first (`SubIFD`) arm's
+        // `Condition` is FALSE — i.e. for an original A100 ARW where `0x014a` is a
+        // pointer to the RAW DATA, NOT a directory. Walking that raw-data offset as
+        // an IFD would emit bogus SubIFD tags/warnings. [`a100_data_offset_condition`]
+        // ports the exact `Condition` (+ `Sony::SetARW`, `Sony.pm:11393-11414`):
+        // IFD0 of a SONY-make `FILE_TYPE eq 'TIFF'` with `SubfileType == 1` +
+        // `Compression == 6`, `Model eq 'DSLR-A100'`, a 4-byte `0x014a` value, and
+        // the offset NOT a valid IFD ([`validate_ifd`]). When it holds, treat
+        // `0x014a` as `A100DataOffset` (defer/skip the SubIFD walk), as ExifTool.
+        if self.file_type.as_deref() != Some("SRW")
+          && !self.a100_data_offset_condition(kind, value_offset, read_len, format)
+        {
+          self.dispatch_classic_subifd(value_offset, read_len, format, count);
+        }
+      } else {
+        self.dispatch_subdir(sub, value_offset, read_len, format, count);
+      }
       // The SubDirectory was dispatched (recursed/captured) — a normal entry:
       // [`Step::Keep`].
       return Step::Keep;
@@ -6032,6 +6364,7 @@ impl Walker<'_, '_> {
           SubDirKind::Gps => IfdKind::Gps,
           SubDirKind::Interop => IfdKind::Interop,
           SubDirKind::MakerNote => unreachable!("MakerNote handled below"),
+          SubDirKind::SubIfd => unreachable!("SubIFD routed to dispatch_classic_subifd"),
         };
         // `unless (IsInt($newStart)) { ... }` passes for a negative `$val`
         // (`IsInt` is `/^[+-]?\d+$/`, ExifTool.pm:5943), but the subsequent
@@ -6657,6 +6990,253 @@ impl Walker<'_, '_> {
           }
         }
       }
+      // `0x014a SubIFD` is routed to [`dispatch_classic_subifd`] by the caller
+      // (the multi-offset descent), never to this single-offset entry point.
+      SubDirKind::SubIfd => unreachable!("SubIFD routed to dispatch_classic_subifd"),
+    }
+  }
+
+  /// `true` when the `0x014a` value is the Sony DSLR-A100 RAW-DATA offset
+  /// (`A100DataOffset`), NOT a SubIFD directory pointer — so the multi-offset
+  /// SubIFD walk MUST be skipped (the offset points at raw image data; walking it
+  /// as an IFD would emit bogus tags/warnings).
+  ///
+  /// Ports `0x014a`'s conditional tag list (`Exif.pm:1006-1037`): the FIRST arm
+  /// (`Name => 'SubIFD'`) is taken when its `Condition` (`Exif.pm:1013-1020`) is
+  /// TRUE, the SECOND (`#16 A100DataOffset`, `Exif.pm:1028-1036`) otherwise. This
+  /// returns `true` ⇔ that `Condition` is FALSE, i.e. ALL of its `or`-clauses fail:
+  ///   * `$$self{DIR_NAME} ne 'IFD0'` fails ⇒ `kind == IFD0`;
+  ///   * `$$self{FILE_TYPE} ne 'TIFF'` fails ⇒ `base_file_type == "TIFF"` (the
+  ///     DETECTION-TIME base type — `'TIFF'` for the whole TIFF-rooted family,
+  ///     NOT the `SetARW`-overridden finalized subtype `self.file_type`, which is
+  ///     `"ARW"` for a real A100 `.arw`);
+  ///   * `$$self{Make} !~ /^SONY/` fails ⇒ `Make` begins `"SONY"`;
+  ///   * `not $$self{SubfileType} or $$self{SubfileType} != 1` fails ⇒ `SubfileType`
+  ///     is truthy AND numifies to `1` (Perl-numeric on the scalar `$val` string);
+  ///   * `not $$self{Compression} or $$self{Compression} != 6` fails ⇒ `Compression`
+  ///     is truthy AND numifies to `6`;
+  ///   * `not require Sony` fails ⇒ always available here;
+  ///   * `Sony::SetARW($self, $valPt)` returns FALSE — `SetARW` (`Sony.pm:11393-11414`)
+  ///     returns false ONLY when `$$et{Model} eq 'DSLR-A100'` AND
+  ///     `length $$valPt == 4` (the `0x014a` value is exactly 4 bytes) AND
+  ///     [`Self::validate_ifd`] (`ValidateIFD`, the `Get32u($valPt,0)` start)
+  ///     reports the offset is NOT a valid IFD.
+  ///
+  /// The `SetARW` side effect (`OverrideFileType('ARW')` + `$$self{TIFF_TYPE} =
+  /// 'ARW'`, `Sony.pm:11398`) — which fires for EVERY Sony arm, not just the A100 —
+  /// is OUT OF SCOPE for the `#331-P2` SubIFD walk (a separate Sony ARW file-type
+  /// port) and is deliberately NOT modelled here; only the A100 raw-data DEFER is.
+  fn a100_data_offset_condition(
+    &self,
+    kind: IfdKind,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+  ) -> bool {
+    // `$$self{DIR_NAME} eq 'IFD0'`.
+    if !matches!(kind, IfdKind::Ifd0) {
+      return false;
+    }
+    // `$$self{FILE_TYPE} eq 'TIFF'` — the DETECTION-TIME base type
+    // (`self.base_file_type`, `ExifTool.pm:3048`), NOT the `SetARW`-overridden
+    // finalized subtype (`self.file_type`, which is `Some("ARW")` for a real
+    // A100 `.arw`). `$$self{FILE_TYPE}` is `'TIFF'` for the whole TIFF-rooted
+    // family (TIFF/ARW/SRW/DNG/…), so the defer fires for an A100 in ANY such
+    // container; an embedded Exif block (outer type ≠ `'TIFF'`, `None`) fails it.
+    if self.base_file_type.as_deref() != Some("TIFF") {
+      return false;
+    }
+    // `$$self{Make} =~ /^SONY/` and `$$self{Model} eq 'DSLR-A100'` — the IFD0
+    // DataMembers captured at 0x010f/0x0110 (decoded before 0x014a in tag-id
+    // order).
+    if !self
+      .captured_make
+      .as_deref()
+      .is_some_and(|m| m.starts_with("SONY"))
+    {
+      return false;
+    }
+    if self.captured_model.as_deref() != Some("DSLR-A100") {
+      return false;
+    }
+    // `$$self{SubfileType} == 1` and `$$self{Compression} == 6` — Perl-numeric on
+    // the scalar `$val` string, AND Perl-truthy (a `''`/`None` or `"0"` is falsy ⇒
+    // the SubIFD arm, not A100).
+    if !data_member_truthy_eq(self.captured_subfile_type.as_deref(), 1)
+      || !data_member_truthy_eq(self.captured_compression.as_deref(), 6)
+    {
+      return false;
+    }
+    // `length $$valPt == 4` (`Sony.pm:11401`) — the `0x014a` value is exactly 4
+    // bytes on disk (a single LONG). A multi-offset / non-4-byte `0x014a` makes
+    // `SetARW` return 1 (the SubIFD arm), so do NOT defer.
+    if read_len != 4 || !format.is_int() {
+      return false;
+    }
+    // `Sony::SetARW`'s `%subdir = (DirStart => Get32u($valPt,0), Base => 0, …)`
+    // then `ValidateIFD`: the start is the 4-byte value read as an int32u in the
+    // walk's byte order (== `Get32u($valPt,0)`), from base 0 (the block start).
+    // `SetARW` returns FALSE (⇒ A100DataOffset) when that offset is NOT a valid
+    // IFD; defer only then.
+    let Some(start) = get_u32(self.data, value_offset, self.order) else {
+      return false;
+    };
+    !self.validate_ifd(start as usize)
+  }
+
+  /// `Image::ExifTool::ValidateIFD` (`WriteExif.pl:285-310`) for an in-memory
+  /// directory at `dir_start` (from base 0) — the validity probe `Sony::SetARW`
+  /// uses to tell an A100 SubIFD offset from a raw-data offset. Reads from
+  /// [`self.data`](Self::data) (the `RAF` analogue); a short/out-of-bounds read is
+  /// the `Read(...) != $len` / `Seek` failure ⇒ `false` (invalid).
+  ///
+  /// Returns `true` ⇔ all of: the 2-byte entry count is `> 1 and < 64`; the full
+  /// `12 * numEntries` entry block is present; and EVERY entry has `format > 0 and
+  /// format <= 13` and `count > 0`. The tag-id ascending check is bypassed
+  /// (`SetARW` passes `AllowOutOfOrderTags => 1`, `Sony.pm:11411`).
+  fn validate_ifd(&self, dir_start: usize) -> bool {
+    // `$raf->Read($buff,2) == 2 or return 0` then `$numEntries = Get16u(\$buff,0)`.
+    let Some(num_entries) = get_u16(self.data, dir_start, self.order) else {
+      return false;
+    };
+    let num_entries = num_entries as usize;
+    // `$numEntries > 1 and $numEntries < 64 or return 0`.
+    if num_entries <= 1 || num_entries >= 64 {
+      return false;
+    }
+    // `$raf->Read($buff, $len) == $len or return 0` ($len = 12 * numEntries): the
+    // whole entry block must be present.
+    let entries_start = dir_start.saturating_add(2);
+    for index in 0..num_entries {
+      let entry = entries_start.saturating_add(index.saturating_mul(12));
+      // `$format = Get16u(\$buff, $entry+2); $format > 0 and $format <= 13 or return 0`.
+      let Some(format_code) = get_u16(self.data, entry.saturating_add(2), self.order) else {
+        return false; // a truncated read ($len shortfall).
+      };
+      if format_code == 0 || format_code > 13 {
+        return false;
+      }
+      // `$count = Get32u(\$buff, $entry+4); $count > 0 or return 0`.
+      let Some(count) = get_u32(self.data, entry.saturating_add(4), self.order) else {
+        return false;
+      };
+      if count == 0 {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// Dispatch the classic-TIFF `0x014a SubIFD` pointer — a MULTI-offset
+  /// SubDirectory (`Exif.pm:1006-1027`, `SubDirectory => { Start => '$val',
+  /// MaxSubdirs => 10 }`). UNLIKE the single-offset ExifIFD/GPS/Interop
+  /// pointers ([`dispatch_subdir`]), the pointer's value is a LIST of int32u
+  /// offsets (`@values = split ' ', $val`, `Exif.pm:6930`); each is walked as
+  /// its own [`IfdKind::SubIfd`] directory whose family-1 group is `SubIFD`
+  /// (1st) then `SubIFD1`/`SubIFD2`/… (`$subdirInfo{DirName} =~ s/\d*$/$dirNum/
+  /// if $dirNum`, `Exif.pm:7074-7076`), reusing the inherited `%Exif::Main`
+  /// table (`$newTagTable = $tagTablePtr`, `Exif.pm:6943` — the pointer carries
+  /// no `SubDirectory{TagTable}` redirect).
+  ///
+  /// `MaxSubdirs => 10` (`Exif.pm:6929-6938`): if the pointer carries more than
+  /// ten offsets, ExifTool warns `Ignoring N SubIFD directories` and processes
+  /// only the first ten — reproduced here so a hostile pointer with thousands
+  /// of offsets cannot fan out the walk.
+  ///
+  /// The byte order is INHERITED (the `0x014a` SubDirectory declares no
+  /// `ByteOrder`, so `$newByteOrder = $oldByteOrder`, `Exif.pm:6995-6996`), and
+  /// the directory start is the offset value directly (`Start => '$val'` with
+  /// the walk's `base`; `dispatch_subdir` resolves the single-offset pointers
+  /// the same way). Each child is descended through the shared [`process_subdir`]
+  /// entry point, which save/set/restores the active table + warn count + order
+  /// around the recursion — so a malformed SubIFD cannot leak a table or abort
+  /// the parent IFD0's warn count, and the `SubfileType`/`Compression`
+  /// DataMembers (reset per-IFD in [`walk_one_ifd_body`]) the JpgFromRaw/
+  /// PreviewImage conditions read are scoped to each child directory.
+  ///
+  /// `value_offset .. value_offset + read_len` is the pointer's value window
+  /// (already bounds-resolved by the caller). A degenerate offset (negative /
+  /// past EOF / `> usize`) is SKIPPED but KEEPS its `$dirNum` slot, so a later
+  /// offset still takes the correct number — the Perl `for ($dirNum...)` index
+  /// advances regardless.
+  fn dispatch_classic_subifd(
+    &mut self,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+    count: usize,
+  ) {
+    // `MaxSubdirs => 10` (`Exif.pm:1025`).
+    const MAX_SUBDIRS: usize = 10;
+    // `my $over = @values - $$subdir{MaxSubdirs}; if ($over > 0) { Warn("Ignoring
+    // $over $tagStr directories"); splice @values, $$subdir{MaxSubdirs} }`
+    // (`Exif.pm:6932-6936`). ExifTool reads the FULL value then splices to ten; a
+    // naive port would `ReadValue` + `split ' ', $val` the WHOLE list first — but a
+    // hostile, huge-but-in-bounds `0x014a` count (e.g. an `int8u[400000]` pointing
+    // into a large read window) would materialize a 400 000-element `RawValue` +
+    // `Vec` + `$val` string BEFORE the cap, a TIFF-controlled memory/CPU DoS (this
+    // branch was previously unwalked). Bound BEFORE materializing: the on-disk
+    // format is proven integer by the caller's `Wrong format` gate, so the number
+    // of `split ' '` tokens `@values` equals the decoded integer element count,
+    // which [`read_value_count`] derives WITHOUT decoding any value. The overage
+    // warning comes from that integer count; only the first ten offsets are then
+    // materialized (a capped `read_value` — `subdir_offsets` over <= 10 elements).
+    let n = read_value_count(self.data, value_offset, format, count, read_len).unwrap_or(0);
+    if n > MAX_SUBDIRS {
+      let over = n - MAX_SUBDIRS;
+      self.warn(std::format!("Ignoring {over} SubIFD directories"));
+    }
+    // Materialize ONLY the first `min(n, MaxSubdirs)` offsets — a capped
+    // `read_value` reads element `0 .. min(count, 10)` from the window (the SAME
+    // leading offsets ExifTool keeps after `splice @values, 10`), so the
+    // `RawValue`/`Vec`/string is bounded to <= 10 entries regardless of the on-disk
+    // count. `subdir_offsets` is the faithful `split ' ', $val` per-token
+    // numification (each integer element -> its offset, in order). A non-decodable
+    // value yields no offsets (no walk).
+    let offsets = match read_value(
+      self.data,
+      value_offset,
+      format,
+      count.min(MAX_SUBDIRS),
+      read_len,
+      self.order,
+    ) {
+      Some(raw) => raw.subdir_offsets(),
+      None => return,
+    };
+    for (dir_num, off) in offsets.into_iter().enumerate() {
+      // A negative / non-finite / `> u64::MAX` token is `None` (the `$subdirStart
+      // < 0` → `Bad SubDirectory start` analogue); a `Some` past `usize` on this
+      // target is likewise unwalkable. Skip but KEEP the `$dirNum` slot.
+      let Some(off) = off else {
+        continue;
+      };
+      let Ok(child_start) = usize::try_from(off) else {
+        continue;
+      };
+      // `$subdirInfo{DirName} =~ s/\d*$/$dirNum/ if $dirNum` (`Exif.pm:7076`) —
+      // the 1st offset is `SubIFD` (the `if $dirNum` guard skips the number),
+      // the 2nd+ are `SubIFD1`/`SubIFD2`/… A pointer with `> u32::MAX` offsets is
+      // structurally impossible (the `MaxSubdirs => 10` cap above bounds it at
+      // ten), but saturate defensively so the `u32` payload is well-defined.
+      let dir_num = u32::try_from(dir_num).unwrap_or(u32::MAX);
+      let child_kind = IfdKind::SubIfd(dir_num);
+      // Descend through the shared sub-directory entry point. The classic SubIFD
+      // declares no `ByteOrder` (inherit `self.order`) and no `Base` (the child
+      // inherits `self.base`); `FixBaseMode::No` makes every pre-walk hook inert,
+      // so this is the same machinery the core ExifIFD/GPS/Interop recursions use,
+      // forced to `%Exif::Main` ([`table_for_ifd_kind`]) + the `SubIFD<dirNum>`
+      // group. `process_subdir` bounds-checks the start (`walk_one_ifd` → the
+      // `Bad SubIFD directory` abort for an offset past EOF) and the
+      // ancestor-cycle guard breaks a SubIFD pointing back at an ancestor.
+      self.process_subdir(
+        child_start,
+        child_kind,
+        table_for_ifd_kind(child_kind),
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
     }
   }
 
@@ -6714,16 +7294,31 @@ impl Walker<'_, '_> {
     // normal TIFF (where `active_table == table_for_ifd_kind(kind)` for every
     // core IFD that carries these tags).
     if matches!(self.active_table, TableRef::Exif | TableRef::Interop) {
-      if tag_id == tables::TAG_SUBFILE_TYPE
-        && let Some(v) = first_uint(&raw)
-      {
-        // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
-        if v == (v & 0x02) {
+      if tag_id == tables::TAG_SUBFILE_TYPE {
+        // The PageCount/MultiPage gate runs in Perl-NUMERIC context — `$val == ($val
+        // & 0x02)` and `$val == 2` numify the scalar `$val` (a count>1 `"7 8"` →
+        // 7), so the leading integer ([`first_uint`]) is the faithful operand for
+        // the bitwise/equality tests. A non-integer shape (no `first_uint`) takes
+        // no PageCount side effect (Perl's bitwise `&` on a non-numeric `$val`
+        // yields 0; the gate's behaviour there is irrelevant to the camera fixtures).
+        if let Some(v) = first_uint(&raw)
+          && v == (v & 0x02)
+        {
+          // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
           self.page_count = self.page_count.saturating_add(1);
           if v == 2 || self.page_count > 1 {
             self.multi_page = true;
           }
         }
+        // `$$self{SubfileType} = $val` (`Exif.pm:460`) — the DataMember is
+        // assigned UNCONDITIONALLY (the `$val == ($val & 0x02)` test above gates
+        // only the PageCount side effect, NOT the member), as the EXACT scalar
+        // `$val` STRING (a count>1 `int16u[2]` of `0, 1` is `"0 1"`, NOT `0`). The
+        // `0x111`/`0x117` conditional tag lists read it with STRING `ne`: the plain
+        // `StripOffsets` arm's exclusion is `not (… $$self{SubfileType} ne '0')`
+        // (`Exif.pm:635`/`:735`, #331-P2) — `'0 1' ne '0'` is TRUE (the
+        // JPEG-preview arm fires), a stored `Some(0)` integer would suppress it.
+        self.captured_subfile_type = Some(raw.raw_conv_val_string().into());
       } else if tag_id == tables::TAG_OLD_SUBFILE_TYPE
         && let Some(v) = first_uint(&raw)
       {
@@ -6734,6 +7329,18 @@ impl Walker<'_, '_> {
             self.multi_page = true;
           }
         }
+      } else if tag_id == tables::TAG_COMPRESSION {
+        // `return $$self{Compression} = $val` (`Exif.pm:517`) — the `Compression`
+        // (0x103) DataMember, assigned each time the leaf is decoded, as the EXACT
+        // scalar `$val` STRING (`ReadValue`'s `join(' ', @vals)`: count-1 → `"7"`,
+        // count>1 → `"7 8"`). The `0x111`/`0x117` `PreviewImage`/`JpgFromRaw` arms
+        // gate on `$$self{Compression} eq '7'` (#331-P2) with STRING equality —
+        // `'7 8' eq '7'` is FALSE, so a count>1 Compression falls to the plain
+        // `StripOffsets` arm (ground-truthed on ExifTool 13.59: `int16u[2]` `7, 8`
+        // → `SubIFD2:StripOffsets`, NOT `JpgFromRaw`). A stored `Some(7)` integer
+        // would WRONGLY match. (The leaf is ALSO emitted below — bundled keeps the
+        // `Compression` tag, e.g. `SubIFD2:Compression = "Unknown (7 8)"`.)
+        self.captured_compression = Some(raw.raw_conv_val_string().into());
       }
     }
 
@@ -6955,12 +7562,22 @@ impl Walker<'_, '_> {
     // IFD1 thumbnail / a DNG SubIFD strip (not IFD0, or no CR2/ARW `TIFF_TYPE`)
     // keeps its table name. `tiff_type` is `$$self{TIFF_TYPE}` (the detected
     // subtype the entry threads in, `ExifTool.pm:8715`, set BEFORE the IFD walk).
+    // The `0x111`/`0x117`/`0x201`/`0x202` conditional-tag-list resolution context
+    // (`$$self{TIFF_TYPE}`/`DIR_NAME`/`Compression`/`SubfileType`), bundled from
+    // the walk's `kind` + `file_type` + the per-IFD `captured_*` DataMembers; read
+    // by BOTH the name override AND the DataTag spec resolution (#331-P2).
+    let offset_ctx = tables::OffsetTagContext {
+      tiff_type: self.file_type.as_deref(),
+      in_ifd0: matches!(kind, IfdKind::Ifd0),
+      // `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's third
+      // directory (`IfdKind::SubIfd(2)`), where 0x111/0x117 name JpgFromRaw.
+      in_subifd2: matches!(kind, IfdKind::SubIfd(2)),
+      compression: self.captured_compression.as_deref(),
+      subfile_type: self.captured_subfile_type.as_deref(),
+    };
     let name = if matches!(self.active_table, TableRef::Exif)
-      && let Some(renamed) = tables::exif_main_offset_name_override(
-        tag_id,
-        matches!(kind, IfdKind::Ifd0),
-        self.file_type.as_deref(),
-      ) {
+      && let Some(renamed) = tables::exif_main_offset_name_override(tag_id, offset_ctx)
+    {
       renamed
     } else {
       name
@@ -7052,11 +7669,7 @@ impl Walker<'_, '_> {
       let spec = if self.active_table == TableRef::NikonPreviewIfd {
         tables::nikon_preview_ifd_data_tag_spec(tag_id)
       } else {
-        tables::exif_main_data_tag_spec_in_context(
-          t,
-          matches!(kind, IfdKind::Ifd0),
-          self.file_type.as_deref(),
-        )
+        tables::exif_main_data_tag_spec_in_context(t, offset_ctx)
       };
       if let Some(spec) = spec
         && let Some(offset) = first_uint(&raw)
@@ -7439,6 +8052,13 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
     tables::TAG_GPS_IFD => Some(SubDirKind::Gps),
     tables::TAG_INTEROP_IFD => Some(SubDirKind::Interop),
     tables::TAG_MAKER_NOTE => Some(SubDirKind::MakerNote),
+    // `0x014a SubIFD` (`Exif.pm:1006-1027`) — the multi-offset classic-TIFF
+    // preview/raw sub-IFD pointer (DNG raw tower). Routed to the bespoke
+    // multi-offset descent (`dispatch_classic_subifd`), NOT the single-offset
+    // `dispatch_subdir` arm. The A100DataOffset alt-arm (`Exif.pm:1028`) is a
+    // SONY-A100-only IsOffset leaf, out of scope — for DNG/TIFF the SubIFD arm
+    // is the one that fires.
+    tables::TAG_SUB_IFD => Some(SubDirKind::SubIfd),
     _ => None,
   }
 }
@@ -9718,8 +10338,12 @@ pub(in crate::exif) fn apple_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Apple tag reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Apple tag reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The captured blob IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -9917,8 +10541,12 @@ pub(in crate::exif) fn sony_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Sony Main leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Sony Main leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -10207,8 +10835,12 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Panasonic Main leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Panasonic Main leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is
+    // not IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -10476,8 +11108,12 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Nikon Main/Type2 leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Nikon Main/Type2 leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is
+    // not IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The chosen walk buffer IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -10811,8 +11447,12 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Pentax leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Pentax leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Pentax)` swaps it to the
@@ -11264,11 +11904,17 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
     // `$$self{TIFF_TYPE}` for the `0x0035 PreviewIFD`
     // `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (#242), which
     // [`Walker::emit`] reads to decide the in-walk PreviewIFD descent. `None` (the
     // `from_blob` / embedded-JPEG path) ⇒ the SRW gate fails, so no descent.
     file_type: file_type.map(smol_str::SmolStr::new),
+    // A Samsung MakerNote sub-walk is not IFD0-of-a-standalone-TIFF (the
+    // Sony-A100 `0x014a` gate needs `kind == Ifd0` of the container), so
+    // `base_file_type` is irrelevant here ⇒ `None`.
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Samsung)` swaps it to
@@ -11560,7 +12206,12 @@ pub(in crate::exif) fn leica_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Leica leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Leica(variant))` swaps
@@ -11742,8 +12393,18 @@ pub(in crate::exif) fn canon_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // `$$self{FILE_TYPE}` — the `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // `$$self{TIFF_TYPE}` / `$$self{FileType}` — the `Canon::ShotInfo` pos-22
+    // CRW-allows-0 RawConv. (The `FILE_TYPE eq "CRW"` Perl source reads the
+    // detection base, but the port threads the finalized subtype here for the
+    // pos-22 gate; either way the CRW branch is provably dead — no CIFF/CRW
+    // front-end — so this is the established behaviour.)
     file_type: file_type.map(smol_str::SmolStr::new),
+    // A Canon MakerNote sub-walk is not IFD0-of-a-standalone-TIFF, so the
+    // Sony-A100 `0x014a` gate (`kind == Ifd0`) is unreachable ⇒ `base_file_type`
+    // is irrelevant here ⇒ `None`.
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk — only the CTMD `0x8769` hop is no-RAF.
     no_raf: false,
@@ -12381,6 +13042,28 @@ fn first_uint(raw: &RawValue) -> Option<u64> {
     RawValue::I64(v) => v.first().and_then(|&n| u64::try_from(n).ok()),
     _ => None,
   }
+}
+
+/// A stored `RawConv` DataMember scalar-string (`None` ≡ ExifTool's `''`) is
+/// Perl-TRUTHY **and** numifies to `target` — the `$$self{X} and $$self{X} ==
+/// target` idiom (e.g. the Sony-A100 `SubfileType == 1` / `Compression == 6`
+/// gate, `Exif.pm:1016-1017`).
+///
+/// Perl truthiness of a string: every value EXCEPT `''` and `'0'` is true
+/// (`None`/`''` and the exact string `"0"` are falsy). The equality is Perl-NUMERIC
+/// (`$str == target`), so the leading-number coercion ([`crate::convert::perl_str_to_f64`],
+/// the same `0 + $val` grammar the offset/Composite ports use) must equal
+/// `target` exactly — a count>1 `"1 0"` numifies to `1` (true for `target == 1`),
+/// while `"0"` is filtered by the truthiness guard first.
+fn data_member_truthy_eq(member: Option<&str>, target: u64) -> bool {
+  let Some(s) = member else {
+    return false; // `''` — falsy.
+  };
+  if s.is_empty() || s == "0" {
+    return false; // Perl-falsy strings.
+  }
+  // `$str == target` in Perl-numeric context.
+  crate::convert::perl_str_to_f64(s) == target as f64
 }
 
 // ====================================================================// GPS value emission — applies a `GpsConv` to a `RawValue`
@@ -15277,7 +15960,14 @@ mod tests {
       page_count: 0,
       multi_page: false,
       dng_version: false,
+      captured_compression: None,
+      captured_subfile_type: None,
       file_type: None,
+      // `None` (matching `file_type`) so the white-box helper's A100 `0x014a`
+      // gate stays off by default — exactly the pre-change behaviour (the OLD
+      // `self.file_type == Some("TIFF")` check was likewise false for this
+      // helper). The end-to-end ARW A100 coverage drives `extract_info` instead.
+      base_file_type: None,
       // RAF-backed (the standalone-TIFF model the existing tests assume); the
       // no-RAF CTMD `0x8769` path is covered via `parse_ctmd_exif_ifd_redispatch`.
       no_raf: false,
@@ -21356,6 +22046,493 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         None,
         "a non-word byte in the first five positions fails the Condition"
       );
+    }
+  }
+
+  // -- #331-P2 round 2: classic-TIFF SubIFD walk hardening (Codex findings) ---
+  //
+  // Shared little-endian TIFF builders for the `0x014a SubIFD` DoS bound
+  // (Finding 1), the `Compression`/`SubfileType` scalar-string DataMember
+  // semantics (Finding 2), and the Sony DSLR-A100 `0x014a` raw-data DEFER
+  // (Finding 3). Offsets are buffer-relative (`base == 0` for a standalone TIFF).
+  mod subifd_walk_hardening {
+    use super::*;
+
+    /// A 12-byte little-endian IFD entry `tag | format | count | value/offset`.
+    fn le_entry(tag: u16, format: u16, count: u32, value: [u8; 4]) -> [u8; 12] {
+      let mut e = [0u8; 12];
+      e[0..2].copy_from_slice(&tag.to_le_bytes());
+      e[2..4].copy_from_slice(&format.to_le_bytes());
+      e[4..8].copy_from_slice(&count.to_le_bytes());
+      e[8..12].copy_from_slice(&value);
+      e
+    }
+
+    /// Assemble a little-endian TIFF: `II*` header → IFD0 at offset 8 holding
+    /// `entries` (ascending tag id) with next-IFD = 0 → `trailing` appended right
+    /// after the IFD0 block (its first byte is at `ifd0_end`). Returns the buffer.
+    fn le_tiff(entries: &[[u8; 12]], trailing: &[u8]) -> (Vec<u8>, usize) {
+      let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      let n = entries.len() as u16;
+      t.extend_from_slice(&n.to_le_bytes());
+      for e in entries {
+        t.extend_from_slice(e);
+      }
+      t.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+      let ifd0_end = t.len();
+      t.extend_from_slice(trailing);
+      (t, ifd0_end)
+    }
+
+    /// A minimal valid SubIFD body (1 entry: `ImageWidth` `int32u` = `width`,
+    /// next-IFD = 0) — `2 + 12 + 4 = 18` bytes. Used as the shared target the
+    /// DoS-bound offsets point at.
+    fn subifd_body(width: u32) -> Vec<u8> {
+      let mut b: Vec<u8> = Vec::new();
+      b.extend_from_slice(&1u16.to_le_bytes()); // numEntries = 1
+      b.extend_from_slice(&le_entry(0x0100, 4, 1, width.to_le_bytes()));
+      b.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+      b
+    }
+
+    /// FINDING 1 [high] — the `0x014a SubIFD` DoS bound. A malformed pointer with
+    /// a HUGE in-bounds count must NOT materialize the full `RawValue`/`Vec`/`$val`
+    /// string before the `MaxSubdirs => 10` cap: the overage warning is derived
+    /// from the integer count and only the first ten offsets are decoded. Here
+    /// `0x014a` is `int8u[200]` (200 one-byte offsets, all pointing at one shared
+    /// valid SubIFD body), so ExifTool's `@values - 10 == 190` ⇒ `Ignoring 190
+    /// SubIFD directories`, and only `SubIFD`..`SubIFD9` are walked (NOT
+    /// `SubIFD10`+). Mirrors `Exif.pm:6932-6936`.
+    #[test]
+    fn classic_subifd_count_bound_warns_and_caps_at_ten() {
+      // Layout: header(8) + IFD0[ count(2) + 2 entries(24) + next(4) = 30 ] ⇒
+      // ifd0_end = 38. Put the shared SubIFD body there; the 200-byte 0x014a value
+      // block follows. Every offset byte = 38 (the body), so each walked offset
+      // descends the SAME body.
+      let body = subifd_body(111);
+      let body_off = 38u8; // ifd0_end for a 2-entry IFD0
+      let mut trailing = body.clone();
+      // The out-of-line 0x014a value: 200 bytes, all == body_off.
+      let val_off = 38 + trailing.len();
+      trailing.extend(std::iter::repeat_n(body_off, 200));
+
+      // IFD0: 0x0100 ImageWidth (inert marker) + 0x014a SubIFD int8u[200] @ val_off.
+      let img = le_entry(0x0100, 4, 1, 500u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 1, 200, (val_off as u32).to_le_bytes());
+      let (data, ifd0_end) = le_tiff(&[img, subifd], &trailing);
+      assert_eq!(ifd0_end, 38, "2-entry IFD0 ends at 38");
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+
+      // `@values - MaxSubdirs == 200 - 10 == 190`.
+      assert!(
+        meta
+          .warnings()
+          .iter()
+          .any(|w| w == "Ignoring 190 SubIFD directories"),
+        "the overage warning must come from the integer count (200 - 10), got {:?}",
+        meta.warnings()
+      );
+      // The shared body emits ImageWidth=111 under SubIFD..SubIFD9 (the first ten),
+      // but NEVER SubIFD10+ — the cap held BEFORE decoding the full list.
+      let groups: Vec<String> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.tag_id() == 0x0100 && e.group().starts_with("SubIFD"))
+        .map(|e| e.group().to_string())
+        .collect();
+      assert!(
+        groups.iter().any(|g| g == "SubIFD") && groups.iter().any(|g| g == "SubIFD9"),
+        "the first ten offsets walk as SubIFD..SubIFD9, got {groups:?}"
+      );
+      assert!(
+        !groups
+          .iter()
+          .any(|g| g == "SubIFD10" || g == "SubIFD11" || g == "SubIFD199"),
+        "offsets beyond the tenth must be spliced out (no SubIFD10+), got {groups:?}"
+      );
+      assert_eq!(
+        groups.len(),
+        10,
+        "exactly ten SubIFD directories walked, got {groups:?}"
+      );
+    }
+
+    /// FINDING 2 [medium] — `Compression` (0x103) is a RawConv DataMember stored as
+    /// the FULL scalar `$val` STRING; the `0x111`/`0x117` JPEG-preview gate uses
+    /// STRING `eq '7'`. A count>1 `Compression` `int16u[2] = 7, 8` stringifies to
+    /// `"7 8"`, and `'7 8' eq '7'` is FALSE ⇒ the plain `StripOffsets` arm fires
+    /// (NOT `JpgFromRaw`). Ground-truthed on ExifTool 13.59 (`int16u[2]` `7, 8` →
+    /// `SubIFD2:StripOffsets`, `SubIFD2:Compression = "Unknown (7 8)"`). A stored
+    /// `Some(7)` integer would WRONGLY select `JpgFromRaw`.
+    #[test]
+    fn classic_subifd2_compression_count2_is_string_ne_seven() {
+      // IFD0 0x014a → three SubIFD offsets; SubIFD2 carries SubfileType=1 +
+      // Compression int16u[2]=7,8 + 0x0111/0x0117. Build the three bodies.
+      // SubIFD0 @ b0: SubfileType=1, ImageWidth (so it is a normal strip dir).
+      let mut sub0: Vec<u8> = Vec::new();
+      sub0.extend_from_slice(&1u16.to_le_bytes());
+      sub0.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      sub0.extend_from_slice(&[0u8, 0, 0, 0]);
+      // SubIFD1 @ b1: one inert leaf.
+      let sub1 = subifd_body(7);
+      // SubIFD2 @ b2: SubfileType=1, Compression int16u[2]=7,8 (inline: 4 bytes),
+      // 0x0111 StripOffsets=245, 0x0117 StripByteCounts=4.
+      let mut sub2: Vec<u8> = Vec::new();
+      sub2.extend_from_slice(&4u16.to_le_bytes());
+      sub2.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      // int16u[2] = 7, 8 stored inline (07 00 08 00).
+      sub2.extend_from_slice(&le_entry(0x0103, 3, 2, [0x07, 0x00, 0x08, 0x00]));
+      sub2.extend_from_slice(&le_entry(0x0111, 4, 1, 245u32.to_le_bytes()));
+      sub2.extend_from_slice(&le_entry(0x0117, 4, 1, 4u32.to_le_bytes()));
+      sub2.extend_from_slice(&[0u8, 0, 0, 0]);
+
+      // Layout: header(8) + IFD0[ count(2) + 2 entries(24) + next(4) = 30 ] = 38.
+      // Then the 0x014a value block (3 LONG offsets = 12 bytes) @ 38, then the
+      // three bodies.
+      let b0 = 38 + 12;
+      let b1 = b0 + sub0.len();
+      let b2 = b1 + sub1.len();
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(&(b0 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b1 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b2 as u32).to_le_bytes());
+      trailing.extend_from_slice(&sub0);
+      trailing.extend_from_slice(&sub1);
+      trailing.extend_from_slice(&sub2);
+
+      let img = le_entry(0x0100, 4, 1, 100u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 3, 38u32.to_le_bytes());
+      let (data, _) = le_tiff(&[img, subifd], &trailing);
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+
+      // The headline: SubIFD2 0x0111/0x0117 stay StripOffsets/StripByteCounts (NOT
+      // JpgFromRawStart/Length), and NO JpgFromRaw DataTag is synthesized.
+      let names: Vec<(&str, u16)> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.group() == "SubIFD2")
+        .map(|e| (e.name(), e.tag_id()))
+        .collect();
+      assert!(
+        names.iter().any(|(n, _)| *n == "StripOffsets")
+          && names.iter().any(|(n, _)| *n == "StripByteCounts"),
+        "count>1 Compression '7 8' ne '7' ⇒ SubIFD2 keeps plain StripOffsets/Counts, got {names:?}"
+      );
+      assert!(
+        !names
+          .iter()
+          .any(|(n, _)| n.starts_with("JpgFromRaw") || *n == "JpgFromRaw"),
+        "'7 8' must NOT select JpgFromRaw, got {names:?}"
+      );
+      assert!(
+        meta.entries().iter().all(|e| e.name() != "JpgFromRaw"),
+        "no JpgFromRaw DataTag for a count>1 Compression"
+      );
+    }
+
+    /// FINDING 2 control — the SINGLE-value `Compression == 7` (`int16u[1]`) path
+    /// STILL selects `JpgFromRaw` in SubIFD2 (`'7' eq '7'`), proving the
+    /// scalar-string change did not break the count-1 case the
+    /// `TIFF_jpgfromraw.tif` golden relies on.
+    #[test]
+    fn classic_subifd2_compression_count1_still_jpgfromraw() {
+      let mut sub2: Vec<u8> = Vec::new();
+      sub2.extend_from_slice(&4u16.to_le_bytes());
+      sub2.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      // int16u[1] = 7 (inline 07 00 00 00).
+      sub2.extend_from_slice(&le_entry(0x0103, 3, 1, [0x07, 0x00, 0x00, 0x00]));
+      sub2.extend_from_slice(&le_entry(0x0111, 4, 1, 245u32.to_le_bytes()));
+      sub2.extend_from_slice(&le_entry(0x0117, 4, 1, 4u32.to_le_bytes()));
+      sub2.extend_from_slice(&[0u8, 0, 0, 0]);
+      // A single SubIFD chain: 0x014a → [SubIFD0, SubIFD1, SubIFD2]; SubIFD0/1 are
+      // tiny placeholders so SubIFD2 is the THIRD directory (DIR_NAME 'SubIFD2').
+      let sub0 = subifd_body(60);
+      let sub1 = subifd_body(7);
+      let b0 = 38 + 12;
+      let b1 = b0 + sub0.len();
+      let b2 = b1 + sub1.len();
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(&(b0 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b1 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b2 as u32).to_le_bytes());
+      trailing.extend_from_slice(&sub0);
+      trailing.extend_from_slice(&sub1);
+      trailing.extend_from_slice(&sub2);
+      let img = le_entry(0x0100, 4, 1, 100u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 3, 38u32.to_le_bytes());
+      let (data, _) = le_tiff(&[img, subifd], &trailing);
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD2" && e.name() == "JpgFromRawStart"),
+        "count-1 Compression '7' ⇒ SubIFD2 0x0111 = JpgFromRawStart (the golden path), got {:?}",
+        meta
+          .entries()
+          .iter()
+          .filter(|e| e.group() == "SubIFD2")
+          .map(|e| e.name())
+          .collect::<Vec<_>>()
+      );
+    }
+
+    /// FINDING 3 [medium] — the Sony DSLR-A100 `0x014a` is the RAW-DATA offset
+    /// (`A100DataOffset`), NOT a SubIFD: with `FILE_TYPE eq 'TIFF'`, `Make =~
+    /// /^SONY/`, `Model eq 'DSLR-A100'`, `SubfileType == 1`, `Compression == 6`, a
+    /// 4-byte `0x014a` value, and the offset NOT a valid IFD, ExifTool emits
+    /// `IFD0:A100DataOffset` and does NOT walk it (ground-truthed on 13.59). The
+    /// port must NOT descend it as a SubIFD (no `SubIFD:*` tags/warnings).
+    #[test]
+    fn classic_subifd_a100_raw_data_offset_not_walked() {
+      // IFD0 entries (ascending): 0x00fe SubfileType=1, 0x0103 Compression=6,
+      // 0x010f Make "SONY\0"(off), 0x0110 Model "DSLR-A100\0"(off), 0x014a → a
+      // NON-IFD location (a 0xFFFF entry-count = invalid per ValidateIFD).
+      // IFD0: count(2) + 5 entries(60) + next(4) = 66 ⇒ ifd0_end = 8 + 66 = 74.
+      let make_off = 74u32;
+      let model_off = make_off + 5; // "SONY\0" = 5 bytes
+      let raw_off = model_off + 10; // "DSLR-A100\0" = 10 bytes
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 1, raw_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A100\0");
+      // At raw_off: a ONE-entry IFD (`ImageWidth = 777`). `ValidateIFD` rejects it
+      // (`numEntries > 1` fails) ⇒ `SetARW` returns FALSE ⇒ A100DataOffset, so the
+      // walk MUST be skipped — yet WITHOUT the defer the walker would happily emit
+      // `SubIFD:ImageWidth = 777` (a structurally valid 1-entry directory). The
+      // discriminator: the offset is walkable, so a missing defer is observable.
+      // Ground-truthed on ExifTool 13.59 (A100 + 1-entry `0x014a` → `A100DataOffset`,
+      // no `SubIFD:*`).
+      trailing.extend_from_slice(&1u16.to_le_bytes());
+      trailing.extend_from_slice(&le_entry(0x0100, 4, 1, 777u32.to_le_bytes()));
+      trailing.extend_from_slice(&[0u8, 0, 0, 0]);
+      let (data, ifd0_end) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+      assert_eq!(ifd0_end, 74, "5-entry IFD0 ends at 74");
+
+      // The standalone-TIFF entry's DETECTION base `FILE_TYPE = 'TIFF'`
+      // (the `base_file_type` arg = the A100 gate's `$$self{FILE_TYPE} eq 'TIFF'`),
+      // exactly as the engine parses a `.tif`. See the sibling
+      // `a100_defer_fires_for_arw_subtype_end_to_end` test for the real ARW path
+      // where the finalized subtype is `ARW` yet the base stays `'TIFF'`.
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      // No SubIFD walk: NO entry in any SubIFD-family group, and the would-be
+      // `ImageWidth = 777` from the deferred offset never appears.
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .all(|e| !e.group().starts_with("SubIFD")),
+        "the A100 0x014a raw-data offset must NOT be walked as a SubIFD, got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .all(|e| !(e.tag_id() == 0x0100 && e.value_ref().raw() == &RawValue::U64(vec![777]))),
+        "the deferred raw-data offset's ImageWidth=777 must NOT be emitted"
+      );
+      // The IFD0 Make/Model/SubfileType/Compression still emit normally.
+      assert!(
+        meta.entry("Make").is_some_and(|e| e.group() == "IFD0"),
+        "IFD0:Make still emits"
+      );
+    }
+
+    /// FINDING 3 boundary — when the A100-shape's `0x014a` DOES point at a VALID
+    /// IFD (`ValidateIFD` true ⇒ `SetARW` returns 1), it IS a SubIFD and the walk
+    /// proceeds — so the DEFER is correctly scoped to the raw-data (invalid-IFD)
+    /// case only, never suppressing a real A100 IDC-edited SubIFD.
+    #[test]
+    fn classic_subifd_a100_valid_ifd_is_walked() {
+      // A valid SubIFD needs `numEntries > 1 and < 64`, every entry `format ∈
+      // 1..=13` + `count > 0`. Build a 2-entry body: ImageWidth + ImageHeight.
+      let mut valid_sub: Vec<u8> = Vec::new();
+      valid_sub.extend_from_slice(&2u16.to_le_bytes());
+      valid_sub.extend_from_slice(&le_entry(0x0100, 4, 1, 321u32.to_le_bytes()));
+      valid_sub.extend_from_slice(&le_entry(0x0101, 4, 1, 240u32.to_le_bytes()));
+      valid_sub.extend_from_slice(&[0u8, 0, 0, 0]);
+
+      let make_off = 74u32;
+      let model_off = make_off + 5;
+      let sub_off = model_off + 10; // valid IFD here
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 1, sub_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A100\0");
+      trailing.extend_from_slice(&valid_sub);
+      let (data, _) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD" && e.tag_id() == 0x0100),
+        "a VALID A100 0x014a IFD (SetARW true) IS walked as SubIFD, got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+    }
+
+    /// FINDING 3 scope — a NON-A100 Sony shape (same gates but `Model` is NOT
+    /// `DSLR-A100`) is ALWAYS a SubIFD (`SetARW` returns 1 immediately), so the
+    /// `0x014a` is walked even though the offset is a raw-data-shaped non-IFD: the
+    /// DEFER must key on the A100 model, not merely the Sony+SubfileType+Compression
+    /// shape.
+    #[test]
+    fn classic_subifd_non_a100_sony_still_walks() {
+      // Same as the A100 raw-data case but Model = "DSLR-A700" ⇒ NOT deferred.
+      let make_off = 74u32;
+      let model_off = make_off + 5;
+      let raw_off = model_off + 10;
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      // 0x014a → a valid 2-entry SubIFD (so the walk has something to emit).
+      let subifd = le_entry(0x014a, 4, 1, raw_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A700\0");
+      // A valid SubIFD body at raw_off.
+      trailing.extend_from_slice(&2u16.to_le_bytes());
+      trailing.extend_from_slice(&le_entry(0x0100, 4, 1, 99u32.to_le_bytes()));
+      trailing.extend_from_slice(&le_entry(0x0101, 4, 1, 88u32.to_le_bytes()));
+      trailing.extend_from_slice(&[0u8, 0, 0, 0]);
+      let (data, _) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD" && e.tag_id() == 0x0100),
+        "a non-A100 Sony 0x014a is a SubIFD (SetARW returns 1), got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+    }
+  }
+
+  // -- #331-P2: the DIRECT standalone-TIFF public API resolves JpgFromRaw -----
+  //
+  // The conformance golden `TIFF_jpgfromraw.tif` exercises only `extract_info`
+  // (the engine `AnyParser::Exif` path), which threads `file_type =
+  // Some("TIFF")` so the DNG/TIFF JPEG-preview gate (`$$self{TIFF_TYPE} =~
+  // /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) holds and a SubIFD2 JPEG strip
+  // resolves `0x111`/`0x117` to `JpgFromRawStart`/`JpgFromRawLength` + the
+  // `JpgFromRaw` DataTag. The DIRECT lib entries [`parse_borrowed`] /
+  // [`ProcessExif::parse`] must do the same — they now pass `file_type =
+  // Some("TIFF")` too. This drives the SAME real fixture bytes through
+  // `parse_borrowed`/`parse` and asserts the SubIFD2 JpgFromRaw output the
+  // golden pins, so the direct public API the golden misses can no longer
+  // silently regress to plain `SubIFD2:StripOffsets`.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  mod direct_api_jpgfromraw {
+    use super::*;
+
+    /// The committed `TIFF_jpgfromraw.tif` conformance fixture's bytes (read at
+    /// `CARGO_MANIFEST_DIR`, the SAME file the golden harness loads).
+    fn fixture_bytes() -> Vec<u8> {
+      std::fs::read(std::concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/TIFF_jpgfromraw.tif"
+      ))
+      .expect("read TIFF_jpgfromraw.tif fixture")
+    }
+
+    /// The SubIFD2 offset/length/DataTag triple as the engine emits it (`-G1`,
+    /// PrintConv), for an [`ExifMeta`] from a direct lib entry.
+    fn subifd2(meta: &ExifMeta<'_>) -> (Option<String>, Option<String>, Option<String>) {
+      let mut map = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(
+        meta,
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+        &mut map,
+      );
+      (
+        map.get_str("SubIFD2", "JpgFromRawStart"),
+        map.get_str("SubIFD2", "JpgFromRawLength"),
+        map.get_str("SubIFD2", "JpgFromRaw"),
+      )
+    }
+
+    /// Assert the SubIFD2 JpgFromRaw triple matches the golden
+    /// (`JpgFromRawStart` 245, `JpgFromRawLength` 4, `JpgFromRaw` the 4-byte
+    /// binary placeholder) for the given direct-entry meta.
+    fn assert_jpgfromraw(meta: &ExifMeta<'_>, via: &str) {
+      // The structural leaves are in `entries()` directly: the SubIFD2 0x0111/
+      // 0x0117 resolved to JpgFromRaw* (NOT plain StripOffsets/Counts).
+      let names: Vec<&str> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.group() == "SubIFD2")
+        .map(super::ExifEntry::name)
+        .collect();
+      assert!(
+        names.contains(&"JpgFromRawStart") && names.contains(&"JpgFromRawLength"),
+        "{via}: SubIFD2 0x0111/0x0117 must resolve to JpgFromRaw* (the file_type \
+         gate), got {names:?}"
+      );
+      assert!(
+        !names.contains(&"StripOffsets") && !names.contains(&"StripByteCounts"),
+        "{via}: the JpgFromRaw arm must EXCLUDE the plain StripOffsets arm, got {names:?}"
+      );
+      // The rendered values match the conformance golden exactly.
+      let (start, len, jpg) = subifd2(meta);
+      assert_eq!(
+        start.as_deref(),
+        Some("245"),
+        "{via}: SubIFD2:JpgFromRawStart"
+      );
+      assert_eq!(len.as_deref(), Some("4"), "{via}: SubIFD2:JpgFromRawLength");
+      assert_eq!(
+        jpg.as_deref(),
+        Some("(Binary data 4 bytes, use -b option to extract)"),
+        "{via}: SubIFD2:JpgFromRaw binary placeholder (the golden marker the \
+         direct API must also emit)"
+      );
+    }
+
+    #[test]
+    fn parse_borrowed_emits_subifd2_jpgfromraw() {
+      let data = fixture_bytes();
+      let meta = parse_borrowed(&data).expect("TIFF_jpgfromraw.tif parses via parse_borrowed");
+      assert_jpgfromraw(&meta, "parse_borrowed");
+    }
+
+    #[test]
+    fn process_exif_parse_emits_subifd2_jpgfromraw() {
+      let data = fixture_bytes();
+      let meta = FormatParser::parse(&ProcessExif, data.as_slice())
+        .expect("TIFF_jpgfromraw.tif parses via ProcessExif::parse");
+      assert_jpgfromraw(&meta, "ProcessExif::parse");
     }
   }
 

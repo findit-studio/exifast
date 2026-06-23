@@ -487,13 +487,29 @@ case "$FIX" in
   # DNG_preview_image.dng — IFD0→SubIFD (0x014a) with `SubfileType=1` +
   # StripOffsets/StripByteCounts and NO `Compression`, so 0x0111 takes the plain
   # `StripOffsets` arm (`Exif.pm:639-653` — the CR2/IFD0 and `Compression=7`
-  # exclusions both miss) ⇒ NO PreviewImage. The port DOES NOT yet walk the
-  # classic-TIFF `SubIFD` (0x014a) pointer, so it cannot emit the SubIFD's
-  # `SubfileType`/`ImageWidth`/`ImageHeight`/`StripOffsets`/`StripByteCounts` —
-  # this fixture is `#[ignore]`-d / NOT_ACTIVE pending SubIFD support (#352). The
-  # golden is still generated (the conventioned `-x System:all` form, composites
-  # KEPT) so the deferral is documented and ready to activate once SubIFD lands.
+  # exclusions both miss) ⇒ NO PreviewImage. The classic-TIFF `SubIFD` (0x014a)
+  # multi-offset walk NOW lands (#331-P2), so the port emits the SubIFD's
+  # `SubfileType`/`ImageWidth`/`ImageHeight`/`StripOffsets`/`StripByteCounts`; the
+  # fixture stays NOT_ACTIVE only because `IFD0:DNGVersion` (0xc612) is not yet an
+  # emitted leaf (a deferred leaf-table item — the walker taps it for the
+  # `$$self{DNGVersion}` DataMember but does not display it). `-x System:all` only,
+  # composites KEPT.
   DNG_preview_image.dng)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # TIFF_jpgfromraw.tif — the #331-P2 SubIFD2:JpgFromRaw verifier: a minimal
+  # little-endian TIFF whose IFD0 0x014a SubIFD pointer carries THREE offsets
+  # (`SubIFD`/`SubIFD1`/`SubIFD2`). SubIFD2 carries `SubfileType=1` +
+  # `Compression=7` (JPEG) + 0x0111/0x0117, which `Exif.pm:673-684`/`:769-778`
+  # resolve to `JpgFromRawStart`/`JpgFromRawLength` (the plain `StripOffsets` arm
+  # is excluded by the DNG/TIFF JPEG-preview gate, the CR2 arm misses, and the
+  # `PreviewImage` arm misses because `DIR_NAME eq "SubIFD2"`). The offset-pair
+  # drives the synthetic `SubIFD2:JpgFromRaw = (Binary data 4 bytes, …)` via the
+  # EXIF DataTag channel. SubIFD0 carries plain `StripOffsets`/`StripByteCounts`
+  # (no `Compression`, so the plain arm wins → NO DataTag) — the SubIFD-context
+  # StripOffsets path P1 could not reach. TIFF is NOT a RAW-ImageSize subtype, so
+  # exifast BUILDS `Composite:ImageSize`/`Megapixels` byte-exact (KEEP them);
+  # `-x System:all` only.
+  TIFF_jpgfromraw.tif)
     EXCLUDE_ARR+=(-x System:all) ;;
 esac
 

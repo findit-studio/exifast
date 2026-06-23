@@ -2483,22 +2483,22 @@ impl AnyParser {
         // `File:PageCount`.
         let base = u32::try_from(header_skip).unwrap_or(u32::MAX);
         let tiff_type_is_tiff = tiff_parent_type == Some("TIFF");
-        // Thread the FINALIZED `$$self{FILE_TYPE}` — the SAME string the engine
-        // emits as `File:FileType` — as the container file type, so the
-        // `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/
-        // `:2990`, which keys on `$$self{FILE_TYPE} eq "CRW"`) checks the RIGHT
-        // variable. It is the candidate `Parent` run through `DoProcessTIFF`'s
-        // `$t`/`SetFileType` rule (ExifTool.pm:8685-8694) + the sub-type-by-ext
-        // promotion — NOT the bare `Parent` (`tiff_parent_type`). The two
-        // diverge for a `.crw`-named TIFF-magic file: its `Parent` is `"CRW"`
-        // (the uppercased ext) but its finalized `FILE_TYPE` is `"TIFF"` (CRW's
-        // base module is `CanonRaw`, not TIFF, and `"CRW"` lacks a `RAW`
-        // substring, so `$t` is undef ⇒ stays `"TIFF"`). The standalone-TIFF
-        // base type is always `"TIFF"` (the only candidate `file_type()` that
-        // maps to `AnyParser::Exif`). The result is provably never `"CRW"` (no
-        // CIFF/CRW front-end; `CRW` is never a TIFF-base/RAW promotion), so the
-        // CRW branch stays correctly dead — but the gate now checks the right
-        // value, and the `.crw`-named-TIFF case matches bundled.
+        // Thread the FINALIZED subtype `$$self{TIFF_TYPE}` / `$$self{FileType}`
+        // — the SAME string the engine emits as `File:FileType` — as the
+        // container subtype, so the `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv
+        // (`Canon.pm:2977`/`:2990`, which keys on the finalized file type eq
+        // "CRW") checks the RIGHT variable. It is the candidate `Parent` run
+        // through `DoProcessTIFF`'s `$t`/`SetFileType` rule (ExifTool.pm:8685-
+        // 8694) + the sub-type-by-ext promotion — NOT the bare `Parent`
+        // (`tiff_parent_type`). The two diverge for a `.crw`-named TIFF-magic
+        // file: its `Parent` is `"CRW"` (the uppercased ext) but its finalized
+        // subtype is `"TIFF"` (CRW's base module is `CanonRaw`, not TIFF, and
+        // `"CRW"` lacks a `RAW` substring, so `$t` is undef ⇒ stays `"TIFF"`).
+        // The standalone-TIFF base type is always `"TIFF"` (the only candidate
+        // `file_type()` that maps to `AnyParser::Exif`). The result is provably
+        // never `"CRW"` (no CIFF/CRW front-end; `CRW` is never a TIFF-base/RAW
+        // promotion), so the CRW branch stays correctly dead — but the gate now
+        // checks the right value, and the `.crw`-named-TIFF case matches bundled.
         // `$$dirInfo{Parent} || ''` (ExifTool.pm:8685) — a missing candidate
         // Parent (dotless / embedded TIFF) is the empty string ⇒ `$t` undef ⇒
         // the finalized name stays the detected `"TIFF"`.
@@ -2517,6 +2517,18 @@ impl AnyParser {
           /* standalone_tiff */
           true,
           Some(&file_type),
+          // The DETECTION-TIME base `$$self{FILE_TYPE}` (`ExifTool.pm:3048`
+          // `$$self{FILE_TYPE} = $type`): for every TIFF-rooted candidate the
+          // classic-TIFF magic resolves `$type = 'TIFF'` (the literal detection
+          // base type, the SAME `base_type` arg threaded into
+          // `finalized_tiff_file_type` above). `SetFileType`/`OverrideFileType`/
+          // `SetARW` never overwrite it, so it stays `'TIFF'` even when the
+          // finalized subtype is `ARW`/`SRW`/`DNG`/… — this is the variable the
+          // Sony DSLR-A100 `0x014a` `Condition` (`Exif.pm:1014`) checks, so the
+          // A100 raw-data defer is reachable for a real `.arw` (finalized
+          // `file_type == "ARW"`), not just a plain `.tif`.
+          /* base_file_type */
+          Some("TIFF"),
         )
         .map(AnyMeta::Exif)
       }

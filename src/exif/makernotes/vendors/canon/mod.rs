@@ -453,6 +453,10 @@ pub fn redispatch_ctmd_makernote_diagnostics(
     // caller reads only the IFD0 structural diagnostics, never `is_cr2_magic`).
     /* standalone_tiff */
     false, /* file_type */ None,
+    // The outer `$$self{FILE_TYPE}` is the Canon-CTMD container type, never
+    // `'TIFF'`, so the Sony-A100 `0x014a` gate stays off ⇒ `base_file_type = None`.
+    /* base_file_type */
+    None,
   ) else {
     return Vec::new();
   };

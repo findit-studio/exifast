@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "BigTIFF_jpegpreview.btf",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "BTF",
+  "File:FileTypeExtension": "btf",
+  "File:MIMEType": "image/x-tiff-big",
+  "IFD0:SubfileType": "Reduced-resolution image",
+  "IFD0:Compression": "JPEG",
+  "IFD0:Make": "BigCam",
+  "IFD0:Model": "BTF-1",
+  "IFD0:StripOffsets": 152,
+  "IFD0:StripByteCounts": 4
+}]
