@@ -11220,3 +11220,19 @@ fn mpeg2_ts_misb_klv_conformance() {
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.json", true);
   check("JPEG_pentax_ks2.jpg", "JPEG_pentax_ks2.jpg.n.json", false);
 }
+
+// #393 — Pentax K-3 Mark III: AFInfoK3III, BatteryInfo re-layout, LevelInfo, FaceInfo
+#[test]
+#[ignore]
+fn pef_pentax_k3_mark_iii_conformance() {
+    check("PEF_pentax_k3_mark_iii.pef", "PEF_pentax_k3_mark_iii.pef.json", true);
+    check("PEF_pentax_k3_mark_iii.pef", "PEF_pentax_k3_mark_iii.pef.n.json", false);
+}
+
+// #393 — Pentax *ist D: raw BatteryInfo variant, AFPointSelected variants
+#[test]
+#[ignore]
+fn pef_pentax_istd_conformance() {
+    check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.json", true);
+    check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.n.json", false);
+}
