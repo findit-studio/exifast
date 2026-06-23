@@ -8456,6 +8456,60 @@ fn bigtiff_subifd_exp_offset_conformance() {
   );
 }
 #[test]
+fn bigtiff_jpegpreview_strip_not_preview_conformance() {
+  // The `dng_tiff_jpeg_preview` gate is TIFF_TYPE-scoped — a BigTIFF must NOT
+  // take the classic-TIFF `PreviewImage`/`JpgFromRaw` arms. `ProcessBTF`/
+  // `ProcessBigIFD` is dispatched from `DoProcessTIFF`'s `$identifier == 0x2b`
+  // arm and `return 1`s at `ExifTool.pm:8668` BEFORE `$$self{TIFF_TYPE} =
+  // $fileType` (`:8715`), so `$$self{TIFF_TYPE}` stays its constructor default
+  // `''` (`:4369`) for the whole BigTIFF walk. `'' !~ /^(DNG|TIFF)$/`
+  // (`Exif.pm:635`/`:735`), so the `0x111`/`0x117` conditional tag lists fall to
+  // the DEFAULT `StripOffsets`/`StripByteCounts` arm (`Exif.pm:631-643`) — even
+  // though IFD0 carries `SubfileType=1` (0xfe) + `Compression=7` (0x103, JPEG),
+  // the EXACT shape that DOES trigger the `PreviewImage` arm for a classic
+  // `TIFF`-typed file (cf. `tiff_jpgfromraw_conformance`).
+  //
+  // This CRAFTED little-endian BigTIFF (version 43, 8-byte offsets —
+  // `tools/gen_bigtiff_subifd_fixture.py <out> jpegpreview`) has IFD0 carry
+  // SubfileType/Compression/Make/Model + `StripOffsets` (0x111) → a 4-byte strip
+  // blob + `StripByteCounts` (0x117). Ground-truthed against bundled ExifTool
+  // 13.59: it emits `IFD0:StripOffsets` + `IFD0:StripByteCounts` (plus
+  // `IFD0:SubfileType`/`IFD0:Compression`), with NO `PreviewImageStart`/`Length`/
+  // `PreviewImage` and NO `JpgFromRaw*`. Pins that `parse_bigtiff` walks with
+  // `Walker::file_type == None` (the `''` TIFF_TYPE sentinel), so the gate is
+  // false — guarding the `file_type`-per-entry class against a BigTIFF inheriting
+  // the caller's `Some("TIFF")` and synthesizing a spurious PreviewImage.
+  check(
+    "BigTIFF_jpegpreview.btf",
+    "BigTIFF_jpegpreview.btf.json",
+    true,
+  );
+  check(
+    "BigTIFF_jpegpreview.btf",
+    "BigTIFF_jpegpreview.btf.n.json",
+    false,
+  );
+
+  // Explicit negative assertions on the raw -j / -n output: NEITHER the renamed
+  // preview offset/length leaves NOR the synthetic image tag appear (a
+  // regression of the gate would rename 0x111/0x117 + add a `PreviewImage`).
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/BigTIFF_jpegpreview.btf"))
+    .expect("read BigTIFF_jpegpreview.btf");
+  for print_on in [true, false] {
+    let got = extract_info("BigTIFF_jpegpreview.btf", &data, print_on);
+    assert!(
+      got.contains("\"IFD0:StripOffsets\":152") && got.contains("\"IFD0:StripByteCounts\":4"),
+      "BigTIFF IFD0 0x0111/0x0117 must stay StripOffsets/StripByteCounts (print_conv={print_on}): {got}",
+    );
+    assert!(
+      !got.contains("PreviewImage") && !got.contains("JpgFromRaw"),
+      "a BigTIFF must NOT take the DNG/TIFF PreviewImage/JpgFromRaw arms \
+       (TIFF_TYPE is '' for the BigTIFF walk) (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
 fn exif_eofoverrun_chain_conformance() {
   // PR #36 Codex R14 F1 — IFD0 entry 1 is an out-of-line value (Software)
   // that overruns EOF, with a VALID entry 2 (Orientation) AFTER it AND a
@@ -9584,23 +9638,25 @@ fn arw_preview_image_conformance() {
   }
 }
 #[test]
-#[ignore = "DNG SubIFD (0x014a) walk not yet ported — deferred to #352 (SubIFD2). \
-            The P2 PreviewImage gating IS correct (the DNG must emit NO PreviewImage, \
-            asserted positively below), but exifast cannot yet emit the SubIFD's \
-            SubfileType/ImageWidth/ImageHeight/StripOffsets/StripByteCounts, so the \
-            full -G1 golden is not byte-exact. NOT_ACTIVE in typed_serde_parity. \
-            Re-activate (drop #[ignore] + the NOT_ACTIVE entry, 560→561) once the \
-            classic-TIFF SubIFD pointer is walked."]
+#[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
+            `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \
+            leaf-table item — the walker taps 0xc612 for the `$$self{DNGVersion}` \
+            DataMember but does not display it). The #331-P2 classic-TIFF SubIFD \
+            walk NOW lands (the SubIFD leaves + NO-PreviewImage gating are asserted \
+            positively below); only DNGVersion display remains. NOT_ACTIVE in \
+            typed_serde_parity; re-activate once DNGVersion is an emitted leaf."]
 fn dng_preview_image_no_preview() {
-  // #331-P2 (#352/#353): a DNG whose IFD0→SubIFD carries `SubfileType=1` +
-  // StripOffsets/StripByteCounts (0x0111/0x0117) but NO `Compression`. ExifTool
+  // #331-P2 (#352/#353): a DNG whose IFD0→SubIFD (0x014a) carries `SubfileType=1`
+  // + StripOffsets/StripByteCounts (0x0111/0x0117) but NO `Compression`. ExifTool
   // routes 0x0111 to the PLAIN `StripOffsets` arm (`Exif.pm:639-653`): the
   // CR2/IFD0 exclusion misses (it is a SubIFD) AND the `Compression=7`
   // DNG-preview exclusion misses (no Compression tag), so the first arm wins and
-  // the later `PreviewImageStart` arms are never reached. The port must emit NO
-  // `PreviewImage` — proving the P2 wiring is Condition-gated and does NOT
-  // spuriously fire on a DNG's SubIFD strips. (The byte-exact `check` is DEFERRED
-  // to #352 — the SubIFD walk — so this is the focused negative assertion only.)
+  // the later `PreviewImageStart`/`JpgFromRaw` arms are never reached. The
+  // classic-TIFF SubIFD multi-offset walk now emits the SubIFD's structural
+  // leaves; the port must emit them AND NO `PreviewImage` — proving the SubIFD
+  // walk works and the P2 DataTag wiring is Condition-gated (it does NOT
+  // spuriously fire on a DNG's plain SubIFD strips). (The byte-exact `check` is
+  // deferred only on the `IFD0:DNGVersion` leaf — see the `#[ignore]` reason.)
   let root = env!("CARGO_MANIFEST_DIR");
   let data = std::fs::read(format!("{root}/tests/fixtures/DNG_preview_image.dng"))
     .expect("read DNG_preview_image.dng");
@@ -9610,10 +9666,63 @@ fn dng_preview_image_no_preview() {
       got.contains("\"File:FileType\":\"DNG\""),
       "fixture must finalize as DNG (print_conv={print_on}): {got}",
     );
+    // The classic-TIFF SubIFD (0x014a) walk now emits the SubIFD's structural
+    // leaves under the `SubIFD:` family-1 group (#331-P2).
     assert!(
-      !got.contains("PreviewImage"),
-      "DNG must NOT emit any PreviewImage (the SubIFD strips are not a preview) \
+      got.contains("\"SubIFD:StripOffsets\":169") && got.contains("\"SubIFD:StripByteCounts\":4"),
+      "the classic-TIFF SubIFD walk must emit SubIFD:StripOffsets/StripByteCounts \
        (print_conv={print_on}): {got}",
+    );
+    assert!(
+      !got.contains("PreviewImage") && !got.contains("JpgFromRaw"),
+      "DNG must NOT emit any PreviewImage/JpgFromRaw (the SubIFD strips are not a \
+       preview — no Compression=7) (print_conv={print_on}): {got}",
+    );
+  }
+}
+#[test]
+fn tiff_jpgfromraw_conformance() {
+  // #331-P2 (#352): the SubIFD2:JpgFromRaw verifier — a minimal little-endian
+  // TIFF whose IFD0 0x014a SubIFD pointer carries THREE offsets, descended as
+  // `SubIFD`/`SubIFD1`/`SubIFD2` (`Exif.pm:7074-7076`'s `s/\d*$/$dirNum/`).
+  // SubIFD2 carries `SubfileType=1` + `Compression=7` (JPEG) + 0x0111/0x0117,
+  // which resolve to `JpgFromRawStart`/`JpgFromRawLength` (`Exif.pm:673-684`/
+  // `:769-778`): the plain `StripOffsets` arm is excluded by the DNG/TIFF
+  // JPEG-preview gate (`Compression eq '7' and SubfileType ne '0'`), the CR2 arm
+  // misses, and the `PreviewImage` arm misses (`DIR_NAME eq "SubIFD2"`). The
+  // offset-pair drives the synthetic `SubIFD2:JpgFromRaw = (Binary data 4 bytes,
+  // …)` via the EXIF DataTag channel. SubIFD0 carries plain `StripOffsets`/
+  // `StripByteCounts` (no Compression ⇒ the plain arm wins ⇒ NO DataTag) — the
+  // SubIFD-context StripOffsets path P1 could not reach.
+  check("TIFF_jpgfromraw.tif", "TIFF_jpgfromraw.tif.json", true);
+  check("TIFF_jpgfromraw.tif", "TIFF_jpgfromraw.tif.n.json", false);
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/TIFF_jpgfromraw.tif"))
+    .expect("read TIFF_jpgfromraw.tif");
+  for print_on in [true, false] {
+    let got = extract_info("TIFF_jpgfromraw.tif", &data, print_on);
+    assert!(
+      got.contains("\"File:FileType\":\"TIFF\""),
+      "fixture must finalize as TIFF (print_conv={print_on}): {got}",
+    );
+    // The headline P2 target: SubIFD2:JpgFromRaw via the DataTag channel.
+    assert!(
+      got.contains("\"SubIFD2:JpgFromRaw\":\"(Binary data 4 bytes, use -b option to extract)\""),
+      "SubIFD2 must emit JpgFromRaw via the P2 DataTag channel (print_conv={print_on}): {got}",
+    );
+    // The SubIFD2 offset-pair leaves are renamed JpgFromRawStart/Length (NOT the
+    // default StripOffsets/StripByteCounts) by the SubIFD2 condition.
+    assert!(
+      got.contains("\"SubIFD2:JpgFromRawStart\":245")
+        && got.contains("\"SubIFD2:JpgFromRawLength\":4"),
+      "SubIFD2 0x0111/0x0117 must be named JpgFromRawStart/Length (print_conv={print_on}): {got}",
+    );
+    // SubIFD0 (no Compression) keeps the plain StripOffsets arm — NO JpgFromRaw
+    // there, proving the DataMember-gated condition does not over-fire.
+    assert!(
+      got.contains("\"SubIFD:StripOffsets\":241"),
+      "SubIFD0 (no Compression) must keep plain StripOffsets (print_conv={print_on}): {got}",
     );
   }
 }

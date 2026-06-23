@@ -210,9 +210,77 @@ def build_exp_offset_variant(child_at, gps_ptr_text):
     return bytes(out)
 
 
+def build_jpegpreview_variant():
+    """A BigTIFF whose IFD0 carries the EXACT `%Exif::Main` JPEG-preview shape
+    that triggers the DNG/TIFF `PreviewImage`/`JpgFromRaw` arms for a CLASSIC
+    TIFF — `SubfileType=1` (0xfe), `Compression=7` (0x103, JPEG), `StripOffsets`
+    (0x111) + `StripByteCounts` (0x117) — to pin that a BigTIFF does NOT take
+    those arms (the `$$self{TIFF_TYPE} =~ /^(DNG|TIFF)$/` gate, `Exif.pm:635`/
+    `:735`).
+
+    `ProcessBTF`/`ProcessBigIFD` (`BigTIFF.pm`) is dispatched from
+    `DoProcessTIFF`'s `$identifier == 0x2b` arm and `return 1`s at
+    `ExifTool.pm:8668` BEFORE `$$self{TIFF_TYPE} = $fileType` (`:8715`), so
+    `$$self{TIFF_TYPE}` stays its constructor default `''` (`:4369`) for the
+    WHOLE BigTIFF walk. `'' !~ /^(DNG|TIFF)$/`, so the `0x111`/`0x117` conditional
+    tag lists fall to the DEFAULT `StripOffsets`/`StripByteCounts` arm
+    (`Exif.pm:631-643`) — NOT the `PreviewImageStart`/`PreviewImageLength` arm a
+    classic `TIFF`-typed file with this same shape takes. Oracle-verified on
+    bundled ExifTool 13.59: this fixture emits `IFD0:StripOffsets` +
+    `IFD0:StripByteCounts` (and `IFD0:SubfileType`/`IFD0:Compression`), with NO
+    `PreviewImageStart`/`Length`/`PreviewImage` and NO `JpgFromRaw*`.
+
+    Layout: header(16) · IFD0 (SubfileType/Compression/Make/Model/StripOffsets/
+    StripByteCounts) · IFD0 value pool (Make/Model) · a 4-byte strip blob the
+    StripOffsets points at (its absolute file offset).
+    """
+    bo = '<'
+    pack = lambda f, *v: struct.pack(bo + f, *v)
+    make, model = b'BigCam\x00', b'BTF-1\x00'
+    strip = b'\xff\xd8\xff\xd9'  # a 4-byte fake JPEG (SOI .. EOI)
+    ifd0_off = 16
+    n0 = 6                       # SubfileType, Compression, Make, Model, StripOffsets, StripByteCounts
+    ifd0_size = 8 + 20 * n0 + 8
+    # IFD0 out-of-line pool for the > 8-byte Make/Model strings.
+    pos = ifd0_off + ifd0_size
+    voff = {}
+    for key, raw in (('make', make), ('model', model)):
+        if len(raw) > 8:
+            voff[key] = pos
+            pos += len(raw) + (len(raw) & 1)
+    # The strip blob the StripOffsets (0x111) references, at its absolute offset.
+    strip_off = pos
+    pos += len(strip)
+
+    def val8(raw, key):
+        return pack('Q', voff[key]) if len(raw) > 8 else raw + b'\x00' * (8 - len(raw))
+
+    out = bytearray(b'II')
+    out += pack('HHH', 0x002B, 8, 0) + pack('Q', ifd0_off)
+    rows = sorted([
+        (0x00fe, LONG, 1, pack('I', 1) + b'\x00' * 4),            # SubfileType = 1 (reduced-res)
+        (0x0103, SHORT, 1, pack('H', 7) + b'\x00' * 6),           # Compression = 7 (JPEG)
+        (0x010f, 2, len(make), val8(make, 'make')),               # Make
+        (0x0110, 2, len(model), val8(model, 'model')),            # Model
+        (0x0111, LONG, 1, pack('I', strip_off) + b'\x00' * 4),    # StripOffsets -> strip blob
+        (0x0117, LONG, 1, pack('I', len(strip)) + b'\x00' * 4),   # StripByteCounts = 4
+    ], key=lambda r: r[0])
+    out += pack('Q', len(rows))
+    for tag, fmt, count, v in rows:
+        out += pack('HHQ', tag, fmt, count) + v
+    out += pack('Q', 0)                                           # next-IFD = 0
+    for key, raw in (('make', make), ('model', model)):
+        if len(raw) > 8:
+            assert len(out) == voff[key], (len(out), voff[key])
+            out += raw + (b'\x00' if len(raw) & 1 else b'')
+    assert len(out) == strip_off, (len(out), strip_off)
+    out += strip
+    return bytes(out)
+
+
 def main():
     if len(sys.argv) < 2:
-        print('usage: gen_bigtiff_subifd_fixture.py <out.btf> [exp]', file=sys.stderr)
+        print('usage: gen_bigtiff_subifd_fixture.py <out.btf> [exp|jpegpreview]', file=sys.stderr)
         return 1
 
     # `exp` variant: the ASCII-exponent GPSInfo SubIFD pointer fixture (#240 R2
@@ -222,6 +290,17 @@ def main():
         with open(sys.argv[1], 'wb') as f:
             f.write(blob)
         print(f'wrote {len(blob)} bytes to {sys.argv[1]} (exp variant, GPS ptr "1e3" → child@1000)')
+        return 0
+
+    # `jpegpreview` variant: IFD0 with the JPEG-preview shape (SubfileType=1 +
+    # Compression=7 + StripOffsets/StripByteCounts) — pins that a BigTIFF
+    # (`TIFF_TYPE == ''`) keeps the plain `StripOffsets`/`StripByteCounts` arm
+    # instead of the classic-TIFF `PreviewImage`/`JpgFromRaw` arms.
+    if len(sys.argv) >= 3 and sys.argv[2] == 'jpegpreview':
+        blob = build_jpegpreview_variant()
+        with open(sys.argv[1], 'wb') as f:
+            f.write(blob)
+        print(f'wrote {len(blob)} bytes to {sys.argv[1]} (jpegpreview variant, IFD0 StripOffsets not PreviewImage)')
         return 0
 
     b = BigTiffBuilder('<')  # little-endian (II)

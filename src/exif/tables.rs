@@ -72,6 +72,25 @@ pub const TAG_INTEROP_IFD: u16 = 0xa005;
 /// [`crate::exif::SubDirKind::MakerNote`]).
 pub const TAG_MAKER_NOTE: u16 = 0x927c;
 
+/// `SubIFD` (0x014a, `Exif.pm:1006-1027`) — the classic-TIFF preview/raw
+/// sub-IFD pointer. `Flags => 'SubIFD'`, `SubDirectory => { Start => '$val',
+/// MaxSubdirs => 10 }`, `Groups => { 1 => 'SubIFD' }`. UNLIKE the single-offset
+/// ExifIFD/GPS/Interop pointers, the value carries MULTIPLE int32u offsets
+/// (`@values = split ' ', $val`, `Exif.pm:6930`), each descended as
+/// `SubIFD`/`SubIFD1`/`SubIFD2`/… The DNG raw tower's `JpgFromRaw` lives in
+/// `SubIFD2` (#331-P2). (The conditional A100DataOffset arm, `Exif.pm:1028`,
+/// fires only for a SONY DSLR-A100 ARW — out of scope; for DNG/TIFF the SubIFD
+/// arm always wins.)
+pub const TAG_SUB_IFD: u16 = 0x014a;
+
+/// `Compression` (0x0103, `Exif.pm:512-528`) — the TIFF compression scheme.
+/// Its `RawConv` sets the `$$self{Compression}` DataMember (`Exif.pm:517`,
+/// `return $$self{Compression} = $val`), which the `0x111`/`0x117` conditional
+/// tag lists consult: `$$self{Compression} eq '7'` (JPEG) gates the
+/// `PreviewImage`/`JpgFromRaw` arms vs the plain `StripOffsets` arm
+/// (`Exif.pm:635`/`:735`, #331-P2). `int16u` (SHORT).
+pub const TAG_COMPRESSION: u16 = 0x0103;
+
 /// `SubfileType` (0x00fe, `Exif.pm:444-461`) — the TIFF spec's
 /// `NewSubfileType` (bit field: 0x01 reduced-res, 0x02 single page of
 /// multi-page, 0x04 transparency mask). Bundled's `RawConv` increments
@@ -331,13 +350,68 @@ impl ExifTag {
   }
 }
 
+/// The `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` + `$$self{Compression}` +
+/// `$$self{SubfileType}` context the `0x111`/`0x117`/`0x201`/`0x202` CONDITIONAL
+/// tag lists (`Exif.pm:601-779`/`:1148-1294`) resolve their `Name`/`OffsetPair`/
+/// `DataTag` against — the `DataMember`s a `ProcessExif` directory threads into
+/// `GetTagInfo`'s `Condition` eval. Bundled by [`Walker::emit`] at the resolution
+/// site from the walk's `IfdKind` + `file_type` + the per-IFD
+/// `captured_compression`/`captured_subfile_type` DataMembers.
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetTagContext<'a> {
+  /// `$$self{TIFF_TYPE}` — the detected subtype (`"CR2"`/`"ARW"`/`"SR2"`/
+  /// `"DNG"`/`"TIFF"`/…), `ExifTool.pm:8715`.
+  pub tiff_type: Option<&'a str>,
+  /// `$$self{DIR_NAME} eq 'IFD0'`.
+  pub in_ifd0: bool,
+  /// `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's THIRD
+  /// directory ([`IfdKind::SubIfd(2)`]), where `0x111`/`0x117` name
+  /// `JpgFromRawStart`/`JpgFromRawLength` (`Exif.pm:673-684`/`:769-778`).
+  pub in_subifd2: bool,
+  /// `$$self{Compression}` (the 0x103 DataMember) as the EXACT scalar `$val`
+  /// STRING (`None` ≡ ExifTool's `''` sentinel). The DNG/TIFF `PreviewImage`/
+  /// `JpgFromRaw` arms gate on `Compression eq '7'` (JPEG) with STRING equality;
+  /// `''` (`None`), a count>1 `"7 8"`, and any other value fall to the plain
+  /// `StripOffsets` arm.
+  pub compression: Option<&'a str>,
+  /// `$$self{SubfileType}` (the 0xfe DataMember) as the EXACT scalar `$val`
+  /// STRING (`None` ≡ `''`). The DNG/TIFF preview arms' EXCLUSION of the plain
+  /// `StripOffsets` arm requires `SubfileType ne '0'` (STRING) — `''` (`None`), a
+  /// count>1 `"0 1"`, and any non-`"0"` value SATISFY it (`'' ne '0'` /
+  /// `'0 1' ne '0'` are true in Perl); only an exact `"0"` fails.
+  pub subfile_type: Option<&'a str>,
+}
+
+impl OffsetTagContext<'_> {
+  /// `true` when the DNG/TIFF JPEG-preview gate holds — `$$self{TIFF_TYPE} =~
+  /// /^(DNG|TIFF)$/ and $$self{Compression} eq '7' and $$self{SubfileType} ne
+  /// '0'` (`Exif.pm:635`/`:735`). When this holds, the plain `StripOffsets` arm
+  /// (`Exif.pm:631-643`) is EXCLUDED, so `0x111`/`0x117` resolve to the
+  /// `PreviewImage` arm (`DIR_NAME ne 'SubIFD2'`, `Exif.pm:661-672`) or the
+  /// `JpgFromRaw` arm (the `SubIFD2` fallthrough, `Exif.pm:673-684`).
+  #[must_use]
+  #[inline]
+  fn dng_tiff_jpeg_preview(&self) -> bool {
+    // `TIFF_TYPE =~ /^(DNG|TIFF)$/`.
+    let dng_or_tiff = matches!(self.tiff_type, Some("DNG" | "TIFF"));
+    // `Compression eq '7'` (STRING equality) — a `''`/`None`, a count>1 `"7 8"`,
+    // or any other value is false.
+    let comp7 = self.compression == Some("7");
+    // `SubfileType ne '0'` (STRING inequality) — `''`/`None`, a count>1 `"0 1"`,
+    // and any non-`"0"` value pass; only an exact `"0"` fails.
+    let subfile_ne0 = self.subfile_type != Some("0");
+    dng_or_tiff && comp7 && subfile_ne0
+  }
+}
+
 /// The conditional `Name` override for a `%Exif::Main` offset/length leaf whose
 /// id is a `Condition`-list entry — `Exif.pm`'s `0x111`/`0x117`/`0x201`/`0x202`
 /// are CONDITIONAL TAG LISTS that resolve to a DIFFERENT name depending on
-/// `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}`. The port's static table carries the
+/// `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` (+ the `Compression`/`SubfileType`
+/// DataMembers for the DNG/TIFF arms). The port's static table carries the
 /// most-common name (`StripOffsets`/`StripByteCounts` for 0x111/0x117,
-/// `ThumbnailOffset`/`ThumbnailLength` for 0x201/0x202); this reproduces the two
-/// camera-relevant `PreviewImage` arms (#331-P2):
+/// `ThumbnailOffset`/`ThumbnailLength` for 0x201/0x202); this reproduces the
+/// camera-relevant `PreviewImage`/`JpgFromRaw` arms (#331-P2):
 ///
 ///  - 0x111 → `PreviewImageStart` / 0x117 → `PreviewImageLength` in **IFD0 of a
 ///    CR2** (`Exif.pm:645-661`/`:742-758`, `Condition => '$$self{TIFF_TYPE} eq
@@ -348,61 +422,90 @@ impl ExifTag {
 ///    ARW or SR2** (`Exif.pm:1226-1237`, `Condition => '$$self{DIR_NAME} eq
 ///    "IFD0" and $$self{TIFF_TYPE} =~ /^(ARW|SR2)$/'`). The FIRST (ThumbnailOffset)
 ///    arm matches only IFD1 / RIFF-MOV-IFD0, so an ARW IFD0 reaches this arm.
+///  - 0x111 → `JpgFromRawStart` / 0x117 → `JpgFromRawLength` in a **DNG/TIFF
+///    SubIFD2** carrying `Compression == 7` + `SubfileType != 0`
+///    (`Exif.pm:673-684`/`:769-778` — the `SubIFD2` fallthrough arm). The plain
+///    `StripOffsets` arm is excluded by the JPEG-preview gate, the CR2 arm
+///    misses (not CR2), and the `PreviewImageStart` arm misses (`DIR_NAME eq
+///    'SubIFD2'`), so the JpgFromRaw arm wins.
+///  - 0x111 → `PreviewImageStart` / 0x117 → `PreviewImageLength` in a **DNG/TIFF
+///    NON-SubIFD2** directory carrying `Compression == 7` + `SubfileType != 0`
+///    (`Exif.pm:661-672`/`:758-768` — `DIR_NAME ne 'SubIFD2'`).
 ///
 /// `None` ⇒ the table default name is correct (every IFD1 thumbnail keeps
-/// `ThumbnailOffset`/`Length`; the DNG SubIFD strips keep `StripOffsets`/
-/// `StripByteCounts` — its 0x111 has no `Compression=7`, so the plain
-/// `StripOffsets` arm wins, `Exif.pm:639-653`). Pure (id + the two `DataMember`
-/// gates), so the walker threads `in_ifd0`/`tiff_type` at the resolution site.
+/// `ThumbnailOffset`/`Length`; a DNG SubIFD strip with NO `Compression=7` keeps
+/// `StripOffsets`/`StripByteCounts` — the plain `StripOffsets` arm wins,
+/// `Exif.pm:631-643`).
 #[must_use]
 #[inline]
 pub fn exif_main_offset_name_override(
   tag_id: u16,
-  in_ifd0: bool,
-  tiff_type: Option<&str>,
+  ctx: OffsetTagContext<'_>,
 ) -> Option<&'static str> {
-  if !in_ifd0 {
-    return None;
+  // IFD0-only `PreviewImageStart` arms (CR2 0x111, ARW/SR2 0x201).
+  if ctx.in_ifd0 {
+    match tag_id {
+      0x0111 if ctx.tiff_type == Some("CR2") => return Some("PreviewImageStart"),
+      0x0117 if ctx.tiff_type == Some("CR2") => return Some("PreviewImageLength"),
+      0x0201 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
+        return Some("PreviewImageStart");
+      }
+      0x0202 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
+        return Some("PreviewImageLength");
+      }
+      _ => {}
+    }
   }
-  match tag_id {
-    0x0111 if tiff_type == Some("CR2") => Some("PreviewImageStart"),
-    0x0117 if tiff_type == Some("CR2") => Some("PreviewImageLength"),
-    0x0201 if matches!(tiff_type, Some("ARW" | "SR2")) => Some("PreviewImageStart"),
-    0x0202 if matches!(tiff_type, Some("ARW" | "SR2")) => Some("PreviewImageLength"),
-    _ => None,
+  // The DNG/TIFF JPEG-preview arms (0x111/0x117): `JpgFromRawStart`/`Length` in
+  // SubIFD2, `PreviewImageStart`/`Length` elsewhere — both gated on the
+  // JPEG-preview DataMember test (`Compression == 7` + `SubfileType != 0`).
+  if ctx.dng_tiff_jpeg_preview() {
+    match (tag_id, ctx.in_subifd2) {
+      (0x0111, true) => return Some("JpgFromRawStart"),
+      (0x0117, true) => return Some("JpgFromRawLength"),
+      (0x0111, false) => return Some("PreviewImageStart"),
+      (0x0117, false) => return Some("PreviewImageLength"),
+      _ => {}
+    }
   }
+  None
 }
 
 /// The `%Exif::Main` `OffsetPair`/`DataTag` spec for an offset leaf, RESOLVED in
-/// the IFD's `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` context — the conditional
-/// analogue of [`ExifTag::data_tag_spec`] (which returns only the static
-/// `ThumbnailImage` default keyed by id). Mirrors the [`exif_main_offset_name_override`]
-/// rename:
+/// the IFD's `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` + `Compression`/
+/// `SubfileType` context — the conditional analogue of [`ExifTag::data_tag_spec`]
+/// (which returns only the static `ThumbnailImage` default keyed by id). Mirrors
+/// the [`exif_main_offset_name_override`] rename:
 ///
 ///  - IFD0 of a CR2: 0x111 → `OffsetPair => 0x117`, `DataTag => 'PreviewImage'`
 ///    (`Exif.pm:645-661`).
 ///  - IFD0 of an ARW/SR2: 0x201 → `OffsetPair => 0x202`, `DataTag => 'PreviewImage'`
 ///    (`Exif.pm:1226-1237`) — overriding the id-default `ThumbnailImage`.
+///  - DNG/TIFF SubIFD2 (`Compression == 7` + `SubfileType != 0`): 0x111 →
+///    `OffsetPair => 0x117`, `DataTag => 'JpgFromRaw'` (`Exif.pm:673-684`).
+///  - DNG/TIFF non-SubIFD2 (`Compression == 7` + `SubfileType != 0`): 0x111 →
+///    `OffsetPair => 0x117`, `DataTag => 'PreviewImage'` (`Exif.pm:661-672`).
 ///  - otherwise: the id-default (`ThumbnailOffset` 0x201 → `ThumbnailImage`).
 ///
 /// So an IFD1 thumbnail still yields `ThumbnailImage`; only a CR2/ARW/SR2 IFD0
-/// preview leaf yields `PreviewImage`. `None` ⇒ no `DataTag` binary for this id.
+/// preview leaf yields `PreviewImage`, a DNG/TIFF SubIFD2 JPEG strip yields
+/// `JpgFromRaw`, and a DNG/TIFF non-SubIFD2 JPEG strip yields `PreviewImage`.
+/// `None` ⇒ no `DataTag` binary for this id.
 #[must_use]
 #[inline]
 pub fn exif_main_data_tag_spec_in_context(
   tag: &ExifTag,
-  in_ifd0: bool,
-  tiff_type: Option<&str>,
+  ctx: OffsetTagContext<'_>,
 ) -> Option<DataTagSpec> {
-  if in_ifd0 {
+  if ctx.in_ifd0 {
     match tag.id {
-      0x0111 if tiff_type == Some("CR2") => {
+      0x0111 if ctx.tiff_type == Some("CR2") => {
         return Some(DataTagSpec {
           offset_pair: 0x0117,
           data_tag: "PreviewImage",
         });
       }
-      0x0201 if matches!(tiff_type, Some("ARW" | "SR2")) => {
+      0x0201 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
         return Some(DataTagSpec {
           offset_pair: 0x0202,
           data_tag: "PreviewImage",
@@ -410,6 +513,20 @@ pub fn exif_main_data_tag_spec_in_context(
       }
       _ => {}
     }
+  }
+  // DNG/TIFF JPEG-preview 0x111 — `JpgFromRaw` in SubIFD2, `PreviewImage`
+  // elsewhere. Only the OFFSET id (0x111) carries a `DataTag` (its `OffsetPair`
+  // points at the 0x117 LENGTH); 0x117 is the length side (no `DataTag` on the
+  // offset-pair OFFSET role), so it is not matched here.
+  if tag.id == 0x0111 && ctx.dng_tiff_jpeg_preview() {
+    return Some(DataTagSpec {
+      offset_pair: 0x0117,
+      data_tag: if ctx.in_subifd2 {
+        "JpgFromRaw"
+      } else {
+        "PreviewImage"
+      },
+    });
   }
   tag.data_tag_spec()
 }
