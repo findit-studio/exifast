@@ -2619,10 +2619,18 @@ fn decode_one_sample(
       // fires AFTER `ProcessProtobuf` (so AFTER the walker warnings) and is keyed
       // to the same sample's `Track<N>` / `Doc<N>` — pushed here within the
       // warning watermark so the stamp below scopes it. NOTE: this minor
-      // `Approximating` warning is a SYSTEMIC gap across ALL exifast synth
-      // sources (freeGPS/insta360/Garmin all call the same `synth_gps_date_time`
-      // helper without raising it) — fixed here for DJI only as part of #163;
-      // the others are a separate follow-up and are deliberately NOT touched.
+      // `Approximating` warning is a SYSTEMIC cross-format gap (#221 item-5):
+      // ExifTool raises it INSIDE `SetGPSDateTime` (QuickTimeStream.pl:989/991),
+      // so EVERY synth caller (freeGPS/insta360/Garmin) raises it, but exifast's
+      // shared `synth_gps_date_time` helper does not, and only this DJI path
+      // raises it (as part of #163). It is DEFERRED for the other sources, not
+      // fixed here: each routes warnings through its OWN per-`Doc<N>` channel +
+      // `[minor]`/WAS_WARNED `[xN]` machinery (insta360 trailer, freeGPS Type-19),
+      // so threading the warning faithfully into all three is a broad cross-module
+      // change. No golden exercises it (every synth-capable fixture has
+      // CreateDate=0 ⇒ `synth_gps_date_time` returns None — verified: no fixture
+      // raises `Approximating GPSDateTime` under bundled `-ee`), so it is a latent
+      // gap with zero current observable divergence — a separate scoped follow-up.
       dji_out.push_warning(crate::metadata::DjiWarning::new(
         smol_str::SmolStr::new_static("Approximating GPSDateTime as CreateDate + SampleTime"),
         true,
