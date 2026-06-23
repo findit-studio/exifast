@@ -20,6 +20,7 @@ import struct
 import sys
 
 # ---- TIFF format codes -----------------------------------------------------
+BYTE = 1
 ASCII = 2
 SHORT = 3
 LONG = 4
@@ -1806,6 +1807,55 @@ def make_exif_ambient_wrongfmt_tif():
     return _exififd_tif(bo, [(0x9400, UNDEF, len(payload), payload)])
 
 
+def make_exif_componentsconfig_wrongfmt_tif():
+    r"""#201 — `ComponentsConfiguration` (0x9101) written with the WRONG on-disk
+    format, pinning that its `Format => 'int8u'` (`Exif.pm:2298`) READ override
+    decodes the raw value bytes as `int(size/1)` int8u ELEMENTS regardless of the
+    declared format code, so the per-byte PrintConv (`Exif.pm:2304-2333`) sees the
+    raw bytes one-per-element. This is the case that distinguishes a faithful
+    raw-byte read from a post-`ReadValue`-`$val` byte-walk: only re-reading the
+    on-disk bytes as int8u (NOT the int16u decode) reproduces bundled.
+
+    Two ExifIFD entries (a malformed-format and an unknown-code case):
+      0x9101 int16u[2] = 0x0102 0x0300  -> raw bytes 01 02 03 00
+             ExifTool's int8u re-read -> elements 1 2 3 0:
+               -j -> "Y, Cb, Cr, -"   (NOT the int16u decode "258 768")
+               -n -> "1 2 3 0"
+    The unknown-code render is in the SEPARATE
+    `Exif_componentsconfig_wrongfmt_err.tif` sibling.
+    -j -> "Y, Cb, Cr, -"
+    -n -> "1 2 3 0"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Pre-fix exifast decoded 0x9101 per its on-disk int16u format and the
+    `Conv::ComponentsConfiguration` arm (which matched `RawValue::Bytes` only)
+    fell through to `emit_raw`, emitting the int16u decode "258 768" (#201).
+    Big-endian (MM)."""
+    bo = '>'
+    # int16u[2] = 0x0102, 0x0300 -> on-disk bytes 01 02 03 00 (inline, <= 4 bytes).
+    blob = struct.pack(bo + 'HH', 0x0102, 0x0300)
+    return _exififd_tif(bo, [(0x9101, SHORT, 2, blob)])
+
+
+def make_exif_componentsconfig_wrongfmt_err_tif():
+    r"""#201 sibling — `ComponentsConfiguration` (0x9101) wrong-format WITH an
+    UNKNOWN element code, pinning the `OTHER` PrintConv sub's `$$conv{$_} ||
+    "Err ($_)"` fall-through (`Exif.pm:2330`): an un-hashed code N renders
+    `"Err (N)"`, NOT `"?"`.
+
+      0x9101 int8u[4] = 7 99 0 1   (7 and 99 are not in the 0..6 hash)
+    -j -> "Err (7), Err (99), -, Y"
+    -n -> "7 99 0 1"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    int8u is itself a "wrong" on-disk format for the typically-`undef` 0x9101, so
+    this also exercises the `Format => 'int8u'` override on a non-`undef` shape.
+    Big-endian (MM)."""
+    bo = '>'
+    blob = bytes([7, 99, 0, 1])                     # int8u[4], inline (4 bytes)
+    return _exififd_tif(bo, [(0x9101, BYTE, 4, blob)])
+
+
 if __name__ == '__main__':
     out_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
     with open(f'{out_dir}/Exif.tif', 'wb') as f:
@@ -1894,6 +1944,10 @@ if __name__ == '__main__':
         f.write(make_exif_composite_exposure_single_fraction_tif())
     with open(f'{out_dir}/Exif_ambient_wrongfmt.tif', 'wb') as f:
         f.write(make_exif_ambient_wrongfmt_tif())
+    with open(f'{out_dir}/Exif_componentsconfig_wrongfmt.tif', 'wb') as f:
+        f.write(make_exif_componentsconfig_wrongfmt_tif())
+    with open(f'{out_dir}/Exif_componentsconfig_wrongfmt_err.tif', 'wb') as f:
+        f.write(make_exif_componentsconfig_wrongfmt_err_tif())
     with open(f'{out_dir}/JPEG_unknown_header.jpg', 'wb') as f:
         f.write(make_jpeg_unknown_header())
     print(f'wrote {out_dir}/Exif.tif, {out_dir}/ExifGPS.tif, '

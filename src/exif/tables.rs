@@ -1426,14 +1426,27 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 /// with this format regardless of the on-disk format code — the on-disk byte
 /// `$size` is preserved and `$count = int($size / $formatSize[$format])`.
 ///
-/// In the camera-relevant `%Exif::Main` subset ported here exactly ONE tag
-/// carries such an override: `UserComment` (0x9286), `Format => 'undef'`
-/// (`Exif.pm:2500`), with the explicit Phil-Harvey comment "I have seen other
-/// applications write it incorrectly as 'string' or 'int8u'" (`Exif.pm:2499`).
-/// Forcing `undef` BEFORE `ReadValue` is what stops a mis-written `string`
-/// 0x9286 from being NUL-trimmed (`ASCII\0\0\0Hello World` → `ASCII`) so the
-/// later `ConvertExifText` RawConv can strip the 8-byte charset prefix and
-/// recover the payload.
+/// The camera-relevant `%Exif::Main` subset ported here carries four such
+/// overrides:
+/// - `UserComment` (0x9286), `Format => 'undef'` (`Exif.pm:2500`), with the
+///   explicit Phil-Harvey comment "I have seen other applications write it
+///   incorrectly as 'string' or 'int8u'" (`Exif.pm:2499`). Forcing `undef`
+///   BEFORE `ReadValue` is what stops a mis-written `string` 0x9286 from being
+///   NUL-trimmed (`ASCII\0\0\0Hello World` → `ASCII`) so the later
+///   `ConvertExifText` RawConv can strip the 8-byte charset prefix and recover
+///   the payload.
+/// - `XPComment`/`XPKeywords` (0x9c9c/0x9c9e), `Format => 'undef'` (the UCS-2
+///   `WindowsXp` ValueConv must see the exact bytes — see below).
+/// - `ComponentsConfiguration` (0x9101), `Format => 'int8u'` (`Exif.pm:2298`).
+///   The tag is `Writable => 'undef'` but its READ `Format` is `int8u`, so
+///   ExifTool decodes the on-disk value as `int(size/1)` int8u ELEMENTS
+///   REGARDLESS of the declared format code — a mis-written `string`/`int16u`/…
+///   0x9101 is still read as the raw bytes one-per-element (verified against
+///   bundled `exiftool 13.59`: an `int16u[2]` `01 02 03 00` → `1 2 3 0` →
+///   "Y, Cb, Cr, -", NOT the int16u decode `258 768`). Without this override
+///   a wrong-format 0x9101 decoded per its on-disk format and the
+///   `Conv::ComponentsConfiguration` byte-walk diverged (#201). The
+///   `Count => 4` is a WRITE hint only; the read count is `int(size/1)`.
 ///
 /// This `%Exif::Main` override is resolved ONLY for non-GPS IFDs; the GPS IFD
 /// has its own table-scoped sibling [`crate::exif::gps::format_override`] (for
@@ -1448,6 +1461,12 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
   match id {
     0x9286 => Some(crate::exif::ifd::Format::Undef),
+    // `ComponentsConfiguration` (0x9101) — `Format => 'int8u'` (`Exif.pm:2298`).
+    // The on-disk value is re-read as `int(size/1)` int8u elements regardless of
+    // the declared format code, so the `Conv::ComponentsConfiguration` per-byte
+    // PrintConv sees the raw value bytes one-per-element even when the tag was
+    // mis-written as `string`/`int16u`/etc. (#201).
+    0x9101 => Some(crate::exif::ifd::Format::Int8u),
     // `XPComment` (0x9c9c) / `XPKeywords` (0x9c9e) carry `Format => 'undef'`
     // (`Exif.pm:2645`/`:2663`): the on-disk `int8u[N]` value is re-read as raw
     // `undef` bytes so the `WindowsXp` UCS-2(LE) `Decode` ValueConv sees the

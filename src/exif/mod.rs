@@ -12806,31 +12806,59 @@ fn emit_exif_value<S: ExifSink>(
       emit_raw(group, name, raw, out)
     }
     Conv::ComponentsConfiguration => {
-      // Per-byte label join (Exif.pm:2304-2317): 0→"-", 1→"Y", 2→"Cb",
-      // 3→"Cr", 4→"R", 5→"G", 6→"B". `-n` emits the space-joined integers.
-      if let RawValue::Bytes(b) = raw {
-        if print_conv {
-          let parts: Vec<&str> = b
-            .iter()
-            .map(|&c| match c {
-              0 => "-",
-              1 => "Y",
-              2 => "Cb",
-              3 => "Cr",
-              4 => "R",
-              5 => "G",
-              6 => "B",
-              _ => "?",
-            })
-            .collect();
-          out.write_str(group, name, &parts.join(", "))?;
-        } else {
-          let parts: Vec<String> = b.iter().map(|&c| std::format!("{c}")).collect();
-          out.write_str(group, name, &parts.join(" "))?;
-        }
-        return Ok(());
+      // Per-element label join (Exif.pm:2304-2333). The PrintConv hash maps the
+      // INTEGER element codes 0→"-", 1→"Y", 2→"Cb", 3→"Cr", 4→"R", 5→"G",
+      // 6→"B"; the `OTHER` sub `split`s the space-joined `$val` and renders each
+      // element `$$conv{$_} || "Err ($_)"` (so an UNKNOWN code N → `"Err (N)"`,
+      // NOT `"?"`). `-n` emits the space-joined `$val` integers.
+      //
+      // 0x9101 carries `Format => 'int8u'` (`Exif.pm:2298`,
+      // `tables::format_override`), so ExifTool re-reads the on-disk value as
+      // `int(size/1)` int8u ELEMENTS regardless of the declared format code —
+      // the Walker's override makes `raw` a `RawValue::U64` of those byte
+      // values for EVERY shape (a mis-written `string`/`int16u`/… 0x9101 is read
+      // as the raw bytes one-per-element, #201; verified byte-identical to
+      // bundled `exiftool 13.59`). Read the integer code list from `U64`; a bare
+      // `Bytes` (no override applied) keeps the same byte→code reading so the
+      // conv is robust either way.
+      use std::borrow::Cow;
+      let codes: Cow<'_, [u64]> = match raw {
+        RawValue::U64(v) => Cow::Borrowed(v),
+        RawValue::Bytes(b) => Cow::Owned(b.iter().map(|&c| u64::from(c)).collect()),
+        _ => return emit_raw(group, name, raw, out),
+      };
+      if print_conv {
+        let parts: Vec<Cow<'_, str>> = codes
+          .iter()
+          .map(|&c| match c {
+            0 => Cow::Borrowed("-"),
+            1 => Cow::Borrowed("Y"),
+            2 => Cow::Borrowed("Cb"),
+            3 => Cow::Borrowed("Cr"),
+            4 => Cow::Borrowed("R"),
+            5 => Cow::Borrowed("G"),
+            6 => Cow::Borrowed("B"),
+            // `$$conv{$_} || "Err ($_)"` — the un-hashed code (`Exif.pm:2330`).
+            other => Cow::Owned(std::format!("Err ({other})")),
+          })
+          .collect();
+        out.write_str(group, name, &parts.join(", "))?;
+      } else if let [c] = codes.as_ref() {
+        // `-n` emits the post-`ReadValue` raw SCALAR. A SINGLETON 0x9101 (a
+        // crafted 1-byte / `int(size/1)==1` value, #201) is one int8u code, so —
+        // exactly as `emit_raw` renders a `RawValue::U64([v])` — it goes through
+        // the EscapeJSON number gate ⇒ a BARE JSON number (`1`, NOT the string
+        // `"1"`). The gate caps the integer width, so an int8u code is always
+        // in-gate. A multi-element value joins below.
+        emit_gated_number(group, name, &std::format!("{c}"), out)?;
+      } else {
+        // A multi-element (or empty) list is the space-joined `$val` integers
+        // (`ReadValue` joins COUNT>1 with single spaces, ExifTool.pm:6330) ⇒ out
+        // of the number gate, a quoted JSON string — same as `emit_raw`'s
+        // multi-`U64` `join_nums` arm.
+        out.write_str(group, name, &join_nums(&codes))?;
       }
-      emit_raw(group, name, raw, out)
+      Ok(())
     }
     Conv::WindowsXp => {
       // Windows `XP*` tags — `ValueConv => '$self->Decode($val,"UCS2","II")'`
