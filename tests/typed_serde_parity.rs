@@ -1179,7 +1179,25 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// These crafted TIFFs pin that the `ConvertExifText` ASCII-prefix payload now
 /// applies `FixUTF8` too — bundled 13.59 `"ExifIFD:UserComment": "AéB?C?D"` /
 /// `"GPS:GPSProcessingMethod": "A?B?C"`, byte-exact at `-j`/`-n`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 579;
+///
+/// 579 → 580 after `QuickTime_camm_2track_dupwarn.mov` (#215): two `camm` `trak`s
+/// whose lone samples EACH raise `Unknown camm record type 0`, pinning ExifTool's
+/// FILE-GLOBAL `WAS_WARNED` (`ExifTool.pm` `sub Warn`) — the same warning TEXT
+/// across the two tracks collapses to ONE `Track1:Warning "… [x2]"` (the first
+/// occurrence's group + the file-wide count), NOT one `Warning` per track. No
+/// GPS/per-sample payload at the default `-j`, so `Composite:AvgBitrate` is the
+/// sole synthesized Composite (KEPT); `System:all` is the sole exclusion.
+///
+/// 580 → 581 after `QuickTime_camm_2track_distinct_collision.mov` (#215-R1): the
+/// DISTINCT-then-repeat case — Track1 raises A ("Unknown camm record type 0") and
+/// B ("Truncated camm record 5"), Track2 repeats B. Pins that `WAS_WARNED` is set
+/// at WARN-TIME (file-global, INDEPENDENT of the per-track `-G1` `Warning` slot):
+/// B is recorded when Track1 raises it even though that track's slot already
+/// holds A, so Track2's B is a repeat (no spurious `Track2:Warning`). Like the
+/// dup-warn fixture, the default `-j` carries no per-sample payload, so
+/// `Composite:AvgBitrate` is the sole synthesized Composite; `System:all` the
+/// sole exclusion.
+const EXPECTED_ACTIVE_FIXTURES: usize = 581;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
