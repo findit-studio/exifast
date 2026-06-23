@@ -9493,7 +9493,18 @@ fn emit_pentax_value<S: ExifSink>(
   {
     return Ok(());
   }
-  let value = pentax_tag.conv.apply(raw, print_conv);
+  // `0x000e AFPointSelected` (`Pentax.pm:1219-1408`) is a `$$self{Model}`-keyed
+  // array-of-variants: the element-0/element-1 PrintConv hashes differ for
+  // `/(K-1|645Z)\b/`, `/(K-3|KP)\b/` and the "other models". The `Copy` conv
+  // dispatched by `apply` has no model context, so 0x000e renders through the
+  // model-aware [`af_point_selected_for_model`](makernotes::vendors::pentax::printconv)
+  // here (where `model` is threaded), exactly as the encrypted `0x005d` shutter
+  // count is handled outside the conv. #311.
+  let value = if entry.tag_id == 0x000e {
+    makernotes::vendors::pentax::printconv::af_point_selected_for_model(raw, print_conv, model)
+  } else {
+    pentax_tag.conv.apply(raw, print_conv)
+  };
   // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x0012
   // ExposureTime` / `0x0013 FNumber` rows, `1` otherwise) so a `Priority => 0`
   // leaf never overrides an earlier same-`(doc, family1, name)` value
@@ -11710,6 +11721,21 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // ⇒ LE; the K-5 II reports `"PENTAX"` ⇒ BE.)
           SubTable::FilterInfo => {
             pentax::subtables::emit_filter_info(block, make, &mut *sink.emissions);
+          }
+          // `%Pentax::AFPointInfo` (0x0245) — a plain SubDirectory (UNCONDITIONAL).
+          // The int16u NumAFPoints inherits the resolved MakerNote (`parent_order`)
+          // order; the offset-4 AFPointsInFocus/Selected/Special leaves are
+          // `/K(P|-1|-70)\b/`-model-gated (`emit_af_point_info` decides from the
+          // threaded `model` — the K-1/KP/K-70 fixtures emit them, no other body
+          // writes a 0x0245). #311.
+          SubTable::AfPointInfo => {
+            pentax::subtables::emit_af_point_info(
+              block,
+              parent_order,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
           }
         }
         continue;

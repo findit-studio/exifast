@@ -224,6 +224,16 @@ pub enum SubTable {
   /// SourceDirectoryIndex (@byte 0) + SourceFileIndex (@byte 2); the 20
   /// `DigitalFilterNN` blobs are deferred.
   FilterInfo,
+  /// `%Pentax::AFPointInfo` at `0x0245` (`Pentax.pm:3117-3120`, `:6067-6100`) —
+  /// the K-1-style AF-point info (`int8u`/`FIRST_ENTRY 0`; the int16u NumAFPoints
+  /// inherits the resolved MakerNote order). The Main `0x0245` row is
+  /// UNCONDITIONAL (a plain SubDirectory). Emits NumAFPoints (@2) and — for the
+  /// `/K(P|-1|-70)\b/` bodies — AFPointsInFocus / AFPointsSelected /
+  /// AFPointsSpecial (@4, each `DecodeAFPoints` over an `int8u[(NumAFPoints+3)/4]`
+  /// slice). Only the K-1, KP and K-70 write a 0x0245 subdir; the K-3 III
+  /// `AFPointValues` belongs to the separate `0x021f AFInfo` table and is deferred
+  /// (no K-3 III fixture).
+  AfPointInfo,
 }
 
 /// The ported `%Pentax::Main` rows — sorted by `id` for binary search.
@@ -1128,6 +1138,17 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0245 AFPointInfo` (`Pentax.pm:3117-3120`) — a plain SubDirectory (no
+  // explicit `Format` ⇒ implicit-`undef`, the whole block reaches the child).
+  // Written only by the K-1, KP and K-70.
+  PentaxTag {
+    id: 0x0245,
+    name: "AFPointInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::AfPointInfo),
+    unknown: false,
+    format: None,
+  },
 ];
 
 /// Look up a `%Pentax::Main` tag by ID. Returns `None` for an unported /
@@ -1175,8 +1196,8 @@ pub fn format_override(id: u16) -> Option<Format> {
 /// repeated across many entries would otherwise force. Mirrors
 /// [`nikon::is_implicit_undef_subdir`](super::super::nikon::is_implicit_undef_subdir);
 /// matches the implicit-`undef` SubDirectory rows `0x003f LensRec`, `0x0205`
-/// CameraSettings, `0x0206` AEInfo, `0x0207` LensInfo, `0x0208` FlashInfo and
-/// `0x0215` CameraInfo.
+/// CameraSettings, `0x0206` AEInfo, `0x0207` LensInfo, `0x0208` FlashInfo,
+/// `0x0215` CameraInfo and `0x0245` AFPointInfo.
 #[must_use]
 pub fn is_implicit_undef_subdir(id: u16) -> bool {
   lookup(id).is_some_and(|tag| tag.format_override().is_none() && tag.sub_table().is_some())
@@ -1427,25 +1448,29 @@ pub fn conditional_leaf(
       ConditionalLeaf::Suppress
     }
   }
+  // `count` (ExifTool's `$count`) is one of the four Condition axes this fn maps;
+  // none of the CURRENTLY-ported gated leaves branches on it (the `0x0016` / `0x004d`
+  // `$count` variants are now both ported and select inside the PrintConv, not
+  // here), but it stays in the signature as a documented Condition input a future
+  // `$count`-gated leaf would consult. Discard it explicitly to keep the unused
+  // axis visible rather than silently dropped.
+  let _ = count;
   match id {
     // ---- GATED #173 leaves ----
     // `$$self{Make} !~ /^Asahi/` selects the ported "Pentax models" variant; an
     // Asahi body (the deferred "Asahi models" hash) ⇒ suppress. A `None` Make
     // (videos) is `!~ /^Asahi/` ⇒ emit.
     0x000d => gate(make.is_none_or(|m| !make_prefix_match(m, "Asahi"))),
-    // The "other models" variant — selected when the model is NOT K-1/645Z and
-    // NOT K-3/KP (those use the deferred model-keyed 0x000e arms). The
-    // [`PentaxPrintConv::AfPointSelected`] conv now renders the FULL int16u[N]
-    // array (element 0 the 11-point hash, element 1 the Single-Point/Expanded-Area
-    // hash), so BOTH the K10D single-element (`'Center'`) and the K-S2
-    // two-element (`'Center; Single Point'`) records emit. A `None` model can only
-    // be the non-K-1/3 arm.
-    0x000e => {
-      let is_k1_645z =
-        model.is_some_and(|m| model_word_match(m, "K-1") || model_word_match(m, "645Z"));
-      let is_k3_kp = model.is_some_and(|m| model_word_match(m, "K-3") || model_word_match(m, "KP"));
-      gate(!is_k1_645z && !is_k3_kp)
-    }
+    // `0x000e AFPointSelected` — ALL THREE model variants are now ported (#311):
+    // the `/(K-1|645Z)\b/` 33-point hash, the `/(K-3|KP)\b/` 27-point hash and the
+    // "other models" 11-point hash. The emit site routes 0x000e through
+    // [`printconv::af_point_selected_for_model`](super::printconv) (which selects
+    // the element-0/element-1 hashes by `$$self{Model}`), so the leaf emits
+    // unconditionally — every record matches exactly one model variant and renders
+    // the FULL int16u[N] array (element 0 the point hash, element 1 the
+    // Single-Point/Expanded-Area hash). A `None` model takes the "other models"
+    // arm.
+    0x000e => ConditionalLeaf::Emit,
     // `0x000f AFPointsInFocus` (`Pentax.pm:1409-1465`) — TWO variants selected by
     // `Condition`. The port implements variant 1, the int32u 27-bit BITMASK
     // (`PrintHex`, `{0=>'(none)', BITMASK=>{...}}`), whose `Condition` is
@@ -1460,9 +1485,14 @@ pub fn conditional_leaf(
     // 0x000f — their `AFPointsInFocus` is the separate `0x021f AFInfo` leaf), so
     // this gate is byte-identical across every active and held fixture.
     0x000f => gate(model.is_some_and(is_afpoints_in_focus_bitmask)),
-    // `$count == 1` selects the ported int16u variant; the count-2 variant is
-    // deferred.
-    0x0016 => gate(count == 1),
+    // `0x0016 ExposureCompensation` — BOTH variants are ported (#311): the
+    // `$count == 1` int16u (`($val-50)/10`) and the `Count => 2` variant. The
+    // count-2 ValueConv is `$val =~ s/ .*//; ($val-50)/10` — it strips everything
+    // after the first space, i.e. takes ELEMENT 0 ONLY, so it produces the SAME
+    // scalar as the count-1 path. [`PentaxPrintConv::ExposureCompensation`] reads
+    // element 0 via `first_i64`, so the leaf emits for either count (the 2nd
+    // element, meaning-unknown, is correctly ignored).
+    0x0016 => ConditionalLeaf::Emit,
     // `$val/100` (variant 2) is the ported FocalLength; an Optio body in the
     // `/^PENTAX Optio (30|33WR|43WR|450|550|555|750Z|X)\b/` list uses the
     // deferred `$val/10` variant ⇒ suppress (10× different).
@@ -1773,10 +1803,10 @@ pub const FOCUS_MODE: &[(i64, &str)] = &[
 ];
 
 /// `0x000e AFPointSelected` element-0 PrintConv (the "other models" K10D
-/// variant, `Pentax.pm:1380-1399`) — sorted by key for binary search. The value
-/// is a single `int16u`, so only this (element-0) hash applies; the element-1
-/// hash (extended tracking, `Pentax.pm:1400-1407`) is unreachable for a
-/// one-element value and is not ported.
+/// variant, `Pentax.pm:1380-1399`) — sorted by key for binary search. Used for
+/// every body NOT matching `/(K-1|645Z)\b/` or `/(K-3|KP)\b/` (the K10D / K-x /
+/// K-5 II / K-70 / K-S2). For a TWO-element record (the K-5 II(s), K-S2) element 1
+/// resolves via [`AF_POINT_SELECTED_AREA`].
 pub const AF_POINT_SELECTED: &[(i64, &str)] = &[
   (0, "None"),
   (1, "Upper-left"),
@@ -1796,6 +1826,165 @@ pub const AF_POINT_SELECTED: &[(i64, &str)] = &[
   (0xfffd, "Automatic Tracking AF"),
   (0xfffe, "Fixed Center"),
   (0xffff, "Auto"),
+];
+
+/// `0x000e AFPointSelected` element-1 PrintConv for the "other models" variant
+/// (`Pentax.pm:1400-1407`, the K-5 II(s) / K-70 / K-S2 etc. extended-tracking
+/// flag): `{0=>'Single Point', 1=>'Expanded Area'}`. Sorted by key.
+pub const AF_POINT_SELECTED_AREA: &[(i64, &str)] = &[(0, "Single Point"), (1, "Expanded Area")];
+
+/// `0x000e AFPointSelected` element-0 PrintConv for the K-1 / 645Z variant
+/// (`Condition => '$$self{Model} =~ /(K-1|645Z)\b/'`, `Pentax.pm:1225-1287`) — the
+/// 33-point pattern plus the Zone-Select labels and the `0xfffb`-`0xffff` special
+/// selections (AF Select / Face Detect AF / Automatic Tracking AF / Fixed Center /
+/// Auto; like the K-3/KP hash, NO `0xfffa` 'Auto 2'). Sorted by key for binary
+/// search.
+pub const AF_POINT_SELECTED_K1: &[(i64, &str)] = &[
+  (0, "None"),
+  (1, "Top-left"),
+  (2, "Top Near-left"),
+  (3, "Top"),
+  (4, "Top Near-right"),
+  (5, "Top-right"),
+  (6, "Upper Far-left"),
+  (7, "Upper-left"),
+  (8, "Upper Near-left"),
+  (9, "Upper-middle"),
+  (10, "Upper Near-right"),
+  (11, "Upper-right"),
+  (12, "Upper Far-right"),
+  (13, "Far Far Left"),
+  (14, "Far Left"),
+  (15, "Left"),
+  (16, "Near-left"),
+  (17, "Center"),
+  (18, "Near-right"),
+  (19, "Right"),
+  (20, "Far Right"),
+  (21, "Far Far Right"),
+  (22, "Lower Far-left"),
+  (23, "Lower-left"),
+  (24, "Lower Near-left"),
+  (25, "Lower-middle"),
+  (26, "Lower Near-right"),
+  (27, "Lower-right"),
+  (28, "Lower Far-right"),
+  (29, "Bottom-left"),
+  (30, "Bottom Near-left"),
+  (31, "Bottom"),
+  (32, "Bottom Near-right"),
+  (33, "Bottom-right"),
+  (263, "Zone Select Upper-left"),
+  (264, "Zone Select Upper Near-left"),
+  (265, "Zone Select Upper Middle"),
+  (266, "Zone Select Upper Near-right"),
+  (267, "Zone Select Upper-right"),
+  (270, "Zone Select Far Left"),
+  (271, "Zone Select Left"),
+  (272, "Zone Select Near-left"),
+  (273, "Zone Select Center"),
+  (274, "Zone Select Near-right"),
+  (275, "Zone Select Right"),
+  (276, "Zone Select Far Right"),
+  (279, "Zone Select Lower-left"),
+  (280, "Zone Select Lower Near-left"),
+  (281, "Zone Select Lower-middle"),
+  (282, "Zone Select Lower Near-right"),
+  (283, "Zone Select Lower-right"),
+  (0xfffb, "AF Select"),
+  (0xfffc, "Face Detect AF"),
+  (0xfffd, "Automatic Tracking AF"),
+  (0xfffe, "Fixed Center"),
+  (0xffff, "Auto"),
+];
+
+/// `0x000e AFPointSelected` element-1 PrintConv for the K-1 / 645Z variant
+/// (`Pentax.pm:1288-1293`): the Expanded-Area sizes ending in `33-point (L)`.
+/// Sorted by key.
+pub const AF_POINT_SELECTED_K1_AREA: &[(i64, &str)] = &[
+  (0, "Single Point"),
+  (1, "Expanded Area 9-point (S)"),
+  (3, "Expanded Area 25-point (M)"),
+  (5, "Expanded Area 33-point (L)"),
+];
+
+/// `0x000e AFPointSelected` element-0 PrintConv for the K-3 / KP variant
+/// (`Condition => '$$self{Model} =~ /(K-3|KP)\b/'`, `Pentax.pm:1300-1368`) — the
+/// 27-point pattern plus the Zone-Select labels and the `0xfffb`-`0xffff` special
+/// selections (AF Select / Face Detect AF / Automatic Tracking AF / Fixed Center /
+/// Auto; the K-3/KP hash has NO `0xfffa` 'Auto 2', unlike the "other models"
+/// hash). Sorted by key for binary search.
+pub const AF_POINT_SELECTED_K3: &[(i64, &str)] = &[
+  (0, "None"),
+  (1, "Top-left"),
+  (2, "Top Near-left"),
+  (3, "Top"),
+  (4, "Top Near-right"),
+  (5, "Top-right"),
+  (6, "Upper-left"),
+  (7, "Upper Near-left"),
+  (8, "Upper-middle"),
+  (9, "Upper Near-right"),
+  (10, "Upper-right"),
+  (11, "Far Left"),
+  (12, "Left"),
+  (13, "Near-left"),
+  (14, "Center"),
+  (15, "Near-right"),
+  (16, "Right"),
+  (17, "Far Right"),
+  (18, "Lower-left"),
+  (19, "Lower Near-left"),
+  (20, "Lower-middle"),
+  (21, "Lower Near-right"),
+  (22, "Lower-right"),
+  (23, "Bottom-left"),
+  (24, "Bottom Near-left"),
+  (25, "Bottom"),
+  (26, "Bottom Near-right"),
+  (27, "Bottom-right"),
+  (257, "Zone Select Top-left"),
+  (258, "Zone Select Top Near-left"),
+  (259, "Zone Select Top"),
+  (260, "Zone Select Top Near-right"),
+  (261, "Zone Select Top-right"),
+  (262, "Zone Select Upper-left"),
+  (263, "Zone Select Upper Near-left"),
+  (264, "Zone Select Upper-middle"),
+  (265, "Zone Select Upper Near-right"),
+  (266, "Zone Select Upper-right"),
+  (267, "Zone Select Far Left"),
+  (268, "Zone Select Left"),
+  (269, "Zone Select Near-left"),
+  (270, "Zone Select Center"),
+  (271, "Zone Select Near-right"),
+  (272, "Zone Select Right"),
+  (273, "Zone Select Far Right"),
+  (274, "Zone Select Lower-left"),
+  (275, "Zone Select Lower Near-left"),
+  (276, "Zone Select Lower-middle"),
+  (277, "Zone Select Lower Near-right"),
+  (278, "Zone Select Lower-right"),
+  (279, "Zone Select Bottom-left"),
+  (280, "Zone Select Bottom Near-left"),
+  (281, "Zone Select Bottom"),
+  (282, "Zone Select Bottom Near-right"),
+  (283, "Zone Select Bottom-right"),
+  (0xfffb, "AF Select"),
+  (0xfffc, "Face Detect AF"),
+  (0xfffd, "Automatic Tracking AF"),
+  (0xfffe, "Fixed Center"),
+  (0xffff, "Auto"),
+];
+
+/// `0x000e AFPointSelected` element-1 PrintConv for the K-3 / KP variant
+/// (`Pentax.pm:1369-1373`): the Expanded-Area sizes ending in `27-point (L)`
+/// (NOT the K-1's `33-point`). Sorted by key.
+pub const AF_POINT_SELECTED_K3_AREA: &[(i64, &str)] = &[
+  (0, "Single Point"),
+  (1, "Expanded Area 9-point (S)"),
+  (3, "Expanded Area 25-point (M)"),
+  (5, "Expanded Area 27-point (L)"),
 ];
 
 /// `0x0062 RawDevelopmentProcess` PrintConv (`Pentax.pm:2302-2323`) — sorted by

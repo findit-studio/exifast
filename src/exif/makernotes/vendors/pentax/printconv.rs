@@ -379,30 +379,84 @@ fn flash_exposure_comp(raw: &RawValue, print_conv: bool) -> TagValue {
   TagValue::Str(SmolStr::from(parts.join("; ")))
 }
 
-/// `0x000e AFPointSelected` "other models" variant (`Pentax.pm:1375-1408`) —
-/// int16u[2], a 2-element ARRAY PrintConv: element 0 via the 18-entry
-/// [`AF_POINT_SELECTED`](super::tags::AF_POINT_SELECTED) hash (incl. the `0xfff*`
-/// special keys), element 1 via `{0=>'Single Point', 1=>'Expanded Area'}`, joined
-/// `"; "`. A miss renders `Unknown (N)` (no `PrintHex`). `-n` ⇒ the space-joined
-/// raw run.
-fn af_point_selected(raw: &RawValue, print_conv: bool) -> TagValue {
+/// `0x000e AFPointSelected` — a MODEL-VARIANT `int16u[N]` 2-element ARRAY PrintConv
+/// (`Pentax.pm:1219-1408`). The element-0 + element-1 PrintConv hashes are selected
+/// by `$$self{Model}` (the ExifTool array-of-`Condition`-variants):
+///   * `/(K-1|645Z)\b/` ⇒ [`AF_POINT_SELECTED_K1`] + [`AF_POINT_SELECTED_K1_AREA`]
+///     (`33-point (L)`);
+///   * `/(K-3|KP)\b/`   ⇒ [`AF_POINT_SELECTED_K3`] + [`AF_POINT_SELECTED_K3_AREA`]
+///     (`27-point (L)`);
+///   * everything else (K10D / K-x / K-5 II / K-70 / K-S2, INCLUDING a `None`
+///     model) ⇒ [`AF_POINT_SELECTED`] + [`AF_POINT_SELECTED_AREA`].
+/// Each element renders via its positional hash (element 0 the point hash, every
+/// later element the area hash — the Perl `$$convList[-1]` reuse), joined `"; "`.
+/// A miss renders `Unknown (N)` (no `PrintHex`). `-n` ⇒ the space-joined raw run.
+pub(crate) fn af_point_selected_for_model(
+  raw: &RawValue,
+  print_conv: bool,
+  model: Option<&str>,
+) -> TagValue {
+  use super::tags::{
+    AF_POINT_SELECTED, AF_POINT_SELECTED_AREA, AF_POINT_SELECTED_K1, AF_POINT_SELECTED_K1_AREA,
+    AF_POINT_SELECTED_K3, AF_POINT_SELECTED_K3_AREA,
+  };
   if !print_conv {
     return TagValue::Str(SmolStr::from(space_join(raw)));
   }
   let Some(elems) = numeric_elems(raw) else {
     return raw_to_tag_value(raw);
   };
-  const AREA: &[(i64, &str)] = &[(0, "Single Point"), (1, "Expanded Area")];
-  let tables: [&[(i64, &str)]; 2] = [super::tags::AF_POINT_SELECTED, AREA];
+  // Mirror `conditional_leaf`'s `(K-1|645Z)` / `(K-3|KP)` model-word gate.
+  let (point, area): (&[(i64, &str)], &[(i64, &str)]) =
+    if model.is_some_and(|m| af_model_word(m, "K-1") || af_model_word(m, "645Z")) {
+      (AF_POINT_SELECTED_K1, AF_POINT_SELECTED_K1_AREA)
+    } else if model.is_some_and(|m| af_model_word(m, "K-3") || af_model_word(m, "KP")) {
+      (AF_POINT_SELECTED_K3, AF_POINT_SELECTED_K3_AREA)
+    } else {
+      (AF_POINT_SELECTED, AF_POINT_SELECTED_AREA)
+    };
   let mut parts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
   for (i, &n) in elems.iter().enumerate() {
-    let table = *tables.get(i).or_else(|| tables.last()).unwrap_or(&AREA);
+    // Element 0 ⇒ the point hash; every later element ⇒ the area hash (the Perl
+    // `$$convList[-1]` reuse for the trailing positions).
+    let table = if i == 0 { point } else { area };
     match hash_get(table, n) {
       Some(l) => parts.push(l.to_string()),
       None => parts.push(std::format!("Unknown ({n})")),
     }
   }
   TagValue::Str(SmolStr::from(parts.join("; ")))
+}
+
+/// The `PentaxPrintConv::AfPointSelected` `apply` arm has no `$$self{Model}`
+/// context (the conv is `Copy` and dispatched by value), so it renders the "other
+/// models" variant. The model-keyed K-1 / K-3 variants render through
+/// [`af_point_selected_for_model`] at the emit site (which DOES have `model`); the
+/// 0x000e leaf is routed there, not here, so this only serves a defensive
+/// `emit_entry` of a 0x000e with no model in scope.
+fn af_point_selected(raw: &RawValue, print_conv: bool) -> TagValue {
+  af_point_selected_for_model(raw, print_conv, None)
+}
+
+/// `true` when `model` contains `needle` followed by a Perl `\b` word boundary —
+/// the same ASCII `\b` test [`tags::model_word_match`](super::tags) uses for the
+/// `0x000e` model gate, duplicated here to keep `printconv` free of a `tags`
+/// cross-import for one predicate.
+fn af_model_word(model: &str, needle: &str) -> bool {
+  let mut from = 0;
+  while let Some(rel) = model.get(from..).and_then(|sub| sub.find(needle)) {
+    let start = from + rel;
+    let end = start + needle.len();
+    let boundary_ok = model
+      .get(end..)
+      .and_then(|sub| sub.chars().next())
+      .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+    if boundary_ok {
+      return true;
+    }
+    from = end;
+  }
+  false
 }
 
 /// `0x000f AFPointsInFocus` for `/K-(3|S1|S2)\b/` (`Pentax.pm:1409-1446`) — int32u,

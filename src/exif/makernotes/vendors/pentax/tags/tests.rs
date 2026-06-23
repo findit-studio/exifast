@@ -198,20 +198,18 @@ const K10D_MODEL: Option<&str> = Some("PENTAX K10D");
 
 #[test]
 fn conditional_leaf_count_gated_leaves() {
-  // 0x0016 ExposureCompensation: `$count == 1` emits; the count-2 variant is
-  // deferred ⇒ Suppress.
-  assert_eq!(
-    conditional_leaf(0x0016, 1, K10D_MODEL, K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Emit,
-    "0x0016 count==1 must emit"
-  );
-  assert_eq!(
-    conditional_leaf(0x0016, 2, K10D_MODEL, K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Suppress,
-    "0x0016 count==2 must suppress (deferred variant)"
-  );
-  assert!(conditional_leaf(0x0016, 0, K10D_MODEL, K10D_MAKE, Format::Int16u).is_suppressed());
-  // 0x004d FlashExposureComp: BOTH variants are now ported (the count==1 int32s
+  // 0x0016 ExposureCompensation: BOTH variants are now ported (#311) — the
+  // `$count == 1` int16u AND the `Count => 2` variant (whose ValueConv strips all
+  // but element 0, so it produces the same scalar). The leaf emits for either
+  // count; the PrintConv reads element 0.
+  for count in [1usize, 2] {
+    assert_eq!(
+      conditional_leaf(0x0016, count, K10D_MODEL, K10D_MAKE, Format::Int16u),
+      ConditionalLeaf::Emit,
+      "0x0016 count=={count} must emit (both variants ported)"
+    );
+  }
+  // 0x004d FlashExposureComp: BOTH variants are ported (the count==1 int32s
   // and the count==2 int8s array), so the leaf emits for either count (#311).
   for count in [1usize, 2] {
     assert_eq!(
@@ -224,10 +222,13 @@ fn conditional_leaf_count_gated_leaves() {
 
 #[test]
 fn conditional_leaf_af_point_selected_model_gated() {
-  // 0x000e AFPointSelected: the "other models" variant emits for a non-K-1/645Z,
-  // non-K-3/KP model, for EITHER count (the array conv now renders both the
-  // single-element K10D form `'Center'` and the two-element K-S2 form
-  // `'Center; Single Point'`, #311).
+  // 0x000e AFPointSelected: ALL THREE model variants are now ported (#311), so the
+  // leaf emits UNCONDITIONALLY for every model and count — the emit site routes it
+  // through `af_point_selected_for_model`, which selects the element-0/element-1
+  // hashes by `$$self{Model}` (the `/(K-1|645Z)\b/` 33-point hash, the
+  // `/(K-3|KP)\b/` 27-point hash, or the "other models" 11-point hash). The
+  // per-model SELECTION (the right labels per body) is covered in the printconv
+  // suite; here the structural gate must never SUPPRESS.
   for count in [1usize, 2] {
     assert_eq!(
       conditional_leaf(0x000e, count, K10D_MODEL, K10D_MAKE, Format::Int16u),
@@ -235,28 +236,20 @@ fn conditional_leaf_af_point_selected_model_gated() {
       "0x000e count=={count} (other-models body) must emit"
     );
   }
-  // The K-1/645Z and K-3/KP model variants are deferred (their own point hashes)
-  // ⇒ Suppress, never the "other models" hash flattened onto them.
   for m in [
     "PENTAX K-1",
     "PENTAX 645Z",
     "PENTAX K-3",
     "PENTAX K-3 Mark III",
     "PENTAX KP",
+    "PENTAX Optio S",
   ] {
     assert_eq!(
       conditional_leaf(0x000e, 1, Some(m), K10D_MAKE, Format::Int16u),
-      ConditionalLeaf::Suppress,
-      "{m} AFPointSelected must suppress (model-specific variant deferred)"
+      ConditionalLeaf::Emit,
+      "{m} AFPointSelected must emit (all model variants ported)"
     );
   }
-  // The `K-3` token must not false-match a non-K-3 model containing the bytes
-  // out of word-boundary (faithful `\b`); a plain Optio is the "other models"
-  // arm.
-  assert_eq!(
-    conditional_leaf(0x000e, 1, Some("PENTAX Optio S"), K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Emit
-  );
 }
 
 /// `0x000f AFPointsInFocus` (#311) — the ported variant 1 is the int32u 27-bit

@@ -11396,26 +11396,33 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
 //   * `XMP-tiff:YCbCrSubSampling` — the unported `RawJoin`/`%JPEG::
 //                                   yCbCrSubSampling` PrintConv (`xmp/tables.rs`).
 //
-// PLUS the per-body `Pentax:*` residuals the #379 port does not yet emit for
-// THESE bodies (each a known DEFERRED `%Pentax::Main` model-variant leaf or
-// `$count`-gated SubDirectory variant — see `vendors/pentax/tags.rs::
-// conditional_leaf` and `subtables.rs`, which deliberately SUPPRESS the
-// unported variant rather than mis-decode it):
+// #311 PORTED the per-body multi-model `%Pentax::Main` conditional branches the
+// `#379` body-agnostic port had suppressed (see `vendors/pentax/tags.rs::
+// conditional_leaf`, `printconv.rs::af_point_selected_for_model` and
+// `subtables.rs::{emit_af_point_info,emit_battery_info}`), now emitted byte-exact:
 //
-//   * `AFPointSelected` (0x000e)   — the model-keyed K-1 (33-point + Zone Select)
-//        and K-3/KP variants (`Pentax.pm:1220/1295`); the port emits only the
-//        "other models" int16u[N] variant (the K-S2 one). K-1/K-3/KP suppressed.
-//   * `AFPointsInFocus` (0x000f)   — the int16u "other models" variant
-//        (`Pentax.pm:1448`); the port emits only the K-3/S1/S2 27-bit BITMASK.
-//   * `ExposureCompensation` (0x0016) — the `Count => 2` variant; the port emits
-//        only the `$count == 1` variant.
+//   * `AFPointSelected` (0x000e)   — the model-keyed K-1/645Z (33-point) and
+//        K-3/KP (27-point) element-0 hashes (`Pentax.pm:1219-1408`), routed by
+//        `$$self{Model}` + the count-2 second positional element. (K-5 II/K-70/K-S2
+//        keep the "other models" 11-point hash.)
+//   * `ExposureCompensation` (0x0016) — the `Count => 2` variant (`Pentax.pm:1605`):
+//        its ValueConv strips all but element 0, so it equals the `$count == 1`
+//        scalar. Now un-gated.
+//   * `NumAFPoints`/`AFPointsInFocus`/`AFPointsSelected`/`AFPointsSpecial` — the
+//        `%Pentax::AFPointInfo` (0x0245) SubDirectory + its `DecodeAFPoints`
+//        bit-mask decoder (`Pentax.pm:6067-6100`, K-1/KP/K-70). The
+//        `DecodeAFPoints` `$mask`/`$bitVal` separation is now faithful.
+//   * `BodyBatteryVoltage3`/`4` (`%Pentax::BatteryInfo` offsets 6/8,
+//        `Pentax.pm:4941-4960`, `/(K-5|K-r|645D)\b/` and `/(K-5|K-r)\b/`, K-5 II).
+//
+// PLUS the per-body `Pentax:*` residuals NOT in #311 scope (still DEFERRED — the
+// port emits nothing, so the golden retains the bundled value and the key is
+// dropped from both sides):
+//
 //   * `ContrastHighlight`/`ContrastShadow`/`ContrastHighlightShadowAdj`
 //        (0x006d/6e/6f), `ISOAutoMinSpeed` (0x007a), `ShutterType` (0x0087),
 //        `SkinToneCorrection` (0x0095), `SensorSize` (0x0064) — `%Pentax::Main`
 //        leaves not yet in `PENTAX_TAGS`.
-//   * `NumAFPoints`/`AFPointsInFocus`/`AFPointsSelected`/`AFPointsSpecial` —
-//        the `%Pentax::AFPointInfo` (0x0245) SubDirectory + its `DecodeAFPoints`
-//        bit-mask decoder (unported).
 //   * `PixelShiftResolution` — the `%Pentax::PixelShiftInfo` (0x0243)
 //        SubDirectory (unported).
 //   * `SensorTemperature`/`SensorTemperature2`/`CameraTemperature4`/`5` — the
@@ -11423,42 +11430,38 @@ fn mpeg2_ts_pruveeo_d90_conformance() {
 //   * (K-5 II only) the `$count`-91 `%Pentax::LensInfo3` variant
 //        (`LensFocalLength`/`MaxAperture`/`MinFocusDistance`/`NominalMax`/`Min
 //        Aperture`/`FocusRangeIndex`), the `%Pentax::WBLevels` (0x022d)
-//        `WB_RGGBLevels*` table, the K-5-II `%Pentax::BatteryInfo` leaves
-//        (`BodyBatteryVoltage3`/`4`), the `%Pentax::ShotInfo` `CameraOrientation`,
+//        `WB_RGGBLevels*` table, the `%Pentax::ShotInfo` `CameraOrientation`,
 //        the `%Pentax::AEInfo` `LevelIndicator`, the `%Pentax::CameraSettings`
 //        `ISOAuto`/`LinkAEToAFPoint`/`SensitivitySteps`, and the
 //        `Pentax:PreviewImageStart` IsOffset pointer — all deferred
 //        K-5-II-specific `$count`/offset SubDirectory variants.
 //
-// These are tracked DEFERRALS (the #311 follow-up to the body-specific variant
-// tables), NOT mis-decodes — exifast emits nothing for them, so the golden
-// retains the bundled value and the key is dropped from both sides.
+// (The K-3 Mark III `AFInfoK3III` `AFPointValues`/`AFPointsSelected` and the
+// *istD-family AFPointSelected variants are also deferred — no fixture.)
 
-// K-1: the K-1 AFPointSelected model variant + AFPointInfo/PixelShiftInfo/
-// Contrast/ISOAutoMinSpeed/ShutterType/SkinToneCorrection/ExposureCompensation
-// residuals.
+// K-1: #311 PORTED the K-1 (`/(K-1|645Z)\b/`) AFPointSelected model variant, the
+// count-2 ExposureCompensation, and the `%Pentax::AFPointInfo` (0x0245) subdir
+// (NumAFPoints + AFPointsInFocus/AFPointsSelected/AFPointsSpecial via
+// `DecodeAFPoints`) — all now byte-exact, so they are NO LONGER excluded. The
+// residual deferrals are NON-#311 `%Pentax::Main` leaves not yet in `PENTAX_TAGS`
+// (Contrast*/ISOAutoMinSpeed/ShutterType/SkinToneCorrection) and the `0x0243
+// PixelShiftInfo` subdir (PixelShiftResolution).
 const K1_DEFERRED: &[&str] = &[
   "XMP-tiff:YCbCrSubSampling",
-  "Pentax:AFPointSelected",
-  "Pentax:AFPointsInFocus",
-  "Pentax:AFPointsSelected",
-  "Pentax:AFPointsSpecial",
   "Pentax:ContrastHighlight",
   "Pentax:ContrastHighlightShadowAdj",
   "Pentax:ContrastShadow",
-  "Pentax:ExposureCompensation",
   "Pentax:ISOAutoMinSpeed",
-  "Pentax:NumAFPoints",
   "Pentax:PixelShiftResolution",
   "Pentax:ShutterType",
   "Pentax:SkinToneCorrection",
 ];
 
-// K-3: the K-3 AFPointSelected model variant + TempInfo (SensorTemperature) +
-// Contrast/ISOAutoMinSpeed residuals.
+// K-3: #311 PORTED the K-3 (`/(K-3|KP)\b/`) AFPointSelected model variant (now
+// byte-exact, no longer excluded). The residuals are the `0x03ff TempInfo` subdir
+// (SensorTemperature/2) and the non-#311 Contrast*/ISOAutoMinSpeed Main leaves.
 const K3_DEFERRED: &[&str] = &[
   "XMP-tiff:YCbCrSubSampling",
-  "Pentax:AFPointSelected",
   "Pentax:ContrastHighlight",
   "Pentax:ContrastHighlightShadowAdj",
   "Pentax:ContrastShadow",
@@ -11467,14 +11470,14 @@ const K3_DEFERRED: &[&str] = &[
   "Pentax:SensorTemperature2",
 ];
 
-// K-5 II (BIG-endian): the deferred K-5-II `$count`/offset SubDirectory variants
-// (LensInfo3 / WBLevels / BatteryInfo / ShotInfo / AEInfo / CameraSettings /
-// TempInfo) + the AFPointInfo/PixelShiftInfo/Contrast residuals + the IsOffset
-// PreviewImageStart.
+// K-5 II (BIG-endian): #311 PORTED the `%Pentax::BatteryInfo` `/(K-5|K-r|645D)\b/`
+// BodyBatteryVoltage3 (offset 6) and `/(K-5|K-r)\b/` BodyBatteryVoltage4 (offset
+// 8) — now byte-exact, no longer excluded. The remaining residuals are the
+// deferred K-5-II `$count`/offset SubDirectory variants (LensInfo3 / WBLevels /
+// ShotInfo / AEInfo / CameraSettings / TempInfo) + the Contrast/ISOAutoMinSpeed
+// Main leaves + the IsOffset PreviewImageStart — none of them #311.
 const K5_II_DEFERRED: &[&str] = &[
   "XMP-tiff:YCbCrSubSampling",
-  "Pentax:BodyBatteryVoltage3",
-  "Pentax:BodyBatteryVoltage4",
   "Pentax:CameraOrientation",
   "Pentax:CameraTemperature4",
   "Pentax:CameraTemperature5",
@@ -11508,21 +11511,18 @@ const K5_II_DEFERRED: &[&str] = &[
   "Pentax:WB_RGGBLevelsUserSelected",
 ];
 
-// KP: identical residual shape to K-1 (the K-3/KP AFPointSelected variant +
-// AFPointInfo/PixelShiftInfo/Contrast/ISOAutoMinSpeed/ShutterType/
-// SkinToneCorrection/ExposureCompensation).
+// KP: identical residual shape to K-1 after #311. PORTED: the KP (`/(K-3|KP)\b/`)
+// AFPointSelected variant, the count-2 ExposureCompensation, and the
+// `%Pentax::AFPointInfo` (0x0245) subdir (NumAFPoints + AFPointsInFocus/Selected/
+// Special) — all byte-exact, no longer excluded. The residuals are the non-#311
+// Contrast*/ISOAutoMinSpeed/ShutterType/SkinToneCorrection Main leaves and the
+// `0x0243 PixelShiftInfo` subdir.
 const KP_DEFERRED: &[&str] = &[
   "XMP-tiff:YCbCrSubSampling",
-  "Pentax:AFPointSelected",
-  "Pentax:AFPointsInFocus",
-  "Pentax:AFPointsSelected",
-  "Pentax:AFPointsSpecial",
   "Pentax:ContrastHighlight",
   "Pentax:ContrastHighlightShadowAdj",
   "Pentax:ContrastShadow",
-  "Pentax:ExposureCompensation",
   "Pentax:ISOAutoMinSpeed",
-  "Pentax:NumAFPoints",
   "Pentax:PixelShiftResolution",
   "Pentax:ShutterType",
   "Pentax:SkinToneCorrection",
@@ -11542,16 +11542,17 @@ const KP_DEFERRED: &[&str] = &[
 // `0.01666666667` (not full-f64 `0.0166666666666667`) and the rounded value
 // propagates byte-exact to the two Composites. The remaining entries are only
 // unimplemented Pentax leaves, so K-70 now activates honestly.
+// #311 PORTED the count-2 ExposureCompensation and the `%Pentax::AFPointInfo`
+// (0x0245) subdir (NumAFPoints + AFPointsInFocus/Selected/Special via
+// `DecodeAFPoints`) — byte-exact, no longer excluded. (K-70's 0x000e is the
+// unrelated CAFPointInfo internal, already emitted, so no AFPointSelected entry.)
+// The residuals are the non-#311 Contrast*/ShutterType/SkinToneCorrection Main
+// leaves and the `0x0243 PixelShiftInfo` subdir.
 const K70_DEFERRED: &[&str] = &[
   "XMP-tiff:YCbCrSubSampling",
-  "Pentax:AFPointsInFocus",
-  "Pentax:AFPointsSelected",
-  "Pentax:AFPointsSpecial",
   "Pentax:ContrastHighlight",
   "Pentax:ContrastHighlightShadowAdj",
   "Pentax:ContrastShadow",
-  "Pentax:ExposureCompensation",
-  "Pentax:NumAFPoints",
   "Pentax:PixelShiftResolution",
   "Pentax:ShutterType",
   "Pentax:SkinToneCorrection",
