@@ -503,8 +503,12 @@ pub enum PngExifEvent {
   /// A native `eXIf` / `zxIf` chunk (`PNG.pm:309-330`, incl. a `%stdCase`
   /// case-variant), or the inflated TIFF of a `zxIf` — dispatched to
   /// `ProcessTIFF` with NO `$$et{PROCESSED}` reset. The payload is the raw
-  /// `II`/`MM`-led TIFF block.
-  NativeTiff(Vec<u8>),
+  /// `II`/`MM`-led TIFF block, stored as a `Box<[u8]>` so its allocation is
+  /// EXACTLY its length by construction (no excess capacity): a retained inflated
+  /// `zxIf` TIFF is charged by its byte length to the file-wide zXIf budget, and a
+  /// `Box<[u8]>` makes that charge equal the retained allocation at the type level
+  /// (not allocator-dependent — see [`crate::formats::png`]'s zXIf inflate path).
+  NativeTiff(Box<[u8]>),
   /// An ImageMagick `Raw profile type exif` / `Raw profile type APP1` chunk
   /// (`PNG.pm:710`/`:689`) whose well-formed body decoded to a TIFF block
   /// (an `Exif\0\0`-prefixed or bare `II`/`MM` TIFF, `PNG.pm:1216-1265`) —
@@ -560,7 +564,8 @@ impl PngExifEvent {
   #[must_use]
   pub fn block(&self) -> Option<&[u8]> {
     match self {
-      Self::NativeTiff(b) | Self::ExifProfile(b) => Some(b),
+      Self::NativeTiff(b) => Some(b),
+      Self::ExifProfile(b) => Some(b),
       Self::ResetOnlyProfile => None,
     }
   }
@@ -688,6 +693,15 @@ pub struct PngMeta<'a> {
   /// `usize::MAX` until the trailer is entered.
   #[cfg(feature = "xmp")]
   trailer_xmp_start: usize,
+  /// Index into [`Self::warnings`] at which the post-`IEND` TRAILER warnings
+  /// begin (warnings `>= this` were raised while bundled's
+  /// `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1484`) was active, so they surface
+  /// as the family-1 `Trailer:Warning` TAG rather than the document-level
+  /// `ExifTool:Warning`). `usize::MAX` until the trailer is entered. NOTE the
+  /// `Trailer data after PNG IEND chunk` entry warning itself (`PNG.pm:1481`) is
+  /// pushed by the walker BEFORE [`Self::begin_trailer`] sets `SET_GROUP1`, so
+  /// its index is `< this` and it stays document-level (oracle-confirmed).
+  trailer_warning_start: usize,
   /// Set when a structural single-value chunk (`IHDR` / `pHYs` / `bKGD` /
   /// `tIME` / `iCCP-name`) was last written from a TRAILER chunk — so its
   /// emitted PNG-level tags carry the `Trailer` family-1 override. (A trailing
@@ -716,6 +730,21 @@ pub struct PngMeta<'a> {
   /// warning would drain AFTER an unrelated later chunk's warning and hide it
   /// (#205, a malformed-input ordering bug).
   diag_order: Vec<PngDiagStep>,
+  /// FILE-WIDE running total of zXIf-inflated bytes (`PNG.pm:1386-1389`). Every
+  /// `zxIf`/`eXIf` chunk's nested-inflate chain charges its decompressed output
+  /// here so the whole PNG's inflated-then-RETAINED EXIF memory
+  /// ([`PngExifEvent::NativeTiff`], cloned out of the inflated buffer) is bounded
+  /// across ALL chunks, not per chunk — a small PNG can carry MANY independent
+  /// `zxIf` chunks, each inflating to a near-cap valid TIFF that is retained, so
+  /// a per-call budget would let retained memory grow as O(chunks × cap). The
+  /// chunk walker reads the REMAINING budget off this and stops a chain (the
+  /// aborted-inflate `Error inflating <tag>` warning, `PNG.pm:943`) once the
+  /// cumulative file-wide total would exceed the cap
+  /// ([`crate::formats::png::process_exif_block`]). Untouched by an uncompressed
+  /// `eXIf` (no inflation — its retained bytes are already bounded by the on-disk
+  /// chunk length), so a real PNG (≤ 1 small uncompressed `eXIf`) never charges
+  /// it and is byte-identical.
+  zxif_inflated_total: usize,
   /// Phantom carry of `'a` for future zero-alloc evolution / sub-Meta
   /// embedding.
   _lifetime: core::marker::PhantomData<&'a ()>,
@@ -796,6 +825,7 @@ impl PngMeta<'_> {
       trailer_event_start: usize::MAX,
       #[cfg(feature = "xmp")]
       trailer_xmp_start: usize::MAX,
+      trailer_warning_start: usize::MAX,
       structural_trailing: StructuralTrailing {
         ihdr: false,
         phys: false,
@@ -805,6 +835,7 @@ impl PngMeta<'_> {
       },
       warnings: Vec::new(),
       diag_order: Vec::new(),
+      zxif_inflated_total: 0,
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -1058,6 +1089,24 @@ impl PngMeta<'_> {
     self.exif_events.push(event);
   }
 
+  /// FILE-WIDE total of zXIf-inflated bytes so far (`PNG.pm:1386-1389`). The
+  /// chunk walker subtracts this from the cap to size each chain's inflate so
+  /// the cumulative inflated-and-retained EXIF memory across ALL `zxIf`/`eXIf`
+  /// chunks is bounded — not reset per chunk.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn zxif_inflated_total(&self) -> usize {
+    self.zxif_inflated_total
+  }
+
+  /// Charge `n` zXIf-inflated bytes to the file-wide running total
+  /// ([`Self::zxif_inflated_total`]). Saturating so the counter never wraps even
+  /// under a crafted chain (it is only ever compared against the cap).
+  #[inline(always)]
+  pub(crate) fn add_zxif_inflated(&mut self, n: usize) {
+    self.zxif_inflated_total = self.zxif_inflated_total.saturating_add(n);
+  }
+
   /// Append a hex-decoded XMP packet captured from a `Raw profile type xmp`
   /// chunk (or the XMP-content arm of `Raw profile type {exif,APP1}`), in WALK
   /// ORDER (`PNG.pm:746`/`:1236`). Decoded into `XMP-*` tags at emission time.
@@ -1115,6 +1164,12 @@ impl PngMeta<'_> {
       {
         self.trailer_xmp_start = self.xmp_profiles.len();
       }
+      // `PNG.pm:1481-1484`: the `Trailer data after PNG IEND chunk` entry
+      // warning is raised (and pushed) by the walker BEFORE this call, so it
+      // sits below the watermark and stays document-level; every warning raised
+      // while parsing a trailer chunk lands at/after the watermark and so
+      // surfaces as `Trailer:Warning` (`SET_GROUP1 = 'Trailer'`).
+      self.trailer_warning_start = self.warnings.len();
     }
   }
 
@@ -1150,6 +1205,17 @@ impl PngMeta<'_> {
   #[must_use]
   pub(crate) const fn xmp_is_trailing(&self, i: usize) -> bool {
     i >= self.trailer_xmp_start
+  }
+
+  /// Whether the warning at index `i` in [`Self::warnings`] was raised while the
+  /// chunk walker was in post-`IEND` TRAILER mode (`PNG.pm:1484`
+  /// `$$et{SET_GROUP1} = 'Trailer'`), so it surfaces as the family-1
+  /// `Trailer:Warning` TAG rather than the document-level `ExifTool:Warning`.
+  /// `false` for every warning of a standard (IEND-last) PNG.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn warning_is_trailing(&self, i: usize) -> bool {
+    i >= self.trailer_warning_start
   }
 
   /// Whether the `IHDR` sub-table tags came from a TRAILER chunk.
@@ -1299,7 +1365,7 @@ mod tests {
     let mut m = PngMeta::new();
     // A native eXIf chunk, then a reset-only profile, then an EXIF raw-profile.
     m.push_exif_event(PngExifEvent::NativeTiff(
-      b"MM\x00\x2a\x00\x00\x00\x08".to_vec(),
+      (*b"MM\x00\x2a\x00\x00\x00\x08").into(),
     ));
     m.push_exif_event(PngExifEvent::ResetOnlyProfile);
     m.push_exif_event(PngExifEvent::ExifProfile(
