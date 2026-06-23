@@ -13007,10 +13007,9 @@ fn emit_exif_value<S: ExifSink>(
       // so every real-camera path is unchanged; the unification just removes the
       // dead/lossy `Text` arm and keeps the conv robust if a future `ExifText`
       // tag lacks the override (it would then byte-walk `Text.raw`, not the
-      // lossy FixUTF8 text). NOTE: `convert_exif_text`'s ASCII branch renders an
-      // invalid-UTF-8 payload byte via `from_utf8_lossy` (U+FFFD), whereas
-      // bundled ExifTool's JSON writer emits `?` for it — a separate, pre-
-      // existing charset-rendering gap (NOT a byte-walk loss), out of #198 scope.
+      // lossy FixUTF8 text). `convert_exif_text` now routes each invalid-UTF-8
+      // payload byte through `FixUTF8` → `?` (matching bundled ExifTool's JSON
+      // writer), not the `from_utf8_lossy` U+FFFD it used pre-#200.
       let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
@@ -13191,11 +13190,10 @@ fn emit_gps_value<S: ExifSink>(
       // bytes (the original on-disk `$val`), NOT the lossy FixUTF8 display
       // text the prior `text.as_bytes()` arm read. The real-camera path is
       // `undef` → `RawValue::Bytes`, which `val_bytes()` borrows verbatim, so
-      // every real GPS path stays byte-identical. NOTE: `convert_exif_text`'s
-      // ASCII branch renders an invalid-UTF-8 payload byte via
-      // `from_utf8_lossy` (U+FFFD) whereas bundled ExifTool's JSON writer
-      // emits `?` — a separate, pre-existing charset-rendering gap (#200), NOT
-      // a byte-walk loss, out of #198 scope.
+      // every real GPS path stays byte-identical. `convert_exif_text` now routes
+      // each invalid-UTF-8 payload byte through `FixUTF8` → `?` (matching
+      // bundled ExifTool's JSON writer), not the `from_utf8_lossy` U+FFFD it
+      // used pre-#200.
       let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())

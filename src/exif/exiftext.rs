@@ -55,8 +55,20 @@ use std::string::String;
 /// JIS decoding needs the full `Image::ExifTool::Charset::JIS` multi-byte
 /// table (a large standalone port — out of camera-metadata scope); a
 /// `JIS\0\0\0\0\0`-prefixed value is rendered with the prefix DROPPED and
-/// the payload kept as a lossy-UTF-8 string (`docs/tracking.md`). The
-/// bundled fixtures use the ASCII / UNICODE prefixes.
+/// the payload kept as a string (`docs/tracking.md`). The bundled fixtures
+/// use the ASCII / UNICODE prefixes.
+///
+/// **Invalid UTF-8 → `?` (`FixUTF8`, #200).** Every byte-payload branch
+/// (ASCII, JIS, the undefined-prefix `else`, and the `< 8` passthrough)
+/// renders its decoded payload through [`crate::convert::fix_utf8`] rather
+/// than `String::from_utf8_lossy`: ExifTool applies its `FixUTF8` (default
+/// `$bad = '?'`, `XMP.pm:2969`) at the JSON serialization boundary
+/// (`exiftool:3823` `EscapeJSON`) to whatever string `ConvertExifText`
+/// returns, so an invalid byte must emit one ASCII `?` (not the Unicode
+/// REPLACEMENT CHARACTER U+FFFD). The UNICODE (UTF-16) branch keeps its own
+/// faithful `decode_utf16_unknown` codec — its lone-surrogate handling is a
+/// separate, `docs/tracking.md`-tracked divergence (`from_utf16_lossy` →
+/// U+FFFD vs ExifTool's `pack 'U*'` → three `?`), out of #200 scope.
 ///
 /// `order` is the TIFF byte order in effect when `ConvertExifText` runs —
 /// ExifTool's `Decode($str, 'UTF16', 'Unknown')` seeds the byte-order guess
@@ -65,12 +77,13 @@ use std::string::String;
 #[must_use]
 pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
   // `return $val if length($val) < 8` — no prefix; treat the whole blob as
-  // the (lossy-UTF-8) value. `split_at_checked(8)` fuses the `length < 8` guard
+  // the value (FixUTF8'd at return). `split_at_checked(8)` fuses the
+  // `length < 8` guard
   // with the `$id = substr($val,0,8); $str = substr($val,8)` split: it returns
   // `None` for a < 8-byte value (the `return $val` arm) and otherwise the two
   // sub-slices — the checked, byte-identical form of `(&val[0..8], &val[8..])`.
   let Some((id, payload)) = val.split_at_checked(8) else {
-    return String::from_utf8_lossy(val).into_owned();
+    return crate::convert::fix_utf8(val);
   };
 
   // `/^(ASCII)?(\0|[\0 ]+$)/` — an "ASCII" prefix (NUL- or space-padded),
@@ -99,7 +112,7 @@ pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
       .iter()
       .position(|&b| b == 0)
       .unwrap_or(payload.len());
-    let mut s = String::from_utf8_lossy(payload.get(..end).unwrap_or(payload)).into_owned();
+    let mut s = crate::convert::fix_utf8(payload.get(..end).unwrap_or(payload));
     trim_trailing_spaces(&mut s);
     return s;
   }
@@ -124,15 +137,17 @@ pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
       .is_some_and(|tail| tail.iter().all(|&b| b == 0 || b == b' '))
   {
     // JIS codec not ported (see doc comment). Drop the prefix, keep the
-    // payload as a lossy string so the value is at least not a binary blob.
-    let mut s = String::from_utf8_lossy(payload).into_owned();
+    // payload as a string so the value is at least not a binary blob. Invalid
+    // bytes render as `?` via `FixUTF8` (the same JSON-boundary pass ExifTool
+    // would apply to whatever JIS-decoded string it produced).
+    let mut s = crate::convert::fix_utf8(payload);
     trim_trailing_spaces(&mut s);
     return s;
   }
 
   // `else` — invalid encoding: ExifTool warns and returns `$id . $str`
   // (the prefix is NOT stripped). Reproduce the concatenation.
-  let mut s = String::from_utf8_lossy(val).into_owned();
+  let mut s = crate::convert::fix_utf8(val);
   trim_trailing_spaces(&mut s);
   s
 }
@@ -334,6 +349,46 @@ mod tests {
     assert_eq!(
       convert_exif_text(b"BOGUS\x00\x00\x00xy", ByteOrder::Big),
       "BOGUS\x00\x00\x00xy"
+    );
+  }
+
+  #[test]
+  fn exif_text_ascii_invalid_utf8_becomes_question_mark() {
+    // #200 — the ASCII-prefix payload renders invalid UTF-8 as one `?` per
+    // bad byte (ExifTool `FixUTF8`, default `$bad = '?'`), NOT the Unicode
+    // REPLACEMENT CHARACTER U+FFFD `from_utf8_lossy` would emit. Bundled
+    // 13.59 on `UserComment = ASCII\0\0\0A\xffB` → "A?B"; the valid `é`
+    // (C3 A9) passes through and each invalid byte → one `?`:
+    //   ASCII\0\0\0 + A é B \xff C \xfe D → "AéB?C?D".
+    let mm = ByteOrder::Big;
+    assert_eq!(convert_exif_text(b"ASCII\x00\x00\x00A\xffB", mm), "A?B");
+    assert_eq!(
+      convert_exif_text(b"ASCII\x00\x00\x00A\xc3\xa9B\xffC\xfeD", mm),
+      "AéB?C?D"
+    );
+    // Truncation at the first NUL still happens BEFORE FixUTF8, so an invalid
+    // byte after the NUL is dropped, not turned into `?`.
+    assert_eq!(
+      convert_exif_text(b"ASCII\x00\x00\x00A\xffB\x00\xfe", mm),
+      "A?B"
+    );
+  }
+
+  #[test]
+  fn exif_text_too_short_invalid_utf8_becomes_question_mark() {
+    // The `< 8` passthrough arm also routes through `FixUTF8` (ExifTool fixes
+    // every emitted string at the JSON boundary regardless of how it was
+    // produced), so a short invalid-UTF-8 blob renders `?`, not U+FFFD.
+    assert_eq!(convert_exif_text(b"A\xffB", ByteOrder::Big), "A?B");
+  }
+
+  #[test]
+  fn exif_text_invalid_encoding_invalid_utf8_becomes_question_mark() {
+    // The undefined-prefix `else` branch returns `$id . $str`; its invalid
+    // bytes also render `?` via `FixUTF8`.
+    assert_eq!(
+      convert_exif_text(b"BOGUS\x00\x00\x00x\xffy", ByteOrder::Big),
+      "BOGUS\x00\x00\x00x?y"
     );
   }
 }

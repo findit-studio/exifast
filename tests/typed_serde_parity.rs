@@ -1163,7 +1163,23 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// position (the unified `PngMeta::diag_order` replay) so the EARLIER XMP
 /// warning wins first-occurrence — the typed-serde path matches the writer +
 /// golden (`PNG:eXIf` is the sole dropped key, the eXIf-suppression deferral).
-const EXPECTED_ACTIVE_FIXTURES: usize = 576;
+///
+/// 576 → 577 after `Exif_make_invalid_utf8.tif` (#200): a crafted big-endian
+/// TIFF whose IFD0 `Make` holds INVALID UTF-8 (`A` + valid `é` + `B` + `0xFF` +
+/// `C` + `0xFE` + `D`). Pins that the EXIF `string` decode applies ExifTool's
+/// `FixUTF8` (each invalid byte → `?`, NOT the U+FFFD `from_utf8_lossy` would
+/// emit); byte-exact at `-j`/`-n` vs bundled 13.59 (`"IFD0:Make": "AéB?C?D"`).
+///
+/// 577 → 579 after the #200 round-2 `ConvertExifText` fixtures
+/// (`Exif_usercomment_invalid_utf8.tif` +
+/// `Exif_gps_processingmethod_invalid_utf8.tif`): the R1 fix routed only the
+/// TIFF `string`/`utf8` decode through `FixUTF8`, leaving the `undef`-format
+/// EXIF-text path (`UserComment` 0x9286 / `GPSProcessingMethod` 0x001b, both
+/// via `exif::exiftext::convert_exif_text`) on `from_utf8_lossy` → U+FFFD.
+/// These crafted TIFFs pin that the `ConvertExifText` ASCII-prefix payload now
+/// applies `FixUTF8` too — bundled 13.59 `"ExifIFD:UserComment": "AéB?C?D"` /
+/// `"GPS:GPSProcessingMethod": "A?B?C"`, byte-exact at `-j`/`-n`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 579;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

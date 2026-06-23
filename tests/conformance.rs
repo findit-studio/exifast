@@ -8245,6 +8245,87 @@ fn exif_badformat_entry0_conformance() {
   );
 }
 #[test]
+fn exif_make_invalid_utf8_fixutf8_conformance() {
+  // #200 — an EXIF text value (IFD0 Make) holding INVALID UTF-8 must render
+  // through ExifTool's `FixUTF8` (default `$bad = '?'`, `XMP.pm:2969`), NOT the
+  // Unicode REPLACEMENT CHARACTER U+FFFD that `from_utf8_lossy` substitutes.
+  // ExifTool applies `FixUTF8` at the JSON serialization boundary
+  // (`exiftool:3823` `EscapeJSON`), so every emitted string is fixed regardless
+  // of tag. `Exif_make_invalid_utf8.tif` is a CRAFTED big-endian TIFF whose
+  // IFD0 `Make` (0x010f, ASCII) carries the bytes `41 c3 a9 42 ff 43 fe 44 00`
+  // = `A` + valid `é` (C3 A9) + `B` + invalid `0xFF` + `C` + invalid `0xFE` +
+  // `D`. Bundled `perl exiftool 13.59 -j -G1` emits `"IFD0:Make": "AéB?C?D"`
+  // (the valid `é` passes through; each invalid byte → one `?`); identical in
+  // `-n`. Verified vs bundled 13.59; golden via `tools/gen_golden.sh`. Pins
+  // that the EXIF `string`/`utf8` decode (`ifd::lossy_string` → `fix_utf8`)
+  // emits `?`, not `\u{FFFD}`.
+  check(
+    "Exif_make_invalid_utf8.tif",
+    "Exif_make_invalid_utf8.tif.json",
+    true,
+  );
+  check(
+    "Exif_make_invalid_utf8.tif",
+    "Exif_make_invalid_utf8.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_usercomment_invalid_utf8_fixutf8_conformance() {
+  // #200 (round 2) — UserComment (0x9286) decodes through `ConvertExifText`
+  // (`exif::exiftext::convert_exif_text`), whose ASCII-prefix payload branch
+  // must render invalid UTF-8 via ExifTool's `FixUTF8` (default `$bad = '?'`,
+  // `XMP.pm:2969`), NOT the Unicode REPLACEMENT CHARACTER U+FFFD that
+  // `from_utf8_lossy` substitutes. ExifTool applies `FixUTF8` at the JSON
+  // serialization boundary (`exiftool:3823` `EscapeJSON`), so the payload's
+  // invalid bytes — which never survive into a `TagValue::Str` the `-j`
+  // serializer could fix — must already be `?` at decode. The R1 fix routed
+  // only the TIFF `string`/`utf8` decode (`ifd::lossy_string`) through
+  // `fix_utf8`; this fixture pins the `ConvertExifText` payload path too.
+  //
+  // `Exif_usercomment_invalid_utf8.tif` is a CRAFTED big-endian TIFF whose
+  // IFD0 → ExifIFD → UserComment carries `ASCII\0\0\0` + `41 c3 a9 42 ff 43
+  // fe 44` = `A` + valid `é` (C3 A9) + `B` + invalid `0xFF` + `C` + invalid
+  // `0xFE` + `D`. Bundled `perl exiftool 13.59 -j -G1` emits
+  // `"ExifIFD:UserComment": "AéB?C?D"` (the valid `é` passes through; each
+  // invalid byte → one `?`); identical in `-n`. Verified vs bundled 13.59;
+  // golden via `tools/gen_golden.sh`.
+  check(
+    "Exif_usercomment_invalid_utf8.tif",
+    "Exif_usercomment_invalid_utf8.tif.json",
+    true,
+  );
+  check(
+    "Exif_usercomment_invalid_utf8.tif",
+    "Exif_usercomment_invalid_utf8.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_gps_processingmethod_invalid_utf8_fixutf8_conformance() {
+  // #200 (round 2) — GPSProcessingMethod (0x001b) also decodes through
+  // `ConvertExifText`; its ASCII-prefix payload must render invalid UTF-8 as
+  // `?` via `FixUTF8`, same as UserComment (both pass `$asciiFlex == 1`).
+  // This pins the GPS sub-IFD path of the fix.
+  //
+  // `Exif_gps_processingmethod_invalid_utf8.tif` is a CRAFTED big-endian TIFF
+  // whose IFD0 → GPS IFD → GPSProcessingMethod carries `ASCII\0\0\0` + `41 ff
+  // 42 fe 43` = `A` + invalid `0xFF` + `B` + invalid `0xFE` + `C`. Bundled
+  // `perl exiftool 13.59 -j -G1` emits `"GPS:GPSProcessingMethod": "A?B?C"`
+  // (one `?` per bad byte); identical in `-n`. Verified vs bundled 13.59;
+  // golden via `tools/gen_golden.sh`.
+  check(
+    "Exif_gps_processingmethod_invalid_utf8.tif",
+    "Exif_gps_processingmethod_invalid_utf8.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_processingmethod_invalid_utf8.tif",
+    "Exif_gps_processingmethod_invalid_utf8.tif.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_excessive_count_conformance() {
   // Golden-v2 Phase C — the `[Minor]` (ignorable == 2) prefix path. A crafted
   // big-endian TIFF whose IFD0 carries ONE KNOWN tag (Orientation 0x0112) with
