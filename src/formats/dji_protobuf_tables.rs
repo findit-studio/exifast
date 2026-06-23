@@ -471,10 +471,36 @@ fn is_known_protocol(protocol: &str) -> bool {
 }
 
 impl Protocol {
+  /// `true` when `path` is a NAMED `SubDirectory` of this protocol — one of the
+  /// four nested message tables `DJI::FrameInfo` / `DJI::GPSInfo` /
+  /// `DJI::DroneInfo` / `DJI::GimbalInfo` (DJI.pm:886-921), spliced in at its
+  /// `SubDirectory` key (the per-protocol `2-3`/`2-2`, `3-3-4-1`/`3-4-2-1`/…,
+  /// `3-3-3`/`3-4-3` keys this transcription expands into child rows).
+  ///
+  /// A named SubDirectory is exactly the parent of a row whose kind is a
+  /// nested-table leaf ([`FieldKind::is_nested_leaf`]) — verified to partition
+  /// cleanly against the UNNAMED intermediate wrappers (`3`/`3-4`/`3-4-2`/`3-3-4`)
+  /// that parent direct leaves (`GPSAltitude`/`GPSDateTime`/`AbsoluteAltitude`/…)
+  /// reached through the speculative IsProtobuf descent, NOT a SubDirectory. The
+  /// distinction is the recursion gate (Protobuf.pm:171-179 vs :227): a named
+  /// SubDirectory is descended UNCONDITIONALLY; an unnamed wrapper only when its
+  /// payload passes `has_non_printable && is_protobuf`.
+  ///
+  /// Rows are path-sorted; a linear scan is fine (each protocol has ≤ ~20 rows).
+  fn is_named_subdir(&self, path: &[u64]) -> bool {
+    self.rows.iter().any(|r| {
+      r.kind.is_nested_leaf() && r.path.len() == path.len() + 1 && r.path.starts_with(path)
+    })
+  }
+
   /// `true` when `path` is the GPSInfo container for a protocol whose
   /// bundled arm carries `Condition => '$$self{CoordUnits} = 1'` —
   /// i.e. Mavic 4 Pro (DJI.pm:841) and Mini 5 Pro (DJI.pm:855). Both place
   /// GPSInfo at `3-3-4-1`. Returns `false` for every other protocol.
+  ///
+  /// Every such path is a named GPSInfo SubDirectory ([`Self::is_named_subdir`]),
+  /// so the force-degrees condition fires only when the named SubDirectory is
+  /// descended unconditionally.
   fn forces_degrees_at(&self, path: &[u64]) -> bool {
     matches!(self.name, "dvtm_Mavic4" | "dvtm_Mini5Pro") && path == [3, 3, 4, 1]
   }
@@ -498,6 +524,84 @@ mod table_tests {
     assert!(!m4.forces_degrees_at(&[3, 3, 4, 2]));
     let wm = protocol_for("dvtm_wm265e").unwrap();
     assert!(!wm.forces_degrees_at(&[3, 3, 4, 1]));
+  }
+
+  #[test]
+  fn named_subdir_matches_djipm_subdirectory_keys() {
+    // The NAMED SubDirectory paths are exactly the DJI.pm `SubDirectory` keys
+    // (FrameInfo/GPSInfo/DroneInfo/GimbalInfo), NOT the UNNAMED intermediate
+    // wrappers that reach direct leaves through the IsProtobuf descent.
+    let ac203 = protocol_for("dvtm_ac203").unwrap();
+    // ac203 named SubDirectories: FrameInfo `2-3`, GPSInfo `3-4-2-1` (DJI.pm).
+    assert!(ac203.is_named_subdir(&[2, 3]), "FrameInfo 2-3 is named");
+    assert!(ac203.is_named_subdir(&[3, 4, 2, 1]), "GPSInfo 3-4-2-1 is named");
+    // The UNNAMED intermediate wrappers `3`, `3-4`, `3-4-2` are NOT named — they
+    // parent the GPSAltitude `3-4-2-2` / GPSDateTime `3-4-2-6-1` direct leaves
+    // (and the named GPSInfo at `3-4-2-1`) but carry no SubDirectory themselves.
+    assert!(!ac203.is_named_subdir(&[3]), "3 is an unnamed wrapper");
+    assert!(!ac203.is_named_subdir(&[3, 4]), "3-4 is an unnamed wrapper");
+    assert!(
+      !ac203.is_named_subdir(&[3, 4, 2]),
+      "3-4-2 parents GPSInfo + direct leaves but is itself unnamed"
+    );
+    // A leaf path is never a named SubDirectory (GPSAltitude direct leaf).
+    assert!(
+      !ac203.is_named_subdir(&[3, 4, 2, 2]),
+      "GPSAltitude is a leaf, not a SubDirectory"
+    );
+
+    // wm265e named SubDirectories: FrameInfo `2-2`, DroneInfo `3-3-3`,
+    // GPSInfo `3-3-4-1`, GimbalInfo `3-4-3` (DJI.pm).
+    let wm = protocol_for("dvtm_wm265e").unwrap();
+    assert!(wm.is_named_subdir(&[2, 2]));
+    assert!(wm.is_named_subdir(&[3, 3, 3]));
+    assert!(wm.is_named_subdir(&[3, 3, 4, 1]));
+    assert!(wm.is_named_subdir(&[3, 4, 3]));
+    // `3-3-4` parents the GPSInfo named SubDirectory `3-3-4-1` AND the
+    // AbsoluteAltitude `3-3-4-2` direct leaf, so it is an UNNAMED wrapper.
+    assert!(
+      !wm.is_named_subdir(&[3, 3, 4]),
+      "3-3-4 parents GPSInfo + AbsoluteAltitude but is itself unnamed"
+    );
+  }
+
+  #[test]
+  fn every_protocol_named_subdir_set_is_internally_consistent() {
+    // Cross-check the discriminator against the structure: for EVERY protocol,
+    // a path is a named SubDirectory iff it parents a nested-table leaf, and no
+    // direct leaf ever shares a parent with a nested-table leaf (the partition
+    // proven offline). Re-assert it here so a future table edit can't silently
+    // break the recursion gate.
+    for proto in PROTOCOLS {
+      let mut named = alloc::collections::BTreeSet::new();
+      for r in proto.rows {
+        if r.kind.is_nested_leaf()
+          && let Some((_, parent)) = r.path.split_last()
+        {
+          named.insert(parent.to_vec());
+        }
+      }
+      for r in proto.rows {
+        if !r.kind.is_nested_leaf()
+          && let Some((_, parent)) = r.path.split_last()
+        {
+          assert!(
+            !named.contains(parent),
+            "{}: direct leaf {:?} at {:?} must not share a parent with a named SubDirectory",
+            proto.name,
+            r.kind,
+            r.path
+          );
+        }
+        // A named-SubDirectory path is never itself a leaf row.
+        assert!(
+          !named.contains(r.path),
+          "{}: named-SubDirectory path {:?} must not also be a leaf",
+          proto.name,
+          r.path
+        );
+      }
+    }
   }
 
   #[test]
