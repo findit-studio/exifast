@@ -1284,23 +1284,39 @@ const _: () = {
         }
         // A FINITE float: ExifTool stringifies it with `%.15g` (its default NV
         // stringification), then runs the SAME unconditional `EscapeJSON`
-        // `return $str` (`exiftool:3810`). So an in-gate `%.15g` rendering is
-        // emitted BARE, byte-for-byte — even when the rendered token's MAGNITUDE
-        // over-ranges finite-f64 (a finite double near `f64::MAX` renders to
-        // `1.79769313486232e+308`, which the gate ADMITS and bundled emits
-        // unquoted, #203). The generic `TagValue::F64` arm reparses that token and
+        // `return $str` (`exiftool:3810`). This renderer arm exists ONLY to fix
+        // the ONE case the generic `TagValue::F64` arm renders DIFFERENTLY from
+        // bundled: a finite double near `f64::MAX` whose `%.15g` token
+        // (`1.79769313486232e+308`) is in-gate yet reparses to `±INFINITY`. The
+        // gate ADMITS it and bundled emits it UNQUOTED (#203), but the generic arm
         // QUOTES it for `to_value` soundness (a `RawValue` of an over-range token
         // errors `NumberOutOfRange` through `to_value`); here, on the
         // `to_string`/`to_writer`-only render path, the bare ExifTool token is
-        // both faithful AND sound. An out-of-gate rendering (a `>16`-fraction
-        // float such as a `DV:Duration` `0.00122222222222222`) and every
-        // NON-finite f64 (the titlecase `Inf`/`-Inf`/`NaN` quoted word) fail the
-        // gate and delegate to the generic arm, which quotes them identically.
+        // both faithful AND sound, so emit it VERBATIM.
+        //
+        // For EVERY OTHER finite double — i.e. one whose `%.15g` token reparses to
+        // a FAITHFUL finite f64 ([`f64_token_is_faithful`]) — the generic arm
+        // already produces bundled's exact bytes (via `serialize_f64`, which
+        // renders a whole-valued double WITH its `.0`: a `Track1:GPSLatitude` of
+        // `12.0` → `12.0`, NOT the `.0`-stripped `%.15g` token `12`). Delegating
+        // there preserves that, so this arm must NOT route a faithful token through
+        // the `%.15g`-verbatim path (which would drop the `.0` and emit a bare
+        // integer, diverging from bundled — #203's over-reach). An out-of-gate
+        // rendering (a `>16`-fraction `DV:Duration` `0.00122222222222222`) and
+        // every NON-finite f64 (the titlecase `Inf`/`-Inf`/`NaN` quoted word) also
+        // delegate to the generic arm, which quotes them identically to bundled.
         TagValue::F64(n) if n.is_finite() => {
           #[cfg(feature = "json")]
           {
             let rounded = crate::value::format_g(*n, 15);
-            if escape_json_is_number(&rounded) {
+            // ONLY the over-range case (in-gate token, NOT a faithful finite f64)
+            // needs the bare-verbatim path bundled emits but the generic arm
+            // quotes; everything faithful is rendered correctly by the generic arm.
+            if escape_json_is_number(&rounded)
+              && rounded
+                .parse::<f64>()
+                .is_ok_and(|f| !crate::value::f64_token_is_faithful(f, &rounded))
+            {
               return serialize_in_gate_number_str_verbatim(&rounded, s);
             }
             self.0.serialize(s)
