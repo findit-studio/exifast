@@ -1404,6 +1404,18 @@ pub struct MakerNote<'a> {
   /// from the dispatched vendor keeps the faithful vendor classification
   /// (`Vendor::Leica`) while matching bundled's `Panasonic:*` output.
   emission_group1: &'static str,
+  /// The IFD that held the `0x927c` MakerNote pointer (the `DirName` the
+  /// `ProcessExif` call walking the pointer's directory ran under) — almost
+  /// always [`IfdKind::ExifIfd`]. ExifTool descends a directory's
+  /// SubDirectories in a DEFERRED pass AFTER emitting all of that directory's
+  /// direct leaves (`%Image::ExifTool::Exif` `ProcessExif` builds `@subdirs`
+  /// in the entry loop, then walks it once the leaf loop finishes — so the
+  /// vendor leaves emit at the END of the parent IFD's stream, after its last
+  /// direct entry and before the walk returns to the grandparent to descend the
+  /// next pointer (e.g. IFD0's `GPSInfo`/`InteropIFD`). [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// reproduces that order by splicing the cached emissions right after this
+  /// IFD's last entry rather than appending them at the very end.
+  parent_ifd: IfdKind,
 }
 
 impl<'a> MakerNote<'a> {
@@ -1511,6 +1523,18 @@ impl<'a> MakerNote<'a> {
   #[inline(always)]
   pub const fn emission_group1(&self) -> &'static str {
     self.emission_group1
+  }
+
+  /// The IFD that held the `0x927c` MakerNote pointer (almost always
+  /// [`IfdKind::ExifIfd`]). [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// splices the cached vendor emissions right after this IFD's last entry,
+  /// reproducing ExifTool's deferred-SubDirectory order (the vendor leaves
+  /// emit at the end of the parent IFD's stream, before the walk returns to
+  /// the grandparent to descend the next pointer — e.g. IFD0's `GPSInfo`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn parent_ifd(&self) -> IfdKind {
+    self.parent_ifd
   }
 }
 
@@ -5337,7 +5361,7 @@ impl Walker<'_, '_> {
           self.dispatch_classic_subifd(value_offset, read_len, format, count);
         }
       } else {
-        self.dispatch_subdir(sub, value_offset, read_len, format, count);
+        self.dispatch_subdir(sub, value_offset, read_len, format, count, kind);
       }
       // The SubDirectory was dispatched (recursed/captured) — a normal entry:
       // [`Step::Keep`].
@@ -6343,6 +6367,7 @@ impl Walker<'_, '_> {
     read_len: usize,
     format: Format,
     count: usize,
+    parent_ifd: IfdKind,
   ) {
     match sub {
       SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop => {
@@ -6986,6 +7011,7 @@ impl Walker<'_, '_> {
               cached_emissions_print_conv: cached_pc,
               value_conv_decode,
               emission_group1,
+              parent_ifd,
             });
           }
         }
@@ -8086,13 +8112,36 @@ impl ExifMeta<'_> {
   ///
   /// Writes DIRECTLY into the caller's `out` buffer (P2 — no per-call temp `Vec`
   /// that [`tags`](crate::emit::Taggable::tags) then has to move). **EXIF
-  /// entries only**: the `File:ExifByteOrder`/`File:PageCount` prefix + the
-  /// MakerNote vendor emissions are pushed by [`tags`](crate::emit::Taggable::tags)
-  /// into the SAME `out`; the `ExifTool:Warning` messages stay a separate channel
+  /// entries + the MakerNote**: the `File:ExifByteOrder`/`File:PageCount` prefix
+  /// is pushed by [`tags`](crate::emit::Taggable::tags) into the SAME `out`
+  /// BEFORE this; the `ExifTool:Warning` messages stay a separate channel
   /// yielded by [`ExifMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics).
+  ///
+  /// ## MakerNote SubDirectory position (#176)
+  ///
+  /// ExifTool's `ProcessExif` walks a directory's SubDirectories in a DEFERRED
+  /// pass — it builds an `@subdirs` list while emitting the directory's direct
+  /// leaves, then descends them once the leaf loop finishes (`Exif.pm`'s
+  /// `ProcessExif` `foreach my $subdir (@subdirs)`). So the `0x927c` MakerNote
+  /// (an `%Exif::Main` SubDirectory of the ExifIFD) is descended AFTER the
+  /// ExifIFD's last direct leaf and BEFORE the walk returns to IFD0 to descend
+  /// IFD0's own deferred SubDirectories (`GPSInfo` 0x8825 / `InteropIFD` via the
+  /// nested ExifIFD `0xa005`). Bundled `exiftool -G1 -j` therefore emits the
+  /// vendor leaves (`Apple:*`/`Canon:*`) immediately after the last `ExifIFD:*`
+  /// tag and BEFORE the first `GPS:*` / `InteropIFD:*` tag — NOT at the very end
+  /// of the file.
+  ///
+  /// `self.entries` is the flat IFD-walk stream; the captured MakerNote leaves
+  /// are NOT in it (they live in the [`MakerNote`]'s cached emissions). To
+  /// reproduce ExifTool's order this splices the MakerNote push right after the
+  /// parent IFD's last entry ([`MakerNote::parent_ifd`], almost always
+  /// `ExifIFD`) rather than appending at the end. The split is the index one
+  /// past the LAST `self.entries` element whose IFD is the MakerNote's parent —
+  /// the end of that IFD's contiguous block (every sub-IFD descent is inline, so
+  /// an IFD's entries are contiguous in walk order). With no MakerNote the loop
+  /// is a single uninterrupted pass (the prior behavior, unchanged).
   fn push_exif_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
     out.reserve(self.entries.len());
-    let mut sink = EmittedTagSink::new(out);
     // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
     // 'Unknown' guess — identical to `serialize_tags`'s `entry_order`. `None`
     // only for a JPEG accepted without a parsed Exif block, which then has NO
@@ -8109,19 +8158,92 @@ impl ExifMeta<'_> {
     let file_type = None;
     let (canon_focal_units, canon_lens_type) = (None, None);
     let canon_focal_length_blob: Option<&[u8]> = None;
-    for entry in &self.entries {
-      // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
-      let Ok(()) = emit_entry(
-        entry,
-        entry_order,
-        print_conv,
-        model,
-        file_type,
-        canon_focal_units,
-        canon_lens_type,
-        canon_focal_length_blob,
-        &mut sink,
-      );
+    // Emit a contiguous slice of `self.entries` through a fresh `EmittedTagSink`,
+    // keeping only the entries whose IFD passes `keep`. A closure (not a held
+    // `&mut sink`) so the sink's borrow of `out` is released between segments,
+    // letting `push_maker_note_tags` write to the SAME `out` in between. The
+    // sink appends in order with NO internal dedup (the engine's `TagMap` dedups
+    // centrally), so splitting one IFD's entries across calls is order-preserving.
+    let emit_slice = |out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+                      slice: &[ExifEntry],
+                      keep: &dyn Fn(IfdKind) -> bool| {
+      let mut sink = EmittedTagSink::new(out);
+      for entry in slice {
+        if !keep(entry.ifd()) {
+          continue;
+        }
+        // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
+        let Ok(()) = emit_entry(
+          entry,
+          entry_order,
+          print_conv,
+          model,
+          file_type,
+          canon_focal_units,
+          canon_lens_type,
+          canon_focal_length_blob,
+          &mut sink,
+        );
+      }
+    };
+    let any = |_: IfdKind| true;
+
+    // No MakerNote: the whole stream emits in one uninterrupted pass (the prior
+    // behavior, unchanged).
+    let Some(mn) = &self.maker_note else {
+      emit_slice(out, &self.entries, &any);
+      return;
+    };
+
+    // MakerNote SubDirectory position (#176). ExifTool descends a directory's
+    // SubDirectories in a DEFERRED pass AFTER emitting its direct leaves, then
+    // walks the deferred subdirs in entry (on-disk) order. The `0x927c`
+    // MakerNote and the ExifIFD's `0xa005 InteropIFD` are BOTH ExifIFD
+    // SubDirectories; their tag IDs ascend (`0x927c < 0xa005`, well-formed TIFF),
+    // so bundled emits, within the ExifIFD subtree: ALL ExifIFD direct leaves →
+    // the MakerNote (`Apple:*`/`Canon:*`) → InteropIFD → (back in IFD0) GPS →
+    // IFD1. The shared `Walker`, by contrast, descends sub-IFDs INLINE at their
+    // on-disk position, so `self.entries` interleaves the Interop leaves AMONG
+    // the ExifIFD direct leaves, and the MakerNote leaves are absent (they live
+    // in the cached emissions). Re-group here to reproduce bundled's order: the
+    // ExifIFD subtree is the FIRST contiguous run of `ExifIfd`/`Interop`
+    // entries (one ExifIFD per file, every sub-IFD descent inline ⇒ contiguous);
+    // its parent-direct (`ExifIfd`) leaves emit first, then the MakerNote, then
+    // its deferred sub-IFD (`Interop`) leaves, with IFD0/GPS/IFD1 untouched
+    // around it.
+    let parent = mn.parent_ifd();
+    let in_subtree =
+      |k: IfdKind| k == parent || (parent == IfdKind::ExifIfd && k == IfdKind::Interop);
+    let region_start = self.entries.iter().position(|e| in_subtree(e.ifd()));
+    match region_start {
+      Some(start) => {
+        // `start <= entries.len()` (it is a `position` index), so `split_at` is
+        // in range — `before` is the pre-subtree prefix (IFD0), `rest` begins at
+        // the subtree.
+        let (before, rest) = self.entries.split_at(start);
+        // The contiguous subtree run is `rest`'s leading `in_subtree` entries
+        // (stop at the first that leaves the subtree — GPS/IFD1). `region_len <=
+        // rest.len()`, so the second `split_at` is in range too.
+        let region_len = rest.iter().take_while(|e| in_subtree(e.ifd())).count();
+        let (region, after) = rest.split_at(region_len);
+        emit_slice(out, before, &any);
+        // Parent-IFD direct leaves first…
+        emit_slice(out, region, &|k| k == parent);
+        // …then the MakerNote at the parent's SubDirectory position…
+        self.push_maker_note_tags(print_conv, out);
+        // …then the parent's DEFERRED sub-IFD (Interop) leaves…
+        emit_slice(out, region, &|k| k != parent);
+        // …then everything after the subtree (GPS, IFD1).
+        emit_slice(out, after, &any);
+      }
+      // No entry belongs to the MakerNote's parent IFD subtree (a degenerate
+      // parent with no direct leaves walked): keep the MakerNote at the front of
+      // the stream, then the entries — matching the deferred-subdir-of-an-empty-
+      // directory position without dropping any tag.
+      None => {
+        self.push_maker_note_tags(print_conv, out);
+        emit_slice(out, &self.entries, &any);
+      }
     }
   }
 
@@ -8150,9 +8272,10 @@ impl ExifMeta<'_> {
 
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
-  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Emitted
-  /// AFTER the EXIF/IFD leaves ([`push_exif_tags`]), faithful to ExifTool
-  /// emitting the MakerNote stream after the parent IFD.
+  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Called by
+  /// [`push_exif_tags`] at the parent IFD's SubDirectory splice point (after the
+  /// ExifIFD's last direct leaf, before `GPS`/`InteropIFD` — #176), faithful to
+  /// ExifTool descending a directory's SubDirectories after emitting its leaves.
   ///
   /// Each [`VendorEmission`](makernotes::VendorEmission) becomes an `EmittedTag`
   /// under `Group{family0:"MakerNotes", family1:<vendor group1>}`
@@ -8432,20 +8555,20 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       order.sort_by_key(|(pos, _)| *pos);
       for (_, block) in order {
         match block {
-          Block::Exif => {
-            self.push_exif_tags(print_conv, &mut tags);
-            self.push_maker_note_tags(print_conv, &mut tags);
-          }
+          // `push_exif_tags` emits the WHOLE EXIF block — the IFD-walk entries
+          // with the captured MakerNote vendor leaves SPLICED at the parent
+          // IFD's (ExifIFD's) position (#176), not appended at the end.
+          Block::Exif => self.push_exif_tags(print_conv, &mut tags),
           Block::Aux(aux) => aux.push_tags(print_conv, &mut tags),
         }
       }
     }
     // Without `quicktime` there are no aux blocks, so the EXIF block is the only
-    // metadata block — emitted in its normal position (unchanged).
+    // metadata block — emitted in its normal position (unchanged). The MakerNote
+    // vendor leaves ride INSIDE the block at the ExifIFD splice point (#176).
     #[cfg(not(feature = "quicktime"))]
     {
       self.push_exif_tags(print_conv, &mut tags);
-      self.push_maker_note_tags(print_conv, &mut tags);
     }
     // The PrintIM `PrintIM:PrintIMVersion` (IFD0 `0xc4a5`) — emitted after the
     // EXIF/MakerNote block (the key MULTISET is position-insensitive). EMPTY for
@@ -17109,6 +17232,177 @@ mod tests {
       std::vec!["aux-early".to_string(), "aux-late".to_string()],
       "the position-1 block sorts before the EXIF block, the position-7 after"
     );
+  }
+
+  // ====================================================================// MakerNote SubDirectory position (#176)
+  //
+  // ExifTool descends a directory's SubDirectories in a DEFERRED pass after
+  // emitting its direct leaves, so the `0x927c` MakerNote (an ExifIFD
+  // SubDirectory) emits AFTER the ExifIFD's last direct leaf and BEFORE the
+  // walk returns to IFD0 to descend `GPSInfo`/`InteropIFD`. Bundled
+  // `exiftool -G1 -j` therefore lists `Apple:*`/`Canon:*` between the last
+  // `ExifIFD:*` key and the first `GPS:*`/`InteropIFD:*` key. These tests
+  // ground-truth that boundary against the bundled tool and assert
+  // `ExifMeta::tags` reproduces it (the splice — not the old end-append).
+  //
+  // ORDER-sensitive: the `-G1 -j` conformance (`src/jsondiff.rs`) compares the
+  // key MULTISET, so it is blind to this; only an ordered check catches it.
+  // ====================================================================
+
+  /// The ordered `Group:Name` keys bundled `exiftool -G1 -j` emits for
+  /// `fixture`, restricted to the family-1 groups `ExifMeta::tags` itself
+  /// produces (drops `SourceFile`, `ExifTool:*`, `System:*`, `Composite:*` —
+  /// engine-orchestration / synthesized groups absent from the typed stream).
+  /// `None` ⇒ the bundled tool or `perl` is unavailable (skip).
+  #[cfg(all(unix, feature = "std"))]
+  fn bundled_g1_key_order(fixture: &std::path::Path) -> Option<std::vec::Vec<std::string::String>> {
+    let script = std::env::var("EXIFTOOL").ok()?;
+    if !have_perl() {
+      return None;
+    }
+    let out = std::process::Command::new("perl")
+      .arg(&script)
+      .args(["-G1", "-j"])
+      .arg(fixture)
+      .output()
+      .ok()?;
+    if !out.status.success() {
+      return None;
+    }
+    let text = std::string::String::from_utf8(out.stdout).ok()?;
+    // `-j` is pretty-printed: one `  "Group:Name": value,` per line. Extract the
+    // first quoted token of each line as the key (the value is never the line's
+    // FIRST quoted token). Keep only the groups the typed stream emits.
+    let mut keys = std::vec::Vec::new();
+    for line in text.lines() {
+      let line = line.trim();
+      let Some(rest) = line.strip_prefix('"') else {
+        continue;
+      };
+      let Some(end) = rest.find('"') else {
+        continue;
+      };
+      let key = &rest[..end];
+      if key == "SourceFile" {
+        continue;
+      }
+      let Some((group, _name)) = key.split_once(':') else {
+        continue;
+      };
+      if matches!(group, "ExifTool" | "System" | "Composite") {
+        continue;
+      }
+      keys.push(key.to_string());
+    }
+    (!keys.is_empty()).then_some(keys)
+  }
+
+  /// The ordered `family1:Name` keys `ExifMeta::tags` yields for `-G1 -j`,
+  /// dropping the `Unknown=>1` leaves the engine suppresses from default output
+  /// (so the sequence is comparable to bundled's visible `-G1 -j` keys).
+  #[cfg(feature = "alloc")]
+  fn exifast_g1_key_order(meta: &ExifMeta<'_>) -> std::vec::Vec<std::string::String> {
+    use crate::emit::Taggable;
+    meta
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .filter(|t| !t.unknown())
+      .map(|t| {
+        let g = t.tag().group_ref();
+        std::format!("{}:{}", g.family1(), t.tag().name())
+      })
+      .collect()
+  }
+
+  /// Assert the MakerNote-vendor keys (`{vendor}:*`) sit AFTER the last
+  /// `ExifIFD:*` key and BEFORE the first `{after}:*` key in `keys` — the
+  /// `0x927c` SubDirectory position. Returns the `(last_exif, first_vendor,
+  /// first_after)` indices so callers can cross-check the two streams agree.
+  #[cfg(feature = "alloc")]
+  fn assert_makernote_at_927c(
+    keys: &[std::string::String],
+    vendor: &str,
+    after: &str,
+    label: &str,
+  ) -> (usize, usize, usize) {
+    let exif_prefix = "ExifIFD:";
+    let vendor_prefix = std::format!("{vendor}:");
+    let after_prefix = std::format!("{after}:");
+    let last_exif = keys
+      .iter()
+      .rposition(|k| k.starts_with(exif_prefix))
+      .unwrap_or_else(|| panic!("{label}: no ExifIFD:* key in {keys:?}"));
+    let first_vendor = keys
+      .iter()
+      .position(|k| k.starts_with(vendor_prefix.as_str()))
+      .unwrap_or_else(|| panic!("{label}: no {vendor}:* key in {keys:?}"));
+    let first_after = keys
+      .iter()
+      .position(|k| k.starts_with(after_prefix.as_str()))
+      .unwrap_or_else(|| panic!("{label}: no {after}:* key in {keys:?}"));
+    assert!(
+      last_exif < first_vendor,
+      "{label}: {vendor}:* must follow the LAST ExifIFD:* key \
+       (last ExifIFD at {last_exif} = {:?}, first {vendor} at {first_vendor} = {:?})",
+      keys.get(last_exif),
+      keys.get(first_vendor),
+    );
+    assert!(
+      first_vendor < first_after,
+      "{label}: {vendor}:* must precede the FIRST {after}:* key \
+       (first {vendor} at {first_vendor} = {:?}, first {after} at {first_after} = {:?})",
+      keys.get(first_vendor),
+      keys.get(first_after),
+    );
+    (last_exif, first_vendor, first_after)
+  }
+
+  /// Drive the #176 order check for one fixture: parse it, compare `tags`'s
+  /// emission order to the MakerNote-at-`0x927c` invariant, and (when the
+  /// bundled tool is present) assert the bundled `-G1 -j` key order agrees.
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn check_makernote_position(fixture_rel: &str, vendor: &str, after: &str) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(root).join(fixture_rel);
+    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {fixture_rel}: {e}"));
+    let meta = jpeg::parse_jpeg_exif(&data).unwrap_or_else(|| panic!("{fixture_rel}: APP1 Exif"));
+
+    let ours = exifast_g1_key_order(&meta);
+    assert_makernote_at_927c(&ours, vendor, after, "exifast");
+
+    // Cross-check the live bundled tool: it must place the vendor block in the
+    // SAME ExifIFD→vendor→after relationship (the oracle for the order). Skipped
+    // only when `EXIFTOOL`/`perl` is unavailable.
+    if let Some(bundled) = bundled_g1_key_order(&path) {
+      assert_makernote_at_927c(&bundled, vendor, after, "bundled exiftool");
+    } else {
+      eprintln!("SKIP bundled cross-check for {fixture_rel}: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #176 — the captured Apple MakerNote (`0x927c` in the ExifIFD) emits between
+  /// the last `ExifIFD:*` tag and the first `GPS:*` tag, matching bundled
+  /// `exiftool -G1 -j` on `MakerNotes_Apple.jpg`. Before the splice fix the
+  /// vendor leaves were appended at the END (after `GPS:*`/`IFD1:*`), so the
+  /// `Apple:* < GPS:*` assertion FAILED — this is the RED→GREEN guard.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn apple_maker_note_emits_at_927c_before_gps() {
+    check_makernote_position("tests/fixtures/MakerNotes_Apple.jpg", "Apple", "GPS");
+  }
+
+  /// #176 — the captured Canon MakerNote (`0x927c` in the ExifIFD) emits between
+  /// the last `ExifIFD:*` tag and the first `InteropIFD:*` tag, matching bundled
+  /// `exiftool -G1 -j` on `MakerNotes_Canon.jpg`. (`InteropIFD` is the ExifIFD
+  /// `0xa005` SubDirectory, descended in IFD0's deferred pass AFTER the
+  /// ExifIFD's MakerNote — so it trails `Canon:*`.) Before the splice fix the
+  /// vendor leaves were appended at the END, failing `Canon:* < InteropIFD:*`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn canon_maker_note_emits_at_927c_before_interop() {
+    check_makernote_position("tests/fixtures/MakerNotes_Canon.jpg", "Canon", "InteropIFD");
   }
 
   // ====================================================================// Canon engine migration — Step A differential test (#243 phase 2)
