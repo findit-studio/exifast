@@ -234,6 +234,30 @@ pub enum SubTable {
   /// `AFPointValues` belongs to the separate `0x021f AFInfo` table and is deferred
   /// (no K-3 III fixture).
   AfPointInfo,
+  /// `%Pentax::PixelShiftInfo` at `0x0243` (`Pentax.pm:3113-3115`, `:6057-6065`) —
+  /// a plain SubDirectory (`int8u`). Emits `PixelShiftResolution` (@0,
+  /// `{0=>'Off',1=>'On'}`). Written by the K-3 II and K-3 III.
+  PixelShiftInfo,
+  /// `%Pentax::TempInfo` at `0x03ff` (`Pentax.pm:3126-3134`, `:6102-6166`) — the
+  /// `Condition => '$$self{Model} =~ /K-(01|3|30|5|50|500)\b/'` variant (else the
+  /// deferred `%UnknownInfo`). `int8u`/`FIRST_ENTRY 0` with `int16s` temperature
+  /// leaves (BigEndian inherited). For the K-3 III emits `ShotNumber` (@0x0a,
+  /// `$val+1`) and `SensorTemperature` (@0x2a, int16s `$val/10`, `%.1f C`); the
+  /// non-K-3III temperature leaves are model-gated out.
+  TempInfo,
+  /// `%Pentax::FaceInfoK3III` at `0x040b` (`Pentax.pm:3154-3158`, `:5803-5881`) —
+  /// `int32u`/`FIRST_ENTRY 0` (BigEndian inherited). Emits `FaceImageSize` (@0,
+  /// int32u[2]), `CAFArea` (@2, int32u[4]), `FacesDetectedA` (@6), `FacesDetectedB`
+  /// (@8); the per-face area/eye leaves are gated on `$$self{FacesA}` (0 here).
+  FaceInfoK3iii,
+  /// `%Pentax::AFInfoK3III` at `0x040c` (`Pentax.pm:3159-3162`, `:5883-5973`) —
+  /// `int16u`/`FIRST_ENTRY 0` (BigEndian inherited). Emits `AFMode` (@0),
+  /// `AFSelectionMode` (@1, PrintHex), `MaxNumAFPoints` (@2), `NumAFPoints` (@3),
+  /// and — when `NumAFPoints > 0` — `AFFrameSize` (@7, int16u[2]), `AFAreas` (@7,
+  /// int16u[7*NumAFPoints] via `AFAreasK3III`), `AFAreaSize` (@11, int16u[2], only
+  /// for contrast-detect). The whole-structure `AFInfoK3III` leaf (@0) is
+  /// `Unknown => 1` (suppressed).
+  AfInfoK3iii,
 }
 
 /// The ported `%Pentax::Main` rows — sorted by `id` for binary search.
@@ -298,6 +322,18 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     id: 0x0008,
     name: "Quality",
     conv: PentaxPrintConv::Hash(QUALITY),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
+  // `0x0009 PentaxImageSize` (`Pentax.pm:1016-1054`) — int16u, a PrintConv keyed
+  // on the SPACE-JOINED run: a single-value record matches a bare-int key (`"0" =>
+  // '640x480'`), a 2-value record matches a pair key (`"36 0" => '3008x2008 or
+  // 3040x2024'`, the *istD). `-n` ⇒ the space-joined run.
+  PentaxTag {
+    id: 0x0009,
+    name: "PentaxImageSize",
+    conv: PentaxPrintConv::StringKeyedHash(super::printconv::PENTAX_IMAGE_SIZE),
     sub_table: None,
     unknown: false,
     format: None,
@@ -416,7 +452,7 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
   PentaxTag {
     id: 0x001f,
     name: "Saturation",
-    conv: PentaxPrintConv::Hash(SATURATION),
+    conv: PentaxPrintConv::ArrayHash(SATURATION_ARRAY),
     sub_table: None,
     unknown: false,
     format: None,
@@ -424,7 +460,7 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
   PentaxTag {
     id: 0x0020,
     name: "Contrast",
-    conv: PentaxPrintConv::Hash(CONTRAST),
+    conv: PentaxPrintConv::ArrayHash(CONTRAST_ARRAY),
     sub_table: None,
     unknown: false,
     format: None,
@@ -432,7 +468,7 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
   PentaxTag {
     id: 0x0021,
     name: "Sharpness",
-    conv: PentaxPrintConv::Hash(SHARPNESS),
+    conv: PentaxPrintConv::ArrayHash(SHARPNESS_ARRAY),
     sub_table: None,
     unknown: false,
     format: None,
@@ -493,6 +529,16 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0029 FrameNumber` (`Pentax.pm:1875-1882`) — int32u, no conv (the *istD /
+  // *istDS frame counter, removed in favour of ShutterCount on later firmware).
+  PentaxTag {
+    id: 0x0029,
+    name: "FrameNumber",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int32u, Some(1))),
+  },
   PentaxTag {
     id: 0x002d,
     name: "EffectiveLV",
@@ -525,6 +571,17 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0035 SensorSize` (`Pentax.pm:2064-2077`) — int16u `Count => 2`; ValueConv
+  // `$_/=500` per element, PrintConv `sprintf("%.3f x %.3f mm", split(" ",$val))`.
+  // `-n` ⇒ the two `/500` floats space-joined.
+  PentaxTag {
+    id: 0x0035,
+    name: "SensorSize",
+    conv: PentaxPrintConv::SensorSize,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16u, Some(2))),
+  },
   PentaxTag {
     id: 0x0037,
     name: "ColorSpace",
@@ -532,6 +589,42 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     sub_table: None,
     unknown: false,
     format: None,
+  },
+  // `0x0038 ImageAreaOffset` (`Pentax.pm:2086-2090`, PEF only) — int16u `Count =>
+  // 2`, no conv (the default space-joined pair).
+  PentaxTag {
+    id: 0x0038,
+    name: "ImageAreaOffset",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16u, Some(2))),
+  },
+  // `0x0039 RawImageSize` (`Pentax.pm:2091-2096`) — int16u `Count => 2`; PrintConv
+  // `s/ /x/` (the same space→`x` rewrite as PreviewImageSize). `-n` ⇒ the pair.
+  PentaxTag {
+    id: 0x0039,
+    name: "RawImageSize",
+    conv: PentaxPrintConv::PreviewImageSize,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16u, Some(2))),
+  },
+  // `0x003c AFPointsInFocus` (`Pentax.pm:2097-2125`) — int32u, `ValueConv =>
+  // '$val & 0x7ff'`, then a `{0=>'(none)', BITMASK=>{...}}` PrintConv
+  // (`DecodeBits`). `-n` ⇒ the masked int. (Distinct from the `0x000f`
+  // K-3/K-S1/K-S2 BITMASK and the `0x000f` "other models" direct hash.) The
+  // `Notes => '*istD only'` is DOCUMENTATION, not a machine `Condition`: the
+  // Pentax.pm row carries no `Condition`, so ExifTool extracts/decodes 0x003c for
+  // ANY body that writes it (the gate is unconditional — see the `conditional_leaf`
+  // arm). #393.
+  PentaxTag {
+    id: 0x003c,
+    name: "AFPointsInFocus",
+    conv: PentaxPrintConv::AfPointsInFocusIstd,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int32u, Some(1))),
   },
   PentaxTag {
     id: 0x003d,
@@ -693,6 +786,16 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x006f ContrastHighlightShadowAdj` (`Pentax.pm:2423-2431`) — int8u,
+  // `{ 0 => 'Off', 1 => 'On' }`.
+  PentaxTag {
+    id: 0x006f,
+    name: "ContrastHighlightShadowAdj",
+    conv: PentaxPrintConv::Hash(super::printconv::OFF_ON),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
   // `0x0070 FineSharpness` (`Pentax.pm:2433-2443`) — int8u `Count => -1` (1 for
   // K20/K200, 2 for K-5+); a 2-positioned ARRAY PrintConv (`'Off; Normal'`). The
   // element count is derived from the on-disk byte size (no count override).
@@ -773,6 +876,19 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x007a ISOAutoMinSpeed` (`Pentax.pm:2546-2566`) — int8u `Count => 2`, a
+  // 2-element conv: element 0 is the mode hash (`{1=>'Shutter Speed Control',
+  // 2=>'Auto Slow',3=>'Auto Standard',4=>'Auto Fast'}`, no ValueConv); element 1
+  // is `ValueConv 'exp(-PentaxEv($val-68)*log(2))'` then `PrintExposureTime`. The
+  // K-3 III writes a pair (e.g. `3 124` → `"Auto Standard; 1/128"`).
+  PentaxTag {
+    id: 0x007a,
+    name: "ISOAutoMinSpeed",
+    conv: PentaxPrintConv::IsoAutoMinSpeed,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int8u, Some(2))),
+  },
   // `0x007b CrossProcess` (`Pentax.pm:2565-2578`) — int8u enum hash.
   PentaxTag {
     id: 0x007b,
@@ -790,6 +906,16 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     sub_table: Some(SubTable::LensCorr),
     unknown: false,
     format: None,
+  },
+  // `0x007e WhiteLevel` (`Pentax.pm:2586-2592`) — int32u, no conv (the raw
+  // black-subtracted white level, e.g. `16376`).
+  PentaxTag {
+    id: 0x007e,
+    name: "WhiteLevel",
+    conv: PentaxPrintConv::None,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int32u, Some(1))),
   },
   // `0x007f BleachBypassToning` (`Pentax.pm:2585-2607`) — int16u enum hash.
   PentaxTag {
@@ -819,6 +945,16 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: Some(FormatOverride::new(Format::Int8u, Some(4))),
   },
+  // `0x0087 ShutterType` (`Pentax.pm:2664-2671`) — int8u, `{ 0 => 'Normal',
+  // 1 => 'Electronic' }`.
+  PentaxTag {
+    id: 0x0087,
+    name: "ShutterType",
+    conv: PentaxPrintConv::Hash(super::printconv::SHUTTER_TYPE),
+    sub_table: None,
+    unknown: false,
+    format: None,
+  },
   // `0x0092 IntervalShooting` (`Pentax.pm:2690-2707`) — int16u `Count => 2`:
   // `'0 0' => 'Off'` plus the `OTHER => sub` (`s/(\d+) (\d+)/Shot $1 of $2/`).
   PentaxTag {
@@ -828,6 +964,20 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     sub_table: None,
     unknown: false,
     format: None,
+  },
+  // `0x0095 SkinToneCorrection` (`Pentax.pm:2708-2726`) — int8s, a `$count`-keyed
+  // pair: the `$count == 2` table (`{'0 0'=>'Off','1 1'=>'On (type 1)','1 2'=>'On
+  // (type 2)'}`) and the `$count == 3` table (`{'0 0 0'=>'Off'}`). The two key
+  // domains are disjoint (a 2-int vs a 3-int space-joined run), so a single
+  // run-keyed hash unifies both variants — the on-disk count selects which key is
+  // looked up. `-n` ⇒ the space-joined int8s run (the K-3 III writes `0 0 0`).
+  PentaxTag {
+    id: 0x0095,
+    name: "SkinToneCorrection",
+    conv: PentaxPrintConv::StringKeyedHash(super::printconv::SKIN_TONE_CORRECTION),
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int8s, None)),
   },
   // `0x0096 ClarityControl` (`Pentax.pm:2727-2745`) — int8s `Count => 2`:
   // `'0 0' => 'Off'` plus the `OTHER => sub` (`^1 (-?\d+)$ → %+d` / `0`).
@@ -854,6 +1004,27 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     sub_table: None,
     unknown: false,
     format: None,
+  },
+  // `0x0203 ColorMatrixA` (`Pentax.pm:2766-2774`) — int16s `Count => 9` (the *istD
+  // camera-RGB→sRGB matrix); ValueConv `$_/8192` per element, PrintConv
+  // `sprintf("%.5f")` per element, space-joined. `-n` ⇒ the nine `/8192` floats.
+  PentaxTag {
+    id: 0x0203,
+    name: "ColorMatrixA",
+    conv: PentaxPrintConv::ColorMatrix,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16s, Some(9))),
+  },
+  // `0x0204 ColorMatrixB` (`Pentax.pm:2775-2783`) — int16s `Count => 9` (the *istD
+  // camera-RGB→Adobe-RGB matrix); same conv as ColorMatrixA.
+  PentaxTag {
+    id: 0x0204,
+    name: "ColorMatrixB",
+    conv: PentaxPrintConv::ColorMatrix,
+    sub_table: None,
+    unknown: false,
+    format: Some(FormatOverride::new(Format::Int16s, Some(9))),
   },
   PentaxTag {
     id: 0x0205,
@@ -1138,6 +1309,15 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     unknown: false,
     format: None,
   },
+  // `0x0243 PixelShiftInfo` (`Pentax.pm:3113-3115`) — a plain SubDirectory.
+  PentaxTag {
+    id: 0x0243,
+    name: "PixelShiftInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::PixelShiftInfo),
+    unknown: false,
+    format: None,
+  },
   // `0x0245 AFPointInfo` (`Pentax.pm:3117-3120`) — a plain SubDirectory (no
   // explicit `Format` ⇒ implicit-`undef`, the whole block reaches the child).
   // Written only by the K-1, KP and K-70.
@@ -1146,6 +1326,34 @@ pub const PENTAX_TAGS: &[PentaxTag] = &[
     name: "AFPointInfo",
     conv: PentaxPrintConv::None,
     sub_table: Some(SubTable::AfPointInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x03ff TempInfo` (`Pentax.pm:3126-3135`) — the `Model =~ /K-(01|3|30|5|50|
+  // 500)\b/` variant (else `%UnknownInfo`, deferred). A plain SubDirectory.
+  PentaxTag {
+    id: 0x03ff,
+    name: "TempInfo",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::TempInfo),
+    unknown: false,
+    format: None,
+  },
+  // `0x040b FaceInfoK3III` (`Pentax.pm:3154-3158`) — a plain SubDirectory.
+  PentaxTag {
+    id: 0x040b,
+    name: "FaceInfoK3III",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::FaceInfoK3iii),
+    unknown: false,
+    format: None,
+  },
+  // `0x040c AFInfoK3III` (`Pentax.pm:3159-3162`) — a plain SubDirectory.
+  PentaxTag {
+    id: 0x040c,
+    name: "AFInfoK3III",
+    conv: PentaxPrintConv::None,
+    sub_table: Some(SubTable::AfInfoK3iii),
     unknown: false,
     format: None,
   },
@@ -1532,6 +1740,17 @@ pub fn conditional_leaf(
     // unconditional (`Emit`). The explicit arm keeps it out of the catch-all so
     // all 13 #173 Main leaf ids are structurally enumerated.
     0x005d => ConditionalLeaf::Emit,
+    // `0x003c AFPointsInFocus` (`Pentax.pm:2097-2125`, the *istD `$val & 0x7ff`
+    // 11-point BITMASK) — #393. The Pentax.pm row carries NO `Condition` (the
+    // `Notes => '*istD only'` is documentation, not a machine gate), so ExifTool
+    // decodes it for EVERY body that writes the id ⇒ unconditional `Emit`. The
+    // explicit arm keeps this #393 leaf out of the `_ => EmitUnported` catch-all,
+    // which is reserved for pre-#173 / unported ids alone (the structural-invariant
+    // tests in `tags/tests.rs` enforce that no enumerated/ported conditioned leaf
+    // reaches the fallback). This is NOT model-gated to *ist D: gating it would
+    // DIVERGE from ExifTool (suppress 0x003c on a body that, per Pentax.pm, should
+    // emit the decode).
+    0x003c => ConditionalLeaf::Emit,
     // ONLY pre-#173 Phase-1/2 leaves and unported ids reach this catch-all; no
     // #173 leaf falls through (the structural test in `tags/tests.rs` proves it).
     _ => ConditionalLeaf::EmitUnported,
@@ -1682,6 +1901,18 @@ pub const SHARPNESS: &[(i64, &str)] = &[
   (7, "-4 (minimum)"),
   (8, "+4 (maximum)"),
 ];
+
+/// `0x001f Saturation` ARRAY PrintConv (`Pentax.pm:1778-1789`) — a single-table
+/// `PrintConv => [{...}]` list. The `*istD` writes a PAIR of values, so element 0
+/// renders via [`SATURATION`] and the trailing element passes through RAW, joined
+/// `"; "` (e.g. `"0 (normal); 0"`); a single-value record renders just element 0.
+pub const SATURATION_ARRAY: &[&[(i64, &str)]] = &[SATURATION];
+
+/// `0x0020 Contrast` ARRAY PrintConv (`Pentax.pm:1797-1808`) — see [`SATURATION_ARRAY`].
+pub const CONTRAST_ARRAY: &[&[(i64, &str)]] = &[CONTRAST];
+
+/// `0x0021 Sharpness` ARRAY PrintConv (`Pentax.pm:1816-1826`) — see [`SATURATION_ARRAY`].
+pub const SHARPNESS_ARRAY: &[&[(i64, &str)]] = &[SHARPNESS];
 
 /// `ISO` PrintConv hash — sorted by key for binary search.
 pub const ISO: &[(i64, &str)] = &[

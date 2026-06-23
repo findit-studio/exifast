@@ -309,6 +309,56 @@ fn conditional_leaf_af_points_in_focus_model_gated() {
   );
 }
 
+/// `0x003c AFPointsInFocus` (the *istD `$val & 0x7ff` 11-point BITMASK variant,
+/// `Pentax.pm:2097-2125`) is UNCONDITIONAL: the Pentax.pm row carries NO
+/// `Condition` (the `Notes => '*istD only'` is documentation, not a machine gate),
+/// so ExifTool decodes it for EVERY body that writes the id. This pins both the
+/// faithful behavior (no model suppression — gating it would DIVERGE from ExifTool)
+/// AND the structural-invariant fix: 0x003c is a #393 leaf and must NOT reach the
+/// `EmitUnported` catch-all (reserved for pre-#173 / unported ids).
+#[test]
+fn conditional_leaf_af_points_in_focus_istd_is_unconditional() {
+  // POSITIVE: the *ist D body (the model the decode was transcribed for) emits.
+  assert_eq!(
+    conditional_leaf(0x003c, 1, Some("PENTAX *ist D"), K10D_MAKE, Format::Int32u),
+    ConditionalLeaf::Emit,
+    "*ist D AFPointsInFocus (0x003c) must emit the masked 11-point decode"
+  );
+  // "NEGATIVE" — but ExifTool does NOT suppress 0x003c for non-*istD bodies (the
+  // row has no Condition), so the FAITHFUL outcome is still emit, NOT Suppress. A
+  // body that, per Pentax.pm, would write 0x003c must NOT have the decode dropped;
+  // suppressing it would be the divergence. Every model — and a `None`-model video
+  // — therefore emits.
+  for m in [
+    Some("PENTAX K10D"),
+    Some("PENTAX K-3 Mark III"),
+    Some("PENTAX K-1"),
+    Some("RICOH GR III"),
+    None,
+  ] {
+    let outcome = conditional_leaf(0x003c, 1, m, K10D_MAKE, Format::Int32u);
+    assert_eq!(
+      outcome,
+      ConditionalLeaf::Emit,
+      "{m:?} AFPointsInFocus (0x003c) must EMIT — Pentax.pm has no model Condition, \
+       so gating/suppressing it would diverge from ExifTool"
+    );
+    assert!(
+      !outcome.is_suppressed(),
+      "{m:?} 0x003c must not be suppressed"
+    );
+  }
+  // STRUCTURAL: 0x003c is a #393 leaf with an EXPLICIT arm, so it never reaches the
+  // `EmitUnported` catch-all (which is reserved for pre-#173 / unported ids). A
+  // regression that dropped the explicit arm would route 0x003c through the
+  // fallback — caught here.
+  assert_ne!(
+    conditional_leaf(0x003c, 1, Some("PENTAX *ist D"), K10D_MAKE, Format::Int32u),
+    ConditionalLeaf::EmitUnported,
+    "0x003c is a #393 leaf and must have an explicit conditional_leaf arm"
+  );
+}
+
 /// `0x000d FocusMode` — `$$self{Make} !~ /^Asahi/`. The Pentax/Ricoh body (and a
 /// `None`-Make video) emit the ported "Pentax models" hash; an Asahi body is the
 /// deferred "Asahi models" variant ⇒ Suppress.

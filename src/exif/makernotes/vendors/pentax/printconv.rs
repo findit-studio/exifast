@@ -107,6 +107,11 @@ pub enum PentaxPrintConv {
   /// `Pentax.pm:1409-...`) — int32u, `PrintHex => 1`, a `{0=>'(none)', BITMASK
   /// => {...}}` PrintConv (`DecodeBits`). `-n` ⇒ the raw int.
   AfPointsInFocus,
+  /// `0x003c AFPointsInFocus` (`Pentax.pm:2097-2126`, *istD only) — int32u,
+  /// `ValueConv => '$val & 0x7ff'` (the low 11 bits = the selected-AF-point
+  /// bitmask) then a `{0=>'(none)', BITMASK=>{...11 points...}}` PrintConv
+  /// (`DecodeBits`). `-n` ⇒ the masked int (NOT the raw 32-bit word).
+  AfPointsInFocusIstd,
   /// A per-position ARRAY-of-hashes PrintConv (`ExifTool.pm:3548-3698`): element
   /// `i` is rendered via `tables[i]` (with a decimal `Unknown (N)` miss
   /// fallback); an element PAST the array length passes through RAW (the
@@ -153,6 +158,22 @@ pub enum PentaxPrintConv {
   /// substitution leaves a non-matching `$val` intact). `-n` ⇒ the space-joined
   /// run.
   IntervalShooting,
+  /// `0x007a ISOAutoMinSpeed` (`Pentax.pm:2546-2566`) — int8u `Count => 2`, a
+  /// 2-element conv. Element 0: NO ValueConv (`undef`), PrintConv mode hash
+  /// (`{1=>'Shutter Speed Control',2=>'Auto Slow',3=>'Auto Standard',
+  /// 4=>'Auto Fast'}`). Element 1: `ValueConv 'exp(-PentaxEv($val-68)*log(2))'`
+  /// (`0` when raw `$val` is `0`), then PrintConv `PrintExposureTime`. Joined
+  /// `"; "` for `-j`; `-n` ⇒ element 0 raw + element 1's post-ValueConv value,
+  /// space-joined (e.g. `3 124` → `-j "Auto Standard; 1/128"`, `-n "3 0.0078125"`).
+  IsoAutoMinSpeed,
+  /// `0x0035 SensorSize` (`Pentax.pm:2064-2077`) — int16u `Count => 2`. ValueConv
+  /// `$_/=500` per element; PrintConv `sprintf("%.3f x %.3f mm", split(" ",$val))`.
+  /// `-n` ⇒ the two `/500` floats space-joined.
+  SensorSize,
+  /// `0x0203 ColorMatrixA` / `0x0204 ColorMatrixB` (`Pentax.pm:2766-2783`) —
+  /// int16s `Count => 9`. ValueConv `$_/8192` per element; PrintConv
+  /// `sprintf("%.5f")` per element, space-joined. `-n` ⇒ the nine `/8192` floats.
+  ColorMatrix,
   /// `0x0096 ClarityControl` (`Pentax.pm:2727-2745`) — int8s `Count => 2`. The
   /// `'0 0' => 'Off'` literal plus an `OTHER => sub`: the forward direction is
   /// `elsif ($val =~ /^1 (-?\d+)$/) { return $1 ? sprintf('%+d', $1) : 0 } else {
@@ -300,6 +321,7 @@ impl PentaxPrintConv {
       PentaxPrintConv::FlashExposureComp => flash_exposure_comp(raw, print_conv),
       PentaxPrintConv::AfPointSelected => af_point_selected(raw, print_conv),
       PentaxPrintConv::AfPointsInFocus => af_points_in_focus(raw, print_conv),
+      PentaxPrintConv::AfPointsInFocusIstd => af_points_in_focus_istd(raw, print_conv),
       PentaxPrintConv::ArrayHash(tables) => array_hash(raw, print_conv, tables),
       PentaxPrintConv::FaceDetect => face_detect(raw, print_conv),
       PentaxPrintConv::FlashMode => flash_mode(raw, print_conv),
@@ -308,6 +330,9 @@ impl PentaxPrintConv {
       PentaxPrintConv::DriveMode => drive_mode(raw, print_conv),
       PentaxPrintConv::StringKeyedHash(table) => string_keyed_hash(raw, print_conv, table),
       PentaxPrintConv::IntervalShooting => interval_shooting(raw, print_conv),
+      PentaxPrintConv::IsoAutoMinSpeed => iso_auto_min_speed(raw, print_conv),
+      PentaxPrintConv::SensorSize => sensor_size(raw, print_conv),
+      PentaxPrintConv::ColorMatrix => color_matrix(raw, print_conv),
       PentaxPrintConv::ClarityControl => clarity_control(raw, print_conv),
     }
   }
@@ -510,6 +535,44 @@ const AF_POINTS_IN_FOCUS_KS2_BITS: &[(u8, &str)] = &[
   (24, "Bottom"),
   (25, "Bottom Near-right"),
   (26, "Bottom-right"),
+];
+
+/// `0x003c AFPointsInFocus` (`Pentax.pm:2097-2126`, *istD only) — int32u,
+/// `ValueConv => '$val & 0x7ff'` then the `{0=>'(none)', BITMASK=>{...}}` PrintConv
+/// (`DecodeBits`, 32-bit). `-n` ⇒ the masked int.
+fn af_points_in_focus_istd(raw: &RawValue, print_conv: bool) -> TagValue {
+  let Some(n) = first_i64(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  // `ValueConv => '$val & 0x7ff'` (applied for BOTH `-j` and `-n`).
+  let masked = n & 0x7ff;
+  if !print_conv {
+    return TagValue::I64(masked);
+  }
+  if masked == 0 {
+    return TagValue::Str(SmolStr::new_static("(none)"));
+  }
+  TagValue::Str(SmolStr::from(crate::convert::decode_bits(
+    &masked.to_string(),
+    Some(AF_POINTS_IN_FOCUS_ISTD_BITS),
+    32,
+  )))
+}
+
+/// `0x003c AFPointsInFocus` BITMASK for the *istD (`Pentax.pm:2111-2124`) — the
+/// 11-point map (bits 0..=10).
+const AF_POINTS_IN_FOCUS_ISTD_BITS: &[(u8, &str)] = &[
+  (0, "Upper-left"),
+  (1, "Top"),
+  (2, "Upper-right"),
+  (3, "Left"),
+  (4, "Mid-left"),
+  (5, "Center"),
+  (6, "Mid-right"),
+  (7, "Right"),
+  (8, "Lower-left"),
+  (9, "Bottom"),
+  (10, "Lower-right"),
 ];
 
 /// A per-position ARRAY-of-hashes PrintConv (`ExifTool.pm:3548-3698`). Element `i`
@@ -855,6 +918,110 @@ fn substitute_first_int_pair(s: &str) -> Option<std::string::String> {
     // No pair anchored at this digit run; the iterator already sits past it.
   }
   None
+}
+
+/// `0x007a ISOAutoMinSpeed` (`Pentax.pm:2546-2566`) — int8u `Count => 2`.
+///
+/// Element 0 has NO ValueConv; its PrintConv is the mode hash. Element 1 has
+/// `ValueConv => '$val ? exp(-PentaxEv($val-68)*log(2)) : 0'` (i.e.
+/// `2**(-PentaxEv($val-68))`, or `0` when the raw byte is `0`) and PrintConv
+/// `PrintExposureTime`. A `[{...}, 'PrintExposureTime']` PrintConv list joins the
+/// rendered elements with `"; "`; the matching ValueConv list (`[undef, ...]`)
+/// converts only element 1, so the `-n` value is element-0-raw + element-1's
+/// post-ValueConv number, space-joined.
+fn iso_auto_min_speed(raw: &RawValue, print_conv: bool) -> TagValue {
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  // Element 1's ValueConv (`undef`-guarded): `0` raw stays `0`, else
+  // `exp(-PentaxEv($val-68)*log(2))`.
+  let conv1 = |v: i64| -> f64 {
+    if v == 0 {
+      0.0
+    } else {
+      (-super::subtables::pentax_ev(v - 68) * std::f64::consts::LN_2).exp()
+    }
+  };
+  if !print_conv {
+    // `-n`: element 0 raw, element 1 post-ValueConv, space-joined.
+    let mut parts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+    for (i, &n) in elems.iter().enumerate() {
+      if i == 1 {
+        parts.push(crate::value::format_g(conv1(n), 15));
+      } else {
+        parts.push(n.to_string());
+      }
+    }
+    return TagValue::Str(SmolStr::from(parts.join(" ")));
+  }
+  // `-j`: per-element PrintConv, `"; "`-joined.
+  let mode = |n: i64| -> std::string::String {
+    match n {
+      1 => "Shutter Speed Control".to_string(),
+      2 => "Auto Slow".to_string(),
+      3 => "Auto Standard".to_string(),
+      4 => "Auto Fast".to_string(),
+      other => std::format!("Unknown ({other})"),
+    }
+  };
+  let mut parts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  for (i, &n) in elems.iter().enumerate() {
+    match i {
+      0 => parts.push(mode(n)),
+      1 => parts.push(print_exposure_time(conv1(n))),
+      // A `[{...}, code]` list applies the LAST converter to trailing elements;
+      // for this 2-value tag there are none, but mirror the rule defensively.
+      _ => parts.push(print_exposure_time(conv1(n))),
+    }
+  }
+  TagValue::Str(SmolStr::from(parts.join("; ")))
+}
+
+/// `0x0035 SensorSize` (`Pentax.pm:2064-2077`) — int16u `Count => 2`. ValueConv
+/// divides each element by 500; PrintConv `sprintf("%.3f x %.3f mm",
+/// split(" ",$val))`. `-n` ⇒ the two `/500` floats space-joined. A record without
+/// two numeric elements falls back to the raw rendering (the `split` would yield
+/// fewer args, but the goldens always carry the pair).
+fn sensor_size(raw: &RawValue, print_conv: bool) -> TagValue {
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  let conv: std::vec::Vec<f64> = elems.iter().map(|&n| n as f64 / 500.0).collect();
+  if !print_conv {
+    let joined = conv
+      .iter()
+      .map(|&f| crate::value::format_g(f, 15))
+      .collect::<std::vec::Vec<_>>()
+      .join(" ");
+    return TagValue::Str(SmolStr::from(joined));
+  }
+  // `sprintf("%.3f x %.3f mm", split(" ",$val))` — Perl pads missing args with the
+  // empty string (→ `0` under `%f`); take the first two, defaulting absent to 0.
+  let a = conv.first().copied().unwrap_or(0.0);
+  let b = conv.get(1).copied().unwrap_or(0.0);
+  TagValue::Str(SmolStr::from(std::format!("{a:.3} x {b:.3} mm")))
+}
+
+/// `0x0203 ColorMatrixA` / `0x0204 ColorMatrixB` (`Pentax.pm:2766-2783`) — int16s
+/// `Count => 9`. ValueConv divides each element by 8192; PrintConv
+/// `sprintf("%.5f")` per element, space-joined. `-n` ⇒ the `/8192` floats.
+fn color_matrix(raw: &RawValue, print_conv: bool) -> TagValue {
+  let Some(elems) = numeric_elems(raw) else {
+    return raw_to_tag_value(raw);
+  };
+  let joined = elems
+    .iter()
+    .map(|&n| {
+      let f = n as f64 / 8192.0;
+      if print_conv {
+        std::format!("{f:.5}")
+      } else {
+        crate::value::format_g(f, 15)
+      }
+    })
+    .collect::<std::vec::Vec<_>>()
+    .join(" ");
+  TagValue::Str(SmolStr::from(joined))
 }
 
 /// `0x0096 ClarityControl` PrintConv (`Pentax.pm:2727-2745`). `'0 0' => 'Off'`
@@ -1266,6 +1433,19 @@ pub(crate) const WHITE_BALANCE_SET: &[(i64, &str)] = &[
 /// (mask 0x0f, `Pentax.pm:3579-3582`).
 pub(crate) const OFF_ON: &[(i64, &str)] = &[(0, "Off"), (1, "On")];
 
+/// `0x0087 ShutterType` PrintConv (`Pentax.pm:2667-2670`). Sorted by key.
+pub(crate) const SHUTTER_TYPE: &[(i64, &str)] = &[(0, "Normal"), (1, "Electronic")];
+
+/// `0x0095 SkinToneCorrection` PrintConv — the UNION of the `$count == 2`
+/// (`Pentax.pm:2713-2717`) and `$count == 3` (`Pentax.pm:2724`) run-keyed tables.
+/// The key domains are disjoint by run length, so the merged hash is faithful.
+pub(crate) const SKIN_TONE_CORRECTION: &[(&str, &str)] = &[
+  ("0 0", "Off"),
+  ("1 1", "On (type 1)"),
+  ("1 2", "On (type 2)"),
+  ("0 0 0", "Off"),
+];
+
 /// `CameraSettings` `13 RawAndJpgRecording` (K10D, PrintHex,
 /// `Pentax.pm:3591-3608`).
 pub(crate) const RAW_AND_JPG_RECORDING: &[(i64, &str)] = &[
@@ -1676,6 +1856,33 @@ pub(crate) const GRIP_BATTERY_STATE_K10D: &[(i64, &str)] = &[
   (4, "Full"),
 ];
 
+/// `BatteryInfo` `0.1 PowerSource` PrintConv (the K-3III variant, mask 0x0f,
+/// `Pentax.pm:4787-4791`). Sorted by key.
+pub(crate) const POWER_SOURCE_K3III: &[(i64, &str)] = &[
+  (1, "Body Battery"),
+  (2, "Grip Battery"),
+  (4, "External Power Supply"),
+];
+
+/// `BatteryInfo` `0.2 PowerAvailable` BITMASK (the K-3III variant, mask 0xf0,
+/// `Pentax.pm:4798-4802`). Sorted by bit.
+pub(crate) const POWER_AVAILABLE_K3III_BITS: &[(u8, &str)] = &[
+  (0, "Body Battery"),
+  (1, "Grip Battery"),
+  (3, "External Power Supply"),
+];
+
+/// `BatteryInfo` Body/Grip `BatteryState` PrintConv (the K-3III variant — the
+/// full-byte 6-entry hash, `Pentax.pm:4881-4888`/`:4965-4972`). Sorted by key.
+pub(crate) const BATTERY_STATE_K3III: &[(i64, &str)] = &[
+  (0, "Empty or Missing"),
+  (1, "Almost Empty"),
+  (2, "Running Low"),
+  (3, "Half Full"),
+  (4, "Close to Full"),
+  (5, "Full"),
+];
+
 /// `AFInfo` `0x0b AFPointsInFocus` PrintConv (the non-K-1/3/70/KP/K-S1/S2
 /// variant, `Pentax.pm:5077-5099`). Sorted by key.
 pub(crate) const AF_POINTS_IN_FOCUS: &[(i64, &str)] = &[
@@ -1701,6 +1908,54 @@ pub(crate) const AF_POINTS_IN_FOCUS: &[(i64, &str)] = &[
   (19, "Center (vertical)"),
   (20, "Mid-right"),
 ];
+
+/// `%Pentax::AFInfo` `0x021f FirstFrameActionInAFC` (K-3III, `Pentax.pm:5154-5161`).
+pub(crate) const FIRST_FRAME_ACTION_IN_AFC: &[(i64, &str)] =
+  &[(0, "Auto"), (1, "Release Priority"), (2, "Focus Priority")];
+
+/// `%Pentax::AFInfo` `0x0220 ActionInAFCCont` (K-3III, `Pentax.pm:5166-5170`).
+pub(crate) const ACTION_IN_AFC_CONT: &[(i64, &str)] =
+  &[(0, "Auto"), (1, "Focus Priority"), (2, "FPS Priority")];
+
+/// `%Pentax::AFInfo` `545 AFCHold` (K-3III, mask 0x03, `Pentax.pm:5176`).
+pub(crate) const AFC_HOLD: &[(i64, &str)] = &[(0, "Low"), (1, "Medium"), (2, "High"), (3, "Off")];
+
+/// `%Pentax::AFInfoK3III` `0.1 AFMode` (`Pentax.pm:5900-5904`). Sorted by key.
+pub(crate) const AF_MODE_K3III: &[(i64, &str)] = &[
+  (0, "Phase Detect"),
+  (2, "Contrast Detect"),
+  (255, "Manual Focus"),
+];
+
+/// `%Pentax::AFInfoK3III` `1 AFSelectionMode` (`Pentax.pm:5909-5932`,
+/// `PrintHex => 1`). Sorted by key.
+pub(crate) const AF_SELECTION_MODE_K3III: &[(i64, &str)] = &[
+  (0x0, "Manual Focus"),
+  (0x1, "Spot"),
+  (0x2, "Select (5-points)"),
+  (0x3, "Expanded Area (S)"),
+  (0x4, "Expanded Area (M)"),
+  (0x5, "Expanded Area (L)"),
+  (0x6, "Select (S)"),
+  (0x7, "Zone Select (21-point)"),
+  (0x8, "Select XS"),
+  (0xff, "Auto Area"),
+  (0x2001, "Contrast-detect Auto Area"),
+  (0x2002, "Contrast-detect Select"),
+  (0x2003, "Pinpoint"),
+  (0x2004, "Tracking"),
+  (0x2005, "Continuous"),
+  (0x2006, "Face Detection"),
+  (0x2007, "Contrast-detect Select (S)"),
+  (0x2008, "Contrast-detect Select (M)"),
+  (0x2009, "Contrast-detect Select (L)"),
+  (0x200a, "Contrast-detect Zone Select"),
+  (0x200b, "Contrast-detect Spot"),
+];
+
+/// `%Pentax::AFInfo` `545.1 AFCPointTracking` (K-3III, mask 0x0c, `Pentax.pm:5182`).
+pub(crate) const AFC_POINT_TRACKING: &[(i64, &str)] =
+  &[(0, "Type 1"), (1, "Type 2"), (2, "Type 3")];
 
 /// `%Pentax::LensData` `0.2 MinAperture` PrintConv (`Pentax.pm:4407-4412`). The
 /// numeric-looking string labels (`"22"`) render as JSON numbers. Sorted by key.
@@ -1920,6 +2175,44 @@ pub(crate) const IMAGE_EDITING: &[(&str, &str)] = &[
   ("6 0 0 0", "Digital Filter 6"),
   ("8 0 0 0", "Red-eye Correction"),
   ("16 0 0 0", "Frame Synthesis?"),
+];
+
+/// `0x0009 PentaxImageSize` PrintConv (`Pentax.pm:1021-1053`) — keyed on the
+/// space-joined run. The single-int keys serve a 1-value record; the pair keys
+/// (`"36 0"`, the *istD) serve a 2-value record. A miss renders `Unknown (<run>)`.
+pub(crate) const PENTAX_IMAGE_SIZE: &[(&str, &str)] = &[
+  ("0", "640x480"),
+  ("1", "Full"),
+  ("2", "1024x768"),
+  ("3", "1280x960"),
+  ("4", "1600x1200"),
+  ("5", "2048x1536"),
+  ("8", "2560x1920 or 2304x1728"),
+  ("9", "3072x2304"),
+  ("10", "3264x2448"),
+  ("19", "320x240"),
+  ("20", "2288x1712"),
+  ("21", "2592x1944"),
+  ("22", "2304x1728 or 2592x1944"),
+  ("23", "3056x2296"),
+  ("25", "2816x2212 or 2816x2112"),
+  ("27", "3648x2736"),
+  ("29", "4000x3000"),
+  ("30", "4288x3216"),
+  ("31", "4608x3456"),
+  ("129", "1920x1080"),
+  ("135", "4608x2592"),
+  ("257", "3216x3216"),
+  ("0 0", "2304x1728"),
+  ("4 0", "1600x1200"),
+  ("5 0", "2048x1536"),
+  ("8 0", "2560x1920"),
+  ("32 2", "960x640"),
+  ("33 2", "1152x768"),
+  ("34 2", "1536x1024"),
+  ("35 1", "2400x1600"),
+  ("36 0", "3008x2008 or 3040x2024"),
+  ("37 0", "3008x2000"),
 ];
 
 /// `0x006c HighLowKeyAdj` PrintConv (`Pentax.pm:2378-2386`) — int16s `Count =>

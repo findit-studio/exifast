@@ -353,6 +353,39 @@ fn af_points_in_focus_ks2_bottom_row_bits() {
 }
 
 #[test]
+fn af_points_in_focus_istd_decodes_masked_11_point_bitmask() {
+  // 0x003c AFPointsInFocus (the *istD variant, `Pentax.pm:2097-2125`) — int32u,
+  // `ValueConv => '$val & 0x7ff'` then a `{0=>'(none)', BITMASK=>{0..10}}`
+  // DecodeBits PrintConv (the 11-point grid). This is the decode the *ist D PEF
+  // fixture exercises; the leaf is UNCONDITIONAL in Pentax.pm (no model
+  // `Condition`), so the PrintConv itself is model-agnostic — the value alone
+  // selects the rendering.
+  let conv = PentaxPrintConv::AfPointsInFocusIstd;
+  // After masking, 0 ⇒ the explicit '(none)' key.
+  assert_eq!(conv.apply(&u(&[0]), true), TagValue::Str("(none)".into()));
+  // bit 5 = "Center" (0x20). `$val & 0x7ff` keeps it.
+  assert_eq!(
+    conv.apply(&u(&[0x20]), true),
+    TagValue::Str("Center".into())
+  );
+  // The two endpoints of the 11-point map: bit 0 "Upper-left", bit 10
+  // "Lower-right" (DecodeBits joins set bits with ", ").
+  assert_eq!(
+    conv.apply(&u(&[(1 << 0) | (1 << 10)]), true),
+    TagValue::Str("Upper-left, Lower-right".into())
+  );
+  // The `XSSSYUUU` nibble layout: only bits 0..=10 (the `SSS`/`UUU` used-point
+  // mask) survive `$val & 0x7ff`; the high `X`/`Y` nibbles are stripped. Raw
+  // `0x6025` (`Y=6`, point bits `0x025`) masks to `0x025` = bits 0,2,5.
+  assert_eq!(
+    conv.apply(&u(&[0x6025]), true),
+    TagValue::Str("Upper-left, Upper-right, Center".into())
+  );
+  // `-n`: the MASKED int (the ValueConv applies for both -j and -n).
+  assert_eq!(conv.apply(&u(&[0x6025]), false), TagValue::I64(0x025));
+}
+
+#[test]
 fn af_point_selected_model_special_high_values() {
   // 0x000e AFPointSelected — the model-keyed element-0 hashes carry the
   // `0xfffb`-`0xffff` SPECIAL selections (Pentax.pm:1225-1230 K-1, 1302-1306

@@ -11737,6 +11737,41 @@ pub(in crate::exif) fn pentax_makernote_isolated(
               &mut *sink.emissions,
             );
           }
+          // `%Pentax::PixelShiftInfo` (0x0243) — `int8u`, UNCONDITIONAL. Emits
+          // PixelShiftResolution (@0). #393.
+          SubTable::PixelShiftInfo => {
+            pentax::subtables::emit_pixel_shift_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::TempInfo` (0x03ff) — the Main row gates on `$$self{Model} =~
+          // /K-(01|3|30|5|50|500)\b/`; `emit_temp_info` re-applies the K-3III leaf
+          // gates (ShotNumber @0x0a, SensorTemperature @0x2a, int16s BE inherited).
+          // #393.
+          SubTable::TempInfo => {
+            pentax::subtables::emit_temp_info(
+              block,
+              parent_order,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          // `%Pentax::FaceInfoK3III` (0x040b) — `int32u` (BigEndian inherited).
+          // FaceImageSize/CAFArea/FacesDetectedA/B; the per-face leaves gate on
+          // FacesA (0 here). #393.
+          SubTable::FaceInfoK3iii => {
+            pentax::subtables::emit_face_info_k3iii(block, parent_order, &mut *sink.emissions);
+          }
+          // `%Pentax::AFInfoK3III` (0x040c) — `int16u` (BigEndian inherited).
+          // AFMode/AFSelectionMode/MaxNumAFPoints/NumAFPoints + the AF-area leaves.
+          // #393.
+          SubTable::AfInfoK3iii => {
+            pentax::subtables::emit_af_info_k3iii(
+              block,
+              parent_order,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
         }
         continue;
       }
