@@ -3759,6 +3759,104 @@ fn camm_2track_ee_global_doc_byte_exact() {
   );
 }
 
+// `QuickTime_camm_2track_dupwarn.mov` — two `camm` `trak`s, EACH whose lone
+// sample carries an `Unknown camm record type 0` (type-0 is not in `%size`, so
+// `ProcessCAMM` `$et->Warn`s, last). The crux: ExifTool's `WAS_WARNED` is a
+// FILE-GLOBAL hash keyed on the warning TEXT (`ExifTool.pm` `sub Warn`
+// 5632-5639) — so the SAME warning string raised in Track1 AND Track2 is
+// recorded ONCE (the first occurrence's `FoundTag('Warning', …)`) and the later
+// one only bumps the count, yielding a single `Warning` whose end-of-extraction
+// `[x$n]` suffix (`ExifTool.pm:3196-3203`) reflects the file-wide total. The
+// oracle (`-ee -G1`) is therefore `Track1:Warning "Unknown camm record type 0
+// [x2]"` with NO `Track2:Warning` (Track2 keeps only its own SampleTime/
+// SampleDuration); at `-ee -G3` it is `Doc1:Track1:Warning … [x2]` with
+// `Doc2:Track2` carrying timing but NO Warning — the dedup spans the doc/track
+// boundary. RED before the fix (the `-G1` `first_seen(family1,"Warning")` gate
+// is per-track, so Track1 AND Track2 each emitted a `Warning`; #215); GREEN
+// after threading the file-wide `WAS_WARNED` text gate. Every tag (incl.
+// `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn camm_2track_dupwarn_file_global_was_warned_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The two-track dup-warn fixture at no-`ee`: camm is a `meta`-handler `trak`, so
+// the per-sample dispatch is `-ee`-only — the no-`ee` path shows the standard
+// `[minor] ExtractEmbedded` warning and NO per-sample record (same shape as the
+// other camm fixtures). Pins that the file-global `WAS_WARNED` threading leaks
+// no record into the no-`ee` path.
+#[test]
+fn camm_2track_dupwarn_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.json",
+    NO_EXCL,
+  );
+}
+
+// `QuickTime_camm_2track_distinct_collision.mov` — the #215-R1 reviewer case for
+// the file-global `WAS_WARNED` SET-AT-WARN-TIME semantics. Track1 raises TWO
+// DISTINCT warnings (sample0 camm0 ⇒ A "Unknown camm record type 0"; sample1
+// truncated camm5 ⇒ B "Truncated camm record 5"); Track2's lone sample repeats B
+// (truncated camm5). ExifTool keys `WAS_WARNED` on the message TEXT at WARN-TIME
+// (`ExifTool.pm:5635`), file-wide and INDEPENDENT of any per-track tag slot — so
+// B is recorded when Track1 raises it, even though Track1's `-G1` priority-0
+// `Warning` slot is already held by A (the `TagMap`'s first-wins, exifast's
+// accepted divergence from ExifTool's numbered `Warning (i)` copies). Track2's
+// later B is therefore a REPEAT: no new `Warning`, only `++[xN]`.
+//
+// Oracle (bundled 13.59): `-ee -G1` ⇒ ONLY `Track1:Warning = A` and NO
+// `Track2:Warning` (B never reaches G1 — its lone position is Track1's full
+// slot); `-ee -G3` ⇒ `Doc1:Track1:Warning A`, `Doc2:Track1:Warning "Truncated
+// camm record 5 [x2]"` (the `[x2]` is the FILE-GLOBAL count over Track1's Doc2 +
+// Track2's Doc3), `Doc3:Track2` timing only.
+//
+// RED before the fix: R1 recorded the text in `was_warned` only INSIDE the
+// `first_seen(family1,"Warning")` slot gate, so B (slot-blocked behind A on
+// Track1) was NEVER added to the file-global set → Track2's B looked first-time
+// and emitted a SPURIOUS `Track2:Warning`. GREEN after recording `was_warned` at
+// warn-time, before the G1 slot gate. Every tag (incl. `Track<N>:MetaFormat`) is
+// byte-exact.
+#[test]
+fn camm_2track_distinct_collision_was_warned_at_warn_time_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The distinct-collision fixture at no-`ee`: camm is a `meta`-handler `trak`, so
+// the per-sample dispatch is `-ee`-only — both tracks show the standard `[minor]
+// ExtractEmbedded` warning and NO per-sample record. Pins that the warn-time
+// `WAS_WARNED` recording leaks nothing into the no-`ee` path.
+#[test]
+fn camm_2track_distinct_collision_noee_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.json",
+    NO_EXCL,
+  );
+}
+
 // `QuickTime_mebx_camm.mov` — a `mebx` `trak` (Track1) FOLLOWED by a `camm`
 // `trak` (Track2: 2 fixes). The crux cross-STRUCT pin: the `mebx` sample opens
 // `Doc1` (in `QuickTimeStreamMeta`), and the two camm fixes CONTINUE the same

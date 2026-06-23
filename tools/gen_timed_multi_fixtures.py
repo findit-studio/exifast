@@ -12,6 +12,20 @@ single-source fixtures (`QuickTime_camm.mov`, `QuickTime_mebx_*.mov`,
       Track1's last, NOT a colliding Doc1) and (b) the group-aware `-ee -G1`
       collapse keeping BOTH `Track1:GPSLatitude` and `Track2:GPSLatitude`.
 
+  QuickTime_camm_2track_distinct_collision.mov   — Track1 raises TWO DISTINCT
+      warnings (sample0 `Unknown camm record type 0` = A, sample1 truncated
+      camm5 `Truncated camm record 5` = B); Track2's lone sample repeats B
+      (truncated camm5). The reviewer's #215-R1 case: B is FIRST raised on
+      Track1 even though Track1's `-G1` priority-0 `Warning` slot is already
+      taken by A, so B must be recorded in the file-global `WAS_WARNED` set at
+      Track1's warn-time — Track2's later B is then a repeat (no new `Warning`,
+      `++[xN]` count). Oracle (`-ee -G1`): only `Track1:Warning = A`, NO
+      `Track2:Warning`, B nowhere (its lone position is Track1's full slot).
+      `-ee -G3`: `Doc1:Track1:Warning A`, `Doc2:Track1:Warning "Truncated camm
+      record 5 [x2]"` (file-global count over Track1+Track2), `Doc3:Track2`
+      timing only. A per-track-only `WAS_WARNED` (the R1 bug) wrongly emits a
+      spurious `Track2:Warning B`.
+
   QuickTime_mebx_camm.mov     — a `mebx` `trak` (Track1) FOLLOWED by a `camm`
       `trak` (Track2). Pins the cross-STRUCT global doc: the `mebx` sample opens
       Doc1, the camm fixes continue Doc2.. — they live in SEPARATE exifast
@@ -25,7 +39,8 @@ single-source fixtures (`QuickTime_camm.mov`, `QuickTime_mebx_*.mov`,
 Run:
   python3 tools/gen_timed_multi_fixtures.py            # -> tests/fixtures/
 Then regenerate goldens with the bundled ExifTool:
-  for f in QuickTime_camm_2track QuickTime_mebx_camm QuickTime_mebx_2track; do
+  for f in QuickTime_camm_2track QuickTime_camm_2track_distinct_collision \
+           QuickTime_mebx_camm QuickTime_mebx_2track; do
     EE=1 EXCLUDE="-x System:all -x Composite:all" tools/gen_golden.sh $f.mov
   done
 
@@ -53,6 +68,22 @@ def camm_packet(type_id: int, payload: bytes) -> bytes:
 
 def camm5_packet(lat: float, lon: float, alt: float) -> bytes:
     return camm_packet(5, struct.pack("<ddd", lat, lon, alt))
+
+
+def camm5_trunc_packet() -> bytes:
+    """A camm5 whose declared 24-byte payload is only 16 bytes present, so
+    `ProcessCAMM` `$et->Warn("Truncated camm record 5"), last`s
+    (QuickTimeStream.pl:3496) — a PLAIN warn (no `[minor]` prefix). Mirrors
+    `gen_camm_fixture.py`'s single-track `QuickTime_camm_trunc.mov`."""
+    return camm_packet(5, b"\x00" * 16)
+
+
+def camm0_packet() -> bytes:
+    """A camm type-0 (AngleAxis) — NOT in `ProcessCAMM`'s `%size` table, so the
+    walk `$et->Warn("Unknown camm record type 0"), last`s
+    (QuickTimeStream.pl:3495), a PLAIN warn. The 12-byte float[3] body is unread
+    (the walk stops on the type lookup)."""
+    return camm_packet(0, struct.pack("<fff", 1.0, 2.0, 3.0))
 
 
 # ── mebx keys-table + sample (QuickTimeStream.pl:876-962 / 2644) ─────────────
@@ -229,6 +260,29 @@ def main() -> None:
         camm5_packet(37.422000, -122.084000, 30.0),
     ])
     write("QuickTime_camm_2track.mov", build_mov([track1, track2]))
+
+    # NOTE: `QuickTime_camm_2track_dupwarn.mov` (#215-R1) is NOT regenerated here
+    # — it was hand-assembled with a slightly different structural skeleton (a
+    # `dinf` box + 8-byte camm0 samples) and is checked in verbatim; rebuilding
+    # it from these helpers would change its bytes. Only the NEW collision
+    # fixture below is generated.
+
+    # ── QuickTime_camm_2track_distinct_collision.mov — distinct-then-repeat ───
+    # Track1 sample0 = camm0 (warning A "Unknown camm record type 0"), sample1 =
+    # truncated camm5 (warning B "Truncated camm record 5"); Track2 sample0 =
+    # truncated camm5 (B again). B is FIRST raised on Track1 even though Track1's
+    # `-G1` priority-0 `Warning` slot is already taken by A, so B must enter the
+    # file-global `WAS_WARNED` set at THAT warn-time — Track2's later B is then a
+    # repeat (no new `Warning`, only `++[xN]`). Oracle `-ee -G1`: only
+    # `Track1:Warning = A`, NO `Track2:Warning`. `-ee -G3`: `Doc1:Track1:Warning
+    # A`, `Doc2:Track1:Warning "Truncated camm record 5 [x2]"` (file-global count
+    # over Track1+Track2), `Doc3:Track2` timing only.
+    dc_t1 = (camm_stsd(), [camm0_packet(), camm5_trunc_packet()])
+    dc_t2 = (camm_stsd(), [camm5_trunc_packet()])
+    write(
+        "QuickTime_camm_2track_distinct_collision.mov",
+        build_mov([dc_t1, dc_t2]),
+    )
 
     # ── mebx key: scene-illuminance (local_id 1, namespace-0 'be32' undef,
     # ValueConv unpack N). dtyp namespace 0 + format code: the existing

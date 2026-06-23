@@ -8807,6 +8807,15 @@ impl crate::emit::Taggable for Meta<'_> {
     // itself survives the `%noDups` first-wins). This file-level set of already-
     // seen eeBox codes mirrors that (the realistic file has one such track).
     let mut ee_warned: std::vec::Vec<&str> = std::vec::Vec::new();
+    // ExifTool's FILE-GLOBAL `$$self{WAS_WARNED}` hash (ExifTool.pm:4358/5632-5639):
+    // each DISTINCT `Warning` text is recorded ONCE per file (the first occurrence
+    // `FoundTag`s it; a later identical text only bumps a count → the ` [x$n]`
+    // suffix). This single set is THREADED across ALL `-ee` warning producers
+    // (camm / ctmd / dji `ProcessSamples` warnings) so a warning string recurring
+    // across tracks/docs — or across producers — dedups to ONE tag at the first
+    // occurrence's group, NOT one per `(Track<N>, Warning)` slot (#215: the prior
+    // emitters' per-track `first_seen` gate let the SAME text emit once per track).
+    let mut was_warned: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
     // First-wins gate: `true` (and records the key) only the FIRST time a
     // `(grp, name)` pair is seen; a repeat returns `false` so the caller skips
     // the push, leaving the earlier value in place (ExifTool.pm:2950-2951).
@@ -10906,7 +10915,13 @@ impl crate::emit::Taggable for Meta<'_> {
     // this emitter pushes ONLY the `Warning` payload (priority-0 first-wins +
     // WAS_WARNED `[xN]` dedup), exactly like [`emit_camm_warnings`]. The
     // MINOR residue warning (`Warn(..., 1)`) carries the `[minor] ` prefix.
-    emit_ctmd_warnings(self.canon_ctmd.warnings(), opts, &mut first_seen, &mut tags);
+    emit_ctmd_warnings(
+      self.canon_ctmd.warnings(),
+      opts,
+      &mut first_seen,
+      &mut was_warned,
+      &mut tags,
+    );
 
     // ── SP4: Parrot drone `mett` (Image::ExifTool::Parrot) ─────────────────
     // The per-sample GPS + flight telemetry decoded from a Parrot `mett` track
@@ -10936,7 +10951,13 @@ impl crate::emit::Taggable for Meta<'_> {
       &mut first_seen,
       &mut tags,
     );
-    emit_dji_warning(&self.dji_protobuf, opts, &mut first_seen, &mut tags);
+    emit_dji_warning(
+      &self.dji_protobuf,
+      opts,
+      &mut first_seen,
+      &mut was_warned,
+      &mut tags,
+    );
 
     // ── SP4: Insta360 INSV/INSP trailer (ProcessInsta360) ──────────────────
     // The file-END trailer's tags (QuickTimeStream.pl:3252-3478) under the
@@ -11029,6 +11050,7 @@ impl crate::emit::Taggable for Meta<'_> {
       opts,
       print_conv,
       &mut first_seen,
+      &mut was_warned,
       &mut tags,
     );
 
@@ -12125,6 +12147,7 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
   opts: crate::emit::EmitOptions,
   print_conv: bool,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -12154,10 +12177,14 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // Message strings whose surviving `Warning` tag has already been emitted (the
-  // WAS_WARNED first-occurrence gate, keyed on the message string — a SECOND
-  // sample with the same message emits NO further `Warning`, only its own timing).
-  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // The FILE-GLOBAL `WAS_WARNED` text set (`$$self{WAS_WARNED}`, threaded across
+  // ALL `-ee` warning producers) gates the first-occurrence — a message string
+  // whose `Warning` was already emitted (in THIS or ANY OTHER camm track/sample,
+  // OR a sibling ctmd/dji producer) emits NO further `Warning`, only its own
+  // timing. ExifTool keys this on the message TEXT file-wide, NOT per-track, so a
+  // duplicate recurring ACROSS tracks/docs collapses to one tag (the first
+  // occurrence's group) with the ` [x$n]` count — `was_warned` carries that
+  // cross-track scope (the prior camm-local `Vec` only deduped within one track).
   // The sample-table `SampleTime`/`SampleDuration` (`ConvertDuration` at `-j`, raw
   // seconds at `-n`) ExifTool's `ProcessSamples` emits AHEAD of a warning under the
   // raising sample's `Doc<N>` — `FoundSomething` runs PER SAMPLE before the
@@ -12202,9 +12229,8 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
       // message-dedup, so a duplicate-message second sample keeps its
       // `Doc<N>:SampleTime`/`SampleDuration` even when its `Warning` text is deduped.
       push_timing_g3(w, &group, print_conv, tags);
-      let msg = smol_str::SmolStr::from(w.message());
-      if !warned_msgs.contains(&msg) {
-        warned_msgs.push(msg);
+      if !was_warned.iter().any(|m| m.as_str() == w.message()) {
+        was_warned.push(smol_str::SmolStr::from(w.message()));
         tags.push(EmittedTag::new(
           group,
           "Warning".into(),
@@ -12212,15 +12238,31 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
           false,
         ));
       }
-    } else if first_seen(family1.as_str(), "Warning") {
-      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
+    } else if !was_warned.iter().any(|m| m.as_str() == w.message()) {
+      // `-G1`: the FILE-GLOBAL `WAS_WARNED` text gate — a message already emitted
+      // under ANY track/producer is suppressed (ExifTool keys on the TEXT, not the
+      // group), so a duplicate recurring across tracks collapses to the first
+      // occurrence's `Track<N>:Warning`. Record the text in the file-global set
+      // HERE, at the warning's WARN-TIME (ExifTool.pm:5635 sets
+      // `$$self{WAS_WARNED}{$str}` inside `Warn`, BEFORE any tag is created),
+      // INDEPENDENT of whether the per-track priority-0 `Warning` slot survives —
+      // otherwise a DISTINCT-text warning that loses the slot (its track already
+      // holds an earlier warning) would never be recorded, and a later same-text
+      // warning on ANOTHER track would wrongly re-emit (#215-R1). The `first_seen`
+      // slot gate then governs ONLY the per-track emission (the priority-0
+      // first-wins `(Track<N>, Warning)`; a distinct-text collision on a filled
+      // slot is dropped — the accepted divergence from ExifTool's numbered
+      // `Warning (i)` copies). The ` [x$n]` count is file-global via `count_of`.
       // Timing is owned by the cross-kind min-`doc()` precompute (above).
-      tags.push(EmittedTag::new(
-        Group::new("QuickTime", family1.as_str()),
-        "Warning".into(),
-        warning_value(w.message()),
-        false,
-      ));
+      was_warned.push(smol_str::SmolStr::from(w.message()));
+      if first_seen(family1.as_str(), "Warning") {
+        tags.push(EmittedTag::new(
+          Group::new("QuickTime", family1.as_str()),
+          "Warning".into(),
+          warning_value(w.message()),
+          false,
+        ));
+      }
     }
   }
 }
@@ -12252,6 +12294,7 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
   warnings: &[crate::metadata::CanonCtmdWarning],
   opts: crate::emit::EmitOptions,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -12284,10 +12327,13 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // FINAL-message strings whose surviving `Warning` has already been emitted at
-  // `-G3` (the WAS_WARNED first-occurrence gate — a later same-message sample
-  // emits no further `Warning`, only the CTMD payload block's own timing).
-  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // The FILE-GLOBAL `WAS_WARNED` text set (`$$self{WAS_WARNED}`, shared with the
+  // sibling camm/dji producers) gates the first-occurrence on the FINAL rendered
+  // message — a message already emitted (in THIS or ANY OTHER ctmd track/sample,
+  // OR a sibling producer) emits no further `Warning`. ExifTool keys this on the
+  // TEXT file-wide (NOT per-track), so a duplicate recurring ACROSS tracks/docs
+  // collapses to one tag (the first occurrence's group) with the ` [x$n]` count —
+  // the prior camm-local `Vec` only deduped within one ctmd track.
   for w in warnings {
     let family1 = std::format!("Track{}", w.track_index().unwrap_or(1));
     let msg = rendered(w);
@@ -12295,9 +12341,8 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
       // `-G3`: the warning carries its CTMD sample's `Doc<N>`; the `TagMap` sink
       // keeps distinct `(doc, family1, name)` rows. WAS_WARNED still suppresses a
       // duplicate FINAL message after the first occurrence.
-      let key = smol_str::SmolStr::from(msg.as_str());
-      if !warned_msgs.contains(&key) {
-        warned_msgs.push(key);
+      if !was_warned.iter().any(|m| m.as_str() == msg) {
+        was_warned.push(smol_str::SmolStr::from(msg.as_str()));
         let group = Group::with_doc("QuickTime", family1.as_str(), w.doc().unwrap_or(0));
         tags.push(EmittedTag::new(
           group,
@@ -12306,14 +12351,28 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
           false,
         ));
       }
-    } else if first_seen(family1.as_str(), "Warning") {
-      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
-      tags.push(EmittedTag::new(
-        Group::new("QuickTime", family1.as_str()),
-        "Warning".into(),
-        warning_value(&msg),
-        false,
-      ));
+    } else if !was_warned.iter().any(|m| m.as_str() == msg) {
+      // `-G1`: the FILE-GLOBAL `WAS_WARNED` text gate (file-wide, NOT per-track) —
+      // a message already emitted under ANY track/producer is suppressed, so a
+      // duplicate recurring across tracks collapses to the first occurrence's
+      // `Track<N>:Warning`. Record the FINAL rendered text in the file-global set
+      // HERE, at WARN-TIME (ExifTool.pm:5635 sets `$$self{WAS_WARNED}{$str}` in
+      // `Warn`, BEFORE the tag), INDEPENDENT of whether the per-track priority-0
+      // `Warning` slot survives — else a DISTINCT-text CTMD warning that loses the
+      // slot to an earlier warning on its track would go unrecorded, and a later
+      // same-text warning on another track would wrongly re-emit (#215-R1, the
+      // camm/ctmd class). The `first_seen` slot gate then governs ONLY the
+      // per-track emission (priority-0 first-wins `(Track<N>, Warning)`); the
+      // ` [x$n]` count is file-global via `count_of`.
+      was_warned.push(smol_str::SmolStr::from(msg.as_str()));
+      if first_seen(family1.as_str(), "Warning") {
+        tags.push(EmittedTag::new(
+          Group::new("QuickTime", family1.as_str()),
+          "Warning".into(),
+          warning_value(&msg),
+          false,
+        ));
+      }
     }
   }
 }
@@ -13622,6 +13681,7 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
   meta: &crate::metadata::DjiProtobufMeta,
   opts: crate::emit::EmitOptions,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -13659,16 +13719,22 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // Distinct FINAL messages already emitted, in first-emission order — drives
-  // both the WAS_WARNED first-occurrence gate (a later same-message warning
-  // emits nothing further) AND the `Warning (i)` numbering (the i-th DISTINCT
-  // message after the first becomes `Warning (i-1)`, ExifTool.pm:9536-9537).
+  // The local distinct-message list (first-emission order) drives the `Warning
+  // (i)` numbering — the i-th DISTINCT message after the first becomes `Warning
+  // (i-1)` (ExifTool.pm:9536-9537). The FILE-GLOBAL `WAS_WARNED` text set
+  // (`$$self{WAS_WARNED}`, shared with the sibling camm/ctmd producers) drives the
+  // first-occurrence DEDUP — a message already emitted (here OR by a sibling
+  // producer) emits nothing further. A real djmd file is djmd-only, so `was_warned`
+  // is empty when this runs and the numbering is unchanged; the shared set only
+  // adds cross-producer dedup (the same text raised by both a djmd and a camm
+  // track), matching ExifTool's single file-global hash.
   let mut emitted_msgs: std::vec::Vec<std::string::String> = std::vec::Vec::new();
   for w in warnings {
     let msg = rendered(w);
-    if emitted_msgs.iter().any(|m| *m == msg) {
-      // A repeat of an already-emitted distinct message — WAS_WARNED only bumped
-      // its count (folded into the ` [x$n]` suffix above); no further tag.
+    if was_warned.iter().any(|m| m.as_str() == msg) {
+      // A repeat of an already-emitted distinct message (in this dji emitter OR a
+      // sibling producer) — WAS_WARNED only bumped its count (folded into the
+      // ` [x$n]` suffix above); no further tag.
       continue;
     }
     // The numbered tag NAME: the first distinct message is `Warning`, the next
@@ -13679,6 +13745,7 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
       smol_str::SmolStr::from(std::format!("Warning ({})", emitted_msgs.len()))
     };
     emitted_msgs.push(msg.clone());
+    was_warned.push(smol_str::SmolStr::from(msg.as_str()));
     let track_index = if w.track_index() == 0 {
       1
     } else {
@@ -19833,6 +19900,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let w = tags
@@ -19859,6 +19927,7 @@ mod tests {
       &m,
       EmitOptions::g1(ConvMode::PrintConv, true),
       &mut gate1,
+      &mut std::vec::Vec::new(),
       &mut tags1,
     );
     let w1 = tags1
@@ -19874,6 +19943,7 @@ mod tests {
       &m,
       EmitOptions::g1(ConvMode::PrintConv, false),
       &mut gate2,
+      &mut std::vec::Vec::new(),
       &mut tags2,
     );
     assert!(tags2.is_empty(), "no warning without -ee");
@@ -19909,6 +19979,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
@@ -19953,6 +20024,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
@@ -20001,6 +20073,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let find = |name: &str| -> Option<TagValue> {
