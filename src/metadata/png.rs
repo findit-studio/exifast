@@ -701,9 +701,43 @@ pub struct PngMeta<'a> {
   /// `PNG.pm:1481`, …). The ENGINE surfaces the FIRST as
   /// `ExifTool:Warning` (`ExifTool.pm:1288-1297`).
   warnings: Vec<String>,
+  /// The WALK-ORDER interleaving of the three document-diagnostic sources —
+  /// the PNG-level [`Self::warnings`], the embedded-EXIF [`Self::exif_events`]
+  /// (whose replay surfaces the embedded `$et->Warn` corpus + the cross-source
+  /// cycle-guard), and the raw-profile [`Self::xmp_profiles`] (whose
+  /// `ProcessXMP` records at most one first-occurrence `$et->Warn`, e.g. `XMP is
+  /// double UTF-encoded`). Each push to one of those three streams appends one
+  /// [`PngDiagStep`] here, so the warning drain
+  /// ([`crate::diagnostics::Diagnose`]) can replay every document warning at its
+  /// CHUNK-WALK position — the order ExifTool's serial chunk walk
+  /// (`PNG.pm:1410-1685`) emits them in, which is load-bearing for the
+  /// document-level FIRST-`ExifTool:Warning` surface (`Warning` is `Priority=0`
+  /// first-wins, `ExifTool.pm:5404-5417`). Without it a raw-profile-XMP decode
+  /// warning would drain AFTER an unrelated later chunk's warning and hide it
+  /// (#205, a malformed-input ordering bug).
+  diag_order: Vec<PngDiagStep>,
   /// Phantom carry of `'a` for future zero-alloc evolution / sub-Meta
   /// embedding.
   _lifetime: core::marker::PhantomData<&'a ()>,
+}
+
+/// One step in [`PngMeta::diag_order`] — which document-diagnostic SOURCE the
+/// chunk walk reached next, recorded in walk order. The warning drain consumes
+/// the three source streams ([`PngMeta::warnings`], [`PngMeta::exif_events`],
+/// [`PngMeta::xmp_profiles`]) in lockstep with this sequence, so each source's
+/// own walk order is preserved AND the sources interleave at their true chunk
+/// positions (#205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PngDiagStep {
+  /// The next [`PngMeta::warnings`] entry — a PNG-level walker warning.
+  Warning,
+  /// The next [`PngMeta::exif_events`] entry — an embedded-EXIF event whose
+  /// replay yields its EXIF warnings + cross-source cycle-guard warning(s).
+  ExifEvent,
+  /// The next [`PngMeta::xmp_profiles`] entry — a raw-profile XMP packet whose
+  /// `ProcessXMP` decode yields at most one first-occurrence warning.
+  #[cfg(feature = "xmp")]
+  Xmp,
 }
 
 /// Which structural single-value PNG chunks (the [`PngMeta`] singleton fields)
@@ -770,6 +804,7 @@ impl PngMeta<'_> {
         time: false,
       },
       warnings: Vec::new(),
+      diag_order: Vec::new(),
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -1019,6 +1054,7 @@ impl PngMeta<'_> {
   /// preserves file order — which, with the per-event kind, drives the replay's
   /// reset / blocking decision (`PNG.pm:1193`, `ExifTool.pm:9061-9072`).
   pub(crate) fn push_exif_event(&mut self, event: PngExifEvent) {
+    self.diag_order.push(PngDiagStep::ExifEvent);
     self.exif_events.push(event);
   }
 
@@ -1027,6 +1063,7 @@ impl PngMeta<'_> {
   /// ORDER (`PNG.pm:746`/`:1236`). Decoded into `XMP-*` tags at emission time.
   #[cfg(feature = "xmp")]
   pub(crate) fn push_xmp_profile(&mut self, packet: Vec<u8>) {
+    self.diag_order.push(PngDiagStep::Xmp);
     self.xmp_profiles.push(packet);
   }
 
@@ -1043,7 +1080,19 @@ impl PngMeta<'_> {
 
   /// Append a structural warning.
   pub(crate) fn push_warning(&mut self, warning: String) {
+    self.diag_order.push(PngDiagStep::Warning);
     self.warnings.push(warning);
+  }
+
+  /// The WALK-ORDER interleaving of the three document-diagnostic sources (one
+  /// [`PngDiagStep`] per push to [`Self::warnings`] / [`Self::exif_events`] /
+  /// [`Self::xmp_profiles`]). The warning drain
+  /// ([`crate::diagnostics::Diagnose`]) replays it with three cursors so every
+  /// document warning surfaces at its chunk-walk position (#205).
+  #[inline]
+  #[must_use]
+  pub(crate) fn diag_order(&self) -> &[PngDiagStep] {
+    &self.diag_order
   }
 
   // ===== trailer (post-IEND) bookkeeping ================================

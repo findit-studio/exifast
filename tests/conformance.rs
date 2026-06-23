@@ -11325,6 +11325,32 @@ fn png_rawprofile_xmp_conformance() {
     "PNG_rawprofile_xmp_oddnibble.png.n.json",
     false,
   );
+  // #205 — diagnostics WALK-ORDER: a malformed `Raw profile type xmp` (the
+  // double-UTF packet → `XMP is double UTF-encoded`, XMP.pm:4494) positioned
+  // BEFORE a later bad `eXIf` (→ `Invalid eXIf chunk`, PNG.pm:1382). ExifTool's
+  // serial chunk walk emits the XMP warning FIRST (the XMP chunk is earlier), so
+  // it — not the later eXIf warning — is the document FIRST `ExifTool:Warning`
+  // (`Warning` is `Priority=0` first-wins, ExifTool.pm:5404-5417). The PNG port
+  // previously drained the raw-profile-XMP decode warning dead-last and surfaced
+  // `Invalid eXIf chunk` instead; the unified ordered diagnostic replay
+  // (`PngMeta::diag_order`) now emits each document warning at its chunk-walk
+  // position, byte-matching bundled. `PNG:eXIf` is dropped from BOTH sides: the
+  // invalid eXIf chunk makes bundled emit a `(Binary data …)` placeholder the
+  // PNG port suppresses (the pre-existing eXIf-suppression deferral) — the
+  // warning ORDER is what this golden pins. Oracle: bundled `perl exiftool -j
+  // -G1 -struct` 13.59.
+  check_excluding(
+    "PNG_rawprofile_xmp_warnorder.png",
+    "PNG_rawprofile_xmp_warnorder.png.json",
+    true,
+    &["PNG:eXIf"],
+  );
+  check_excluding(
+    "PNG_rawprofile_xmp_warnorder.png",
+    "PNG_rawprofile_xmp_warnorder.png.n.json",
+    false,
+    &["PNG:eXIf"],
+  );
 }
 
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
