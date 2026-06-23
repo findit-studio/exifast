@@ -227,6 +227,14 @@ const NOT_ACTIVE: &[&str] = &[
   // `-G1` golden is not byte-exact. Accept-deferred to #352 (the SubIFD walk);
   // the CR2 + ARW members of this set ARE active (the IFD0:PreviewImage proof).
   "DNG_preview_image.dng",
+  // The two Pentax PEF (`.pef`) RAW fixtures (#393/#401) ship with paired
+  // `.json`/`.n.json` goldens but their conformance tests are `#[ignore]`d pending
+  // the PEF/Pentax-variant decode port — exifast does not yet emit the full tag
+  // set bundled extracts from these bodies. Accept-deferred here so the auto-
+  // discovered active set stays at `EXPECTED_ACTIVE_FIXTURES`; the in-flight #393
+  // port will move them to active once the variants decode byte-exact.
+  "PEF_pentax_k3_mark_iii.pef",
+  "PEF_pentax_istd.pef",
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
