@@ -368,6 +368,72 @@ mod tests {
     );
   }
 
+  /// #203 — the PRODUCTION render path (`to_exiftool_json` -> `render_document` ->
+  /// `serde_json::to_string(&Document)`, the SAME path `extract_info`/conformance
+  /// flows through) emits an EXTREME / over-precision f64 as ExifTool
+  /// `EscapeJSON`'s BARE token (`return $str`, `exiftool:3810`), byte-for-byte —
+  /// NOT a quoted string. Ground-truthed against bundled ExifTool 13.59: a crafted
+  /// DOUBLE-typed Exif tag holding `f64::MAX` (`-u`) renders
+  /// `"IFD0:Exif_0x9a9a": 1.79769313486232e+308` (bare), and a string-origin
+  /// over-range exponent renders bare too. exifast PRE-#203 quoted both (a sound
+  /// fallback); this asserts the now-faithful bare emission on the real render
+  /// path. The companion `value.rs` wrapper/serializer tests pin the same at the
+  /// `JsonTagValue` and `to_value` layers; this is the end-to-end proof.
+  #[cfg(feature = "json")]
+  #[test]
+  fn render_document_emits_extreme_f64_bare_token() {
+    let mut m = Metadata::new("a.tif");
+    // NUMERIC-ORIGIN: a finite `TagValue::F64` near `f64::MAX`. ExifTool
+    // stringifies it `%.15g` -> `1.79769313486232e+308`, then `return $str` BARE
+    // (even though that token reparses to INFINITY — ExifTool never reparses).
+    m.push(
+      Group::new("IFD0", "IFD0"),
+      "RawGain",
+      TagValue::F64(f64::MAX),
+    );
+    // STRING-ORIGIN: an over/underflow exponent the EscapeJSON gate ADMITS
+    // (`e[-+]?\d{1,3}`) but finite-f64 cannot hold — bundled emits both BARE.
+    m.push(Group::new("X", "X"), "Over", TagValue::Str("1e999".into()));
+    m.push(
+      Group::new("X", "X"),
+      "Under",
+      TagValue::Str("1e-999".into()),
+    );
+    let s = to_exiftool_json(&m);
+    // Each emits its EXACT token BARE (unquoted), byte-identical to bundled.
+    assert!(
+      s.contains(r#""IFD0:RawGain":1.79769313486232e+308"#),
+      "near-f64::MAX must emit its bare %.15g token, not quoted: {s}"
+    );
+    assert!(
+      s.contains(r#""X:Over":1e999"#),
+      "over-range exponent must emit bare, not quoted: {s}"
+    );
+    assert!(
+      s.contains(r#""X:Under":1e-999"#),
+      "underflow exponent must emit bare (significand preserved), not quoted: {s}"
+    );
+    // And NOT the pre-#203 QUOTED-string fallback (the lexeme is now a bare number).
+    assert!(
+      !s.contains(r#""IFD0:RawGain":"1.79769313486232e+308""#),
+      "near-f64::MAX must NOT be quoted: {s}"
+    );
+    assert!(
+      !s.contains(r#""X:Over":"1e999""#) && !s.contains(r#""X:Under":"1e-999""#),
+      "over/underflow tokens must NOT be quoted: {s}"
+    );
+    // The verbatim bytes are valid JSON: the document parses, and each extreme
+    // token round-trips byte-identically through a borrowed `RawValue` (the raw
+    // bytes, NOT a reparsed canonical `Number` — which would `NumberOutOfRange`).
+    let raw: Vec<&serde_json::value::RawValue> =
+      serde_json::from_str(&s).expect("document is a valid single-object JSON array");
+    let obj: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+      serde_json::from_str(raw[0].get()).expect("file object");
+    assert_eq!(obj["IFD0:RawGain"].get(), "1.79769313486232e+308");
+    assert_eq!(obj["X:Over"].get(), "1e999");
+    assert_eq!(obj["X:Under"].get(), "1e-999");
+  }
+
   #[test]
   fn boolean_value() {
     let mut m = Metadata::new("a.jpg");
