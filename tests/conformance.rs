@@ -8918,6 +8918,83 @@ fn exif_ambient_wrongfmt_conformance() {
   );
 }
 #[test]
+fn exif_componentsconfig_wrongfmt_conformance() {
+  // #201 — `ComponentsConfiguration` (0x9101) `Conv::ComponentsConfiguration`
+  // written with the WRONG on-disk format. Unlike the 0xa462/0x9400 `$val`
+  // byte-walks, 0x9101 carries a `Format => 'int8u'` READ override
+  // (`Exif.pm:2298`, `tables::format_override`): ExifTool re-reads the on-disk
+  // value as `int(size/1)` int8u ELEMENTS regardless of the declared format
+  // code, so the per-byte PrintConv (`Exif.pm:2304-2333`) sees the raw value
+  // bytes one-per-element.
+  //
+  // `wrongfmt` = `int16u[2]` `0x0102 0x0300` (on-disk bytes `01 02 03 00`): the
+  // int8u re-read yields elements `1 2 3 0` → `-j` "Y, Cb, Cr, -" (NOT the
+  // int16u decode "258 768"), `-n` "1 2 3 0". This is the discriminating shape —
+  // a `RawValue::val_bytes()` byte-walk would emit the space-joined int16u `$val`
+  // ("258 768"), so ONLY re-reading the raw on-disk bytes as int8u matches.
+  //
+  // `wrongfmt_err` = `int8u[4]` `7 99 0 1` (codes 7/99 not in the 0..6 hash):
+  // pins the `OTHER` sub's `$$conv{$_} || "Err ($_)"` fall-through
+  // (`Exif.pm:2330`) → `-j` "Err (7), Err (99), -, Y" (NOT "?"), `-n` "7 99 0 1".
+  //
+  // Pre-fix exifast decoded 0x9101 per its on-disk format and the
+  // `RawValue::Bytes`-only conv arm fell through to `emit_raw` (the int16u
+  // "258 768" / the int8u space-join). Both verified byte-identical to bundled
+  // `perl exiftool` 13.59.
+  //
+  // #201 R2 — the SINGLETON / short shapes the four-byte `wrongfmt`/`wrongfmt_err`
+  // values do NOT exercise. Under `-n` ExifTool emits the post-`ReadValue` raw
+  // SCALAR: a one-element 0x9101 (`int(size/1)==1`) is a BARE JSON number (the
+  // EscapeJSON number gate), while a COUNT>1 value space-joins to a quoted string.
+  // The pre-R2 `-n` arm unconditionally joined + `write_str`, so a singleton
+  // emitted the STRING "1" rather than the bare number `1`.
+  //   * `singleton` = `int8u[1]` code `1` → `-j` "Y", `-n` `1` (bare number, NOT
+  //     "1"). The discriminating shape for this fix.
+  //   * `pair` = `int8u[2]` codes `1 2` → `-j` "Y, Cb", `-n` "1 2" (the
+  //     count==2 boundary — still the space-joined quoted string).
+  // Both verified byte-identical to bundled `perl exiftool` 13.59.
+  check(
+    "Exif_componentsconfig_wrongfmt.tif",
+    "Exif_componentsconfig_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_componentsconfig_wrongfmt.tif",
+    "Exif_componentsconfig_wrongfmt.tif.n.json",
+    false,
+  );
+  check(
+    "Exif_componentsconfig_wrongfmt_err.tif",
+    "Exif_componentsconfig_wrongfmt_err.tif.json",
+    true,
+  );
+  check(
+    "Exif_componentsconfig_wrongfmt_err.tif",
+    "Exif_componentsconfig_wrongfmt_err.tif.n.json",
+    false,
+  );
+  check(
+    "Exif_componentsconfig_singleton.tif",
+    "Exif_componentsconfig_singleton.tif.json",
+    true,
+  );
+  check(
+    "Exif_componentsconfig_singleton.tif",
+    "Exif_componentsconfig_singleton.tif.n.json",
+    false,
+  );
+  check(
+    "Exif_componentsconfig_pair.tif",
+    "Exif_componentsconfig_pair.tif.json",
+    true,
+  );
+  check(
+    "Exif_componentsconfig_pair.tif",
+    "Exif_componentsconfig_pair.tif.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_gps_after_interop_conformance() {
   // PR #36 Codex R12 F2 — the Windows Phone 7.5 InteropIFD/GPS pointer
   // collision. IFD0's GPSInfo (0x8825) and ExifIFD's InteropOffset

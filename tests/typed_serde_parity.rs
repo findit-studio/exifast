@@ -1197,7 +1197,32 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// dup-warn fixture, the default `-j` carries no per-sample payload, so
 /// `Composite:AvgBitrate` is the sole synthesized Composite; `System:all` the
 /// sole exclusion.
-const EXPECTED_ACTIVE_FIXTURES: usize = 581;
+///
+/// 581 → 583 (#201) adds two WRONG-on-disk-format `ComponentsConfiguration`
+/// (0x9101) fixtures. Unlike the 0xa462/0x9400 `$val` byte-walks, 0x9101 carries
+/// a `Format => 'int8u'` READ override (`Exif.pm:2298`) so ExifTool re-reads the
+/// raw value bytes as `int(size/1)` int8u ELEMENTS regardless of the declared
+/// format — the per-byte PrintConv sees the raw bytes one-per-element:
+///   * `Exif_componentsconfig_wrongfmt.tif` (`int16u[2]` `0x0102 0x0300` →
+///     on-disk bytes `01 02 03 00` → int8u re-read `1 2 3 0` → `-j`
+///     "Y, Cb, Cr, -" / `-n` "1 2 3 0"; the discriminating shape a
+///     `val_bytes()` walk would mis-render as "258 768");
+///   * `Exif_componentsconfig_wrongfmt_err.tif` (`int8u[4]` `7 99 0 1`, codes
+///     7/99 un-hashed → the `OTHER` sub's `"Err ($_)"` → `-j`
+///     "Err (7), Err (99), -, Y" / `-n` "7 99 0 1").
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 583 → 585 (#201 R2) adds two SHORT 0x9101 fixtures the four-byte values above
+/// do not exercise: under `-n` ExifTool emits the post-`ReadValue` raw SCALAR, so
+/// a SINGLETON is a BARE JSON number (the EscapeJSON number gate) while a COUNT>1
+/// value space-joins to a quoted string. (The pre-R2 `-n` arm unconditionally
+/// joined + `write_str`, emitting the singleton as the STRING "1".)
+///   * `Exif_componentsconfig_singleton.tif` (`int8u[1]` code `1` → `-j` "Y" /
+///     `-n` `1`, a bare number — the discriminating shape);
+///   * `Exif_componentsconfig_pair.tif` (`int8u[2]` codes `1 2` → `-j` "Y, Cb" /
+///     `-n` "1 2", the count==2 boundary — still a space-joined quoted string).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 585;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
