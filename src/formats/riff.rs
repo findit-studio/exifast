@@ -2476,12 +2476,14 @@ fn emit_bmp_video_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
 /// Non-printable bytes are replaced with `\xNN` escapes; bundled also trims
 /// trailing whitespace via `unpack("A4", ...)`.
 fn render_fourcc(bytes: &[u8; 4]) -> String {
+  use core::fmt::Write as _;
   // bundled: `$val =~ s/([\0-\x1f\x7f-\xff])/sprintf('\\x%.2x',ord $1)/eg`,
   // then implicit `unpack("A4")` trims trailing ASCII spaces.
-  let mut s = String::new();
+  // Worst case is 4 escaped bytes (`\xNN` each = 4 chars).
+  let mut s = String::with_capacity(bytes.len() * 4);
   for &b in bytes.iter() {
     if !(0x20..0x7f).contains(&b) {
-      s.push_str(&std::format!("\\x{b:02x}"));
+      let _ = write!(&mut s, "\\x{b:02x}");
     } else {
       s.push(b as char);
     }

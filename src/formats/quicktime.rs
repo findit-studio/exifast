@@ -16182,16 +16182,18 @@ fn camm_gps_measure_mode_value(mode: u32, print_conv: bool) -> crate::value::Tag
 fn media_uid_value(raw: &str, print_conv: bool) -> crate::value::TagValue {
   use crate::value::TagValue;
   if print_conv {
+    use core::fmt::Write as _;
     // Hex-concatenate the parsed u32s. A non-numeric element falls back to a
     // bare `0` slot only if `parse` fails — but the parser always emits
     // decimal u32s, so every element parses. Faithful `sprintf('%.8x',$_)`.
-    let mut hex = std::string::String::new();
+    // Each u32 renders to exactly 8 hex chars.
+    let mut hex = std::string::String::with_capacity(raw.len());
     for tok in raw.split(' ') {
       if tok.is_empty() {
         continue;
       }
       let v: u32 = tok.parse().unwrap_or(0);
-      hex.push_str(&std::format!("{v:08x}"));
+      let _ = write!(&mut hex, "{v:08x}");
     }
     TagValue::Str(hex.into())
   } else {

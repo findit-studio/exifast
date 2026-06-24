@@ -409,12 +409,13 @@ fn bytes_to_decimal_string(bytes: &[u8]) -> String {
     }
   }
   // Serialize most-significant first; interior limbs zero-pad to 9.
+  use core::fmt::Write as _;
   let mut out = String::with_capacity(limbs.len() * 9);
   if let Some(last) = limbs.last() {
     out.push_str(&last.to_string());
   }
   for limb in limbs.iter().rev().skip(1) {
-    out.push_str(&format!("{:09}", limb));
+    let _ = write!(&mut out, "{limb:09}");
   }
   out
 }
