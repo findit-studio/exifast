@@ -1,26 +1,18 @@
-[
-  {
-    "ExifTool:ExifToolVersion": 13.55,
-    "File:FileName": "MPEG2_TS_mpeg2video.ts",
-    "File:Directory": "tests/fixtures",
-    "File:FileSize": 3989924,
-    "File:FileModifyDate": "2026:06:24 12:35:45+09:00",
-    "File:FileAccessDate": "2026:06:24 12:35:45+09:00",
-    "File:FileInodeChangeDate": "2026:06:24 12:35:45+09:00",
-    "File:FilePermissions": 100644,
-    "File:FileType": "M2T",
-    "File:FileTypeExtension": "M2T",
-    "File:MIMEType": "video/mpeg",
-    "M2TS:AudioStreamType": 129,
-    "M2TS:AudioSampleRate": 0,
-    "M2TS:Duration": 4.42108888888889,
-    "MPEG:ImageWidth": 1280,
-    "MPEG:ImageHeight": 720,
-    "MPEG:AspectRatio": 0.7031,
-    "MPEG:FrameRate": 59.94,
-    "MPEG:VideoBitrate": 19000000,
-    "Composite:ImageSize": "1280 720",
-    "Composite:Megapixels": 0.9216,
-    "Composite:Duration": 1.679968
-  }
-]
+[{
+  "SourceFile": "MPEG2_TS_mpeg2video.ts",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "M2T",
+  "File:FileTypeExtension": "m2t",
+  "File:MIMEType": "video/mpeg",
+  "M2TS:AudioStreamType": "A52/AC-3 Audio",
+  "M2TS:Duration": "4.42 s",
+  "AC3:AudioSampleRate": 48000,
+  "MPEG:ImageWidth": 1280,
+  "MPEG:ImageHeight": 720,
+  "MPEG:AspectRatio": "16:9, 625 line, PAL",
+  "MPEG:FrameRate": "59.94 fps",
+  "MPEG:VideoBitrate": "19 Mbps",
+  "Composite:ImageSize": "1280x720",
+  "Composite:Megapixels": 0.922,
+  "Composite:Duration": "1.68 s (approx)"
+}]
