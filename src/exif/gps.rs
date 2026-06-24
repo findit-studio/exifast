@@ -126,11 +126,34 @@ pub enum GpsConv {
 #[derive(Debug, Clone, Copy)]
 pub struct GpsTag {
   /// On-disk tag ID (`%GPS::Main` hash key).
-  pub id: u16,
+  id: u16,
   /// Tag NAME (`Name => '…'`).
-  pub name: &'static str,
+  name: &'static str,
   /// The conversion ExifTool applies.
-  pub conv: GpsConv,
+  conv: GpsConv,
+}
+
+impl GpsTag {
+  /// On-disk tag ID (`%GPS::Main` hash key).
+  #[must_use]
+  #[inline]
+  pub const fn id(&self) -> u16 {
+    self.id
+  }
+
+  /// Tag NAME (`Name => '…'`).
+  #[must_use]
+  #[inline]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+
+  /// The conversion ExifTool applies.
+  #[must_use]
+  #[inline]
+  pub const fn conv(&self) -> GpsConv {
+    self.conv
+  }
 }
 
 /// The ported `%Image::ExifTool::GPS::Main` (`GPS.pm:50-353`). The GPS IFD

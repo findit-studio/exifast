@@ -287,11 +287,11 @@ pub enum Conv {
 #[derive(Debug, Clone, Copy)]
 pub struct ExifTag {
   /// On-disk tag ID (`%Exif::Main` hash key).
-  pub id: u16,
+  id: u16,
   /// Tag NAME (`Name => '…'`).
-  pub name: &'static str,
+  name: &'static str,
   /// The conversion ExifTool applies.
-  pub conv: Conv,
+  conv: Conv,
 }
 
 /// The `OffsetPair` + `DataTag` attribute pair on an `IsOffset` leaf
@@ -332,6 +332,36 @@ impl DataTagSpec {
 }
 
 impl ExifTag {
+  /// Construct a tag descriptor — the const constructor the table literals
+  /// (and the synthetic-image placeholder in [`crate::exif`]) use in place of
+  /// a private-field struct literal.
+  #[must_use]
+  #[inline]
+  pub const fn new(id: u16, name: &'static str, conv: Conv) -> Self {
+    Self { id, name, conv }
+  }
+
+  /// On-disk tag ID (`%Exif::Main` hash key).
+  #[must_use]
+  #[inline]
+  pub const fn id(&self) -> u16 {
+    self.id
+  }
+
+  /// Tag NAME (`Name => '…'`).
+  #[must_use]
+  #[inline]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+
+  /// The conversion ExifTool applies.
+  #[must_use]
+  #[inline]
+  pub const fn conv(&self) -> Conv {
+    self.conv
+  }
+
   /// The `OffsetPair`/`DataTag` attribute pair for this leaf, if it is an
   /// `IsOffset` tag that names a binary `DataTag` image — `None` for every
   /// other leaf. Keyed by tag ID (the attribute lives on the `%Exif::Main`
