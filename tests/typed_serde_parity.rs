@@ -1386,7 +1386,26 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `APNG`, `MIMEType` → `image/apng`, `FileTypeExtension` → `png`/`PNG`). The
 /// per-frame `fcTL`/`fdAT` chunks have no bundled table and emit nothing.
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 606;
+/// 606 → 609 (#158, the faithfully-craftable RIFF (AVI) `strd` StreamData
+/// variants) adds `AVI_strd_zora.avi` (`RIFF:VendorName` — Samsung PL90,
+/// `RIFF.pm:1270`), `AVI_strd_casi.avi` (`Casio:Software` via `%Casio::AVI`,
+/// `RIFF.pm:1266-1269` / `Casio.pm:2006-2015`) + `AVI_strd_unknown.avi`
+/// (`RIFF:UnknownData` — the `unknown` fallback, `RIFF.pm:1271-1275`) — crafted
+/// minimal AVIs whose `LIST_strl` carries a single `strd` chunk
+/// (`ProcessStreamData`, `RIFF.pm:1699-1748`). The Canon `AVIF` variant
+/// (headerless-IFD0 `Exif::Main` re-dispatch + `Base`/offset mechanics, needs a
+/// real Canon AVIF) stays deferred. Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+/// 609 → 611 (#158 Codex [medium], the MULTI-stream `strd` fix) adds
+/// `AVI_strd_multi.avi` — a two-`LIST_strl` AVI whose `strd` chunks are
+/// DIFFERENT variants (`XVND…` unknown ⇒ `RIFF:UnknownData`, then `Zora…` ⇒
+/// `RIFF:VendorName`): bundled runs `ProcessStreamData` per stream so BOTH
+/// leaves emit, where the old single-slot capture dropped the second — and
+/// `AVI_strd_dup.avi` — two SAME-variant `Zora…` `strd` chunks rendering to the
+/// same `RIFF:VendorName`, pinning the `TagMap` last-wins duplicate resolution
+/// (`"ZoraSECOND"`) against bundled 13.59. Additive — every PRE-EXISTING golden
+/// (incl. the three single-`strd` fixtures) stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 611;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
