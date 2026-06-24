@@ -1969,12 +1969,16 @@ fn avif_brand_conformance() {
   //
   // EXCLUDE (now baked into the `gen_golden.sh AVIF_sample.avif` arm): `-x
   // System:all -x HandlerType -x HandlerDescription -x PixelAspectRatio
-  // -x ImageSpatialExtent -x ImagePixelDepth -x AV1ConfigurationVersion
-  // -x ChromaFormat -x ChromaSamplePosition`. The AVIF has only a file-`meta`
+  // -x ImageSpatialExtent -x ImagePixelDepth`. The AVIF has only a file-`meta`
   // `pict` handler (no `trak`), so the bare `-x HandlerType`/`HandlerDescription`
-  // are collision-free; the `av1C`/`pasp`/`ispe`/`pixi` property atoms are the
-  // unsupported codec-config / spatial-extent fields. The brand routing + `pitm`
-  // + the primary-`ispe` `File:ImageWidth`/`Height` (#146) are byte-exact.
+  // are collision-free; the `pasp`/`ispe`/`pixi` property atoms are the
+  // unsupported spatial-extent / aspect fields (the ipco QuickTime-group
+  // property-tag emission, sibling-issue #146/#147 territory). The `av1C` AV1
+  // Codec Configuration IS now ported (#149) — the three non-`Unknown`
+  // `AV1Config` tags (`AV1ConfigurationVersion` 1, `ChromaFormat` "YUV
+  // 4:2:0"/3, `ChromaSamplePosition` "Unknown"/0) emit byte-exact and are KEPT
+  // in the golden. The brand routing + `pitm` + the primary-`ispe`
+  // `File:ImageWidth`/`Height` (#146) are byte-exact.
   // `Composite:all` is NO LONGER excluded: an `image/*` QuickTime is allow-listed
   // (#133 PR 3), so exifast now builds the ported `Composite:ImageSize`
   // ("1204x800") + `Composite:Megapixels` (0.963) from the primary dimensions,

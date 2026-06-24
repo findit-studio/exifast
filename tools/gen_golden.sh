@@ -419,11 +419,16 @@ case "$FIX" in
                   -x ParallelismType -x ChromaFormat -x BitDepthLuma \
                   -x BitDepthChroma -x AverageFrameRate -x ConstantFrameRate \
                   -x NumTemporalLayers -x TemporalIDNested) ;;
+  # #149: the `av1C` AV1 Codec Configuration is now ported — exifast emits the
+  # three non-`Unknown` `AV1Config` tags (`AV1ConfigurationVersion`/`ChromaFormat`/
+  # `ChromaSamplePosition`) byte-exact, so those `-x` are REMOVED. The remaining
+  # drops are the file-`meta` `hdlr` (`HandlerType`/`HandlerDescription`) and the
+  # other `ipco` property atoms (`pasp` PixelAspectRatio / `ispe`
+  # ImageSpatialExtent / `pixi` ImagePixelDepth) — the QuickTime-group ipco
+  # property-tag emission is the sibling-issue territory (#146/#147), deferred.
   AVIF_sample.avif)
     EXCLUDE_ARR+=(-x System:all -x HandlerType -x HandlerDescription \
-                  -x PixelAspectRatio -x ImageSpatialExtent -x ImagePixelDepth \
-                  -x AV1ConfigurationVersion -x ChromaFormat \
-                  -x ChromaSamplePosition) ;;
+                  -x PixelAspectRatio -x ImageSpatialExtent -x ImagePixelDepth) ;;
   # SamsungNX500.srw (#133 PR 4): exifast now builds the ported EXIF + lens
   # Composite chain (`Aperture`/`ShutterSpeed`/`ScaleFactor35efl` [SAMSUNG, NOT
   # Canon — the simple `$foc35/$focal` path: 69/45 = 1.5] / `CircleOfConfusion`/

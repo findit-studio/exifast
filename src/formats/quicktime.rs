@@ -11535,6 +11535,75 @@ impl crate::emit::Taggable for Meta<'_> {
         false,
       ));
     }
+    // HEIF/AVIF `av1C` AV1 Codec Configuration (#149). The `ipco` `av1C`
+    // property (QuickTime.pm:3079-3082) is a `ProcessBinaryData` SubDirectory
+    // (`%QuickTime::AV1Config`, QuickTime.pm:3308-3367). The table sets only
+    // `GROUPS => { 2 => 'Video' }`, inheriting the parent QuickTime table's
+    // family-0/1 `QuickTime`/`QuickTime` (oracle `-G1`: `QuickTime:ChromaFormat`).
+    // Three non-`Unknown` tags emit, in table (byte-offset) order:
+    //   AV1ConfigurationVersion (no PrintConv ⇒ bare int both modes),
+    //   ChromaFormat            (PrintConv map; -n ⇒ raw int),
+    //   ChromaSamplePosition    (PrintConv map; -n ⇒ raw int).
+    // A PrintConv hash MISS renders `Unknown ($val)` (ExifTool.pm:3622), as for
+    // MajorBrand above. Oracle (AVIF_sample.avif): AV1ConfigurationVersion 1,
+    // ChromaFormat "YUV 4:2:0"/3, ChromaSamplePosition "Unknown"/0.
+    //
+    // Each tag is emitted PER-FIELD: `ProcessBinaryData` emits a tag only when
+    // its byte offset is within the `av1C` body (ExifTool.pm:9963-9964), so a
+    // truncated 1-/2-byte `av1C` carries `AV1ConfigurationVersion` (byte 0) but
+    // NOT `ChromaFormat`/`ChromaSamplePosition` (byte 2). The per-field `Option`s
+    // on `Av1Config` carry that presence (oracle: crafted 1/2-byte AVIF → version
+    // only; 3+-byte → all three; duplicate av1C → per-tag last-wins).
+    if let Some(cfg) = self.heif().av1_config() {
+      if let Some(version) = cfg.version() {
+        tags.push(EmittedTag::new(
+          main(),
+          "AV1ConfigurationVersion".into(),
+          TagValue::U64(u64::from(version)),
+          false,
+        ));
+      }
+      if let Some(cf) = cfg.chroma_format() {
+        let chroma_format = if print_conv {
+          // `Mask 0x1c` ⇒ values 0..=7; only 0/2/3/7 are mapped, so 1/4/5/6 fall
+          // through to `Unknown ($val)` (ExifTool.pm:3622).
+          match cf {
+            0 => TagValue::Str("YUV 4:4:4".into()),
+            2 => TagValue::Str("YUV 4:2:2".into()),
+            3 => TagValue::Str("YUV 4:2:0".into()),
+            7 => TagValue::Str("Monochrome 4:0:0".into()),
+            other => TagValue::Str(std::format!("Unknown ({other})").into()),
+          }
+        } else {
+          TagValue::U64(u64::from(cf))
+        };
+        tags.push(EmittedTag::new(
+          main(),
+          "ChromaFormat".into(),
+          chroma_format,
+          false,
+        ));
+      }
+      if let Some(csp) = cfg.chroma_sample_position() {
+        let chroma_sample_position = if print_conv {
+          // `Mask 0x03` ⇒ values 0..=3, all mapped (no `Unknown` fallthrough).
+          match csp {
+            0 => TagValue::Str("Unknown".into()),
+            1 => TagValue::Str("Vertical".into()),
+            2 => TagValue::Str("Colocated".into()),
+            _ => TagValue::Str("(reserved)".into()),
+          }
+        } else {
+          TagValue::U64(u64::from(csp))
+        };
+        tags.push(EmittedTag::new(
+          main(),
+          "ChromaSamplePosition".into(),
+          chroma_sample_position,
+          false,
+        ));
+      }
+    }
     // HEIF `File:ImageWidth` / `File:ImageHeight` (#146) from the PRIMARY item's
     // `ispe` (ImageSpatialExtent, QuickTime.pm:3034-3047). The `ispe` `RawConv`
     // `FoundTag(ImageWidth/ImageHeight)` runs only for the primary (main-document)
