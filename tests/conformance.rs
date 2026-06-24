@@ -11511,6 +11511,102 @@ fn png_rawprofile_xmp_conformance() {
   );
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_crafted_input_hardening_conformance() {
+  // #180 — POST-IEND TRAILER family-1 group on a warning raised while parsing a
+  // trailer chunk. A complete (IEND-terminated) PNG followed by a TRAILER `iCCP`
+  // chunk whose zlib stream is corrupt. Bundled (`PNG.pm:1479-1484`) processes
+  // post-IEND chunks under `$$et{SET_GROUP1} = 'Trailer'`, so the `Error
+  // inflating iCCP` warning (`PNG.pm:942`) — raised WHILE parsing the trailer
+  // chunk — resolves its family-1 group to `Trailer` (`ExifTool.pm:9475`) and
+  // surfaces as the `Trailer:Warning` TAG, NOT the document `ExifTool:Warning`.
+  // The trailer-ENTRY warning `Trailer data after PNG IEND chunk` (`PNG.pm:1481`)
+  // is raised BEFORE `SET_GROUP1`, so it stays `ExifTool:Warning` (and `[minor]`).
+  // The trailer iCCP's `ProfileName` rides the `Trailer` group too. The port
+  // previously emitted the inflate-error warning as a flat document-level
+  // `ExifTool:Warning` (no `Trailer:Warning` key); it now group-scopes every
+  // post-IEND-trailer warning via the `trailer_warning_start` watermark. Bundled
+  // also emits a deferred `Trailer:ICC_Profile` binary placeholder (no
+  // ICC_Profile sub-port) the port suppresses — dropped from both sides. Oracle:
+  // bundled `perl exiftool -j -G1 -struct` 13.59.
+  check_excluding(
+    "PNG_trailer_iccp_warn.png",
+    "PNG_trailer_iccp_warn.png.json",
+    true,
+    &["Trailer:ICC_Profile"],
+  );
+  check_excluding(
+    "PNG_trailer_iccp_warn.png",
+    "PNG_trailer_iccp_warn.png.n.json",
+    false,
+    &["Trailer:ICC_Profile"],
+  );
+  // #178-item1 — NESTED-zXIf inner inflate recursion warning text. A `zxIf`
+  // (compressed EXIF) chunk whose body inflates to a SECOND `\0`-typed (still
+  // "compressed") block of only 3 bytes. Bundled's `ProcessPNG_eXIf`
+  // (`PNG.pm:1378-1389`) re-enters `FoundPNG` (level 2) on the inflated buffer
+  // and, seeing the `\0` type again, does `substr($inner, 5)` — empty/`undef` on
+  // the 3-byte inner block — so the second inflate FAILS ⇒ `Error inflating
+  // zxIf`. The port (pre-#178) treated the sub-5-byte inner `\0` block as a
+  // non-II/MM TIFF and warned `Invalid zxIf chunk`; it now bounded-recurses the
+  // inner inflate (depth-guarded against a nested-compression DoS) so the warning
+  // matches bundled. Both extract no EXIF. Bundled emits a `PNG:zxIf` binary
+  // placeholder the port suppresses (the pre-existing eXIf/zxIf-suppression
+  // deferral, as `PNG_rawprofile_xmp_warnorder` drops `PNG:eXIf`) — dropped from
+  // both sides. Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check_excluding(
+    "PNG_nested_zxif.png",
+    "PNG_nested_zxif.png.json",
+    true,
+    &["PNG:zxIf"],
+  );
+  check_excluding(
+    "PNG_nested_zxif.png",
+    "PNG_nested_zxif.png.n.json",
+    false,
+    &["PNG:zxIf"],
+  );
+}
+
+#[test]
+#[cfg(all(feature = "png", feature = "xmp"))]
+fn png_trailer_xmp_warn_conformance() {
+  // #180 (round 2) — POST-IEND TRAILER diagnostic re-scoping for an embedded XMP
+  // sub-Meta. A complete (IEND-terminated) PNG followed by a TRAILER `Raw profile
+  // type xmp` tEXt chunk carrying the double-UTF packet. Bundled processes
+  // post-IEND chunks under `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1479-1484`), so
+  // the XMP sub-Meta's `XMP is double UTF-encoded` `$et->Warn` (`XMP.pm:4494`, a
+  // DOCUMENT-level warning — empty `$grps[1]`) resolves under that global to the
+  // family-1 `Trailer:Warning` TAG (`ExifTool.pm:9475`), NOT the document-level
+  // `ExifTool:Warning`. It then LOSES the priority-0 first-wins race
+  // (`ExifTool.pm:5404-5417`) to the EARLIER `Trailer:Warning = "[minor] Text/EXIF
+  // chunk(s) found after PNG IDAT …"` (`PNG.pm:1604`, raised when the trailer tEXt
+  // chunk is first encountered) and is SUPPRESSED — so the observable proof of the
+  // re-scoping is the ABSENCE of a stray doc-level `ExifTool:Warning` for it. The
+  // PNG port previously forwarded the XMP diagnostic UNCHANGED (leaking it as a
+  // doc-level `ExifTool:Warning`) and shifted the decoded `XMP-dc:Format` tag to
+  // `Trailer:Format`; it now (a) re-scopes the trailing XMP/EXIF diagnostics to
+  // the `Trailer` group via the `xmp_is_trailing`/`event_is_trailing` watermarks
+  // (mirroring the `warning_is_trailing` Warning arm) and (b) keeps the explicit
+  // `XMP-<ns>` family-1 group (the `$grps[1] or …` short-circuit) so
+  // `XMP-dc:Format` stays `XMP-dc`, NOT `Trailer`. No deferred-subsystem key to
+  // drop, so a PLAIN `check`. Gated on the `xmp` feature (the golden expects the
+  // decoded `XMP-dc:Format`, which a non-`xmp` build drops — mirrors
+  // `png_rawprofile_xmp_conformance`). Oracle: bundled
+  // `perl exiftool -j -G1 -struct` 13.59.
+  check(
+    "PNG_trailer_xmp_warn.png",
+    "PNG_trailer_xmp_warn.png.json",
+    true,
+  );
+  check(
+    "PNG_trailer_xmp_warn.png",
+    "PNG_trailer_xmp_warn.png.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

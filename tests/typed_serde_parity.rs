@@ -406,6 +406,21 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // not the later `Invalid eXIf chunk`) is what this fixture pins. Mirrors
   // `conformance.rs::png_rawprofile_xmp_conformance`'s `check_excluding`.
   ("PNG_rawprofile_xmp_warnorder.png", &["PNG:eXIf"]),
+  // #180 — the post-`IEND` Trailer family-1 group fixture. The trailer `iCCP`
+  // chunk's corrupt zlib stream makes bundled emit a deferred `Trailer:ICC_Profile
+  // = (Binary data 1 bytes, …)` placeholder (the still-compressed body) that the
+  // PNG port suppresses (no ICC_Profile sub-port). Dropped from BOTH sides; the
+  // group-scoped `Trailer:Warning = Error inflating iCCP` (the #180 fix) and the
+  // `Trailer:ProfileName` are what this fixture pins. Mirrors
+  // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
+  ("PNG_trailer_iccp_warn.png", &["Trailer:ICC_Profile"]),
+  // #178-item1 — the nested-zXIf inner-inflate fixture. The doubly-compressed
+  // `zxIf` makes bundled emit a `PNG:zxIf = <err>` placeholder the PNG port
+  // suppresses (the pre-existing eXIf/zxIf-suppression deferral). Dropped from
+  // BOTH sides; the `Error inflating zxIf` warning text (the #178-item1 fix, vs
+  // the prior `Invalid zxIf chunk`) is what this fixture pins. Mirrors
+  // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
+  ("PNG_nested_zxif.png", &["PNG:zxIf"]),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1230,7 +1245,33 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///   * `Exif_componentsconfig_pair.tif` (`int8u[2]` codes `1 2` → `-j` "Y, Cb" /
 ///     `-n` "1 2", the count==2 boundary — still a space-joined quoted string).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 585;
+///
+/// 585 → 587 (#180 + #178-item1, PNG crafted-input hardening) adds two minimal
+/// 1x1 malformed PNGs whose only variation is a decode-error edge (the default
+/// well-formed PNG path is unaffected):
+///   * `PNG_trailer_iccp_warn.png` — a post-`IEND` TRAILER `iCCP` chunk with a
+///     corrupt zlib stream: the `Error inflating iCCP` warning is raised under
+///     `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1484`) so it surfaces as the
+///     `Trailer:Warning` TAG (#180); the trailer-entry `Trailer data after PNG
+///     IEND chunk` stays the document `[minor] ExifTool:Warning`.
+///   * `PNG_nested_zxif.png` — a `zxIf` whose inflated buffer is itself a
+///     degenerate `\0`-typed (still "compressed") block: bundled re-enters
+///     `ProcessPNG_eXIf` and inflates AGAIN ⇒ `Error inflating zxIf` (the port
+///     bounded-recurses the inner inflate, #178-item1) rather than the prior
+///     `Invalid zxIf chunk`.
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 587 → 588 (#180 round 2, PNG TRAILER diagnostic re-scoping) adds one minimal
+/// 1x1 PNG with a post-`IEND` TRAILER `Raw profile type xmp` chunk:
+///   * `PNG_trailer_xmp_warn.png` — the trailing embedded-XMP sub-Meta's `XMP is
+///     double UTF-encoded` `$et->Warn` is re-scoped to the `Trailer` family-1
+///     group (`PNG.pm:1484`, mirroring the Warning arm) so it does NOT leak as a
+///     stray doc-level `ExifTool:Warning` (priority-0 first-wins then suppresses
+///     it behind the earlier `Trailer:Warning`), while the decoded
+///     `XMP-dc:Format` keeps its EXPLICIT `XMP-dc` family-1 group (NOT `Trailer`,
+///     the `$grps[1] or …` short-circuit). No dropped keys (a plain golden).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 588;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

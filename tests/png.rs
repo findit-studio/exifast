@@ -2319,10 +2319,11 @@ fn engine_trailing_exif_decodes_under_trailer_group_with_warning() {
   );
   // It is NOT under the standard `File` group anymore.
   assert!(!json.contains("\"File:ExifByteOrder\""), "got {json}");
-  // The document-level minor warning fires (exact text, sans the [minor] flag
-  // prefix that exifast strips like every other minor warning).
+  // The document-level minor warning fires with its `[minor] ` prefix
+  // (`PNG.pm:1481` `$et->Warn(..., 1)`, applied by the diagnostics mechanism —
+  // matching bundled + the committed goldens).
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   // Standard PNG structural tags still present and UNshifted (they are pre-IEND).
@@ -2366,7 +2367,7 @@ fn engine_trailing_exif_gps_keeps_ifd_groups_byteorder_and_gps_shift_to_trailer(
   // GPS is NOT under the normal `GPS` group.
   assert!(!json.contains("\"GPS:GPSLatitudeRef\""), "got {json}");
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
 }
@@ -2390,7 +2391,7 @@ fn engine_trailing_text_comment_shifts_to_trailer_group() {
   // NOT under the standard PNG group.
   assert!(!json.contains("\"PNG:Comment\""), "got {json}");
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
 }
@@ -2406,7 +2407,7 @@ fn engine_trailing_junk_warns_without_bogus_tags() {
   );
   let json = extract_info("trail_junk.png", &bytes, /* print_conv */ true);
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   // No Trailer-group tag fabricated from the junk.
@@ -2425,7 +2426,7 @@ fn engine_trailing_junk_8plus_bytes_warns_without_bogus_tags() {
   );
   let json = extract_info("trail_junk2.png", &bytes, /* print_conv */ true);
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   assert!(!json.contains("\"Trailer:"), "got {json}");
@@ -2479,5 +2480,50 @@ fn engine_trailing_exif_typed_meta_records_trailer_boundary() {
   assert_eq!(
     meta.warnings().first().map(String::as_str),
     Some("Trailer data after PNG IEND chunk"),
+  );
+}
+
+#[test]
+fn engine_trailing_exif_cycle_guard_diagnostic_is_trailer_scoped() {
+  use exifast::diagnostics::Diagnose;
+  // #180 (round 2) — the embedded-EXIF DIAGNOSTIC channel under SET_GROUP1.
+  // Two TRAILING eXIf chunks whose IFD0 both live at offset 8: the FIRST claims
+  // addr 8, the SECOND is BLOCKED by the offset-keyed cross-source cycle-guard
+  // (`ExifTool.pm:9067-9070`) and raises `IFD0 pointer references previous IFD0
+  // directory`. Because both eXIf chunks are post-`IEND`, that warning is raised
+  // under `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1484`), so — like the tag-side
+  // `apply_trailer_group` — it must be re-scoped to the `Trailer` family-1 group
+  // (the EXIF arm of the diagnostic drain). We inspect the raw `Diagnose` stream
+  // directly (rather than the JSON), because in the rendered document this
+  // `Trailer:Warning` LOSES the priority-0 first-wins race to the earlier
+  // `Text/EXIF chunk(s) found after IDAT` trailer walker warning and is
+  // suppressed — so the typed channel is where the re-scoping is observable.
+  let first = tiff_make_model("FirstMk", "FirstModel");
+  let second = tiff_make_model("SecondMk", "SecondModel");
+  let mut trailer = chunk(b"eXIf", &first);
+  trailer.extend_from_slice(&chunk(b"eXIf", &second));
+  let bytes = assemble_with_trailer(
+    &[ihdr_gray_1x1(), chunk(b"IDAT", &zlib_store(&[0, 0]))],
+    &trailer,
+  );
+  let meta = parse_borrowed(&bytes).expect("png");
+  let diags = Diagnose::diagnostics(&meta);
+  // The cross-source cycle-guard diagnostic exists AND carries the `Trailer`
+  // family-1 group (re-scoped from the would-be document-level `ExifTool:Warning`).
+  let cg = diags
+    .iter()
+    .find(|d| d.message() == "IFD0 pointer references previous IFD0 directory")
+    .unwrap_or_else(|| panic!("cycle-guard diagnostic missing, got {diags:?}"));
+  assert_eq!(
+    cg.group(),
+    Some("Trailer"),
+    "a trailing embedded-EXIF cycle-guard warning must be Trailer-scoped, got {cg:?}",
+  );
+  // Sanity: it is NOT a stray document-level diagnostic (group None).
+  assert!(
+    !diags.iter().any(
+      |d| d.group().is_none() && d.message() == "IFD0 pointer references previous IFD0 directory"
+    ),
+    "the cycle-guard warning must not leak as a document-level diagnostic, got {diags:?}",
   );
 }

@@ -125,6 +125,15 @@ case "$FIX" in
   # IHDR dimensions), byte-matching bundled. They are no longer excluded — the
   # decoded profile content (`XMP-*`) PLUS the two ported Composites are compared.
   PNG_rawprofile_*) : ;;
+  # The PNG crafted-input hardening fixtures (#180 post-IEND Trailer family-1
+  # group; #178-item1 nested-zXIf warning text): minimal 1x1 PNGs whose only
+  # variation is a malformed trailer/zXIf chunk. PNG is in the Composite
+  # allow-list, so the ported `Composite:ImageSize`/`Megapixels` are kept (no
+  # exclusion). The deferred-subsystem keys bundled adds — `Trailer:ICC_Profile`
+  # (no ICC_Profile sub-port) for the trailer-iCCP fixture and `PNG:zxIf` (the
+  # eXIf/zxIf binary-block placeholder the port suppresses) for the nested-zXIf
+  # fixture — stay in the golden; the conformance `check_excluding` drops them.
+  PNG_trailer_*|PNG_nested_*) : ;;
   # ── #133 PR 5 video/container Composite arms ─────────────────────────────────
   # The full-video-activation fixtures keep their ported Composites
   # (ImageSize/Megapixels/AvgBitrate/Rotation/Duration + the GPS-group SubDoc
