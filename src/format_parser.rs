@@ -1409,6 +1409,47 @@ impl OverrideWithMime {
   }
 }
 
+/// Payload for [`FileTypeFinalize::DetectedThenOverrideWithExt`]: a
+/// `SetFileType()` (detected) followed by `OverrideFileType($file_type, undef,
+/// $ext)` where the override carries an EXPLICIT `$normExt` (the 3rd argument,
+/// ExifTool.pm:9729) but NO explicit MIME (the 2nd argument is `undef`, so
+/// `%mimeType` IS consulted, ExifTool.pm:9734). The lone case is the animated
+/// PNG: `AnimationFrames`'s RawConv calls `OverrideFileType("APNG", undef,
+/// "PNG")` (PNG.pm:776), where `APNG` has a `%mimeType` entry (`image/apng`)
+/// but NO `%fileTypeExt` entry — so the extension MUST come from the explicit
+/// `"PNG"` argument (the table lookup would yield the wrong `"APNG"`/`"apng"`),
+/// while the MIME comes from the `%mimeType{APNG}` lookup. Extracted into a
+/// named struct so the enum stays unit-or-newtype only (§2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideWithExt {
+  file_type: &'static str,
+  ext: &'static str,
+}
+
+impl OverrideWithExt {
+  /// Construct from the `OverrideFileType` type + explicit `$normExt` arguments.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(file_type: &'static str, ext: &'static str) -> Self {
+    Self { file_type, ext }
+  }
+
+  /// The override `FileType` (drives `File:FileType` + the `%mimeType` lookup).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_type(&self) -> &'static str {
+    self.file_type
+  }
+
+  /// The EXPLICIT `$normExt` argument (verbatim, NOT a `%fileTypeExt` lookup).
+  /// `File:FileTypeExtension` is `uc $ext` (then `lc` under PrintConv).
+  #[must_use]
+  #[inline(always)]
+  pub const fn ext(&self) -> &'static str {
+    self.ext
+  }
+}
+
 /// How the engine ([`crate::parser::extract_info`]) should finalize the
 /// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
 /// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
@@ -1480,6 +1521,15 @@ pub enum FileTypeFinalize {
   /// explicit argument rather than a table lookup. The payload (see
   /// [`OverrideWithMime`]) carries the `file_type` + `mime`.
   DetectedThenOverrideWithMime(OverrideWithMime),
+  /// `SetFileType()` then `OverrideFileType($file_type, undef, $ext)` with an
+  /// EXPLICIT `$normExt` argument but a TABLE-derived MIME (animated PNG:
+  /// `OverrideFileType("APNG", undef, "PNG")`, PNG.pm:776). Distinct from
+  /// [`DetectedThenOverride`](Self::DetectedThenOverride) because the override
+  /// type (`APNG`) has NO `%fileTypeExt` entry, so the extension MUST come from
+  /// the explicit `"PNG"` argument; the MIME still comes from `%mimeType{APNG}`
+  /// (`image/apng`). The payload (see [`OverrideWithExt`]) carries the
+  /// `file_type` + `ext`.
+  DetectedThenOverrideWithExt(OverrideWithExt),
   /// **No `SetFileType` at all** — the parser accepted the input (returned a
   /// `Meta`, NOT `Ok(None)`) but bundled `return 1`s WITHOUT calling
   /// `SetFileType`, so NO `File:FileType` / `File:FileTypeExtension` /
@@ -1687,10 +1737,22 @@ impl AnyMeta<'_> {
       },
       // PNG: `ProcessPNG` calls `$et->SetFileType($fileType)` with
       // `$fileType` from `%pngLookup` (PNG.pm:1439-1440). For the PNG
-      // signature this is `"PNG"` — the detected candidate. Bundled does
-      // NOT apply post-walk overrides for PNG/MNG/JNG.
+      // signature this is `"PNG"` — the detected candidate. An animated PNG
+      // (an `acTL` chunk was seen) then promotes to `APNG`: the
+      // `AnimationFrames` RawConv calls `OverrideFileType("APNG", undef, "PNG")`
+      // (PNG.pm:776), so `File:FileType` → `APNG`, `MIMEType` →
+      // `image/apng` (the `%mimeType{APNG}` lookup), and `FileTypeExtension`
+      // → the EXPLICIT `"PNG"` arg (`png`/`PNG`), since `APNG` has no
+      // `%fileTypeExt` entry. Bundled applies no other post-walk override for
+      // PNG/MNG/JNG.
       #[cfg(feature = "png")]
-      AnyMeta::Png(_) => FileTypeFinalize::Detected,
+      AnyMeta::Png(m) => {
+        if m.is_apng() {
+          FileTypeFinalize::DetectedThenOverrideWithExt(OverrideWithExt::new("APNG", "PNG"))
+        } else {
+          FileTypeFinalize::Detected
+        }
+      }
       // Real: SetFileType($type) where $type = 'RM' / 'RA' / 'RAM' / 'RPM'
       // (Real.pm:528-558). The candidate detected as "Real" is finalized
       // to whichever sub-type the magic prefix selected.
@@ -2324,14 +2386,23 @@ impl AnyParser {
       #[cfg(feature = "png")]
       AnyParser::Png(p) => {
         // PNG is a leaf format with no cross-format chain state — `shared`
-        // and `ext` are unused. The chunk walker captures every ported
-        // chunk and an optional `eXIf` TIFF block; the embedded Exif IFD
-        // chain is decoded at `serialize_tags` time via the Exif sub-
-        // walker (sharing the same TagMap sink, faithful to bundled's
-        // `ProcessPNG → ProcessTIFF → ProcessExif` dispatch chain at
-        // PNG.pm:1391).
-        let _ = (shared, ext);
-        p.parse(bytes).map(AnyMeta::Png)
+        // is unused. The chunk walker captures every ported chunk and an
+        // optional `eXIf` TIFF block; the embedded Exif IFD chain is decoded
+        // at `serialize_tags` time via the Exif sub-walker (sharing the same
+        // TagMap sink, faithful to bundled's `ProcessPNG → ProcessTIFF →
+        // ProcessExif` dispatch chain at PNG.pm:1391).
+        //
+        // `ext` IS threaded: ExifTool runs `SetFileType` BEFORE the chunk walk
+        // (ExifTool.pm:9677-9706), so a `.apng`-named PNG-signature file has
+        // `$$et{FileType} = APNG` from the start (the sub-type-by-extension
+        // rule, ExifTool.pm:9686-9692) — independently of any `acTL`. The
+        // after-IDAT `Text/EXIF chunk(s) found after <FileType> IDAT` warning
+        // interpolates that firing-point FileType, so the leaf `parse` (no
+        // extension channel) would miss the extension-derived `APNG`. The
+        // `parse_with_ext` entry threads `$$self{FILE_EXT}` so the warning is
+        // faithful for BOTH sources (extension-derived + `acTL`-derived).
+        let _ = (p, shared);
+        crate::formats::png::parse_with_ext(bytes, ext).map(AnyMeta::Png)
       }
       #[cfg(feature = "real")]
       AnyParser::Real(p) => {

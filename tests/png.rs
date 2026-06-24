@@ -510,6 +510,262 @@ fn engine_extract_info_emits_idot_under_both_png_and_trailer_groups() {
   );
 }
 
+// ===========================================================================
+// acTL (`AnimationControl`, `ProcessBinaryData`, PNG.pm:766-782) per-field
+// availability (#141 Codex [medium]; same class as #128 MPEG / #149 av1C). Each
+// `int32u` field emits IFF its `offset+size` is within the chunk length:
+//   AnimationFrames (offset 0) needs bytes 0..4 — and its RawConv fires
+//   OverrideFileType("APNG", undef, "PNG") (the FileType→APNG promotion);
+//   AnimationPlays  (offset 4) needs bytes 4..8.
+// All assertions are oracle-verified against bundled `perl exiftool -j -G1`
+// (and `-n`) 13.59 on crafted APNGs whose acTL is truncated to 2/4/7/8 bytes.
+// ===========================================================================
+
+/// Build an APNG: 1x1 RGB IHDR + an `acTL` chunk carrying `actl` raw bytes.
+fn apng_with_actl(actl: &[u8]) -> Vec<u8> {
+  assemble(&[ihdr_rgb_1x1(), chunk(b"acTL", actl)])
+}
+
+#[test]
+fn engine_actl_4byte_emits_frames_and_apng_override_without_plays() {
+  // A 4-byte acTL (AnimationFrames only). Oracle (`perl exiftool -j -G1` 13.59):
+  //   "File:FileType": "APNG", "File:MIMEType": "image/apng",
+  //   "File:FileTypeExtension": "png", "PNG:AnimationFrames": 2,
+  //   and NO "PNG:AnimationPlays".
+  let bytes = apng_with_actl(&2u32.to_be_bytes());
+  let json = extract_info("apng_actl4.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/apng\""),
+    "got {json}",
+  );
+  assert!(
+    json.contains("\"File:FileTypeExtension\":\"png\""),
+    "got {json}",
+  );
+  assert!(json.contains("\"PNG:AnimationFrames\":2"), "got {json}");
+  // Bytes 4..8 absent ⇒ AnimationPlays must NOT emit.
+  assert!(!json.contains("AnimationPlays"), "got {json}");
+}
+
+#[test]
+fn engine_actl_7byte_emits_frames_and_apng_override_without_plays() {
+  // A 7-byte acTL: byte 4 exists but bytes 4..8 are NOT fully present, so
+  // ProcessBinaryData still skips AnimationPlays — identical output to the
+  // 4-byte case (this is the key per-field boundary the old all-or-nothing
+  // 8-byte gate got wrong). Oracle (13.59): AnimationFrames=2 + APNG, no plays.
+  let mut actl = 2u32.to_be_bytes().to_vec(); // frames = 2
+  actl.extend_from_slice(&[0x00, 0x00, 0x07]); // 3 of the 4 plays bytes
+  assert_eq!(actl.len(), 7);
+  let bytes = apng_with_actl(&actl);
+  let json = extract_info("apng_actl7.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/apng\""),
+    "got {json}",
+  );
+  assert!(json.contains("\"PNG:AnimationFrames\":2"), "got {json}");
+  assert!(!json.contains("AnimationPlays"), "got {json}");
+}
+
+#[test]
+fn engine_actl_8byte_emits_both_frames_and_plays() {
+  // A full 8-byte acTL: both fields present. frames=2, plays=7 (non-zero ⇒ the
+  // bare number under PrintConv). Oracle (13.59): AnimationFrames=2 +
+  // AnimationPlays=7 + APNG/image/apng.
+  let mut actl = 2u32.to_be_bytes().to_vec();
+  actl.extend_from_slice(&7u32.to_be_bytes());
+  let bytes = apng_with_actl(&actl);
+  let json = extract_info("apng_actl8.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  assert!(json.contains("\"PNG:AnimationFrames\":2"), "got {json}");
+  assert!(json.contains("\"PNG:AnimationPlays\":7"), "got {json}");
+}
+
+#[test]
+fn engine_actl_8byte_zero_plays_renders_inf() {
+  // A full 8-byte acTL whose play count is 0 — the APNG "infinite loop"
+  // sentinel. PrintConv `$val || "inf"` (PNG.pm:780) renders it as the string
+  // "inf" (matching the bundled PNG_apng.png golden); `-n` keeps the raw 0.
+  let mut actl = 2u32.to_be_bytes().to_vec();
+  actl.extend_from_slice(&0u32.to_be_bytes());
+  let bytes = apng_with_actl(&actl);
+  let json = extract_info("apng_actl8_inf.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains("\"PNG:AnimationPlays\":\"inf\""),
+    "got {json}",
+  );
+  let json_n = extract_info("apng_actl8_inf.png", &bytes, /* print_conv */ false);
+  assert!(json_n.contains("\"PNG:AnimationPlays\":0"), "got {json_n}");
+}
+
+#[test]
+fn engine_actl_runt_under_4_bytes_emits_no_animation_and_stays_png() {
+  // A `< 4`-byte acTL (2 bytes): bytes 0..4 are NOT present, so
+  // ProcessBinaryData extracts NOTHING — no AnimationFrames, the APNG override
+  // does NOT fire, and File:FileType stays "PNG". Oracle (13.59): FileType=PNG,
+  // image/png, no Animation* tags.
+  let bytes = apng_with_actl(&[0x00, 0x02]);
+  let json = extract_info("apng_actl2.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"PNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/png\""),
+    "got {json}",
+  );
+  assert!(!json.contains("APNG"), "got {json}");
+  assert!(!json.contains("Animation"), "got {json}");
+}
+
+#[test]
+fn engine_actl_before_and_after_iend_keep_per_field_groups() {
+  // #141 (Codex [medium]) — PER-FIELD provenance: a FULL pre-`IEND` `acTL`
+  // (frames=2, plays=7 → PNG: group) PLUS a 4-byte post-`IEND` TRAILER `acTL`
+  // (frames=9 only — bytes 4..8 absent → no plays) must NOT fabricate a
+  // `Trailer:AnimationPlays`. AnimationFrames and AnimationPlays each carry
+  // their OWN main/trailer occurrence (the iDOT/gdAT `BinaryChunkLengths`
+  // pattern), so the trailer chunk sets only `Trailer:AnimationFrames` while
+  // the main `PNG:AnimationPlays` stays under `PNG`. A single shared trailing
+  // flag re-grouped the stale main plays value to `Trailer` — fixed here.
+  // Oracle (`perl exiftool -j -G1` 13.59 on this exact byte layout):
+  //   "PNG:AnimationFrames": 2, "PNG:AnimationPlays": 7,
+  //   "Trailer:AnimationFrames": 9,  (and NO "Trailer:AnimationPlays")
+  //   "ExifTool:Warning": "[minor] Trailer data after PNG IEND chunk"
+  let main_actl = {
+    let mut a = 2u32.to_be_bytes().to_vec(); // frames = 2
+    a.extend_from_slice(&7u32.to_be_bytes()); // plays  = 7 (non-zero → bare int)
+    a
+  };
+  let trailer_actl = 9u32.to_be_bytes(); // 4 bytes: frames = 9, no plays
+  let bytes = assemble_with_trailer(
+    &[ihdr_gray_1x1(), chunk(b"acTL", &main_actl)],
+    &chunk(b"acTL", &trailer_actl),
+  );
+  let json = extract_info("apng_actl_trailer.png", &bytes, /* print_conv */ true);
+  // Main `acTL` → both fields under PNG.
+  assert!(json.contains("\"PNG:AnimationFrames\":2"), "got {json}");
+  assert!(json.contains("\"PNG:AnimationPlays\":7"), "got {json}");
+  // Trailer `acTL` (4 bytes) → AnimationFrames ONLY, under Trailer.
+  assert!(json.contains("\"Trailer:AnimationFrames\":9"), "got {json}",);
+  // The missing trailer play count must NOT be fabricated/mis-grouped — the old
+  // stale main plays value (7) must NOT appear under the Trailer group.
+  assert!(
+    !json.contains("\"Trailer:AnimationPlays\""),
+    "a Trailer:AnimationPlays was fabricated from the stale main value, got {json}",
+  );
+  // The post-`IEND` entry warning is document-level (raised before SET_GROUP1).
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
+    "got {json}",
+  );
+}
+
+#[test]
+fn engine_post_idat_text_after_actl_warning_says_apng() {
+  // #141 Codex [medium]: an `acTL` (≥4 bytes → the APNG FileType override)
+  // BEFORE IDAT, then a tEXt AFTER IDAT. The post-IDAT warning interpolates the
+  // CURRENT FileType (`$$et{FileType}`, PNG.pm:1604) — which is already `APNG`
+  // because the `acTL` was dispatched earlier in the walk. Oracle (`perl
+  // exiftool -j -G1` 13.59 on this exact byte layout):
+  //   "File:FileType": "APNG",
+  //   "ExifTool:Warning": "[minor] Text/EXIF chunk(s) found after APNG IDAT
+  //                        (may be ignored by some readers)"
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"acTL", &{
+      let mut a = 2u32.to_be_bytes().to_vec();
+      a.extend_from_slice(&0u32.to_be_bytes());
+      a
+    }),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"tEXt", b"Comment\0Hi"),
+  ]);
+  let json = extract_info(
+    "apng_text_after_idat.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  // The warning must name APNG (the post-override FileType), not PNG.
+  assert!(
+    json.contains("Text/EXIF chunk(s) found after APNG IDAT (may be ignored by some readers)"),
+    "expected the APNG-form post-IDAT warning, got {json}",
+  );
+  assert!(
+    !json.contains("found after PNG IDAT"),
+    "must NOT emit the PNG-form warning for an APNG, got {json}",
+  );
+  // The minor classifier must still recognize the APNG form ⇒ `[minor]` prefix.
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"[minor] Text/EXIF chunk(s) found after APNG IDAT"),
+    "the APNG-form warning must keep its [minor] prefix, got {json}",
+  );
+}
+
+#[test]
+fn engine_post_idat_text_with_actl_after_warning_says_png_firing_point() {
+  // #141 firing-point subtlety: the `acTL` (→ APNG) comes AFTER the post-IDAT
+  // tEXt. When the text-after-IDAT warning fires, `$$et{FileType}` is STILL
+  // `PNG` (the override has not run yet), so the warning says PNG — even though
+  // the file's FINAL FileType is APNG. Oracle (`perl exiftool -j -G1` 13.59):
+  //   "File:FileType": "APNG",
+  //   "ExifTool:Warning": "[minor] Text/EXIF chunk(s) found after PNG IDAT …"
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"tEXt", b"Comment\0Hi"),
+    chunk(b"acTL", &{
+      let mut a = 2u32.to_be_bytes().to_vec();
+      a.extend_from_slice(&0u32.to_be_bytes());
+      a
+    }),
+  ]);
+  let json = extract_info(
+    "apng_actl_after_text.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  // FileType finalizes to APNG (the acTL is still seen, just later).
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  // But the warning reflects the firing-point FileType = PNG.
+  assert!(
+    json.contains("Text/EXIF chunk(s) found after PNG IDAT (may be ignored by some readers)"),
+    "expected the PNG-form warning (acTL not yet seen at firing point), got {json}",
+  );
+  assert!(
+    !json.contains("found after APNG IDAT"),
+    "must NOT say APNG when the acTL fires after the warning, got {json}",
+  );
+}
+
+#[test]
+fn engine_post_idat_exif_after_actl_warning_says_apng() {
+  // The `eXIf` chunk is also an `isTxtChunk` member (PNG.pm:93), so an eXIf
+  // after IDAT (with an earlier acTL) likewise raises the APNG-form warning.
+  // Oracle (13.59): "File:FileType": "APNG" + the `found after APNG IDAT`
+  // warning. We use a tiny valid II*-led TIFF as the eXIf payload.
+  let tiff = tiff_make_model(" X", "Y");
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"acTL", &{
+      let mut a = 2u32.to_be_bytes().to_vec();
+      a.extend_from_slice(&0u32.to_be_bytes());
+      a
+    }),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"eXIf", &tiff),
+  ]);
+  let json = extract_info(
+    "apng_exif_after_idat.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  assert!(
+    json.contains("Text/EXIF chunk(s) found after APNG IDAT (may be ignored by some readers)"),
+    "expected the APNG-form post-IDAT warning for an eXIf chunk, got {json}",
+  );
+}
+
 #[test]
 fn engine_ztxt_inflates_comment() {
   // Oracle (`perl exiftool -j -G1`) on a zTXt "Comment" chunk:

@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "PNG_apng.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "APNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/apng",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG:AnimationFrames": 2,
+  "PNG:AnimationPlays": "inf",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

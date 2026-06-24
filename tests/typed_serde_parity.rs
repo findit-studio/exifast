@@ -1378,7 +1378,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// The Olympus/Ricoh/Lucas JUNK variants (vendor subsystems) + CasioJunk (needs a
 /// real EX-S600 AVI) stay deferred. Additive — every PRE-EXISTING golden stays
 /// byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 605;
+/// 605 → 606 (#141, the animated-PNG `acTL` Animation Control chunk) adds
+/// `PNG_apng.png` — a minimal 1x1 RGB APNG carrying `acTL`
+/// (`AnimationControl`, `PNG.pm:766-782`): `PNG:AnimationFrames` +
+/// `PNG:AnimationPlays` (`0` ⇒ `"inf"` under `-j`), and the
+/// `OverrideFileType("APNG", undef, "PNG")` promotion (`File:FileType` →
+/// `APNG`, `MIMEType` → `image/apng`, `FileTypeExtension` → `png`/`PNG`). The
+/// per-frame `fcTL`/`fdAT` chunks have no bundled table and emit nothing.
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 606;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
