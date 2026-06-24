@@ -72,5 +72,6 @@
   "Composite:Aperture": 2.8,
   "Composite:ImageSize": "1136x852",
   "Composite:Megapixels": 0.968,
-  "Composite:ShutterSpeed": 0.4
+  "Composite:ShutterSpeed": 0.4,
+  "Composite:Flash": "Off, Did not fire"
 }]

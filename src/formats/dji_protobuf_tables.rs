@@ -18,11 +18,16 @@
 // `# (NC)` "Not Confirmed" markers in DJI.pm are preserved as-is — they are
 // included exactly when the bundled default table extracts them.
 //
-// Walked-but-discarded fields (FrameNumber `3-1-1`, AccelerometerX/Y/Z,
-// "model code", version numbers) are NOT rows here: the camera-indexing typed
-// surface drops them (FrameNumber is a per-frame video index, not camera/GPS
-// metadata; the accelerometer/model-code/version fields are `Unknown => 1`
-// non-default extractions). See the module docs.
+// FrameNumber (`3-1-1`) IS a row on EVERY protocol arm (DJI.pm:279/:320/:361/
+// :404/:446/:479/:515/:558/:598/:639/:677/:721/:744/:782/:833/:868,
+// `#forum17996`): a NAMED tag (`Name => 'FrameNumber', Format => 'unsigned'`)
+// with no `Unknown` flag ⇒ ExifTool extracts it by default at `-ee`. It lives
+// in the per-frame `3-1` message next to TimeStamp (`3-1-2`), so it is emitted
+// PER `djmd` sample (one `Doc<N>` each), not clip-level.
+//
+// Walked-but-discarded fields (AccelerometerX/Y/Z, "model code", version
+// numbers) are NOT rows here: they are `Unknown => 1` non-default extractions.
+// See the module docs.
 //
 // SerialNumber2 (`2-2-3-1`) IS a row on the AVATA2 + DJI Neo arms only
 // (DJI.pm:399/:553): a NAMED tag with no `Unknown` flag ⇒ ExifTool extracts it
@@ -49,6 +54,7 @@ static AC203: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:274-277 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },      //   "
   Row { path: &[2, 3, 3], kind: K::FrameRate },        //   "
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:279 (forum17996)
   Row { path: &[3, 2, 3, 1], kind: K::Iso },           // DJI.pm:280 (forum17996)
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:281-285
   Row { path: &[3, 2, 6, 1], kind: K::ColorTemperature }, // DJI.pm:284
@@ -68,6 +74,7 @@ static AC204: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:314-317 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:320 (forum17996)
   Row { path: &[3, 2, 3, 1], kind: K::Iso },           // DJI.pm:321 (forum17996)
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:322-326
   Row { path: &[3, 2, 6, 1], kind: K::ColorTemperature }, // DJI.pm:327
@@ -87,6 +94,7 @@ static AC206: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:353-356 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:361 (forum17996)
   Row { path: &[3, 2, 3, 1], kind: K::Iso },           // DJI.pm:362 (forum17996)
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:363-367
   Row { path: &[3, 2, 6, 1], kind: K::ColorTemperature }, // DJI.pm:368
@@ -107,6 +115,7 @@ static AVATA2: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:394-397 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:404
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:399-405
   Row { path: &[3, 2, 2, 1], kind: K::Iso },           // DJI.pm:408
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:409-413
@@ -131,6 +140,7 @@ static WM265E: &[Row] = &[
   Row { path: &[2, 2, 1], kind: K::FrameWidth },       // DJI.pm:436-439 FrameInfo
   Row { path: &[2, 2, 2], kind: K::FrameHeight },
   Row { path: &[2, 2, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:446
   Row { path: &[3, 2, 2, 1], kind: K::Iso },           // DJI.pm:441
   Row { path: &[3, 2, 3, 1], kind: K::ShutterSpeed },  // DJI.pm:442-446
   Row { path: &[3, 2, 6, 1], kind: K::DigitalZoom },   // DJI.pm:448
@@ -156,6 +166,7 @@ static PM320: &[Row] = &[
   Row { path: &[2, 2, 1], kind: K::FrameWidth },       // DJI.pm:468-471 FrameInfo
   Row { path: &[2, 2, 2], kind: K::FrameHeight },
   Row { path: &[2, 2, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:479
   Row { path: &[3, 2, 2, 1], kind: K::Iso },           // DJI.pm:472
   Row { path: &[3, 2, 3, 1], kind: K::ShutterSpeed },  // DJI.pm:473-477
   Row { path: &[3, 2, 4, 1], kind: K::FNumber },       // DJI.pm:478-482
@@ -182,6 +193,7 @@ static MINI4PRO: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:503-506 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:515
   Row { path: &[3, 2, 7, 1], kind: K::Iso },           // DJI.pm:507
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:508-512
   Row { path: &[3, 2, 11, 1], kind: K::FNumber },      // DJI.pm:513-517
@@ -210,6 +222,7 @@ static DJI_NEO: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:545-548 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:558
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:550-556
   Row { path: &[3, 2, 2, 1], kind: K::Iso },           // DJI.pm:559
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:560-564
@@ -232,6 +245,7 @@ static AIR3: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:585-588 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:598 (NC)
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:589-594
   Row { path: &[3, 2, 7, 1], kind: K::Iso },           // DJI.pm:595
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:596-600
@@ -258,6 +272,7 @@ static AIR3S: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:625-628 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:639 (NC)
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:629-634
   Row { path: &[3, 2, 7, 1], kind: K::Iso },           // DJI.pm:635
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:636-640
@@ -283,6 +298,7 @@ static OQ101: &[Row] = &[
   Row { path: &[1, 1, 5], kind: K::SerialNumber },     // DJI.pm:664
   Row { path: &[1, 1, 10], kind: K::Model },           // DJI.pm:665
   Row { path: &[1, 14, 1], kind: K::FNumber },         // DJI.pm:679-683
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:677
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:666-671
   Row { path: &[3, 2, 3, 1], kind: K::Iso },           // DJI.pm:672
   Row { path: &[3, 2, 4, 1], kind: K::ShutterSpeed },  // DJI.pm:673-677
@@ -303,6 +319,7 @@ static PP101: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:705-708 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:721
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:709-714
   Row { path: &[3, 2, 9, 1], kind: K::Iso },           // DJI.pm:715
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:716-720
@@ -318,6 +335,7 @@ static WA345E: &[Row] = &[
   Row { path: &[2, 2, 1], kind: K::FrameWidth },       // DJI.pm:727-730 FrameInfo
   Row { path: &[2, 2, 2], kind: K::FrameHeight },
   Row { path: &[2, 2, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:744
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:731-736
   Row { path: &[3, 3, 3, 1], kind: K::DroneRoll },     // DJI.pm:737-740 DroneInfo
   Row { path: &[3, 3, 3, 2], kind: K::DronePitch },
@@ -342,6 +360,7 @@ static WM261: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:764-767 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:782
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:768-773
   Row { path: &[3, 2, 9, 1], kind: K::Iso },           // DJI.pm:774
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:775-779
@@ -371,6 +390,7 @@ static MAVIC4: &[Row] = &[
   Row { path: &[2, 3, 1], kind: K::FrameWidth },       // DJI.pm:814-817 FrameInfo
   Row { path: &[2, 3, 2], kind: K::FrameHeight },
   Row { path: &[2, 3, 3], kind: K::FrameRate },
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:833
   Row { path: &[3, 1, 2], kind: K::TimeStamp },        // DJI.pm:818-823
   Row { path: &[3, 2, 9, 1], kind: K::Iso },           // DJI.pm:826
   Row { path: &[3, 2, 10, 1], kind: K::ShutterSpeed }, // DJI.pm:827-831
@@ -393,6 +413,7 @@ static MAVIC4: &[Row] = &[
 static MINI5PRO: &[Row] = &[
   Row { path: &[1, 1, 5], kind: K::SerialNumber },     // DJI.pm:850
   Row { path: &[1, 1, 10], kind: K::Model },           // DJI.pm:851
+  Row { path: &[3, 1, 1], kind: K::FrameNumber },      // DJI.pm:868 (NC)
   Row { path: &[3, 2, 37, 1], kind: K::Temperature },  // DJI.pm:852
   Row { path: &[3, 3, 4, 1, 1], kind: K::CoordinateUnits }, // DJI.pm:853-857 GPSInfo
   Row { path: &[3, 3, 4, 1, 2], kind: K::GpsLatitude },
@@ -450,10 +471,36 @@ fn is_known_protocol(protocol: &str) -> bool {
 }
 
 impl Protocol {
+  /// `true` when `path` is a NAMED `SubDirectory` of this protocol — one of the
+  /// four nested message tables `DJI::FrameInfo` / `DJI::GPSInfo` /
+  /// `DJI::DroneInfo` / `DJI::GimbalInfo` (DJI.pm:886-921), spliced in at its
+  /// `SubDirectory` key (the per-protocol `2-3`/`2-2`, `3-3-4-1`/`3-4-2-1`/…,
+  /// `3-3-3`/`3-4-3` keys this transcription expands into child rows).
+  ///
+  /// A named SubDirectory is exactly the parent of a row whose kind is a
+  /// nested-table leaf ([`FieldKind::is_nested_leaf`]) — verified to partition
+  /// cleanly against the UNNAMED intermediate wrappers (`3`/`3-4`/`3-4-2`/`3-3-4`)
+  /// that parent direct leaves (`GPSAltitude`/`GPSDateTime`/`AbsoluteAltitude`/…)
+  /// reached through the speculative IsProtobuf descent, NOT a SubDirectory. The
+  /// distinction is the recursion gate (Protobuf.pm:171-179 vs :227): a named
+  /// SubDirectory is descended UNCONDITIONALLY; an unnamed wrapper only when its
+  /// payload passes `has_non_printable && is_protobuf`.
+  ///
+  /// Rows are path-sorted; a linear scan is fine (each protocol has ≤ ~20 rows).
+  fn is_named_subdir(&self, path: &[u64]) -> bool {
+    self.rows.iter().any(|r| {
+      r.kind.is_nested_leaf() && r.path.len() == path.len() + 1 && r.path.starts_with(path)
+    })
+  }
+
   /// `true` when `path` is the GPSInfo container for a protocol whose
   /// bundled arm carries `Condition => '$$self{CoordUnits} = 1'` —
   /// i.e. Mavic 4 Pro (DJI.pm:841) and Mini 5 Pro (DJI.pm:855). Both place
   /// GPSInfo at `3-3-4-1`. Returns `false` for every other protocol.
+  ///
+  /// Every such path is a named GPSInfo SubDirectory ([`Self::is_named_subdir`]),
+  /// so the force-degrees condition fires only when the named SubDirectory is
+  /// descended unconditionally.
   fn forces_degrees_at(&self, path: &[u64]) -> bool {
     matches!(self.name, "dvtm_Mavic4" | "dvtm_Mini5Pro") && path == [3, 3, 4, 1]
   }
@@ -477,6 +524,84 @@ mod table_tests {
     assert!(!m4.forces_degrees_at(&[3, 3, 4, 2]));
     let wm = protocol_for("dvtm_wm265e").unwrap();
     assert!(!wm.forces_degrees_at(&[3, 3, 4, 1]));
+  }
+
+  #[test]
+  fn named_subdir_matches_djipm_subdirectory_keys() {
+    // The NAMED SubDirectory paths are exactly the DJI.pm `SubDirectory` keys
+    // (FrameInfo/GPSInfo/DroneInfo/GimbalInfo), NOT the UNNAMED intermediate
+    // wrappers that reach direct leaves through the IsProtobuf descent.
+    let ac203 = protocol_for("dvtm_ac203").unwrap();
+    // ac203 named SubDirectories: FrameInfo `2-3`, GPSInfo `3-4-2-1` (DJI.pm).
+    assert!(ac203.is_named_subdir(&[2, 3]), "FrameInfo 2-3 is named");
+    assert!(ac203.is_named_subdir(&[3, 4, 2, 1]), "GPSInfo 3-4-2-1 is named");
+    // The UNNAMED intermediate wrappers `3`, `3-4`, `3-4-2` are NOT named — they
+    // parent the GPSAltitude `3-4-2-2` / GPSDateTime `3-4-2-6-1` direct leaves
+    // (and the named GPSInfo at `3-4-2-1`) but carry no SubDirectory themselves.
+    assert!(!ac203.is_named_subdir(&[3]), "3 is an unnamed wrapper");
+    assert!(!ac203.is_named_subdir(&[3, 4]), "3-4 is an unnamed wrapper");
+    assert!(
+      !ac203.is_named_subdir(&[3, 4, 2]),
+      "3-4-2 parents GPSInfo + direct leaves but is itself unnamed"
+    );
+    // A leaf path is never a named SubDirectory (GPSAltitude direct leaf).
+    assert!(
+      !ac203.is_named_subdir(&[3, 4, 2, 2]),
+      "GPSAltitude is a leaf, not a SubDirectory"
+    );
+
+    // wm265e named SubDirectories: FrameInfo `2-2`, DroneInfo `3-3-3`,
+    // GPSInfo `3-3-4-1`, GimbalInfo `3-4-3` (DJI.pm).
+    let wm = protocol_for("dvtm_wm265e").unwrap();
+    assert!(wm.is_named_subdir(&[2, 2]));
+    assert!(wm.is_named_subdir(&[3, 3, 3]));
+    assert!(wm.is_named_subdir(&[3, 3, 4, 1]));
+    assert!(wm.is_named_subdir(&[3, 4, 3]));
+    // `3-3-4` parents the GPSInfo named SubDirectory `3-3-4-1` AND the
+    // AbsoluteAltitude `3-3-4-2` direct leaf, so it is an UNNAMED wrapper.
+    assert!(
+      !wm.is_named_subdir(&[3, 3, 4]),
+      "3-3-4 parents GPSInfo + AbsoluteAltitude but is itself unnamed"
+    );
+  }
+
+  #[test]
+  fn every_protocol_named_subdir_set_is_internally_consistent() {
+    // Cross-check the discriminator against the structure: for EVERY protocol,
+    // a path is a named SubDirectory iff it parents a nested-table leaf, and no
+    // direct leaf ever shares a parent with a nested-table leaf (the partition
+    // proven offline). Re-assert it here so a future table edit can't silently
+    // break the recursion gate.
+    for proto in PROTOCOLS {
+      let mut named = alloc::collections::BTreeSet::new();
+      for r in proto.rows {
+        if r.kind.is_nested_leaf()
+          && let Some((_, parent)) = r.path.split_last()
+        {
+          named.insert(parent.to_vec());
+        }
+      }
+      for r in proto.rows {
+        if !r.kind.is_nested_leaf()
+          && let Some((_, parent)) = r.path.split_last()
+        {
+          assert!(
+            !named.contains(parent),
+            "{}: direct leaf {:?} at {:?} must not share a parent with a named SubDirectory",
+            proto.name,
+            r.kind,
+            r.path
+          );
+        }
+        // A named-SubDirectory path is never itself a leaf row.
+        assert!(
+          !named.contains(r.path),
+          "{}: named-SubDirectory path {:?} must not also be a leaf",
+          proto.name,
+          r.path
+        );
+      }
+    }
   }
 
   #[test]

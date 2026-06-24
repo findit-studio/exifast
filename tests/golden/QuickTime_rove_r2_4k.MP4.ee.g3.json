@@ -122,5 +122,9 @@
   "Doc9:QuickTime:GPSLatitude": "40 deg 26' 15.67\" N",
   "Doc9:QuickTime:GPSLongitude": "79 deg 57' 44.44\" W",
   "Doc9:QuickTime:GPSSpeed": 35,
-  "Doc9:QuickTime:Accelerometer": "-0.03 0.98 0.18"
+  "Doc9:QuickTime:Accelerometer": "-0.03 0.98 0.18",
+  "Composite:ImageSize": "1920x1080",
+  "Composite:Megapixels": 2.1,
+  "Composite:AvgBitrate": "20.6 Mbps",
+  "Composite:Rotation": 0
 }]

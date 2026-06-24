@@ -1555,6 +1555,120 @@ fn engine_iccp_binary_chunk_does_not_reset_second_exif_blocked() {
   );
 }
 
+// ===========================================================================
+// #205 — raw-profile XMP diagnostics WALK-ORDER. ExifTool dispatches `Raw
+// profile type xmp` (PNG.pm:746) via `ProcessProfile` → `ProcessXMP` AT the
+// chunk's walk position, so its `XMP is double UTF-encoded` warning (XMP.pm:4494)
+// interleaves with every other chunk's warning in serial chunk order. Because
+// `Warning` is `Priority=0` FIRST-wins (ExifTool.pm:5404-5417), the document
+// `ExifTool:Warning` surface is the EARLIEST-walked warning. The PNG port
+// previously drained the raw-profile-XMP decode warning dead-last, surfacing a
+// LATER chunk's warning instead; the unified ordered diagnostic replay
+// (`PngMeta::diag_order`) fixes this. Both orderings are oracle-verified against
+// local bundled 13.59 (`perl exiftool -warning -a -G1`).
+// ===========================================================================
+
+/// A double-UTF-encoded XMP packet: a RAW leading UTF-8 BOM (`\xef\xbb\xbf`)
+/// DIRECTLY before `<?xpacket`, which trips ExifTool's double-encoding probe
+/// (XMP.pm:4310) → the `XMP is double UTF-encoded` warning (XMP.pm:4494). The
+/// re-decoded body is valid UTF-8, so the `XMP-dc:Format` tag is still emitted.
+#[cfg(feature = "xmp")]
+fn double_utf_xmp_packet() -> Vec<u8> {
+  let mut v = vec![0xef, 0xbb, 0xbf];
+  v.extend_from_slice(
+    b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>\
+      <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+      <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+      <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+      <dc:format>image/png</dc:format>\
+      </rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>",
+  );
+  v
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn engine_raw_profile_xmp_warning_before_bad_exif_surfaces_xmp_warning_first() {
+  // FORWARD — `Raw profile type xmp` (malformed: double-UTF) THEN a bad `eXIf`.
+  // The XMP chunk is walked FIRST, so `XMP is double UTF-encoded` is the document
+  // FIRST `ExifTool:Warning` — NOT the later `Invalid eXIf chunk` (the #205 bug).
+  // Oracle (local 13.59, `-warning -a -G1`): the warnings are emitted in the
+  // order [XMP is double UTF-encoded, Invalid eXIf chunk].
+  let body = raw_profile_body(
+    "xmp",
+    &double_utf_xmp_packet(),
+    double_utf_xmp_packet().len(),
+  );
+  let mut text = b"Raw profile type xmp\0".to_vec();
+  text.extend_from_slice(&body);
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"tEXt", &text),
+    chunk(b"eXIf", b"XXXXbadexifheader"),
+  ]);
+  let json = extract_info(
+    "rp_xmp_warnorder_fwd.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  // The document first-warning is the XMP one (the earlier chunk).
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"XMP is double UTF-encoded\""),
+    "the earlier XMP raw-profile warning must surface as the first ExifTool:Warning, got {json}",
+  );
+  // The later eXIf warning must NOT be the surfaced first-warning (it is the
+  // SECOND walked, so first-wins keeps the XMP one).
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"Invalid eXIf chunk\""),
+    "the LATER eXIf warning must not win first-occurrence over the earlier XMP one, got {json}",
+  );
+  // The XMP packet still decoded (valid after the BOM strip).
+  assert!(
+    json.contains("\"XMP-dc:Format\":\"image/png\""),
+    "got {json}"
+  );
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn engine_bad_exif_before_raw_profile_xmp_warning_surfaces_exif_warning_first() {
+  // REVERSE — a bad `eXIf` THEN `Raw profile type xmp` (double-UTF). Now the
+  // eXIf chunk is walked FIRST, so `Invalid eXIf chunk` is the document FIRST
+  // `ExifTool:Warning` (this proves the fix is a genuine walk-order interleave,
+  // not a blanket "XMP wins" — the symmetric case must invert).
+  // Oracle (local 13.59, `-warning -a -G1`): the warnings are emitted in the
+  // order [Invalid eXIf chunk, XMP is double UTF-encoded].
+  let body = raw_profile_body(
+    "xmp",
+    &double_utf_xmp_packet(),
+    double_utf_xmp_packet().len(),
+  );
+  let mut text = b"Raw profile type xmp\0".to_vec();
+  text.extend_from_slice(&body);
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"eXIf", b"XXXXbadexifheader"),
+    chunk(b"tEXt", &text),
+  ]);
+  let json = extract_info(
+    "rp_xmp_warnorder_rev.png",
+    &bytes,
+    /* print_conv */ true,
+  );
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"Invalid eXIf chunk\""),
+    "the earlier eXIf warning must surface as the first ExifTool:Warning, got {json}",
+  );
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"XMP is double UTF-encoded\""),
+    "the LATER XMP warning must not win first-occurrence over the earlier eXIf one, got {json}",
+  );
+  assert!(
+    json.contains("\"XMP-dc:Format\":\"image/png\""),
+    "got {json}"
+  );
+}
+
 #[test]
 fn engine_single_exif_chunk_source_matches_oracle() {
   // Single native eXIf source — one source, always processed.
@@ -2205,10 +2319,11 @@ fn engine_trailing_exif_decodes_under_trailer_group_with_warning() {
   );
   // It is NOT under the standard `File` group anymore.
   assert!(!json.contains("\"File:ExifByteOrder\""), "got {json}");
-  // The document-level minor warning fires (exact text, sans the [minor] flag
-  // prefix that exifast strips like every other minor warning).
+  // The document-level minor warning fires with its `[minor] ` prefix
+  // (`PNG.pm:1481` `$et->Warn(..., 1)`, applied by the diagnostics mechanism —
+  // matching bundled + the committed goldens).
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   // Standard PNG structural tags still present and UNshifted (they are pre-IEND).
@@ -2252,7 +2367,7 @@ fn engine_trailing_exif_gps_keeps_ifd_groups_byteorder_and_gps_shift_to_trailer(
   // GPS is NOT under the normal `GPS` group.
   assert!(!json.contains("\"GPS:GPSLatitudeRef\""), "got {json}");
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
 }
@@ -2276,7 +2391,7 @@ fn engine_trailing_text_comment_shifts_to_trailer_group() {
   // NOT under the standard PNG group.
   assert!(!json.contains("\"PNG:Comment\""), "got {json}");
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
 }
@@ -2292,7 +2407,7 @@ fn engine_trailing_junk_warns_without_bogus_tags() {
   );
   let json = extract_info("trail_junk.png", &bytes, /* print_conv */ true);
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   // No Trailer-group tag fabricated from the junk.
@@ -2311,7 +2426,7 @@ fn engine_trailing_junk_8plus_bytes_warns_without_bogus_tags() {
   );
   let json = extract_info("trail_junk2.png", &bytes, /* print_conv */ true);
   assert!(
-    json.contains("\"ExifTool:Warning\":\"Trailer data after PNG IEND chunk\""),
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
     "got {json}",
   );
   assert!(!json.contains("\"Trailer:"), "got {json}");
@@ -2365,5 +2480,50 @@ fn engine_trailing_exif_typed_meta_records_trailer_boundary() {
   assert_eq!(
     meta.warnings().first().map(String::as_str),
     Some("Trailer data after PNG IEND chunk"),
+  );
+}
+
+#[test]
+fn engine_trailing_exif_cycle_guard_diagnostic_is_trailer_scoped() {
+  use exifast::diagnostics::Diagnose;
+  // #180 (round 2) — the embedded-EXIF DIAGNOSTIC channel under SET_GROUP1.
+  // Two TRAILING eXIf chunks whose IFD0 both live at offset 8: the FIRST claims
+  // addr 8, the SECOND is BLOCKED by the offset-keyed cross-source cycle-guard
+  // (`ExifTool.pm:9067-9070`) and raises `IFD0 pointer references previous IFD0
+  // directory`. Because both eXIf chunks are post-`IEND`, that warning is raised
+  // under `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1484`), so — like the tag-side
+  // `apply_trailer_group` — it must be re-scoped to the `Trailer` family-1 group
+  // (the EXIF arm of the diagnostic drain). We inspect the raw `Diagnose` stream
+  // directly (rather than the JSON), because in the rendered document this
+  // `Trailer:Warning` LOSES the priority-0 first-wins race to the earlier
+  // `Text/EXIF chunk(s) found after IDAT` trailer walker warning and is
+  // suppressed — so the typed channel is where the re-scoping is observable.
+  let first = tiff_make_model("FirstMk", "FirstModel");
+  let second = tiff_make_model("SecondMk", "SecondModel");
+  let mut trailer = chunk(b"eXIf", &first);
+  trailer.extend_from_slice(&chunk(b"eXIf", &second));
+  let bytes = assemble_with_trailer(
+    &[ihdr_gray_1x1(), chunk(b"IDAT", &zlib_store(&[0, 0]))],
+    &trailer,
+  );
+  let meta = parse_borrowed(&bytes).expect("png");
+  let diags = Diagnose::diagnostics(&meta);
+  // The cross-source cycle-guard diagnostic exists AND carries the `Trailer`
+  // family-1 group (re-scoped from the would-be document-level `ExifTool:Warning`).
+  let cg = diags
+    .iter()
+    .find(|d| d.message() == "IFD0 pointer references previous IFD0 directory")
+    .unwrap_or_else(|| panic!("cycle-guard diagnostic missing, got {diags:?}"));
+  assert_eq!(
+    cg.group(),
+    Some("Trailer"),
+    "a trailing embedded-EXIF cycle-guard warning must be Trailer-scoped, got {cg:?}",
+  );
+  // Sanity: it is NOT a stray document-level diagnostic (group None).
+  assert!(
+    !diags.iter().any(
+      |d| d.group().is_none() && d.message() == "IFD0 pointer references previous IFD0 directory"
+    ),
+    "the cycle-guard warning must not leak as a document-level diagnostic, got {diags:?}",
   );
 }

@@ -103,6 +103,48 @@ def build_xmp_oddnibble_png() -> bytes:
     )
 
 
+# A double-UTF-encoded XMP packet: a RAW leading UTF-8 BOM (`\xef\xbb\xbf`)
+# DIRECTLY before `<?xpacket`, which trips ExifTool's double-encoding probe
+# (XMP.pm:4310) and raises the document warning `XMP is double UTF-encoded`
+# (XMP.pm:4494) at the XMP chunk's walk position. (Contrast `XMP_PACKET`, whose
+# BOM lives INSIDE the `begin="…"` attribute and so produces no warning.) The
+# re-decoded body is valid UTF-8, so ExifTool still emits the `XMP-dc:Format`
+# tag.
+XMP_DOUBLE_PACKET = (
+    b"\xef\xbb\xbf"
+    b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+    b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+    b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    b'<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+    b"<dc:format>image/png</dc:format>"
+    b"</rdf:Description></rdf:RDF></x:xmpmeta>"
+    b"<?xpacket end='w'?>"
+)
+
+
+def build_xmp_warnorder_png() -> bytes:
+    # Issue #205 — a MALFORMED `Raw profile type xmp` chunk (the double-UTF
+    # packet, warning `XMP is double UTF-encoded`) positioned BEFORE a later
+    # warning-producing chunk (a bad `eXIf` whose body is neither `II`/`MM`/`\0`,
+    # warning `Invalid eXIf chunk`). Because the XMP chunk is walked FIRST, its
+    # warning must become the document FIRST `ExifTool:Warning` (`Warning` is
+    # `Priority=0` first-wins). exifast previously drained the raw-profile-XMP
+    # decode warning dead-last and surfaced the later `Invalid eXIf chunk`
+    # instead; this fixture pins the faithful chunk-walk-position ordering. The
+    # bad `eXIf` precedes `IDAT`, so no "Text/EXIF chunk found after IDAT"
+    # warning is added. (Bundled emits a `PNG:eXIf` binary placeholder for the
+    # invalid eXIf chunk; exifast suppresses it, so the conformance check drops
+    # that one key — the warning order is what is compared.)
+    return (
+        SIG
+        + ihdr(1, 1)
+        + raw_profile_text("xmp", XMP_DOUBLE_PACKET)
+        + chunk(b"eXIf", b"XXXXbadexifheader")
+        + idat_1x1_rgb()
+        + chunk(b"IEND", b"")
+    )
+
+
 def main() -> None:
     outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -113,6 +155,7 @@ def main() -> None:
     fixtures = {
         "PNG_rawprofile_xmp.png": build_xmp_png(),
         "PNG_rawprofile_xmp_oddnibble.png": build_xmp_oddnibble_png(),
+        "PNG_rawprofile_xmp_warnorder.png": build_xmp_warnorder_png(),
     }
     for name, data in fixtures.items():
         path = os.path.join(outdir, name)

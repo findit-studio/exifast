@@ -245,7 +245,7 @@ static EXIF_TIMEZONEOFFSET: ExifTag = ExifTag {
 static EXIF_SENSITIVITYTYPE: ExifTag = ExifTag {
   id: 0x8830,
   name: "SensitivityType",
-  conv: Conv::None,
+  conv: Conv::IntLabel(super::SENSITIVITY_TYPE),
 };
 static EXIF_STANDARDOUTPUTSENSITIVITY: ExifTag = ExifTag {
   id: 0x8831,
@@ -520,7 +520,7 @@ static EXIF_SENSINGMETHOD: ExifTag = ExifTag {
 static EXIF_FILESOURCE: ExifTag = ExifTag {
   id: 0xa300,
   name: "FileSource",
-  conv: Conv::IntLabel(super::FILE_SOURCE),
+  conv: Conv::FileSource(super::FILE_SOURCE),
 };
 static EXIF_SCENETYPE: ExifTag = ExifTag {
   id: 0xa301,
@@ -596,7 +596,7 @@ static EXIF_SATURATION: ExifTag = ExifTag {
 static EXIF_SHARPNESS: ExifTag = ExifTag {
   id: 0xa40a,
   name: "Sharpness",
-  conv: Conv::IntLabel(super::CONTRAST),
+  conv: Conv::IntLabel(super::SHARPNESS),
 };
 static EXIF_DEVICESETTINGDESCRIPTION: ExifTag = ExifTag {
   id: 0xa40b,
@@ -664,7 +664,7 @@ static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
   conv: Conv::CompositeImageExposureTimes,
 };
 
-/// `Exif::Main` — the generated shadow (115 ids: the ported hand subset + the
+/// `Exif::Main` — the generated shadow (118 ids: the ported hand subset + the
 /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
 /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
 /// in the hand table) is the only one this fallback actually returns.

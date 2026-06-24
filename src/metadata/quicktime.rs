@@ -989,6 +989,26 @@ pub struct AudioSampleDesc {
   /// so an `mp4a` descriptor's `btrt` surfaces here. `PRIORITY => 0`. `None`
   /// when the entry carries no `btrt`.
   bitrate: Option<Bitrate>,
+  /// `chan` `LayoutFlags` (`%QuickTime::ChannelLayout` offset 4, `int16u`,
+  /// QuickTime.pm:7892-7986). The `AudioChannelLayout` (`chan`) sample-entry
+  /// child decodes through `ProcessBinaryData`; `LayoutFlags` is its first tag
+  /// (a `DATAMEMBER` stashed for the conditional later tags). PrintConv maps the
+  /// known layout enums (`1 => 'UseBitmap'`, `100 => 'Mono'`, …); `-n` keeps the
+  /// raw `int16u`. `None` when the entry carries no `chan`.
+  channel_layout_flags: Option<u16>,
+  /// `chan` `AudioChannelTypes` (`%QuickTime::ChannelLayout` offset 8, `int32u`,
+  /// QuickTime.pm:7996-8019). Decoded ONLY when `LayoutFlags == 1` (the bitmap
+  /// channel-layout form); `PrintConv => { BITMASK => {...} }` (`Left`/`Right`/
+  /// `Center`/…, `DecodeBits`). `None` when there is no `chan` or
+  /// `LayoutFlags != 1`.
+  audio_channel_types: Option<u32>,
+  /// `chan` `NumChannelDescriptions` (`%QuickTime::ChannelLayout` offset 12,
+  /// `int32u`, QuickTime.pm:8021-8025). Decoded ONLY when `LayoutFlags == 1`;
+  /// no conversion (bare int both modes). It gates the per-channel description
+  /// tags (`Channel<N>Label`/…) — none of which BlackVue carries
+  /// (`NumChannelDescriptions == 0`). `None` when there is no `chan` or
+  /// `LayoutFlags != 1`.
+  num_channel_descriptions: Option<u32>,
 }
 
 impl AudioSampleDesc {
@@ -1003,6 +1023,9 @@ impl AudioSampleDesc {
       bits_per_sample: None,
       sample_rate: None,
       bitrate: None,
+      channel_layout_flags: None,
+      audio_channel_types: None,
+      num_channel_descriptions: None,
     }
   }
 
@@ -1047,6 +1070,29 @@ impl AudioSampleDesc {
   #[must_use]
   pub const fn bitrate(&self) -> Option<&Bitrate> {
     self.bitrate.as_ref()
+  }
+
+  /// `chan` `LayoutFlags` (raw `int16u`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn channel_layout_flags(&self) -> Option<u16> {
+    self.channel_layout_flags
+  }
+
+  /// `chan` `AudioChannelTypes` (raw `int32u`; present only when
+  /// `LayoutFlags == 1`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_channel_types(&self) -> Option<u32> {
+    self.audio_channel_types
+  }
+
+  /// `chan` `NumChannelDescriptions` (raw `int32u`; present only when
+  /// `LayoutFlags == 1`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn num_channel_descriptions(&self) -> Option<u32> {
+    self.num_channel_descriptions
   }
 
   /// Set `AudioFormat`.
@@ -1103,6 +1149,27 @@ impl AudioSampleDesc {
     }
   }
 
+  /// Set the `chan` `LayoutFlags`.
+  #[inline(always)]
+  pub const fn set_channel_layout_flags(&mut self, v: Option<u16>) -> &mut Self {
+    self.channel_layout_flags = v;
+    self
+  }
+
+  /// Set the `chan` `AudioChannelTypes`.
+  #[inline(always)]
+  pub const fn set_audio_channel_types(&mut self, v: Option<u32>) -> &mut Self {
+    self.audio_channel_types = v;
+    self
+  }
+
+  /// Set the `chan` `NumChannelDescriptions`.
+  #[inline(always)]
+  pub const fn set_num_channel_descriptions(&mut self, v: Option<u32>) -> &mut Self {
+    self.num_channel_descriptions = v;
+    self
+  }
+
   /// Fold a later `stsd` entry's Audio Sample Description into `self` with
   /// ExifTool `ProcessSampleDesc` per-tag LAST-WINS semantics (see
   /// [`VisualSampleDesc::merge_from`]): a `Some` field in `other` overrides,
@@ -1129,6 +1196,17 @@ impl AudioSampleDesc {
     // `btrt` is PRIORITY 0 (per-field first-wins), NOT last-wins.
     if let Some(other_bitrate) = other.bitrate {
       self.fold_bitrate_priority0(other_bitrate);
+    }
+    // `chan` ChannelLayout — a plain `ProcessBinaryData` SubDirectory (no
+    // PRIORITY override), so per-tag LAST-WINS like the fixed audio fields.
+    if other.channel_layout_flags.is_some() {
+      self.channel_layout_flags = other.channel_layout_flags;
+    }
+    if other.audio_channel_types.is_some() {
+      self.audio_channel_types = other.audio_channel_types;
+    }
+    if other.num_channel_descriptions.is_some() {
+      self.num_channel_descriptions = other.num_channel_descriptions;
     }
   }
 }
@@ -1240,6 +1318,203 @@ impl SampleDescRoute {
   }
 }
 
+/// The `mdia/minf/hdlr` data-reference handler triplet (QuickTime.pm:7319-7322
+/// → `%QuickTime::Handler`): a track's SECOND `hdlr`, distinct from the
+/// `mdia/hdlr` media handler. Carries the same four `%Handler` fields
+/// (HandlerClass offset 4, HandlerType offset 8, HandlerVendorID offset 12,
+/// HandlerDescription offset 24). Held separately on [`MediaTrack`] so the
+/// per-track Handler dedup can choose between the media and the data handler
+/// without the two clobbering one set of slots.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DataReferenceHandler {
+  class: Option<String>,
+  code: Option<String>,
+  vendor_id: Option<String>,
+  description: Option<String>,
+}
+
+impl DataReferenceHandler {
+  /// `hdlr` HandlerClass / ComponentType (raw 4-byte code), `None` when all-zero.
+  #[inline(always)]
+  #[must_use]
+  pub fn class(&self) -> Option<&str> {
+    self.class.as_deref()
+  }
+
+  /// `hdlr` HandlerType (raw 4-byte code, verbatim — e.g. `"url "`).
+  #[inline(always)]
+  #[must_use]
+  pub fn code(&self) -> Option<&str> {
+    self.code.as_deref()
+  }
+
+  /// `hdlr` HandlerVendorID (`None` when all-zero).
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// `hdlr` HandlerDescription (post the Pascal/C-string `RawConv`), `None`
+  /// when empty.
+  #[inline(always)]
+  #[must_use]
+  pub fn description(&self) -> Option<&str> {
+    self.description.as_deref()
+  }
+
+  /// Set the raw 4-byte HandlerClass / ComponentType (already RawConv-filtered).
+  #[inline(always)]
+  pub fn set_class(&mut self, v: Option<String>) -> &mut Self {
+    self.class = v;
+    self
+  }
+
+  /// Set the raw 4-byte HandlerType code (verbatim).
+  #[inline(always)]
+  pub fn set_code(&mut self, v: Option<String>) -> &mut Self {
+    self.code = v;
+    self
+  }
+
+  /// Set the HandlerVendorID (already RawConv-filtered to non-zero).
+  #[inline(always)]
+  pub fn set_vendor_id(&mut self, v: Option<String>) -> &mut Self {
+    self.vendor_id = v;
+    self
+  }
+
+  /// Set the HandlerDescription (already RawConv-decoded).
+  #[inline(always)]
+  pub fn set_description(&mut self, v: Option<String>) -> &mut Self {
+    self.description = v;
+    self
+  }
+
+  /// Whether this `minf/hdlr` carried any extractable `%Handler` field — a
+  /// HandlerType code, HandlerClass, HandlerVendorID or HandlerDescription. A
+  /// short/empty/all-undef `minf/hdlr` (every field `None`) returns `false`: it
+  /// extracts no tag, so it cannot own the bare `Track<N>:Handler*` key nor
+  /// suppress the track's `mdia/hdlr` MEDIA handler (a fully-undef `hdlr`
+  /// produces no `HandlerType` in bundled ExifTool — only the media handler
+  /// shows). A present-but-zero HandlerType (`code == Some("\0\0\0\0")`) still
+  /// counts as content: bundled emits `HandlerType => "Unknown ()"` for it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn has_content(&self) -> bool {
+    self.class.is_some()
+      || self.code.is_some()
+      || self.vendor_id.is_some()
+      || self.description.is_some()
+  }
+
+  /// Fold a later `minf/hdlr`'s decoded `%Handler` fields into this slot,
+  /// PER FIELD (last-Some): a field the later box PROVIDES (`Some`) overrides,
+  /// a field it OMITS (`None`) leaves the earlier value intact. This mirrors
+  /// ExifTool's binary `%Handler` table — each of HandlerClass (offset 4),
+  /// HandlerType (8), HandlerVendorID (12) and HandlerDescription (24) is an
+  /// INDEPENDENT `FoundTag`, and a box whose RawConv yields `undef` for a field
+  /// (an all-zero HandlerClass/VendorID, an empty HandlerDescription, or an
+  /// offset past the box end) extracts NO tag for it, so it cannot override an
+  /// earlier `minf/hdlr`'s value of that field. Two `minf/hdlr` boxes in one
+  /// `trak` (`url ` full then a class-only `dhlr`) therefore retain the `url `'s
+  /// HandlerType/Description while taking the later HandlerClass.
+  #[inline(always)]
+  pub fn merge_from(&mut self, other: &Self) {
+    if other.class.is_some() {
+      self.class = other.class.clone();
+    }
+    if other.code.is_some() {
+      self.code = other.code.clone();
+    }
+    if other.vendor_id.is_some() {
+      self.vendor_id = other.vendor_id.clone();
+    }
+    if other.description.is_some() {
+      self.description = other.description.clone();
+    }
+  }
+}
+
+/// One walked `hdlr` box's four `%Handler` fields, recorded IN FILE ORDER as the
+/// `trak` walk visits it — the `mdia/hdlr` MEDIA handler AND every `mdia/minf/hdlr`
+/// DATA handler, each as a SEPARATE record (no media/data distinction stored).
+/// ExifTool runs the `%Handler` binary-data table for EVERY `hdlr` box it walks
+/// (QuickTime.pm:8391-8461 / 7319-7322), extracting HandlerClass (offset 4),
+/// HandlerType (offset 8), HandlerVendorID (offset 12) and HandlerDescription
+/// (offset 24) as FOUR independent `FoundTag`s, all into the same `Track<N>`
+/// family-1 group. The position of a box in [`MediaTrack::handler_boxes`] IS its
+/// monotonic parse-order sequence: the parser walks the `mdia` children in FILE
+/// order, so a NORMAL `mdia(mdhd, hdlr, minf(hdlr))` records the media handler
+/// before the data handler, whereas a REORDERED `mdia(mdhd, minf(hdlr), hdlr)`
+/// records the data handler first and the media handler last. The per-track
+/// Handler resolution (`resolve_per_track_handlers` in `formats/quicktime.rs`)
+/// reads these boxes in actual file order — the per-field LAST-in-file-order
+/// provider wins — with NO media-before-data assumption. A field a box does NOT
+/// provide (its RawConv yields `undef` — an all-zero HandlerClass/VendorID, an
+/// empty HandlerDescription, or an offset past the box end) is `None`, so it
+/// never wins that field; an all-`None` box (a short/empty `hdlr`) contributes
+/// nothing and can neither own a bare key nor suppress a neighbour.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HandlerBox {
+  class: Option<String>,
+  code: Option<String>,
+  vendor_id: Option<String>,
+  description: Option<String>,
+}
+
+impl HandlerBox {
+  /// Build one walked `hdlr` box record from its four already-RawConv-filtered
+  /// `%Handler` fields (HandlerClass / HandlerType / HandlerVendorID /
+  /// HandlerDescription).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new(
+    class: Option<String>,
+    code: Option<String>,
+    vendor_id: Option<String>,
+    description: Option<String>,
+  ) -> Self {
+    Self {
+      class,
+      code,
+      vendor_id,
+      description,
+    }
+  }
+
+  /// The box's HandlerClass / ComponentType (raw 4-byte code), `None` when
+  /// all-zero or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn class(&self) -> Option<&str> {
+    self.class.as_deref()
+  }
+
+  /// The box's HandlerType (raw 4-byte code, verbatim), `None` when past the
+  /// box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn code(&self) -> Option<&str> {
+    self.code.as_deref()
+  }
+
+  /// The box's HandlerVendorID, `None` when all-zero or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn vendor_id(&self) -> Option<&str> {
+    self.vendor_id.as_deref()
+  }
+
+  /// The box's HandlerDescription (post the Pascal/C-string `RawConv`), `None`
+  /// when empty or past the box end.
+  #[inline(always)]
+  #[must_use]
+  pub fn description(&self) -> Option<&str> {
+    self.description.as_deref()
+  }
+}
+
 /// One QuickTime track — the typed mirror of a `trak` atom and its
 /// `tkhd` / `mdia(mdhd, hdlr)` children (QuickTime.pm:1424-1582,
 /// 7218-7327). All fields are optional: a fixture too short for a given
@@ -1327,6 +1602,48 @@ pub struct MediaTrack {
   /// ord(first))`), else a NUL-terminated C string; an empty result is `None`.
   /// Drives `Track<N>:HandlerDescription`.
   handler_description: Option<String>,
+  /// The `mdia/minf/hdlr` data-reference handler triplet (HandlerClass /
+  /// HandlerType / HandlerVendorID / HandlerDescription), the SECOND `hdlr` in a
+  /// `trak` (a `dhlr`/`url ` data handler, QuickTime.pm:7319-7322 →
+  /// `%QuickTime::Handler`), kept DISTINCT from the `mdia/hdlr` media triplet
+  /// above. ExifTool extracts BOTH `hdlr`s into the same `Track<N>` family-1
+  /// group; its group-aware JSON dedup (exiftool:2745 + 2952) then keeps, per
+  /// track, ONE `HandlerClass`/`HandlerType`/`HandlerDescription` — the bare
+  /// tag key lands (via the FoundTag priority shuffle, ExifTool.pm:9564) on the
+  /// LAST-extracted `hdlr` in the whole file, so only the FINAL `trak`'s
+  /// `minf/hdlr` survives as its track's value while every earlier `trak` keeps
+  /// its `mdia/hdlr` media triplet. The emission replays that selection (see
+  /// the per-track Handler block in `formats/quicktime.rs`). `None` when this
+  /// `trak` has no `minf/hdlr`.
+  data_handler: Option<DataReferenceHandler>,
+  /// EVERY raw 4-byte `hdlr` HandlerType code the `trak` walk encounters, in
+  /// file order — the `mdia/hdlr` MEDIA handler followed by EACH `mdia/minf/hdlr`
+  /// DATA handler, INCLUDING repeated `minf` boxes (the parser walks every
+  /// `minf` child). Distinct from both [`Self::handler_code`] (the single
+  /// `mdia/hdlr` 4cc that is the `HandlerType` tag) and [`Self::data_handler`]
+  /// (the SINGLE last-wins data-reference triplet the Handler dedup may surface):
+  /// each of those keeps only ONE code, whereas ExifTool runs the `%Handler`
+  /// `HandlerType` RawConv (QuickTime.pm:8407-8414) for EVERY `hdlr` box it
+  /// walks. This complete list is what the no-`ee` `EEWarn` iterates so the
+  /// warning fires for ANY `%eeBox` code seen — even one carried by a `minf/hdlr`
+  /// that a LATER `minf/hdlr` overwrites in the `data_handler` slot (a track with
+  /// `mdia/hdlr=vide` + first `minf/hdlr=meta` + later `minf/hdlr=url ` still
+  /// warns on the `meta`). The triplet emission is UNCHANGED (still the
+  /// last-surviving `hdlr` per group). Empty when the `trak` has no `hdlr`.
+  all_handler_codes: std::vec::Vec<String>,
+  /// EVERY walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]), recorded
+  /// IN FILE ORDER — the `mdia/hdlr` MEDIA handler AND each `mdia/minf/hdlr` DATA
+  /// handler, in the order the `trak` walk visits them (the `mdia` children are
+  /// walked in file order). The `Vec` position is the box's monotonic parse-order
+  /// sequence, so a NORMAL `mdia(hdlr, minf(hdlr))` lists the media box before the
+  /// data box, while a REORDERED `mdia(minf(hdlr), hdlr)` lists the data box first.
+  /// This is what `resolve_per_track_handlers` reads for the per-field
+  /// LAST-in-file-order Handler resolution — NO media-before-data assumption. The
+  /// per-`mdia/hdlr` media triplet ([`Self::handler_class`] etc.) and the merged
+  /// [`Self::data_handler`] slot are KEPT for the [`crate::metadata::MediaMetadata`]
+  /// projection and the existing accessors; this `Vec` is the additive provenance
+  /// channel the resolver consults. Empty when the `trak` has no `hdlr`.
+  handler_boxes: std::vec::Vec<HandlerBox>,
   /// `minf/smhd` AudioHeader Balance (the `%QuickTime::AudioHeader` key 2 ⇒
   /// byte 4, `fixed16s`, QuickTime.pm:7349). Present only for an audio track
   /// with an `smhd`. Drives `Track<N>:Balance` (the rounded 16.8 fixed-point).
@@ -1427,6 +1744,9 @@ impl MediaTrack {
       other_format: None,
       handler_vendor_id: None,
       handler_description: None,
+      data_handler: None,
+      all_handler_codes: std::vec::Vec::new(),
+      handler_boxes: std::vec::Vec::new(),
       audio_balance: None,
       visual_sample_desc: None,
       audio_sample_desc: None,
@@ -1613,6 +1933,57 @@ impl MediaTrack {
   #[must_use]
   pub fn handler_description(&self) -> Option<&str> {
     self.handler_description.as_deref()
+  }
+
+  /// The `mdia/minf/hdlr` data-reference handler triplet (the track's SECOND
+  /// `hdlr`), or `None` when the `trak` has no `minf/hdlr`. Distinct from the
+  /// `mdia/hdlr` media handler above; the per-track Handler dedup chooses
+  /// between them.
+  #[inline(always)]
+  #[must_use]
+  pub const fn data_handler(&self) -> Option<&DataReferenceHandler> {
+    self.data_handler.as_ref()
+  }
+
+  /// Fold one `mdia/minf/hdlr` data-reference handler into the track's slot,
+  /// PER FIELD (last-Some — [`DataReferenceHandler::merge_from`]). The parser
+  /// builds the candidate from one `minf/hdlr` body and only calls this when the
+  /// candidate carries content ([`DataReferenceHandler::has_content`]); a
+  /// fully-undef `minf/hdlr` is a no-op at the walk source, so it can neither
+  /// clear nor overwrite a prior valid handler (a short/empty box never erases
+  /// an earlier `url ` triplet). When a `trak` carries SEVERAL `minf/hdlr`
+  /// boxes, each contributes only the `%Handler` fields it provides, so the slot
+  /// accumulates the per-field LAST value across them (a `url ` full then a
+  /// class-only `dhlr` keeps the `url ` HandlerType/Description, takes the later
+  /// HandlerClass) — exactly the bundled last-extracted-per-`FoundTag` result.
+  #[inline(always)]
+  pub fn merge_data_handler(&mut self, handler: &DataReferenceHandler) {
+    match &mut self.data_handler {
+      Some(slot) => slot.merge_from(handler),
+      slot @ None => *slot = Some(handler.clone()),
+    }
+  }
+
+  /// EVERY `hdlr` HandlerType code the `trak` walk encountered, in file order
+  /// (`mdia/hdlr` then each `mdia/minf/hdlr`, including repeated `minf` boxes).
+  /// The no-`ee` `EEWarn` iterates this complete list so it sees every
+  /// `%eeBox` code regardless of which one won the single-slot
+  /// [`Self::data_handler`] triplet.
+  #[inline(always)]
+  #[must_use]
+  pub fn all_handler_codes(&self) -> &[String] {
+    &self.all_handler_codes
+  }
+
+  /// EVERY walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]), in FILE
+  /// ORDER (the `mdia/hdlr` media handler and each `mdia/minf/hdlr` data handler,
+  /// in walk order). The slice position is the box's parse-order sequence; the
+  /// per-track Handler resolution reads it for the per-field LAST-in-file-order
+  /// provider, with NO media-before-data assumption.
+  #[inline(always)]
+  #[must_use]
+  pub fn handler_boxes(&self) -> &[HandlerBox] {
+    &self.handler_boxes
   }
 
   /// `minf/smhd` Balance (the rounded 16.8 fixed-point), `None` for a track
@@ -1839,6 +2210,30 @@ impl MediaTrack {
     let code = code.into();
     self.handler = Some(HandlerKind::from_code(&code));
     self.handler_code = Some(code);
+    self
+  }
+
+  /// Append a raw 4-byte `hdlr` HandlerType code to the file-order
+  /// [`Self::all_handler_codes`] accumulation. Called by the parser at EVERY
+  /// `hdlr` box of the `trak` walk (`mdia/hdlr` AND every `mdia/minf/hdlr`,
+  /// including repeated `minf` boxes) so the no-`ee` `EEWarn` sees the complete
+  /// set — separate from the single-slot media/data-handler triplets.
+  #[inline(always)]
+  pub fn push_handler_code(&mut self, code: impl Into<String>) -> &mut Self {
+    self.all_handler_codes.push(code.into());
+    self
+  }
+
+  /// Append one walked `hdlr` box's four `%Handler` fields ([`HandlerBox`]) to
+  /// the file-order [`Self::handler_boxes`] provenance. Called by the parser at
+  /// EVERY `hdlr` box of the `trak` walk (the `mdia/hdlr` media handler AND each
+  /// `mdia/minf/hdlr` data handler, in walk order), so the slice records the boxes
+  /// in actual file order for the per-field LAST-in-file-order Handler resolution.
+  /// A fully-undef box (every field `None`) is still recorded — it simply wins no
+  /// field — so the caller need not pre-filter on content.
+  #[inline(always)]
+  pub fn push_handler_box(&mut self, handler: HandlerBox) -> &mut Self {
+    self.handler_boxes.push(handler);
     self
   }
 
@@ -2127,6 +2522,234 @@ impl KodakFrea {
   }
 }
 
+/// Pittasoft BlackVue dashcam `free`-atom metadata
+/// (`%Image::ExifTool::QuickTime::Pittasoft`, QuickTime.pm:8488-8546). The
+/// top-level `free` atom whose body matches the Pittasoft Condition
+/// (QuickTime.pm:572 — `^\0\0..(cprt|sttm|ptnm|ptrh|thum|gps |3gf )`) is walked
+/// as a `ProcessMOV` SubDirectory; its child atoms decode to these `QuickTime`-
+/// grouped tags (the table has no `GROUPS` override → family-0/1 default
+/// `QuickTime`). `ptrh` is a recursive container (`ptvi`/`ptso`) ExifTool emits
+/// nothing from, and `lte ` is an unknown sibling — neither surfaces a tag.
+///
+/// **D8 — no public fields, accessors only.**
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Pittasoft {
+  /// `cprt` Copyright (QuickTime.pm:8491) — the raw string value (a plain
+  /// string tag, NUL-truncated). For BlackVue this is the leading-space nested
+  /// JSON status blob (`{"model":"DR770X",…}`), emitted verbatim in both modes.
+  copyright: Option<smol_str::SmolStr>,
+  /// `sttm` StartTime (QuickTime.pm:8536-8545) — the FORMATTED date string.
+  /// `Format => 'int64u'` (ms since 1970 local), `ValueConv` =
+  /// `ConvertUnixTime(int($val/1000)) . sprintf(".%03d", $val - secs*1000)`,
+  /// `PrintConv => ConvertDateTime` (which reproduces the same `YYYY:MM:DD
+  /// HH:MM:SS.sss`), so the value is mode-invariant. Stored pre-formatted.
+  start_time: Option<smol_str::SmolStr>,
+  /// `ptnm` OriginalFileName (QuickTime.pm:8504-8507) — `ValueConv =>
+  /// 'substr($val, 4, -1)'` (skip the 4-byte `\x01\0\0\0` prefix, drop the
+  /// trailing NUL). Mode-invariant.
+  original_file_name: Option<smol_str::SmolStr>,
+  /// `thum` PreviewImage (QuickTime.pm:8492-8503) — `Binary => 1`; the RawConv
+  /// strips a leading 4-byte big-endian length and returns that many image
+  /// bytes. We store the DECODED image byte length for the `(Binary data N
+  /// bytes …)` placeholder (the bytes are not retained). `None` when the
+  /// payload is too short or the declared length overruns it (the RawConv
+  /// `return undef`).
+  preview_image_len: Option<u64>,
+  /// `gps ` GPSLog (QuickTime.pm:8514-8525) — `Binary => 1` (an ASCII NMEA
+  /// track log). The RawConv strips trailing NULs and returns the remainder
+  /// (separately parsed to GPS only under `ExtractEmbedded`; for this fixture
+  /// `-ee` surfaces no extra GPS). We store the trailing-NUL-stripped byte
+  /// length for the placeholder.
+  gps_log_len: Option<u64>,
+  /// `3gf ` AccelData → the FIRST record's `TimeCode` (`Process_3gf`,
+  /// QuickTimeStream.pl:2703 — `$tc / 1000`). Without `-ee`, `Process_3gf`
+  /// truncates the box to its first 10-byte record (and raises the document
+  /// `EEWarn`), so the no-`ee` base path emits exactly this one value. `None`
+  /// when the box has no decodable record (or its first record is the
+  /// `0xffffffff` terminator).
+  time_code: Option<f64>,
+  /// `3gf ` AccelData → the FIRST record's `Accelerometer` (`Process_3gf`,
+  /// QuickTimeStream.pl:2704 — `"$x $y $z"`, each int16s/10). Paired with
+  /// [`Self::time_code`]; mode-invariant string.
+  accelerometer: Option<smol_str::SmolStr>,
+  /// `true` once a `3gf ` box was seen with MORE than one record at no-`ee` —
+  /// ExifTool's `EEWarn` ("[minor] The ExtractEmbedded option may find more
+  /// tags in the media data", QuickTimeStream.pl:2693-2694), the doc-level
+  /// `Warning` BlackVue raises in the base path. Tracked so the emitter can
+  /// surface it (priority-0 first-wins) without `-ee`.
+  ee_warn: bool,
+  /// The absolute file offset of the top-level `free`/Pittasoft atom whose
+  /// `3gf ` child raised [`Self::ee_warn`] (`None` when no EEWarn). The free
+  /// atom precedes `mdat` in file order, so this lets the document-level
+  /// diagnostics drain rank the `3gf ` `EEWarn` against a LATER truncated-`mdat`
+  /// `ProcessMOV` warning by file position — ExifTool emits `Warning` tags
+  /// priority-0 first-wins, so the EARLIER-positioned warning becomes the public
+  /// `ExifTool:Warning` (the #159/#361 offset-ordered first-wins mechanism).
+  ee_warn_offset: Option<u64>,
+}
+
+impl Pittasoft {
+  /// A fresh, empty Pittasoft decode (no `free`/Pittasoft sub-atom seen).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      copyright: None,
+      start_time: None,
+      original_file_name: None,
+      preview_image_len: None,
+      gps_log_len: None,
+      time_code: None,
+      accelerometer: None,
+      ee_warn: false,
+      ee_warn_offset: None,
+    }
+  }
+
+  /// `cprt` Copyright — the raw (NUL-truncated) string.
+  #[inline(always)]
+  #[must_use]
+  pub fn copyright(&self) -> Option<&str> {
+    self.copyright.as_deref()
+  }
+
+  /// `sttm` StartTime — the pre-formatted `YYYY:MM:DD HH:MM:SS.sss` string.
+  #[inline(always)]
+  #[must_use]
+  pub fn start_time(&self) -> Option<&str> {
+    self.start_time.as_deref()
+  }
+
+  /// `ptnm` OriginalFileName.
+  #[inline(always)]
+  #[must_use]
+  pub fn original_file_name(&self) -> Option<&str> {
+    self.original_file_name.as_deref()
+  }
+
+  /// `thum` PreviewImage — decoded image byte length (for the placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn preview_image_len(&self) -> Option<u64> {
+    self.preview_image_len
+  }
+
+  /// `gps ` GPSLog — trailing-NUL-stripped byte length (for the placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn gps_log_len(&self) -> Option<u64> {
+    self.gps_log_len
+  }
+
+  /// `3gf ` first-record TimeCode (`$tc / 1000`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn time_code(&self) -> Option<f64> {
+    self.time_code
+  }
+
+  /// `3gf ` first-record Accelerometer (`"$x $y $z"`).
+  #[inline(always)]
+  #[must_use]
+  pub fn accelerometer(&self) -> Option<&str> {
+    self.accelerometer.as_deref()
+  }
+
+  /// `true` when a multi-record `3gf ` box raised the no-`ee` `EEWarn`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn ee_warn(&self) -> bool {
+    self.ee_warn
+  }
+
+  /// The top-level `free`/Pittasoft atom file offset that raised the no-`ee`
+  /// `EEWarn` (`None` when no EEWarn) — the offset the document diagnostics
+  /// drain ranks against the other doc-level `Warning`s (#159/#361 first-wins).
+  #[inline(always)]
+  #[must_use]
+  pub const fn ee_warn_offset(&self) -> Option<u64> {
+    self.ee_warn_offset
+  }
+
+  /// `true` when no Pittasoft tag was decoded (the `free` atom was not a
+  /// Pittasoft container, or it carried only `ptrh`/`lte `).
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    self.copyright.is_none()
+      && self.start_time.is_none()
+      && self.original_file_name.is_none()
+      && self.preview_image_len.is_none()
+      && self.gps_log_len.is_none()
+      && self.time_code.is_none()
+      && self.accelerometer.is_none()
+  }
+
+  /// Record the `cprt` Copyright string.
+  #[inline(always)]
+  pub fn set_copyright(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.copyright = v;
+    self
+  }
+
+  /// Record the `sttm` StartTime (pre-formatted date string).
+  #[inline(always)]
+  pub fn set_start_time(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.start_time = v;
+    self
+  }
+
+  /// Record the `ptnm` OriginalFileName.
+  #[inline(always)]
+  pub fn set_original_file_name(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.original_file_name = v;
+    self
+  }
+
+  /// Record the `thum` PreviewImage decoded byte length.
+  #[inline(always)]
+  pub const fn set_preview_image_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.preview_image_len = v;
+    self
+  }
+
+  /// Record the `gps ` GPSLog (NUL-stripped) byte length.
+  #[inline(always)]
+  pub const fn set_gps_log_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.gps_log_len = v;
+    self
+  }
+
+  /// Record the `3gf ` first-record TimeCode.
+  #[inline(always)]
+  pub const fn set_time_code(&mut self, v: Option<f64>) -> &mut Self {
+    self.time_code = v;
+    self
+  }
+
+  /// Record the `3gf ` first-record Accelerometer.
+  #[inline(always)]
+  pub fn set_accelerometer(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.accelerometer = v;
+    self
+  }
+
+  /// Record that a multi-record `3gf ` box raised the no-`ee` `EEWarn`.
+  #[inline(always)]
+  pub const fn set_ee_warn(&mut self, v: bool) -> &mut Self {
+    self.ee_warn = v;
+    self
+  }
+
+  /// Record the top-level `free`/Pittasoft atom file offset that raised the
+  /// no-`ee` `EEWarn` (for the document-level offset-ordered first-wins drain).
+  #[inline(always)]
+  pub const fn set_ee_warn_offset(&mut self, v: Option<u64>) -> &mut Self {
+    self.ee_warn_offset = v;
+    self
+  }
+}
+
 /// **SP2** — a QuickTime GPS coordinate from an ISO 6709 string (`©xyz` /
 /// `com.apple.quicktime.location.ISO6709`). Mirrors `ConvertISO6709`
 /// (QuickTime.pm:8884-8909): [`Self::value_conv`] is the faithful ValueConv
@@ -2309,6 +2932,12 @@ pub struct QuickTimeUserData {
   /// GPSCoordinates — the copyright-symbol `xyz`, decoded from ISO 6709
   /// (QuickTime.pm:1657-1664).
   gps: Option<QuickTimeGps>,
+  /// `loci` LocationInformation — the 3gp location box decoded by the
+  /// `%QuickTime::UserData` `loci` RawConv (QuickTime.pm:1775-1818, group2
+  /// `Location`): the post-RawConv string `"<name> Role=… Lat=… Lon=… Alt=…
+  /// Body=… Notes=…"`. Mode-invariant (the RawConv is the only conversion).
+  /// Emitted under `QuickTime:UserData`.
+  location_information: Option<String>,
   /// `CAME` SerialNumberHash (QuickTime.pm:2120-2125, GoPro Hero4): the
   /// `ValueConv => 'unpack("H*",$val)'` result — the lower-case hex of the raw
   /// bytes. Code-valued, so HAND-ported (not in the generated conv-less map).
@@ -2353,6 +2982,7 @@ impl QuickTimeUserData {
       content_create_date: None,
       date_time_original: None,
       gps: None,
+      location_information: None,
       serial_number_hash: None,
       media_uid: None,
       convless: Vec::new(),
@@ -2451,6 +3081,13 @@ impl QuickTimeUserData {
     self.gps.as_ref()
   }
 
+  /// `loci` LocationInformation (the post-RawConv 3gp location string).
+  #[inline(always)]
+  #[must_use]
+  pub fn location_information(&self) -> Option<&str> {
+    self.location_information.as_deref()
+  }
+
   /// `CAME` SerialNumberHash (the `unpack("H*")` hex of the raw bytes).
   #[inline(always)]
   #[must_use]
@@ -2491,6 +3128,7 @@ impl QuickTimeUserData {
       && self.content_create_date.is_none()
       && self.date_time_original.is_none()
       && self.gps.is_none()
+      && self.location_information.is_none()
       && self.serial_number_hash.is_none()
       && self.media_uid.is_none()
       && self.convless.is_empty()
@@ -2619,6 +3257,13 @@ impl QuickTimeUserData {
     self
   }
 
+  /// Set `loci` LocationInformation (the post-RawConv 3gp location string).
+  #[inline(always)]
+  pub fn set_location_information(&mut self, v: Option<String>) -> &mut Self {
+    self.location_information = v;
+    self
+  }
+
   /// Set `CAME` SerialNumberHash (the `unpack("H*")` hex string).
   #[inline(always)]
   pub fn set_serial_number_hash(&mut self, v: Option<String>) -> &mut Self {
@@ -2669,7 +3314,16 @@ pub struct QuickTimeKeys {
   /// `location.ISO6709` GPSCoordinates, decoded from ISO 6709
   /// (QuickTime.pm:6701-6712). CONV-BEARING (`ConvertISO6709` + the
   /// `PrintGPSCoordinates` print-conv), so it is decoded into a typed field.
+  /// Also the sink for a cross-table `\xa9xyz` ItemList GPSCoordinates id (same
+  /// tag NAME + ValueConv), QuickTime.pm:9810/6589-6595.
   gps: Option<QuickTimeGps>,
+  /// `\xa9day` ContentCreateDate, ISO-8601 normalized (`%iso8601Date`,
+  /// QuickTime.pm:3511) — populated ONLY by the ItemList cross-table resolution
+  /// (QuickTime.pm:9810: an mdta `keys` id whose literal 4-cc is the
+  /// `©`-copyright `\xa9day` ItemList id). Distinct from [`Self::creation_date`]
+  /// because the ItemList tag NAME ("ContentCreateDate") differs from the
+  /// `%Keys` `creationdate` NAME ("CreationDate"); both copy `%iso8601Date`.
+  content_create_date: Option<String>,
   /// Every CONV-LESS `%QuickTime::Keys` atom (no `Format`, no `ValueConv`), as
   /// `(Name, value)` in walk order — the camera-identity keys
   /// (`Make`/`Model`/`Software`/`AndroidMake`/`AndroidModel`/`AndroidVersion`/
@@ -2690,6 +3344,16 @@ pub struct QuickTimeKeys {
   /// a number, an `AndroidCaptureFPS` written with a string flag emits the
   /// string — whereas the prior per-key typed fields handled only one flavor.
   convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
+  /// `player.movie.audio.mute` Mute (`%QuickTime::AudioKeys` ONLY,
+  /// QuickTime.pm:6912-6916) — the SOLE conv-BEARING AudioKeys entry: `Format =>
+  /// 'int8u'` + `PrintConv => { 0 => 'Off', 1 => 'On' }`. Stored as the
+  /// pre-PrintConv `data`-atom read (an int8u number for a numeric flag, or the
+  /// decoded string for a string flag — faithful to `ProcessMOV`'s Format-vs-
+  /// stringEncoding branch, QuickTime.pm:10396-10410); the `Off`/`On`/`Unknown
+  /// ($val)` PrintConv is applied at emit (mode-dependent, raw int at `-n`).
+  /// Only ever set on the audio-track `meta` path (the movie-level `%Keys` is
+  /// resolved through the separate generic resolver); `None` otherwise.
+  mute: Option<crate::value::TagValue>,
 }
 
 impl QuickTimeKeys {
@@ -2700,7 +3364,9 @@ impl QuickTimeKeys {
     Self {
       creation_date: None,
       gps: None,
+      content_create_date: None,
       convless: Vec::new(),
+      mute: None,
     }
   }
 
@@ -2808,7 +3474,15 @@ impl QuickTimeKeys {
     self.creation_date.as_deref()
   }
 
-  /// `location.ISO6709` GPSCoordinates.
+  /// The cross-table `\xa9day` ContentCreateDate (ISO-8601 normalized) — the
+  /// ItemList tag NAME distinct from [`Self::creation_date`].
+  #[inline(always)]
+  #[must_use]
+  pub fn content_create_date(&self) -> Option<&str> {
+    self.content_create_date.as_deref()
+  }
+
+  /// `location.ISO6709` GPSCoordinates (also the cross-table `\xa9xyz` sink).
   #[inline(always)]
   #[must_use]
   pub const fn gps(&self) -> Option<&QuickTimeGps> {
@@ -2829,7 +3503,28 @@ impl QuickTimeKeys {
   #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.creation_date.is_none() && self.gps.is_none() && self.convless.is_empty()
+    self.creation_date.is_none()
+      && self.gps.is_none()
+      && self.content_create_date.is_none()
+      && self.convless.is_empty()
+      && self.mute.is_none()
+  }
+
+  /// `player.movie.audio.mute` Mute — the pre-PrintConv `data`-atom read value
+  /// (an int8u number, or a decoded string for a string flag), `None` unless an
+  /// audio-track `meta` AudioKeys `mute` key was decoded. The `Off`/`On`/`Unknown
+  /// ($val)` PrintConv is applied by the emitter (see the field doc).
+  #[inline(always)]
+  #[must_use]
+  pub const fn mute(&self) -> Option<&crate::value::TagValue> {
+    self.mute.as_ref()
+  }
+
+  /// Set `player.movie.audio.mute` Mute (the pre-PrintConv `data`-atom value).
+  #[inline(always)]
+  pub fn set_mute(&mut self, v: Option<crate::value::TagValue>) -> &mut Self {
+    self.mute = v;
+    self
   }
 
   /// Set `creationdate` CreationDate.
@@ -2839,7 +3534,14 @@ impl QuickTimeKeys {
     self
   }
 
-  /// Set `location.ISO6709` GPSCoordinates.
+  /// Set the cross-table `\xa9day` ContentCreateDate.
+  #[inline(always)]
+  pub fn set_content_create_date(&mut self, v: Option<String>) -> &mut Self {
+    self.content_create_date = v;
+    self
+  }
+
+  /// Set `location.ISO6709` GPSCoordinates (also the cross-table `\xa9xyz` sink).
   #[inline(always)]
   pub fn set_gps(&mut self, v: Option<QuickTimeGps>) -> &mut Self {
     self.gps = v;
@@ -2861,6 +3563,116 @@ impl QuickTimeKeys {
 }
 
 impl Default for QuickTimeKeys {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The `moov/udta/meta` ItemList metadata (`%QuickTime::ItemList`,
+/// QuickTime.pm:3481-6623), decoded from the `ilst` `data`-atom items by their
+/// literal 4-character-code (`\xa9nam` Title, `\xa9ART` Artist, `\xa9day`
+/// ContentCreateDate, `\xa9too` Encoder, `covr` CoverArt, `\xa9xyz`
+/// GPSCoordinates …). Emitted under family-1 group `ItemList` (the
+/// `MOV-Movie-Track-UserData-Meta-ItemList` group-derivation, QuickTime.pm:374),
+/// distinct from the `moov/meta`(`mdta`) `keys`-resolved `ilst` that lands under
+/// `Keys` (QuickTime.pm:373).
+///
+/// Two tags carry a conversion and are decoded into typed fields: ContentCreateDate
+/// (`%iso8601Date`) and GPSCoordinates (`ConvertISO6709` + `PrintGPSCoordinates`).
+/// EVERY OTHER modeled ItemList tag is conv-less under the `FORMAT => 'string'`
+/// table (a plain string, or — `covr` / a binary `data` flag — the
+/// `(Binary data N bytes…)` placeholder), so it follows the same conv-less
+/// `data`-atom cascade as the UserData/Keys conv-less atoms and is stored in
+/// [`Self::convless`] by table Name in walk order.
+///
+/// **D8 — no public fields, accessors only.**
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickTimeItemList {
+  /// `\xa9day` ContentCreateDate, ISO-8601 normalized (`%iso8601Date`,
+  /// QuickTime.pm:3511). Conv-bearing ⇒ a typed field.
+  content_create_date: Option<String>,
+  /// `\xa9xyz` GPSCoordinates, decoded from ISO 6709 (QuickTime.pm:6589-6595).
+  /// Conv-bearing (`ConvertISO6709` + `PrintGPSCoordinates`) ⇒ a typed field.
+  gps: Option<QuickTimeGps>,
+  /// Every CONV-LESS ItemList `data` atom (Title / Artist / Encoder / CoverArt /
+  /// …) as `(Name, value)` in walk order. The `%QuickTime::ItemList` table is
+  /// `FORMAT => 'string'`, so a plain `data` atom reads as a string
+  /// ([`crate::value::TagValue::Str`]); a `Binary => 1` tag (`covr`) or a
+  /// non-string/non-numeric `data` flag yields the binary scalar-ref placeholder
+  /// ([`crate::value::TagValue::Bytes`]). Emitted verbatim under
+  /// `QuickTime:ItemList`.
+  convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
+}
+
+impl QuickTimeItemList {
+  /// An empty ItemList block (no item decoded).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      content_create_date: None,
+      gps: None,
+      convless: Vec::new(),
+    }
+  }
+
+  /// `\xa9day` ContentCreateDate (ISO-8601 normalized).
+  #[inline(always)]
+  #[must_use]
+  pub fn content_create_date(&self) -> Option<&str> {
+    self.content_create_date.as_deref()
+  }
+
+  /// `\xa9xyz` GPSCoordinates.
+  #[inline(always)]
+  #[must_use]
+  pub const fn gps(&self) -> Option<&QuickTimeGps> {
+    self.gps.as_ref()
+  }
+
+  /// The conv-less ItemList atoms, as `(Name, value)` in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn convless(&self) -> &[(smol_str::SmolStr, crate::value::TagValue)] {
+    &self.convless
+  }
+
+  /// `true` when no item was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.content_create_date.is_none() && self.gps.is_none() && self.convless.is_empty()
+  }
+
+  /// Set `\xa9day` ContentCreateDate.
+  #[inline(always)]
+  pub fn set_content_create_date(&mut self, v: Option<String>) -> &mut Self {
+    self.content_create_date = v;
+    self
+  }
+
+  /// Set `\xa9xyz` GPSCoordinates.
+  #[inline(always)]
+  pub fn set_gps(&mut self, v: Option<QuickTimeGps>) -> &mut Self {
+    self.gps = v;
+    self
+  }
+
+  /// Record a conv-less ItemList atom by its tag NAME and decoded value,
+  /// preserving walk order.
+  #[inline(always)]
+  pub fn push_convless(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    value: crate::value::TagValue,
+  ) -> &mut Self {
+    self.convless.push((name.into(), value));
+    self
+  }
+}
+
+impl Default for QuickTimeItemList {
   #[inline(always)]
   fn default() -> Self {
     Self::new()
@@ -2938,10 +3750,24 @@ pub struct QuickTimeMeta {
   /// `mdat-offset` MediaDataOffset — the absolute file offset of the `mdat`
   /// payload (QuickTime.pm:697-700 + 10160).
   media_data_offset: Option<u64>,
+  /// The top-level `skip` atom's `Image::ExifTool::QuickTime::SkipInfo` `'ver '`
+  /// Version (QuickTime.pm:1020 — "found in 70mai Pro Plus+ MP4 videos", also
+  /// the Viofo A119). The raw string value; no PrintConv/ValueConv. `None` for
+  /// the common case (no SkipInfo `skip` atom).
+  skip_version: Option<smol_str::SmolStr>,
+  /// The top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload byte
+  /// length (QuickTime.pm:1022-1026, `Binary => 1`, group2 `Preview`). Rendered
+  /// as the `(Binary data N bytes, use -b option to extract)` placeholder; the
+  /// bytes are not retained. `None` when no SkipInfo `thma` was decoded.
+  skip_thumbnail_len: Option<u64>,
   /// The top-level `frea` atom's `Image::ExifTool::Kodak::frea` tags
   /// (Kodak PixPro / Rexing — Kodak.pm:2977-2990). Empty for the common case
   /// (no `frea` atom). See [`KodakFrea`].
   kodak_frea: KodakFrea,
+  /// The top-level Pittasoft BlackVue `free`-atom tags
+  /// (`%QuickTime::Pittasoft`, QuickTime.pm:8488-8546). Empty for the common
+  /// case (no Pittasoft `free` atom). See [`Pittasoft`].
+  pittasoft: Pittasoft,
   /// One [`MediaTrack`] per `trak` atom, in file order.
   tracks: Vec<MediaTrack>,
   /// **SP2** — the `moov/meta` Metadata-handler HandlerType (the `hdlr`
@@ -2966,8 +3792,18 @@ pub struct QuickTimeMeta {
   meta_handler_description: Option<String>,
   /// **SP2** — the `moov/udta` camera/metadata atoms. [`QuickTimeUserData`].
   user_data: QuickTimeUserData,
-  /// **SP2** — the `moov/meta` Keys/ItemList camera/metadata. [`QuickTimeKeys`].
+  /// **SP2** — the `moov/meta`(`mdta`) `keys`-resolved metadata, emitted under
+  /// family-1 group `Keys`. [`QuickTimeKeys`].
   keys: QuickTimeKeys,
+  /// The `moov/udta/meta`(`mdir`) `ilst` ItemList metadata (direct-4cc atoms),
+  /// emitted under family-1 group `ItemList`. [`QuickTimeItemList`].
+  item_list: QuickTimeItemList,
+  /// The audio-track `meta`(`mdta`) `keys`-resolved metadata (`%QuickTime::
+  /// AudioKeys`, QuickTime.pm:6895 — the `keys` Condition `MediaType eq "soun"`,
+  /// QuickTime.pm:2867-2870), emitted under family-1 group `AudioKeys`. Reuses
+  /// the [`QuickTimeKeys`] conv-less model (the AudioKeys table is also conv-less
+  /// apart from `Mute`). Empty for a file with no audio-track Keys box.
+  audio_keys: QuickTimeKeys,
 }
 
 impl QuickTimeMeta {
@@ -2997,7 +3833,10 @@ impl QuickTimeMeta {
       media_data_size: None,
       media_data_total: None,
       media_data_offset: None,
+      skip_version: None,
+      skip_thumbnail_len: None,
       kodak_frea: KodakFrea::new(),
+      pittasoft: Pittasoft::new(),
       tracks: Vec::new(),
       meta_handler_type: None,
       meta_handler_class: None,
@@ -3005,6 +3844,8 @@ impl QuickTimeMeta {
       meta_handler_description: None,
       user_data: QuickTimeUserData::new(),
       keys: QuickTimeKeys::new(),
+      item_list: QuickTimeItemList::new(),
+      audio_keys: QuickTimeKeys::new(),
     }
   }
 
@@ -3115,12 +3956,38 @@ impl QuickTimeMeta {
     self.media_data_offset
   }
 
+  /// The top-level `skip` atom's `SkipInfo` `'ver '` Version (raw string).
+  #[inline(always)]
+  #[must_use]
+  pub fn skip_version(&self) -> Option<&str> {
+    match &self.skip_version {
+      Some(v) => Some(v.as_str()),
+      None => None,
+    }
+  }
+
+  /// The top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload byte
+  /// length (for the binary placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn skip_thumbnail_len(&self) -> Option<u64> {
+    self.skip_thumbnail_len
+  }
+
   /// The top-level `frea` atom's [`KodakFrea`] tags (Kodak PixPro / Rexing).
   /// Empty (`KodakFrea::is_empty`) when no `frea` atom was decoded.
   #[inline(always)]
   #[must_use]
   pub const fn kodak_frea(&self) -> &KodakFrea {
     &self.kodak_frea
+  }
+
+  /// The top-level Pittasoft BlackVue `free`-atom [`Pittasoft`] tags. Empty
+  /// (`Pittasoft::is_empty`) when no Pittasoft `free` atom was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn pittasoft(&self) -> &Pittasoft {
+    &self.pittasoft
   }
 
   /// `mvhd` MovieHeaderVersion.
@@ -3340,12 +4207,35 @@ impl QuickTimeMeta {
     self
   }
 
+  /// Record the top-level `skip` atom's `SkipInfo` `'ver '` Version string.
+  #[inline(always)]
+  pub fn set_skip_version(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.skip_version = v;
+    self
+  }
+
+  /// Record the top-level `skip` atom's `SkipInfo` `thma` ThumbnailImage payload
+  /// byte length.
+  #[inline(always)]
+  pub const fn set_skip_thumbnail_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.skip_thumbnail_len = v;
+    self
+  }
+
   /// Mutable access to the [`KodakFrea`] tags — used by the `frea` atom
   /// handler ([`crate::formats::quicktime`]) to record `tima`/`ver`/`thma`/
   /// `scra` as they are decoded.
   #[inline(always)]
   pub const fn kodak_frea_mut(&mut self) -> &mut KodakFrea {
     &mut self.kodak_frea
+  }
+
+  /// Mutable access to the [`Pittasoft`] tags — used by the `free` atom
+  /// handler ([`crate::formats::quicktime`]) to record the Pittasoft
+  /// `cprt`/`sttm`/`ptnm`/`thum`/`gps `/`3gf ` children as they are decoded.
+  #[inline(always)]
+  pub const fn pittasoft_mut(&mut self) -> &mut Pittasoft {
+    &mut self.pittasoft
   }
 
   /// Set the `mvhd` MovieHeaderVersion.
@@ -3462,6 +4352,32 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub const fn keys_mut(&mut self) -> &mut QuickTimeKeys {
     &mut self.keys
+  }
+
+  /// The decoded `moov/udta/meta` ItemList metadata (group `ItemList`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn item_list(&self) -> &QuickTimeItemList {
+    &self.item_list
+  }
+
+  /// Mutable access to the ItemList block (decode seam).
+  #[inline(always)]
+  pub const fn item_list_mut(&mut self) -> &mut QuickTimeItemList {
+    &mut self.item_list
+  }
+
+  /// The decoded audio-track Keys metadata (group `AudioKeys`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn audio_keys(&self) -> &QuickTimeKeys {
+    &self.audio_keys
+  }
+
+  /// Mutable access to the audio-track Keys block (decode seam).
+  #[inline(always)]
+  pub const fn audio_keys_mut(&mut self) -> &mut QuickTimeKeys {
+    &mut self.audio_keys
   }
 
   /// **SP2** — set the `moov/meta` HandlerType (`hdlr` subtype).

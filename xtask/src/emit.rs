@@ -507,8 +507,10 @@ fn emit_phf_map_const(buf: &mut String, name: &str, _conv: &Conv, values: &[(Str
   for (k, v) in values {
     // Both int- and string-keyed maps key by the raw scalar STRING (an int key
     // is already its decimal text in `-listx`), matching the slice path's
-    // `k.to_string() == numeric` lookup semantics.
-    m.entry(k.as_str(), &format!("{v:?}"));
+    // `k.to_string() == numeric` lookup semantics. `entry` takes the value as
+    // `impl Into<Cow<str>>`; pass the owned `String` so the builder OWNS it
+    // (a `&str` would have to outlive the whole `Map`, not just this iteration).
+    m.entry(k.as_str(), format!("{v:?}"));
   }
   let _ = writeln!(
     buf,

@@ -125,6 +125,64 @@ fn effective_lv_and_image_editing_format_overrides() {
   assert_eq!(format_override(0x001d), None);
 }
 
+/// Every `%Pentax::Main` leaf that carries an explicit `Format => 'int8u'`
+/// directive must re-read as `int8u` regardless of the on-disk TIFF type: the
+/// `0x0071 HighISONoiseReduction` row (`Pentax.pm:2445`, no `Count`) and the
+/// three metering-segment arrays `0x0209 AEMeteringSegments` / `0x020a`
+/// FlashMeteringSegments / `0x020b` SlaveFlashMeteringSegments (`Format =>
+/// 'int8u', Count => -1` — variable-length, so NO bundled count). Without the
+/// override the walker would trust the on-disk format and decode the wrong
+/// element width/count (the regression this test pins).
+#[test]
+fn high_iso_nr_and_metering_segments_int8u_format_overrides() {
+  use crate::exif::ifd::Format;
+  for id in [0x0071u16, 0x0209, 0x020a, 0x020b] {
+    assert_eq!(
+      format_override(id),
+      Some(Format::Int8u),
+      "{id:#06x} must re-read as int8u",
+    );
+    // `Count => -1` (the metering arrays) and the count-less 0x0071 both carry
+    // NO bundled count — the walker recomputes `int(size/1)` per Exif.pm:6743.
+    let row = lookup(id).unwrap_or_else(|| panic!("row {id:#06x} missing"));
+    let ovr = row
+      .format_override()
+      .unwrap_or_else(|| panic!("row {id:#06x} has no FormatOverride"));
+    assert_eq!(ovr.format(), Format::Int8u, "{id:#06x} override format");
+    assert_eq!(
+      ovr.count(),
+      None,
+      "{id:#06x} variable-length: no bundled count"
+    );
+  }
+}
+
+/// Prove the `Format => 'int8u'` override actually RE-READS a non-byte-sized
+/// on-disk entry. A crafted file may write `0x0209 AEMeteringSegments` with an
+/// on-disk type that is not `int8u` (e.g. `int16u[8]`); ExifTool re-interprets
+/// the SAME value bytes as `int8u`, recomputing the count from the byte size —
+/// `int(16 / 1) == 16` (`Exif.pm:6743`). [`resolve_read_format`] (the shared
+/// walker helper) must return `(Int8u, 16)`, not the on-disk `(Int16u, 8)`.
+#[test]
+fn format_override_rereads_non_byte_sized_metering_entry() {
+  use crate::exif::ifd::Format;
+  use crate::exif::makernotes::vendors::resolve_read_format;
+  let ovr = lookup(0x0209).unwrap().format_override();
+  assert!(
+    ovr.is_some(),
+    "0x0209 must carry a FormatOverride to re-read"
+  );
+  // On-disk int16u[8] = 16 bytes ⇒ re-read as int8u[16].
+  let (fmt, count) = resolve_read_format(Format::Int16u, 8, ovr);
+  assert_eq!(fmt, Format::Int8u, "re-read format");
+  assert_eq!(count, 16, "recomputed int(16/1) element count");
+  // Sanity: when the on-disk type already IS int8u, the count is the on-disk
+  // count untouched (the override is a no-op for an equal format).
+  let (fmt2, count2) = resolve_read_format(Format::Int8u, 77, ovr);
+  assert_eq!(fmt2, Format::Int8u);
+  assert_eq!(count2, 77, "equal-format override leaves the on-disk count");
+}
+
 /// #173 branch selection — the count-/`Make`-/`Model`-/on-disk-`$format`-
 /// CONDITIONED `%Pentax::Main` leaves emit ONLY their ported variant; every
 /// other context returns [`ConditionalLeaf::Suppress`] so no foreign-variant
@@ -140,58 +198,164 @@ const K10D_MODEL: Option<&str> = Some("PENTAX K10D");
 
 #[test]
 fn conditional_leaf_count_gated_leaves() {
-  // 0x0016 ExposureCompensation + 0x004d FlashExposureComp: `$count == 1` emits;
-  // the count-2 (2nd-value) variant is deferred ⇒ Suppress.
-  for id in [0x0016u16, 0x004d] {
+  // 0x0016 ExposureCompensation: BOTH variants are now ported (#311) — the
+  // `$count == 1` int16u AND the `Count => 2` variant (whose ValueConv strips all
+  // but element 0, so it produces the same scalar). The leaf emits for either
+  // count; the PrintConv reads element 0.
+  for count in [1usize, 2] {
     assert_eq!(
-      conditional_leaf(id, 1, K10D_MODEL, K10D_MAKE, Format::Int16u),
+      conditional_leaf(0x0016, count, K10D_MODEL, K10D_MAKE, Format::Int16u),
       ConditionalLeaf::Emit,
-      "{id:#06x} count==1 must emit"
+      "0x0016 count=={count} must emit (both variants ported)"
     );
+  }
+  // 0x004d FlashExposureComp: BOTH variants are ported (the count==1 int32s
+  // and the count==2 int8s array), so the leaf emits for either count (#311).
+  for count in [1usize, 2] {
     assert_eq!(
-      conditional_leaf(id, 2, K10D_MODEL, K10D_MAKE, Format::Int16u),
-      ConditionalLeaf::Suppress,
-      "{id:#06x} count==2 must suppress (deferred variant)"
+      conditional_leaf(0x004d, count, K10D_MODEL, K10D_MAKE, Format::Int16u),
+      ConditionalLeaf::Emit,
+      "0x004d count=={count} must emit (both variants ported)"
     );
-    assert!(conditional_leaf(id, 0, K10D_MODEL, K10D_MAKE, Format::Int16u).is_suppressed());
   }
 }
 
 #[test]
 fn conditional_leaf_af_point_selected_model_gated() {
-  // 0x000e AFPointSelected: the "other models" element-0 variant emits ONLY for
-  // a non-K-1/645Z, non-K-3/KP model AND a single-element value.
-  assert_eq!(
-    conditional_leaf(0x000e, 1, K10D_MODEL, K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Emit
-  );
-  // The K-1/645Z and K-3/KP model variants are deferred (their own point hashes)
-  // ⇒ Suppress, never the "other models" hash flattened onto them.
+  // 0x000e AFPointSelected: ALL THREE model variants are now ported (#311), so the
+  // leaf emits UNCONDITIONALLY for every model and count — the emit site routes it
+  // through `af_point_selected_for_model`, which selects the element-0/element-1
+  // hashes by `$$self{Model}` (the `/(K-1|645Z)\b/` 33-point hash, the
+  // `/(K-3|KP)\b/` 27-point hash, or the "other models" 11-point hash). The
+  // per-model SELECTION (the right labels per body) is covered in the printconv
+  // suite; here the structural gate must never SUPPRESS.
+  for count in [1usize, 2] {
+    assert_eq!(
+      conditional_leaf(0x000e, count, K10D_MODEL, K10D_MAKE, Format::Int16u),
+      ConditionalLeaf::Emit,
+      "0x000e count=={count} (other-models body) must emit"
+    );
+  }
   for m in [
     "PENTAX K-1",
     "PENTAX 645Z",
     "PENTAX K-3",
     "PENTAX K-3 Mark III",
     "PENTAX KP",
+    "PENTAX Optio S",
   ] {
     assert_eq!(
       conditional_leaf(0x000e, 1, Some(m), K10D_MAKE, Format::Int16u),
-      ConditionalLeaf::Suppress,
-      "{m} AFPointSelected must suppress (model-specific variant deferred)"
+      ConditionalLeaf::Emit,
+      "{m} AFPointSelected must emit (all model variants ported)"
     );
   }
-  // A 2nd positional element (count == 2) carries the Single-Point/Expanded-Area
-  // hash the port does not implement ⇒ Suppress (never drop just the 2nd value).
+}
+
+/// `0x000f AFPointsInFocus` (#311) — the ported variant 1 is the int32u 27-bit
+/// BITMASK, `Condition => '$$self{Model} =~ /K-(3|S1|S2)\b/'`. ONLY a K-3 / K-S1
+/// / K-S2 body emits; every other model — and a `None` model — suppresses
+/// (variant 2, the int16u `'other models'` enum, is DEFERRED, so its layout is
+/// never flattened onto the bitmask). The `format`/`count`/`make` axes are
+/// irrelevant to this leaf, so the gate keys purely on the model.
+#[test]
+fn conditional_leaf_af_points_in_focus_model_gated() {
+  // The three matching bodies (the `Notes => 'K-3, K-S1 and K-S2 only'` set) emit
+  // the bitmask. `K-3` matches with a trailing space ("K-3 Mark III" too); the
+  // K-S1/K-S2 models are spelled out in full.
+  for m in [
+    "PENTAX K-3",
+    "PENTAX K-3 Mark III",
+    "PENTAX K-S1",
+    "PENTAX K-S2",
+  ] {
+    assert_eq!(
+      conditional_leaf(0x000f, 1, Some(m), None, Format::Int32u),
+      ConditionalLeaf::Emit,
+      "{m} AFPointsInFocus must emit (the /K-(3|S1|S2)\\b/ bitmask variant)"
+    );
+  }
+  // Every NON-matching model suppresses: the K10D / K-x / K-5 II carry no Main
+  // 0x000f at all, the K-1 / KP / K-70 0x000f is the unrelated CAFPointInfo
+  // sub-block — but were any of them to present a Main 0x000f it would be the
+  // DEFERRED int16u enum, NOT the bitmask. `K-30` must NOT match `K-3\b` (the `3`
+  // is followed by the word char `0`); `K-S10`/`K-S20` must NOT match `K-S1\b`/
+  // `K-S2\b`; `645Z` and a bare `KP` are other Pentax bodies outside the set.
+  for m in [
+    "PENTAX K10D",
+    "PENTAX K-x",
+    "PENTAX K-5 II",
+    "PENTAX K-1",
+    "PENTAX KP",
+    "PENTAX K-70",
+    "PENTAX K-30",
+    "PENTAX K-S10",
+    "PENTAX K-S20",
+    "PENTAX 645Z",
+    "PENTAX Optio S",
+  ] {
+    assert_eq!(
+      conditional_leaf(0x000f, 1, Some(m), None, Format::Int32u),
+      ConditionalLeaf::Suppress,
+      "{m} AFPointsInFocus must suppress (not /K-(3|S1|S2)\\b/; variant-2 deferred)"
+    );
+  }
+  // A `None` model (videos carry no Model) cannot match the regex (Perl undef
+  // `=~` is false) ⇒ suppress.
   assert_eq!(
-    conditional_leaf(0x000e, 2, K10D_MODEL, K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Suppress
+    conditional_leaf(0x000f, 1, None, None, Format::Int32u),
+    ConditionalLeaf::Suppress,
+    "None-model AFPointsInFocus must suppress (undef =~ // is false)"
   );
-  // The `K-3` token must not false-match a non-K-3 model containing the bytes
-  // out of word-boundary (faithful `\b`); a plain Optio is the "other models"
-  // arm.
+}
+
+/// `0x003c AFPointsInFocus` (the *istD `$val & 0x7ff` 11-point BITMASK variant,
+/// `Pentax.pm:2097-2125`) is UNCONDITIONAL: the Pentax.pm row carries NO
+/// `Condition` (the `Notes => '*istD only'` is documentation, not a machine gate),
+/// so ExifTool decodes it for EVERY body that writes the id. This pins both the
+/// faithful behavior (no model suppression — gating it would DIVERGE from ExifTool)
+/// AND the structural-invariant fix: 0x003c is a #393 leaf and must NOT reach the
+/// `EmitUnported` catch-all (reserved for pre-#173 / unported ids).
+#[test]
+fn conditional_leaf_af_points_in_focus_istd_is_unconditional() {
+  // POSITIVE: the *ist D body (the model the decode was transcribed for) emits.
   assert_eq!(
-    conditional_leaf(0x000e, 1, Some("PENTAX Optio S"), K10D_MAKE, Format::Int16u),
-    ConditionalLeaf::Emit
+    conditional_leaf(0x003c, 1, Some("PENTAX *ist D"), K10D_MAKE, Format::Int32u),
+    ConditionalLeaf::Emit,
+    "*ist D AFPointsInFocus (0x003c) must emit the masked 11-point decode"
+  );
+  // "NEGATIVE" — but ExifTool does NOT suppress 0x003c for non-*istD bodies (the
+  // row has no Condition), so the FAITHFUL outcome is still emit, NOT Suppress. A
+  // body that, per Pentax.pm, would write 0x003c must NOT have the decode dropped;
+  // suppressing it would be the divergence. Every model — and a `None`-model video
+  // — therefore emits.
+  for m in [
+    Some("PENTAX K10D"),
+    Some("PENTAX K-3 Mark III"),
+    Some("PENTAX K-1"),
+    Some("RICOH GR III"),
+    None,
+  ] {
+    let outcome = conditional_leaf(0x003c, 1, m, K10D_MAKE, Format::Int32u);
+    assert_eq!(
+      outcome,
+      ConditionalLeaf::Emit,
+      "{m:?} AFPointsInFocus (0x003c) must EMIT — Pentax.pm has no model Condition, \
+       so gating/suppressing it would diverge from ExifTool"
+    );
+    assert!(
+      !outcome.is_suppressed(),
+      "{m:?} 0x003c must not be suppressed"
+    );
+  }
+  // STRUCTURAL: 0x003c is a #393 leaf with an EXPLICIT arm, so it never reaches the
+  // `EmitUnported` catch-all (which is reserved for pre-#173 / unported ids). A
+  // regression that dropped the explicit arm would route 0x003c through the
+  // fallback — caught here.
+  assert_ne!(
+    conditional_leaf(0x003c, 1, Some("PENTAX *ist D"), K10D_MAKE, Format::Int32u),
+    ConditionalLeaf::EmitUnported,
+    "0x003c is a #393 leaf and must have an explicit conditional_leaf arm"
   );
 }
 
@@ -451,4 +615,165 @@ fn conditional_leaf_173_leaves_are_structurally_handled() {
   // `EmitUnported` is byte-equivalent to `Emit` for the caller (NOT suppressed),
   // so routing pre-#173 / unported ids through it does not change any output.
   assert!(!ConditionalLeaf::EmitUnported.is_suppressed());
+}
+
+/// The `%Pentax::Main` LEAF ids the #311 commit added that carry a `Pentax.pm`
+/// `Condition` selected at the LEAF level (so they MUST gate through
+/// [`conditional_leaf`], not the subdirectory dispatch). The audit of every
+/// #311-added Main row found exactly ONE: `0x000f AFPointsInFocus`
+/// (`/K-(3|S1|S2)\b/`). The other two #311 conditioned rows are SubDirectory
+/// pointers whose `Condition` selects an axis at the subdir-dispatch site, NOT a
+/// leaf PrintConv — see [`pentax_311_subdir_conditions_handled_at_dispatch`].
+const MAIN_311_CONDITIONED_LEAF_IDS: [u16; 1] = [
+  0x000f, // AFPointsInFocus (`$$self{Model} =~ /K-(3|S1|S2)\b/`)
+];
+
+/// STRUCTURAL no-flattening invariant for the #311 conditioned Main LEAVES
+/// (mirrors [`conditional_leaf_173_leaves_are_structurally_handled`]). The #311
+/// port added 25 Main rows; the comprehensive `Pentax.pm` audit found three with
+/// a `Condition` — `0x000f` (a leaf, gated here), `0x022a` and `0x022b` (subdir
+/// pointers, gated at dispatch). This test pins that the LEAF one
+/// (`MAIN_311_CONDITIONED_LEAF_IDS`) has an EXPLICIT `conditional_leaf` arm and
+/// NEVER reaches the `EmitUnported` catch-all in any context — so removing the
+/// `0x000f` arm (regressing it to a global row that emits the K-3/S1/S2 bitmask
+/// for EVERY model) FAILS this test. The K-S2 golden alone cannot catch that
+/// regression (it matches the condition), which is exactly why the gate is
+/// pinned structurally.
+#[test]
+fn conditional_leaf_311_leaves_are_structurally_handled() {
+  // A context matrix wide enough that `0x000f` takes BOTH its emit branch (a
+  // K-3/S1/S2 model) and its suppress branch (every other model / `None`), yet
+  // never returns `EmitUnported` in any of them.
+  let contexts: &[(usize, Option<&str>, Option<&str>, Format)] = &[
+    (1, Some("PENTAX K-3"), None, Format::Int32u),
+    (1, Some("PENTAX K-S1"), None, Format::Int32u),
+    (
+      1,
+      Some("PENTAX K-S2"),
+      Some("RICOH IMAGING COMPANY, LTD."),
+      Format::Int32u,
+    ),
+    (1, K10D_MODEL, K10D_MAKE, Format::Int16u),
+    (1, Some("PENTAX K-1"), None, Format::Int32u),
+    (2, Some("PENTAX KP"), None, Format::Int32u),
+    (0, None, None, Format::Undef),
+    (1, Some("PENTAX K-30"), None, Format::Int32u),
+  ];
+  for id in MAIN_311_CONDITIONED_LEAF_IDS {
+    for &(count, model, make, fmt) in contexts {
+      assert_ne!(
+        conditional_leaf(id, count, model, make, fmt),
+        ConditionalLeaf::EmitUnported,
+        "#311 conditioned Main leaf {id:#06x} reached the catch-all (count={count}, \
+         model={model:?}, make={make:?}, format={fmt:?}); it MUST have an explicit \
+         conditional_leaf arm so the model gate is structural, not a global row \
+         that the K-S2 golden masks"
+      );
+    }
+  }
+}
+
+/// The two #311 `%Pentax::Main` SubDirectory rows that carry a `Pentax.pm`
+/// `Condition` (`Pentax.pm:3030-3051`) are CORRECTLY NOT gated through
+/// [`conditional_leaf`] — their `Condition` picks a per-subdirectory axis that is
+/// resolved at the dispatch site in `exif/mod.rs`, faithfully, so each routes
+/// through the catch-all (`EmitUnported`) as a subdir pointer with no leaf
+/// PrintConv to gate. This test pins that classification (so a future edit that
+/// wrongly adds a leaf gate, or drops the dispatch-site handling, is visible):
+///
+/// * `0x022a FilterInfo` — `[{ Condition => '$$self{Make} =~ /^RICOH/' …
+///   LittleEndian }, { … BigEndian }]`. BOTH variants are the SAME `%FilterInfo`
+///   table; the `Condition` only flips the byte order, which
+///   `pentax::subtables::emit_filter_info(block, make, …)` decides from the
+///   threaded `Make` (RICOH ⇒ LE, else ⇒ BE).
+/// * `0x022b LevelInfo` — `[{ Name => 'LevelInfoK3III', Condition =>
+///   '$$self{Model} =~ /K-3 Mark III/' … }, { Name => 'LevelInfo' … }]`. The
+///   `SubTable::LevelInfo` arm picks `%LevelInfoK3III` vs `%LevelInfo` from
+///   `is_k3_mark_iii(model)`.
+#[test]
+fn pentax_311_subdir_conditions_handled_at_dispatch() {
+  use crate::exif::ifd::Format;
+  // Both rows resolve as SubDirectory pointers (a `sub_table`, no leaf gate).
+  for (id, name, sub) in [
+    (0x022au16, "FilterInfo", SubTable::FilterInfo),
+    (0x022b, "LevelInfo", SubTable::LevelInfo),
+  ] {
+    let tag = lookup(id).unwrap_or_else(|| panic!("{id:#06x} row missing"));
+    assert_eq!(tag.name(), name, "{id:#06x} name");
+    assert_eq!(tag.sub_table(), Some(sub), "{id:#06x} is a SubDirectory");
+    // No LEAF-level `conditional_leaf` gate (the byte-order / model axis lives at
+    // the subdir-dispatch site), so the catch-all classifies it `EmitUnported`
+    // for both the matching and non-matching context.
+    for (model, make) in [
+      (
+        Some("PENTAX K-3 Mark III"),
+        Some("RICOH IMAGING COMPANY, LTD."),
+      ),
+      (Some("PENTAX K-5 II"), Some("PENTAX")),
+      (None, None),
+    ] {
+      assert_eq!(
+        conditional_leaf(id, 1, model, make, Format::Undef),
+        ConditionalLeaf::EmitUnported,
+        "{id:#06x} subdir condition is resolved at dispatch, not via conditional_leaf"
+      );
+    }
+  }
+}
+
+/// #311 P1 — the nine UNCONDITIONAL `%Pentax::Main` scalar leaves the K-x
+/// `Pentax.avi` fixture exercises resolve via [`lookup`] with the right name,
+/// are plain leaves (no SubDirectory), and — having NO `Pentax.pm` `Condition`
+/// — route through the `conditional_leaf` catch-all as `EmitUnported` (which is
+/// NOT suppressed, so they emit unconditionally). The `pentax_tags_sorted_and_
+/// unique` test above proves their ids keep the table strictly sorted (the
+/// `lookup` binary-search precondition).
+#[test]
+fn pentax_p1_main_scalar_leaves() {
+  use crate::exif::ifd::Format;
+  let expected: &[(u16, &str)] = &[
+    (0x0067, "Hue"),
+    (0x006c, "HighLowKeyAdj"),
+    (0x0073, "MonochromeFilterEffect"),
+    (0x0074, "MonochromeToning"),
+    (0x007b, "CrossProcess"),
+    (0x0229, "SerialNumber"),
+    (0x022e, "Artist"),
+    (0x022f, "Copyright"),
+    (0x0230, "FirmwareVersion"),
+  ];
+  for &(id, name) in expected {
+    let tag = lookup(id).unwrap_or_else(|| panic!("{id:#06x} {name} row missing"));
+    assert_eq!(tag.name(), name, "{id:#06x} name");
+    assert_eq!(tag.sub_table(), None, "{id:#06x} is a plain leaf");
+    assert!(!tag.is_unknown(), "{id:#06x} not Unknown");
+    // No `Pentax.pm` Condition ⇒ the catch-all (`EmitUnported`), never suppressed.
+    assert_eq!(
+      conditional_leaf(id, 1, Some("PENTAX K-x"), None, Format::Int16u),
+      ConditionalLeaf::EmitUnported,
+      "{id:#06x} is unconditional"
+    );
+  }
+  // The five enum-hash leaves carry an int-keyed `Hash`; `HighLowKeyAdj` is the
+  // one space-joined `StringKeyedHash`; the four `string` leaves are `None`.
+  assert!(matches!(
+    lookup(0x0067).unwrap().conv,
+    PentaxPrintConv::Hash(_)
+  ));
+  assert!(matches!(
+    lookup(0x006c).unwrap().conv,
+    PentaxPrintConv::StringKeyedHash(_)
+  ));
+  assert!(matches!(
+    lookup(0x007b).unwrap().conv,
+    PentaxPrintConv::Hash(_)
+  ));
+  assert!(matches!(
+    lookup(0x0229).unwrap().conv,
+    PentaxPrintConv::None
+  ));
+  assert!(matches!(
+    lookup(0x0230).unwrap().conv,
+    PentaxPrintConv::None
+  ));
 }

@@ -82,6 +82,15 @@ use super::{ExifEntry, ExifMeta, MakerNote, SofInfo, parse_exif_block_with_base}
 /// `ExifTool.pm:7743` + `:7780`).
 const EXIF_APP1_HDR: &[u8] = b"Exif\0\0";
 
+/// `Image::ExifTool::xmpAPP1hdr` (`ExifTool.pm:1241`): the 29-byte namespace
+/// marker prefixing a standard XMP packet in a JPEG `APP1` segment. The
+/// `ProcessJPEG` arm `$$valPt =~ /^$xmpAPP1hdr/` (`ExifTool.pm:7794`) matches it,
+/// strips it (`substr`/`DirStart`), and hands the remainder to `ProcessXMP`. The
+/// SAME constant the PNG raw-profile-XMP path uses
+/// ([`crate::formats::png`]'s `XMP_APP1_HDR`).
+#[cfg(feature = "xmp")]
+const XMP_APP1_HDR: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+
 /// `ProcessTIFF` failure on an `APP1` Exif segment — bundled `ExifTool.pm:7783`
 /// `$self->ProcessTIFF(\%dirInfo) or $self->Warn('Malformed APP1 EXIF
 /// segment')`. A non-fatal `Warn`, NOT a container rejection.
@@ -97,6 +106,17 @@ const MALFORMED_APP1_WARNING: &str = "Malformed APP1 EXIF segment";
 pub(super) struct Segment {
   /// The JPEG marker code (e.g. `0xe1` for `APP1`).
   marker: u8,
+  /// 0-based ordinal of this marker in the file's marker sequence, counting
+  /// EVERY marker the `Marker:` loop reaches — standalone (length-less) markers
+  /// (RST0-RST7, TEM, …, `%markerLenBytes`) INCLUDED — not just the captured
+  /// length-bearing ones. Because standalone markers carry no payload and are
+  /// not stored as `Segment`s, two length-bearing segments can be ADJACENT in
+  /// the `Segment` list yet have an intervening standalone marker between them
+  /// in the file; comparing `marker_index` (true file-marker adjacency iff the
+  /// difference is exactly 1) is what lets the `APP13` reassembly run honor
+  /// ExifTool's IMMEDIATELY-next-segment continuation rule (`ExifTool.pm:8382`),
+  /// where ANY intervening marker — standalone or otherwise — breaks the run.
+  marker_index: usize,
   /// File offset of the segment payload's first byte (bundled `$segPos`,
   /// `ExifTool.pm:7363` — just past the 2-byte length word).
   payload_start: usize,
@@ -206,6 +226,34 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // the MakerNote for JPEGs exactly as for a standalone TIFF (the seam #75+
   // consume). First-wins matches bundled keeping the PRIMARY MakerNote.
   let mut maker_note: Option<MakerNote<'_>> = None;
+  // The PrintIM versions (IFD0 `0xc4a5`) accumulated across the merged `APP1`
+  // Exif blocks — a JPEG carries its PrintIM in the `APP1` Exif block's IFD0, so
+  // the merge must preserve it (the engine emits `PrintIM:PrintIMVersion`).
+  let mut printim_versions: Vec<smol_str::SmolStr> = Vec::new();
+  // The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
+  // (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm). A
+  // JPEG normally carries exactly one; a file with more than one is handled by
+  // seeding this slot with the first and absorbing each later packet
+  // ([`XmpMeta::absorb_additional_packet`]), matching ExifTool's per-`APP1`
+  // `ProcessXMP` + accumulating `FoundTag`. `XmpMeta` owns its strings (the `'a`
+  // is a `PhantomData` anchor), so it is stored `'static`. The marker walk runs
+  // ONCE (the XMP packet is conv-mode-independent — `XmpMeta::tags(opts)` renders
+  // for either mode at emit time), so a single parse serves both `-j` and `-n`.
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp: Option<crate::formats::xmp::XmpMeta<'static>> = None;
+  // The file (marker) offset of the FIRST warning-PRODUCING XMP `APP1` segment
+  // (`base_offset + payload start`) and of the FIRST EXIF `APP1` that warned —
+  // the two positions [`ExifMeta::diagnostics`] ranks the embedded-XMP `Warning`
+  // against the EXIF warnings by (first-by-marker-position wins, mirroring the
+  // QuickTime `uuid`-XMP `#361` / Pittasoft `#362` priority-0 model). ExifTool
+  // processes `APPn` markers in FILE ORDER, so the earlier `APP1`'s warning owns
+  // the bare `ExifTool:Warning`. `None` until the relevant warning fires;
+  // `get_or_insert` keeps the FIRST (the one that owns the bare slot). Threaded
+  // only under `xmp` (the EXIF offset is consulted solely for this ordering).
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp_offset: Option<u32> = None;
+  #[cfg(feature = "xmp")]
+  let mut exif_warning_offset: Option<u32> = None;
   // `true` while inside a deferred multi-segment (extended) EXIF chain — set
   // when bundled's discriminator (`ExifTool.pm:7764`) detects the chain START
   // and propagated across the continuation fragments (bundled keeps
@@ -293,9 +341,58 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
       };
       // Is this an `APP1` segment matching the Exif arm `^(.{0,4})Exif\0.`?
       let Some(garbage) = exif_arm_garbage(payload) else {
-        // A non-Exif APP1 (XMP / extended-XMP / QVCI / PARROT) — its arms are a
-        // deferred JPEG-container follow-up. Keep walking (`ExifTool.pm:7821`
-        // `next`). `$$self{Make}` is unchanged here (no IFD0 was parsed).
+        // A non-Exif APP1 — bundled's `ProcessJPEG` next tests the standard XMP
+        // arm `$$valPt =~ /^$xmpAPP1hdr/` (`ExifTool.pm:7794`, `$xmpAPP1hdr =
+        // 'http://ns.adobe.com/xap/1.0/\0'`). Strip the 29-byte namespace marker
+        // and route the remaining XMP packet to the shared XMP parser
+        // ([`crate::formats::xmp::parse_borrowed`]) — the same `ProcessXMP` a
+        // standalone `.xmp` sidecar / a QuickTime `uuid`-XMP box (#361) uses. A
+        // file with several XMP `APP1`s seeds the slot with the first and absorbs
+        // each later one (ExifTool runs `ProcessXMP` per matching `APP1` and
+        // `FoundTag` accumulates with no de-dup, `ExifTool.pm:7794`). `$$self
+        // {Make}` is unchanged (no IFD0 was parsed). The ExtendedXMP arm
+        // (`$$valPt =~ /^$xmpExtAPP1hdr/`, `'http://ns.adobe.com/xmp/extension/
+        // \0'`, the GUID/offset-reassembled overflow packets) is a separate
+        // follow-up — no test fixture carries one. The other non-Exif APP1 arms
+        // (QVCI / FLIR / PARROT) stay deferred.
+        #[cfg(feature = "xmp")]
+        if let Some(packet) = payload.strip_prefix(XMP_APP1_HDR) {
+          // `parse_borrowed` returns `XmpMeta<'_>` tied to `packet`, but the
+          // decoded XMP owns its strings (the `'a` is a `PhantomData` anchor), so
+          // `into_static` rebrands it to `'static` for storage on the
+          // independently-lifetimed `ExifMeta`.
+          let parsed = crate::formats::xmp::parse_borrowed(packet)
+            .map(crate::formats::xmp::XmpMeta::into_static);
+          // `true` when THIS XMP `APP1`'s packet produced the adopted
+          // `ExifTool:Warning` (the seed packet warned, OR every earlier packet
+          // was clean and this one warns — first-warning-wins by file order,
+          // mirroring the QuickTime `uuid`-XMP path and `FoundTag('Warning')`
+          // priority-0). `absorb_additional_packet` returns that for a later
+          // packet; for the seed, inspect its own `warning()`.
+          let this_packet_owns_warning = match (&mut embedded_xmp, parsed) {
+            (slot @ None, parsed) => {
+              let warned = parsed.as_ref().is_some_and(|p| p.warning().is_some());
+              *slot = parsed;
+              warned
+            }
+            (Some(existing), Some(parsed)) => existing.absorb_additional_packet(parsed),
+            (Some(_), None) => false,
+          };
+          // Record the file (marker) offset of the FIRST warning-producing XMP
+          // `APP1` so [`ExifMeta::diagnostics`] can rank its `Warning` against
+          // the EXIF warnings by position. The same `base_offset + payload start`
+          // unit the EXIF side uses, `u32`-saturated on a pathological rebase
+          // (a JPEG cannot place an `APP1` past 4 GiB) — matching the EXIF
+          // `base` arithmetic below.
+          if this_packet_owns_warning {
+            let off = base_offset
+              .checked_add(seg.payload_start)
+              .and_then(|s| u32::try_from(s).ok())
+              .unwrap_or(u32::MAX);
+            embedded_xmp_offset.get_or_insert(off);
+          }
+        }
+        // Keep walking (`ExifTool.pm:7821` `next`).
         break 'app1;
       };
 
@@ -338,6 +435,13 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
         .and_then(|s| s.checked_add(hdr_len))
         .and_then(|s| u32::try_from(s).ok())
         .unwrap_or(u32::MAX);
+
+      // The warning count BEFORE this `APP1`'s parse — so a grown count after
+      // attributes the new warning(s) to THIS segment's marker position
+      // (`exif_warning_offset`, recorded once for the FIRST warning-producing
+      // EXIF `APP1`; see below).
+      #[cfg(feature = "xmp")]
+      let warnings_before = warnings.len();
 
       // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')`
       // (`ExifTool.pm:7783`). A bad TIFF block is a non-fatal `Warn` — the JPEG
@@ -397,6 +501,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
             &mut warnings_ignorable,
             &mut byte_order,
             &mut maker_note,
+            &mut printim_versions,
             exif,
           );
         }
@@ -412,6 +517,20 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
           warnings_ignorable.push(0); // normal warning (ExifTool.pm:7783)
         }
         None => {}
+      }
+      // If this EXIF `APP1` contributed any warning (a `ProcessTIFF` walk warning
+      // OR the `Malformed APP1 EXIF segment` push), record its marker (file)
+      // position — but only the FIRST such, the one that owns the bare
+      // `ExifTool:Warning`. The SAME `base_offset + payload start` unit the XMP
+      // side uses (the APP1 segment position, NOT the `+ hdr_len` TIFF-block
+      // offset), so [`ExifMeta::diagnostics`] ranks the two by true marker order.
+      #[cfg(feature = "xmp")]
+      if warnings.len() > warnings_before {
+        let off = base_offset
+          .checked_add(seg.payload_start)
+          .and_then(|s| u32::try_from(s).ok())
+          .unwrap_or(u32::MAX);
+        exif_warning_offset.get_or_insert(off);
       }
     }
     // Record the running `$$self{Make} eq 'DJI'` state AS OF this segment — after
@@ -429,6 +548,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     warnings_ignorable,
     byte_order,
     maker_note,
+    printim_versions,
   );
   // The JPEG auxiliary `APP`-segment tags: JFIF (`APP0`), MPF (`APP2`) and the
   // DJI thermal arms (`APP3`/`APP4`/`APP5`/`APP7`). Decoded for BOTH print-conv
@@ -443,6 +563,111 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     if !app_pc.is_empty() || !app_n.is_empty() {
       meta.set_jpeg_app_tags(app_pc, app_n);
     }
+  }
+  // The JPEG IPTC (`APP13` Photoshop `0x0404`, `ExifTool.pm:8371-8400`) and
+  // `COM` `File:Comment` (`0xfe`, `ExifTool.pm:8429-8432`) segments, walked in
+  // marker (file) order so multiple `COM` segments accumulate in order (the
+  // first wins under `Comment`'s `Priority => 0`). The `APP13` arm finds the
+  // `Photoshop 3.0\0` IRB, locates the `0x0404` IPTC resource, parses its IIM
+  // datasets, and computes `File:CurrentIPTCDigest` (the MD5 of the standard-
+  // location IPTC block). Attached for [`Taggable::tags`] to emit the `File:*`
+  // digest/comment in the `File`-group prefix and the `IPTC:*` tags after the
+  // EXIF block. Nothing attached for a JPEG with neither segment.
+  //
+  // A single Photoshop IRB can exceed one JPEG `APPn`'s ~64 KB cap, so a large
+  // IPTC block is split across CONSECUTIVE `Photoshop 3.0\0` `APP13` segments.
+  // ExifTool reassembles such a run into one buffer before the single
+  // `ProcessPhotoshop` call (`$combinedSegData`, `ExifTool.pm:8375-8385`); the
+  // index walk below groups each maximal run of consecutive
+  // `Photoshop 3.0\0`-prefixed `APP13` segments and hands it to
+  // [`super::iptc::reassemble_app13_run`] (a lone segment — the realistic case —
+  // reassembles to itself, byte-identical). ExifTool's continuation test
+  // (`$$nextSegDataPt =~ /^$psAPP13hdr/`, `ExifTool.pm:8382`) inspects the
+  // IMMEDIATELY-next segment in its `Marker:` loop, so ANY intervening marker —
+  // a non-`APP13` segment, an `APP13` not starting with `Photoshop 3.0\0` (the
+  // legacy `Adobe_Photoshop2.5:` / `Adobe_CM` forms), OR a length-less STANDALONE
+  // marker (RSTn / TEM / fill — `%markerLenBytes`, which `scan_jpeg_segments`
+  // does NOT store as a `Segment`) — breaks the run. The two captured `APP13`
+  // segments are reassembled ONLY when they are TRULY marker-adjacent
+  // (`marker_index` differing by exactly 1): a standalone marker between two
+  // `Photoshop 3.0\0` `APP13`s leaves them adjacent in the `Segment` LIST but
+  // NOT in the file, and must each be processed standalone.
+  {
+    let mut iptc = super::iptc::IptcMeta::default();
+    let payload_of = |seg: &Segment| data.get(seg.payload_start..seg.payload_end);
+    let mut i = 0usize;
+    while let Some(seg) = segments.get(i) {
+      let Some(payload) = payload_of(seg) else {
+        i += 1;
+        continue;
+      };
+      match seg.marker {
+        0xed if super::iptc::is_photoshop_app13_segment(payload) => {
+          // Collect the maximal run of consecutive `Photoshop 3.0\0` `APP13`
+          // segments (this one and every immediately-following match), in file
+          // order, then reassemble + process once. `run_tail_marker_index`
+          // tracks the file-marker ordinal of the run's current last segment so
+          // the next candidate is admitted ONLY when it is the IMMEDIATELY-next
+          // marker (no standalone or other marker between them).
+          let mut run: std::vec::Vec<&[u8]> = std::vec::Vec::new();
+          run.push(payload);
+          let mut run_tail_marker_index = seg.marker_index;
+          while let Some(next) = segments.get(i + 1) {
+            // Marker-contiguity: the next captured segment must be the very next
+            // marker in the file. A gap (a standalone marker the walk skipped, or
+            // any captured segment that already broke the chain) ends the run —
+            // ExifTool's continuation test sees that intervening marker first.
+            if next.marker_index != run_tail_marker_index + 1 {
+              break;
+            }
+            if next.marker != 0xed {
+              break;
+            }
+            let Some(next_payload) = payload_of(next) else {
+              break;
+            };
+            if !super::iptc::is_photoshop_app13_segment(next_payload) {
+              break;
+            }
+            run.push(next_payload);
+            run_tail_marker_index = next.marker_index;
+            i += 1;
+          }
+          super::iptc::reassemble_app13_run(&run, &mut iptc);
+        }
+        // A non-Photoshop `APP13` (legacy `Adobe_Photoshop2.5:` or `Adobe_CM`)
+        // is processed standalone — it never joins / extends a reassembly run.
+        0xed => super::iptc::process_app13(payload, &mut iptc),
+        0xfe => iptc.push_comment(payload),
+        _ => {}
+      }
+      i += 1;
+    }
+    if !iptc.is_empty() {
+      meta.set_jpeg_iptc(iptc);
+    }
+  }
+  // The embedded XMP `APP1` packet (`ExifTool.pm:7794`), decoded once during the
+  // marker walk above. Attached for [`Taggable::tags`] to append after the EXIF
+  // block (its `XMP-*` tags) and for [`Diagnose`] to surface its `Warning`.
+  // `None` for a JPEG carrying no XMP `APP1`.
+  #[cfg(feature = "xmp")]
+  if embedded_xmp.is_some() {
+    meta.set_jpeg_embedded_xmp(embedded_xmp);
+  }
+  // The marker (file) positions of the warning-producing XMP `APP1` and the
+  // first warning-producing EXIF `APP1`, so [`ExifMeta::diagnostics`] ranks the
+  // embedded-XMP `Warning` against the EXIF warnings by file order (first-by-
+  // position wins, mirroring `#361`/`#362`). Each is `Some` only when the
+  // corresponding warning fired; a JPEG whose realistic camera layout puts the
+  // EXIF `APP1` first keeps the EXIF warnings leading, byte-identical.
+  #[cfg(feature = "xmp")]
+  if let Some(off) = embedded_xmp_offset {
+    meta.set_jpeg_embedded_xmp_offset(off);
+  }
+  #[cfg(feature = "xmp")]
+  if let Some(off) = exif_warning_offset {
+    meta.set_jpeg_exif_warning_offset(off);
   }
   // The `File:*` Start-Of-Frame dimension tags (`ExifTool.pm:7419-7462`): the
   // FIRST SOF segment yields `ImageWidth`/`ImageHeight`/`EncodingProcess`/
@@ -630,6 +855,16 @@ pub(super) fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
   let mut segments: Vec<Segment> = Vec::new();
   // Cursor sits just past the SOI marker. The `Marker:` loop reads ahead.
   let mut pos = 2usize;
+  // Sequential ordinal of EVERY marker the walk reaches — incremented once per
+  // marker byte consumed below, BEFORE the standalone-skip / stop tests, so
+  // standalone (length-less) markers and the EOI/SOS/SOD stop markers each
+  // claim an ordinal too. A captured `Segment` records the ordinal of its own
+  // marker (`marker_index`); two captured segments are file-marker-adjacent iff
+  // those ordinals differ by exactly 1 — i.e. nothing (no standalone marker, no
+  // other length-bearing segment) sits between them. This is the adjacency the
+  // `APP13` reassembly run consults to honor ExifTool's IMMEDIATELY-next-segment
+  // continuation rule (`ExifTool.pm:8382`).
+  let mut marker_seq = 0usize;
 
   loop {
     // `ExifTool.pm:7343-7357`: skip to the next marker. JPEG markers begin
@@ -654,6 +889,10 @@ pub(super) fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
       return segments;
     };
     pos += 1;
+    // This marker's file-sequence ordinal (incremented for EVERY marker the
+    // walk consumes, standalone ones included, so adjacency is exact).
+    let marker_index = marker_seq;
+    marker_seq += 1;
 
     // `ExifTool.pm:7339-7340`: the read-ahead loop stops at EOI (0xd9), SOS
     // (0xda) or SOD (0x93) — no further metadata segment beyond these.
@@ -685,6 +924,7 @@ pub(super) fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
     }
     segments.push(Segment {
       marker,
+      marker_index,
       payload_start,
       payload_end,
     });
@@ -933,10 +1173,17 @@ fn merge_exif_block<'a>(
   warnings_ignorable: &mut Vec<u8>,
   byte_order: &mut Option<ByteOrder>,
   maker_note: &mut Option<MakerNote<'a>>,
+  printim_versions: &mut Vec<smol_str::SmolStr>,
   block: ExifMeta<'a>,
 ) {
-  let (block_entries, block_warnings, block_warnings_ignorable, block_order, block_maker_note) =
-    block.into_jpeg_parts();
+  let (
+    block_entries,
+    block_warnings,
+    block_warnings_ignorable,
+    block_order,
+    block_maker_note,
+    block_printim_versions,
+  ) = block.into_jpeg_parts();
   if byte_order.is_none() {
     *byte_order = block_order;
   }
@@ -949,6 +1196,9 @@ fn merge_exif_block<'a>(
   warnings.extend(block_warnings);
   // Keep the parallel ignorable levels index-aligned with `warnings`.
   warnings_ignorable.extend(block_warnings_ignorable);
+  // The PrintIM versions accumulate across blocks (in block order), faithful to
+  // ExifTool emitting each PrintIM's `PrintIMVersion` as the IFD walk reaches it.
+  printim_versions.extend(block_printim_versions);
 }
 
 /// `true` when `block` begins with a BigTIFF header — a valid TIFF byte-order
@@ -1338,6 +1588,96 @@ mod tests {
       meta2.warnings(),
       &[String::from(MALFORMED_APP1_WARNING)],
       "a non-II/MM marker is not a BigTIFF skip — it still warns"
+    );
+  }
+
+  /// The embedded-XMP `Warning` is ordered against the EXIF `APP1` warnings by
+  /// APP1 MARKER FILE POSITION — the FIRST warning-producing `APP1` (XMP or EXIF)
+  /// owns the bare `ExifTool:Warning` (the same first-by-position priority-0
+  /// model as the QuickTime `uuid`-XMP `#361` / Pittasoft `#362` doc warnings),
+  /// NOT always-after-EXIF. ExifTool processes JPEG `APPn` markers in file order
+  /// and `Warning` is a priority-0 `FoundTag` first-wins, so a warning-producing
+  /// XMP `APP1` placed BEFORE a malformed (warning-producing) EXIF `APP1`
+  /// surfaces the XMP warning first, and the reverse layout surfaces the EXIF
+  /// warning first. Ground-truthed vs bundled 13.59 `-G1 -j`.
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn embedded_xmp_warning_ordered_by_app1_marker_position() {
+    // A warning-producing XMP `APP1` payload: the `$xmpAPP1hdr` namespace marker
+    // + a UTF-8-BOM `<?xpacket>` whose `dc:title` carries a DOUBLE-encoded `é`
+    // (`\xc3\xa9`) — `ProcessXMP` decodes the double layer and raises
+    // `XMP is double UTF-encoded` (XMP.pm:4494), exactly the
+    // `xmp::tests` double-decode fixture.
+    let xmp_app1 = || -> Vec<u8> {
+      let head = b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">";
+      let tail = b"</rdf:li></rdf:Alt></dc:title></rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>";
+      let mut packet: Vec<u8> = std::vec![0xef, 0xbb, 0xbf]; // UTF-8 BOM → $double path
+      packet.extend_from_slice(head);
+      packet.extend_from_slice(b"\xc3\xa9"); // double-encoded é
+      packet.extend_from_slice(tail);
+      let mut app1: Vec<u8> = XMP_APP1_HDR.to_vec();
+      app1.extend_from_slice(&packet);
+      app1
+    };
+    // A warning-producing EXIF `APP1` payload: `Exif\0\0` + a non-TIFF block ⇒
+    // `ProcessTIFF(...) or Warn('Malformed APP1 EXIF segment')` (ExifTool.pm:7783).
+    let exif_app1 = || -> Vec<u8> {
+      let mut app1: Vec<u8> = b"Exif\0\0".to_vec();
+      app1.extend_from_slice(b"NOT-A-VALID-TIFF-BLOCK");
+      app1
+    };
+    // Wrap the given `APP1` payloads, in order, into a JPEG (`SOI` + each as an
+    // `0xff 0xe1` length-bearing segment + `EOI`). The byte order IS the marker
+    // (file) order the walk sees.
+    let jpeg_with_app1s = |payloads: &[Vec<u8>]| -> Vec<u8> {
+      let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+      for p in payloads {
+        j.push(0xff);
+        j.push(0xe1);
+        let len = (p.len() + 2) as u16;
+        j.extend_from_slice(&len.to_be_bytes());
+        j.extend_from_slice(p);
+      }
+      j.extend_from_slice(&[0xff, 0xd9]); // EOI
+      j
+    };
+    // The bare `ExifTool:Warning` is the FIRST document-level warning drained by
+    // `run_diagnostics` (TagMap::first_warning) — exactly bundled's priority-0
+    // first-wins `FoundTag('Warning')`.
+    let bare_warning = |j: &[u8]| -> (Option<String>, std::vec::Vec<String>) {
+      let meta = parse_jpeg_exif(j).expect("a valid JPEG is accepted");
+      let mut tm = crate::tagmap::TagMap::new();
+      crate::diagnostics::run_diagnostics(&meta, &mut tm);
+      (
+        tm.first_warning().map(str::to_string),
+        tm.warnings().to_vec(),
+      )
+    };
+
+    // XMP `APP1` BEFORE the malformed EXIF `APP1` → the EARLIER (XMP) warning
+    // owns the bare `Warning`; the EXIF warning still surfaces, after it.
+    let (bare, all) = bare_warning(&jpeg_with_app1s(&[xmp_app1(), exif_app1()]));
+    assert_eq!(
+      bare.as_deref(),
+      Some("XMP is double UTF-encoded"),
+      "the earlier (XMP) APP1's warning must own the bare ExifTool:Warning, got {all:?}"
+    );
+    assert!(
+      all.iter().any(|w| w == MALFORMED_APP1_WARNING),
+      "the later EXIF warning still surfaces (after the XMP one), got {all:?}"
+    );
+
+    // The REVERSE layout: the malformed EXIF `APP1` BEFORE the XMP `APP1` → the
+    // EARLIER (EXIF) warning owns the bare slot; the XMP warning trails.
+    let (bare_rev, all_rev) = bare_warning(&jpeg_with_app1s(&[exif_app1(), xmp_app1()]));
+    assert_eq!(
+      bare_rev.as_deref(),
+      Some(MALFORMED_APP1_WARNING),
+      "the earlier (EXIF) APP1's warning must own the bare ExifTool:Warning, got {all_rev:?}"
+    );
+    assert!(
+      all_rev.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the later XMP warning still surfaces (after the EXIF one), got {all_rev:?}"
     );
   }
 
@@ -2245,6 +2585,192 @@ mod tests {
       start1,
       start0 + base as u64,
       "base_offset must be threaded into the MPF Base so MPImageStart is absolute"
+    );
+  }
+
+  /// Build the full single-`APP13` Photoshop payload for an `iptc` stream
+  /// (`Photoshop 3.0\0` + one `8BIM 0x0404` IRB), so a split test can cut it
+  /// across a segment boundary. `iptc` is wrapped with an even-padded `Size`.
+  fn ps_app13_full(iptc: &[u8]) -> Vec<u8> {
+    let mut p: Vec<u8> = Vec::new();
+    p.extend_from_slice(b"Photoshop 3.0\0");
+    p.extend_from_slice(b"8BIM");
+    p.extend_from_slice(&0x0404u16.to_be_bytes());
+    p.push(0x00); // name length 0
+    p.push(0x00); // pad (even name)
+    p.extend_from_slice(&(iptc.len() as u32).to_be_bytes());
+    p.extend_from_slice(iptc);
+    if iptc.len() & 1 == 1 {
+      p.push(0x00);
+    }
+    p
+  }
+
+  /// A two-dataset IPTC stream (ApplicationRecordVersion 4 + ObjectName
+  /// "Split") whose IRB body is long enough to split across a segment boundary.
+  fn split_iptc() -> Vec<u8> {
+    std::vec![
+      0x1c, 0x02, 0x00, 0x00, 0x02, 0x00, 0x04, // 2:00 version 4
+      0x1c, 0x02, 0x05, 0x00, 0x05, b'S', b'p', b'l', b'i', b't', // 2:05 ObjectName
+    ]
+  }
+
+  /// A large IPTC/Photoshop block that spans TWO consecutive `Photoshop 3.0\0`
+  /// `APP13` segments (each JPEG `APPn` is ~64 KB-capped) must be reassembled —
+  /// in file order, each continuation segment's 14-byte header stripped — into
+  /// one IRB before `ProcessPhotoshop` (`$combinedSegData`,
+  /// `ExifTool.pm:8375-8385`). The split `0x0404` block is then intact, so the
+  /// JPEG emits the full `IPTC:*` tags AND the `File:CurrentIPTCDigest` MD5 over
+  /// the reassembled block — exactly the single-segment decode.
+  #[test]
+  fn split_app13_run_emits_full_iptc() {
+    let iptc = split_iptc();
+    let full = ps_app13_full(&iptc);
+    // Cut at the IRB data boundary (14 hdr + 12 IRB-header) so the second
+    // segment carries only the IPTC data; re-prefix it with its own header.
+    let cut = 14 + 12;
+    let (head, tail) = full.split_at(cut);
+    let mut seg1: Vec<u8> = Vec::new();
+    seg1.extend_from_slice(b"Photoshop 3.0\0");
+    seg1.extend_from_slice(tail);
+
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&minimal_tiff())); // a real Exif APP1
+    j.extend_from_slice(&app_segment(0xed, head)); // APP13 #1 (head)
+    j.extend_from_slice(&app_segment(0xed, &seg1)); // APP13 #2 (tail, consecutive)
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+
+    let meta = parse_jpeg_exif(&j).expect("JPEG with split APP13 accepted");
+    let g = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    // The reassembled IPTC produced its ObjectName + the digest over the block.
+    assert_eq!(
+      g.get(&("IPTC".to_string(), "ObjectName".to_string()))
+        .map(String::as_str),
+      Some("Split"),
+      "the split 0x0404 block must reassemble into the full ObjectName"
+    );
+    assert_eq!(
+      g.get(&("IPTC".to_string(), "ApplicationRecordVersion".to_string()))
+        .map(String::as_str),
+      Some("4")
+    );
+    // `File:CurrentIPTCDigest` = MD5 over the reassembled (unpadded) 0x0404
+    // block (the 17-byte `split_iptc` stream) — `md5sum` of those exact bytes.
+    assert_eq!(
+      g.get(&("File".to_string(), "CurrentIPTCDigest".to_string()))
+        .map(String::as_str),
+      Some("0747649a2f00c703f18be13b07d692e2"),
+      "the digest must be over the REASSEMBLED block, not a single segment"
+    );
+  }
+
+  /// A NON-consecutive APP13 run breaks: `APP13(head) → COM → APP13(tail)`. The
+  /// `COM` between the two Photoshop segments ends the run (ExifTool's
+  /// `$$nextSegDataPt =~ /^$psAPP13hdr/` continuation test fails,
+  /// `ExifTool.pm:8382`), so each `APP13` is processed STANDALONE: the head's
+  /// IRB is truncated (its `8BIM` size runs past the segment → bad-resource stop)
+  /// and the tail starts mid-IPTC-data (not a valid IRB type → stop). Neither
+  /// yields IPTC — exactly ExifTool, which only reassembles the CONTIGUOUS run.
+  #[test]
+  fn non_consecutive_app13_does_not_reassemble() {
+    let iptc = split_iptc();
+    let full = ps_app13_full(&iptc);
+    let cut = 14 + 12;
+    let (head, tail) = full.split_at(cut);
+    let mut seg1: Vec<u8> = Vec::new();
+    seg1.extend_from_slice(b"Photoshop 3.0\0");
+    seg1.extend_from_slice(tail);
+
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&minimal_tiff()));
+    j.extend_from_slice(&app_segment(0xed, head)); // APP13 #1
+    j.extend_from_slice(&app_segment(0xfe, b"a comment")); // COM breaks the run
+    j.extend_from_slice(&app_segment(0xed, &seg1)); // APP13 #2 (now isolated)
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let g = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    // The broken run reassembled nothing: no IPTC tags, no digest.
+    assert!(
+      !g.contains_key(&("IPTC".to_string(), "ObjectName".to_string())),
+      "a non-contiguous split must NOT reassemble into ObjectName"
+    );
+    assert!(
+      !g.contains_key(&("File".to_string(), "CurrentIPTCDigest".to_string())),
+      "no complete 0x0404 block ⇒ no CurrentIPTCDigest"
+    );
+    // The intervening COM still produced its File:Comment (run-break is benign).
+    assert_eq!(
+      g.get(&("File".to_string(), "Comment".to_string()))
+        .map(String::as_str),
+      Some("a comment"),
+      "the COM that broke the run is still emitted"
+    );
+  }
+
+  /// A length-less STANDALONE marker between two `Photoshop 3.0\0` `APP13`
+  /// segments breaks the reassembly run: `APP13(head) → RST0 (0xff 0xd0) →
+  /// APP13(tail)`. A standalone marker (RSTn / TEM / fill, `%markerLenBytes`)
+  /// carries NO length word or payload, so `scan_jpeg_segments` skips it and
+  /// does NOT store it as a `Segment` — leaving the two `APP13`s ADJACENT in the
+  /// `Segment` list. But in the FILE the `RST0` sits between them, so ExifTool's
+  /// `Marker:` loop reaches `0xd0` as `$nextMarker` first and its continuation
+  /// test (`$nextMarker == $marker and $$nextSegDataPt =~ /^$psAPP13hdr/`,
+  /// `ExifTool.pm:8382`) FAILS — each `APP13` is processed standalone. The
+  /// `marker_index` adjacency check reproduces this: the two segments' ordinals
+  /// differ by 2 (the skipped `RST0` claims the one between), so the run breaks.
+  /// The head's `8BIM` size then runs past its (short) segment and the tail
+  /// starts mid-IPTC-data — neither yields a complete `0x0404` block, so NO
+  /// `IPTC:*` tag and NO `CurrentIPTCDigest` (contrast the contiguous
+  /// `split_app13_run_emits_full_iptc`, which DOES reassemble).
+  #[test]
+  fn standalone_marker_between_app13_breaks_run() {
+    let iptc = split_iptc();
+    let full = ps_app13_full(&iptc);
+    let cut = 14 + 12;
+    let (head, tail) = full.split_at(cut);
+    let mut seg1: Vec<u8> = Vec::new();
+    seg1.extend_from_slice(b"Photoshop 3.0\0");
+    seg1.extend_from_slice(tail);
+
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    j.extend_from_slice(&app1_exif_segment(&minimal_tiff()));
+    j.extend_from_slice(&app_segment(0xed, head)); // APP13 #1 (head)
+    // A length-LESS standalone marker (RST0). It carries no payload, so
+    // `scan_jpeg_segments` does not store it — yet it sits in the file between
+    // the two `APP13`s and so breaks ExifTool's immediately-next-segment run.
+    j.extend_from_slice(&[0xff, 0xd0]); // RST0 — standalone, breaks the run
+    j.extend_from_slice(&app_segment(0xed, &seg1)); // APP13 #2 (now isolated)
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+
+    let meta = parse_jpeg_exif(&j).expect("JPEG accepted");
+    let g = emitted_by_group(&meta, crate::emit::ConvMode::PrintConv);
+    // The standalone marker broke the run: the two `APP13`s were NOT
+    // reassembled (the 0x0404 block was never recombined), so no IPTC.
+    assert!(
+      !g.contains_key(&("IPTC".to_string(), "ObjectName".to_string())),
+      "a standalone marker between the two APP13s must break the run (no ObjectName)"
+    );
+    assert!(
+      !g.contains_key(&("File".to_string(), "CurrentIPTCDigest".to_string())),
+      "no complete 0x0404 block across the broken run ⇒ no CurrentIPTCDigest"
+    );
+
+    // Control: the SAME two segments with NO intervening marker DO reassemble —
+    // confirming the break is caused by the standalone marker, not the split.
+    let mut j_ok: Vec<u8> = std::vec![0xff, 0xd8];
+    j_ok.extend_from_slice(&app1_exif_segment(&minimal_tiff()));
+    j_ok.extend_from_slice(&app_segment(0xed, head));
+    j_ok.extend_from_slice(&app_segment(0xed, &seg1));
+    j_ok.extend_from_slice(&[0xff, 0xd9]);
+    let meta_ok = parse_jpeg_exif(&j_ok).expect("JPEG accepted");
+    let g_ok = emitted_by_group(&meta_ok, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      g_ok
+        .get(&("IPTC".to_string(), "ObjectName".to_string()))
+        .map(String::as_str),
+      Some("Split"),
+      "the contiguous run (no intervening marker) still reassembles"
     );
   }
 }

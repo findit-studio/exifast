@@ -591,6 +591,67 @@ fn inflate_chunk(method_byte: u8, compressed: &[u8]) -> Inflate {
   }
 }
 
+/// Outcome of a size-bounded zXIf inflate ([`inflate_chunk_limited`]). Unlike
+/// [`Inflate`], the failure arm carries the number of transient output bytes
+/// [`miniz_oxide`] actually MATERIALIZED before giving up, so the caller can
+/// charge that allocation to the file-wide budget ([`MAX_ZXIF_INFLATE_TOTAL`]).
+/// This is what makes the memory bound COMPREHENSIVE: a FAILED inflate — most
+/// importantly a CAP-HIT, where miniz grows its buffer all the way to `max_size`
+/// before refusing — counts toward the running total exactly like a successful
+/// one, so a PNG of many over-cap zXIf chunks cannot replay a near-cap inflate
+/// ATTEMPT per chunk (the prior code charged only on success, leaving the budget
+/// untouched after each cap-hit warning — finding 1).
+enum LimitedInflate {
+  /// Clean inflate ⇒ the decompressed buffer (charged on retain/re-entry).
+  Ok(Vec<u8>),
+  /// Inflate failed — corrupt zlib OR the `max_size` cap was hit. `allocated`
+  /// is the transient output miniz held before aborting (`DecompressError.output`
+  /// length): exactly `max_size` on a cap-hit (`HasMoreOutput` returns the buffer
+  /// grown to the limit), and only the small initial buffer for an early
+  /// corruption error. Both map to bundled's single `Error inflating $tag` arm
+  /// (`PNG.pm:943`); the caller charges `allocated` so a cap-hit EXHAUSTS the
+  /// file-wide budget (`remaining == 0` ⇒ later chunks skip with no further
+  /// inflate attempt) while a small corrupt chunk barely dents it.
+  Err { allocated: usize },
+}
+
+/// Inflate a PNG compressed-chunk payload (method `0`, ZLIB-wrapped deflate)
+/// bounded to at most `max_size` DECOMPRESSED bytes — the DoS-guarded sibling of
+/// [`inflate_chunk`] used ONLY on the nested-zXIf re-entry path
+/// ([`process_exif_block`], `PNG.pm:1389`), where an attacker controls the
+/// decompressed content and can chain large expansions.
+///
+/// Same faithful semantics as [`inflate_chunk`] (`PNG.pm:929-948`): a clean
+/// inflate ⇒ [`LimitedInflate::Ok`], a corrupt stream ⇒ [`LimitedInflate::Err`]
+/// (the `Error inflating $tag` arm). The ONE addition is the size cap:
+/// [`miniz_oxide`]'s `decompress_to_vec_zlib_with_limit` never grows its output
+/// buffer past `max_size`, returning `Err(HasMoreOutput)` (with the buffer grown
+/// to exactly `max_size`) if the stream would exceed it — so an over-budget level
+/// is reported as [`LimitedInflate::Err`] (semantically "could not decompress this
+/// chain", the same `Error inflating <tag>` warning bundled raises for any
+/// aborted inflate) rather than allocating an unbounded buffer. The failure arm
+/// reports `allocated` = the bytes miniz transiently held (`DecompressError`'s
+/// `output` length) so the caller can charge that transient peak to the file-wide
+/// budget. `max_size == 0` ⇒ immediate `Err { allocated: 0 }` (the budget is
+/// already exhausted — never call the inflater with a zero cap; no allocation).
+fn inflate_chunk_limited(compressed: &[u8], max_size: usize) -> LimitedInflate {
+  if max_size == 0 {
+    return LimitedInflate::Err { allocated: 0 };
+  }
+  match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, max_size) {
+    Ok(bytes) => LimitedInflate::Ok(bytes),
+    // `DecompressError.output` is the partial buffer miniz materialized before
+    // aborting: `max_size` on a cap-hit (`HasMoreOutput`), or the small initial
+    // buffer (`min(2*input.len(), max_size)`) on an early corruption error. Both
+    // are the actual transient allocation for this attempt — charge exactly that
+    // (clamped to `max_size`, which it never exceeds) so the file-wide bound
+    // accounts for FAILED inflates too.
+    Err(e) => LimitedInflate::Err {
+      allocated: e.output.len().min(max_size),
+    },
+  }
+}
+
 // ===========================================================================
 // ImageMagick "Raw profile type X" chunks — ProcessProfile (PNG.pm:1155-1281)
 // ===========================================================================
@@ -1451,77 +1512,276 @@ fn decode_exif(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
   // type, interpolated into the `Invalid $tag chunk` (`PNG.pm:1382`) and
   // `Error inflating $tag` (`PNG.pm:943`) warnings. `chunk` is `eXIf`/`zxIf`.
   let tag = core::str::from_utf8(chunk).unwrap_or("eXIf");
-  // `PNG.pm:1368-1373`: improper `Exif\0\0` prefix. Checked `.get(6..)`: `Some`
-  // because the `starts_with(b"Exif\0\0")` arm guarantees len ≥ 6 ⇒
-  // byte-identical to `&data[6..]`.
-  let block: &[u8] = if data.starts_with(b"Exif\0\0") {
-    meta.push_warning(String::from("Improper \"Exif00\" header in EXIF chunk"));
-    data.get(6..).unwrap_or(&[])
-  } else {
-    data
-  };
-  // `PNG.pm:1374-1384`: validate the TIFF header byte-order marker. We
-  // don't validate the magic ourselves — the Exif walker
-  // (`parse_exif_block`) does, returning `None` on a bad block. But the
-  // BUNDLED warning fires from inside `ProcessPNG_eXIf` before
-  // `ProcessTIFF` runs, so we emit it here too.
-  // Checked `.get(0)`: `None` only when empty, but the `is_empty` guard already
-  // returned ⇒ byte-identical to `block[0]`.
-  let Some(&first) = block.first() else {
-    meta.push_warning(format!("Invalid {tag} chunk"));
-    return;
-  };
-  if first != 0 && !block.starts_with(b"II") && !block.starts_with(b"MM") {
-    meta.push_warning(format!("Invalid {tag} chunk"));
-    return;
-  }
-  if first == 0 {
-    // `PNG.pm:1378-1381`: zXIf compressed EXIF. Skip the `\0` type byte + a
-    // 4-byte (unused) field — `substr($$dataPt, 5)` — and inflate the rest as
-    // a deflate stream (compression code 2, no method byte to validate).
-    let payload = match block.get(5..) {
-      Some(p) => p,
-      // A `\0`-typed block shorter than 5 bytes has no compressed payload;
-      // bundled's `substr($$dataPt, 5)` would be empty and inflate fails.
-      None => {
+  process_exif_block(meta, tag, data, 0);
+}
+
+/// Recursion-depth ceiling for nested zXIf inflate re-entry. Bundled's
+/// `ProcessPNG_eXIf` → `FoundPNG` (level 2, `PNG.pm:1389`) → `ProcessPNG_eXIf`
+/// loop has NO explicit cap — it relies on a level's `substr`/inflate failing —
+/// so a maliciously crafted chunk that inflates to ANOTHER `\0`-typed (still
+/// compressed) block at every level would recurse unboundedly (a stack-/CPU-
+/// exhaustion DoS). Realistic input is at most doubly compressed (depth 2), so
+/// this generous ceiling never fires on a well-formed file yet bounds the
+/// pathological nest. At the ceiling we STOP and raise the `Error inflating
+/// <tag>` warning — bundled would itself bottom out in `Error inflating` a level
+/// or two deeper (a crafted nest can only end in an inflate/`substr` failure, not
+/// a valid TIFF, beyond a sane depth), so the shape matches its
+/// "could-not-decompress-this-chain" signal (`PNG.pm:943`, the same warning the
+/// `PNG_nested_zxif` fixture pins) rather than a bespoke cap message.
+const MAX_ZXIF_DEPTH: u32 = 8;
+
+/// FILE-WIDE cumulative decompressed-size budget (bytes) for ALL zXIf inflation
+/// in one PNG parse — every `zxIf`/`eXIf` chunk's nested-inflate chain (the
+/// depth-`0` on-disk chunk + every `PNG.pm:1389` re-entry on an inflated buffer)
+/// charges against this one aggregate cap, tracked on
+/// [`crate::metadata::PngMeta::zxif_inflated_total`] across the whole walk.
+///
+/// Bundled's `Compress::Zlib::inflate` (`PNG.pm:937`) is UNBOUNDED — it inflates
+/// each level's whole zlib stream into memory before recursing, so a small
+/// crafted chunk that decompresses to a large `\0`-typed block (which then
+/// decompresses to another large block, …) can force large allocations and
+/// bottom out in an OOM. Worse, a successful `II`/`MM` inflate is retained as a
+/// [`crate::metadata::PngExifEvent::NativeTiff`] that lives in
+/// [`crate::metadata::PngMeta`] for the rest of the parse — so a small PNG with
+/// MANY independent `zxIf` chunks, each inflating to a near-cap valid TIFF, would
+/// accumulate retained EXIF memory as O(chunks × cap) if the budget reset per
+/// chunk. We therefore bound the SUM of ALL inflated bytes across the ENTIRE file
+/// to this single cap, so the COMPREHENSIVE invariant holds — at every instant the
+/// total live zXIf-inflated memory (the one transient inflate buffer + every
+/// retained TIFF) is ≤ this cap:
+/// * each level's inflate is size-limited to the budget REMAINING after every
+///   prior chunk's inflation ([`miniz_oxide`]'s `decompress_to_vec_zlib_with_limit`,
+///   which never grows its buffer past the cap);
+/// * EVERY inflate is charged to the file-wide running total — a successful one by
+///   its output length, AND a FAILED one (corrupt OR cap-hit) by the bytes miniz
+///   transiently materialized ([`LimitedInflate::Err`]'s `allocated`); a cap-hit
+///   therefore allocates ~the cap and charges ~the cap, exhausting the budget so a
+///   later over-cap chunk short-circuits (`remaining == 0`) rather than replaying a
+///   near-cap inflate ATTEMPT per chunk;
+/// * a retained `II`/`MM` TIFF is MOVED out of the (already-charged) inflate buffer
+///   rather than cloned, so retention never transiently doubles the live buffer.
+///
+/// Once the aggregate is exhausted any further inflate stops with the same `Error
+/// inflating <tag>` warning bundled raises for any aborted inflate (`PNG.pm:943`).
+/// So total inflated-and-retained EXIF memory for the whole PNG is ≤ this cap (peak
+/// included), NOT O(chunks × cap) and not 2× the cap.
+///
+/// 64 MiB is far above any realistic EXIF/TIFF zXIf payload — a compressed-EXIF
+/// chunk carries a TIFF block (IFDs + at most an embedded preview), KB-to-low-MB
+/// even for a RAW preview, and a real PNG carries at most ONE small (typically
+/// uncompressed) `eXIf` — so this never fires on a well-formed file yet caps the
+/// crafted decompression-bomb / many-zXIf chain at one bounded buffer's worth of
+/// retained memory for the whole parse.
+const MAX_ZXIF_INFLATE_TOTAL: usize = 64 * 1024 * 1024;
+
+/// One `ProcessPNG_eXIf` pass (`PNG.pm:1358-1404`) over an EXIF `block`, faithful
+/// down to the nested-zXIf re-entry. `depth` is the inflate-recursion level
+/// (`0` = the on-disk `eXIf`/`zxIf` chunk; `n > 0` = the `n`-th `FoundPNG`
+/// level-2 re-entry on an inflated buffer, `PNG.pm:1389`). The SAME logic runs
+/// at every level (bundled re-enters this very subroutine):
+///
+/// 1. `^Exif\0\0` (`PNG.pm:1368`) ⇒ warn `Improper "Exif00" header …`, strip 6.
+/// 2. `^(\0|II|MM)` (`PNG.pm:1374`): neither ⇒ warn `Invalid <tag> chunk`, stop.
+/// 3. `II`/`MM` ⇒ a real TIFF: capture a native event (`ProcessTIFF`, NO
+///    `$$et{PROCESSED}` reset, `PNG.pm:1358`).
+/// 4. `\0` (`PNG.pm:1378`, compressed EXIF) ⇒ `substr($$dataPt, 5)` then inflate
+///    (compression code 2, no method byte); a block shorter than 5 bytes makes
+///    `substr` empty/`undef` so the inflate fails ⇒ `Error inflating <tag>`
+///    (oracle-confirmed: bundled emits exactly this for a degenerate inner `\0`
+///    block, with a harmless `substr outside of string` Perl notice). On a clean
+///    inflate, RE-ENTER on the inflated buffer (`PNG.pm:1389`).
+///
+/// Bundled re-enters this very subroutine recursively for a `\0`-typed level
+/// (`ProcessPNG_eXIf` → `FoundPNG` → `ProcessPNG_eXIf`), holding every parent
+/// buffer live on the Perl stack. We unwrap the zXIf nest ITERATIVELY instead
+/// (semantically identical — the same steps 1-4 at each level), which releases
+/// each inflated buffer before inflating the next and lets us bound the work by
+/// both DEPTH ([`MAX_ZXIF_DEPTH`], per chain) and CUMULATIVE decompressed SIZE
+/// ([`MAX_ZXIF_INFLATE_TOTAL`], FILE-WIDE across every chunk via
+/// [`PngMeta::zxif_inflated_total`]); either cap ⇒ the `Error inflating <tag>`
+/// warning (the aborted-inflate shape, `PNG.pm:943`). Only one inflated buffer is
+/// ever alive at a time, AND a clean `II`/`MM` inflate is MOVED (not cloned) into a
+/// retained [`PngExifEvent::NativeTiff`] in `meta` — so charging EVERY inflate's
+/// transient bytes to the file-wide running total (a success by its output length,
+/// a corrupt/cap-hit failure by the bytes miniz materialized) bounds the TOTAL
+/// inflated-and-retained EXIF memory for the whole PNG to the cap AT EVERY INSTANT,
+/// defeating a many-`zxIf` decompression-bomb that would otherwise accumulate
+/// O(chunks × cap) of retained buffers (see [`MAX_ZXIF_INFLATE_TOTAL`] for the
+/// full invariant).
+fn process_exif_block(meta: &mut PngMeta<'_>, tag: &str, block: &[u8], depth: u32) {
+  // The buffer currently under inspection. At depth 0 it is `None` and the level
+  // is a view into the on-disk chunk (`block`, borrowed from the file — already
+  // resident, NOT zXIf-inflated memory). At depth ≥ 1 it is `Some(inflated)`: the
+  // most recent inflated buffer, which we OWN. It is REPLACED (the previous one
+  // dropped) when a `\0`-typed level inflates the next — so at most one inflated
+  // buffer is held at a time (vs bundled's full recursive stack).
+  //
+  // COMPREHENSIVE MEMORY INVARIANT: at every instant the TOTAL live zXIf-inflated
+  // memory — the transient buffer (`owned` here, or the one miniz is growing) PLUS
+  // every retained `NativeTiff` charged into `meta` so far — is ≤
+  // `MAX_ZXIF_INFLATE_TOTAL`. Four things uphold it together: (a) only ONE inflate
+  // buffer is alive at a time (the iterative unwrap drops each before the next);
+  // (b) EVERY inflate is charged to the file-wide total — a successful one by its
+  // output length, a FAILED/cap-hit one by the bytes miniz transiently allocated
+  // (`LimitedInflate::Err { allocated }`) — so an over-cap chunk EXHAUSTS the
+  // budget and later chunks short-circuit (`remaining == 0`) instead of replaying a
+  // near-cap inflate ATTEMPT each; (c) an `II`/`MM` inflate is MOVED (not cloned)
+  // into its retained `NativeTiff`, so retaining it does NOT transiently double the
+  // live buffer — the one already-charged buffer simply becomes the retained one;
+  // (d) the retained `NativeTiff` is a `Box<[u8]>` (built via `into_boxed_slice`),
+  // whose allocation is EXACTLY its length BY CONSTRUCTION — a boxed slice carries
+  // no excess capacity. This makes the `inner.len()` charge in (b) the EXACT
+  // retained-allocation size at the TYPE LEVEL, not allocator-dependent: miniz
+  // sizes its output buffer from the COMPRESSED input
+  // (`min(2*input.len(), max_size)`) and only `truncate`s on success (capacity
+  // unchanged), so a tiny TIFF inflated from a stream with large trailing padding
+  // would otherwise retain a near-cap CAPACITY while charging only its few-byte
+  // LENGTH — an O(chunks × cap) capacity-vs-length undercharge. Storing the
+  // retained buffer as a boxed slice closes that dimension STRUCTURALLY and
+  // DEFINITIVELY: capacity == length is a TYPE GUARANTEE (not the
+  // allocator-defined `shrink_to_fit`, whose Vec contract MAY leave excess
+  // capacity), so the summed retained allocation is the summed charged length,
+  // ≤ the cap. No other allocator dimension contributes a payload-scaled term: the
+  // transient inflate buffer's own capacity is bounded by `max_size` (the budget),
+  // and the per-chunk event `Vec` / tag `BTreeMap` overhead is O(metadata-count),
+  // not O(payload-size).
+  let mut owned: Option<Vec<u8>> = None;
+  let mut depth = depth;
+  loop {
+    let cur: &[u8] = owned.as_deref().unwrap_or(block);
+    // 1. `PNG.pm:1368-1373`: improper `Exif\0\0` prefix. `prefix` is the byte
+    //    offset of the level within `cur` (6 after the strip, else 0) — recorded
+    //    so a retained `II`/`MM` level can be MOVED out of `owned` (drain the
+    //    prefix) rather than cloned (finding 2).
+    let prefix: usize = if cur.starts_with(b"Exif\0\0") {
+      meta.push_warning(String::from("Improper \"Exif00\" header in EXIF chunk"));
+      6
+    } else {
+      0
+    };
+    // `cur.get(prefix..)` is `Some`: `prefix` is 0, or 6 under a len-≥-6 guard.
+    let level: &[u8] = cur.get(prefix..).unwrap_or_default();
+    // 2. `PNG.pm:1374-1384`: the TIFF byte-order marker must be `\0`/`II`/`MM`.
+    let Some(&first) = level.first() else {
+      meta.push_warning(format!("Invalid {tag} chunk"));
+      return;
+    };
+    if first != 0 && !level.starts_with(b"II") && !level.starts_with(b"MM") {
+      meta.push_warning(format!("Invalid {tag} chunk"));
+      return;
+    }
+    if first != 0 {
+      // 3. `II`/`MM` real TIFF: capture as a native event in walk order; the
+      //    replay runs the Exif walker over the shared `$$et{PROCESSED}` set
+      //    with NO reset (`PNG.pm:1358`). The retained block is exactly `level`
+      //    (`cur[prefix..]`, which always runs to the end of `cur`).
+      //    - depth ≥ 1: `cur` IS the inflated `owned` buffer (already charged to
+      //      the file-wide total when it was inflated). MOVE it into the event —
+      //      drain the `Exif\0\0` prefix in place if present — so retention adds
+      //      NO new allocation and never doubles the live inflated memory.
+      //    - depth 0: `cur` is the borrowed on-disk chunk (not inflatable memory,
+      //      not charged), so the retained TIFF must be COPIED out of the file
+      //      slice — this is the ordinary uncompressed `eXIf` path, unchanged.
+      // The retained TIFF is a `Box<[u8]>`: its allocation is EXACTLY its length
+      // by construction (a boxed slice carries no excess capacity), so the
+      // `meta.add_zxif_inflated(len)` charge below equals the retained allocation
+      // at the type level — see the memory invariant above. `into_boxed_slice`
+      // reallocates the (possibly over-capacity) inflated `Vec` down to exactly
+      // its length; it preserves the bytes.
+      let tiff: Box<[u8]> = match owned.take() {
+        Some(mut buf) => {
+          buf.drain(..prefix);
+          buf.into_boxed_slice()
+        }
+        // depth 0: `owned` is `None`, so `cur == block` and the level is
+        // `block[prefix..]` — re-slice `block` directly (NOT `level`, which
+        // borrows `owned` and would clash with the `take()` above) and copy it.
+        None => Box::from(block.get(prefix..).unwrap_or_default()),
+      };
+      // A retained depth-≥1 TIFF was inflated and ALREADY charged when it was
+      // inflated; the depth-0 path copies from the borrowed on-disk chunk (not
+      // zXIf-inflated memory), so neither re-charges here. The charge happens at
+      // the inflate site (`add_zxif_inflated(inner.len())`); a boxed slice makes
+      // that recorded length the exact retained allocation.
+      meta.push_exif_event(PngExifEvent::NativeTiff(tiff));
+      return;
+    }
+    // 4. `\0`-typed ⇒ compressed EXIF (zXIf); inflate + re-enter (`PNG.pm:1389`).
+    // DoS guard: a malicious chunk could inflate to ANOTHER `\0`-typed block at
+    // every level. Bundled has no cap; we bound the unwrap. At the ceiling STOP
+    // with the aborted-inflate warning (a crafted nest can only bottom out in
+    // an inflate/`substr` failure beyond a sane depth — `PNG.pm:943` shape).
+    if depth >= MAX_ZXIF_DEPTH {
+      meta.push_warning(format!("Error inflating {tag}"));
+      return;
+    }
+    // `substr($$dataPt, 5)`: skip the `\0` type byte + the 4-byte (unused)
+    // uncompressed-length field. A block shorter than 5 bytes has no payload —
+    // bundled's `substr` is empty/`undef` so the deflate fails ⇒ `Error
+    // inflating $tag` (oracle-confirmed for the degenerate inner `\0` block).
+    let Some(payload_off) = prefix.checked_add(5) else {
+      meta.push_warning(format!("Error inflating {tag}"));
+      return;
+    };
+    let Some(payload) = cur.get(payload_off..) else {
+      meta.push_warning(format!("Error inflating {tag}"));
+      return;
+    };
+    // Size-bounded inflate: cap THIS level to the budget REMAINING after every
+    // prior chunk's inflation (FILE-WIDE, `PngMeta::zxif_inflated_total`), so the
+    // SUM of all inflated bytes across the WHOLE PNG — transient buffers AND the
+    // retained `NativeTiff`s — never exceeds `MAX_ZXIF_INFLATE_TOTAL`. A prior
+    // chunk that already exhausted the budget leaves `remaining == 0`, which
+    // `inflate_chunk_limited` reports as `Err { allocated: 0 }` immediately (no
+    // allocation, no near-cap re-attempt).
+    let remaining = MAX_ZXIF_INFLATE_TOTAL.saturating_sub(meta.zxif_inflated_total());
+    match inflate_chunk_limited(payload, remaining) {
+      // `PNG.pm:1389`: re-enter on the INFLATED buffer (same `$tag`). A nested
+      // zXIf (inflated block is itself `\0`-typed) inflates AGAIN next iteration;
+      // an inflated `Exif00`/non-`II`/`MM` block is handled by steps 1-3 above.
+      // Charge the output to the file-wide running total: if the inflated block is
+      // an `II`/`MM` TIFF it is RETAINED (`NativeTiff`, by MOVE) so its bytes stay
+      // accounted for the rest of the parse; if it is another `\0`/`Exif00`/invalid
+      // level its transient bytes still count, keeping a multi-chunk bomb bounded.
+      LimitedInflate::Ok(inner) => {
+        // `decompress_to_vec_zlib_with_limit` sizes its output buffer from the
+        // COMPRESSED input length — `vec![0; min(2*input.len(), max_size)]`
+        // up front (miniz_oxide 0.9.1 inflate/mod.rs:212) — and on success only
+        // `truncate`s the buffer to the decompressed length (`:226`), which does
+        // NOT release the over-allocated CAPACITY. So a crafted payload of a tiny
+        // valid zlib stream followed by large trailing padding inflates to a tiny
+        // `II`/`MM` TIFF whose backing `Vec` still holds a near-`max_size`
+        // CAPACITY. That buffer is then either re-inflated (dropped next
+        // iteration) or RETAINED in a `NativeTiff` for the rest of the parse.
+        // We charge `inner.len()` (the LENGTH, not the capacity); the
+        // capacity-vs-length gap that would otherwise reopen the O(chunks × cap)
+        // retained-memory DoS (each chunk charges a few bytes yet retains a
+        // near-cap allocation) is closed at the RETENTION site, NOT here: an
+        // `II`/`MM` level is stored as a `Box<[u8]>` (`into_boxed_slice`), whose
+        // allocation is EXACTLY its length BY CONSTRUCTION, so the recorded length
+        // equals the retained allocation at the type level — not dependent on an
+        // allocator-defined `shrink_to_fit` (whose Rust contract MAY leave excess
+        // capacity). The live + retained total is thus the sum of the small TIFF
+        // lengths — bounded by the cap, never their pre-shrink capacities.
+        // Beyond-faithful hardening: ExifTool 13.59 has NO zXIf size cap.
+        meta.add_zxif_inflated(inner.len());
+        owned = Some(inner);
+        depth += 1;
+      }
+      // `PNG.pm:943`: corrupt zlib OR the file-wide size cap was hit ⇒ `Error
+      // inflating $tag`. Charge `allocated` — the bytes miniz transiently
+      // materialized for this attempt (== the cap on a cap-hit, small for an early
+      // corruption error) — to the file-wide total BEFORE warning, so a single
+      // over-cap chunk exhausts the budget and the NEXT over-cap chunk short-
+      // circuits at `remaining == 0` instead of forcing another near-cap inflate
+      // (finding 1). The transient buffer is already freed (the inflater returned).
+      LimitedInflate::Err { allocated } => {
+        meta.add_zxif_inflated(allocated);
         meta.push_warning(format!("Error inflating {tag}"));
         return;
       }
-    };
-    match inflate_chunk(0, payload) {
-      Inflate::Ok(tiff) => {
-        // Bundled re-enters `ProcessPNG_eXIf` on the INFLATED buffer via
-        // `FoundPNG(..., level 2)` (`PNG.pm:1389`), keeping the same `$tag`, so
-        // apply the SAME `Exif\0\0`-strip + `II`/`MM` validation as the
-        // uncompressed path: an inflated `Exif00`-prefixed block is stripped
-        // (+warned) then decoded; a non-`II`/`MM` inflated block is
-        // `Invalid $tag chunk`. Then capture as a native event (no PROCESSED
-        // reset, `PNG.pm:1358`).
-        let inner: &[u8] = if tiff.starts_with(b"Exif\0\0") {
-          meta.push_warning(String::from("Improper \"Exif00\" header in EXIF chunk"));
-          // Checked `.get(6..)`: `Some` (the `starts_with` arm ⇒ len ≥ 6) ⇒
-          // byte-identical to `&tiff[6..]`.
-          tiff.get(6..).unwrap_or(&[])
-        } else {
-          &tiff
-        };
-        if inner.is_empty() || (!inner.starts_with(b"II") && !inner.starts_with(b"MM")) {
-          meta.push_warning(format!("Invalid {tag} chunk"));
-        } else {
-          meta.push_exif_event(PngExifEvent::NativeTiff(inner.to_vec()));
-        }
-      }
-      // `PNG.pm:943`: corrupt zlib ⇒ `Error inflating $tag`.
-      // (`UnknownMethod` is unreachable here — method is hard-coded 0.)
-      Inflate::Error | Inflate::UnknownMethod(_) => {
-        meta.push_warning(format!("Error inflating {tag}"));
-      }
     }
-    return;
   }
-  // Capture the block as a native event in walk order; the replay runs the Exif
-  // walker over the shared `$$et{PROCESSED}` set with NO reset (`PNG.pm:1358`).
-  meta.push_exif_event(PngExifEvent::NativeTiff(block.to_vec()));
 }
 
 // ===========================================================================
@@ -1626,44 +1886,64 @@ const GROUP_TRAILER: &str = "Trailer";
 /// to how `GetGroup` (`ExifTool.pm:3860`) resolves the live global.
 ///
 /// The override replaces the family-1 group with `"Trailer"` UNLESS the tag
-/// already carries an EXPLICIT family-1 group set by the `Exif::Main` table's
-/// `SET_GROUP1 => 1` mechanism (`Exif.pm:416` → `SetGroup`, `Exif.pm:7183`,
-/// which records `TAG_EXTRA{G1}` and so wins over the global at
-/// `ExifTool.pm:3860`). Those explicit groups are exactly the `Exif::Main`-table
-/// IFD names — `IFD0`, the trailing `IFD<n>`, `ExifIFD`, `InteropIFD`
-/// (`Exif.pm:412`/`:487`/`:2008`/`:2722`, all sharing `Exif::Main`). Every OTHER
-/// family-1 group — PNG-level (`PNG`/`PNG-pHYs`), the `File:ExifByteOrder` tag
-/// (family-1 `File`), the GPS sub-IFD (its `GPS::Main` table has NO
-/// `SET_GROUP1`, so its family-1 is a table default that the global overrides),
-/// and MakerNotes vendor groups — shifts to `Trailer` (oracle-verified against
-/// `perl exiftool -j -G1` 13.59: `Trailer:ExifByteOrder`, `Trailer:GPSLatitudeRef`,
-/// but `IFD0:Make` / `ExifIFD:DateTimeOriginal` / `IFD1:Artist` UNCHANGED).
+/// already carries an EXPLICIT family-1 group (the `$grps[1] or …` rule,
+/// `ExifTool.pm:9475`) — the `Exif::Main`-table IFDs (`IFD0`/`IFD<n>`/`ExifIFD`/
+/// `InteropIFD`, via `SET_GROUP1 => 1`, `Exif.pm:416`) and the XMP namespace
+/// groups (`XMP-<ns>`, via `SetGroup`, `XMP.pm:3717`) — see
+/// [`has_explicit_family1_group`]. Every OTHER family-1 group — PNG-level
+/// (`PNG`/`PNG-pHYs`), the `File:ExifByteOrder` tag (family-1 `File`), the GPS
+/// sub-IFD (its `GPS::Main` table has NO `SET_GROUP1`, so its family-1 is a table
+/// default that the global overrides), and MakerNotes vendor groups — shifts to
+/// `Trailer` (oracle-verified against `perl exiftool -j -G1` 13.59:
+/// `Trailer:ExifByteOrder`, `Trailer:GPSLatitudeRef`, but `IFD0:Make` /
+/// `ExifIFD:DateTimeOriginal` / `IFD1:Artist` / `XMP-dc:Format` UNCHANGED).
 /// family-0 is never touched (`PNG.pm` overrides only group1).
 #[cfg(feature = "alloc")]
 fn apply_trailer_group(g: crate::value::Group) -> crate::value::Group {
-  if is_exif_main_ifd_group(g.family1()) {
+  if has_explicit_family1_group(g.family1()) {
     g
   } else {
     crate::value::Group::new(g.family0(), GROUP_TRAILER)
   }
 }
 
-/// `true` if `family1` is an `Exif::Main`-table IFD family-1 group name —
-/// `IFD0`, a trailing `IFD<n>` (all digits after `IFD`), `ExifIFD`, or
-/// `InteropIFD`. These IFDs share `Image::ExifTool::Exif::Main`, whose
-/// `SET_GROUP1 => 1` (`Exif.pm:416`) records an EXPLICIT family-1 group that
-/// wins over the trailer's `SET_GROUP1` global; the GPS sub-IFD (`GPS::Main`,
-/// no `SET_GROUP1`) and every non-EXIF group do NOT match and so shift to
-/// `Trailer`.
+/// `true` if `family1` is a family-1 group name that the tag carries EXPLICITLY
+/// (via its table's `GROUPS{1}` / `SET_GROUP1 => 1`), so the FoundTag rule
+/// `$grps[1] or $grps[1] = $$self{SET_GROUP1}` (`ExifTool.pm:9475`) keeps it and
+/// the trailer's `SET_GROUP1 = 'Trailer'` global does NOT override it. Two
+/// families qualify:
+///
+/// - **`Exif::Main`-table IFDs** — `IFD0`, a trailing `IFD<n>` (all digits after
+///   `IFD`), `ExifIFD`, `InteropIFD`. These share `Image::ExifTool::Exif::Main`,
+///   whose `SET_GROUP1 => 1` (`Exif.pm:416` → `SetGroup`, `Exif.pm:7183`) records
+///   the explicit family-1 group. (The GPS sub-IFD's `GPS::Main` has NO
+///   `SET_GROUP1`, so `GPS` does NOT match and shifts to `Trailer`.)
+/// - **XMP namespace groups** — `XMP-<ns>` (`XMP-dc`, `XMP-exif`, `XMP-x`,
+///   `XMP-tiff`, `XMP-rdf`, …, plus the `XMP-XML` lastUpdate group). The XMP
+///   reader assigns each tag its namespace-derived family-1 group via
+///   `SetGroup("XMP-$ns")` (`XMP.pm:3717`), an explicit `$grps[1]` — so a
+///   post-`IEND` raw-profile XMP keeps `XMP-dc:Format` (oracle-confirmed against
+///   `perl exiftool -G1` 13.59: a TRAILER `Raw profile type xmp` still emits
+///   `XMP-dc:Format`, NOT `Trailer:Format`), exactly like the `Exif::Main` IFDs.
+///
+/// Every OTHER family-1 group — PNG-level (`PNG`/`PNG-pHYs`), `File`
+/// (`ExifByteOrder`), the GPS sub-IFD, MakerNotes vendor groups — has no explicit
+/// `$grps[1]` and so shifts to `Trailer`.
 #[cfg(feature = "alloc")]
-fn is_exif_main_ifd_group(family1: &str) -> bool {
+fn has_explicit_family1_group(family1: &str) -> bool {
   match family1 {
     "ExifIFD" | "InteropIFD" => true,
     // "IFD0", "IFD1", "IFD2", … "IFD4294967295" — the literal `IFD` prefix
     // followed by ≥1 decimal digits (the trailing-IFD numbering, `Exif.pm:7215`).
-    s => s
+    s if s
       .strip_prefix("IFD")
-      .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())),
+      .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())) =>
+    {
+      true
+    }
+    // "XMP-<ns>" — every XMP tag's namespace-derived family-1 group
+    // (`XMP.pm:3717` `SetGroup`); the on-disk XMP reader sets it explicitly.
+    s => s.starts_with("XMP-"),
   }
 }
 
@@ -2131,52 +2411,199 @@ impl crate::emit::Taggable for PngMeta<'_> {
   }
 }
 
+/// Whether a PNG walker warning was raised by bundled as MINOR
+/// (`$et->Warn($msg, 1)` ⇒ a `[minor] ` prefix, `ExifTool.pm:5630`), keyed on
+/// the BARE message (the [`PngMeta::warnings`] store keeps messages un-prefixed;
+/// the prefix is mechanism-applied at drain time, the single source of truth —
+/// see [`crate::diagnostics::Diagnostic::warn_minor`]). Only THREE PNG walker
+/// warnings carry the minor flag in `PNG.pm`:
+///
+/// - `Trailer data after PNG IEND chunk` (`PNG.pm:1481` `$et->Warn(..., 1)`).
+/// - `Text/EXIF chunk(s) found after PNG <chunk> (…)` (`PNG.pm:1604`
+///   `$et->Warn(..., 1)`).
+/// - `<chunk> chunk should be <std>` (the `%stdCase` case-fix, `PNG.pm:1650`
+///   `$et->Warn(..., 1)`).
+///
+/// Every OTHER PNG warning (`Error inflating …`, `Invalid … chunk`,
+/// `Truncated …`, `Corrupted …`, `Unknown raw profile …`, `Unknown compression
+/// method …`, `Improper "Exif00" header …`, `Non-standard PNG …`, `PNG image
+/// did not start with IHDR`, `Invalid PNG chunk size`) is a plain `$et->Warn`
+/// (no minor flag) ⇒ no prefix. Oracle-confirmed against `perl exiftool` 13.59.
+fn png_warning_is_minor(msg: &str) -> bool {
+  msg == "Trailer data after PNG IEND chunk"
+    || (msg.starts_with("Text/EXIF chunk(s) found after PNG ")
+      && msg.ends_with("(may be ignored by some readers)"))
+    || msg.ends_with(" chunk should be eXIf")
+    || msg.ends_with(" chunk should be zxIf")
+}
+
+/// Re-scope one diagnostic raised while parsing a post-`IEND` TRAILER chunk to
+/// the `Trailer` family-1 group (`PNG.pm:1484` `$$et{SET_GROUP1} = 'Trailer'`),
+/// mirroring `$grps[1] or $grps[1] = $$self{SET_GROUP1}` (`ExifTool.pm:9475`).
+///
+/// An embedded eXIf / raw-profile-XMP sub-Meta raises its `$et->Warn`/`$et->Error`
+/// while the PNG chunk walker is in trailer mode, so a DOCUMENT-level diagnostic
+/// (`group == None` — the `Warning`/`Error` FoundTag has no explicit `$grps[1]`)
+/// surfaces as `Trailer:Warning`/`Trailer:Error` rather than the document-level
+/// `ExifTool:Warning`/`:Error` (exactly the [`apply_trailer_group`] tag-side
+/// shift, applied to the diagnostic channel). A diagnostic that ALREADY carries
+/// an explicit group keeps it (the `$grps[1] or …` short-circuit) — though the
+/// embedded EXIF/XMP `Diagnose` impls only yield document-level diagnostics, so
+/// in practice every trailing one is re-scoped. The severity / `ignorable` minor
+/// flag / `no_count` bit are preserved.
+#[cfg(feature = "alloc")]
+fn rescope_trailing_diag(d: crate::diagnostics::Diagnostic) -> crate::diagnostics::Diagnostic {
+  if d.group().is_some() {
+    return d;
+  }
+  crate::diagnostics::Diagnostic::new(
+    d.message().into(),
+    d.severity(),
+    Some(GROUP_TRAILER.into()),
+    d.ignorable(),
+    d.no_count(),
+  )
+}
+
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for PngMeta<'_> {
-  /// PNG's diagnostics in the retired drain order:
-  /// (a) the PNG walker's own accumulated warnings (`Truncated PNG image`
-  ///     PNG.pm:1486, `Text/EXIF chunk(s) found after …` PNG.pm:1598, the zlib
-  ///     inflate-error warnings, the `Invalid eXIf chunk` / `Improper "Exif00"
-  ///     header …` warnings, …) BEFORE the eXIf dispatch;
-  /// (b) the embedded eXIf / Raw-profile EXIF sub-Metas' diagnostics, IN CHUNK
-  ///     ORDER via the SAME shared-`$$et{PROCESSED}` event replay `tags()` /
-  ///     `project()` use ([`replay_exif_events`], `ExifTool.pm:9061-9072` +
-  ///     `PNG.pm:1193`). For each EXIF event: its own EXIF warnings (via the
-  ///     parsed [`ExifMeta`](crate::exif::ExifMeta)'s `Diagnose` impl), then the
-  ///     cross-source cycle-guard warning(s) the walk raised
-  ///     (`ExifTool.pm:9068`).
-  /// The PNG-level warnings always precede the EXIF ones (PNG walks first), so
-  /// the document-level `first_warning` is unchanged. Byte-identical net
-  /// `TagMap`.
+  /// PNG's document diagnostics, replayed at their CHUNK-WALK position via the
+  /// ordered [`PngMeta::diag_order`](crate::metadata::png::PngMeta) interleave —
+  /// the SAME serial order ExifTool's chunk walk (`PNG.pm:1410-1685`) emits them
+  /// in. Three sources fold onto one walk axis (each [`PngDiagStep`] advancing
+  /// one cursor):
+  /// (a) the PNG walker's own warnings (`Truncated PNG image` PNG.pm:1486,
+  ///     `Text/EXIF chunk(s) found after …` PNG.pm:1598, the zlib inflate-error
+  ///     warnings, `Invalid eXIf chunk` / `Improper "Exif00" header …`, the
+  ///     raw-profile `… is wrong size` / `Unknown raw profile …` warnings, …);
+  /// (b) the embedded eXIf / Raw-profile EXIF sub-Metas' diagnostics, via the
+  ///     SAME shared-`$$et{PROCESSED}` event replay `tags()` / `project()` use
+  ///     ([`replay_exif_events`], `ExifTool.pm:9061-9072` + `PNG.pm:1193`) — for
+  ///     each EXIF event: its own EXIF warnings (the parsed
+  ///     [`ExifMeta`](crate::exif::ExifMeta)'s `Diagnose`), then the cross-source
+  ///     cycle-guard warning(s) the walk raised (`ExifTool.pm:9068`);
+  /// (c) the raw-profile XMP sub-Metas' decode warnings (`ProcessXMP` records at
+  ///     most one first-occurrence `$et->Warn`, e.g. `XMP is double UTF-encoded`
+  ///     XMP.pm:4491), each dispatched at its `Raw profile type {xmp,exif,APP1}`
+  ///     chunk position (`PNG.pm:746`/`:1236`).
+  ///
+  /// Folding (c) onto the walk axis (rather than draining it dead-last, the #205
+  /// bug) is load-bearing: `Warning` is `Priority=0` first-wins
+  /// (`ExifTool.pm:5404-5417`), so a malformed XMP raw-profile that precedes a
+  /// later chunk's warning must surface as the document FIRST `ExifTool:Warning`
+  /// — exactly as bundled. The three cursors consume their streams in push order,
+  /// so each source's internal order is preserved while the sources interleave at
+  /// their true chunk positions. For a PNG whose only diagnostics are PNG-level
+  /// (no embedded EXIF, no XMP raw-profile) the result is byte-identical to the
+  /// pre-#205 flat `self.warnings()` drain (the `diag_order` is then all
+  /// `Warning` steps in push order).
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    use crate::metadata::png::PngDiagStep;
     let mut out = std::vec::Vec::new();
-    out.extend(
-      self
-        .warnings()
-        .iter()
-        .map(crate::diagnostics::Diagnostic::warn),
-    );
+    // Precompute the EXIF event replays once (one per event, IN ORDER); the
+    // `ExifEvent` cursor walks them in lockstep with the event push order.
+    // `png` chains `exif` (`Cargo.toml`), so this file always builds with
+    // `feature = "exif"` — the guard mirrors the rest of the module.
     #[cfg(feature = "exif")]
-    for replay in replay_exif_events(self.exif_events()) {
-      if let Some(exif_meta) = replay.meta() {
-        out.extend(crate::diagnostics::Diagnose::diagnostics(exif_meta));
-      }
-      out.extend(
-        replay
-          .cycle_guard_warnings()
-          .iter()
-          .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
-      );
-    }
-    // Raw-profile XMP sub-Metas' own decode/walk warnings (`ProcessXMP` records
-    // at most one first-occurrence `$et->Warn`, e.g. `XMP is double UTF-encoded`
-    // XMP.pm:4491). These follow the PNG-level + EXIF warnings (XMP profiles are
-    // dispatched after the chunk walk), so the document-level first-warning is
-    // unchanged.
+    let replays = replay_exif_events(self.exif_events());
+    // Each cursor is enumerated so the trailing-watermark predicates
+    // (`event_is_trailing` / `warning_is_trailing` / `xmp_is_trailing`) can
+    // re-scope a TRAILER-chunk diagnostic to the `Trailer` family-1 group
+    // (`PNG.pm:1484`) — for the warning, EXIF, AND XMP sources alike.
+    #[cfg(feature = "exif")]
+    let mut event_cursor = replays.iter().enumerate();
+    let mut warn_cursor = self.warnings().iter().enumerate();
     #[cfg(feature = "xmp")]
-    for packet in self.xmp_profiles() {
-      if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
-        out.extend(crate::diagnostics::Diagnose::diagnostics(&xmp_meta));
+    let mut xmp_cursor = self.xmp_profiles().iter().enumerate();
+
+    for step in self.diag_order() {
+      match step {
+        PngDiagStep::Warning => {
+          if let Some((wi, w)) = warn_cursor.next() {
+            // `PNG.pm:1481-1484`: a warning raised while parsing a post-`IEND`
+            // TRAILER chunk runs under `$$et{SET_GROUP1} = 'Trailer'`, so its
+            // `FoundTag('Warning', …)` resolves the family-1 group to `Trailer`
+            // (`ExifTool.pm:9475`) and surfaces as the `Trailer:Warning` TAG
+            // rather than the document-level `ExifTool:Warning`. The minor flag
+            // (`$et->Warn(..., 1)`) is reconstructed by message shape, faithful
+            // to the three minor PNG walker warnings (see `png_warning_is_minor`).
+            let minor = png_warning_is_minor(w);
+            out.push(match (self.warning_is_trailing(wi), minor) {
+              (false, false) => crate::diagnostics::Diagnostic::warn(w),
+              (false, true) => crate::diagnostics::Diagnostic::warn_minor(w),
+              (true, false) => crate::diagnostics::Diagnostic::warn_in_group(GROUP_TRAILER, w),
+              (true, true) => crate::diagnostics::Diagnostic::new(
+                w.into(),
+                crate::diagnostics::Severity::Warn,
+                Some(GROUP_TRAILER.into()),
+                1,
+                false,
+              ),
+            });
+          }
+        }
+        // `png` chains `exif` (`Cargo.toml`), so this arm always runs; the
+        // `cfg` mirrors the rest of the module's belt-and-suspenders gating.
+        #[cfg(feature = "exif")]
+        PngDiagStep::ExifEvent => {
+          if let Some((ei, replay)) = event_cursor.next() {
+            // `PNG.pm:1484`: an embedded-EXIF event parsed from a post-`IEND`
+            // TRAILER `eXIf`/`Raw profile type exif` chunk raises its EXIF
+            // `$et->Warn`/`$et->Error` AND any cross-source cycle-guard warning
+            // under `SET_GROUP1 = 'Trailer'`, so each document-level diagnostic
+            // surfaces as `Trailer:Warning`/`:Error` (mirroring the tag-side
+            // `apply_trailer_group`). A non-trailing event's diagnostics are
+            // emitted UNCHANGED (the standard byte-identical path).
+            let trailing = self.event_is_trailing(ei);
+            let rescope = |d: crate::diagnostics::Diagnostic| {
+              if trailing {
+                rescope_trailing_diag(d)
+              } else {
+                d
+              }
+            };
+            if let Some(exif_meta) = replay.meta() {
+              out.extend(
+                crate::diagnostics::Diagnose::diagnostics(exif_meta)
+                  .into_iter()
+                  .map(rescope),
+              );
+            }
+            out.extend(
+              replay
+                .cycle_guard_warnings()
+                .iter()
+                .map(|w| rescope(crate::diagnostics::Diagnostic::warn(w.as_str()))),
+            );
+          }
+        }
+        #[cfg(not(feature = "exif"))]
+        PngDiagStep::ExifEvent => {}
+        #[cfg(feature = "xmp")]
+        PngDiagStep::Xmp => {
+          if let Some((xi, packet)) = xmp_cursor.next()
+            && let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet)
+          {
+            // `PNG.pm:1484`: a post-`IEND` TRAILER `Raw profile type xmp` chunk
+            // raises its `ProcessXMP` `$et->Warn` (e.g. `XMP is double
+            // UTF-encoded`) under `SET_GROUP1 = 'Trailer'`, so the document-level
+            // XMP diagnostic surfaces as `Trailer:Warning` (where priority-0
+            // first-wins then resolves it against any earlier `Trailer:Warning`,
+            // e.g. the `Text/EXIF chunk(s) found after IDAT` walker warning).
+            let trailing = self.xmp_is_trailing(xi);
+            out.extend(
+              crate::diagnostics::Diagnose::diagnostics(&xmp_meta)
+                .into_iter()
+                .map(|d| {
+                  if trailing {
+                    rescope_trailing_diag(d)
+                  } else {
+                    d
+                  }
+                }),
+            );
+          }
+        }
       }
     }
     out
@@ -4067,7 +4494,7 @@ mod tests {
         .collect()
     };
     // IFD0 offset is the discriminator; `val` keeps the blocks distinct.
-    let exif = |ifd0: u32, val: u16| PngExifEvent::NativeTiff(tiff_ifd0(ifd0, val, 0));
+    let exif = |ifd0: u32, val: u16| PngExifEvent::NativeTiff(tiff_ifd0(ifd0, val, 0).into());
     let prof = |ifd0: u32, val: u16| PngExifEvent::ExifProfile(tiff_ifd0(ifd0, val, 0));
     let reset = || PngExifEvent::ResetOnlyProfile;
     const W_IFD0: &str = "IFD0 pointer references previous IFD0 directory";
@@ -4125,7 +4552,7 @@ mod tests {
     );
     // Malformed header is attempted (meta None — no tags) and registers no addr,
     // so two malformed events do not collide with each other (no warnings).
-    let bad = |b: &[u8]| PngExifEvent::NativeTiff(b.to_vec());
+    let bad = |b: &[u8]| PngExifEvent::NativeTiff(b.into());
     assert_eq!(
       collect(&[bad(b"II\x2a"), bad(b"XX")]),
       vec![(false, 0, String::new()), (false, 0, String::new())],
@@ -4141,8 +4568,8 @@ mod tests {
     // 40) therefore collides with the RECORDED TRAILING IFD ⇒ BLOCKED, and the
     // cycle-guard warning names the previous directory `IFD1` (not `IFD0`),
     // exactly as bundled 13.59 (see tests/png.rs's oracle-verified twin).
-    let ev1 = PngExifEvent::NativeTiff(tiff_ifd0_and_ifd1(1, 40, 2));
-    let ev2 = PngExifEvent::NativeTiff(tiff_ifd0(40, 3, 0));
+    let ev1 = PngExifEvent::NativeTiff(tiff_ifd0_and_ifd1(1, 40, 2).into());
+    let ev2 = PngExifEvent::NativeTiff(tiff_ifd0(40, 3, 0).into());
     let events = [ev1, ev2];
     let replays = replay_exif_events(&events);
     // Event 1 contributes (IFD0 + IFD1 tags), no cycle warning.
@@ -4365,5 +4792,463 @@ mod tests {
     // about bad CRC.
     assert_eq!(meta.dimensions(), Some((1, 1)));
     assert!(meta.warnings().iter().all(|w| !w.contains("Bad CRC")));
+  }
+
+  // ─── nested-zXIf DoS bounds (#178 round 2) ────────────────────────────────
+
+  /// Wrap `inner` as one zXIf level: the `\0` type byte + the 4-byte (ignored)
+  /// uncompressed-length field + a ZLIB-wrapped deflate of `inner`
+  /// (`PNG.pm:1378`/`:1386`). Re-applying this nests the zXIf one level deeper.
+  fn zxif_wrap(inner: &[u8]) -> Vec<u8> {
+    let comp = miniz_oxide::deflate::compress_to_vec_zlib(inner, 6);
+    let mut body = Vec::with_capacity(5 + comp.len());
+    body.push(0); // `\0` type byte ⇒ compressed EXIF
+    body.extend_from_slice(&(inner.len() as u32).to_be_bytes()); // unused length field
+    body.extend_from_slice(&comp);
+    body
+  }
+
+  /// A minimal valid little-endian TIFF (`II*`, IFD0 at offset 8, zero entries)
+  /// — a clean innermost block so the ONLY thing that stops the unwrap is the
+  /// DoS cap, not an inflate/`substr` failure at the bottom.
+  fn minimal_ii_tiff() -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(b"II");
+    t.extend_from_slice(&42u16.to_le_bytes());
+    t.extend_from_slice(&8u32.to_le_bytes());
+    t.extend_from_slice(&0u16.to_le_bytes()); // 0 IFD entries
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    t
+  }
+
+  #[test]
+  fn nested_zxif_depth_cap_bounds_recursion_with_inflate_warning() {
+    // A crafted zXIf chain of MAX_ZXIF_DEPTH + several levels of VALID `\0`-
+    // compression over a clean inner TIFF. Bundled (no cap) would unwrap every
+    // level and extract the inner TIFF; the port stops at `MAX_ZXIF_DEPTH` and
+    // raises `Error inflating zxIf` (the aborted-inflate shape) instead of
+    // recursing unboundedly — bounding a stack/CPU-exhaustion DoS. The unwrap is
+    // iterative, so this returns promptly (no deep recursion).
+    let mut body = minimal_ii_tiff();
+    for _ in 0..(MAX_ZXIF_DEPTH + 4) {
+      body = zxif_wrap(&body);
+    }
+    let bytes = synthetic_png(&[chunk(b"zxIf", &body), chunk(b"IEND", &[])]);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    // The depth cap fired: the aborted-inflate warning, and NO inner TIFF tag.
+    assert!(
+      meta.warnings().iter().any(|w| w == "Error inflating zxIf"),
+      "depth cap must raise the aborted-inflate warning, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      meta.exif_events().is_empty(),
+      "no EXIF event should be captured past the depth cap, got {:?}",
+      meta.exif_events(),
+    );
+  }
+
+  #[test]
+  fn nested_zxif_size_cap_bounds_inflate_with_warning() {
+    // A SINGLE zXIf level whose payload decompresses to MORE than the cumulative
+    // size budget (`MAX_ZXIF_INFLATE_TOTAL`). Bundled (no cap) inflates the whole
+    // buffer into memory; the port's size-limited inflate
+    // (`decompress_to_vec_zlib_with_limit`) refuses to grow past the budget and
+    // reports it as the aborted-inflate `Error inflating zxIf` — bounding a
+    // decompression-bomb OOM. miniz never allocates past the cap, so this stays
+    // within one bounded buffer's worth of memory.
+    let oversize = MAX_ZXIF_INFLATE_TOTAL + 4 * 1024 * 1024;
+    // A run of zeros compresses to a tiny zlib stream but inflates back to its
+    // full length (the classic compression bomb). The `\0` type byte + length
+    // field precede the compressed stream (`PNG.pm:1386` `substr($$dataPt, 5)`).
+    let body = {
+      let zeros = std::vec![0u8; oversize];
+      let comp = miniz_oxide::deflate::compress_to_vec_zlib(&zeros, 6);
+      // `zeros` is dropped here so only the (tiny) compressed stream is held
+      // through the parse; the inflate is then bounded to the budget.
+      let mut b = Vec::with_capacity(5 + comp.len());
+      b.push(0);
+      b.extend_from_slice(&0u32.to_be_bytes());
+      b.extend_from_slice(&comp);
+      b
+    };
+    let bytes = synthetic_png(&[chunk(b"zxIf", &body), chunk(b"IEND", &[])]);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert!(
+      meta.warnings().iter().any(|w| w == "Error inflating zxIf"),
+      "size cap must raise the aborted-inflate warning, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      meta.exif_events().is_empty(),
+      "no EXIF event should be captured when the size cap fires, got {:?}",
+      meta.exif_events(),
+    );
+  }
+
+  #[test]
+  fn multiple_zxif_chunks_share_one_filewide_inflate_budget() {
+    // The reviewer's exact aggregate-DoS case (#178/#180 follow-up): a SINGLE
+    // small PNG carrying MANY independent `zxIf` chunks, EACH of which inflates
+    // to a VALID `II`/`MM` TIFF that INDIVIDUALLY stays well below the per-chunk
+    // cap but COLLECTIVELY exceeds `MAX_ZXIF_INFLATE_TOTAL`. A clean `II`/`MM`
+    // inflate is RETAINED as a `PngExifEvent::NativeTiff` that lives in
+    // `PngMeta` for the whole parse — so were the inflate budget reset per chunk
+    // (call-local), every chunk would succeed and retained EXIF memory would grow
+    // as O(chunks × cap). With the FILE-WIDE budget the cumulative inflated +
+    // retained total is bounded to the single cap: once it is exhausted, a further
+    // chunk's inflate stops with `Error inflating zxIf` (the aborted-inflate
+    // shape, `PNG.pm:943`) and is NOT retained.
+    //
+    // Each chunk inflates to a valid little-endian TIFF (`II*`, IFD0 at offset 8,
+    // 0 entries) padded with trailing zeros to ~24 MiB; three such chunks sum to
+    // ~72 MiB > the 64 MiB cap. The body is built/compressed ONCE (the chunks are
+    // identical) so the test allocates only one 24 MiB buffer transiently.
+    const PER_CHUNK_INFLATED: usize = 24 * 1024 * 1024;
+    const CHUNKS: usize = 3;
+    // Sanity: each chunk is individually under the cap, but they collectively
+    // exceed it — the only way to bound retention is a shared file-wide budget.
+    assert!(PER_CHUNK_INFLATED < MAX_ZXIF_INFLATE_TOTAL);
+    assert!(PER_CHUNK_INFLATED * CHUNKS > MAX_ZXIF_INFLATE_TOTAL);
+
+    let body = {
+      // A minimal valid `II` TIFF header, then zero-padding so the inflated block
+      // is `II`-led (retained as `NativeTiff`) yet large.
+      let mut tiff = minimal_ii_tiff();
+      tiff.resize(PER_CHUNK_INFLATED, 0);
+      zxif_wrap(&tiff)
+    };
+
+    let mut chunks = std::vec![chunk(b"IHDR", &{
+      let mut ihdr = Vec::new();
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // width
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
+      ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // depth/color/comp/filter/interlace
+      ihdr
+    })];
+    for _ in 0..CHUNKS {
+      chunks.push(chunk(b"zxIf", &body));
+    }
+    chunks.push(chunk(b"IEND", &[]));
+    let bytes = synthetic_png(&chunks);
+
+    let meta = parse_borrowed(&bytes).expect("png parses");
+
+    // The aggregate budget fired: at least one chunk could NOT inflate once the
+    // file-wide total was exhausted.
+    assert!(
+      meta.warnings().iter().any(|w| w == "Error inflating zxIf"),
+      "the file-wide inflate budget must abort a chunk with the aborted-inflate \
+       warning once the cumulative total is exhausted, got {:?}",
+      meta.warnings(),
+    );
+
+    // Retention is BOUNDED: the sum of all retained `NativeTiff` bytes is ≤ the
+    // single file-wide cap (NOT O(chunks × cap)). A per-chunk-reset budget would
+    // have retained all 3 chunks (~72 MiB); the file-wide budget caps it.
+    let retained: usize = meta
+      .exif_events()
+      .iter()
+      .filter_map(PngExifEvent::block)
+      .map(<[u8]>::len)
+      .sum();
+    assert!(
+      retained <= MAX_ZXIF_INFLATE_TOTAL,
+      "total retained inflated-TIFF bytes must be bounded by the file-wide cap \
+       ({MAX_ZXIF_INFLATE_TOTAL}), got {retained}",
+    );
+    // Concretely: fewer than `CHUNKS` chunks were retained (the budget stopped the
+    // last one) — proving the budget did NOT reset per chunk.
+    assert!(
+      meta.exif_events().len() < CHUNKS,
+      "the file-wide budget must stop at least one chunk from being retained \
+       (a per-chunk reset would retain all {CHUNKS}), got {} events",
+      meta.exif_events().len(),
+    );
+  }
+
+  #[test]
+  fn multiple_oversized_failing_zxif_chunks_exhaust_budget_after_the_first() {
+    // Finding 1 (the FAILED-inflate accounting hole): a PNG with MANY independent
+    // `zxIf` chunks, EACH of which would inflate PAST the cap (so each FAILS with
+    // the limit error and is discarded). The prior code charged the file-wide total
+    // only on `Inflate::Ok`, so every failing chunk forced ANOTHER near-cap inflate
+    // ATTEMPT (miniz grows its buffer to `max_size` before reporting HasMoreOutput)
+    // — O(chunks) transient ~64 MiB allocations, the budget never moving. The fix
+    // charges the cap-hit's transient allocation: the FIRST chunk saturates the
+    // file-wide total to the cap, so EVERY later chunk sees `remaining == 0` and is
+    // refused IMMEDIATELY by `inflate_chunk_limited` (no miniz call, no allocation).
+    //
+    // The body is built/compressed ONCE (the chunks are identical) and only the
+    // FIRST chunk performs a real (capped) inflate, so the whole test costs a single
+    // transient ~64 MiB buffer — the later chunks short-circuit.
+    let oversize = MAX_ZXIF_INFLATE_TOTAL + 4 * 1024 * 1024;
+    let body = {
+      // A run of zeros: tiny compressed, inflates back to `oversize` (> cap).
+      let zeros = std::vec![0u8; oversize];
+      let comp = miniz_oxide::deflate::compress_to_vec_zlib(&zeros, 6);
+      let mut b = Vec::with_capacity(5 + comp.len());
+      b.push(0); // `\0` type byte ⇒ compressed EXIF
+      b.extend_from_slice(&0u32.to_be_bytes()); // unused length field
+      b.extend_from_slice(&comp);
+      b
+    };
+
+    const CHUNKS: usize = 4;
+    let mut chunks = std::vec![chunk(b"IHDR", &{
+      let mut ihdr = Vec::new();
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // width
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
+      ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // depth/color/comp/filter/interlace
+      ihdr
+    })];
+    for _ in 0..CHUNKS {
+      chunks.push(chunk(b"zxIf", &body));
+    }
+    chunks.push(chunk(b"IEND", &[]));
+    let bytes = synthetic_png(&chunks);
+
+    let meta = parse_borrowed(&bytes).expect("png parses");
+
+    // Every over-cap chunk reports the aborted-inflate warning — one per chunk.
+    let errs = meta
+      .warnings()
+      .iter()
+      .filter(|w| *w == "Error inflating zxIf")
+      .count();
+    assert_eq!(
+      errs,
+      CHUNKS,
+      "each over-cap chunk must raise the aborted-inflate warning, got {:?}",
+      meta.warnings(),
+    );
+    // Nothing is retained (no chunk yields a valid TIFF).
+    assert!(
+      meta.exif_events().is_empty(),
+      "no EXIF event should be retained from failing chunks, got {:?}",
+      meta.exif_events(),
+    );
+    // THE key assertion: the file-wide total is charged EXACTLY the cap — the first
+    // chunk's cap-hit charged `max_size == cap`, and every later chunk short-
+    // circuited at `remaining == 0` and charged nothing. The pre-fix code left this
+    // at 0 (failed inflates were never charged), which is what let each chunk replay
+    // a near-cap inflate. So this both proves the budget is exhausted after the
+    // first AND that the later chunks added no further allocation.
+    assert_eq!(
+      meta.zxif_inflated_total(),
+      MAX_ZXIF_INFLATE_TOTAL,
+      "the first over-cap chunk must saturate the file-wide budget to exactly the \
+       cap (and later chunks must add nothing, having short-circuited)",
+    );
+  }
+
+  #[test]
+  fn near_cap_valid_zxif_retained_by_move_charges_one_buffer_no_double() {
+    // Finding 2 (the retain-clone peak): a SINGLE `zxIf` that inflates to a valid
+    // near-cap `II`/`MM` TIFF. The prior code did `NativeTiff(level.to_vec())` —
+    // CLONING the inflated buffer into the retained event while the local inflate
+    // buffer was still alive ⇒ ~2× the cap live at the instant of retention. The fix
+    // MOVES the inflated buffer into the event (no clone), so the single already-
+    // charged buffer simply BECOMES the retained one: peak == one buffer ≤ cap.
+    //
+    // Deterministic proof within unit-test reach: the retained block length equals
+    // the full inflated length (the move preserved the whole buffer), AND the file-
+    // wide total was charged EXACTLY ONCE (== that length) — a near-cap value that
+    // leaves < that length of budget remaining, i.e. only ONE near-cap buffer's
+    // worth was ever accounted (a second near-cap chunk would now be refused).
+    const INFLATED: usize = MAX_ZXIF_INFLATE_TOTAL - 1024 * 1024; // ~63 MiB, near cap
+    assert!(INFLATED < MAX_ZXIF_INFLATE_TOTAL);
+
+    let body = {
+      // A minimal valid little-endian TIFF, zero-padded to ~63 MiB so the inflated
+      // block is `II`-led (retained) yet near the cap. Compressed ONCE (a run of
+      // mostly zeros compresses tiny); the ~63 MiB buffer is dropped after compress.
+      let mut tiff = minimal_ii_tiff();
+      tiff.resize(INFLATED, 0);
+      zxif_wrap(&tiff)
+    };
+    let bytes = synthetic_png(&[
+      chunk(b"IHDR", &{
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        ihdr
+      }),
+      chunk(b"zxIf", &body),
+      chunk(b"IEND", &[]),
+    ]);
+
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert!(
+      meta.warnings().is_empty(),
+      "a clean near-cap zXIf must not warn, got {:?}",
+      meta.warnings(),
+    );
+    // Exactly one retained TIFF, holding the WHOLE inflated buffer (the move kept
+    // every byte; a sub-slice clone or truncation would shorten it).
+    let blocks: Vec<&[u8]> = meta
+      .exif_events()
+      .iter()
+      .filter_map(PngExifEvent::block)
+      .collect();
+    assert_eq!(blocks.len(), 1, "one native TIFF expected");
+    assert_eq!(
+      blocks[0].len(),
+      INFLATED,
+      "the retained TIFF must be the whole moved inflate buffer",
+    );
+    assert!(
+      blocks[0].starts_with(b"II"),
+      "retained block is the II TIFF"
+    );
+    // The file-wide total was charged EXACTLY the inflated length — ONCE. The move
+    // means retention added no second allocation; a clone would still charge once
+    // here (the charge is on inflate, not retain) but would have transiently held
+    // TWO near-cap buffers at the retain instant. The single charge == retained len
+    // is the accounting that the peak is one buffer ≤ cap, NOT 2× the cap.
+    assert_eq!(
+      meta.zxif_inflated_total(),
+      INFLATED,
+      "the near-cap inflate must be charged exactly once (no double-buffer / clone)",
+    );
+    // Corollary: the remaining budget is now < INFLATED, so only ONE near-cap
+    // buffer's worth is accounted file-wide (peak bounded by the cap).
+    assert!(
+      MAX_ZXIF_INFLATE_TOTAL - meta.zxif_inflated_total() < INFLATED,
+      "after one near-cap retain the remaining budget must be below another \
+       near-cap buffer — the peak is bounded to one buffer",
+    );
+  }
+
+  #[test]
+  fn tiny_tiff_with_padded_zlib_stream_retained_boxed_exact_no_undercharge() {
+    // The capacity-vs-length follow-up (#178/#180 rounds 5-6): a `zxIf` payload that
+    // decompresses to a TINY `II`/`MM` TIFF but whose miniz output `Vec` holds a
+    // near-cap CAPACITY. `decompress_to_vec_zlib_with_limit` sizes its output buffer
+    // from the COMPRESSED-input length — `vec![0; min(2*input.len(), max_size)]` up
+    // front (miniz_oxide 0.9.1) — and on success only `truncate`s to the decompressed
+    // length, leaving that capacity intact. So a tiny valid zlib stream followed by
+    // large trailing PADDING (the padding inflates nothing but inflates `input.len()`)
+    // yields a 14-byte TIFF in a Vec whose capacity is ~2× the padding. Charging only
+    // `len` (14) would undercharge if the retained allocation kept that capacity: each
+    // chunk would retain a near-cap ALLOCATION (in a `NativeTiff`) while the file-wide
+    // total barely moves — O(chunks × cap) retained CAPACITY even though every charged
+    // LENGTH is tiny. The fix retains the inflated TIFF as a `Box<[u8]>`
+    // (`into_boxed_slice`), whose allocation is EXACTLY its length BY CONSTRUCTION (a
+    // boxed slice carries no excess capacity) — so the charge is exact and the
+    // retained allocation equals the (tiny) retained length, GUARANTEED by the type,
+    // not by an allocator-dependent `shrink_to_fit`.
+    //
+    // Build one chunk: a minimal `II` TIFF, zlib-compressed, then ~24 MiB of trailing
+    // zero padding appended AFTER the compressed stream (so the inflate payload —
+    // `cur[5..]`, i.e. `comp + padding` — is ~24 MiB ⇒ a ~48 MiB miniz output buffer
+    // for a 14-byte result). MANY such chunks: a naive `Vec`-retain of miniz's output
+    // would retain ~48 MiB of capacity each (O(chunks × cap)); the fix retains each as
+    // a 14-byte `Box<[u8]>` whose allocation is exactly its length by construction.
+    const PADDING: usize = 24 * 1024 * 1024;
+    const CHUNKS: usize = 4;
+    let tiff = minimal_ii_tiff();
+    let tiny_len = tiff.len();
+    let body = {
+      let comp = miniz_oxide::deflate::compress_to_vec_zlib(&tiff, 6);
+      let mut b = Vec::with_capacity(5 + comp.len() + PADDING);
+      b.push(0); // `\0` type byte ⇒ compressed EXIF
+      b.extend_from_slice(&(tiny_len as u32).to_be_bytes()); // unused length field
+      b.extend_from_slice(&comp);
+      // Trailing padding: NOT part of the zlib stream (the stream ends at `Done`),
+      // but it inflates `payload.len()` so miniz pre-allocates ~2× it.
+      b.resize(b.len() + PADDING, 0);
+      b
+    };
+
+    let mut chunks = std::vec![chunk(b"IHDR", &{
+      let mut ihdr = Vec::new();
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // width
+      ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
+      ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // depth/color/comp/filter/interlace
+      ihdr
+    })];
+    for _ in 0..CHUNKS {
+      chunks.push(chunk(b"zxIf", &body));
+    }
+    chunks.push(chunk(b"IEND", &[]));
+    let bytes = synthetic_png(&chunks);
+
+    let meta = parse_borrowed(&bytes).expect("png parses");
+
+    // A tiny valid TIFF is NOT an over-cap inflate: every chunk inflates cleanly, so
+    // there is no aborted-inflate warning. (The trailing padding past the zlib stream
+    // is benign — miniz stops at the stream's `Done`.)
+    assert!(
+      meta.warnings().iter().all(|w| w != "Error inflating zxIf"),
+      "a tiny TIFF with trailing zlib padding must inflate cleanly, got {:?}",
+      meta.warnings(),
+    );
+
+    // EVERY chunk is retained (its charge is the tiny TIFF length, so the file-wide
+    // budget is never exhausted) — proving the undercharge is precisely the danger the
+    // capacity dimension posed: with a near-cap `Vec`-retain, all CHUNKS would also be
+    // retained but each holding a ~48 MiB CAPACITY (O(chunks × cap) live), while the
+    // charged total stayed near zero. As `Box<[u8]>` the retained allocation collapses
+    // to the retained length.
+    let retained: Vec<&[u8]> = meta
+      .exif_events()
+      .iter()
+      .filter_map(|ev| match ev {
+        PngExifEvent::NativeTiff(v) => Some(v.as_ref()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      retained.len(),
+      CHUNKS,
+      "every tiny-TIFF chunk inflates cleanly and is retained, got {} events",
+      meta.exif_events().len(),
+    );
+
+    // The structural close, BY CONSTRUCTION: each retained buffer is a `Box<[u8]>`,
+    // whose backing allocation is EXACTLY its length (a boxed slice has no excess
+    // capacity — capacity == len is a type-level guarantee, not an allocator-dependent
+    // `shrink_to_fit` result). So summing `len()` gives the EXACT total retained bytes.
+    // Each is the tiny TIFF (`tiny_len`), NOT a near-cap allocation.
+    let mut total_retained = 0usize;
+    for v in &retained {
+      assert_eq!(
+        v.len(),
+        tiny_len,
+        "the retained boxed block is the tiny inflated TIFF (its allocation == its \
+         length by construction), not the ~48 MiB padding capacity; got len {}",
+        v.len(),
+      );
+      assert!(v.starts_with(b"II"), "retained block is the II TIFF");
+      // A `Box<[u8]>`'s allocation size IS its length (exact by construction).
+      total_retained += v.len();
+    }
+
+    // Total retained ALLOCATION is bounded by the cap — accurately. As `Box<[u8]>` it
+    // is just `CHUNKS * tiny_len` (a few dozen bytes); a near-cap `Vec`-retain would be
+    // `CHUNKS * ~48 MiB` (~192 MiB) ≫ the 64 MiB cap, the reopened O(chunks × cap) DoS.
+    assert!(
+      total_retained <= MAX_ZXIF_INFLATE_TOTAL,
+      "total retained allocation must be bounded by the file-wide cap \
+       ({MAX_ZXIF_INFLATE_TOTAL}); got {total_retained}",
+    );
+
+    // The file-wide charge equals the summed retained LENGTH (== the retained
+    // allocation, by construction), so the accounting is exact: the charge is neither
+    // an under- nor over-count of the live retained memory — independent of the
+    // allocator (no `shrink_to_fit` microstructure gap behind a boxed slice).
+    assert_eq!(
+      meta.zxif_inflated_total(),
+      CHUNKS * tiny_len,
+      "the file-wide total must charge exactly the summed retained length",
+    );
+    assert_eq!(
+      meta.zxif_inflated_total(),
+      total_retained,
+      "charge == retained allocation: the capacity-vs-length gap is closed at the type \
+       level (Box<[u8]> is exact by construction)",
+    );
   }
 }

@@ -55,7 +55,7 @@ pub struct Resolved {
 /// 2. **subset / variant label maps** — the curated camera-relevant
 ///    `IntLabel` slices that are a strict SUBSET of (or carry different labels
 ///    than) the full `-listx` map (`Compression`, `LightSource`,
-///    `SensingMethod`, `Sharpness`→`CONTRAST`, …) and the two `PrintHex`
+///    `SensingMethod`, `Sharpness`→`SHARPNESS`, …) and the two `PrintHex`
 ///    (`IntLabelHex`) maps (`Flash`, `ColorSpace`) — `-listx` omits the
 ///    `PrintHex` flag; these pin the conv to the existing hand const so the
 ///    shadow reuses the SAME curated slice;
@@ -63,9 +63,10 @@ pub struct Resolved {
 ///    `INTEROP_INDEX` `StrLabel` slice is curated in a DIFFERENT key order than
 ///    `-listx` emits, so it is pinned to the hand const for a byte-identical
 ///    (and order-stable) shadow;
-/// 4. **map suppression** — `SensitivityType` (0x8830): `-listx` carries a
-///    `<values>` enumeration the hand subset deliberately does NOT apply, so it
-///    is pinned to `Conv::None` rather than the derived `IntLabel`;
+/// 4. **subset-order pin** — `SensitivityType` (0x8830): the hand
+///    `SENSITIVITY_TYPE` `IntLabel` slice (the full `%sensitivityType` map,
+///    `Exif.pm:2184-2193`) is pinned to the hand const so the shadow reuses the
+///    hand slice byte-for-byte rather than re-deriving it from `-listx`;
 /// 5. **name-only** overrides — the four conditional ids whose `-listx` name is
 ///    a DIFFERENT `Condition` branch than the hand table's default name
 ///    (`0x0111` `JpgFromRawStart`→`StripOffsets`, `0x0117`
@@ -97,13 +98,11 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   // pin it to the hand const to reuse its exact byte order (a hit is a linear
   // first-match either way, but byte-identical emit requires the hand order).
   hp(0x0001, "Conv::StrLabel(super::INTEROP_INDEX)"),
-  // ---- `-listx`-has-a-map-but-hand-is-`None` (SensitivityType) -------------
-  // `SensitivityType` (0x8830): `-listx` carries the full `%sensitivityType`
-  // enumeration, but the hand `%Exif::Main` subset deliberately leaves this tag
-  // as a plain numeric `Conv::None` (no PrintConv). Pin it to `Conv::None` so
-  // the shadow does NOT pick up the (unported) `-listx` map.
-  hp(0x8830, "Conv::None"),
   // ---- subset / variant `IntLabel` PrintConv slices (Exif.pm) -------------
+  // `SensitivityType` (0x8830): the hand `SENSITIVITY_TYPE` slice IS the full
+  // `%sensitivityType` map (`Exif.pm:2184-2193`); pin the hand const so the
+  // shadow reuses its exact byte order rather than re-deriving from `-listx`.
+  hp(0x8830, "Conv::IntLabel(super::SENSITIVITY_TYPE)"),
   hp(0x00fe, "Conv::IntLabel(super::SUBFILE_TYPE)"),
   hp(0x0103, "Conv::IntLabel(super::COMPRESSION)"),
   hp(0x0106, "Conv::IntLabel(super::PHOTOMETRIC)"),
@@ -111,8 +110,15 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   hp(0x9208, "Conv::IntLabel(super::LIGHT_SOURCE)"),
   hp(0xa210, "Conv::IntLabel(super::RESOLUTION_UNIT)"),
   hp(0xa217, "Conv::IntLabel(super::SENSING_METHOD)"),
-  hp(0xa300, "Conv::IntLabel(super::FILE_SOURCE)"),
-  hp(0xa40a, "Conv::IntLabel(super::CONTRAST)"),
+  // `FileSource` (0xa300) — the `%Exif::Main` HASH has the integer codes 1/2/3
+  // PLUS the literal 4-byte STRING key `"\3\0\0\0" => 'Sigma Digital Camera'`
+  // (`Exif.pm:2820`), which `-listx` cannot represent. The dedicated
+  // `Conv::FileSource` carries the int labels (the `super::FILE_SOURCE` slice)
+  // AND the Sigma literal-key handling (#399).
+  hp(0xa300, "Conv::FileSource(super::FILE_SOURCE)"),
+  // `Sharpness` (0xa40a) — `{0:Normal,1:Soft,2:Hard}` (Exif.pm:2946), DISTINCT
+  // from `Contrast` (`{0:Normal,1:Low,2:High}`); pin the hand `SHARPNESS` slice.
+  hp(0xa40a, "Conv::IntLabel(super::SHARPNESS)"),
   // ---- `PrintHex` (IntLabelHex) maps — `-listx` omits the PrintHex flag ----
   hp(0x9209, "Conv::IntLabelHex(super::FLASH)"),
   hp(0xa001, "Conv::IntLabelHex(super::COLOR_SPACE)"),
@@ -439,15 +445,15 @@ mod tests {
   }
 
   #[test]
-  fn exif_sensitivity_type_suppresses_listx_map() {
-    // SensitivityType (0x8830): `-listx` carries the full enumeration, but the
-    // hand subset leaves it `Conv::None` → the HANDPORTED pin wins over the
-    // derived `IntLabel`.
+  fn exif_sensitivity_type_pins_to_hand_const() {
+    // SensitivityType (0x8830): the hand `SENSITIVITY_TYPE` slice IS the full
+    // `%sensitivityType` map (Exif.pm:2184-2193); the HANDPORTED pin reuses its
+    // exact byte order rather than re-deriving the `IntLabel` from `-listx`.
     let r = resolve_exif(
       0x8830,
       &tag("33866", "SensitivityType", Some(vec![("0", "Unknown")])),
     );
-    assert_eq!(r.conv_expr, "Conv::None");
+    assert_eq!(r.conv_expr, "Conv::IntLabel(super::SENSITIVITY_TYPE)");
   }
 
   #[test]

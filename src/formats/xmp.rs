@@ -319,6 +319,60 @@ impl XmpMeta<'_> {
   fn set_decode_warning(&mut self, msg: String) {
     self.warning = Some(msg);
   }
+
+  /// Rebrand the `'a` lifetime to `'static`. `XmpMeta` OWNS its decoded data
+  /// (every `tags` string is a transcoded owned `String`/`SmolStr`; the `'a` is
+  /// the `_input: PhantomData<&'a [u8]>` GAT anchor and binds nothing borrowed),
+  /// so this just moves the owned fields under a `'static` phantom — no data is
+  /// borrowed from the source buffer. Used by the JPEG front-end to store the
+  /// embedded-`APP1` XMP on the (independently-lifetimed) `ExifMeta` without
+  /// tying it to the JPEG byte slice. (`pub(crate)`: an internal storage seam.)
+  #[must_use]
+  pub(crate) fn into_static(self) -> XmpMeta<'static> {
+    XmpMeta {
+      tags: self.tags,
+      warning: self.warning,
+      nikon_nxd: self.nikon_nxd,
+      _input: core::marker::PhantomData,
+    }
+  }
+
+  /// Absorb a SECOND XMP packet decoded from the SAME file (e.g. a second
+  /// top-level `uuid`-XMP box in a QuickTime container — ExifTool's `ProcessMOV`
+  /// atom walk dispatches EVERY `uuid` atom, with no de-dup, so a file may carry
+  /// more than one XMP packet; QuickTime.pm:10032 loop + the `uuid` Condition,
+  /// see `%dupTagOK` listing `uuid` at QuickTime.pm:506-509). Faithful to
+  /// `XMP::ProcessXMP` running once PER packet and `FoundTag` ACCUMULATING (a
+  /// duplicate tag is never dropped — ExifTool.pm:9514-9596), this appends
+  /// `other`'s tags AFTER this packet's in file-walk order; the downstream
+  /// last-wins `TagMap`/`iter_tags` dedup then resolves a duplicate same-name
+  /// XMP tag to the later (file-order) packet's value — matching ExifTool's
+  /// equal-priority "later atom owns the bare tag key" resolution.
+  ///
+  /// `Warning` stays FIRST-wins (`FoundTag('Warning')`, Extra.pm Priority 0 ⇒
+  /// the earliest-extracted warning is the public one), so an existing warning
+  /// is kept; the Nikon-NX-D `OverrideFileType` latch is OR-ed (any packet that
+  /// fires it sets it). `LIST_TAGS` does NOT span packets (ExifTool resets it
+  /// per `ProcessDirectory`, ExifTool.pm:9076), so cross-packet duplicates go
+  /// through the new-key/last-wins path, never an in-place list append — which
+  /// is exactly what concatenation + last-wins dedup reproduces.
+  ///
+  /// Returns `true` when THIS call adopted `other`'s warning — i.e. there was no
+  /// earlier warning and `other` carried one. The caller uses that to record the
+  /// warning's ORIGIN offset: the first warning-producing packet's atom offset,
+  /// not the first XMP packet's (the two differ when an earlier packet is clean
+  /// and a later one warns). The bare `ExifTool:Warning` text is first-wins; its
+  /// offset must follow the SAME first-warning-wins file order so the HEIC
+  /// priority-0 (by-offset) ranking places the XMP warning at its true position.
+  pub(crate) fn absorb_additional_packet(&mut self, other: XmpMeta<'_>) -> bool {
+    self.tags.extend(other.tags);
+    let adopted = self.warning.is_none() && other.warning.is_some();
+    if adopted {
+      self.warning = other.warning;
+    }
+    self.nikon_nxd |= other.nikon_nxd;
+    adopted
+  }
 }
 
 /// One emitted XMP tag: family-1 group (`XMP-exif`, `XMP-dc`, …), tag name,
@@ -6201,5 +6255,124 @@ mod tests {
     // Both `-j` (print) and `-n` (numeric) forms are the et:prt text.
     assert_eq!(scalar.text(), "Print");
     assert_eq!(scalar.numeric(), "Print");
+  }
+
+  // ----- #361 R2 / FINDING 2: multiple top-level `uuid`-XMP packets ---------
+  /// A minimal XMP packet with one `foo:` custom-namespace property whose
+  /// scalar text is `value` (mirrors `et_qualifier_suppression_emits_prt`'s
+  /// proven `XMP-foo:<name>` shape: `foo:` → family-1 group `XMP-foo`).
+  fn one_tag_packet(name: &str, value: &str) -> std::vec::Vec<u8> {
+    format!(
+      r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="http://ns.example.com/foo/1.0/">
+   <foo:{name}>{value}</foo:{name}>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="r"?>"#
+    )
+    .into_bytes()
+  }
+
+  /// ExifTool's `ProcessMOV` walks EVERY top-level `uuid` atom (no de-dup,
+  /// QuickTime.pm:10032 + `%dupTagOK` listing `uuid`), running `XMP::ProcessXMP`
+  /// once per packet and ACCUMULATING tags (`FoundTag` never drops a duplicate,
+  /// ExifTool.pm:9514-9596). [`XmpMeta::absorb_additional_packet`] reproduces
+  /// that: the second packet's tags are APPENDED after the first's in
+  /// file-walk order, so the downstream last-wins `iter_tags` dedup resolves a
+  /// duplicate same-name XMP tag to the LATER packet's value (ExifTool's
+  /// equal-priority "later atom owns the bare key").
+  #[test]
+  fn absorb_additional_packet_accumulates_tags_in_file_order() {
+    let (a, b) = (one_tag_packet("Alpha", "1"), one_tag_packet("Beta", "2"));
+    let first = super::parse_borrowed(&a).expect("first parses");
+    let second = super::parse_borrowed(&b).expect("second parses");
+
+    let mut merged = first;
+    merged.absorb_additional_packet(second);
+
+    // Both packets' DISTINCT tags survive, in file-walk (append) order.
+    let names: std::vec::Vec<&str> = merged.tags_slice().iter().map(|t| t.name()).collect();
+    assert_eq!(names, vec!["Alpha", "Beta"]);
+    // Faithful family-1 group from the `foo:` namespace (NOT stripped — the
+    // packets are not a `Composite:` exclusion).
+    assert!(merged.tags_slice().iter().all(|t| t.group() == "XMP-foo"));
+    assert_eq!(
+      merged
+        .tags_slice()
+        .iter()
+        .find(|t| t.name() == "Beta")
+        .and_then(|t| t.value_ref().scalar_ref())
+        .map(super::XmpScalar::text),
+      Some("2"),
+    );
+  }
+
+  /// A duplicate SAME-NAME tag across two packets is RETAINED (never dropped) —
+  /// both instances are present after the absorb, in file order. The downstream
+  /// last-wins dedup (not this layer) then picks the later value; here we assert
+  /// the accumulation, the prerequisite for that resolution.
+  #[test]
+  fn absorb_additional_packet_keeps_duplicate_same_name_tag() {
+    let (a, b) = (
+      one_tag_packet("Dup", "early"),
+      one_tag_packet("Dup", "late"),
+    );
+    let first = super::parse_borrowed(&a).expect("first parses");
+    let second = super::parse_borrowed(&b).expect("second parses");
+
+    let mut merged = first;
+    merged.absorb_additional_packet(second);
+
+    let dup_values: std::vec::Vec<&str> = merged
+      .tags_slice()
+      .iter()
+      .filter(|t| t.name() == "Dup")
+      .filter_map(|t| t.value_ref().scalar_ref())
+      .map(super::XmpScalar::text)
+      .collect();
+    // BOTH retained, in file order — the later does NOT overwrite/erase the
+    // earlier at this layer (matches `FoundTag`'s indexed-key duplicate).
+    assert_eq!(dup_values, vec!["early", "late"]);
+  }
+
+  /// `Warning` stays FIRST-wins across packets (`FoundTag('Warning')` Priority 0
+  /// ⇒ earliest-extracted is public): a first packet's recorded warning is kept
+  /// even when a later packet also warns; if only the later warns, it is
+  /// adopted. The return flags whether THIS absorb adopted `other`'s warning (so
+  /// the QuickTime caller records the warning's ORIGIN offset, not the first
+  /// XMP atom's).
+  #[test]
+  fn absorb_additional_packet_warning_is_first_wins() {
+    // Synthesize warnings via the crate-internal setter (decode-stage warning).
+    let (a, b) = (one_tag_packet("A", "1"), one_tag_packet("B", "2"));
+    let mut first = super::parse_borrowed(&a).expect("first parses");
+    first.set_decode_warning("first".into());
+    let mut second = super::parse_borrowed(&b).expect("second parses");
+    second.set_decode_warning("second".into());
+
+    let mut merged = first;
+    // An EARLIER warning already exists ⇒ NOT adopted (false), text unchanged.
+    assert!(!merged.absorb_additional_packet(second));
+    assert_eq!(merged.warning(), Some("first"));
+
+    // Only the later packet warns ⇒ its warning IS adopted (true) — no earlier
+    // one — and the caller will record this packet's offset as the origin.
+    let (c, d) = (one_tag_packet("A", "1"), one_tag_packet("B", "2"));
+    let mut clean = super::parse_borrowed(&c).expect("clean parses");
+    let mut warned = super::parse_borrowed(&d).expect("warned parses");
+    warned.set_decode_warning("only-later".into());
+    assert!(clean.absorb_additional_packet(warned));
+    assert_eq!(clean.warning(), Some("only-later"));
+
+    // BOTH clean ⇒ nothing adopted (false), no warning.
+    let (e, f) = (one_tag_packet("A", "1"), one_tag_packet("B", "2"));
+    let mut clean_a = super::parse_borrowed(&e).expect("clean parses");
+    let clean_b = super::parse_borrowed(&f).expect("clean parses");
+    assert!(!clean_a.absorb_additional_packet(clean_b));
+    assert_eq!(clean_a.warning(), None);
   }
 }

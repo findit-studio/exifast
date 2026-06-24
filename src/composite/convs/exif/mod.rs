@@ -255,5 +255,59 @@ pub(crate) fn print_megapixels(val: f64) -> String {
   format!("{val:.prec$}")
 }
 
+/// The complete `%Image::ExifTool::Exif::flash` enumerated hash (Exif.pm:175-
+/// 209), ported key-for-key — the table `Composite:Flash`'s PrintConv references
+/// (`PrintConv => \%Image::ExifTool::Exif::flash`, XMP.pm:2834). A faithful copy
+/// is kept here (the same value the EXIF `Flash` leaf and `h264::flash_print_conv`
+/// render) to avoid cross-feature table plumbing — `crate::exif::tables::FLASH`
+/// is `exif`-private and the `xmp`/`exif` features are independent.
+#[cfg(feature = "alloc")]
+const FLASH: &[(i64, &str)] = &[
+  (0x00, "No Flash"),
+  (0x01, "Fired"),
+  (0x05, "Fired, Return not detected"),
+  (0x07, "Fired, Return detected"),
+  (0x08, "On, Did not fire"),
+  (0x09, "On, Fired"),
+  (0x0d, "On, Return not detected"),
+  (0x0f, "On, Return detected"),
+  (0x10, "Off, Did not fire"),
+  (0x14, "Off, Did not fire, Return not detected"),
+  (0x18, "Auto, Did not fire"),
+  (0x19, "Auto, Fired"),
+  (0x1d, "Auto, Fired, Return not detected"),
+  (0x1f, "Auto, Fired, Return detected"),
+  (0x20, "No flash function"),
+  (0x30, "Off, No flash function"),
+  (0x41, "Fired, Red-eye reduction"),
+  (0x45, "Fired, Red-eye reduction, Return not detected"),
+  (0x47, "Fired, Red-eye reduction, Return detected"),
+  (0x49, "On, Red-eye reduction"),
+  (0x4d, "On, Red-eye reduction, Return not detected"),
+  (0x4f, "On, Red-eye reduction, Return detected"),
+  (0x50, "Off, Red-eye reduction"),
+  (0x58, "Auto, Did not fire, Red-eye reduction"),
+  (0x59, "Auto, Fired, Red-eye reduction"),
+  (0x5d, "Auto, Fired, Red-eye reduction, Return not detected"),
+  (0x5f, "Auto, Fired, Red-eye reduction, Return detected"),
+];
+
+/// `Composite:Flash`'s PrintConv (`PrintConv => \%Image::ExifTool::Exif::flash`,
+/// XMP.pm:2834) on the composite's numeric `$val` (the assembled bitmask).
+///
+/// The XMP Flash composite carries `PrintHex => 1` (XMP.pm:2820), so a value
+/// absent from `%flash` renders `sprintf('Unknown (0x%x)', $val)` (ExifTool.pm:
+/// 3623-3627) — the same `Conv::IntLabelHex` fallback the EXIF `Flash` leaf uses.
+/// `$val` is the non-negative bitmask the ValueConv built (`0..=0x7f`), so the
+/// lowercase-hex `{:x}` matches Perl's unsigned `%x`.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub(crate) fn flash_print_conv(code: i64) -> std::string::String {
+  match FLASH.iter().find(|(k, _)| *k == code) {
+    Some((_, label)) => (*label).to_string(),
+    None => std::format!("Unknown (0x{code:x})"),
+  }
+}
+
 #[cfg(test)]
 mod tests;

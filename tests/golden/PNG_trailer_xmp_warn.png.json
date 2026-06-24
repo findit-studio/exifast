@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "PNG_trailer_xmp_warn.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Trailer data after PNG IEND chunk",
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "Trailer:Warning": "[minor] Text/EXIF chunk(s) found after PNG IDAT (may be ignored by some readers)",
+  "XMP-dc:Format": "image/png",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

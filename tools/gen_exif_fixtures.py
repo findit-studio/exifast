@@ -20,6 +20,7 @@ import struct
 import sys
 
 # ---- TIFF format codes -----------------------------------------------------
+BYTE = 1
 ASCII = 2
 SHORT = 3
 LONG = 4
@@ -1806,6 +1807,121 @@ def make_exif_ambient_wrongfmt_tif():
     return _exififd_tif(bo, [(0x9400, UNDEF, len(payload), payload)])
 
 
+def make_exif_componentsconfig_wrongfmt_tif():
+    r"""#201 — `ComponentsConfiguration` (0x9101) written with the WRONG on-disk
+    format, pinning that its `Format => 'int8u'` (`Exif.pm:2298`) READ override
+    decodes the raw value bytes as `int(size/1)` int8u ELEMENTS regardless of the
+    declared format code, so the per-byte PrintConv (`Exif.pm:2304-2333`) sees the
+    raw bytes one-per-element. This is the case that distinguishes a faithful
+    raw-byte read from a post-`ReadValue`-`$val` byte-walk: only re-reading the
+    on-disk bytes as int8u (NOT the int16u decode) reproduces bundled.
+
+    Two ExifIFD entries (a malformed-format and an unknown-code case):
+      0x9101 int16u[2] = 0x0102 0x0300  -> raw bytes 01 02 03 00
+             ExifTool's int8u re-read -> elements 1 2 3 0:
+               -j -> "Y, Cb, Cr, -"   (NOT the int16u decode "258 768")
+               -n -> "1 2 3 0"
+    The unknown-code render is in the SEPARATE
+    `Exif_componentsconfig_wrongfmt_err.tif` sibling.
+    -j -> "Y, Cb, Cr, -"
+    -n -> "1 2 3 0"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Pre-fix exifast decoded 0x9101 per its on-disk int16u format and the
+    `Conv::ComponentsConfiguration` arm (which matched `RawValue::Bytes` only)
+    fell through to `emit_raw`, emitting the int16u decode "258 768" (#201).
+    Big-endian (MM)."""
+    bo = '>'
+    # int16u[2] = 0x0102, 0x0300 -> on-disk bytes 01 02 03 00 (inline, <= 4 bytes).
+    blob = struct.pack(bo + 'HH', 0x0102, 0x0300)
+    return _exififd_tif(bo, [(0x9101, SHORT, 2, blob)])
+
+
+def make_exif_componentsconfig_wrongfmt_err_tif():
+    r"""#201 sibling — `ComponentsConfiguration` (0x9101) wrong-format WITH an
+    UNKNOWN element code, pinning the `OTHER` PrintConv sub's `$$conv{$_} ||
+    "Err ($_)"` fall-through (`Exif.pm:2330`): an un-hashed code N renders
+    `"Err (N)"`, NOT `"?"`.
+
+      0x9101 int8u[4] = 7 99 0 1   (7 and 99 are not in the 0..6 hash)
+    -j -> "Err (7), Err (99), -, Y"
+    -n -> "7 99 0 1"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    int8u is itself a "wrong" on-disk format for the typically-`undef` 0x9101, so
+    this also exercises the `Format => 'int8u'` override on a non-`undef` shape.
+    Big-endian (MM)."""
+    bo = '>'
+    blob = bytes([7, 99, 0, 1])                     # int8u[4], inline (4 bytes)
+    return _exififd_tif(bo, [(0x9101, BYTE, 4, blob)])
+
+
+def make_exif_gps_versionid_undef_tif():
+    r"""#399 item 1 — `GPSVersionID` (0x0000) written with the WRONG on-disk
+    format (`undef[4]` instead of the spec `int8u[4]`), pinning that the value
+    is rendered per the on-disk format — NOT re-read as int8u and NOT the binary
+    `(Binary data ...)` placeholder.
+
+    GPSVersionID has `Writable => 'int8u'`, `PrintConv => '$val =~ tr/ /./;
+    $val'` (`GPS.pm:59-62`) but NO `Format =>` directive, so ExifTool reads it
+    with the on-disk format. For `undef[4]` `02 03 00 00`, `ReadValue` returns
+    the raw 4 bytes; the PrintConv `tr/ /./` is a no-op (no space bytes); the
+    JSON writer's `EscapeJSON` strips ALL NULs (`exiftool:3819` `tr/\0//d`) and
+    `\u`-escapes the rest:
+      -j -> "\u0002\u0003"   (the 2 non-NUL bytes, NOT "2.3.0.0")
+      -n -> "\u0002\u0003"   (same — no spaces to dot, identical to -j)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    The dotted `2.3.0.0` form ONLY appears for the correct `int8u[4]`/`int8s[4]`
+    on-disk shape (the space-joined `2 3 0 0` -> `tr/ /./`), exercised by the
+    active GPS fixtures. Pre-fix exifast's `GpsConv::VersionId` arm rendered only
+    `RawValue::U64`; an `undef` value fell to `emit_raw` -> the binary
+    `write_bytes` placeholder. Big-endian (MM).
+
+    Layout: MM header, IFD0 (GPSInfo pointer), GPS IFD (GPSVersionID undef[4],
+    inline)."""
+    bo = '>'  # MM / big-endian TIFF
+    out = bytearray()
+    out += b'MM' + struct.pack(bo + 'H', 0x002a) + struct.pack(bo + 'I', 8)
+    ifd0_off = 8
+    ifd0_len = 2 + 1 * 12 + 4
+    gps_off = ifd0_off + ifd0_len
+    # IFD0: GPSInfo pointer only.
+    out += struct.pack(bo + 'H', 1)
+    out += _raw_entry(bo, 0x8825, LONG, 1, gps_off)     # GPSInfo -> GPS IFD
+    out += struct.pack(bo + 'I', 0)
+    # GPS IFD: GPSVersionID as undef[4] (format code 7) = bytes 02 03 00 00
+    # inline (<= 4 bytes packed into the value word).
+    out += struct.pack(bo + 'H', 1)
+    out += struct.pack(bo + 'HHI', 0x0000, UNDEF, 4) + bytes([2, 3, 0, 0])
+    out += struct.pack(bo + 'I', 0)
+    return bytes(out)
+
+
+def make_exif_filesource_sigma_tif():
+    r"""#399 item 2 — `FileSource` (0xa300) carrying the literal Sigma 4-byte
+    value `\x03\x00\x00\x00`, pinning the dedicated PrintConv key
+    `"\3\0\0\0" => 'Sigma Digital Camera'` (`Exif.pm:2820`).
+
+    FileSource is `Writable => 'undef'` with a HASH PrintConv whose keys are the
+    integer codes 1/2/3 (`Exif.pm:2816-2818`) PLUS the literal 4-byte string the
+    comment notes "handle the case where Sigma incorrectly gives this tag a count
+    of 4". A normal single byte `\x03` hits the `undef[1] -> int8u` carve-out
+    (`Exif.pm:6682`) and matches the integer key 3 -> "Digital Camera"; only the
+    4-byte form matches the string key:
+      -j -> "Sigma Digital Camera"
+      -n -> "\u0003"   (the post-ReadValue raw bytes 03 00 00 00, EscapeJSON
+                        `tr/\0//d`-stripped of NULs -> the single 0x03 byte)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Pre-fix exifast's `Conv::IntLabel` handled only the single-byte int8u code;
+    the 4-byte `RawValue::Bytes` fell to `emit_raw` -> the binary `write_bytes`
+    placeholder. Big-endian (MM)."""
+    bo = '>'
+    # undef[4] = 03 00 00 00 (the literal Sigma key), inline (4 bytes).
+    return _exififd_tif(bo, [(0xa300, UNDEF, 4, bytes([3, 0, 0, 0]))])
+
+
 if __name__ == '__main__':
     out_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
     with open(f'{out_dir}/Exif.tif', 'wb') as f:
@@ -1894,6 +2010,14 @@ if __name__ == '__main__':
         f.write(make_exif_composite_exposure_single_fraction_tif())
     with open(f'{out_dir}/Exif_ambient_wrongfmt.tif', 'wb') as f:
         f.write(make_exif_ambient_wrongfmt_tif())
+    with open(f'{out_dir}/Exif_componentsconfig_wrongfmt.tif', 'wb') as f:
+        f.write(make_exif_componentsconfig_wrongfmt_tif())
+    with open(f'{out_dir}/Exif_componentsconfig_wrongfmt_err.tif', 'wb') as f:
+        f.write(make_exif_componentsconfig_wrongfmt_err_tif())
+    with open(f'{out_dir}/Exif_gps_versionid_undef.tif', 'wb') as f:
+        f.write(make_exif_gps_versionid_undef_tif())
+    with open(f'{out_dir}/Exif_filesource_sigma.tif', 'wb') as f:
+        f.write(make_exif_filesource_sigma_tif())
     with open(f'{out_dir}/JPEG_unknown_header.jpg', 'wb') as f:
         f.write(make_jpeg_unknown_header())
     print(f'wrote {out_dir}/Exif.tif, {out_dir}/ExifGPS.tif, '

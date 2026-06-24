@@ -112,28 +112,44 @@ use exifast::{
 /// typed-serde path — and is exercised both here and, byte-exact incl.
 /// `MetaFormat`, by `tests/timed_metadata_conformance.rs`.)
 const NOT_ACTIVE: &[&str] = &[
-  // #342/#336: the 3 real-device fixtures (Parrot Anafi mett, Viofo A119 LigoGPS,
-  // MISB KLV M2TS) ship full bundled goldens + #[ignore]'d conformance tests, but
-  // exifast does not yet emit the full tag set (the parsers need completion — #122
-  // Parrot, #138 LigoGPS, #130 MISB). Accept-deferred here until activated; #342
-  // added them but missed this NOT_ACTIVE entry, leaving main red on the
-  // auto-discovered active-fixture parity check.
-  "MP4_parrot_anafi.mp4",
-  "MP4_viofo_a119_gps.mp4",
-  "MPEG2_TS_misb_klv.ts",
-  // #318/#311: the 6 Pentax body fixtures (k1/k3/k5_ii/k70/kp/ks2) carry full
-  // bundled goldens for the #173 MakerNote conditional branches, but their
-  // conformance tests are #[ignore]d (aspirational) — exifast's Pentax port does
-  // not yet emit the full ~245-tag MakerNote set bundled does (it emits ~118),
-  // so they are NOT byte-exact-active. Accept-deferred here until the Pentax port
-  // is extended (see #311). #318 added them but missed this NOT_ACTIVE entry,
-  // leaving main red on the auto-discovered active-fixture parity check.
-  "JPEG_pentax_k1.jpg",
-  "JPEG_pentax_k3.jpg",
-  "JPEG_pentax_k5_ii.jpg",
-  "JPEG_pentax_k70.jpg",
-  "JPEG_pentax_kp.jpg",
-  "JPEG_pentax_ks2.jpg",
+  // (#345/#211 `QuickTime_gopro_hero6_gpmf.mp4` was here too but is now ACTIVE:
+  // its three goldens are regenerated conventioned via the
+  // `gen_golden.sh QuickTime_gopro_hero6_gpmf.mp4` arm and exifast emits the
+  // full real `gpmd` timed-GPS/sensor `Doc<N>` block — Accelerometer/Gyroscope
+  // binary placeholders, the camera-vision streams FaceNumbers/FaceDetected/
+  // ISOSpeeds/ExposureTimes/ColorTemperatures/WhiteBalanceRGB/CameraTemperature,
+  // the GPS5 scalars, and the Track5 `fdsc` identity — byte-exact vs bundled
+  // ExifTool 13.59. The base `.json`/`.n.json` are byte-exact in
+  // `conformance.rs::quicktime_gopro_hero6_gpmf_conformance`; the `-ee` `.ee.json`
+  // in `timed_metadata_conformance.rs::gopro_hero6_gpmd_ee_byte_exact`.)
+  // (#122 `MP4_parrot_anafi.mp4` (Parrot Anafi drone) was here too but is now
+  // ACTIVE: its `mett` metadata track carries no per-sample timed telemetry that
+  // bundled 13.59 surfaces (`-ee` == base), so the conventioned base goldens —
+  // which exclude the unported subsystems by name (the QuickTime-embedded XMP
+  // packet, the `udta/meta`(`mdir`) ItemList/`ilst` atoms + `HandlerVendorID`,
+  // the `meta`(`mdta`) Keys, `AudioKeys:Balance`, the `UserData:LocationInformation`
+  // struct, and the GPSCoordinates-derived `Composite:GPS*`; see the
+  // `tools/gen_golden.sh` arm) — are byte-exact, see
+  // `conformance.rs::mp4_parrot_anafi_conformance`.)
+  // (#138 `MP4_viofo_a119_gps.mp4` was here too but is now ACTIVE — the #348
+  // dual-`hdlr` per-track Handler dedup landed, so its no-`ee` `.json`/`.n.json`
+  // are byte-exact, see `conformance.rs::mp4_viofo_a119_gps_conformance`.)
+  // (#130 MISB KLV M2TS was here too but is now ACTIVE: this fixture's PMT
+  // declares only a type-0x1b H.264 stream — no type-0x15 packetized-metadata
+  // PID — and the file carries no SMPTE/MISB universal label, so bundled
+  // ExifTool 13.59 decodes no MISB tags and exifast already matches it byte-exact.)
+  // (#318/#311 FOUR of the five additional Pentax body fixtures (k1/k3/k5_ii/kp)
+  // were here too but are now ACTIVE: the #379 body-agnostic sub-tables
+  // (model-gated by `is_k3_mark_iii`/`is_af_points_in_focus_excluded`/
+  // `is_body_voltage`/…) decode them byte-exact vs bundled 13.59 — the full Pentax
+  // tag set proven on `JPEG_pentax_ks2.jpg`, across the per-body MakerNote variant
+  // branches and both byte orders (k1/k3/kp/k70 little-endian; k5_ii BIG-endian),
+  // see `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,kp,k70}_conformance`. Their
+  // goldens drop the same cross-cutting deferred subsystems as KS-2 minus the
+  // body-absent `Composite:DateTimeCreated`, PLUS only unimplemented `Pentax:*`
+  // leaves, see `FIXTURE_EXCLUDED_KEYS`. The FIFTH body — `JPEG_pentax_k70.jpg` —
+  // activated on #380 (the `1/60` `rational64u` ExposureTime now rounds via
+  // `RoundFloat($num/$den, 10)`, so its core EXIF/Composite values match bundled).)
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
@@ -164,25 +180,32 @@ const NOT_ACTIVE: &[&str] = &[
   "QuickTime_insta360_real.insv",
   // The #285 round-2 real-device fixtures (#109/#92/#100) — dropped with
   // goldens + #[ignore]d conformance tests pending their ports (DJI MakerNote/
-  // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect, the
-  // Rove dashcam GPS). Their no-ee .json carries tags exifast does not yet emit,
-  // so accept-deferred here until each port lands (then they move to active).
+  // MPF/JFIF thermal for the M3T RJPEG, XMP-GPano for the Insta360 equirect).
+  // Their no-ee .json carries tags exifast does not yet emit, so accept-deferred
+  // here until each port lands (then they move to active).
   // `DJI_Matrice30T.jpg` (#114) is now ACTIVE — the JFIF/MPF/DJI-thermal port
   // landed (`src/exif/jpeg_app.rs`), byte-exact at both `-j`/`-n` (see
   // `tests/conformance.rs::dji_matrice30t_conformance`).
+  // (#100 `QuickTime_rove_r2_4k.MP4` was here too but is now ACTIVE — the #348
+  // dual-`hdlr` per-track Handler dedup + the `©fmt`/`©inf` UserData atoms landed,
+  // so its no-`ee` `.json`/`.n.json` are byte-exact, see
+  // `conformance.rs::quicktime_rove_r2_4k_conformance`.)
   "DJI_M3T_thermal.RJPEG",
   "Insta360ONE_equirectangular.jpg",
-  "QuickTime_rove_r2_4k.MP4",
-  // The BlackVue DR770X (#213) dashcam fixture — dropped with goldens +
-  // #[ignore]d conformance test pending its port (BlackVue GPS/accelerometer/
-  // embedded-JSON). Its no-ee .json carries tags exifast does not yet emit, so
-  // accept-deferred here.
+  // (`MP4_blackvue_dr770x.mp4` (#362/#213) is now ACTIVE — the BlackVue DR770X
+  // PittaSoft port landed: the top-level `free`/`%QuickTime::Pittasoft`
+  // SubDirectory (Copyright/StartTime/OriginalFileName + PreviewImage/GPSLog
+  // binary placeholders + the no-`ee` first-record TimeCode/Accelerometer from
+  // `3gf `) and the audio `chan` `%QuickTime::ChannelLayout` (LayoutFlags/
+  // AudioChannelTypes/NumChannelDescriptions). Its no-`ee` `.json`/`.n.json` are
+  // byte-exact (the ported Composites kept; `System:all` excluded), see
+  // `conformance.rs::mp4_blackvue_dr770x_conformance`. No `.ee.*` golden — `-ee`
+  // surfaces no timed metadata for this file.)
   // (`MPEG2_TS_pruveeo_d90.ts` (#138/#129) is now ACTIVE — the M2TS LIGOGPSINFO
   // dashcam timed-GPS port landed: its no-`ee` `.json`/`.n.json` are byte-exact
   // (M2TS/H264 only; Composite-excluded per the QuickTime/MPEG precedent) and
   // the `-ee` LIGO GPS is pinned in
   // `tests/timed_metadata_conformance.rs::pruveeo_d90_ligogps_ee_byte_exact`.)
-  "MP4_blackvue_dr770x.mp4",
   // `CanonRaw_ctmd.cr3` (the REAL minimal CRX still-RAW, #81 phase 2) — the
   // Canon CTMD `Priority => 0` dedup fix (the `ExposureInfo` `FNumber 3.5` /
   // `ExposureTime 1/80` win over the `ShotInfo` `Priority => 0` re-dispatch) is
@@ -194,7 +217,271 @@ const NOT_ACTIVE: &[&str] = &[
   // emits only the structural moov/track scalars + the `Track1:Warning`
   // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
   "CanonRaw_ctmd.cr3",
+  // `DNG_preview_image.dng` (#352/#353) — the #331-P2 PreviewImage fixture set's
+  // DNG member. Its IFD0→SubIFD (0x014a) carries `SubfileType=1` + StripOffsets/
+  // StripByteCounts; the P2 PreviewImage gating is CORRECT (the DNG must — and
+  // does — emit NO PreviewImage, since 0x0111 takes the plain `StripOffsets` arm,
+  // `Exif.pm:639-653`). But exifast does not yet WALK the classic-TIFF `SubIFD`
+  // pointer, so it cannot emit the SubIFD's
+  // SubfileType/ImageWidth/ImageHeight/StripOffsets/StripByteCounts and the full
+  // `-G1` golden is not byte-exact. Accept-deferred to #352 (the SubIFD walk);
+  // the CR2 + ARW members of this set ARE active (the IFD0:PreviewImage proof).
+  "DNG_preview_image.dng",
+  // (The two Pentax PEF fixtures #393/#401 — K-3 Mark III + *ist D — are now
+  // ACTIVE: #393 ported their MakerNote variants byte-exact, so they moved out of
+  // NOT_ACTIVE into the active set with per-fixture FIXTURE_EXCLUDED_KEYS for the
+  // non-MakerNote residuals.)
 ];
+
+/// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
+/// dependent subsystem is deferred — the tag is dropped from BOTH the
+/// typed-serde/writer output AND the golden (the golden keeps the matching `-x`
+/// in `tools/gen_golden.sh`, exifast emits a diverging value, so a golden-only
+/// `-x` would leave exifast's extra). Mirrors `conformance.rs::check_excluding`
+/// + `timed_metadata_conformance.rs::drop_keys`. Each entry is
+/// `(fixture, &[FULLY-QUALIFIED "Family1:Name" keys])`.
+///
+/// - `MP4_parrot_anafi.mp4` (#361): exifast emits the XMP-derived
+///   `Composite:GPSAltitude` (byte-exact vs bundled for an XMP-only file), but
+///   bundled's anafi `Composite:GPS*` come from the unported
+///   `%QuickTime::Composite` `GPSCoordinates`/`LocationInformation` tables
+///   (QuickTime.pm:8668-8728) which OVERRIDE the XMP one — the same port-wide
+///   GPS-composite deferral the GoPro/SP2 arms carry. So the seven exact
+///   `Composite:GPS*` keys are dropped here while that table is unported (every
+///   other anafi tag — the 33 newly-decoded XMP/ItemList/Keys/AudioKeys/
+///   LocationInformation/HandlerVendorID tags included — is byte-exact). The
+///   distinct `XMP-exif:GPS*` tags are NOT excluded (exact-key matching, not a
+///   `:tail` suffix), so the embedded-XMP GPS byte-exactness is verified here.
+/// - `MP4_movie_keys.mov` (#361 R7): the crafted movie-level `keys` fixture's
+///   `\xa9xyz` ⇒ `Keys:GPSCoordinates` seeds the unported `%QuickTime::Composite`
+///   table (QuickTime.pm:8668) that bundled uses to synthesize
+///   `Composite:GPSLatitude`/`Longitude`/`GPSPosition` — the same port-wide GPS-
+///   composite deferral. exifast emits none, so those three are dropped here
+///   (every Keys/ItemList/UserData tag + the ported ImageSize/Megapixels/
+///   AvgBitrate/Rotation Composites stay byte-exact).
+const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
+  (
+    "MP4_parrot_anafi.mp4",
+    &[
+      "Composite:GPSAltitude",
+      "Composite:GPSAltitudeRef",
+      "Composite:GPSLatitude",
+      "Composite:GPSLatitudeRef",
+      "Composite:GPSLongitude",
+      "Composite:GPSLongitudeRef",
+      "Composite:GPSPosition",
+    ],
+  ),
+  (
+    "MP4_movie_keys.mov",
+    &[
+      "Composite:GPSLatitude",
+      "Composite:GPSLongitude",
+      "Composite:GPSPosition",
+    ],
+  ),
+  // #311 — the K-S2. #381 ported the four cross-cutting Composites/IFD
+  // (`Composite:Flash`/`LensID`/`DateTimeCreated` + `PrintIM:PrintIMVersion`) —
+  // now emitted byte-exact, so they are NO LONGER excluded. The sole remaining
+  // deferral is the `tiff:YCbCrSubSampling` `RawJoin`. Mirrors `conformance.rs::
+  // jpeg_pentax_ks2_conformance`. The golden keeps the faithful 13.59 dump.
+  ("JPEG_pentax_ks2.jpg", &["XMP-tiff:YCbCrSubSampling"]),
+  // #311/#318 — the 5 additional Pentax body fixtures. #311 ported the per-body
+  // multi-model Main conditional branches: the `/(K-1|645Z)\b/` + `/(K-3|KP)\b/`
+  // AFPointSelected (0x000e) model point-hashes, the count-2 ExposureCompensation
+  // (0x0016), the `%Pentax::BatteryInfo` BodyBatteryVoltage3/4 (K-5 II), and the
+  // `%Pentax::AFPointInfo` (0x0245) subdir (NumAFPoints + AFPointsInFocus/Selected/
+  // Special via `DecodeAFPoints`) — all now emitted byte-exact, no longer excluded.
+  // The remaining exclusions are `XMP-tiff:YCbCrSubSampling` PLUS the NON-#311
+  // per-body `Pentax:*` residuals the port does not yet emit (Contrast* /
+  // ISOAutoMinSpeed / ShutterType / SkinToneCorrection Main leaves; the `0x0243
+  // PixelShiftInfo`, `0x03ff TempInfo` and K-5-II `$count`/offset SubDirectory
+  // variants) — deferred, NOT mis-decoded (exifast emits nothing, the golden keeps
+  // the bundled value). These lists MIRROR EXACTLY the per-fixture `*_DEFERRED`
+  // consts in `conformance.rs::jpeg_pentax_{k1,k3,k5_ii,k70,kp}_conformance` (see
+  // the detailed rationale there).
+  (
+    "JPEG_pentax_k1.jpg",
+    &[
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:PixelShiftResolution",
+      "Pentax:ShutterType",
+      "Pentax:SkinToneCorrection",
+    ],
+  ),
+  (
+    "JPEG_pentax_k3.jpg",
+    &[
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:SensorTemperature",
+      "Pentax:SensorTemperature2",
+    ],
+  ),
+  (
+    "JPEG_pentax_k5_ii.jpg",
+    &[
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:CameraOrientation",
+      "Pentax:CameraTemperature4",
+      "Pentax:CameraTemperature5",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:FocusRangeIndex",
+      "Pentax:ISOAuto",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:LensFocalLength",
+      "Pentax:LevelIndicator",
+      "Pentax:LinkAEToAFPoint",
+      "Pentax:MaxAperture",
+      "Pentax:MinFocusDistance",
+      "Pentax:NominalMaxAperture",
+      "Pentax:NominalMinAperture",
+      "Pentax:PreviewImageStart",
+      "Pentax:SensitivitySteps",
+      "Pentax:SensorSize",
+      "Pentax:SensorTemperature",
+      "Pentax:SensorTemperature2",
+      "Pentax:WB_RGGBLevelsCloudy",
+      "Pentax:WB_RGGBLevelsDaylight",
+      "Pentax:WB_RGGBLevelsFlash",
+      "Pentax:WB_RGGBLevelsFluorescentD",
+      "Pentax:WB_RGGBLevelsFluorescentL",
+      "Pentax:WB_RGGBLevelsFluorescentN",
+      "Pentax:WB_RGGBLevelsFluorescentW",
+      "Pentax:WB_RGGBLevelsShade",
+      "Pentax:WB_RGGBLevelsTungsten",
+      "Pentax:WB_RGGBLevelsUserSelected",
+    ],
+  ),
+  // `JPEG_pentax_k70.jpg` (#311/#318) — ACTIVATED by #380. The CORE
+  // `ExifIFD:ExposureTime` / `Composite:ShutterSpeed` / `Composite:LightValue`
+  // now match bundled byte-exact (`Conv::ExposureTime` rounds the `1/60`
+  // `rational64u` quotient via `RoundFloat($num/$den, 10)`, exactly as ExifTool's
+  // `GetRational64u` reader), so they are NO LONGER excluded — only unimplemented
+  // Pentax leaves remain (mirrors `conformance.rs::K70_DEFERRED`).
+  (
+    "JPEG_pentax_k70.jpg",
+    &[
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:PixelShiftResolution",
+      "Pentax:ShutterType",
+      "Pentax:SkinToneCorrection",
+    ],
+  ),
+  (
+    "JPEG_pentax_kp.jpg",
+    &[
+      "XMP-tiff:YCbCrSubSampling",
+      "Pentax:ContrastHighlight",
+      "Pentax:ContrastHighlightShadowAdj",
+      "Pentax:ContrastShadow",
+      "Pentax:ISOAutoMinSpeed",
+      "Pentax:PixelShiftResolution",
+      "Pentax:ShutterType",
+      "Pentax:SkinToneCorrection",
+    ],
+  ),
+  // #393 — the K-3 Mark III PEF. The K-3III MakerNote variants are ported
+  // byte-exact; the residuals are the NON-MakerNote container tags (the unported
+  // `ExifIFD:CFAPattern`; the PEF IFD2 JpgFromRaw raw-image chain — bundled
+  // `IFD2:JpgFromRaw*` vs the port's `IFD2:ThumbnailOffset/Length` +
+  // `ExifTool:Warning`, dropped from both; the deferred `Pentax:PreviewImage`/
+  // `PreviewImageStart` IsOffset binary). MIRRORS `conformance.rs::
+  // pef_pentax_k3_mark_iii_conformance`'s `K3III_PEF_DEFERRED`.
+  (
+    "PEF_pentax_k3_mark_iii.pef",
+    &[
+      "ExifIFD:CFAPattern",
+      "IFD2:JpgFromRaw",
+      "IFD2:JpgFromRawStart",
+      "IFD2:JpgFromRawLength",
+      "IFD2:ThumbnailOffset",
+      "IFD2:ThumbnailLength",
+      "ExifTool:Warning",
+      "Pentax:PreviewImage",
+      "Pentax:PreviewImageStart",
+    ],
+  ),
+  // #393 — the *ist D PEF. The OLD-format MakerNote is ported byte-exact; the
+  // residuals are `Composite:LensID` (the camera Composite subsystem, deferred
+  // port-wide), the unported `ExifIFD:CFAPattern`, and the
+  // `Pentax:PreviewImage`/`PreviewImageStart`/`ToneCurve` IsOffset/binary leaves.
+  // MIRRORS `conformance.rs::pef_pentax_istd_conformance`'s `ISTD_PEF_DEFERRED`.
+  (
+    "PEF_pentax_istd.pef",
+    &[
+      "Composite:LensID",
+      "ExifIFD:CFAPattern",
+      "Pentax:PreviewImage",
+      "Pentax:PreviewImageStart",
+      "Pentax:ToneCurve",
+    ],
+  ),
+  // #205 — the PNG raw-profile-XMP diagnostics walk-order fixture. The invalid
+  // `eXIf` chunk (whose body is neither `II`/`MM`/`\0`) makes bundled emit a
+  // `PNG:eXIf = (Binary data 17 bytes, …)` placeholder the PNG port suppresses
+  // (the pre-existing eXIf-suppression deferral — exifast decodes EXIF blocks,
+  // not the raw-chunk binary placeholder). Dropped from BOTH sides; the document
+  // FIRST-`ExifTool:Warning` ORDER (the earlier XMP `XMP is double UTF-encoded`,
+  // not the later `Invalid eXIf chunk`) is what this fixture pins. Mirrors
+  // `conformance.rs::png_rawprofile_xmp_conformance`'s `check_excluding`.
+  ("PNG_rawprofile_xmp_warnorder.png", &["PNG:eXIf"]),
+  // #180 — the post-`IEND` Trailer family-1 group fixture. The trailer `iCCP`
+  // chunk's corrupt zlib stream makes bundled emit a deferred `Trailer:ICC_Profile
+  // = (Binary data 1 bytes, …)` placeholder (the still-compressed body) that the
+  // PNG port suppresses (no ICC_Profile sub-port). Dropped from BOTH sides; the
+  // group-scoped `Trailer:Warning = Error inflating iCCP` (the #180 fix) and the
+  // `Trailer:ProfileName` are what this fixture pins. Mirrors
+  // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
+  ("PNG_trailer_iccp_warn.png", &["Trailer:ICC_Profile"]),
+  // #178-item1 — the nested-zXIf inner-inflate fixture. The doubly-compressed
+  // `zxIf` makes bundled emit a `PNG:zxIf = <err>` placeholder the PNG port
+  // suppresses (the pre-existing eXIf/zxIf-suppression deferral). Dropped from
+  // BOTH sides; the `Error inflating zxIf` warning text (the #178-item1 fix, vs
+  // the prior `Invalid zxIf chunk`) is what this fixture pins. Mirrors
+  // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
+  ("PNG_nested_zxif.png", &["PNG:zxIf"]),
+];
+
+/// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
+/// none).
+fn excluded_keys_for(fixture: &str) -> &'static [&'static str] {
+  FIXTURE_EXCLUDED_KEYS
+    .iter()
+    .find(|(f, _)| *f == fixture)
+    .map_or(&[], |(_, keys)| *keys)
+}
+
+/// Strip a set of FULLY-QUALIFIED keys (exact `Family1:Name`) from every object
+/// in a `-j -G1`/`-n` JSON document. A no-op when `exact_keys` is empty.
+/// Matching is EXACT (not an `:tail` suffix) so excluding
+/// `Composite:GPSAltitude` does NOT also strip the distinct `XMP-exif:GPSAltitude`.
+fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
+  if exact_keys.is_empty() {
+    return doc.to_string();
+  }
+  let mut v: serde_json::Value = serde_json::from_str(doc).expect("valid JSON document");
+  if let Some(arr) = v.as_array_mut() {
+    for el in arr {
+      if let Some(obj) = el.as_object_mut() {
+        obj.retain(|k, _| !exact_keys.iter().any(|t| k == t));
+      }
+    }
+  }
+  serde_json::to_string(&v).expect("re-serialize document")
+}
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
 /// with paired `.json` + `.n.json` goldens, minus [`NOT_ACTIVE`]). Bumped per
@@ -823,7 +1110,248 @@ const NOT_ACTIVE: &[&str] = &[
 /// `gpmd`-handler `.mov`s (no-`ee` `.json`/`.n.json` = structural scalars + the
 /// `[minor]` EEWarn, byte-exact); the `-ee` group behavior is pinned in
 /// `tests/timed_metadata_conformance.rs`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 556;
+/// 557 → 558 after `SamsungNX1.srw` (#210) activated — the REAL Samsung NX1 raw
+/// whose goldens are regenerated conventioned (System tags dropped) via the
+/// `gen_golden.sh SamsungNX1.srw` arm (the SAME SubIFD/SubIFD1 + MakerNote-
+/// Composite exclusions as the NX500 arm). exifast emits its full Type2 surface
+/// — all 45 `Samsung:*` leaves (incl. the 16 decrypted #242 Crypt rows), the
+/// 8-tag PreviewIFD, and the 8 ported EXIF+lens Composites — byte-exact vs
+/// bundled in BOTH `.json` and `.n.json`. The Type2 port (#210 leaf + #242
+/// PreviewIFD/Crypt) needed NO gap-closing: the NX1 shares the identical 45-tag
+/// table with the already-active NX500 (different camera/lens/firmware values,
+/// e.g. `LensType` = "Samsung NX 16-50mm F2-2.8 S ED OIS", a populated
+/// `CameraTemperature` = "0.7513126037 C").
+/// 558 → 560 after the #331-P2 PreviewImage fixtures (#352/#353):
+/// `CR2_preview_image.cr2` (IFD0 0x0111/0x0117 → `IFD0:PreviewImage` for a CR2)
+/// and `ARW_preview_image.arw` (IFD0 0x0201/0x0202 → `IFD0:PreviewImage` for an
+/// ARW) both activate byte-exact — the IFD0:PreviewImage proof of the `DataTag`
+/// P2 wiring. The set's `DNG_preview_image.dng` is NOT_ACTIVE (its SubIFD walk is
+/// deferred to #352), so the bump is +2 (not +3).
+///
+/// 560 → 562 after `MP4_viofo_a119_gps.mp4` (#138) + `QuickTime_rove_r2_4k.MP4`
+/// (#100) activated — the #348 dual-`hdlr` per-track Handler dedup (the FINAL
+/// `trak`'s `minf/hdlr` data handler owns the bare `Track<N>:Handler*` key,
+/// every earlier `trak` keeps its `mdia/hdlr` media handler; the MP4→M4A
+/// FileType decision keys on the file-global `HasHandler` set) makes both dashcam
+/// MP4s' no-`ee` `.json`/`.n.json` byte-exact; rove also needed the `©fmt`/`©inf`
+/// (Format/Information) conv-less `udta` atoms (NOVATEK chipset).
+///
+/// 562 → 563 after `QuickTime_gopro_hero6_gpmf.mp4` (#211) activated — its raw
+/// 13.55 goldens are regenerated conventioned (`-G1 -x System:all`, the
+/// `Composite:GPS*` drops) and exifast's `gpmd`/`fdsc` GPMF emission (the typed
+/// `GoProTag` surface + generic-tag table) matches the full real timed block
+/// byte-exact, the same emission path the active hero8 fixture already exercises.
+///
+/// 563 → 564 after `MP4_parrot_anafi.mp4` (#122) activated — its raw 13.55
+/// goldens are regenerated conventioned (the `tools/gen_golden.sh` arm dropping
+/// the unported XMP/ItemList(+`HandlerVendorID`)/Keys/AudioKeys/
+/// `UserData:LocationInformation`/`Composite:GPS*` subsystems by name) and
+/// exifast's QuickTime/Track structure + `udta` Parrot `Make`/`Model` + ported
+/// ImageSize/Megapixels/AvgBitrate/Rotation Composites match the residual
+/// byte-exact. The `mett` metadata track surfaces no per-sample timed telemetry
+/// in bundled 13.59 (`-ee` == base), so there is no `.ee.*` golden.
+///
+/// 564 → 565 after `MP4_audiokeys_mute.mp4` (#361 R4) activated — a crafted
+/// audio-only MP4 pinning the `%QuickTime::AudioKeys` resolution (`Mute`'s int8u
+/// `Off`/`On` PrintConv + the unknown-key DERIVE path for `Make`/`Creationdate`/
+/// `AcmeTotallyBogusZzz`); byte-exact at both `-j` and `-n` (only `System:all`
+/// excluded — the ported `Composite:AvgBitrate` is verified). (`MP4_audiokeys_mute.mp4`
+/// is later EXTENDED in place by #361 R7 with two raw-`0xA9` ItemList ids — no
+/// new fixture, the count is unchanged by that extension.)
+///
+/// 565 → 566 after `MP4_movie_keys.mov` (#361 R7) activated — a crafted
+/// movie-level `moov/meta`(`mdta`) `keys` fixture pinning the GENERIC
+/// `%QuickTime::Keys` ProcessKeys order: the unknown-key DERIVE
+/// (`Keys:AcmeTotallyBogusZzz` — the movie-level [high] fix) plus the raw-`0xA9`
+/// cross-table (`Keys:ContentCreateDate` from `\xa9day`, `Keys:GPSCoordinates`
+/// from `\xa9xyz`) and `Keys:Make` (`manu` UserData). Byte-exact at `-j`/`-n`;
+/// the 3 `Composite:GPS*` are the unported `%QuickTime::Composite` deferral.
+///
+/// 566 → 567 after `MP4_blackvue_dr770x.mp4` (#362) activated — the REAL
+/// BlackVue DR770X dashcam (PittaSoft): the top-level `free`/`%QuickTime::
+/// Pittasoft` SubDirectory (Copyright/StartTime/OriginalFileName + the
+/// PreviewImage/GPSLog binary placeholders + the no-`ee` first-record
+/// TimeCode/Accelerometer from `3gf `) and the audio `chan` `%QuickTime::
+/// ChannelLayout` (LayoutFlags/AudioChannelTypes/NumChannelDescriptions),
+/// byte-exact at `-j`/`-n` with the no-`ee` `EEWarn`. The ported Composites are
+/// kept; `System:all` is the sole exclusion.
+///
+/// 567 → 573 after ALL FIVE additional Pentax body fixtures (#311/#318) activated
+/// — `JPEG_pentax_{k1,k3,k5_ii,kp,k70}.jpg`. The #379 body-agnostic Pentax
+/// sub-tables decode them byte-exact vs bundled 13.59 (the full set proven on
+/// `JPEG_pentax_ks2.jpg`), across the per-body MakerNote variant branches and both
+/// byte orders (k1/k3/kp/k70 little-endian; k5_ii BIG-endian). Each drops only the
+/// KS-2 cross-cutting deferrals (minus the body-absent `Composite:DateTimeCreated`)
+/// PLUS unimplemented `Pentax:*` leaves — NO core-EXIF values. The FIFTH body,
+/// `JPEG_pentax_k70.jpg`, activated on #380 (572 → 573): its non-clean `1/60`
+/// `rational64u` ExposureTime now rounds via `RoundFloat($num/$den, 10)` (exactly
+/// as ExifTool's `GetRational64u` reader), so the CORE `ExifIFD:ExposureTime` /
+/// `Composite:ShutterSpeed` / `Composite:LightValue` match bundled byte-exact.
+///
+/// 573 → 574 after `TIFF_jpgfromraw.tif` (#331-P2 / #352): the crafted
+/// SubIFD2:JpgFromRaw verifier. A minimal little-endian TIFF whose IFD0 0x014a
+/// SubIFD pointer carries THREE offsets (descended as `SubIFD`/`SubIFD1`/
+/// `SubIFD2` via the new classic-TIFF multi-offset SubIFD walk); SubIFD2's
+/// `SubfileType=1` + `Compression=7` + 0x0111/0x0117 resolve to
+/// `JpgFromRawStart`/`JpgFromRawLength` and drive the synthetic
+/// `SubIFD2:JpgFromRaw = (Binary data 4 bytes, …)` through the EXIF DataTag
+/// channel (`Exif.pm:673-684`/`:769-778`), byte-exact at `-j`/`-n` vs bundled
+/// 13.59. SubIFD0's plain `StripOffsets`/`StripByteCounts` (no Compression) emit
+/// NO DataTag — the SubIFD-context StripOffsets path P1 could not reach. The
+/// ported `Composite:ImageSize`/`Megapixels` are KEPT (TIFF is not a
+/// RAW-ImageSize subtype); `System:all` is the sole exclusion.
+///
+/// 574 → 575 after `BigTIFF_jpegpreview.btf`: the BigTIFF counterpart of the
+/// `TIFF_jpgfromraw.tif` verifier, pinning that a BigTIFF does NOT take the
+/// `PreviewImage`/`JpgFromRaw` arms. A crafted little-endian BigTIFF (version 43)
+/// whose IFD0 carries the SAME JPEG-preview shape (`SubfileType=1` +
+/// `Compression=7` + 0x0111/0x0117) keeps the DEFAULT `IFD0:StripOffsets`/
+/// `IFD0:StripByteCounts` arm — `ProcessBTF` `return 1`s before
+/// `$$self{TIFF_TYPE}` is set (`ExifTool.pm:8668`/`:8715`), so `TIFF_TYPE == ''`
+/// and the `/^(DNG|TIFF)$/` gate is false. Byte-exact at `-j`/`-n` vs bundled
+/// 13.59; no `Composite:*` (IFD0-only, no FNumber/ExposureTime).
+///
+/// 575 → 576 after `PNG_rawprofile_xmp_warnorder.png` (#205): a malformed `Raw
+/// profile type xmp` chunk (double-UTF packet → `XMP is double UTF-encoded`)
+/// positioned BEFORE a later bad `eXIf` (→ `Invalid eXIf chunk`). Pins that the
+/// PNG port now drains each document `ExifTool:Warning` at its chunk-walk
+/// position (the unified `PngMeta::diag_order` replay) so the EARLIER XMP
+/// warning wins first-occurrence — the typed-serde path matches the writer +
+/// golden (`PNG:eXIf` is the sole dropped key, the eXIf-suppression deferral).
+///
+/// 576 → 577 after `Exif_make_invalid_utf8.tif` (#200): a crafted big-endian
+/// TIFF whose IFD0 `Make` holds INVALID UTF-8 (`A` + valid `é` + `B` + `0xFF` +
+/// `C` + `0xFE` + `D`). Pins that the EXIF `string` decode applies ExifTool's
+/// `FixUTF8` (each invalid byte → `?`, NOT the U+FFFD `from_utf8_lossy` would
+/// emit); byte-exact at `-j`/`-n` vs bundled 13.59 (`"IFD0:Make": "AéB?C?D"`).
+///
+/// 577 → 579 after the #200 round-2 `ConvertExifText` fixtures
+/// (`Exif_usercomment_invalid_utf8.tif` +
+/// `Exif_gps_processingmethod_invalid_utf8.tif`): the R1 fix routed only the
+/// TIFF `string`/`utf8` decode through `FixUTF8`, leaving the `undef`-format
+/// EXIF-text path (`UserComment` 0x9286 / `GPSProcessingMethod` 0x001b, both
+/// via `exif::exiftext::convert_exif_text`) on `from_utf8_lossy` → U+FFFD.
+/// These crafted TIFFs pin that the `ConvertExifText` ASCII-prefix payload now
+/// applies `FixUTF8` too — bundled 13.59 `"ExifIFD:UserComment": "AéB?C?D"` /
+/// `"GPS:GPSProcessingMethod": "A?B?C"`, byte-exact at `-j`/`-n`.
+///
+/// 579 → 580 after `QuickTime_camm_2track_dupwarn.mov` (#215): two `camm` `trak`s
+/// whose lone samples EACH raise `Unknown camm record type 0`, pinning ExifTool's
+/// FILE-GLOBAL `WAS_WARNED` (`ExifTool.pm` `sub Warn`) — the same warning TEXT
+/// across the two tracks collapses to ONE `Track1:Warning "… [x2]"` (the first
+/// occurrence's group + the file-wide count), NOT one `Warning` per track. No
+/// GPS/per-sample payload at the default `-j`, so `Composite:AvgBitrate` is the
+/// sole synthesized Composite (KEPT); `System:all` is the sole exclusion.
+///
+/// 580 → 581 after `QuickTime_camm_2track_distinct_collision.mov` (#215-R1): the
+/// DISTINCT-then-repeat case — Track1 raises A ("Unknown camm record type 0") and
+/// B ("Truncated camm record 5"), Track2 repeats B. Pins that `WAS_WARNED` is set
+/// at WARN-TIME (file-global, INDEPENDENT of the per-track `-G1` `Warning` slot):
+/// B is recorded when Track1 raises it even though that track's slot already
+/// holds A, so Track2's B is a repeat (no spurious `Track2:Warning`). Like the
+/// dup-warn fixture, the default `-j` carries no per-sample payload, so
+/// `Composite:AvgBitrate` is the sole synthesized Composite; `System:all` the
+/// sole exclusion.
+///
+/// 581 → 583 (#201) adds two WRONG-on-disk-format `ComponentsConfiguration`
+/// (0x9101) fixtures. Unlike the 0xa462/0x9400 `$val` byte-walks, 0x9101 carries
+/// a `Format => 'int8u'` READ override (`Exif.pm:2298`) so ExifTool re-reads the
+/// raw value bytes as `int(size/1)` int8u ELEMENTS regardless of the declared
+/// format — the per-byte PrintConv sees the raw bytes one-per-element:
+///   * `Exif_componentsconfig_wrongfmt.tif` (`int16u[2]` `0x0102 0x0300` →
+///     on-disk bytes `01 02 03 00` → int8u re-read `1 2 3 0` → `-j`
+///     "Y, Cb, Cr, -" / `-n` "1 2 3 0"; the discriminating shape a
+///     `val_bytes()` walk would mis-render as "258 768");
+///   * `Exif_componentsconfig_wrongfmt_err.tif` (`int8u[4]` `7 99 0 1`, codes
+///     7/99 un-hashed → the `OTHER` sub's `"Err ($_)"` → `-j`
+///     "Err (7), Err (99), -, Y" / `-n` "7 99 0 1").
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 583 → 585 (#201 R2) adds two SHORT 0x9101 fixtures the four-byte values above
+/// do not exercise: under `-n` ExifTool emits the post-`ReadValue` raw SCALAR, so
+/// a SINGLETON is a BARE JSON number (the EscapeJSON number gate) while a COUNT>1
+/// value space-joins to a quoted string. (The pre-R2 `-n` arm unconditionally
+/// joined + `write_str`, emitting the singleton as the STRING "1".)
+///   * `Exif_componentsconfig_singleton.tif` (`int8u[1]` code `1` → `-j` "Y" /
+///     `-n` `1`, a bare number — the discriminating shape);
+///   * `Exif_componentsconfig_pair.tif` (`int8u[2]` codes `1 2` → `-j` "Y, Cb" /
+///     `-n` "1 2", the count==2 boundary — still a space-joined quoted string).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 585 → 587 (#180 + #178-item1, PNG crafted-input hardening) adds two minimal
+/// 1x1 malformed PNGs whose only variation is a decode-error edge (the default
+/// well-formed PNG path is unaffected):
+///   * `PNG_trailer_iccp_warn.png` — a post-`IEND` TRAILER `iCCP` chunk with a
+///     corrupt zlib stream: the `Error inflating iCCP` warning is raised under
+///     `$$et{SET_GROUP1} = 'Trailer'` (`PNG.pm:1484`) so it surfaces as the
+///     `Trailer:Warning` TAG (#180); the trailer-entry `Trailer data after PNG
+///     IEND chunk` stays the document `[minor] ExifTool:Warning`.
+///   * `PNG_nested_zxif.png` — a `zxIf` whose inflated buffer is itself a
+///     degenerate `\0`-typed (still "compressed") block: bundled re-enters
+///     `ProcessPNG_eXIf` and inflates AGAIN ⇒ `Error inflating zxIf` (the port
+///     bounded-recurses the inner inflate, #178-item1) rather than the prior
+///     `Invalid zxIf chunk`.
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 587 → 588 (#180 round 2, PNG TRAILER diagnostic re-scoping) adds one minimal
+/// 1x1 PNG with a post-`IEND` TRAILER `Raw profile type xmp` chunk:
+///   * `PNG_trailer_xmp_warn.png` — the trailing embedded-XMP sub-Meta's `XMP is
+///     double UTF-encoded` `$et->Warn` is re-scoped to the `Trailer` family-1
+///     group (`PNG.pm:1484`, mirroring the Warning arm) so it does NOT leak as a
+///     stray doc-level `ExifTool:Warning` (priority-0 first-wins then suppresses
+///     it behind the earlier `Trailer:Warning`), while the decoded
+///     `XMP-dc:Format` keeps its EXPLICIT `XMP-dc` family-1 group (NOT `Trailer`,
+///     the `$grps[1] or …` short-circuit). No dropped keys (a plain golden).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 588 → 590 (#393) activates the two real-device Pentax PEF raw fixtures whose
+/// `K-3 Mark III` / `*ist D` MakerNote variants are now ported byte-exact (the
+/// `%BatteryInfo`/`%AFInfo` K-3III re-layouts, `%AFInfoK3III` (0x040c),
+/// `%FaceInfoK3III` (0x040b), `%PixelShiftInfo` (0x0243), `%TempInfo` (0x03ff), the
+/// `%LensInfo`-old (*istD) → `%LensData`, `0x003c AFPointsInFocus`, and the
+/// per-body Main scalars). The conformance arms exclude only the non-MakerNote
+/// container residuals (CFAPattern / the PEF IFD2 JpgFromRaw chain / IsOffset
+/// binary previews), see `conformance.rs::pef_pentax_{k3_mark_iii,istd}_conformance`.
+///
+/// 590 → 592 (#399) adds two crafted wrong-format EXIF byte-conv fixtures, each a
+/// plain golden (no dropped keys):
+///   * `Exif_gps_versionid_undef.tif` — `GPSVersionID` (0x0000) as `undef[4]`
+///     `02 03 00 00`. ExifTool reads the on-disk format (GPSVersionID has no
+///     `Format =>` override), so the value is the NUL-stripped raw bytes
+///     ("\u0002\u0003"), NOT re-read as int8u and NOT the binary placeholder.
+///   * `Exif_filesource_sigma.tif` — `FileSource` (0xa300) as the literal Sigma
+///     `undef[4]` `03 00 00 00`, hitting the dedicated PrintConv string key
+///     `"\3\0\0\0" => 'Sigma Digital Camera'` (`Exif.pm:2820`).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 592 → 594 (#399 follow-up, Codex [medium]) adds two crafted NUL-split-UTF-8
+/// fixtures pinning ExifTool's `EscapeJSON` ORDER (NUL-delete `exiftool:3820`
+/// BEFORE `FixUTF8` `exiftool:3824`) on the raw-byte render paths, each a plain
+/// golden:
+///   * `Exif_gps_versionid_nulsplit.tif` — `GPSVersionID` (0x0000) `undef[4]`
+///     `C2 00 A9 00`: the NUL between `C2` and `A9` SPLITS a 2-byte sequence;
+///     NUL-strip-THEN-FixUTF8 reassembles `C2 A9` → "©" (bundled 13.59, both
+///     `-j`/`-n`), where the pre-fix FixUTF8-first order emitted "??".
+///   * `Exif_filesource_nulsplit.tif` — the same `C2 00 A9 00` on the non-Sigma
+///     multi-byte `FileSource` HASH-miss path → "Unknown (©)" / "©".
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 594 → 597 (#399 follow-up R2, Codex [medium]) adds three crafted NUL-split
+/// fixtures pinning the FULL `EscapeJSON` CLASSIFY order — the value is classified
+/// against the boolean/number gate AS-IS (the ORIGINAL, WITH NULs) BEFORE
+/// `tr/\0//d` (`exiftool:3805-3810` precede `:3820`), so a value whose NUL strip
+/// PRODUCES a number/boolean lexeme is still a QUOTED string. Each a plain golden:
+///   * `Exif_gps_versionid_nulnum.tif` — `GPSVersionID` (0x0000) `undef[4]`
+///     `31 00 32 00` (`"1\02\0"`): NUL-strip → `12`, but the NUL-bearing original
+///     fails the number gate ⇒ quoted `"12"` (NOT bare `12`), both `-j`/`-n`.
+///   * `Exif_gps_versionid_nulbool.tif` — `GPSVersionID` (0x0000) `undef[8]`
+///     `74 00 72 00 75 00 65 00` (`"t\0r\0u\0e\0"`): NUL-strip → `true`, but the
+///     NUL-bearing original fails the boolean gate ⇒ quoted `"true"` (NOT bare
+///     `true`), both `-j`/`-n`.
+///   * `Exif_filesource_nulnum.tif` — the same `31 00 32 00` on the `FileSource`
+///     HASH-miss path → "Unknown (12)" / quoted "12".
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 597;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -1971,9 +2499,15 @@ fn typed_serde_path_equals_writer_path_and_golden_all_337() {
     let golden_n = std::fs::read_to_string(format!("{root}/tests/golden/{fixture}.n.json"))
       .unwrap_or_else(|e| panic!("read golden {fixture}.n.json: {e}"));
 
+    // Tags whose value diverges from bundled under a deferred subsystem are
+    // dropped from BOTH sides (the golden keeps the matching `-x`); see
+    // [`FIXTURE_EXCLUDED_KEYS`]. Empty for the vast majority of fixtures.
+    let excluded = excluded_keys_for(fixture);
+
     for (mode, print_on, golden) in [("j", true, &golden_j), ("n", false, &golden_n)] {
-      let typed = typed_serde_document(fixture, &data, print_on);
-      let writer = extract_info(fixture, &data, print_on);
+      let typed = drop_keys(&typed_serde_document(fixture, &data, print_on), excluded);
+      let writer = drop_keys(&extract_info(fixture, &data, print_on), excluded);
+      let golden = drop_keys(golden, excluded);
 
       // typed serde == writer path.
       if let Err(e) = json_equivalent(&typed, &writer) {
@@ -1983,7 +2517,7 @@ fn typed_serde_path_equals_writer_path_and_golden_all_337() {
         ));
       }
       // typed serde == golden.
-      if let Err(e) = json_equivalent(&typed, golden) {
+      if let Err(e) = json_equivalent(&typed, &golden) {
         failures.push(format!(
           "[{mode}] {fixture}: typed-serde != golden: {}\n  typed:  {typed}\n  golden: {golden}",
           e.message()

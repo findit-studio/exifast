@@ -86,6 +86,15 @@ pub struct VendorEmission {
   /// overrides only when `(priority != 0) && (priority >= stored_priority)`
   /// (`ExifTool.pm:9544-9560`) — a `Priority => 0` vendor tag never overrides.
   priority: u8,
+  /// A per-emission family-1 group OVERRIDE — `None` ⇒ the emission inherits the
+  /// captured MakerNote's group1
+  /// ([`MakerNote::emission_group1`](crate::exif::MakerNote::emission_group1),
+  /// e.g. `Samsung`); `Some(g)` ⇒ the emission groups under `g`. For a
+  /// SubDirectory whose `GROUPS => { 1 => … }` differs from the parent table's:
+  /// the Samsung `0x0035 PreviewIFD` descent emits its `%Nikon::PreviewIFD`
+  /// leaves under `PreviewIFD` (`Nikon.pm:5389`) while the sibling Samsung leaves
+  /// stay under `Samsung` (#242). The family-0 group (`MakerNotes`) is unchanged.
+  group1_override: Option<&'static str>,
 }
 
 #[cfg(feature = "alloc")]
@@ -118,6 +127,29 @@ impl VendorEmission {
       value,
       unknown,
       priority,
+      group1_override: None,
+    }
+  }
+
+  /// Compose a vendor emission whose family-1 group is OVERRIDDEN to `group1`
+  /// (rather than inherited from the captured MakerNote's group1) — for a
+  /// SubDirectory whose `GROUPS => { 1 => … }` differs, like the Samsung
+  /// `0x0035 PreviewIFD` leaves grouping under `PreviewIFD` (#242). Default
+  /// `Priority => 1`; `Unknown` carried as given.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn new_with_group1(
+    name: smol_str::SmolStr,
+    value: crate::value::TagValue,
+    unknown: bool,
+    group1: &'static str,
+  ) -> Self {
+    Self {
+      name,
+      value,
+      unknown,
+      priority: 1,
+      group1_override: Some(group1),
     }
   }
 
@@ -154,6 +186,16 @@ impl VendorEmission {
   #[inline(always)]
   pub const fn priority(&self) -> u8 {
     self.priority
+  }
+
+  /// This emission's family-1 group OVERRIDE — `None` ⇒ inherit the captured
+  /// MakerNote's group1; `Some(g)` ⇒ emit under `g`. The Samsung
+  /// `0x0035 PreviewIFD` leaves carry `Some("PreviewIFD")` (#242); see
+  /// [`ExifMeta::push_maker_note_tags`](crate::exif).
+  #[must_use]
+  #[inline(always)]
+  pub const fn group1_override(&self) -> Option<&'static str> {
+    self.group1_override
   }
 }
 

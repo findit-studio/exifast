@@ -78,6 +78,14 @@
   "Samsung:ToneCurveAdobeRGBDefault": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
   "Samsung:ToneCurveSRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
   "Samsung:ToneCurveAdobeRGB": "11 0 16 32 64 128 256 512 1024 2048 3072 4095 0 7 14 28 52 90 140 190 230 245 255",
+  "PreviewIFD:SubfileType": "Full-resolution image",
+  "PreviewIFD:XResolution": 0.9837400966,
+  "PreviewIFD:YResolution": 20.89618535,
+  "PreviewIFD:ResolutionUnit": "inches",
+  "PreviewIFD:PreviewImageStart": 51018,
+  "PreviewIFD:PreviewImageLength": 66055,
+  "PreviewIFD:YCbCrPositioning": "Co-sited",
+  "PreviewIFD:PreviewImage": "(Binary data 66055 bytes, use -b option to extract)",
   "Composite:Aperture": 9.0,
   "Composite:ScaleFactor35efl": 1.5,
   "Composite:ShutterSpeed": "1/160",
@@ -85,5 +93,6 @@
   "Composite:FOV": "29.2 deg",
   "Composite:FocalLength35efl": "45.0 mm (35 mm equivalent: 69.0 mm)",
   "Composite:HyperfocalDistance": "11.48 m",
+  "Composite:LensID": "Samsung NX 45mm F1.8",
   "Composite:LightValue": 6.0
 }]

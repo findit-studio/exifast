@@ -59,10 +59,10 @@ use crate::{
     insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
   },
   metadata::{
-    AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DjiProtobufMeta,
-    GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta, Insta360Meta,
-    LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
-    SampleDescRoute, SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
+    AudioSampleDesc, Bitrate, CammMeta, CanonCtmdMeta, ColorRepresentation, DataReferenceHandler,
+    DjiProtobufMeta, GenMediaInfo, GoProConv, GoProMeta, GoProTag, GoProTagValue, GoProTimedMeta,
+    HandlerBox, Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
+    QuickTimeStreamMeta, SampleDescRoute, SonyRtmdMeta, TcMediaInfo, VisualSampleDesc,
   },
   value::{binary_placeholder, format_g},
 };
@@ -86,6 +86,16 @@ const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 /// (`quicktime_brands`) bound their independent `moov`/container descents at
 /// the SAME budget instead of inventing a second cap.
 pub(crate) const MAX_ATOM_DEPTH: u32 = 100;
+
+/// The 16-byte UUID that flags an XMP packet stored in a top-level `uuid` box —
+/// the canonical XMP-in-MP4 location (QuickTime.pm:155-163 `%QuickTime::Main`
+/// `uuid` Condition `$$valPt=~/^\xbe\x7a\xcf\xcb…/`, "this is where ExifTool
+/// writes XMP in MP4 videos as per the XMP spec"). The XMP packet bytes follow
+/// the 16-byte UUID; they are routed to the shared [`crate::formats::xmp`]
+/// parser exactly like a standalone `.xmp` sidecar.
+const XMP_UUID: [u8; 16] = [
+  0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac,
+];
 
 // ===========================================================================
 // SP2 supplementary conv-less camera-atom map (xtask `--kind quicktime`)
@@ -190,6 +200,13 @@ pub const QUICKTIME_USERDATA_CONVLESS_ALLOW: &[&str] = &[
   "CameraPitch",
   "CameraYaw",
   "CameraRoll",
+  // `©fmt` Format (QuickTime.pm:1630) / `©inf` Information (1633): bare `'Name'`
+  // international-text atoms (NOVATEK/Novatek-chipset dashcams write
+  // `Format = NOVATEK`, `Information = DEMO1` in `moov/udta`). No
+  // RawConv/ValueConv/PrintConv/Avoid ⇒ conv-less, emitted verbatim under
+  // `QuickTime:UserData`.
+  "Format",
+  "Information",
 ];
 
 /// The `xtask --kind quicktime` allowlist of `%QuickTime::Keys` atoms verified
@@ -1396,6 +1413,178 @@ fn text_font_value(v: u16, print_conv: bool) -> crate::value::TagValue {
   }
 }
 
+/// The `%QuickTime::ChannelLayout` `AudioChannelTypes` BITMASK labels
+/// (QuickTime.pm:7996-8019), in bit order, for `DecodeBits`. The PrintConv hash
+/// is `{ BITMASK => {...} }` (NO direct `0 =>` key), so a value of `0` renders
+/// `(none)` and each set bit `n` renders its label (or `[n]` for an unlabeled
+/// bit), joined with `", "`. Default 32-bit word (no `BitsPerWord`).
+const AUDIO_CHANNEL_TYPE_BITS: &[(u8, &str)] = &[
+  (0, "Left"),
+  (1, "Right"),
+  (2, "Center"),
+  (3, "LFEScreen"),
+  (4, "LeftSurround"),
+  (5, "RightSurround"),
+  (6, "LeftCenter"),
+  (7, "RightCenter"),
+  (8, "CenterSurround"),
+  (9, "LeftSurroundDirect"),
+  (10, "RightSurroundDirect"),
+  (11, "TopCenterSurround"),
+  (12, "VerticalHeightLeft"),
+  (13, "VerticalHeightCenter"),
+  (14, "VerticalHeightRight"),
+  (15, "TopBackLeft"),
+  (16, "TopBackCenter"),
+  (17, "TopBackRight"),
+];
+
+/// Render the `chan` `AudioChannelTypes` `int32u` for `print_conv`
+/// (QuickTime.pm:7996-8019): the `{ BITMASK => {...} }` PrintConv → `DecodeBits`
+/// (`(none)` for `0`, the `", "`-joined labels otherwise). The bare raw int
+/// rides at `-n`.
+fn audio_channel_types_value(v: u32, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  TagValue::Str(
+    crate::convert::decode_bits(&std::format!("{v}"), Some(AUDIO_CHANNEL_TYPE_BITS), 0).into(),
+  )
+}
+
+/// Render the `chan` `LayoutFlags` `int16u` for `print_conv` (the
+/// `%QuickTime::ChannelLayout` PrintConv hash, QuickTime.pm:7893-7986): a direct
+/// key → its name, else `Unknown ($val)` (decimal, ExifTool.pm:3633). The bare
+/// raw int rides at `-n`. The hash covers `0`/`1` (UseDescriptions/UseBitmap),
+/// the `100..=183` named layouts, and `0xffff` (Unknown).
+fn layout_flags_value(v: u16, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::U64(u64::from(v));
+  }
+  let name = match v {
+    0 => "UseDescriptions",
+    1 => "UseBitmap",
+    100 => "Mono",
+    101 => "Stereo",
+    102 => "StereoHeadphones",
+    103 => "MatrixStereo",
+    104 => "MidSide",
+    105 => "XY",
+    106 => "Binaural",
+    107 => "Ambisonic_B_Format",
+    108 => "Quadraphonic",
+    109 => "Pentagonal",
+    110 => "Hexagonal",
+    111 => "Octagonal",
+    112 => "Cube",
+    113 => "MPEG_3_0_A",
+    114 => "MPEG_3_0_B",
+    115 => "MPEG_4_0_A",
+    116 => "MPEG_4_0_B",
+    117 => "MPEG_5_0_A",
+    118 => "MPEG_5_0_B",
+    119 => "MPEG_5_0_C",
+    120 => "MPEG_5_0_D",
+    121 => "MPEG_5_1_A",
+    122 => "MPEG_5_1_B",
+    123 => "MPEG_5_1_C",
+    124 => "MPEG_5_1_D",
+    125 => "MPEG_6_1_A",
+    126 => "MPEG_7_1_A",
+    127 => "MPEG_7_1_B",
+    128 => "MPEG_7_1_C",
+    129 => "Emagic_Default_7_1",
+    130 => "SMPTE_DTV",
+    131 => "ITU_2_1",
+    132 => "ITU_2_2",
+    133 => "DVD_4",
+    134 => "DVD_5",
+    135 => "DVD_6",
+    136 => "DVD_10",
+    137 => "DVD_11",
+    138 => "DVD_18",
+    139 => "AudioUnit_6_0",
+    140 => "AudioUnit_7_0",
+    141 => "AAC_6_0",
+    142 => "AAC_6_1",
+    143 => "AAC_7_0",
+    144 => "AAC_Octagonal",
+    145 => "TMH_10_2_std",
+    146 => "TMH_10_2_full",
+    147 => "DiscreteInOrder",
+    148 => "AudioUnit_7_0_Front",
+    149 => "AC3_1_0_1",
+    150 => "AC3_3_0",
+    151 => "AC3_3_1",
+    152 => "AC3_3_0_1",
+    153 => "AC3_2_1_1",
+    154 => "AC3_3_1_1",
+    155 => "EAC_6_0_A",
+    156 => "EAC_7_0_A",
+    157 => "EAC3_6_1_A",
+    158 => "EAC3_6_1_B",
+    159 => "EAC3_6_1_C",
+    160 => "EAC3_7_1_A",
+    161 => "EAC3_7_1_B",
+    162 => "EAC3_7_1_C",
+    163 => "EAC3_7_1_D",
+    164 => "EAC3_7_1_E",
+    165 => "EAC3_7_1_F",
+    166 => "EAC3_7_1_G",
+    167 => "EAC3_7_1_H",
+    168 => "DTS_3_1",
+    169 => "DTS_4_1",
+    170 => "DTS_6_0_A",
+    171 => "DTS_6_0_B",
+    172 => "DTS_6_0_C",
+    173 => "DTS_6_1_A",
+    174 => "DTS_6_1_B",
+    175 => "DTS_6_1_C",
+    176 => "DTS_7_0",
+    177 => "DTS_7_1",
+    178 => "DTS_8_0_A",
+    179 => "DTS_8_0_B",
+    180 => "DTS_8_1_A",
+    181 => "DTS_8_1_B",
+    182 => "DTS_6_1_D",
+    183 => "AAC_7_1_B",
+    0xffff => "Unknown",
+    _ => return TagValue::Str(std::format!("Unknown ({v})").into()),
+  };
+  TagValue::Str(name.into())
+}
+
+/// Render the `%QuickTime::AudioKeys` `Mute` value (QuickTime.pm:6912-6916) for
+/// `print_conv`: the `PrintConv => { 0 => 'Off', 1 => 'On' }` hash at `-j`, the
+/// raw pre-PrintConv value at `-n`. `value` is the stored `data`-atom read (an
+/// int8u number for a numeric flag, or a decoded string for a string flag —
+/// [`read_audio_mute`]). The hash lookup mirrors Perl's string-keyed
+/// `$$conv{$val}` (so a numeric `0`/`1` AND a string `"0"`/`"1"` both map), with
+/// the `Unknown ($val)` default on a miss (ExifTool.pm:3633). Conv-bearing ⇒
+/// this is the SOLE AudioKeys tag whose `-j`/`-n` outputs differ.
+fn audio_mute_value(value: &crate::value::TagValue, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return value.clone();
+  }
+  // Key the hash on the value's canonical string form (Perl hash keys are
+  // strings): a numeric `0`/`1` and a string `"0"`/`"1"` both hit `Off`/`On`.
+  // [`read_audio_mute`] only ever yields `U64` (int8u flag) or `Str` (string
+  // flag), so those two carry the lookup; any other variant cannot occur.
+  let key: std::borrow::Cow<'_, str> = match value {
+    TagValue::U64(n) => std::borrow::Cow::Owned(n.to_string()),
+    TagValue::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
+    _ => return value.clone(),
+  };
+  match key.as_ref() {
+    "0" => TagValue::Str("Off".into()),
+    "1" => TagValue::Str("On".into()),
+    raw => TagValue::Str(std::format!("Unknown ({raw})").into()),
+  }
+}
+
 /// Render a `%QuickTime::ColorRep` CICP `int16u` field for `print_conv`: the
 /// PrintConv label (via `lookup`) at `-j`, the ExifTool `Unknown ($val)`
 /// fallback on a hash miss, and the bare raw int at `-n`. Mirrors the
@@ -2566,6 +2755,37 @@ fn decode_btrt(body: &[u8]) -> Option<Bitrate> {
   Some(b)
 }
 
+/// Decode a `chan` `AudioChannelLayout` sub-atom via `%QuickTime::ChannelLayout`
+/// (QuickTime.pm:7886-8090, `ProcessBinaryData`). `body` is the atom payload
+/// after the `[size][type]` header (offset 0 = the version+flags word).
+///
+/// Faithful tag subset (the BlackVue/`UseBitmap` path):
+///  - `LayoutFlags` (offset 4, `int16u`) — always read; stashed as the
+///    `$$self{LayoutFlags}` `DATAMEMBER` that conditions the rest.
+///  - `AudioChannelTypes` (offset 8, `int32u`) — `Condition => '$$self{LayoutFlags}
+///    == 1'` (the bitmap form). The non-bitmap `AudioChannels` (offset 6,
+///    `Condition => 'LayoutFlags != 0 and != 1'`) and the `UseDescriptions`
+///    per-channel arrays are NOT in scope here (BlackVue is `LayoutFlags == 1`).
+///  - `NumChannelDescriptions` (offset 12, `int32u`) — same `LayoutFlags == 1`
+///    condition; gates the (here-empty) `Channel<N>Label`/… description tags.
+///
+/// Each field read is independent and bounds-checked (a short box leaves the
+/// missing fields `None`); `ReadValue` would `return undef` past the end too.
+fn decode_chan(body: &[u8], a: &mut AudioSampleDesc) {
+  // LayoutFlags — `int16u` at offset 4 (QuickTime.pm:7892, the DATAMEMBER).
+  let layout_flags = be_u16(body, 4);
+  a.set_channel_layout_flags(layout_flags);
+  // The conditional tags fire ONLY for the bitmap layout (`LayoutFlags == 1`,
+  // QuickTime.pm:7997/8022). A `LayoutFlags` of 0 (UseDescriptions) or a named
+  // enum (>= 100) leaves AudioChannelTypes/NumChannelDescriptions `None`.
+  if layout_flags == Some(1) {
+    // AudioChannelTypes — `int32u` at offset 8 (BITMASK PrintConv).
+    a.set_audio_channel_types(be_u32(body, 8));
+    // NumChannelDescriptions — `int32u` at offset 12 (no conversion).
+    a.set_num_channel_descriptions(be_u32(body, 12));
+  }
+}
+
 /// Read a fixed-count `int16u[n]` array at byte `off` and join the values with
 /// single spaces (the ExifTool `join(" ", unpack ...)` ValueConv shape —
 /// `OpColor` / `GenOpColor` / `TextColor` / `BackgroundColor` are all
@@ -2857,10 +3077,17 @@ fn decode_audio_child_atoms(entry: &[u8], child_pos: Option<usize>, a: &mut Audi
     entry.len(),
     &mut sink,
     |atom, body, _w| {
-      if &atom.atom_type == b"btrt"
-        && let Some(b) = decode_btrt(body)
-      {
-        a.fold_bitrate_priority0(b);
+      match &atom.atom_type {
+        b"btrt" => {
+          if let Some(b) = decode_btrt(body) {
+            a.fold_bitrate_priority0(b);
+          }
+        }
+        // `chan` AudioChannelLayout (`%QuickTime::ChannelLayout`,
+        // QuickTime.pm:7566-7568) — the audio sample-entry child carrying the
+        // LayoutFlags / AudioChannelTypes / NumChannelDescriptions.
+        b"chan" => decode_chan(body, a),
+        _ => {}
       }
     },
   );
@@ -2973,6 +3200,212 @@ fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<Stri
   });
 }
 
+/// The `%QuickTime::Main` `free` atom's Pittasoft Condition (QuickTime.pm:572):
+/// `$$valPt =~ /^\0\0..(cprt|sttm|ptnm|ptrh|thum|gps |3gf )/s` — the BlackVue
+/// dashcam "free" data. The first two bytes are `\0\0` (the high half of the
+/// first child atom's big-endian size) and bytes 4..8 are one of the known
+/// Pittasoft child types. A `free` atom that fails this is plain padding (or
+/// the Kodak `Seri` / DJI-thermal variants — out of scope here).
+fn looks_like_pittasoft(body: &[u8]) -> bool {
+  // `^\0\0` then any two bytes, then a 4cc at offset 4 in the known set.
+  match body {
+    [0, 0, _, _, t0, t1, t2, t3, ..] => matches!(
+      &[*t0, *t1, *t2, *t3],
+      b"cprt" | b"sttm" | b"ptnm" | b"ptrh" | b"thum" | b"gps " | b"3gf "
+    ),
+    _ => false,
+  }
+}
+
+/// Decode the top-level `free` atom as the Pittasoft BlackVue dashcam
+/// SubDirectory (`%QuickTime::Pittasoft`, QuickTime.pm:570-573, 8488-8546) when
+/// its body matches [`looks_like_pittasoft`]. ExifTool re-uses `ProcessMOV` to
+/// walk it, so each child is a standard `[size:4][type:4][payload]` box. The
+/// decoded values land on [`QuickTimeMeta::pittasoft`]:
+///
+///  - `cprt` → **Copyright** (a plain string tag — trailing NULs stripped).
+///  - `sttm` → **StartTime** (`int64u` ms since 1970; `ConvertUnixTime` +
+///    `.%03d` fractional ms; mode-invariant).
+///  - `ptnm` → **OriginalFileName** (`ValueConv => 'substr($val, 4, -1)'`).
+///  - `thum` → **PreviewImage** (`Binary => 1`; the RawConv strips a leading
+///    4-byte big-endian length and yields that many image bytes → placeholder).
+///  - `gps ` → **GPSLog** (`Binary => 1`; trailing-NUL-stripped → placeholder.
+///    Its `ExtractEmbedded`-only GPS re-parse is the timed-metadata path, NOT
+///    reached here).
+///  - `3gf ` → **AccelData** → `Process_3gf` (QuickTimeStream.pl:2686-2708): at
+///    no-`ee` the box is truncated to its first 10-byte record (and raises the
+///    `EEWarn`), so the base path emits one `TimeCode` + one `Accelerometer`.
+///  - `ptrh` (a recursive container of `ptvi`/`ptso`) and `lte ` (unknown) emit
+///    nothing.
+fn decode_free_pittasoft(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
+    let pit = qt.pittasoft_mut();
+    match &inner.atom_type {
+      // `cprt` Copyright (QuickTime.pm:8491) — a plain string tag. Strip
+      // trailing NULs (the `s/\0+$//` a NUL-terminated MOV string carries) and
+      // emit the rest verbatim (the leading space is part of the value).
+      b"cprt" => {
+        let s = core::str::from_utf8(ibody)
+          .unwrap_or("")
+          .trim_end_matches('\0');
+        if !s.is_empty() {
+          pit.set_copyright(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `sttm` StartTime (QuickTime.pm:8536-8545) — `Format => 'int64u'` (8-byte
+      // big-endian ms since 1970, local TZ). ValueConv: `secs = int($val/1000)`,
+      // `ConvertUnixTime($secs) . sprintf(".%03d", $val - secs*1000)`. PrintConv
+      // `ConvertDateTime` reproduces the same string, so it is mode-invariant.
+      b"sttm" => {
+        if let Some(ms) = be_u64(ibody, 0) {
+          let secs = ms / 1000;
+          let frac = ms - secs * 1000;
+          // `convert_unix_time` takes the Unix-epoch seconds; the BlackVue value
+          // fits an `i64` (a 2026 timestamp). Append the fixed 3-digit ms.
+          let date = convert_unix_time(secs as i64);
+          let s = std::format!("{date}.{frac:03}");
+          pit.set_start_time(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `ptnm` OriginalFileName (QuickTime.pm:8504-8507) — `ValueConv =>
+      // 'substr($val, 4, -1)'`: drop the 4-byte `\x01\0\0\0` prefix AND the last
+      // byte (the trailing NUL). Perl `substr($val, 4, -1)` = bytes `[4 .. len-1)`.
+      b"ptnm" => {
+        if ibody.len() > 5
+          && let Some(slice) = ibody.get(4..ibody.len() - 1)
+          && let Ok(s) = core::str::from_utf8(slice)
+        {
+          pit.set_original_file_name(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `thum` PreviewImage (QuickTime.pm:8492-8503) — `Binary => 1`; RawConv:
+      // `return undef unless length $val > 4; $len = unpack('N',$val); return
+      // undef unless length $val >= 4 + $len; return substr($val, 4, $len)`. We
+      // record the DECODED image length ($len) for the placeholder.
+      b"thum" => {
+        if ibody.len() > 4
+          && let Some(len) = be_u32(ibody, 0)
+          && ibody.len() as u64 >= 4 + u64::from(len)
+        {
+          pit.set_preview_image_len(Some(u64::from(len)));
+        }
+      }
+      // `gps ` GPSLog (QuickTime.pm:8514-8525) — `Binary => 1`; RawConv strips
+      // trailing NULs (`$val =~ s/\0+$//`). The remaining byte count feeds the
+      // `(Binary data N bytes…)` placeholder. The `ExtractEmbedded` GPS re-parse
+      // (`ProcessGPSLog`) is the timed path; the base path emits the placeholder.
+      b"gps " => {
+        // `$val =~ s/\0+$//` — the byte count after trailing NULs are removed.
+        let stripped = ibody.len() - ibody.iter().rev().take_while(|&&b| b == 0).count();
+        if stripped > 0 {
+          pit.set_gps_log_len(Some(stripped as u64));
+        }
+      }
+      // `3gf ` AccelData (QuickTime.pm:8527-8534) → `Process_3gf`
+      // (QuickTimeStream.pl:2686-2708). 10-byte records `[tc:int32u]
+      // [x:int16s][y:int16s][z:int16s]`, x/y/z scaled by 1/10; a `0xffffffff`
+      // timecode terminates. Without `-ee` the directory is truncated to its
+      // FIRST record (and the `EEWarn` fires when there is more than one) — so
+      // the base path emits exactly one `TimeCode`/`Accelerometer` pair.
+      b"3gf " => {
+        // `Process_3gf` (QuickTimeStream.pl:2686-2708) reads 10-byte records
+        // `[timecode:int32u][x:int16s][y:int16s][z:int16s]` while
+        // `pos + RECORD_SIZE <= length` (the `while` loop, :2700). A partial
+        // trailing/first record is NEVER processed — so the no-`ee` base path
+        // must require a COMPLETE first record before emitting any tag.
+        const REC: usize = 10;
+        // QuickTimeStream.pl:2693 — `$dirLen > $recLen` (no `-ee`) sets the
+        // doc-level EEWarn (rendered as the base `ExifTool:Warning`).
+        if ibody.len() > REC {
+          pit.set_ee_warn(true);
+        }
+        // The first record (the only one the no-`ee` truncation keeps). Require
+        // the FULL 10-byte record present (`pos + REC <= len`, matching the
+        // stream decoder's strictness) — a truncated 4-9-byte box decodes NO
+        // record, so neither `TimeCode` nor `Accelerometer` is fabricated. Bounds
+        // -safe reads of every axis (no `unwrap_or(0)` filling a missing axis). A
+        // `0xffffffff` terminator first record emits nothing (the loop `last`s).
+        if ibody.len() >= REC
+          && let Some(tc) = be_u32(ibody, 0)
+          && tc != 0xffff_ffff
+          && let Some(x_raw) = be_i16(ibody, 4)
+          && let Some(y_raw) = be_i16(ibody, 6)
+          && let Some(z_raw) = be_i16(ibody, 8)
+        {
+          pit.set_time_code(Some(f64::from(tc) / 1000.0));
+          let x = f64::from(x_raw) / 10.0;
+          let y = f64::from(y_raw) / 10.0;
+          let z = f64::from(z_raw) / 10.0;
+          pit.set_accelerometer(Some(smol_str::SmolStr::new(std::format!("{x} {y} {z}"))));
+        }
+      }
+      _ => {}
+    }
+  });
+}
+
+/// The `%QuickTime::Main` `skip` atom's `SkipInfo` Condition (QuickTime.pm:634):
+/// `$$valPt =~ /^\0[\0-\x04]..[a-zA-Z ]{4}/s` — the first 8 payload bytes must
+/// look like a QuickTime atom header (a big-endian size whose top two bytes are
+/// `0x00` and `0x00..=0x04`, i.e. a sub-32-bit length, followed by a 4-byte type
+/// of ASCII letters/spaces). A `skip` atom that fails this is the (unported,
+/// out-of-scope) plain padding atom — NOT a SkipInfo container.
+fn looks_like_skipinfo(body: &[u8]) -> bool {
+  // The first 8 bytes (a slice pattern avoids panicking indexing): `[hi, lo, _,
+  // _, t0, t1, t2, t3, ..]`. `hi == 0 && lo <= 0x04` is the sub-32-bit size; the
+  // four type bytes must each be an ASCII letter or space.
+  match body {
+    [0, lo, _, _, t0, t1, t2, t3, ..] if *lo <= 0x04 => [t0, t1, t2, t3]
+      .into_iter()
+      .all(|&b| b.is_ascii_alphabetic() || b == b' '),
+    _ => false,
+  }
+}
+
+/// Decode the top-level `skip` atom as a `SubDirectory` dispatched to
+/// `Image::ExifTool::QuickTime::SkipInfo` from the `%QuickTime::Main` `skip`
+/// Condition list (QuickTime.pm:631-636 — "found in 70mai Pro Plus+ MP4 videos",
+/// also the Viofo A119). ExifTool re-uses `ProcessMOV` to walk the SkipInfo
+/// SubDirectory, so each sub-atom is a standard `[size:4][type:4][payload]` box
+/// (QuickTime.pm:1017-1027):
+///
+///  - `'ver '` → **Version** (the raw string value; no PrintConv/ValueConv).
+///  - `tima` → int32u, `Unknown` (commented-out in the table) ⇒ not emitted.
+///  - `thma` → **ThumbnailImage** (`Binary => 1` ⇒ the `(Binary data N bytes…)`
+///    placeholder; group2 `Preview`).
+///
+/// The Version/ThumbnailImage land on `QuickTime` (the SkipInfo table's family-0
+/// default), distinct from the Kodak-grouped `frea` `'ver '`/`thma`.
+fn decode_skip(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
+  // The Condition gates the whole SubDirectory dispatch: a non-SkipInfo `skip`
+  // (plain padding) contributes nothing.
+  if !looks_like_skipinfo(payload) {
+    return;
+  }
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
+    match &inner.atom_type {
+      // `'ver '` Version — the raw string (QuickTime.pm:1020). Trailing NULs (a
+      // NUL-padded box) are dropped; the value is otherwise verbatim.
+      b"ver " => {
+        let s = core::str::from_utf8(ibody)
+          .unwrap_or("")
+          .trim_end_matches('\0');
+        if !s.is_empty() {
+          qt.set_skip_version(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `thma` ThumbnailImage — `Binary => 1` (QuickTime.pm:1022-1026). Record
+      // only the payload byte length for the placeholder; bytes are not kept.
+      b"thma" => {
+        qt.set_skip_thumbnail_len(Some(ibody.len() as u64));
+      }
+      _ => {}
+    }
+  });
+}
+
 /// The WALK-LEVEL routing HandlerType a `meta` box sets — the subtype 4cc of the
 /// `meta` box's direct-child `hdlr`, as the `%QuickTime::Meta` table routes it
 /// through `%QuickTime::Handler` (QuickTime.pm:2824 / 8403-8416). A data-
@@ -3012,6 +3445,61 @@ fn meta_box_routing_handler(body: &[u8], body_offset: usize) -> Option<String> {
     }
   });
   handler
+}
+
+/// Push EVERY `hdlr` HandlerType code a `meta` box carries onto the file-global
+/// HasHandler accumulator (`$$self{HasHandler}{$val} = 1`, QuickTime.pm:8414 — set
+/// in the `%QuickTime::Handler` RawConv for EACH `hdlr` box the file contains, at
+/// ANY level). Unlike [`meta_box_routing_handler`] (which suppresses the routing
+/// update for an `alis`/`url ` data-reference handler, QuickTime.pm:8412), the
+/// `HasHandler` set records ALL codes including `alis`/`url ` — so this collector
+/// does NOT filter them. It is the NON-track contribution to the file-global set:
+/// a top-level (`%QuickTime::Main`, `body_offset` 4), `moov`/`trak` (`%Movie`/
+/// `%Track`, offset 0) or `udta` (`%UserData`, offset 4) `meta/hdlr`. The MP4→M4A
+/// FileType override (QuickTime.pm:10621-10622) keys on this file-global set, so a
+/// non-track `meta/hdlr` = `soun` (no `soun` `trak`) still flips MP4→M4A, and a
+/// non-track `meta/hdlr` = `vide` still SUPPRESSES the override on an audio-only
+/// file — ground-truthed vs bundled ExifTool 13.59.
+fn collect_meta_box_handler_codes(body: &[u8], body_offset: usize, sink: &mut Vec<String>) {
+  let region = body.get(body_offset..).unwrap_or_default();
+  // A throwaway warning sink — Pass 1's `walk_meta` already surfaced any
+  // malformed-child warning for this same box; this read MUST NOT double-report.
+  let mut warn_sink: Option<String> = None;
+  walk_atoms(
+    0,
+    region,
+    0,
+    region.len(),
+    &mut warn_sink,
+    |atom, abody, _w| {
+      if &atom.atom_type == b"hdlr"
+        && let Some(code) = decode_hdlr(abody)
+      {
+        sink.push(code);
+      }
+    },
+  );
+}
+
+/// Push EVERY `meta`-box `hdlr` code nested in a `udta` body onto the file-global
+/// HasHandler accumulator (the `%UserData` `meta` is `Start => 4`,
+/// QuickTime.pm:1690-1691). The `udta` counterpart to
+/// [`collect_meta_box_handler_codes`] — same all-codes (no `alis`/`url ` filter)
+/// `HasHandler` semantics — for a `moov/udta/meta` or `trak/udta/meta`.
+fn collect_udta_meta_handler_codes(udta_body: &[u8], sink: &mut Vec<String>) {
+  let mut warn_sink: Option<String> = None;
+  walk_atoms(
+    0,
+    udta_body,
+    0,
+    udta_body.len(),
+    &mut warn_sink,
+    |atom, abody, _w| {
+      if &atom.atom_type == b"meta" {
+        collect_meta_box_handler_codes(abody, 4, sink);
+      }
+    },
+  );
 }
 
 /// The WALK-LEVEL routing HandlerType a `udta/meta` box sets, read from a `udta`
@@ -3072,6 +3560,7 @@ fn decode_moov_trak(
   qt: &mut QuickTimeMeta,
   warning: &mut Option<String>,
   handler_so_far: &mut Option<String>,
+  file_handlers: &mut Vec<String>,
 ) {
   // ExifTool's `$track` counter is a `my` local of THIS `moov`'s `ProcessMOV`
   // invocation (QuickTime.pm:9944), starting undef⇒0 and `++`-incremented per
@@ -3102,6 +3591,10 @@ fn decode_moov_trak(
       // (Keys/ItemList) already ran in Pass 1; here we read ONLY its routing
       // handler.
       b"meta" => {
+        // The file-global `HasHandler` set (QuickTime.pm:8414) records this
+        // NON-track `moov/meta` `hdlr` — including `alis`/`url ` — so it feeds the
+        // MP4→M4A FileType override even with no matching `trak`.
+        collect_meta_box_handler_codes(ibody, 0, file_handlers);
         if let Some(h) = meta_box_routing_handler(ibody, 0) {
           *handler_so_far = Some(h);
         }
@@ -3111,13 +3604,14 @@ fn decode_moov_trak(
       // (Make/Model/…) already decoded in Pass 1; here we read ONLY the routing
       // handler of a `meta` box nested in this `moov/udta` (case F).
       b"udta" => {
+        collect_udta_meta_handler_codes(ibody, file_handlers);
         if let Some(h) = udta_meta_routing_handler(ibody) {
           *handler_so_far = Some(h);
         }
       }
       b"trak" => {
         track_num += 1; // QuickTime.pm:10354 `++$track`
-        let mut track = walk_trak_threaded(1, ibody, movie_ts, handler_so_far);
+        let mut track = walk_trak_threaded(1, ibody, movie_ts, handler_so_far, file_handlers);
         track.set_track_group(track_num);
         qt.push_track(track);
       }
@@ -3139,9 +3633,16 @@ fn decode_moov_trak(
 #[cfg(test)]
 fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
   // A standalone `trak` with no inbound cross-`trak` handler state: seed an empty
-  // file-global routing handler local to this call.
+  // file-global routing handler + HasHandler accumulator local to this call.
   let mut handler_so_far: Option<String> = None;
-  walk_trak_threaded(depth, payload, movie_timescale, &mut handler_so_far)
+  let mut file_handlers: Vec<String> = Vec::new();
+  walk_trak_threaded(
+    depth,
+    payload,
+    movie_timescale,
+    &mut handler_so_far,
+    &mut file_handlers,
+  )
 }
 
 /// Walk one `trak` atom like [`walk_trak`], threading the FILE-GLOBAL routing
@@ -3163,6 +3664,7 @@ fn walk_trak_threaded(
   payload: &[u8],
   movie_timescale: Option<u32>,
   handler_so_far: &mut Option<String>,
+  file_handlers: &mut Vec<String>,
 ) -> MediaTrack {
   let mut track = MediaTrack::new();
   let mut track_warning: Option<String> = None;
@@ -3204,6 +3706,10 @@ fn walk_trak_threaded(
         // in file order is too late (the `stsd` already decoded under the prior
         // handler) — the file-order walk handles that naturally.
         b"meta" => {
+          // A `trak/meta` `hdlr` ALSO enters the file-global `HasHandler` set
+          // (QuickTime.pm:8414 is `$$self`-scoped, not per-trak) — collected here
+          // alongside the routing update (incl. `alis`/`url `).
+          collect_meta_box_handler_codes(body, 0, file_handlers);
           if let Some(h) = meta_box_routing_handler(body, 0) {
             *handler_so_far = Some(h);
           }
@@ -3213,6 +3719,7 @@ fn walk_trak_threaded(
         // camera atoms already decoded in Pass 1; here we read ONLY the routing
         // handler of a `meta` box nested in this `trak/udta`.
         b"udta" => {
+          collect_udta_meta_handler_codes(body, file_handlers);
           if let Some(h) = udta_meta_routing_handler(body) {
             *handler_so_far = Some(h);
           }
@@ -3246,11 +3753,28 @@ fn walk_trak_threaded(
                   if code != "alis" && code != "url " {
                     *handler_so_far = Some(code.clone());
                   }
+                  // Accumulate EVERY walked `hdlr` code for the no-`ee` EEWarn
+                  // (it runs the `%Handler` HandlerType RawConv per box —
+                  // QuickTime.pm:8407-8414), separate from the single-slot
+                  // `handler_code` tag value.
+                  track.push_handler_code(code.clone());
                   track.set_handler_code(code);
                 }
                 track.set_handler_class(decode_hdlr_class(ibody));
                 track.set_handler_vendor_id(decode_hdlr_vendor_id(ibody));
                 track.set_handler_description(decode_hdlr_description(ibody));
+                // Record this MEDIA `hdlr` as a walked box (file order) for the
+                // per-field LAST-in-file-order Handler resolution — the same four
+                // `%Handler` fields ExifTool extracts here, captured at the box's
+                // actual parse position (BEFORE any `minf/hdlr` in a normal
+                // `mdia(hdlr, minf)`, but AFTER the `minf/hdlr` in a reordered
+                // `mdia(minf, hdlr)`). NO media-before-data assumption is baked in.
+                track.push_handler_box(HandlerBox::new(
+                  decode_hdlr_class(ibody),
+                  decode_hdlr(ibody),
+                  decode_hdlr_vendor_id(ibody),
+                  decode_hdlr_description(ibody),
+                ));
               }
               // `minf` holds the audio media header (`smhd` Balance) and the
               // sample table (`stbl/stsd`). The `stsd` first-entry format 4cc is
@@ -3286,7 +3810,69 @@ fn walk_trak_threaded(
                     // leaves `MediaType`/`handler_code` untouched). A data-reference
                     // (`alis`/`url `) does not change it (QuickTime.pm:8412).
                     b"hdlr" => {
-                      if let Some(code) = decode_hdlr(mbody)
+                      // ExifTool extracts the FULL `%Handler` triplet (HandlerClass
+                      // / HandlerType / HandlerVendorID / HandlerDescription) for
+                      // EVERY `hdlr` it walks, INCLUDING this `minf/hdlr` data
+                      // handler (QuickTime.pm:7319-7322 → `%QuickTime::Handler`),
+                      // all into the same `Track<N>` family-1 group. Capture it on
+                      // the track's `data_handler` slot so the per-track Handler
+                      // dedup (in the emission) can choose it for the FINAL `trak`.
+                      let code = decode_hdlr(mbody);
+                      // Accumulate EVERY `minf/hdlr` code for the no-`ee` EEWarn
+                      // (one push per walked `hdlr` box, INCLUDING a repeated
+                      // `minf`), separate from the single last-contentful
+                      // `data_handler` triplet slot below — so a `meta` data
+                      // handler that a LATER `minf/hdlr` (`url `) overwrites
+                      // still triggers the warning. An all-undef `minf/hdlr`
+                      // (`code` is `None`) contributes nothing here.
+                      if let Some(code) = &code {
+                        track.push_handler_code(code.clone());
+                      }
+                      // Build the candidate `%Handler` fields for THIS
+                      // `minf/hdlr`, then fold them into the track's data-handler
+                      // slot PER FIELD (last-Some) — but ONLY when the candidate
+                      // carries content (any of HandlerClass / HandlerType /
+                      // HandlerVendorID / HandlerDescription decoded to `Some`).
+                      // A fully-undef box (a short/empty/all-zero `minf/hdlr`
+                      // whose every field is `None`) extracts NO tag in bundled
+                      // ExifTool — its `HandlerType` RawConv yields nothing
+                      // usable — so it must be a NO-OP: it can neither own a bare
+                      // `Track<N>:Handler*` key, suppress the `mdia/hdlr` media
+                      // handler, NOR clear a valid earlier data handler. A
+                      // repeated-`minf` track (`url ` then a later short box)
+                      // therefore KEEPS the `url ` fields — the empty box does
+                      // not erase them. A CODED-or-classed box merges its OWN
+                      // present fields over the slot (`merge_from` last-Some), so
+                      // the slot holds the per-field LAST data-handler value
+                      // across every `minf/hdlr` (matching ExifTool's
+                      // last-extracted `%Handler` `FoundTag` PER FIELD — each of
+                      // the four is independent). A `url ` full then a class-only
+                      // `dhlr` keeps `url `'s HandlerType/Description and takes
+                      // the later HandlerClass.
+                      let mut candidate = DataReferenceHandler::default();
+                      candidate.set_class(decode_hdlr_class(mbody));
+                      candidate.set_code(code.clone());
+                      candidate.set_vendor_id(decode_hdlr_vendor_id(mbody));
+                      candidate.set_description(decode_hdlr_description(mbody));
+                      // Record this DATA `hdlr` as a walked box (file order) for
+                      // the per-field LAST-in-file-order Handler resolution,
+                      // BEFORE the content-gated `data_handler` fold below. Every
+                      // `minf/hdlr` is recorded at its actual parse position —
+                      // including a fully-undef box (it wins no field, so it needs
+                      // no `has_content` gate here; the resolver skips its `None`
+                      // fields). The merged `data_handler` slot stays content-gated
+                      // (the existing accessor/projection contract) — the resolver
+                      // now reads `handler_boxes`, not that slot.
+                      track.push_handler_box(HandlerBox::new(
+                        candidate.class().map(str::to_owned),
+                        candidate.code().map(str::to_owned),
+                        candidate.vendor_id().map(str::to_owned),
+                        candidate.description().map(str::to_owned),
+                      ));
+                      if candidate.has_content() {
+                        track.merge_data_handler(&candidate);
+                      }
+                      if let Some(code) = code
                         && code != "alis"
                         && code != "url "
                       {
@@ -3483,11 +4069,209 @@ fn decode_moov_udta_meta(
     payload.len(),
     warning,
     |atom, body, w| match &atom.atom_type {
-      b"udta" => walk_udta(depth + 1, body, w, qt.user_data_mut()),
+      b"udta" => {
+        // The `%QuickTime::Movie` `moov/udta` UserData walk: the camera/GPS/
+        // capture-identity atoms (Make/Model/©xyz/…) into `user_data`. This pass
+        // surfaces any `udta`-internal truncation warning.
+        walk_udta(depth + 1, body, w, qt.user_data_mut());
+        // The `moov/udta` `loci` LocationInformation box + the nested `meta`
+        // (`mdir`) ItemList / Handler box — `%QuickTime::UserData` `loci`
+        // (QuickTime.pm:1775) + `meta` `Start => 4` (QuickTime.pm:1690-1691).
+        // A SECOND pass over the SAME `udta` body (each tag family is
+        // group-bucketed at emit, so cross-family order is immaterial); it
+        // discards its walk warnings (`&mut None`) since the first `walk_udta`
+        // pass already surfaced any `udta` truncation (no double-report).
+        walk_udta_loci_meta(depth + 1, body, &mut None, qt);
+      }
+      // The `moov/meta`(`mdta`) box — `%QuickTime::Movie` `meta` (offset 0): the
+      // `keys`-resolved ItemList → group `Keys`, plus the Handler box.
       b"meta" => walk_meta(depth + 1, body, w, qt),
+      // A `trak`: an audio track's `meta`(`mdta`) `keys` route through
+      // `%QuickTime::AudioKeys` (the `keys` Condition `$$self{MediaType} eq
+      // "soun"`, QuickTime.pm:2867-2870) → movie-level group `AudioKeys`. Decoded
+      // in Pass 1 here (alongside the moov-level meta/udta) into `qt.audio_keys`;
+      // the Pass-2 `trak` walk handles the structural track fields separately —
+      // and OWNS the trak's warnings (a truncated `tkhd`/`mdhd` surfaces a
+      // `Track<N>:Warning` there), so this supplementary AudioKeys scan discards
+      // its own walk warnings (`&mut None`) to avoid a DUPLICATE document-level
+      // `ExifTool:Warning`.
+      b"trak" => decode_trak_audio_keys(depth + 1, body, qt),
       _ => {}
     },
   );
+}
+
+/// Scan one `trak` for an AUDIO-track `meta`(`mdta`) `keys` box and decode its
+/// `keys`-resolved `ilst` into `qt.audio_keys` (group `AudioKeys`). ExifTool's
+/// `%QuickTime::Meta` `keys` is a Condition list (QuickTime.pm:2867-2878):
+/// `AudioKeys` when the track's `$$self{MediaType}` is `"soun"`, `VideoKeys` for
+/// `"vide"`, else `Keys`. This port wires the AUDIO case (the common
+/// `player.movie.audio.balance` → `AudioKeys:Balance`); a video-track or
+/// other-type `meta/keys` is left undecoded (the `VideoKeys` table / a
+/// track-level `Keys` are not yet modeled and no fixture needs them).
+///
+/// The track's `MediaType` is the `mdia/hdlr` 4-cc (`soun`/`vide`); a real
+/// audio track lists `mdia` before the `meta` box (the `meta` keys carry no
+/// `MediaType` of their own), so a single child walk that records the media
+/// handler first and decodes a soun-track `meta` after is faithful.
+fn decode_trak_audio_keys(depth: u32, payload: &[u8], qt: &mut QuickTimeMeta) {
+  // Discard structural walk warnings — the Pass-2 `trak` walk owns the trak's
+  // warnings (see the call site), so this scan must not double-report them.
+  let mut sink: Option<String> = None;
+  let mut media_type: Option<[u8; 4]> = None;
+  walk_atoms(
+    depth,
+    payload,
+    0,
+    payload.len(),
+    &mut sink,
+    |atom, body, w| {
+      match &atom.atom_type {
+        // `mdia/hdlr` HandlerType (`$$self{MediaType}`, QuickTime.pm:8413) — only a
+        // `Media`-parent `hdlr` sets it (the `mdia` child, not a `minf`/`meta` one).
+        b"mdia" => {
+          walk_atoms(depth + 1, body, 0, body.len(), w, |inner, ibody, _iw| {
+            if &inner.atom_type == b"hdlr"
+              && let Some(code) = ibody.get(8..12).and_then(|s| s.try_into().ok())
+            {
+              media_type = Some(code);
+            }
+          });
+        }
+        // An audio-track `meta`(`mdta`) box: decode its `keys`-resolved `ilst`
+        // into `audio_keys`. `%QuickTime::Track` `meta` has NO `Start` ⇒ offset 0.
+        b"meta" if media_type.as_ref() == Some(b"soun") => {
+          walk_meta_audio_keys(depth + 1, body, w, qt);
+        }
+        _ => {}
+      }
+    },
+  );
+}
+
+/// Walk an audio-track `meta`(`mdta`) box (offset 0): decode its `keys` +
+/// `keys`-resolved `ilst` into `qt.audio_keys`, faithful to `%QuickTime::
+/// AudioKeys`. Mirrors [`walk_meta`]'s single-pass `keys`/`ilst` resolution (the
+/// `KeysCount.index` lookup), but each resolved key is routed through the
+/// AudioKeys-specific [`apply_audio_key`] (NOT the generic [`apply_key`]): the
+/// `keys` `Condition => '$$self{MediaType} eq "soun"'` (QuickTime.pm:2867-2870)
+/// selects `%QuickTime::AudioKeys`, a DISTINCT 6-key table, so its members
+/// (`AudioGain`/`Treble`/`Bass`/`Balance`/`PitchShift`/`Mute`) resolve via that
+/// table (`Mute` keeps its int8u Format + `Off`/`On` PrintConv) and ANY other
+/// key takes `ProcessKeys`' unknown-key DERIVE path (a conv-less tag named from
+/// the key id — NOT the generic `%Keys` conversions). All emitted under group
+/// `AudioKeys`. The Handler box is NOT re-extracted here (the movie-level
+/// `meta_handler_*` come from the moov/udta meta boxes; an audio-track `mdta`
+/// hdlr carries an empty vendor and would not change them).
+fn walk_meta_audio_keys(
+  depth: u32,
+  payload: &[u8],
+  w: &mut Option<String>,
+  qt: &mut QuickTimeMeta,
+) {
+  let mut key_names: std::vec::Vec<KeyName> = std::vec::Vec::new();
+  walk_atoms(
+    depth,
+    payload,
+    0,
+    payload.len(),
+    w,
+    |atom, body, w| match &atom.atom_type {
+      b"keys" => key_names = parse_keys_box(body),
+      b"ilst" => {
+        walk_atoms(depth + 1, body, 0, body.len(), w, |item, item_body, iw| {
+          let index = u32::from_be_bytes(item.atom_type) as usize;
+          let Some(key) = index.checked_sub(1).and_then(|i| key_names.get(i)) else {
+            return;
+          };
+          let Some(data) = decode_ilst_data(depth + 2, item_body, iw) else {
+            return;
+          };
+          apply_audio_key(key, &data, qt.audio_keys_mut());
+        });
+      }
+      _ => {}
+    },
+  );
+}
+
+/// Walk a `moov/udta` (or `trak/udta`) body for the `loci` LocationInformation
+/// box and the nested `meta`(`mdir`) ItemList / Handler box — the
+/// `%QuickTime::UserData` `loci` (QuickTime.pm:1775-1818) and `meta` (the
+/// `Start => 4` SubDirectory through `%QuickTime::Meta`, QuickTime.pm:1690-1691).
+/// Separate from [`walk_udta`] (which decodes the camera atoms into
+/// `user_data`) because these targets live on the enclosing [`QuickTimeMeta`]
+/// (`loci` → `user_data.location_information`; the `meta/ilst` → `item_list`
+/// under group `ItemList`; the `meta/hdlr` → the `meta_handler_*` fields, which
+/// is where a `mdir`+`appl` `HandlerVendorID` comes from).
+fn walk_udta_loci_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickTimeMeta) {
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
+    match &atom.atom_type {
+      // `loci` LocationInformation (the 3gp location box). Decoded by the
+      // `loci` RawConv; emitted under `QuickTime:UserData`.
+      b"loci" => {
+        qt.user_data_mut()
+          .set_location_information(Some(decode_loci(body)));
+      }
+      // The `moov/udta/meta`(`mdir`) box: the `ilst` ItemList (direct-4cc
+      // atoms → group `ItemList`) + the Handler box (`mdir`+`appl` →
+      // `QuickTime:HandlerVendorID`). The `%QuickTime::UserData` `meta` is
+      // `Start => 4` (a 4-byte ISO version/flags prefix before the children).
+      b"meta" => {
+        let inner = body.get(4..).unwrap_or_default();
+        walk_udta_meta_box(depth + 1, inner, w, qt);
+      }
+      _ => {}
+    }
+  });
+}
+
+/// Walk a `udta/meta`(`mdir`) box's children (AFTER its 4-byte ISO version/flags
+/// prefix): the `hdlr` Handler box and the `ilst` ItemList. The `ilst` items are
+/// resolved by their LITERAL 4-character-code against `%QuickTime::ItemList`
+/// (`HasData => 1`, QuickTime.pm:2814-2819) and emitted under group `ItemList`
+/// (the `MOV-Movie-Track-UserData-Meta-ItemList` group-derivation). The `hdlr`
+/// shares the `%QuickTime::Handler` table with the `moov/meta` one — so a
+/// `mdir` HandlerType / an `appl` HandlerVendorID set the SAME movie-level
+/// `meta_handler_*` fields (last-wins, but an UNDEFINED field — an all-zero
+/// VendorID — does NOT clobber a prior defined one, faithful to ExifTool's
+/// `FoundTag`-only-when-defined RawConv).
+fn walk_udta_meta_box(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickTimeMeta) {
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
+    match &atom.atom_type {
+      // The Handler box — same `%QuickTime::Handler` table as `moov/meta/hdlr`.
+      // HandlerType last-wins; HandlerVendorID / HandlerClass / HandlerDescription
+      // only OVERWRITE when defined (an all-zero RawConv ⇒ `None` ⇒ no FoundTag ⇒
+      // the prior value stays), so a later empty-vendor `mdta` box does not erase
+      // this box's `appl`→"Apple".
+      b"hdlr" => {
+        if let Some(c) = decode_hdlr_class(body) {
+          qt.set_meta_handler_class(Some(c));
+        }
+        if let Some(code) = decode_hdlr(body) {
+          qt.set_meta_handler_type(Some(code));
+        }
+        if let Some(v) = decode_hdlr_vendor_id(body) {
+          qt.set_meta_handler_vendor_id(Some(v));
+        }
+        if let Some(d) = decode_hdlr_description(body) {
+          qt.set_meta_handler_description(Some(d));
+        }
+      }
+      // The ItemList: each item atom's 4-cc is a literal `%QuickTime::ItemList`
+      // tag id (`\xa9nam`, `covr`, …), NOT a `keys`-index. Decode its `data`
+      // atom and project onto the `item_list` (group `ItemList`).
+      b"ilst" => {
+        walk_atoms(depth + 1, body, 0, body.len(), w, |item, item_body, iw| {
+          let Some(data) = decode_ilst_data(depth + 2, item_body, iw) else {
+            return;
+          };
+          apply_item_list(&item.atom_type, &data, qt.item_list_mut());
+        });
+      }
+      _ => {}
+    }
+  });
 }
 
 /// Mirror ExifTool's LigoGPS `udta` SubDirectory Conditions in the
@@ -3738,6 +4522,101 @@ fn decode_manu_modl(body: &[u8]) -> String {
   String::from_utf8_lossy(s).into_owned()
 }
 
+/// Strip a leading NUL-terminated string off `data`, returning `(decoded,
+/// rest)` — the `loci` RawConv's `$val =~ s/^(\xfe\xff(.{2})*?)\0\0//s` (UTF-16BE
+/// when a `\xfe\xff` BOM leads) / `s/^(.*?)\0//s` (UTF-8) consume-and-decode
+/// (QuickTime.pm:1790-1796 / 1807-1816). A UTF-16BE run ends at the first
+/// `\0\0` 2-byte-aligned terminator; a UTF-8 run at the first `\0`. Returns
+/// `None` when no terminator is found (the Perl `s///` fails to match — the
+/// caller maps that to `<err>` for the name, or stops appending for body/notes).
+fn loci_take_string(val: &[u8]) -> Option<(String, &[u8])> {
+  if val.first() == Some(&0xfe) && val.get(1) == Some(&0xff) {
+    // UTF-16BE: scan from offset 2 for a 2-byte-aligned `\0\0`.
+    let mut i = 2;
+    while i + 1 < val.len() {
+      if val.get(i) == Some(&0) && val.get(i + 1) == Some(&0) {
+        let text = decode_utf16be(val.get(2..i).unwrap_or_default());
+        return Some((text, val.get(i + 2..).unwrap_or_default()));
+      }
+      i += 2;
+    }
+    None
+  } else {
+    let nul = val.iter().position(|&b| b == 0)?;
+    let text = String::from_utf8_lossy(val.get(..nul).unwrap_or_default()).into_owned();
+    Some((text, val.get(nul + 1..).unwrap_or_default()))
+  }
+}
+
+/// Decode a `loci` LocationInformation box body — the `%QuickTime::UserData`
+/// `loci` RawConv (QuickTime.pm:1788-1817). Layout after the box's leading
+/// 6-byte version/flags+lang header (the `data`-atom header is stripped by the
+/// caller, like ExifTool's `Start`): a NUL-terminated `name` string (UTF-16BE if
+/// `\xfe\xff`-prefixed, else UTF-8), then `int8u role`, `fixed32s lon`,
+/// `fixed32s lat`, `fixed32s alt`, then NUL-terminated `body` + `notes` strings.
+/// Returns the assembled `"<name> Role=… Lat=%.5f Lon=%.5f Alt=%.2f Body=…
+/// Notes=…"` string (or `"<err>"` on a malformed box, faithful to the RawConv's
+/// `return '<err>'`). An empty name renders as `(none)`.
+fn decode_loci(body: &[u8]) -> String {
+  // The 3gp `loci` box has a 6-byte prefix (4-byte version/flags + 2-byte
+  // language) before the name string (QuickTime.pm: the IText=6 / the box's own
+  // header). ExifTool's `loci` is decoded directly from the box value, where the
+  // 4-byte version/flags + 2-byte pad precede the string.
+  let Some(after_hdr) = body.get(6..) else {
+    return "<err>".to_string();
+  };
+  // Strip the leading name string. A `s///` failure (no terminator) ⇒ `<err>`.
+  let Some((name, rest)) = loci_take_string(after_hdr) else {
+    return "<err>".to_string();
+  };
+  let mut out = if name.is_empty() {
+    "(none)".to_string()
+  } else {
+    name
+  };
+  // `return '<err>' if length $val < 13` (role + 3 fixed32s = 13 bytes).
+  if rest.len() < 13 {
+    return "<err>".to_string();
+  }
+  let role = rest.first().copied().unwrap_or(0);
+  let read_fixed = |off: usize| -> f64 {
+    let raw = rest
+      .get(off..off + 4)
+      .and_then(|b| b.try_into().ok())
+      .map_or(0, i32::from_be_bytes);
+    get_fixed32s(raw)
+  };
+  let lon = read_fixed(1);
+  let lat = read_fixed(5);
+  let alt = read_fixed(9);
+  let role_str = match role {
+    0 => "shooting",
+    1 => "real",
+    2 => "fictional",
+    3 => "reserved",
+    _ => "",
+  };
+  if role_str.is_empty() {
+    out.push_str(&std::format!(" Role=unknown({role})"));
+  } else {
+    out.push_str(" Role=");
+    out.push_str(role_str);
+  }
+  out.push_str(&std::format!(" Lat={lat:.5} Lon={lon:.5} Alt={alt:.2}"));
+  // `$val = substr($val, 13)` then the Body + Notes strings (each optional).
+  let mut tail = rest.get(13..).unwrap_or_default();
+  if let Some((bodytext, after)) = loci_take_string(tail) {
+    out.push_str(" Body=");
+    out.push_str(&bodytext);
+    tail = after;
+  }
+  if let Some((notes, _)) = loci_take_string(tail) {
+    out.push_str(" Notes=");
+    out.push_str(&notes);
+  }
+  out
+}
+
 /// One `data` value decoded from an `ilst` item, with its format flags.
 struct IlstData {
   /// The `data`-atom flags `int32u` (the high byte selects the value format —
@@ -3803,11 +4682,28 @@ fn ilst_data_string(data: &IlstData) -> Option<String> {
 /// loop). Carrying both lets [`apply_key`] reproduce that fallback so keys NOT
 /// in the `com.apple.quicktime` namespace — e.g. `com.android.manufacturer`,
 /// whose table id keeps the `com.` prefix — still resolve.
+///
+/// **Raw vs decoded.** ExifTool's `$tag` is the RAW key BYTES throughout
+/// `ProcessKeys` (QuickTime.pm:9798-9842 — `GetTagInfo` keys the table by the
+/// byte string). A `\xa9`-prefixed 4-cc key id (e.g. `\xa9day` = `0xA9 d a y`,
+/// the `©`-copyright-symbol ItemList/UserData ids) is NOT valid UTF-8, so the
+/// `String` (`from_utf8_lossy`) views replace the `0xA9` with U+FFFD (3 bytes) —
+/// which can NEVER match the literal 4-byte ItemList/UserData id. The cross-table
+/// resolver therefore gates on the RAW byte forms ([`stripped_raw`]/[`full_raw`],
+/// the un-decoded key id), while the `%Keys`/`%AudioKeys` NAME lookups (and the
+/// derive transform, which deletes any non-`[-\w. ]` byte) use the `String`
+/// views — those tables only carry ASCII ids, where the lossy view is identical.
 struct KeyName {
-  /// The key after the `mdta` `s/^com\.(apple\.quicktime\.)?//` strip.
+  /// The key after the `mdta` `s/^com\.(apple\.quicktime\.)?//` strip, as a
+  /// (lossy) `String` for the name-keyed `%Keys`/`%AudioKeys` lookups.
   stripped: String,
-  /// The key as written (before stripping).
+  /// The key as written (before stripping), as a (lossy) `String`.
   full: String,
+  /// The RAW stripped key bytes (no lossy decode) — the literal id the
+  /// ItemList/UserData cross-table is keyed by (preserves a leading `0xA9`).
+  stripped_raw: std::vec::Vec<u8>,
+  /// The RAW full (un-stripped) key bytes.
+  full_raw: std::vec::Vec<u8>,
 }
 
 /// Parse the `keys` box payload into the ordered list of key names
@@ -3832,13 +4728,24 @@ fn parse_keys_box(payload: &[u8]) -> std::vec::Vec<KeyName> {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let truncated = raw.get(..end).unwrap_or_default();
     let full = String::from_utf8_lossy(truncated).into_owned();
-    // QuickTime.pm:9803 — strip the apple quicktime domain for mdta keys.
-    let stripped = if ns == b"mdta" {
-      strip_apple_quicktime_prefix(&full)
+    let full_raw = truncated.to_vec();
+    // QuickTime.pm:9803 — strip the apple quicktime domain for mdta keys. The
+    // strip prefixes are pure ASCII, so the byte strip mirrors the `String` one
+    // (and preserves a non-ASCII `0xA9`-prefixed id for the cross-table gate).
+    let (stripped, stripped_raw) = if ns == b"mdta" {
+      (
+        strip_apple_quicktime_prefix(&full),
+        strip_apple_quicktime_prefix_bytes(truncated).to_vec(),
+      )
     } else {
-      full.clone()
+      (full.clone(), full_raw.clone())
     };
-    keys.push(KeyName { stripped, full });
+    keys.push(KeyName {
+      stripped,
+      full,
+      stripped_raw,
+      full_raw,
+    });
     pos += len;
   }
   keys
@@ -3854,6 +4761,17 @@ fn strip_apple_quicktime_prefix(tag: &str) -> String {
   } else {
     tag.to_string()
   }
+}
+
+/// The byte-level twin of [`strip_apple_quicktime_prefix`] (QuickTime.pm:9803,
+/// operating on the raw key bytes ExifTool's `$tag` holds). Used for the literal
+/// id the ItemList/UserData cross-table is keyed by, so a `0xA9`-prefixed 4-cc id
+/// survives un-decoded (the `String` form would lossily mangle the `0xA9`).
+fn strip_apple_quicktime_prefix_bytes(tag: &[u8]) -> &[u8] {
+  tag
+    .strip_prefix(b"com.apple.quicktime.".as_slice())
+    .or_else(|| tag.strip_prefix(b"com.".as_slice()))
+    .unwrap_or(tag)
 }
 
 /// Walk one `moov/meta` atom payload in a **single, file-order pass**, decoding
@@ -3891,12 +4809,24 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
       // HandlerType = subtype at body offset 8; HandlerVendorID = offset 12
       // (all-zero ⇒ None); HandlerDescription = offset 24 to end (Pascal/C-string).
       b"hdlr" => {
-        qt.set_meta_handler_class(decode_hdlr_class(body));
+        // Each field FoundTag's only when its RawConv yields a DEFINED value, so
+        // a later all-zero field does NOT clobber an earlier defined one (a file
+        // with both a `mdir`+`appl` `udta/meta` box and an empty-vendor `mdta`
+        // `moov/meta` box keeps `HandlerVendorID = "Apple"`). HandlerType is the
+        // exception ExifTool already had (always defined for a known subtype) ⇒
+        // last-wins, which is the existing `if let Some` behavior.
+        if let Some(c) = decode_hdlr_class(body) {
+          qt.set_meta_handler_class(Some(c));
+        }
         if let Some(code) = decode_hdlr(body) {
           qt.set_meta_handler_type(Some(code));
         }
-        qt.set_meta_handler_vendor_id(decode_hdlr_vendor_id(body));
-        qt.set_meta_handler_description(decode_hdlr_description(body));
+        if let Some(v) = decode_hdlr_vendor_id(body) {
+          qt.set_meta_handler_vendor_id(Some(v));
+        }
+        if let Some(d) = decode_hdlr_description(body) {
+          qt.set_meta_handler_description(Some(d));
+        }
       }
       // A `keys` box REPLACES the active key list (see the multi-box note above).
       b"keys" => key_names = parse_keys_box(body),
@@ -3919,9 +4849,65 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
   });
 }
 
-/// Project one resolved `keys` entry onto [`crate::metadata::QuickTimeKeys`],
-/// faithful to the `%QuickTime::Keys` table (QuickTime.pm:6651-6770). Only the
-/// camera/GPS/capture-identity keys are decoded.
+/// Resolve one `moov/udta/meta` `ilst` item by its literal 4-character-code
+/// against the modeled subset of `%QuickTime::ItemList`
+/// (QuickTime.pm:3481-6623), projecting onto [`crate::metadata::QuickTimeItemList`]
+/// (group `ItemList`). Returns `true` when the 4-cc matched a modeled tag.
+///
+/// Two tags are CONV-BEARING (typed fields): `\xa9day` ContentCreateDate
+/// (`%iso8601Date`, QuickTime.pm:3511) and `\xa9xyz` GPSCoordinates
+/// (`ConvertISO6709` + `PrintGPSCoordinates`, QuickTime.pm:6589-6595) — fed the
+/// pre-ValueConv `data`-atom value ([`ilst_data_valueconv_str`]). EVERY OTHER
+/// modeled tag is conv-less (a plain `string`, or — `covr` `Binary => 1` / a
+/// non-string `data` flag — the binary placeholder), routed through the conv-less
+/// `data`-atom cascade ([`ilst_data_convless`]) and stored by table Name.
+fn apply_item_list(
+  item_4cc: &[u8; 4],
+  data: &IlstData,
+  out: &mut crate::metadata::QuickTimeItemList,
+) -> bool {
+  // The conv-less string/binary ItemList tags this port models, keyed by the
+  // literal 4-cc (the `©`-prefixed bytes carry the 0xA9 copyright symbol). All
+  // are plain `'Name'` entries in `%QuickTime::ItemList` with no Format/ValueConv
+  // (or `Binary => 1` for `covr`), so the data-atom flag governs the value.
+  let convless_name: Option<&'static str> = match item_4cc {
+    b"\xa9nam" => Some("Title"),    // QuickTime.pm:3520
+    b"\xa9ART" => Some("Artist"),   // QuickTime.pm:3505
+    b"\xa9too" => Some("Encoder"),  // QuickTime.pm:3521
+    b"\xa9alb" => Some("Album"),    // QuickTime.pm:3506
+    b"\xa9cmt" => Some("Comment"),  // QuickTime.pm:3508
+    b"\xa9gen" => Some("Genre"),    // (plain — the gnre int form is separate)
+    b"\xa9wrt" => Some("Composer"), // QuickTime.pm
+    b"covr" => Some("CoverArt"),    // QuickTime.pm:3549 (Binary => 1)
+    b"desc" => Some("Description"), // QuickTime.pm
+    _ => None,
+  };
+  if let Some(name) = convless_name {
+    out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  match item_4cc {
+    // `\xa9day` ContentCreateDate — `%iso8601Date` (ConvertXMPDate). Fed the
+    // pre-ValueConv data-atom value; a non-date passes through verbatim.
+    b"\xa9day" => {
+      out.set_content_create_date(Some(convert_iso8601_date(&ilst_data_valueconv_str(data))));
+      true
+    }
+    // `\xa9xyz` GPSCoordinates — ConvertISO6709 + PrintGPSCoordinates.
+    b"\xa9xyz" => {
+      out.set_gps(Some(parse_iso6709(&ilst_data_valueconv_str(data))));
+      true
+    }
+    _ => false,
+  }
+}
+
+/// Project one resolved movie-level `keys` entry onto
+/// [`crate::metadata::QuickTimeKeys`] (group `Keys`) through the COMPLETE
+/// `ProcessKeys` order (QuickTime.pm:9806-9854) with `$tagTablePtr =
+/// %QuickTime::Keys`: active `%Keys` table → `%ItemList` → `%UserData` → derive —
+/// the SAME four-step order as the audio-track path ([`apply_audio_key`]), only
+/// with `%Keys` (not `%AudioKeys`) as the active table.
 ///
 /// **Stripped-then-full key fallback (QuickTime.pm:9807-9824).** ExifTool tries
 /// the `mdta`-stripped key first, then the FULL (un-stripped) key. So the
@@ -3930,14 +4916,37 @@ fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickT
 /// (`com.android.version` / `com.android.manufacturer` / `com.android.model`,
 /// whose table ids keep the `com.` prefix) match only the FULL key — the bare
 /// `com.` strip yields `android.*`, which is not a table id.
+///
+/// **Derive on the double-miss (QuickTime.pm:9844-9854).** A movie-level key that
+/// matches NEITHER `%Keys` NOR the ItemList/UserData cross-table is NOT dropped —
+/// `ProcessKeys` derives a CamelCased name from the stripped id and emits it
+/// CONV-LESS under `Keys` (e.g. `acme.totally.bogus.zzz` ⇒
+/// `Keys:AcmeTotallyBogusZzz`), exactly as the AudioKeys path does for `AudioKeys`
+/// (verified vs bundled 13.59).
 fn apply_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadata::QuickTimeKeys) {
+  // (1) The active `%QuickTime::Keys` table: stripped key, then full key.
   if apply_key_name(&key.stripped, data, keys_out) {
     return;
   }
-  // Stripped key did not match a modeled tag — fall back to the FULL key
-  // (skip the redundant retry when stripping was a no-op).
-  if key.full != key.stripped {
-    apply_key_name(&key.full, data, keys_out);
+  if key.full != key.stripped && apply_key_name(&key.full, data, keys_out) {
+    return;
+  }
+  // (2)/(3) ItemList then UserData by the literal 4-cc (QuickTime.pm:9810-9811),
+  // before the derive — the SAME complete ProcessKeys order as the AudioKeys
+  // path. A key whose stripped form is a literal table id (e.g. `manu`/`modl`)
+  // resolves to the ItemList/UserData Name (Make/Model) under the active `Keys`
+  // group, NOT a derived `Keys:Manu`/`Modl`.
+  if apply_keys_cross_table_either(key, data, keys_out) {
+    return;
+  }
+  // (4) Unknown-key auto-tag (QuickTime.pm:9844-9854): a movie-level `%Keys` key
+  // matching NONE of the above is NOT dropped — `ProcessKeys` DERIVES a tag name
+  // from the (stripped) key id and emits it CONV-LESS under group `Keys`, EXACTLY
+  // like the AudioKeys path ([`apply_audio_key`]). So a movie-level
+  // `acme.totally.bogus.zzz` ⇒ `Keys:AcmeTotallyBogusZzz` (verified vs bundled
+  // 13.59). `None` only when the id fails the reasonable-id gate.
+  if let Some(name) = derive_keys_name(&key.stripped) {
+    keys_out.push_convless(name, ilst_data_convless(data));
   }
 }
 
@@ -4001,6 +5010,29 @@ fn apply_key_name(
     "software" => {
       keys_out.push_convless("Software", ilst_data_convless(data));
     }
+    // The ShutterEncoder "preserve metadata" Keys (QuickTime.pm:6830-6832) —
+    // `MajorBrand`/`MinorVersion`/`CompatibleBrands`. `Avoid => 1` (a WRITE
+    // hint only) with no Format/ValueConv ⇒ conv-less. Their `data` atoms store
+    // the human-readable strings directly (`"MP4 v2 [ISO 14496-14]"` /
+    // `"mp42, mp41, …"`), so the cascade yields them verbatim.
+    "major_brand" => {
+      keys_out.push_convless("MajorBrand", ilst_data_convless(data));
+    }
+    "minor_version" => {
+      keys_out.push_convless("MinorVersion", ilst_data_convless(data));
+    }
+    "compatible_brands" => {
+      keys_out.push_convless("CompatibleBrands", ilst_data_convless(data));
+    }
+    // `player.movie.audio.balance` Balance (QuickTime.pm:6745). This is the
+    // MOVIE-level `meta` (`%QuickTime::Keys`) `Keys:Balance` — `player.movie.*`
+    // tuning keys CAN appear in the movie-level Keys box. The audio-TRACK `meta`
+    // resolves Balance through the SEPARATE `%QuickTime::AudioKeys` table
+    // ([`apply_audio_key_name`]), NOT this generic resolver. Conv-less ⇒ the
+    // numeric `data` flag yields the bare number.
+    "player.movie.audio.balance" => {
+      keys_out.push_convless("Balance", ilst_data_convless(data));
+    }
     // Conv-less keys NOT in the com.apple.quicktime namespace (full-key
     // fallback): the table id keeps the `com.`/vendor prefix, so the stripped
     // form does not match and the FULL key resolves here.
@@ -4039,6 +5071,450 @@ fn apply_key_name(
     },
   }
   true
+}
+
+/// ProcessKeys cross-table resolution (QuickTime.pm:9810-9811): after the active
+/// `keys` table (AudioKeys / Keys) misses, ExifTool tries the SAME (stripped)
+/// key id as a literal tag id against `%QuickTime::ItemList` THEN
+/// `%QuickTime::UserData` before deriving an unknown name. So a key whose
+/// stripped form is a literal 4-cc atom id — e.g. `manu` (UserData Make,
+/// QuickTime.pm:1879) or `modl` (UserData Model, QuickTime.pm:1885) — resolves to
+/// that table's tag NAME, NOT a derived `Manu`/`Modl`.
+///
+/// **Group (QuickTime.pm:9826-9842).** The matched ItemList/UserData tagInfo is
+/// COPIED into a fresh Keys tag whose family-1 group is forced to the active keys
+/// group (`Keys` at 9842, overridden to `AudioKeys` by TAG_EXTRA G1 for a `soun`
+/// track). So the resolved tag carries the ItemList/UserData **Name** but the
+/// ACTIVE keys group — here, whichever typed slot / `convless` Name the caller
+/// emits under `audio_group()` / `keys_group()`. This function pushes onto the
+/// shared [`QuickTimeKeys`] sink, so the caller's group is automatically applied.
+///
+/// **Conversions (QuickTime.pm:9826-9833).** The copy takes `Name`, `Format`,
+/// `ValueConv`, `PrintConv` (and `SubDirectory`) — but NOT `RawConv`. So the
+/// UserData `manu`/`modl` RawConv (`s/^\0{4}..//s; s/\0.*//`, the Canon-prefix
+/// strip) is DROPPED: Make/Model carry no Format/ValueConv/PrintConv either, so
+/// the resolved key is CONV-LESS and its value flows through the same
+/// string→numeric→binary `data`-atom cascade ([`ilst_data_convless`]) as any
+/// conv-less key — verified vs bundled 13.59 (`AudioKeys:Make` = the raw atom
+/// value, the 6-byte Canon prefix INTACT, i.e. no RawConv). The two CONV-BEARING
+/// ItemList tags (`\xa9day` ContentCreateDate `%iso8601Date`, `\xa9xyz`
+/// GPSCoordinates `ConvertISO6709`+`PrintGPSCoordinates`) DO copy their ValueConv
+/// ⇒ routed to [`QuickTimeKeys`]'s typed `creation_date` / `gps` slots (which
+/// apply the same conversion at emit under the active group).
+///
+/// Returns `true` when the 4-cc matched an ItemList or UserData tag id (so the
+/// caller does NOT fall through to [`derive_keys_name`]); `false` otherwise.
+fn apply_keys_cross_table(
+  four_cc: &[u8; 4],
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  // (2) %ItemList first (QuickTime.pm:9810). The two CONV-BEARING tags copy their
+  //     ValueConv ⇒ the typed slots; every other modeled ItemList tag is conv-less.
+  match four_cc {
+    // `\xa9day` ContentCreateDate — `%iso8601Date` (ConvertXMPDate). The copied
+    // ValueConv runs on the pre-ValueConv `data` value, emitted under the active
+    // keys group via the `content_create_date` slot. NOTE: this is the ItemList
+    // tag NAME "ContentCreateDate" — DISTINCT from the `%Keys` `creationdate`
+    // ("CreationDate", the `creation_date` slot) — so it must NOT reuse that
+    // slot (ground-truthed vs bundled 13.59: `Keys:ContentCreateDate` /
+    // `AudioKeys:ContentCreateDate`, not `CreationDate`).
+    b"\xa9day" => {
+      keys_out.set_content_create_date(Some(convert_iso8601_date(&ilst_data_valueconv_str(data))));
+      return true;
+    }
+    // `\xa9xyz` GPSCoordinates — ConvertISO6709 + PrintGPSCoordinates (copied
+    // ValueConv) ⇒ the typed `gps` slot.
+    b"\xa9xyz" => {
+      keys_out.set_gps(Some(parse_iso6709(&ilst_data_valueconv_str(data))));
+      return true;
+    }
+    _ => {}
+  }
+  // The conv-less ItemList tags (plain `'Name'`, no copied conversion — `covr` is
+  // `Binary => 1`): emit the Name via the conv-less `data`-atom cascade under the
+  // active keys group. Same id→Name set as [`apply_item_list`]'s conv-less arm.
+  let item_list_name: Option<&'static str> = match four_cc {
+    b"\xa9nam" => Some("Title"),
+    b"\xa9ART" => Some("Artist"),
+    b"\xa9too" => Some("Encoder"),
+    b"\xa9alb" => Some("Album"),
+    b"\xa9cmt" => Some("Comment"),
+    b"\xa9gen" => Some("Genre"),
+    b"\xa9wrt" => Some("Composer"),
+    b"covr" => Some("CoverArt"),
+    b"desc" => Some("Description"),
+    _ => None,
+  };
+  if let Some(name) = item_list_name {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  // (3) %UserData (QuickTime.pm:9811). The plain-4-cc identity tags from
+  //     [`walk_udta`] — their RawConv / `string`-NUL-decode is NOT copied by
+  //     ProcessKeys, so each is CONV-LESS here and emits its Name through the
+  //     same `data`-atom cascade. (The `©`-prefixed international-text UserData
+  //     atoms can be keys too, so the generated map and the hand 0xA9 names are
+  //     consulted alongside the plain ids.)
+  let user_data_name: Option<&'static str> = match four_cc {
+    // Canon SX280 / Samsung GT-S8530 (QuickTime.pm:1879/1885) — the central case.
+    b"manu" => Some("Make"),
+    b"modl" => Some("Model"),
+    // Other plain-string identity ids resolved by [`walk_udta`].
+    b"cmnm" | b"CNMN" => Some("Model"),
+    b"slno" | b"SNum" => Some("SerialNumber"),
+    b"CNFV" | b"info" | b"FIRM" => Some("FirmwareVersion"),
+    b"CNCV" => Some("CompressorVersion"),
+    b"cmid" => Some("CameraID"),
+    // The `©`-prefixed plain-Name UserData atoms hand-ported in [`walk_udta`]
+    // (the generated map covers `©mal`/`©gpt`/`©gyw`/`©grl`/`©fmt`/`©inf` etc.).
+    b"\xa9mak" => Some("Make"),
+    b"\xa9mod" | b"\xa9mdl" => Some("Model"),
+    b"\xa9swr" => Some("Software"),
+    b"\xa9nam" => Some("Title"),
+    b"\xa9cmt" => Some("Comment"),
+    b"\xa9cpy" => Some("Copyright"),
+    _ => None,
+  };
+  if let Some(name) = user_data_name {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  // The generated conv-less UserData map (`GoPr`/`LENS`/`FOV\0` + the `©…`
+  // international-text names): a bare `'Name'` ⇒ conv-less, same cascade.
+  if let Some(name) = userdata_convless_name(four_cc) {
+    keys_out.push_convless(name, ilst_data_convless(data));
+    return true;
+  }
+  false
+}
+
+/// Resolve one audio-track `meta`(`mdta`) `keys` entry through
+/// `%QuickTime::AudioKeys` (QuickTime.pm:6895-6917) — the SEPARATE table the
+/// `keys` `Condition => '$$self{MediaType} eq "soun"'` (QuickTime.pm:2867-2870)
+/// selects for a `soun` track. This mirrors `ProcessKeys` (QuickTime.pm:9795-
+/// 9868) with `$tagTablePtr = %AudioKeys`, NOT the generic `%QuickTime::Keys`
+/// resolver ([`apply_key_name`]):
+///
+///   1. **AudioKeys table lookup** (stripped key, then full key — the
+///      QuickTime.pm:9807-9824 `for(;;)` fallback): the 6 members resolve via
+///      [`apply_audio_key_name`] (`Mute` keeps its int8u Format + `Off`/`On`
+///      PrintConv; the other five are conv-less).
+///   2. **Cross-table ItemList/UserData lookup** (QuickTime.pm:9810-9811): the
+///      same (stripped, then full) key id is tried as a literal tag id against
+///      `%QuickTime::ItemList` then `%QuickTime::UserData` BEFORE deriving — see
+///      [`apply_keys_cross_table`]. A key whose stripped form is a literal 4-cc
+///      atom id (e.g. `manu`/`modl`) resolves to the ItemList/UserData **Name**
+///      (Make/Model), emitted under the ACTIVE `AudioKeys` group (NOT a derived
+///      `AudioKeys:Manu`/`Modl`).
+///   3. **Unknown-key auto-tag** (QuickTime.pm:9844-9854): a key matching NONE of
+///      the above is NOT dropped — `ProcessKeys` DERIVES a tag name from the
+///      (stripped) key id ([`derive_keys_name`]) and emits it CONV-LESS under
+///      group `AudioKeys` (the `for(;;)` loop resets `$tag` to the stripped
+///      `$short` before the `AddTagToTable`, line 9819-9822). So `make` ⇒
+///      `AudioKeys:Make`, `creationdate` ⇒ `AudioKeys:Creationdate` (the RAW
+///      string — NOT the `%Keys` date ValueConv), `acme.totally.bogus.zzz` ⇒
+///      `AudioKeys:AcmeTotallyBogusZzz` — verified vs bundled 13.59. This is the
+///      key difference from the generic `%Keys` resolver, which would apply the
+///      `%Keys` conversions and drop non-identity keys.
+fn apply_audio_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadata::QuickTimeKeys) {
+  // 1. AudioKeys table: stripped key, then full key (the `for(;;)` fallback).
+  if apply_audio_key_name(&key.stripped, data, keys_out) {
+    return;
+  }
+  if key.full != key.stripped && apply_audio_key_name(&key.full, data, keys_out) {
+    return;
+  }
+  // 2. ItemList then UserData, by the literal 4-cc — stripped key, then full key
+  //    (the `for(;;)` loop runs the cross-table lookup with both forms). Only an
+  //    exactly-4-byte key id can be a literal table id. The resolved Name is
+  //    emitted under the active `AudioKeys` group (the shared `keys_out` sink).
+  if apply_keys_cross_table_either(key, data, keys_out) {
+    return;
+  }
+  // 3. No table matched ⇒ derive the name from the STRIPPED key (the `$short` the
+  //    loop restores, QuickTime.pm:9805/9819-9822) and emit conv-less. `None`
+  //    only when the id fails the reasonable-id gate.
+  if let Some(name) = derive_keys_name(&key.stripped) {
+    keys_out.push_convless(name, ilst_data_convless(data));
+  }
+}
+
+/// The cross-table lookup ([`apply_keys_cross_table`]) over BOTH key forms — the
+/// `mdta`-stripped id first, then the full id — mirroring ExifTool's `for(;;)`
+/// loop (QuickTime.pm:9806-9824), which re-runs `GetTagInfo($itemList/$userData,
+/// $tag)` once with `$tag = $short` and once with `$tag = $full`. A literal table
+/// id is exactly 4 bytes, so only a 4-byte key form can match; the gate skips any
+/// other-length form. Returns `true` when either form resolved against ItemList
+/// or UserData.
+///
+/// **Reversed-id form (QuickTime.pm:9812-9818).** ExifTool has samples where the
+/// key id is a BYTE-REVERSED ItemList/UserData id: after the forward ItemList +
+/// UserData lookups for the current `$tag` both miss, if `$tag =~ /^\w{3}\xa9$/`
+/// (3 word chars then `0xA9`) it byte-reverses the id (`pack('N', unpack('V',
+/// $tag))` — a plain 4-byte reversal) and tries ItemList THEN UserData once more,
+/// then `last`s unconditionally (line 9817). So `yad\xa9` (the reversed `\xa9day`)
+/// resolves to the ItemList `ContentCreateDate` (ground-truthed vs bundled 13.59).
+/// The reversed lookup is tried per-form, in the SAME `$tag = $short` then
+/// `$tag = $full` order as the forward attempts.
+///
+/// **Why the matched pattern always returns `true` (consumes the key).** ExifTool
+/// `last`s after the reversed attempt regardless of its outcome (line 9817), so on
+/// a reversed-id key it NEVER reaches the `$tag = $full` reset (the full form is
+/// not retried) NOR the normal unknown-key DERIVE on the stripped id. On a reversed
+/// MISS, the `$tag` carried into the derive gate (9844) is the reversed `\xa9xxx`,
+/// which ALWAYS fails it (`0xA9` is outside `[-\w. ]` and a `\xa9`+3-char id has no
+/// run of 4 word chars) ⇒ ExifTool emits nothing. So in BOTH the reversed-hit and
+/// reversed-miss sub-cases the key is CONSUMED here (the caller must not derive
+/// from the un-reversed stripped id); only the un-reversed forward path falls
+/// through to [`derive_keys_name`].
+///
+/// The RAW key bytes ([`KeyName::stripped_raw`]/[`full_raw`]) are matched, NOT the
+/// lossy `String` — a `0xA9`-prefixed 4-cc id (`\xa9day`/`\xa9xyz`/`\xa9too`, the
+/// `©`-symbol ItemList/UserData ids) is invalid UTF-8 whose `String` form is a
+/// 6-byte U+FFFD sequence that could never match the 4-byte table id.
+fn apply_keys_cross_table_either(
+  key: &KeyName,
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  if let Ok(cc) = <&[u8; 4]>::try_from(key.stripped_raw.as_slice()) {
+    if apply_keys_cross_table(cc, data, keys_out) {
+      return true;
+    }
+    // QuickTime.pm:9812-9818: the reversed-id ItemList/UserData lookup. A matched
+    // `^\w{3}\xa9$` id CONSUMES the key (ExifTool `last`s here, and a reversed
+    // miss derives nothing) — so the full-form lookup below is skipped too.
+    if let Some(rev) = reversed_a9_id(cc) {
+      apply_keys_cross_table(&rev, data, keys_out);
+      return true;
+    }
+  }
+  if key.full_raw != key.stripped_raw {
+    if let Ok(cc) = <&[u8; 4]>::try_from(key.full_raw.as_slice()) {
+      if apply_keys_cross_table(cc, data, keys_out) {
+        return true;
+      }
+      if let Some(rev) = reversed_a9_id(cc) {
+        apply_keys_cross_table(&rev, data, keys_out);
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// The reversed-id transform of QuickTime.pm:9813-9814. Returns the BYTE-REVERSED
+/// 4-cc when `cc` matches `^\w{3}\xa9$` (bytes 0-2 are word chars `[A-Za-z0-9_]`
+/// and byte 3 is `0xA9`), else `None`. `pack('N', unpack('V', $tag))` reads the id
+/// little-endian and writes it big-endian — a plain 4-byte reversal — so
+/// `[a, b, c, 0xA9]` ⇒ `[0xA9, c, b, a]` (e.g. `yad\xa9` ⇒ `\xa9day`).
+fn reversed_a9_id(cc: &[u8; 4]) -> Option<[u8; 4]> {
+  let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+  if cc[3] == 0xA9 && is_word(cc[0]) && is_word(cc[1]) && is_word(cc[2]) {
+    Some([cc[3], cc[2], cc[1], cc[0]])
+  } else {
+    None
+  }
+}
+
+/// Resolve a single key NAME against `%QuickTime::AudioKeys` (the audio-track
+/// `keys` table, QuickTime.pm:6907-6916). Returns `true` when the name matched a
+/// table entry. The five plain entries (`AudioGain`/`Treble`/`Bass`/`Balance`/
+/// `PitchShift`, QuickTime.pm:6907-6911) are bare `'Name'` mappings — NO Format,
+/// NO ValueConv ⇒ conv-less, routed through the SAME full string→numeric→binary
+/// `data`-atom cascade as the Keys table ([`ilst_data_convless`]). `Mute`
+/// (QuickTime.pm:6912-6916) is the SOLE conv-bearing entry: `Format => 'int8u'`
+/// + `PrintConv => { 0 => 'Off', 1 => 'On' }`, read via [`read_audio_mute`] and
+/// rendered with the PrintConv at emit. A name NOT in this 6-key set returns
+/// `false` so the caller falls through to the unknown-key derive path.
+fn apply_audio_key_name(
+  name: &str,
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  match name {
+    // The five conv-less AudioKeys (bare `'Name'`, no Format/ValueConv). Each
+    // shares the `player.movie.audio.*` key strings with `%QuickTime::Keys`
+    // (QuickTime.pm:6742-6746), but is resolved HERE under group `AudioKeys`.
+    "player.movie.audio.gain" => {
+      keys_out.push_convless("AudioGain", ilst_data_convless(data));
+    }
+    "player.movie.audio.treble" => {
+      keys_out.push_convless("Treble", ilst_data_convless(data));
+    }
+    "player.movie.audio.bass" => {
+      keys_out.push_convless("Bass", ilst_data_convless(data));
+    }
+    "player.movie.audio.balance" => {
+      keys_out.push_convless("Balance", ilst_data_convless(data));
+    }
+    "player.movie.audio.pitchshift" => {
+      keys_out.push_convless("PitchShift", ilst_data_convless(data));
+    }
+    // `player.movie.audio.mute` Mute — `Format => 'int8u'`, `PrintConv => { 0 =>
+    // 'Off', 1 => 'On' }`. Store the pre-PrintConv read (int8u number for a
+    // numeric flag, decoded string for a string flag); the PrintConv is applied
+    // at emit. Last-wins (a second `mute` overwrites), matching the single typed
+    // FoundTag slot. A `data` atom with no usable read yields `None` ⇒ no tag.
+    "player.movie.audio.mute" => {
+      if let Some(v) = read_audio_mute(data) {
+        keys_out.set_mute(Some(v));
+      }
+    }
+    _ => return false,
+  }
+  true
+}
+
+/// Derive a Keys/AudioKeys tag NAME from an unknown (table-miss) key id, faithful
+/// to `ProcessKeys` (QuickTime.pm:9844-9854). The id is the `mdta`-STRIPPED key.
+/// Returns `None` when the id fails ExifTool's reasonable-id gate
+/// (`/^[-\w. ]+$/ or /\w{4}/`, line 9844) — such a key adds no tag.
+///
+/// The transform (QuickTime.pm:9846-9851), in order:
+///   1. `ucfirst` the id.
+///   2. `tr/-0-9a-zA-Z_. //dc` — DELETE every char not in `[-0-9A-Za-z_. ]`.
+///   3. `s/[. ]+(.?)/\U$1/g` — collapse runs of `.`/space, upper-casing the next
+///      char (CamelCase the dotted/spaced path; a trailing run drops to "").
+///   4. `s/_([a-z])/_\U$1/g` — upper-case a lower-case char right after `_`.
+///   5. `s/([a-z])_([A-Z])/$1$2/g` — drop a `_` between a lower and an upper.
+///   6. `"Tag_$name"` when the result is shorter than 2 chars.
+fn derive_keys_name(stripped: &str) -> Option<String> {
+  // An empty stripped key would be `Tag_$ns` (= `Tag_mdta`) at QuickTime.pm:9804
+  // before the gate; reproduce that so an empty audio key still tags.
+  if stripped.is_empty() {
+    return Some("Tag_mdta".to_string());
+  }
+  // Reasonable-id gate (QuickTime.pm:9844): all chars in `[-\w. ]`, OR there is
+  // a run of >=4 word chars somewhere. `\w` is `[A-Za-z0-9_]`.
+  let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+  let all_reasonable = stripped
+    .chars()
+    .all(|c| is_word(c) || c == '-' || c == '.' || c == ' ');
+  let has_word4 = stripped.as_bytes().windows(4).any(|w| {
+    w.iter()
+      .all(|&b| (b as char).is_ascii_alphanumeric() || b == b'_')
+  });
+  if !all_reasonable && !has_word4 {
+    return None;
+  }
+
+  // 1. ucfirst.
+  let mut name = String::with_capacity(stripped.len());
+  {
+    let mut chars = stripped.chars();
+    if let Some(first) = chars.next() {
+      name.extend(first.to_uppercase());
+      name.push_str(chars.as_str());
+    }
+  }
+  // 2. tr/-0-9a-zA-Z_. //dc — keep only `[-0-9A-Za-z_. ]`.
+  name.retain(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '));
+  // 3. s/[. ]+(.?)/\U$1/g — collapse `.`/space runs, upper-casing the next char.
+  name = collapse_dot_space_upper(&name);
+  // 4. s/_([a-z])/_\U$1/g — upper-case the char after `_`.
+  name = upper_after_underscore(&name);
+  // 5. s/([a-z])_([A-Z])/$1$2/g — drop `_` between a lower and an upper.
+  name = drop_underscore_between_lower_upper(&name);
+  // 6. `Tag_` prefix when < 2 chars (QuickTime.pm:9851).
+  if name.chars().count() < 2 {
+    name = std::format!("Tag_{name}");
+  }
+  Some(name)
+}
+
+/// `s/[. ]+(.?)/\U$1/g` — replace each maximal run of `.`/space (plus the single
+/// following char, if any) with the upper-cased following char.
+fn collapse_dot_space_upper(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  let mut chars = s.chars().peekable();
+  while let Some(c) = chars.next() {
+    if c == '.' || c == ' ' {
+      // Consume the rest of the `[. ]+` run.
+      while matches!(chars.peek(), Some('.') | Some(' ')) {
+        chars.next();
+      }
+      // `(.?)` — the next char (any), upper-cased; an end-of-string run vanishes.
+      if let Some(next) = chars.next() {
+        out.extend(next.to_uppercase());
+      }
+    } else {
+      out.push(c);
+    }
+  }
+  out
+}
+
+/// `s/_([a-z])/_\U$1/g` — upper-case an ASCII lower-case char immediately after `_`.
+fn upper_after_underscore(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  let mut chars = s.chars().peekable();
+  while let Some(c) = chars.next() {
+    out.push(c);
+    if c == '_'
+      && let Some(&n) = chars.peek()
+      && n.is_ascii_lowercase()
+    {
+      out.push(n.to_ascii_uppercase());
+      chars.next();
+    }
+  }
+  out
+}
+
+/// `s/([a-z])_([A-Z])/$1$2/g` — drop a `_` sitting between an ASCII lower-case
+/// and an ASCII upper-case char (non-overlapping, left-to-right like Perl `/g`).
+fn drop_underscore_between_lower_upper(s: &str) -> String {
+  let chars: std::vec::Vec<char> = s.chars().collect();
+  let mut out = String::with_capacity(s.len());
+  let mut i = 0usize;
+  while let Some(&c) = chars.get(i) {
+    // A lower `_` Upper triple collapses to lower+Upper (drop the `_`); Perl's
+    // non-overlapping `/g` then resumes AFTER the matched triple.
+    if c.is_ascii_lowercase()
+      && chars.get(i + 1) == Some(&'_')
+      && chars.get(i + 2).is_some_and(|n| n.is_ascii_uppercase())
+    {
+      out.push(c);
+      if let Some(&up) = chars.get(i + 2) {
+        out.push(up);
+      }
+      i += 3;
+    } else {
+      out.push(c);
+      i += 1;
+    }
+  }
+  out
+}
+
+/// Read a `%QuickTime::AudioKeys` `Mute` (`Format => 'int8u'`) `data`-atom value
+/// into its pre-PrintConv [`TagValue`], faithful to `ProcessMOV`'s Format-aware
+/// branch (QuickTime.pm:10396-10410). A `%stringEncoding` flag decodes as a
+/// string (QuickTime.pm:10396-10400 — the table `Format` is bypassed for a
+/// string flag); otherwise the explicit `int8u` Format reads via `ReadValue`,
+/// length-adjusted (QuickTime.pm:10404-10410: `{1=>int8,2=>int16,4=>int32}` —
+/// `int8u` stays `int8u` for a 1-byte atom and reads byte 0). Returns `None`
+/// when neither a string nor a usable integer can be read (an empty `data`), so
+/// the caller records no tag.
+fn read_audio_mute(data: &IlstData) -> Option<crate::value::TagValue> {
+  use crate::value::TagValue;
+  // String-encoding flag ⇒ the decoded string (Format bypassed, QuickTime.pm:10396).
+  if let Some(s) = ilst_data_string(data) {
+    return Some(TagValue::Str(s.into()));
+  }
+  // Otherwise `int8u` via `ReadValue`, length-adjusted EXACTLY as ExifTool:
+  // `{ 1=>int8, 2=>int16, 4=>int32 }->{$len}` (QuickTime.pm:10406) — len 1
+  // reads int8u, len 2 int16u, len 4 int32u. For ANY OTHER length (0/3/5/…)
+  // `$fmt` is undef so `$format` STAYS the table `int8u` and `ReadValue` reads a
+  // single int8u = byte 0 (so a 3-byte atom reads its first byte, not nothing).
+  let read_len = match data.bytes.len() {
+    2 => 2,
+    4 => 4,
+    _ => 1,
+  };
+  read_be_int_unsigned(&data.bytes, read_len).map(TagValue::U64)
 }
 
 /// Decode a conv-less `Keys`/`ItemList` `data`-atom value — a tag with NO
@@ -4914,6 +6390,31 @@ pub struct Meta<'a> {
   /// Surfaces as an `ExifTool:Warning` so the gap is visible (see
   /// `docs/tracking.md`).
   embedded_exif_deferred: bool,
+  /// The embedded XMP packet decoded from a top-level `uuid` box (the canonical
+  /// XMP-in-MP4 location, QuickTime.pm:155-163 `%QuickTime::Main` `uuid` → the
+  /// `Image::ExifTool::XMP::Main` SubDirectory). Routed to the shared
+  /// [`crate::formats::xmp`] parser exactly like a `.xmp` sidecar, so its
+  /// `XMP-*` tags (`XMP-tiff:Make`, `XMP-exif:GPSLatitude`, …) ride QuickTime's
+  /// `tags()` under family-0 `XMP`. `None` when the file carries no XMP `uuid`
+  /// box (the common case). `XmpMeta` owns its decoded strings (the input is
+  /// transcoded to owned `String`s); the `'a` is the GAT lifetime anchor only.
+  #[cfg(feature = "xmp")]
+  embedded_xmp: Option<crate::formats::xmp::XmpMeta<'a>>,
+  /// The absolute file offset of the FIRST warning-producing top-level
+  /// `uuid`-XMP atom (`None` when no XMP `uuid` box warned). Lets
+  /// [`Self::diagnostics`] rank an embedded-XMP `ProcessXMP` warning against the
+  /// other document-level warnings: ExifTool sets `PRIORITY_DIR = 'XMP'` in
+  /// `ProcessMOV` for every container EXCEPT `HEIC` (QuickTime.pm:10016), so the
+  /// XMP `Warning` is priority-1 (and unconditionally owns the bare
+  /// `ExifTool:Warning`) for MP4/MOV/HEIF/AVIF/… but priority-0 (competes by
+  /// this walk offset, first-wins) for `HEIC`. The bare XMP `Warning` is
+  /// first-wins by file order across multiple packets; this offset follows the
+  /// SAME order (the first packet that warns owns BOTH the text and the
+  /// position), so an intervening non-XMP doc warning can outrank a later XMP
+  /// warning on `HEIC` — NOT the first XMP atom's offset, which would
+  /// misplace the warning earlier than where `ProcessXMP` actually raised it.
+  #[cfg(feature = "xmp")]
+  embedded_xmp_offset: Option<u64>,
   /// The detected file type + MIME, derived from `ftyp` (or the MOV
   /// default). Drives [`crate::format_parser::FileTypeFinalize`].
   file_type: &'static str,
@@ -5268,6 +6769,7 @@ impl Meta<'_> {
     use crate::metadata::{CameraInfo, GpsLocation};
     let ud = self.qt.user_data();
     let keys = self.qt.keys();
+    let item_list = self.qt.item_list();
 
     // ── CameraInfo (make / model / software) — Keys over UserData ──────
     if md.camera().is_none() {
@@ -5289,20 +6791,46 @@ impl Meta<'_> {
 
     // ── Capture date (CreationDate / ContentCreateDate) ────────────────
     // `MediaInfo::created` is set by `from_quicktime` from the `mvhd`
-    // CreateDate; the explicit camera capture date (the iOS `creationdate`,
-    // else `©day`) is a higher-quality signal, so override it here.
-    if let Some(date) = keys.creation_date().or_else(|| ud.content_create_date()) {
+    // CreateDate; the explicit camera capture date is a higher-quality signal,
+    // so override it here. Precedence follows the ExifTool tag chain:
+    //   1. `Keys:CreationDate` (the dedicated iOS `com.apple.quicktime.
+    //      creationdate`, with timezone) — the single best capture timestamp.
+    //   2. ContentCreateDate (the `©day` tag NAME, shared by the ItemList /
+    //      UserData / Keys tables) in PREFERRED order: ItemList (PREFERRED => 2,
+    //      QuickTime.pm:3486) over UserData (PREFERRED => 1, QuickTime.pm:1591)
+    //      over the cross-table `Keys:ContentCreateDate` (the reversed-id /
+    //      raw-`\xa9day` keys landing, no PREFERRED). So an Android / drone file
+    //      whose capture date lives ONLY in `ItemList:ContentCreateDate`
+    //      (e.g. the Parrot ANAFI — a LOCAL-time `©day`, distinct from the UTC
+    //      `mvhd` CreateDate) surfaces that local capture date here.
+    if let Some(date) = keys
+      .creation_date()
+      .or_else(|| item_list.content_create_date())
+      .or_else(|| ud.content_create_date())
+      .or_else(|| keys.content_create_date())
+    {
       md.media_mut().update_created(Some(date.to_string()));
     }
 
-    // ── GpsLocation — Keys `location.ISO6709` over `©xyz` ──────────────
-    // Only a DECODED coordinate (numeric lat/lon) projects a `GpsLocation`; a
-    // present-but-undecodable value still emits the `GPSCoordinates` tag (the
-    // raw string) but carries no usable lat/lon, so it is skipped here.
+    // ── GpsLocation — GPSCoordinates across the ItemList / UserData / Keys
+    //    tables ─────────────────────────────────────────────────────────
+    // `GPSCoordinates` is the SAME tag NAME in all three tables (ItemList
+    // `\xa9xyz` QuickTime.pm:6590, UserData `\xa9xyz` :1659, Keys
+    // `location.ISO6709` :6702), so its read-priority is the PREFERRED order:
+    // ItemList (2) over
+    // UserData (1) over Keys (0) — i.e. the Composite `GPSPosition`'s
+    // `QuickTime:GPSCoordinates` resolves to the ItemList value when present.
+    // (`keys.gps()` is BOTH `location.ISO6709` and the cross-table `\xa9xyz`
+    // landing.) Only a DECODED coordinate (numeric lat/lon) projects a
+    // `GpsLocation`; a present-but-undecodable value still emits the
+    // `GPSCoordinates` tag (the raw string) but carries no usable lat/lon, so it
+    // is skipped here. So a file whose GPS lives ONLY in `ItemList:GPSCoordinates`
+    // (the Parrot ANAFI) surfaces its location through the public projection.
     if md.gps().is_none()
-      && let Some((lat, lon, alt)) = keys
+      && let Some((lat, lon, alt)) = item_list
         .gps()
         .or_else(|| ud.gps())
+        .or_else(|| keys.gps())
         .and_then(QuickTimeGps::coords)
     {
       let mut loc = GpsLocation::new();
@@ -5580,6 +7108,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // at the offending atom — so a single check after the per-atom decode (plus
   // capture in the early-`break` error arms) records the right position.
   let mut warning_offset: Option<u64> = None;
+  // The embedded XMP packet from a top-level `uuid` box (QuickTime.pm:155-163),
+  // decoded in file order at its atom position. `None` until an XMP-signature
+  // `uuid` is reached.
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp: Option<crate::formats::xmp::XmpMeta<'a>> = None;
+  // The first WARNING-PRODUCING XMP `uuid` atom's body offset — see
+  // [`Meta::embedded_xmp_offset`].
+  #[cfg(feature = "xmp")]
+  let mut embedded_xmp_offset: Option<u64> = None;
   let mut pos = 0usize;
   while pos < scan_end {
     match read_atom_header(scan_data, pos, true) {
@@ -5626,6 +7163,101 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // Pass 1 so `KodakVersion` is populated BEFORE the `mdat` freeGPS
           // scan (which reads it to apply the Type-17b lat/lon scaling).
           b"frea" => decode_frea(body, &mut qt, &mut warning),
+          // The top-level `free` atom (QuickTime.pm:563-573 `%QuickTime::Main`
+          // Condition list). The in-scope arm is `Pittasoft` (BlackVue dashcam
+          // "free" data) — gated by [`looks_like_pittasoft`] (the KodakFree
+          // `Seri` and DJI-thermal `mdat` arms precede it but are out of scope).
+          // A non-Pittasoft `free` (plain padding / a freeGPS-bearing block the
+          // `mdat` scan handles) is a no-op here.
+          b"free" if looks_like_pittasoft(body) => {
+            // #159/#361 — the `3gf ` no-`ee` `EEWarn` is a DOCUMENT-level warning
+            // raised during this `free`/Pittasoft subdirectory walk. Stamp the
+            // file offset so `Meta::diagnostics` ranks it against a LATER
+            // truncated-`mdat` `ProcessMOV` warning by file position (the free
+            // atom precedes `mdat`, so the earlier EEWarn wins the bare
+            // `ExifTool:Warning`). The doc-level channel — NOT a `Track<N>` group —
+            // because the `free` atom is not a `trak` (no `SET_GROUP1` active).
+            //
+            // ExifTool's `Warn` adds each warning message ONCE, at the first
+            // call site (ExifTool.pm:5635-5639 — a repeat hits the `WAS_WARNED`
+            // cache and only bumps the count, never re-`FoundTag`s). So the
+            // `EEWarn`'s bare-`Warning` position is the offset of the FIRST
+            // `free`/Pittasoft atom whose `3gf ` actually RAISES it. Because
+            // `ee_warn` is sticky, stamp the offset ONLY when THIS atom is the
+            // raiser — the `false→true` transition across this decode — and only
+            // while still unset (`is_none`, a first-wins guard so a later raiser
+            // never overwrites the first); mirroring the embedded-XMP `uuid`
+            // first-warning-wins `get_or_insert` offset below.
+            let raised_before = qt.pittasoft().ee_warn();
+            decode_free_pittasoft(body, &mut qt, &mut warning);
+            if qt.pittasoft().ee_warn()
+              && !raised_before
+              && qt.pittasoft().ee_warn_offset().is_none()
+            {
+              qt.pittasoft_mut().set_ee_warn_offset(Some(pos as u64));
+            }
+          }
+          // The top-level `skip` atom (QuickTime.pm:631-636 `%QuickTime::Main`
+          // Condition list ⇒ `Image::ExifTool::QuickTime::SkipInfo` for a body
+          // that looks like a QuickTime atom header) — the 70mai/Viofo A119
+          // `'ver '` Version + `thma` ThumbnailImage. A non-SkipInfo `skip`
+          // (plain padding) is a no-op (the Condition fails inside `decode_skip`).
+          b"skip" => decode_skip(body, &mut qt, &mut warning),
+          // The top-level `uuid` XMP box (QuickTime.pm:155-163 `%QuickTime::Main`
+          // `uuid` Condition `$$valPt=~/^\xbe\x7a\xcf\xcb…/` → the
+          // `Image::ExifTool::XMP::Main` SubDirectory — "this is where ExifTool
+          // writes XMP in MP4 videos as per the XMP spec"). The XMP packet
+          // follows the 16-byte UUID; route it to the shared XMP parser, exactly
+          // like a `.xmp` sidecar. A non-XMP `uuid` (Canon CR3, C2PA, …) is left
+          // to the brand walkers / the embedded-Exif detector below.
+          //
+          // ExifTool's `ProcessMOV` atom loop (QuickTime.pm:10032) has NO
+          // `uuid` de-dup — it dispatches EVERY top-level `uuid` atom through the
+          // tag table (`uuid` is even listed in `%dupTagOK`, QuickTime.pm:506),
+          // running `XMP::ProcessXMP` once per XMP packet and ACCUMULATING the
+          // tags (`FoundTag` never drops a duplicate, ExifTool.pm:9514-9596). So
+          // a file with >1 XMP `uuid` is faithful only if ALL packets are
+          // processed: parse each and APPEND its tags in file order (the first
+          // seeds `embedded_xmp`; each later one is absorbed via
+          // [`XmpMeta::absorb_additional_packet`], which concatenates tags so the
+          // downstream last-wins dedup reproduces ExifTool's equal-priority
+          // "later atom owns the bare tag key" resolution). Real files normally
+          // carry exactly one (the anafi fixture has one); the multi-packet path
+          // is covered by `xmp::tests::absorb_additional_packet_*`.
+          #[cfg(feature = "xmp")]
+          b"uuid" if body.get(..16) == Some(&XMP_UUID[..]) => {
+            if let Some(packet) = body.get(16..) {
+              // `true` when THIS `uuid` atom's packet is the one that produced the
+              // adopted `ExifTool:Warning` (the seed packet warned, OR every
+              // earlier packet was clean and this one warns — first-warning-wins
+              // by file order, mirroring `FoundTag('Warning')` priority-0).
+              let this_packet_owns_warning = match (
+                &mut embedded_xmp,
+                crate::formats::xmp::parse_borrowed(packet),
+              ) {
+                (slot @ None, parsed) => {
+                  let warned = parsed.as_ref().is_some_and(|p| p.warning().is_some());
+                  *slot = parsed;
+                  warned
+                }
+                (Some(existing), Some(parsed)) => existing.absorb_additional_packet(parsed),
+                (Some(_), None) => false,
+              };
+              // Record the offset of the FIRST warning-PRODUCING XMP `uuid` atom
+              // (NOT merely the first XMP atom) so `diagnostics` can rank an
+              // embedded-XMP `ProcessXMP` warning against the other doc-level
+              // warnings by file position when the container is `HEIC` (the
+              // priority-0 case; QuickTime.pm:10016). The bare `Warning` is
+              // first-wins by file order; its offset must follow the SAME order —
+              // so when packet 1 is clean and packet 3 warns, the recorded
+              // position is packet 3's atom, letting an intervening HEIF `iinf`
+              // warning correctly outrank the later XMP warning. For non-`HEIC`
+              // the XMP warning is priority-1 and wins regardless of offset.
+              if this_packet_owns_warning {
+                embedded_xmp_offset.get_or_insert(header.payload_start as u64);
+              }
+            }
+          }
           b"mdat" => {
             // QuickTime.pm:10158-10160 — the synthetic `mdat-size`/`mdat-offset`
             // tags: payload byte count + absolute payload file offset.
@@ -5753,6 +7385,17 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `trak/udta/meta`, `mdia/hdlr` or `minf/hdlr` updates it as the walk reaches
   // each — read ONLY at `stsd`-decode time, so NO source is missed.
   let mut handler_so_far: Option<String> = None;
+  // **#348 — the FILE-GLOBAL `HasHandler` set** (`$$self{HasHandler}`,
+  // QuickTime.pm:8414): EVERY NON-track `meta`-box `hdlr` code the walk encounters
+  // at ANY level (file-level `meta`, `moov/meta`, `moov/udta/meta`, `trak/meta`,
+  // `trak/udta/meta`), collected here in file order. The per-track `mdia/hdlr` +
+  // `minf/hdlr` codes are NOT duplicated into this Vec — they already live on each
+  // [`MediaTrack::all_handler_codes`] — so the file-global `HasHandler` set is the
+  // UNION of this Vec and every track's `all_handler_codes` (computed below in the
+  // MP4→M4A `has_handler` closure). A `meta/hdlr` = `soun` with no `soun` `trak`
+  // therefore still flips MP4→M4A, and a non-track `meta/hdlr` = `vide` suppresses
+  // the override on an audio-only file (ground-truthed vs bundled ExifTool 13.59).
+  let mut file_handlers: Vec<String> = Vec::new();
   let mut pos = 0usize;
   while pos < scan_end {
     // A top-level size-0 atom (`ExtendsToEof`) STOPS the walk with NO payload
@@ -5777,12 +7420,23 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       // (Keys/ItemList) are decoded elsewhere; here we read ONLY its routing
       // handler.
       b"meta" => {
+        // A FILE-LEVEL `meta` `hdlr` enters the file-global `HasHandler` set
+        // (QuickTime.pm:8414, incl. `alis`/`url `) — so a top-level `meta/hdlr` =
+        // `soun` with no `trak` still drives the MP4→M4A override.
+        collect_meta_box_handler_codes(body, 4, &mut file_handlers);
         if let Some(h) = meta_box_routing_handler(body, 4) {
           handler_so_far = Some(h);
         }
       }
       b"moov" => {
-        decode_moov_trak(body, movie_ts, &mut qt, &mut warning, &mut handler_so_far);
+        decode_moov_trak(
+          body,
+          movie_ts,
+          &mut qt,
+          &mut warning,
+          &mut handler_so_far,
+          &mut file_handlers,
+        );
       }
       _ => {}
     }
@@ -5812,25 +7466,54 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // ```
   //
   // `$$et{save_ftyp}` is the `ftyp` MAJOR brand (the first 4 bytes,
-  // QuickTime.pm:9990-9991) — here `qt.major_brand()`. `$$et{HasHandler}{$h}`
-  // records every `hdlr` HandlerType seen (QuickTime.pm:8414); `soun`/`vide`
-  // only ever appear as the MEDIA handler in `trak/mdia/hdlr` (SP1's sole
-  // `hdlr` decode site), so the per-track handler codes are the faithful
-  // source for these two keys. The override fires only when the resolved type
-  // is MP4, the major brand starts with `iso`/`dash`/`mp42`, at least one
-  // track is a `soun` handler, and NO track is a `vide` handler — flipping the
-  // common audio-only `.m4a` (e.g. `ftyp isom` + a lone `soun` track) to
-  // `File:FileType=M4A` / `File:MIMEType=audio/mp4`. `OverrideFileType`
-  // additionally rewrites `FileTypeExtension` to `uc($fileTypeExt{M4A} //
-  // 'M4A') = 'M4A'` (PrintConv `lc` ⇒ `m4a`); the engine derives that from
-  // the new `file_type` via the shared `resolve_file_type`, so setting the
-  // type + MIME here is sufficient (verified vs bundled ExifTool 13.58).
+  // QuickTime.pm:9990-9991) — here `qt.major_brand()`. `$$et{HasHandler}{$h}` is
+  // the FILE-GLOBAL set of EVERY `hdlr` HandlerType `$val` the walk saw
+  // (QuickTime.pm:8414 `$$self{HasHandler}{$val} = 1` runs in the `%Handler`
+  // RawConv for EACH `hdlr` box the file contains, at ANY level — the per-track
+  // `mdia/hdlr` MEDIA handler and every nested `mdia/minf/hdlr` DATA handler, AND
+  // every NON-track `meta/hdlr`: a top-level `meta`, a `moov/meta`, a
+  // `moov/udta/meta`, a `trak/meta`, a `trak/udta/meta`). The faithful source for
+  // the `soun`/`vide` keys is therefore the UNION of the per-track
+  // [`MediaTrack::all_handler_codes`] (the `mdia/hdlr` + `minf/hdlr` codes) and the
+  // file-global `file_handlers` Vec (#348 — the non-track `meta/hdlr` codes
+  // collected during the Pass-2 walk), NOT the single `mdia/hdlr` `handler_code()`
+  // media 4cc. So a nested `minf/hdlr` = `vide` SUPPRESSES the override even when
+  // every track's MEDIA handler is `soun`, AND a non-track `meta/hdlr` = `soun`
+  // with NO `soun` `trak` STILL flips MP4→M4A (a non-track `meta/hdlr` = `vide`
+  // suppresses an audio-only file) — ALL ground-truthed vs bundled 13.59:
+  //   * a lone `soun` `mdia/hdlr` + a `minf/hdlr` = `url ` ⇒ `M4A`; the SAME bytes
+  //     with the `minf/hdlr` = `vide` ⇒ `MP4` / `video/mp4`;
+  //   * a `moov/meta/hdlr` = `soun` with NO `trak` ⇒ `M4A` / `audio/mp4`;
+  //   * a `soun` `trak` + a `moov/meta/hdlr` = `vide` ⇒ `MP4` / `video/mp4`.
+  // This mirrors the EEWarn (R4) and Handler-tag (R8) consumers, which already read
+  // the all-`hdlr` per-track model; the trak-scoped `MediaType` consumers (the
+  // `stts` VideoFrameRate gate, QuickTime.pm:7412) stay on `handler_code()` because
+  // `$$self{MediaType}` is set ONLY for a `mdia/hdlr` (parent path `Media`,
+  // QuickTime.pm:8413), not a nested `minf/hdlr` or a `meta/hdlr` code — so a
+  // non-track/`minf` `hdlr` updates the file-global `HasHandler` WITHOUT touching
+  // the trak-scoped `MediaType`/VideoFrameRate.
+  //
+  // The override fires only when the resolved type is MP4, the major brand
+  // starts with `iso`/`dash`/`mp42`, some `hdlr` is `soun`, and NO `hdlr` is
+  // `vide` — flipping the common audio-only `.m4a` (e.g. `ftyp isom` + a lone
+  // `soun` track) to `File:FileType=M4A` / `File:MIMEType=audio/mp4`.
+  // `OverrideFileType` additionally rewrites `FileTypeExtension` to
+  // `uc($fileTypeExt{M4A} // 'M4A') = 'M4A'` (PrintConv `lc` ⇒ `m4a`); the
+  // engine derives that from the new `file_type` via the shared
+  // `resolve_file_type`, so setting the type + MIME here is sufficient.
+  let has_handler = |code: &str| {
+    file_handlers.iter().any(|c| c == code)
+      || qt
+        .tracks()
+        .iter()
+        .any(|t| t.all_handler_codes().iter().any(|c| c == code))
+  };
   if file_type == "MP4"
     && qt
       .major_brand()
       .is_some_and(|b| b.starts_with("iso") || b.starts_with("dash") || b.starts_with("mp42"))
-    && qt.tracks().iter().any(|t| t.handler_code() == Some("soun"))
-    && !qt.tracks().iter().any(|t| t.handler_code() == Some("vide"))
+    && has_handler("soun")
+    && !has_handler("vide")
   {
     file_type = "M4A";
     mime = "audio/mp4";
@@ -5911,14 +7594,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // reaches a `udta/GPMF` when it descends that `udta` child
   // (`ProcessDirectory`, QuickTime.pm:10359) and a `trak`'s `gpmd` samples when
   // that `trak`'s `stbl` box exits (QuickTime.pm:10369-10371) — so they
-  // interleave by atom layout, and the flat `gopro_meta` accumulates in walk
-  // order instead of the prior fixed "all `gpmd` then all `udta/GPMF`" post-
-  // pass. NOTE (oracle-verified, ExifTool 13.59): when a `moov` carries BOTH
-  // sources ExifTool keeps them in DIFFERENT groups (`Track<N>:` for `gpmd`
-  // vs `GoPro:` for `udta/GPMF`), so there is no single cross-source last-wins
-  // to match — the flat `GoProMeta` collapses both, a divergence this ordered
-  // walk does not by itself resolve (see `walk_moov` doc). The walk completes
-  // BEFORE the `mdat` scan, and a visited `udta/GPMF` (like a
+  // interleave by atom layout. #189 (oracle-verified, ExifTool 13.59): a `moov`
+  // carrying BOTH sources keeps them in DIFFERENT family-1 groups (`Track<N>:`
+  // for `gpmd` — the `trak`'s `SET_GROUP1`, GoPro.pm:826 — vs `GoPro:` for
+  // `udta/GPMF`), so both survive with no cross-source collision. exifast mirrors
+  // that by source: the `udta/GPMF` atom fills this flat `gopro_meta` (→ `GoPro:`,
+  // no-`ee`), while each `gpmd` `DEVC` sample is a per-`Doc<N>` entry in the
+  // SEPARATE `gopro_timed_meta` ([`GoProTimedMeta`]) stamped with its `Track<N>`
+  // index (→ `Track<N>:`, `-ee` only — see `walk_moov` + `emit_gopro_doc`). The
+  // walk completes BEFORE the `mdat` scan, and a visited `udta/GPMF` (like a
   // `gpmd` sample) folds into `found_embedded`, so the `mdat` scan is still
   // suppressed by the mere PRESENCE of any dispatched GoPro source
   // (`return if $$et{FoundEmbedded}`, QuickTimeStream.pl:3689). A direct
@@ -6228,6 +7912,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     cr3: cr3_meta,
     jp2: jp2_meta,
     embedded_exif_deferred,
+    #[cfg(feature = "xmp")]
+    embedded_xmp,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset,
     file_type,
     mime,
     warning,
@@ -6414,9 +8102,11 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// `Track<N>:Warning`, not here (R6/F2); (b) the LigoGPS
   /// decoder warning (`Unrecognized data in LigoGPS trailer` /
   /// `LIGOGPSINFO coordinates out of range` / `LIGOGPSINFO format error` / the
-  /// decrypt-failure deferral); (c) the SP3 embedded-Exif-hop deferral notice
-  /// when an Exif/TIFF block was detected (`embedded_exif_deferred`, awaiting
-  /// the Exif+GPS port).
+  /// decrypt-failure deferral); (c) the embedded `uuid`-XMP `ProcessXMP`
+  /// warning (`XMP is double UTF-encoded`, …), ranked by PRIORITY then walk
+  /// position (see below — priority-1 for non-`HEIC`, priority-0 for `HEIC`);
+  /// (d) the SP3 embedded-Exif-hop deferral notice when an Exif/TIFF block was
+  /// detected (`embedded_exif_deferred`, awaiting the Exif+GPS port).
   ///
   /// The LigoGPS warning is **document-level** (`ExifTool:Warning`), NOT a
   /// group-scoped `LIGO:Warning`. ExifTool only sets `$$et{SET_GROUP1} = 'LIGO'`
@@ -6435,7 +8125,38 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// (LigoGPS warnings fire DURING extraction — the trailer loop / `ScanMediaData`
   /// freeGPS pass — i.e. after the atom-walk `ProcessMOV` warning) keeps the
   /// earlier-extracted document warning, matching ExifTool's file order.
+  ///
+  /// The no-`ee` base mode (the faithful default the 2-arg
+  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) drives); the
+  /// `-ee`-sensitive Pittasoft `3gf ` `EEWarn` is folded in by
+  /// [`Self::diagnostics_with_options`].
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.diagnostics_inner(false)
+  }
+
+  /// `-ee`-threaded variant — the serializer's single mode-carrying entry. At
+  /// no-`ee` it adds the Pittasoft `3gf ` `EEWarn` (QuickTimeStream.pl:2693) to
+  /// the priority-0 / file-position first-wins `priority0` race at the
+  /// `free`/Pittasoft atom's offset, so it competes against the `ProcessMOV` /
+  /// HEIF / LigoGPS document warnings exactly like every other one (the
+  /// EARLIER-positioned warning becomes the bare `ExifTool:Warning`). At `-ee`
+  /// ExifTool processes every record and raises no `EEWarn`, so it is omitted.
+  fn diagnostics_with_options(
+    &self,
+    extract_embedded: bool,
+  ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.diagnostics_inner(extract_embedded)
+  }
+}
+
+impl Meta<'_> {
+  /// Build the document-level diagnostics for the given `-ee` mode (shared by
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) and
+  /// [`Diagnose::diagnostics_with_options`](crate::diagnostics::Diagnose)).
+  fn diagnostics_inner(
+    &self,
+    extract_embedded: bool,
+  ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     let mut out = std::vec::Vec::new();
     // SP4: the `ftyp`-dispatched brand walkers raise their own non-fatal walk
     // warnings (truncated iloc/iinf/ipma + `Item info entries are out of order`
@@ -6445,40 +8166,91 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
     //
     // **#159** — the consumer (`diagnostics.rs` `TagMap`) keeps the FIRST
     // document-level `Warning` (ExifTool emits `Warning` priority-0 first-wins
-    // ⇒ the earliest by WALK POSITION). The `ProcessMOV` warning
-    // (`Meta::warning`) and the HEIF `meta`-box walk warning
-    // (`HeifMeta::warning`) are raised at DIFFERENT file positions: the HEIF
-    // `meta` box at its atom offset, the `ProcessMOV` warning at its offending
-    // top-level atom. So the two are pushed in ASCENDING offset order — a HEIF
-    // `iinf` out-of-order warning (early `meta` box) must outrank a LATER
-    // malformed top-level atom's warning, and vice-versa. A `ProcessMOV`
-    // warning with NO recorded offset (`warning_offset == None`) does not
-    // outrank the HEIF one (push HEIF first). The CR3 walker has no warning
-    // producer yet but the drain is wired for symmetry / future hardening.
-    let heif_first = match (self.warning_offset(), self.heif().warning_offset()) {
-      // Both positioned: the smaller offset wins the first-wins slot. A tie
-      // keeps the `ProcessMOV` warning first (HEIF's `meta` box is the SAME
-      // top-level atom as the surrounding walk, never strictly earlier).
-      (Some(self_off), Some(heif_off)) => heif_off < self_off,
-      // The `ProcessMOV` warning has no position but HEIF does: HEIF (a
-      // located walk warning) is not outranked by an offset-less one.
-      (None, Some(_)) => true,
-      // HEIF has no position (no HEIF warning, or — defensively — an
-      // unpositioned one): keep the existing `self`-then-HEIF order.
-      (_, None) => false,
-    };
-    if !heif_first && let Some(w) = self.warning() {
+    // ⇒ the earliest by WALK POSITION among equal-priority warnings). The
+    // `ProcessMOV` warning (`Meta::warning`) and the HEIF `meta`-box walk
+    // warning (`HeifMeta::warning`) are raised at DIFFERENT file positions: the
+    // HEIF `meta` box at its atom offset, the `ProcessMOV` warning at its
+    // offending top-level atom. So the priority-0 warnings are emitted in
+    // ASCENDING offset order — a HEIF `iinf` out-of-order warning (early `meta`
+    // box) must outrank a LATER malformed top-level atom's warning, and
+    // vice-versa. A `ProcessMOV` warning with NO recorded offset
+    // (`warning_offset == None`) does not outrank a located one. The CR3 walker
+    // has no warning producer yet but the drain is wired for symmetry / future
+    // hardening.
+    //
+    // The embedded XMP packet's `ProcessXMP` `$et->Warn` (`XMP is double
+    // UTF-encoded` / `X is not a structure!` / …; document-level — XMP sets no
+    // `SET_GROUP1`) joins this ranking, but at a DIFFERENT priority: ExifTool
+    // sets `$$et{PRIORITY_DIR} = 'XMP'` in `ProcessMOV` for every container
+    // EXCEPT `HEIC` (QuickTime.pm:10016 `unless $fileType eq 'HEIC'`). So for
+    // MP4 / MOV / M4A / HEIF / AVIF / CR3 / … the XMP `Warning` is PRIORITY-1
+    // (ExifTool.pm:9555 promotes the priority-0 tag in the priority dir) and
+    // unconditionally owns the bare `ExifTool:Warning` over the priority-0
+    // `ProcessMOV` / HEIF / LigoGPS warnings — regardless of file order
+    // (ground-truthed vs bundled 13.59: an EARLY `moov`-child truncation FOLLOWED
+    // BY a `uuid`-XMP double-encode still reports the XMP warning as the bare
+    // `Warning`). For `HEIC` the XMP dir is NOT promoted, so the XMP `Warning`
+    // is priority-0 and competes by walk position like the others (an EARLY HEIF
+    // `iinf` out-of-order warning keeps the slot over a LATER `uuid`-XMP).
+    #[cfg(feature = "xmp")]
+    let xmp_warning = self.embedded_xmp.as_ref().and_then(|x| x.warning());
+    #[cfg(not(feature = "xmp"))]
+    let xmp_warning: Option<&str> = None;
+    // The priority-1 XMP case (non-`HEIC`): the XMP `Warning` outranks every
+    // priority-0 document warning, so it leads the stream (→ the bare
+    // `ExifTool:Warning`). On `HEIC` it stays in the priority-0 race below.
+    let xmp_priority1 = xmp_warning.is_some() && self.file_type() != "HEIC";
+    if xmp_priority1 && let Some(w) = xmp_warning {
       out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    // The priority-0 document warnings, ranked by ascending walk position
+    // (first-wins, #159): each carries its raising offset (`u64::MAX` when
+    // unpositioned — an offset-less `ProcessMOV` warning never outranks a
+    // located one, and the post-walk LigoGPS warning always trails the atom-walk
+    // warnings). A STABLE sort preserves the producer insertion order on a tie
+    // (e.g. a same-offset HEIF `meta` box keeps the surrounding `ProcessMOV`
+    // warning first; the offset-less LigoGPS trails). The list is empty unless a
+    // warning fired, so a file with no warning is byte-identical.
+    let mut priority0: std::vec::Vec<(u64, &str)> = std::vec::Vec::new();
+    if let Some(w) = self.warning() {
+      priority0.push((self.warning_offset().unwrap_or(u64::MAX), w));
     }
     if let Some(w) = self.heif().warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
-    }
-    if heif_first && let Some(w) = self.warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
+      priority0.push((self.heif().warning_offset().unwrap_or(u64::MAX), w));
     }
     if let Some(w) = self.ligogps().warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
+      priority0.push((u64::MAX, w));
     }
+    // The Pittasoft BlackVue `3gf ` no-`ee` `EEWarn` (QuickTimeStream.pl:2693) —
+    // a DOCUMENT-level priority-0 `Warning` (the `free` atom is not a `trak`, so
+    // no `SET_GROUP1`). It is raised at the `free`/Pittasoft atom's file offset,
+    // which precedes `mdat`, so it joins THIS offset-ordered race: an EARLIER
+    // `free` `EEWarn` outranks a LATER truncated-`mdat` `ProcessMOV` warning,
+    // while a `ProcessMOV` warning positioned BEFORE the `free` atom (a
+    // walk-stopping truncation can't reach `free`, but an earlier-offset
+    // non-fatal one could) still leads. Gated on `!extract_embedded`: under `-ee`
+    // ExifTool processes every record and raises no `EEWarn`. `EE_WARNING`
+    // already carries the literal `[minor] ` prefix, so it rides `warn`
+    // (ignorable 0) verbatim — matching the in-stream `Track<N>:Warning` text.
+    if !extract_embedded && self.qt.pittasoft().ee_warn() {
+      priority0.push((
+        self.qt.pittasoft().ee_warn_offset().unwrap_or(u64::MAX),
+        EE_WARNING,
+      ));
+    }
+    // `HEIC`: the embedded-XMP warning is priority-0 — rank it by the `uuid`
+    // atom's walk offset alongside the others (inserted LAST so a tie keeps the
+    // structural producers ahead).
+    #[cfg(feature = "xmp")]
+    if !xmp_priority1 && let Some(w) = xmp_warning {
+      priority0.push((self.embedded_xmp_offset.unwrap_or(u64::MAX), w));
+    }
+    priority0.sort_by_key(|&(off, _)| off);
+    out.extend(
+      priority0
+        .into_iter()
+        .map(|(_, w)| crate::diagnostics::Diagnostic::warn(w)),
+    );
     if self.embedded_exif_deferred() {
       out.push(crate::diagnostics::Diagnostic::warn(
         "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
@@ -6486,6 +8258,163 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
     }
     out
   }
+}
+
+/// The four `%Handler` fields a `Track<N>` group surfaces, resolved PER FIELD
+/// (HandlerClass / HandlerType / HandlerVendorID / HandlerDescription each its
+/// own borrowed value, `None` when no `hdlr` in the group provided it).
+#[cfg(feature = "alloc")]
+#[derive(Default, Clone, Copy)]
+struct ResolvedHandlers<'a> {
+  class: Option<&'a str>,
+  code: Option<&'a str>,
+  vendor_id: Option<&'a str>,
+  description: Option<&'a str>,
+}
+
+/// Resolve, for each `Track<N>` family-1 group, the bundled `Track<N>:Handler*`
+/// triplet PER FIELD — the TRUE structural model: ExifTool's `%Handler` table is
+/// binary-data, so HandlerClass (offset 4), HandlerType (8), HandlerVendorID (12)
+/// and HandlerDescription (24) are FOUR INDEPENDENT `FoundTag`s, each extracted
+/// from EVERY `hdlr` box (a track's `mdia/hdlr` MEDIA handler + each
+/// `mdia/minf/hdlr` DATA handler) whose RawConv yields a value for THAT field
+/// (HandlerClass/VendorID skip an all-zero code, HandlerDescription an empty
+/// string; HandlerType always extracts — a zero code becomes `Unknown ()`).
+///
+/// For a given field, the GLOBAL bare key lands on the LAST extraction in file
+/// order (FoundTag last-wins, ExifTool.pm:9564); its family-1 group is the
+/// field's `owner_group`. The render-stage filter (exiftool:2745) then keeps,
+/// per `(Track<N>, field)`: in the owner's group the bare-key value (the global
+/// last), and in EVERY OTHER group the FIRST-in-file-order extraction (the
+/// surviving `(n)` duplicate resolves first-wins, exiftool:2952). Because the
+/// bare key is per-field, two fields can resolve to DIFFERENT owner groups, so
+/// the triplet is NEVER a unit: a partial `hdlr` (class-only `dhlr`, or a
+/// zero-code box) overrides ONLY the field it provides, the other boxes' fields
+/// are KEPT. This subsumes the empty (R5/R6 — no field, the other box wins all),
+/// full-`url ` (viofo/rove — the `url ` wins all), partial (the #348 finding)
+/// and zero-code cases uniformly.
+///
+/// The per-field provider order is the ACTUAL FILE ORDER of the walked `hdlr`
+/// boxes ([`MediaTrack::handler_boxes`] — recorded as the `trak` walk visits
+/// them), with NO media-before-data assumption: the FIRST-in-file-order provider
+/// of a field is the value from the LOWEST-index box that provides it, the
+/// LAST-in-file-order provider the value from the HIGHEST-index box that provides
+/// it. A NORMAL `mdia(hdlr, minf(hdlr))` records the media box first, so its data
+/// `minf/hdlr` is the per-field last (R7 result); a REORDERED `mdia(minf(hdlr),
+/// hdlr)` records the data box first, so the MEDIA `hdlr` is the per-field last
+/// and wins its fields (ground-truthed vs bundled ExifTool 13.59:
+/// `mdia(minf(hdlr=url ), hdlr=vide)` → `HandlerType=Video Track`,
+/// `HandlerClass=Media Handler`, `HandlerDescription=VideoHandler`). The global
+/// per-field owner is the LAST track (file order) whose LAST-provider is `Some`.
+/// Returned in track/group file order; a group is listed once (its first
+/// appearance).
+#[cfg(feature = "alloc")]
+fn resolve_per_track_handlers(tracks: &[MediaTrack]) -> std::vec::Vec<(u32, ResolvedHandlers<'_>)> {
+  // Field selectors for the four `%Handler` tags (HandlerClass / HandlerType /
+  // HandlerVendorID / HandlerDescription — binary-table offsets 4/8/12/24),
+  // matched on rather than used as array indices.
+  const CLASS: usize = 0;
+  const CODE: usize = 1;
+  const VENDOR: usize = 2;
+  const DESC: usize = 3;
+  // A track's family-1 group number (the per-`moov` `Track<N>` index; the
+  // 1-based Vec index for unit-built tracks without a recorded group).
+  fn group_of(idx: usize, t: &MediaTrack) -> u32 {
+    t.track_group().unwrap_or((idx + 1) as u32)
+  }
+  // One walked `hdlr` box's value for a field (the `%Handler` binary-table
+  // offsets 4/8/12/24), `None` when this box did not provide it.
+  fn box_field(b: &HandlerBox, field: usize) -> Option<&str> {
+    match field {
+      CLASS => b.class(),
+      CODE => b.code(),
+      VENDOR => b.vendor_id(),
+      _ => b.description(),
+    }
+  }
+  // The per-field FIRST-in-file-order provider of one track: the value from the
+  // LOWEST-index (earliest-walked) `hdlr` box that provides the field. This is
+  // what a NON-owner group surfaces (its surviving first-in-file-order `(n)`
+  // duplicate, exiftool:2952). The walk records the boxes in ACTUAL file order,
+  // so there is NO media-before-data assumption — a reordered
+  // `mdia(minf(hdlr), hdlr)` makes the `minf/hdlr` the first provider.
+  fn first_of(t: &MediaTrack, field: usize) -> Option<&str> {
+    t.handler_boxes().iter().find_map(|b| box_field(b, field))
+  }
+  // The per-field LAST-in-file-order provider of one track: the value from the
+  // HIGHEST-index (latest-walked) `hdlr` box that provides the field. This is
+  // what the OWNER group surfaces (the global last-extracted bare key,
+  // ExifTool.pm:9564). By actual file order — a NORMAL `mdia(hdlr, minf(hdlr))`
+  // makes the data `minf/hdlr` last; a REORDERED `mdia(minf(hdlr), hdlr)` makes
+  // the MEDIA `hdlr` last (and it wins its fields).
+  fn last_of(t: &MediaTrack, field: usize) -> Option<&str> {
+    t.handler_boxes()
+      .iter()
+      .rev()
+      .find_map(|b| box_field(b, field))
+  }
+  // Per field, the global bare-key owner = the LAST track (file order) whose
+  // LAST-provider is `Some`; record its group + value once. A field with no
+  // provider anywhere has `owner_group == None` (never emitted).
+  let owner_group_value = |field: usize| -> (Option<u32>, Option<&str>) {
+    tracks
+      .iter()
+      .enumerate()
+      .rev()
+      .find(|(_, t)| last_of(t, field).is_some())
+      .map_or((None, None), |(i, t)| {
+        (Some(group_of(i, t)), last_of(t, field))
+      })
+  };
+  // Resolve one field for a group: the owner group takes the global
+  // LAST-provider value (`owner`); every other group takes its FIRST-in-group
+  // track's FIRST-provider value (the surviving first-in-file-order `(n)`
+  // duplicate). A free `fn` (not a closure) so the borrowed `&str` it returns is
+  // tied to `tracks`.
+  fn resolve<'a>(
+    tracks: &'a [MediaTrack],
+    g: u32,
+    field: usize,
+    owner: (Option<u32>, Option<&'a str>),
+  ) -> Option<&'a str> {
+    let (owner_g, owner_v) = owner;
+    if owner_g == Some(g) {
+      owner_v
+    } else {
+      tracks
+        .iter()
+        .enumerate()
+        .filter(|(i, tk)| group_of(*i, tk) == g)
+        .find_map(|(_, tk)| first_of(tk, field))
+    }
+  }
+  // The per-field global bare-key owner (group + value), computed once each; a
+  // named binding per field avoids index-based array access (the file-level
+  // `#![deny(clippy::indexing_slicing)]` panic-safety contract).
+  let owner_class = owner_group_value(CLASS);
+  let owner_code = owner_group_value(CODE);
+  let owner_vendor = owner_group_value(VENDOR);
+  let owner_desc = owner_group_value(DESC);
+  // Walk tracks in file order, one row per group at its FIRST appearance.
+  let mut out: std::vec::Vec<(u32, ResolvedHandlers<'_>)> = std::vec::Vec::new();
+  for (idx, t) in tracks.iter().enumerate() {
+    let g = group_of(idx, t);
+    if out.iter().any(|(seen, _)| *seen == g) {
+      // A later same-group track is render-suppressed for the bare key; its
+      // contribution is already folded via the owner / first-in-group lookups.
+      continue;
+    }
+    out.push((
+      g,
+      ResolvedHandlers {
+        class: resolve(tracks, g, CLASS, owner_class),
+        code: resolve(tracks, g, CODE, owner_code),
+        vendor_id: resolve(tracks, g, VENDOR, owner_vendor),
+        description: resolve(tracks, g, DESC, owner_desc),
+      },
+    ));
+  }
+  out
 }
 
 #[cfg(feature = "alloc")]
@@ -6571,6 +8500,30 @@ impl crate::emit::Taggable for Meta<'_> {
         main(),
         "CompatibleBrands".into(),
         TagValue::List(items),
+        false,
+      ));
+    }
+
+    // ── skip / SkipInfo (70mai Pro Plus+ / Viofo A119) ─────────────────
+    // The top-level `skip` atom's `Image::ExifTool::QuickTime::SkipInfo`
+    // `'ver '` Version + `thma` ThumbnailImage (QuickTime.pm:1017-1027). Both
+    // are `QuickTime`-grouped (the SkipInfo table's family-0 default) — distinct
+    // from the Kodak-grouped `frea` `'ver '`/`thma` emitted below.
+    if let Some(ver) = self.qt.skip_version() {
+      tags.push(EmittedTag::new(
+        main(),
+        "Version".into(),
+        TagValue::Str(ver.into()),
+        false,
+      ));
+    }
+    if let Some(len) = self.qt.skip_thumbnail_len() {
+      // `thma` ThumbnailImage: `Binary => 1` ⇒ the `(Binary data N bytes, use -b
+      // option to extract)` placeholder in BOTH modes (QuickTime.pm:1022-1026).
+      tags.push(EmittedTag::new(
+        main(),
+        "ThumbnailImage".into(),
+        TagValue::Str(binary_placeholder(len)),
         false,
       ));
     }
@@ -6745,6 +8698,88 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── free / Pittasoft (BlackVue dashcam — QuickTime.pm:8488-8546) ────
+    // The top-level `free` atom's `%QuickTime::Pittasoft` SubDirectory tags. The
+    // table has no `GROUPS` override, so family-0/1 default to `QuickTime` (the
+    // `main()` group), verified vs the bundled `-G1` oracle. Emitted in the
+    // child file order (cprt → sttm → ptnm → thum → gps → 3gf). Every tag is a
+    // known table key ⇒ `unknown: false`.
+    let pit = self.qt.pittasoft();
+    if !pit.is_empty() {
+      // `cprt` Copyright — the raw string (mode-invariant).
+      if let Some(s) = pit.copyright() {
+        tags.push(EmittedTag::new(
+          main(),
+          "Copyright".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `sttm` StartTime — the pre-formatted `YYYY:MM:DD HH:MM:SS.sss` date
+      // (mode-invariant: ValueConv and PrintConv produce the same string).
+      if let Some(s) = pit.start_time() {
+        tags.push(EmittedTag::new(
+          main(),
+          "StartTime".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `ptnm` OriginalFileName — `substr($val, 4, -1)` (mode-invariant).
+      if let Some(s) = pit.original_file_name() {
+        tags.push(EmittedTag::new(
+          main(),
+          "OriginalFileName".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // `thum` PreviewImage — `Binary => 1` ⇒ the `(Binary data N bytes…)`
+      // placeholder (the DECODED image length) in BOTH modes.
+      if let Some(len) = pit.preview_image_len() {
+        tags.push(EmittedTag::new(
+          main(),
+          "PreviewImage".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
+      // `gps ` GPSLog — `Binary => 1` ⇒ the placeholder (the NUL-stripped
+      // length) in BOTH modes.
+      if let Some(len) = pit.gps_log_len() {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSLog".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
+      // `3gf ` AccelData → the no-`ee` first-record TimeCode + Accelerometer
+      // (`Process_3gf`). TimeCode is a bare number; Accelerometer a string. Both
+      // mode-invariant (no PrintConv on either Stream-table tag).
+      if let Some(tc) = pit.time_code() {
+        tags.push(EmittedTag::new(
+          main(),
+          "TimeCode".into(),
+          TagValue::F64(tc),
+          false,
+        ));
+      }
+      if let Some(s) = pit.accelerometer() {
+        tags.push(EmittedTag::new(
+          main(),
+          "Accelerometer".into(),
+          TagValue::Str(s.into()),
+          false,
+        ));
+      }
+      // The Pittasoft `3gf ` no-`ee` `EEWarn` is NOT a tag — it is a
+      // DOCUMENT-level `Warning` raised at the `free`/Pittasoft atom offset, so
+      // it flows through the offset-ordered priority-0 first-wins drain in
+      // `Meta::diagnostics_with_options` (the same #159/#361 race as the
+      // `ProcessMOV`/HEIF/LigoGPS warnings), not the tag stream here.
+    }
+
     // ── per-track (tkhd / mdhd / hdlr) ─────────────────────────────────
     // ExifTool's `Track#` family-1 group (QuickTime.pm:1427) is driven by the
     // per-`moov` `$track` counter (RESET per `ProcessMOV`/`moov`), stored on
@@ -6773,6 +8808,15 @@ impl crate::emit::Taggable for Meta<'_> {
     // itself survives the `%noDups` first-wins). This file-level set of already-
     // seen eeBox codes mirrors that (the realistic file has one such track).
     let mut ee_warned: std::vec::Vec<&str> = std::vec::Vec::new();
+    // ExifTool's FILE-GLOBAL `$$self{WAS_WARNED}` hash (ExifTool.pm:4358/5632-5639):
+    // each DISTINCT `Warning` text is recorded ONCE per file (the first occurrence
+    // `FoundTag`s it; a later identical text only bumps a count → the ` [x$n]`
+    // suffix). This single set is THREADED across ALL `-ee` warning producers
+    // (camm / ctmd / dji `ProcessSamples` warnings) so a warning string recurring
+    // across tracks/docs — or across producers — dedups to ONE tag at the first
+    // occurrence's group, NOT one per `(Track<N>, Warning)` slot (#215: the prior
+    // emitters' per-track `first_seen` gate let the SAME text emit once per track).
+    let mut was_warned: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
     // First-wins gate: `true` (and records the key) only the FIRST time a
     // `(grp, name)` pair is seen; a repeat returns `false` so the caller skips
     // the push, leaving the earlier value in place (ExifTool.pm:2950-2951).
@@ -6784,6 +8828,27 @@ impl crate::emit::Taggable for Meta<'_> {
       emitted_keys.push(key);
       true
     };
+    // Per-track Handler (HandlerClass/HandlerType/HandlerVendorID/
+    // HandlerDescription) PER-FIELD dual-`hdlr` resolution. A `trak` carries up
+    // to TWO kinds of `hdlr` — the `mdia/hdlr` MEDIA handler (`mhlr` vide/soun/…)
+    // and one-or-more `mdia/minf/hdlr` DATA handlers (`dhlr` url/alis/…) — and
+    // ExifTool's `%Handler` is a binary-data table, so HandlerClass (offset 4),
+    // HandlerType (8), HandlerVendorID (12) and HandlerDescription (24) are FOUR
+    // INDEPENDENT `FoundTag`s, NOT a unit. Each is extracted from EVERY `hdlr`
+    // box that provides it; per field, the bare key lands on the global LAST
+    // extraction (FoundTag last-wins, ExifTool.pm:9564) and the render filter
+    // (exiftool:2745) keeps the owner group's bare value + every other group's
+    // first-in-file-order `(n)` (its media handler). Because the bare key is
+    // per-field, a partial `minf/hdlr` (class-only `dhlr`, or a zero-code box)
+    // overrides ONLY its field — the media handler's other fields are KEPT. The
+    // full derivation + cases live on [`resolve_per_track_handlers`], which
+    // returns one row per `Track<N>` group (first appearance) carrying the four
+    // independently-resolved values. Ground-truthed vs bundled ExifTool 13.59 on
+    // the viofo + rove dashcam MP4s (full `url ` data handler → all three from
+    // the data handler for the audio track, all from the media handler for the
+    // video track) and on crafted class-only / zero-code / empty / two-`moov`
+    // dual-`hdlr` files.
+    let resolved_handlers = resolve_per_track_handlers(self.qt.tracks());
     for (idx, track) in self.qt.tracks().iter().enumerate() {
       // Fall back to the 1-based Vec index only for tracks built directly in
       // unit tests (no `track_group` recorded).
@@ -6793,6 +8858,18 @@ impl crate::emit::Taggable for Meta<'_> {
       // The per-track family1 is the computed `Track<N>` string; family0 stays
       // "QuickTime" (the `%QuickTime::Main` table group).
       let track_group = || Group::new("QuickTime", grp);
+      // The four per-field-resolved Handler values for THIS track's group (the
+      // same row for every track in the group; the `first_seen` gate below emits
+      // them once, at the FIRST track of the group — where bundled places them).
+      let resolved = resolved_handlers
+        .iter()
+        .find(|(g, _)| *g == group_num)
+        .map(|(_, r)| *r)
+        .unwrap_or_default();
+      let sel_handler_class = resolved.class;
+      let sel_handler_code = resolved.code;
+      let sel_handler_vendor_id = resolved.vendor_id;
+      let sel_handler_description = resolved.description;
       // R7/F2: a `Truncated '...' data` warning raised inside this `trak`'s
       // walk (a header-valid but payload-overrunning tkhd / mdhd) surfaces
       // under this track's family-1 group — ExifTool attaches the warning to
@@ -6998,7 +9075,7 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
-      if let Some(class) = track.handler_class()
+      if let Some(class) = sel_handler_class
         && first_seen(grp, "HandlerClass")
       {
         // HandlerClass / ComponentType (QuickTime.pm:8395-8402); emitted only
@@ -7035,22 +9112,37 @@ impl crate::emit::Taggable for Meta<'_> {
       // first-wins `Warning` (a truncation warning raised earlier in THIS track's
       // walk takes precedence). The per-sample GPS stays `-ee` gated (see
       // `emit_timed_samples`).
-      if !opts.extract_embedded
-        && let Some(code) = track.handler_code()
-        && is_ee_handler(code)
-        && !ee_warned.contains(&code)
-      {
-        ee_warned.push(code);
-        if first_seen(grp, "Warning") {
-          tags.push(EmittedTag::new(
-            track_group(),
-            "Warning".into(),
-            TagValue::Str(EE_WARNING.into()),
-            false,
-          ));
+      //
+      // ExifTool runs the `%Handler` `HandlerType` RawConv for EVERY `hdlr` box
+      // it walks — the `mdia/hdlr` MEDIA handler AND every nested `mdia/minf/hdlr`
+      // DATA handler (repeated `minf` boxes included) — so the warning sees ALL of
+      // their codes (in file order), INDEPENDENT of which one the per-group
+      // per-field Handler resolution (`resolve_per_track_handlers`) surfaces.
+      // We therefore iterate the COMPLETE accumulated `all_handler_codes` list
+      // (filled at each `hdlr` box in `walk_trak`), NOT the per-field-merged
+      // `data_handler` (a `meta` data handler that a LATER `minf/hdlr` = `url `
+      // overrides in the HandlerType field would otherwise be missed). A track
+      // whose `mdia/hdlr` is `vide` (no warn — gated on the
+      // `stsd`) but whose `minf/hdlr` is a metadata handler (`meta`/`mett`→`meta`/
+      // …) therefore still warns, exactly as bundled does. Data-reference handlers
+      // (`url `/`alis`/`dhlr`) are NOT in `%eeBox`, so the common `minf/hdlr` =
+      // `url ` (viofo/rove → list `[vide|soun, url ]`) does NOT fire the warning.
+      if !opts.extract_embedded {
+        for code in track.all_handler_codes().iter().map(String::as_str) {
+          if is_ee_handler(code) && !ee_warned.contains(&code) {
+            ee_warned.push(code);
+            if first_seen(grp, "Warning") {
+              tags.push(EmittedTag::new(
+                track_group(),
+                "Warning".into(),
+                TagValue::Str(EE_WARNING.into()),
+                false,
+              ));
+            }
+          }
         }
       }
-      if let Some(code) = track.handler_code()
+      if let Some(code) = sel_handler_code
         && first_seen(grp, "HandlerType")
       {
         // HandlerType: the flat tag is driven by the RAW 4-byte code (F3).
@@ -7079,7 +9171,7 @@ impl crate::emit::Taggable for Meta<'_> {
       // raw 4-char code. Only present when non-zero (the all-zero RawConv-undef
       // branch is applied at decode). Right after HandlerType (the `%Handler`
       // binary-table field order: offset 8 before 12).
-      if let Some(vid) = track.handler_vendor_id()
+      if let Some(vid) = sel_handler_vendor_id
         && first_seen(grp, "HandlerVendorID")
       {
         let value = if print_conv {
@@ -7102,7 +9194,7 @@ impl crate::emit::Taggable for Meta<'_> {
       // HandlerDescription (`hdlr` offset 24 to end, QuickTime.pm:8453-8461):
       // the post Pascal/C-string RawConv value, mode-invariant (no PrintConv/
       // ValueConv). In ALL the codec fixtures; right after HandlerVendorID.
-      if let Some(desc) = track.handler_description()
+      if let Some(desc) = sel_handler_description
         && first_seen(grp, "HandlerDescription")
       {
         tags.push(EmittedTag::new(
@@ -7585,6 +9677,42 @@ impl crate::emit::Taggable for Meta<'_> {
         // first-wins handling as the visual btrt.
         if let Some(bt) = a.bitrate() {
           emit_bitrate(&mut tags, &track_group, &mut first_seen, grp, bt);
+        }
+        // `chan` AudioChannelLayout (`%QuickTime::ChannelLayout`, QuickTime.pm:
+        // 7886-8090) — the sample-entry child's LayoutFlags / AudioChannelTypes /
+        // NumChannelDescriptions, in the table's byte order. LayoutFlags is the
+        // `int16u` enum; AudioChannelTypes/NumChannelDescriptions are present
+        // only for the `LayoutFlags == 1` (UseBitmap) form (decoded conditionally
+        // in `decode_chan`).
+        if let Some(lf) = a.channel_layout_flags()
+          && first_seen(grp, "LayoutFlags")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "LayoutFlags".into(),
+            layout_flags_value(lf, print_conv),
+            false,
+          ));
+        }
+        if let Some(act) = a.audio_channel_types()
+          && first_seen(grp, "AudioChannelTypes")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "AudioChannelTypes".into(),
+            audio_channel_types_value(act, print_conv),
+            false,
+          ));
+        }
+        if let Some(ncd) = a.num_channel_descriptions()
+          && first_seen(grp, "NumChannelDescriptions")
+        {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "NumChannelDescriptions".into(),
+            TagValue::U64(u64::from(ncd)),
+            false,
+          ));
         }
       }
       // OtherFormat (`%OtherSampleDesc` 4cc, QuickTime.pm:7802-7806): emitted for
@@ -8788,7 +10916,13 @@ impl crate::emit::Taggable for Meta<'_> {
     // this emitter pushes ONLY the `Warning` payload (priority-0 first-wins +
     // WAS_WARNED `[xN]` dedup), exactly like [`emit_camm_warnings`]. The
     // MINOR residue warning (`Warn(..., 1)`) carries the `[minor] ` prefix.
-    emit_ctmd_warnings(self.canon_ctmd.warnings(), opts, &mut first_seen, &mut tags);
+    emit_ctmd_warnings(
+      self.canon_ctmd.warnings(),
+      opts,
+      &mut first_seen,
+      &mut was_warned,
+      &mut tags,
+    );
 
     // ── SP4: Parrot drone `mett` (Image::ExifTool::Parrot) ─────────────────
     // The per-sample GPS + flight telemetry decoded from a Parrot `mett` track
@@ -8818,7 +10952,13 @@ impl crate::emit::Taggable for Meta<'_> {
       &mut first_seen,
       &mut tags,
     );
-    emit_dji_warning(&self.dji_protobuf, opts, &mut first_seen, &mut tags);
+    emit_dji_warning(
+      &self.dji_protobuf,
+      opts,
+      &mut first_seen,
+      &mut was_warned,
+      &mut tags,
+    );
 
     // ── SP4: Insta360 INSV/INSP trailer (ProcessInsta360) ──────────────────
     // The file-END trailer's tags (QuickTimeStream.pl:3252-3478) under the
@@ -8911,6 +11051,7 @@ impl crate::emit::Taggable for Meta<'_> {
       opts,
       print_conv,
       &mut first_seen,
+      &mut was_warned,
       &mut tags,
     );
 
@@ -9197,6 +11338,101 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // `loci` LocationInformation (`%QuickTime::UserData`, QuickTime.pm:1775).
+      // Group `QuickTime:UserData`, mode-invariant (the RawConv is the only conv).
+      if let Some(loc) = ud.location_information() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "LocationInformation".into(),
+          TagValue::Str(loc.into()),
+          false,
+        ));
+      }
+    }
+
+    // ── ItemList (`moov/udta/meta`(`mdir`) `ilst`, QuickTime.pm:3481-6623) ──
+    // Group `QuickTime:ItemList` (family-1 `ItemList` — the `MOV-Movie-Track-
+    // UserData-Meta-ItemList` group-derivation). The two CONV-BEARING tags
+    // (`ContentCreateDate` `%iso8601Date`, `GPSCoordinates` ConvertISO6709 +
+    // PrintGPSCoordinates) are emitted typed; every other ItemList tag rides the
+    // conv-less `convless` loop (string / binary-placeholder, mode-invariant).
+    let item_list = self.qt.item_list();
+    if !item_list.is_empty() {
+      let item_group = || Group::new("QuickTime", "ItemList");
+      if let Some(date) = item_list.content_create_date() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          "ContentCreateDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      if let Some(gps) = item_list.gps() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
+      for (name, value) in item_list.convless() {
+        tags.push(EmittedTag::new(
+          item_group(),
+          name.clone(),
+          value.clone(),
+          false,
+        ));
+      }
+    }
+
+    // ── AudioKeys (the audio-track `meta`(`mdta`) `keys`, QuickTime.pm:6895) ──
+    // Group `QuickTime:AudioKeys` (family-1 `AudioKeys`). The five plain AudioKeys
+    // (`AudioGain`/`Treble`/`Bass`/`Balance`/`PitchShift`) AND the unknown-key
+    // DERIVE tags (`Make`/`Creationdate`/… — see [`apply_audio_key`]) are
+    // conv-less ⇒ the shared `convless` loop. `Mute` (QuickTime.pm:6912-6916) is
+    // the SOLE conv-bearing entry: `Format => 'int8u'` + `PrintConv => { 0 =>
+    // 'Off', 1 => 'On' }`, rendered via [`audio_mute_value`] (the `Off`/`On`/
+    // `Unknown ($val)` label at `-j`, the raw int at `-n`).
+    let audio_keys = self.qt.audio_keys();
+    if !audio_keys.is_empty() {
+      let audio_group = || Group::new("QuickTime", "AudioKeys");
+      for (name, value) in audio_keys.convless() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          name.clone(),
+          value.clone(),
+          false,
+        ));
+      }
+      if let Some(mute) = audio_keys.mute() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "Mute".into(),
+          audio_mute_value(mute, print_conv),
+          false,
+        ));
+      }
+      // The CONV-BEARING ItemList tags resolved through the cross-table
+      // (QuickTime.pm:9810: `\xa9day` ContentCreateDate `%iso8601Date`, `\xa9xyz`
+      // GPSCoordinates `ConvertISO6709` + `PrintGPSCoordinates`) emit by their
+      // ItemList NAME under the ACTIVE `AudioKeys` group (verified vs bundled
+      // 13.59: `AudioKeys:ContentCreateDate` / `AudioKeys:GPSCoordinates`).
+      if let Some(date) = audio_keys.content_create_date() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "ContentCreateDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      if let Some(gps) = audio_keys.gps() {
+        tags.push(EmittedTag::new(
+          audio_group(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
     }
 
     // ── SP2: moov/meta Keys/ItemList (QuickTime.pm:6651-6760) ──────────
@@ -9216,6 +11452,18 @@ impl crate::emit::Taggable for Meta<'_> {
         tags.push(EmittedTag::new(
           keys_group(),
           "CreationDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
+      }
+      // The cross-table `\xa9day` ItemList ContentCreateDate (QuickTime.pm:9810)
+      // — the ItemList NAME, DISTINCT from the `%Keys` `creationdate`
+      // ("CreationDate") above — under the active `Keys` group (verified vs
+      // bundled 13.59: `Keys:ContentCreateDate`).
+      if let Some(date) = keys.content_create_date() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "ContentCreateDate".into(),
           TagValue::Str(date.into()),
           false,
         ));
@@ -9309,6 +11557,19 @@ impl crate::emit::Taggable for Meta<'_> {
         TagValue::U64(u64::from(h)),
         false,
       ));
+    }
+
+    // The embedded XMP packet (top-level `uuid`, QuickTime.pm:155-163 → the
+    // `Image::ExifTool::XMP::Main` SubDirectory). Its `XMP-*` tags are produced
+    // by the shared XMP parser's own `Taggable` impl (family-0 `XMP`, family-1
+    // the namespace group — `XMP-tiff` / `XMP-exif` / `XMP-x` / …), already
+    // rendered for the active conv mode. Emitting via that impl keeps the
+    // QuickTime path byte-identical to a standalone `.xmp` sidecar — exactly
+    // what bundled does (one shared `ProcessXMP`). The XMP `Warning` (if any)
+    // rides the sibling `Diagnose` channel, not this stream.
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      tags.extend(crate::emit::Taggable::tags(xmp, opts));
     }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
@@ -9887,6 +12148,7 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
   opts: crate::emit::EmitOptions,
   print_conv: bool,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -9916,10 +12178,14 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // Message strings whose surviving `Warning` tag has already been emitted (the
-  // WAS_WARNED first-occurrence gate, keyed on the message string — a SECOND
-  // sample with the same message emits NO further `Warning`, only its own timing).
-  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // The FILE-GLOBAL `WAS_WARNED` text set (`$$self{WAS_WARNED}`, threaded across
+  // ALL `-ee` warning producers) gates the first-occurrence — a message string
+  // whose `Warning` was already emitted (in THIS or ANY OTHER camm track/sample,
+  // OR a sibling ctmd/dji producer) emits NO further `Warning`, only its own
+  // timing. ExifTool keys this on the message TEXT file-wide, NOT per-track, so a
+  // duplicate recurring ACROSS tracks/docs collapses to one tag (the first
+  // occurrence's group) with the ` [x$n]` count — `was_warned` carries that
+  // cross-track scope (the prior camm-local `Vec` only deduped within one track).
   // The sample-table `SampleTime`/`SampleDuration` (`ConvertDuration` at `-j`, raw
   // seconds at `-n`) ExifTool's `ProcessSamples` emits AHEAD of a warning under the
   // raising sample's `Doc<N>` — `FoundSomething` runs PER SAMPLE before the
@@ -9964,9 +12230,8 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
       // message-dedup, so a duplicate-message second sample keeps its
       // `Doc<N>:SampleTime`/`SampleDuration` even when its `Warning` text is deduped.
       push_timing_g3(w, &group, print_conv, tags);
-      let msg = smol_str::SmolStr::from(w.message());
-      if !warned_msgs.contains(&msg) {
-        warned_msgs.push(msg);
+      if !was_warned.iter().any(|m| m.as_str() == w.message()) {
+        was_warned.push(smol_str::SmolStr::from(w.message()));
         tags.push(EmittedTag::new(
           group,
           "Warning".into(),
@@ -9974,15 +12239,31 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
           false,
         ));
       }
-    } else if first_seen(family1.as_str(), "Warning") {
-      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
+    } else if !was_warned.iter().any(|m| m.as_str() == w.message()) {
+      // `-G1`: the FILE-GLOBAL `WAS_WARNED` text gate — a message already emitted
+      // under ANY track/producer is suppressed (ExifTool keys on the TEXT, not the
+      // group), so a duplicate recurring across tracks collapses to the first
+      // occurrence's `Track<N>:Warning`. Record the text in the file-global set
+      // HERE, at the warning's WARN-TIME (ExifTool.pm:5635 sets
+      // `$$self{WAS_WARNED}{$str}` inside `Warn`, BEFORE any tag is created),
+      // INDEPENDENT of whether the per-track priority-0 `Warning` slot survives —
+      // otherwise a DISTINCT-text warning that loses the slot (its track already
+      // holds an earlier warning) would never be recorded, and a later same-text
+      // warning on ANOTHER track would wrongly re-emit (#215-R1). The `first_seen`
+      // slot gate then governs ONLY the per-track emission (the priority-0
+      // first-wins `(Track<N>, Warning)`; a distinct-text collision on a filled
+      // slot is dropped — the accepted divergence from ExifTool's numbered
+      // `Warning (i)` copies). The ` [x$n]` count is file-global via `count_of`.
       // Timing is owned by the cross-kind min-`doc()` precompute (above).
-      tags.push(EmittedTag::new(
-        Group::new("QuickTime", family1.as_str()),
-        "Warning".into(),
-        warning_value(w.message()),
-        false,
-      ));
+      was_warned.push(smol_str::SmolStr::from(w.message()));
+      if first_seen(family1.as_str(), "Warning") {
+        tags.push(EmittedTag::new(
+          Group::new("QuickTime", family1.as_str()),
+          "Warning".into(),
+          warning_value(w.message()),
+          false,
+        ));
+      }
     }
   }
 }
@@ -10014,6 +12295,7 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
   warnings: &[crate::metadata::CanonCtmdWarning],
   opts: crate::emit::EmitOptions,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -10046,10 +12328,13 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // FINAL-message strings whose surviving `Warning` has already been emitted at
-  // `-G3` (the WAS_WARNED first-occurrence gate — a later same-message sample
-  // emits no further `Warning`, only the CTMD payload block's own timing).
-  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // The FILE-GLOBAL `WAS_WARNED` text set (`$$self{WAS_WARNED}`, shared with the
+  // sibling camm/dji producers) gates the first-occurrence on the FINAL rendered
+  // message — a message already emitted (in THIS or ANY OTHER ctmd track/sample,
+  // OR a sibling producer) emits no further `Warning`. ExifTool keys this on the
+  // TEXT file-wide (NOT per-track), so a duplicate recurring ACROSS tracks/docs
+  // collapses to one tag (the first occurrence's group) with the ` [x$n]` count —
+  // the prior camm-local `Vec` only deduped within one ctmd track.
   for w in warnings {
     let family1 = std::format!("Track{}", w.track_index().unwrap_or(1));
     let msg = rendered(w);
@@ -10057,9 +12342,8 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
       // `-G3`: the warning carries its CTMD sample's `Doc<N>`; the `TagMap` sink
       // keeps distinct `(doc, family1, name)` rows. WAS_WARNED still suppresses a
       // duplicate FINAL message after the first occurrence.
-      let key = smol_str::SmolStr::from(msg.as_str());
-      if !warned_msgs.contains(&key) {
-        warned_msgs.push(key);
+      if !was_warned.iter().any(|m| m.as_str() == msg) {
+        was_warned.push(smol_str::SmolStr::from(msg.as_str()));
         let group = Group::with_doc("QuickTime", family1.as_str(), w.doc().unwrap_or(0));
         tags.push(EmittedTag::new(
           group,
@@ -10068,14 +12352,28 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
           false,
         ));
       }
-    } else if first_seen(family1.as_str(), "Warning") {
-      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
-      tags.push(EmittedTag::new(
-        Group::new("QuickTime", family1.as_str()),
-        "Warning".into(),
-        warning_value(&msg),
-        false,
-      ));
+    } else if !was_warned.iter().any(|m| m.as_str() == msg) {
+      // `-G1`: the FILE-GLOBAL `WAS_WARNED` text gate (file-wide, NOT per-track) —
+      // a message already emitted under ANY track/producer is suppressed, so a
+      // duplicate recurring across tracks collapses to the first occurrence's
+      // `Track<N>:Warning`. Record the FINAL rendered text in the file-global set
+      // HERE, at WARN-TIME (ExifTool.pm:5635 sets `$$self{WAS_WARNED}{$str}` in
+      // `Warn`, BEFORE the tag), INDEPENDENT of whether the per-track priority-0
+      // `Warning` slot survives — else a DISTINCT-text CTMD warning that loses the
+      // slot to an earlier warning on its track would go unrecorded, and a later
+      // same-text warning on another track would wrongly re-emit (#215-R1, the
+      // camm/ctmd class). The `first_seen` slot gate then governs ONLY the
+      // per-track emission (priority-0 first-wins `(Track<N>, Warning)`); the
+      // ` [x$n]` count is file-global via `count_of`.
+      was_warned.push(smol_str::SmolStr::from(msg.as_str()));
+      if first_seen(family1.as_str(), "Warning") {
+        tags.push(EmittedTag::new(
+          Group::new("QuickTime", family1.as_str()),
+          "Warning".into(),
+          warning_value(&msg),
+          false,
+        ));
+      }
     }
   }
 }
@@ -11208,6 +13506,10 @@ fn dji_push_sample_tags(
   if let Some(r) = s.frame_rate() {
     push(scratch, "FrameRate", TagValue::F64(r));
   }
+  // ── FrameNumber (3-1-1) — Format => 'unsigned', no conv ⇒ raw integer ────
+  if let Some(fno) = s.frame_number() {
+    push(scratch, "FrameNumber", TagValue::U64(fno));
+  }
   // ── TimeStamp (3-1-2) — ValueConv `$val / 1e6` seconds, raw number ───────
   if let Some(us) = s.time_stamp_us() {
     #[allow(clippy::cast_precision_loss)]
@@ -11380,6 +13682,7 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
   meta: &crate::metadata::DjiProtobufMeta,
   opts: crate::emit::EmitOptions,
   first_seen: &mut F,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -11417,16 +13720,22 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
     };
     TagValue::Str(text)
   };
-  // Distinct FINAL messages already emitted, in first-emission order — drives
-  // both the WAS_WARNED first-occurrence gate (a later same-message warning
-  // emits nothing further) AND the `Warning (i)` numbering (the i-th DISTINCT
-  // message after the first becomes `Warning (i-1)`, ExifTool.pm:9536-9537).
+  // The local distinct-message list (first-emission order) drives the `Warning
+  // (i)` numbering — the i-th DISTINCT message after the first becomes `Warning
+  // (i-1)` (ExifTool.pm:9536-9537). The FILE-GLOBAL `WAS_WARNED` text set
+  // (`$$self{WAS_WARNED}`, shared with the sibling camm/ctmd producers) drives the
+  // first-occurrence DEDUP — a message already emitted (here OR by a sibling
+  // producer) emits nothing further. A real djmd file is djmd-only, so `was_warned`
+  // is empty when this runs and the numbering is unchanged; the shared set only
+  // adds cross-producer dedup (the same text raised by both a djmd and a camm
+  // track), matching ExifTool's single file-global hash.
   let mut emitted_msgs: std::vec::Vec<std::string::String> = std::vec::Vec::new();
   for w in warnings {
     let msg = rendered(w);
-    if emitted_msgs.iter().any(|m| *m == msg) {
-      // A repeat of an already-emitted distinct message — WAS_WARNED only bumped
-      // its count (folded into the ` [x$n]` suffix above); no further tag.
+    if was_warned.iter().any(|m| m.as_str() == msg) {
+      // A repeat of an already-emitted distinct message (in this dji emitter OR a
+      // sibling producer) — WAS_WARNED only bumped its count (folded into the
+      // ` [x$n]` suffix above); no further tag.
       continue;
     }
     // The numbered tag NAME: the first distinct message is `Warning`, the next
@@ -11437,6 +13746,7 @@ fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
       smol_str::SmolStr::from(std::format!("Warning ({})", emitted_msgs.len()))
     };
     emitted_msgs.push(msg.clone());
+    was_warned.push(smol_str::SmolStr::from(msg.as_str()));
     let track_index = if w.track_index() == 0 {
       1
     } else {
@@ -14423,6 +16733,702 @@ mod tests {
     assert_eq!(k.convless(), [("Make".into(), TagValue::U64(300))]);
   }
 
+  /// The audio-track `keys` resolve through `%QuickTime::AudioKeys`
+  /// ([`apply_audio_key`]), NOT the generic `%Keys` resolver. The 6 table members
+  /// resolve via the table (`Mute` keeps its int8u Format + `Off`/`On` PrintConv;
+  /// the 5 plain ones are conv-less); every OTHER key takes `ProcessKeys`'
+  /// unknown-key DERIVE path (a conv-less tag named from the id) — NOT the `%Keys`
+  /// conversions, and NOT dropped. Ground-truthed vs bundled 13.59 in the
+  /// `MP4_audiokeys_mute.mp4` conformance fixture.
+  #[test]
+  fn audio_keys_resolve_through_audiokeys_table_not_generic_keys() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    let strkey = |s: &str| {
+      let full = std::format!("com.apple.quicktime.{s}");
+      KeyName {
+        stripped: s.to_string(),
+        stripped_raw: s.as_bytes().to_vec(),
+        full_raw: full.as_bytes().to_vec(),
+        full,
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // `Mute` int8u flag (0x16, byte 0x01) ⇒ pre-PrintConv U64(1) stored; `On` at
+    // `-j`, `1` at `-n`.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &strkey("player.movie.audio.mute"),
+      &IlstData {
+        flags: 0x16,
+        bytes: vec![0x01],
+      },
+      &mut k,
+    );
+    assert_eq!(k.mute(), Some(&TagValue::U64(1)));
+    assert_eq!(
+      audio_mute_value(k.mute().unwrap(), true),
+      TagValue::Str("On".into())
+    );
+    assert_eq!(audio_mute_value(k.mute().unwrap(), false), TagValue::U64(1));
+    // Mute=0 ⇒ Off; Mute=2 ⇒ Unknown (2).
+    assert_eq!(
+      audio_mute_value(&TagValue::U64(0), true),
+      TagValue::Str("Off".into())
+    );
+    assert_eq!(
+      audio_mute_value(&TagValue::U64(2), true),
+      TagValue::Str("Unknown (2)".into())
+    );
+
+    // The 5 plain AudioKeys are conv-less under their AudioKeys names.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &strkey("player.movie.audio.balance"),
+      &str_data("0"),
+      &mut k,
+    );
+    apply_audio_key(&strkey("player.movie.audio.gain"), &str_data("3"), &mut k);
+    apply_audio_key(
+      &strkey("player.movie.audio.pitchshift"),
+      &str_data("x"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [
+        ("Balance".into(), TagValue::Str("0".into())),
+        ("AudioGain".into(), TagValue::Str("3".into())),
+        ("PitchShift".into(), TagValue::Str("x".into())),
+      ]
+    );
+    assert_eq!(k.mute(), None);
+
+    // A NON-AudioKeys key is NOT dropped and is NOT date-converted: `make` ⇒
+    // conv-less `Make`, `creationdate` ⇒ conv-less `Creationdate` (the RAW
+    // string — the `%Keys` ValueConv is NOT applied), `acme.totally.bogus.zzz`
+    // (stripped from `com.acme.…`) ⇒ derived `AcmeTotallyBogusZzz`.
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&strkey("make"), &str_data("SHOULD_DROP"), &mut k);
+    apply_audio_key(
+      &strkey("creationdate"),
+      &str_data("2025-07-03T17:22:10-0400"),
+      &mut k,
+    );
+    apply_audio_key(
+      &KeyName {
+        stripped: "acme.totally.bogus.zzz".to_string(),
+        full: "com.acme.totally.bogus.zzz".to_string(),
+        stripped_raw: b"acme.totally.bogus.zzz".to_vec(),
+        full_raw: b"com.acme.totally.bogus.zzz".to_vec(),
+      },
+      &str_data("ARBVAL"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("SHOULD_DROP".into())),
+        (
+          "Creationdate".into(),
+          TagValue::Str("2025-07-03T17:22:10-0400".into())
+        ),
+        ("AcmeTotallyBogusZzz".into(), TagValue::Str("ARBVAL".into())),
+      ]
+    );
+    assert!(
+      k.creation_date().is_none(),
+      "AudioKeys creationdate must NOT take the %Keys date-ValueConv path"
+    );
+  }
+
+  /// #361 R6 — the COMPLETE `ProcessKeys` order (QuickTime.pm:9806-9854): active
+  /// table → `%ItemList` → `%UserData` → derive. A `keys` id whose stripped form
+  /// is a literal UserData/ItemList 4-cc (`manu`/`modl`, QuickTime.pm:1879/1885)
+  /// resolves to the UserData NAME (Make/Model) under the ACTIVE keys group —
+  /// `AudioKeys` for the audio path, `Keys` for the movie path — NOT a derived
+  /// `Manu`/`Modl`. The UserData RawConv is NOT copied by ProcessKeys ⇒ conv-less
+  /// (a clean ASCII value passes through verbatim). Ground-truthed vs bundled
+  /// 13.59 in the `MP4_audiokeys_mute.mp4` fixture (`manu`/`modl` items).
+  #[test]
+  fn keys_cross_table_resolves_itemlist_userdata_before_derive() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // An `mdta` key whose stripped form is exactly the 4-cc (no `com.` prefix on
+    // these literal ids, so stripped == full).
+    let cc_key = |s: &str| KeyName {
+      stripped: s.to_string(),
+      full: s.to_string(),
+      stripped_raw: s.as_bytes().to_vec(),
+      full_raw: s.as_bytes().to_vec(),
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // --- AudioKeys path: manu ⇒ Make, modl ⇒ Model (UserData names). ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("manu"), &str_data("CanonManu"), &mut k);
+    apply_audio_key(&cc_key("modl"), &str_data("EOS SX280"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("CanonManu".into())),
+        ("Model".into(), TagValue::Str("EOS SX280".into())),
+      ],
+      "manu/modl must resolve to the UserData Make/Model name, NOT a derived Manu/Modl"
+    );
+
+    // --- The SAME resolution on the movie-level Keys path ([`apply_key`]). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&cc_key("manu"), &str_data("Acme"), &mut k);
+    apply_key(&cc_key("modl"), &str_data("Z1"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [
+        ("Make".into(), TagValue::Str("Acme".into())),
+        ("Model".into(), TagValue::Str("Z1".into())),
+      ]
+    );
+
+    // --- ItemList 4-cc (the cross-table tries ItemList first): `desc` ⇒
+    //     Description (conv-less ItemList name) under the active group. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("desc"), &str_data("a clip"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Description".into(), TagValue::Str("a clip".into()))]
+    );
+
+    // --- The RawConv is NOT copied (the central faithfulness point): a `manu`
+    //     value with a leading `\0\0\0\0..` Canon prefix is NOT stripped — the
+    //     conv-less cascade emits the raw atom value, NOT `decode_manu_modl`'s
+    //     prefix-stripped form. (A `\0`-prefixed UTF-8 atom string-decodes
+    //     lossily and is then trailing-NUL-trimmed only, so the leading prefix
+    //     and the inner `Canon` survive — proving no `s/^\0{4}..//` strip ran.) ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &cc_key("manu"),
+      &IlstData {
+        flags: 0x01,
+        bytes: b"\x00\x00\x00\x00ABCanon".to_vec(),
+      },
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [(
+        "Make".into(),
+        TagValue::Str("\u{0}\u{0}\u{0}\u{0}ABCanon".into())
+      )],
+      "the UserData RawConv (Canon 6-byte prefix strip) must NOT be applied to the keys-context value"
+    );
+
+    // --- A 4-cc that is NOT a table id still DERIVES (the order's last step):
+    //     `zzzz` ⇒ AudioKeys:Zzzz. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(&cc_key("zzzz"), &str_data("v"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Zzzz".into(), TagValue::Str("v".into()))],
+      "a non-table 4-cc must fall through to the derive path"
+    );
+
+    // --- A non-4-byte id can never be a literal table id ⇒ straight to derive
+    //     (no spurious cross-table hit): the dotted `make` still derives `Make`. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &KeyName {
+        stripped: "make".to_string(),
+        full: "com.apple.quicktime.make".to_string(),
+        stripped_raw: b"make".to_vec(),
+        full_raw: b"com.apple.quicktime.make".to_vec(),
+      },
+      &str_data("x"),
+      &mut k,
+    );
+    assert_eq!(k.convless(), [("Make".into(), TagValue::Str("x".into()))]);
+  }
+
+  /// The MOVIE-level `%Keys` path ([`apply_key`]) runs the COMPLETE `ProcessKeys`
+  /// order — active `%Keys` → ItemList → UserData → DERIVE (QuickTime.pm:9844-
+  /// 9854) — exactly like the AudioKeys path. A movie-level key matching NONE of
+  /// the tables is NOT dropped: it derives a CONV-LESS `Keys:*` tag from the
+  /// stripped id. Ground-truthed vs bundled 13.59 (a movie-level
+  /// `com.apple.quicktime.acme.totally.bogus.zzz` ⇒ `Keys:AcmeTotallyBogusZzz`),
+  /// the `MP4_movie_keys.mov` conformance fixture.
+  #[test]
+  fn movie_keys_derive_on_double_miss() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    let mdta_key = |stripped: &str| {
+      let full = std::format!("com.apple.quicktime.{stripped}");
+      KeyName {
+        stripped: stripped.to_string(),
+        stripped_raw: stripped.as_bytes().to_vec(),
+        full_raw: full.as_bytes().to_vec(),
+        full,
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // A non-table movie key DERIVES (the [high] fix — previously dropped).
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &mdta_key("acme.totally.bogus.zzz"),
+      &str_data("BOGUSVAL"),
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [(
+        "AcmeTotallyBogusZzz".into(),
+        TagValue::Str("BOGUSVAL".into())
+      )],
+      "a movie-level non-table key must DERIVE Keys:* (not be dropped)"
+    );
+
+    // A movie key failing the reasonable-id gate (a non-`[-\w. ]` id with no run
+    // of 4 word chars) still adds nothing — the derive returns `None`.
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &KeyName {
+        stripped: "a!b".to_string(),
+        full: "a!b".to_string(),
+        stripped_raw: b"a!b".to_vec(),
+        full_raw: b"a!b".to_vec(),
+      },
+      &str_data("v"),
+      &mut k,
+    );
+    assert!(
+      k.convless().is_empty(),
+      "a gate-failing movie key derives nothing"
+    );
+  }
+
+  /// A RAW `0xA9`-prefixed 4-cc key id (`\xa9day`/`\xa9xyz`/`\xa9too` — the
+  /// `©`-copyright-symbol ItemList/UserData ids) must reach the cross-table as the
+  /// 4 RAW bytes, so the literal lookup matches. Its `String` view is a 6-byte
+  /// U+FFFD sequence (`from_utf8_lossy` mangles the invalid `0xA9`) that could
+  /// never match the 4-byte table id — hence the cross-table gates on the RAW
+  /// bytes ([`KeyName::stripped_raw`]). Ground-truthed vs bundled 13.59 in both
+  /// the `MP4_audiokeys_mute.mp4` (AudioKeys) and `MP4_movie_keys.mov` (Keys)
+  /// fixtures: a `\xa9day` keys id resolves to the ItemList `ContentCreateDate`
+  /// (its `%iso8601Date` ValueConv applied), `\xa9too` to `Encoder`, `\xa9xyz` to
+  /// `GPSCoordinates`.
+  #[test]
+  fn raw_a9_key_resolves_itemlist_through_cross_table() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // A raw `mdta` 4-cc key whose first byte is the literal `0xA9` (no `com.`
+    // prefix on these ids ⇒ stripped == full). The `String` views go through
+    // `from_utf8_lossy` exactly as `parse_keys_box` builds them.
+    let a9_key = |suffix: &[u8; 3]| {
+      let raw = [0xA9u8, suffix[0], suffix[1], suffix[2]];
+      let s = String::from_utf8_lossy(&raw).into_owned();
+      KeyName {
+        stripped: s.clone(),
+        full: s,
+        stripped_raw: raw.to_vec(),
+        full_raw: raw.to_vec(),
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // The lossy `String` view is indeed un-matchable (6 bytes, not 4) — the very
+    // reason the raw plumbing is required.
+    assert_eq!(a9_key(b"day").stripped.len(), 6);
+
+    // --- AudioKeys path: \xa9day ⇒ ContentCreateDate (ValueConv), \xa9too ⇒
+    //     Encoder (conv-less). ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &a9_key(b"day"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    apply_audio_key(&a9_key(b"too"), &str_data("MyEncoder"), &mut k);
+    assert_eq!(
+      k.content_create_date(),
+      Some("2024:05:06 07:08:09-05:00"),
+      "\\xa9day must resolve to the ItemList ContentCreateDate ValueConv"
+    );
+    assert_eq!(
+      k.convless(),
+      [("Encoder".into(), TagValue::Str("MyEncoder".into()))],
+      "\\xa9too must resolve to the ItemList Encoder name"
+    );
+
+    // --- Movie-level Keys path ([`apply_key`]): \xa9xyz ⇒ GPSCoordinates
+    //     (ConvertISO6709 typed slot), proving the SAME raw-byte plumbing. ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&a9_key(b"xyz"), &str_data("+12.3456-098.7654/"), &mut k);
+    assert!(
+      k.gps().is_some(),
+      "\\xa9xyz must resolve to the ItemList GPSCoordinates slot"
+    );
+  }
+
+  /// #363 — the REVERSED-id cross-table form (QuickTime.pm:9812-9818). A `keys` id
+  /// of the shape `^\w{3}\xa9$` (3 word chars then `0xA9`) is a BYTE-REVERSED
+  /// ItemList/UserData id: after the forward ItemList + UserData lookups miss,
+  /// ExifTool reverses the 4 bytes (`pack('N', unpack('V', $tag))`) and retries
+  /// ItemList then UserData. So `yad\xa9` (the reversed `\xa9day`) resolves to the
+  /// ItemList `ContentCreateDate` — ground-truthed vs bundled 13.59
+  /// (`exiftool -Keys:all` on a crafted MP4 with a `yad\xa9` keys id surfaces
+  /// `Keys:ContentCreateDate`). exifast handled the forward `\xa9`-prefix form
+  /// (#361) but DROPPED this reversed form before this fix.
+  #[test]
+  fn reversed_a9_key_resolves_itemlist_through_cross_table() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+    // A raw `mdta` 4-cc key id with the 4th byte = literal `0xA9` (no `com.`
+    // prefix on these ids ⇒ stripped == full), built exactly as `parse_keys_box`
+    // does (the leading 3 bytes are ASCII word chars; the lossy `String` view is
+    // a 6-byte U+FFFD sequence, never matching a 4-byte id — so the cross-table
+    // gates on the RAW bytes).
+    let rev_key = |prefix: &[u8; 3]| {
+      let raw = [prefix[0], prefix[1], prefix[2], 0xA9u8];
+      let s = String::from_utf8_lossy(&raw).into_owned();
+      KeyName {
+        stripped: s.clone(),
+        full: s,
+        stripped_raw: raw.to_vec(),
+        full_raw: raw.to_vec(),
+      }
+    };
+    let str_data = |s: &str| IlstData {
+      flags: 0x01,
+      bytes: s.as_bytes().to_vec(),
+    };
+
+    // --- Movie-level Keys path: yad\xa9 (reverse of \xa9day) ⇒ ContentCreateDate
+    //     (the ItemList ValueConv applied at the reversed lookup). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(
+      &rev_key(b"yad"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    assert_eq!(
+      k.content_create_date(),
+      Some("2024:05:06 07:08:09-05:00"),
+      "yad\\xa9 must byte-reverse to \\xa9day and resolve ItemList ContentCreateDate"
+    );
+
+    // --- AudioKeys path: the SAME reversed id resolves under the active group. ---
+    let mut k = QuickTimeKeys::new();
+    apply_audio_key(
+      &rev_key(b"yad"),
+      &str_data("2024-05-06T07:08:09-0500"),
+      &mut k,
+    );
+    assert_eq!(k.content_create_date(), Some("2024:05:06 07:08:09-05:00"));
+
+    // --- zyx\xa9 (reverse of \xa9xyz) ⇒ GPSCoordinates (ConvertISO6709 slot). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&rev_key(b"zyx"), &str_data("+12.3456-098.7654/"), &mut k);
+    assert!(
+      k.gps().is_some(),
+      "zyx\\xa9 must byte-reverse to \\xa9xyz and resolve GPSCoordinates"
+    );
+
+    // --- A `\w{3}\xa9` id whose REVERSE is not a table id emits NOTHING: ExifTool
+    //     `last`s after the reversed miss, and the derive gate then sees the
+    //     reversed `\xa9zzz` (a `0xA9`+3-char id), which fails `/^[-\w. ]+$/` and
+    //     has no `\w{4}` run ⇒ no tag. So the key is fully consumed — NOT derived
+    //     from the un-reversed `zzz\xa9` stripped id (which would wrongly yield
+    //     `Keys:Zzz`). ---
+    let mut k = QuickTimeKeys::new();
+    apply_key(&rev_key(b"zzz"), &str_data("v"), &mut k);
+    assert!(
+      k.content_create_date().is_none() && k.gps().is_none() && k.convless().is_empty(),
+      "a reversed-id pattern key with a non-table reverse must emit nothing (not derive Zzz)"
+    );
+
+    // --- The reversed transform requires exactly 3 WORD chars then 0xA9: an id
+    //     with 0xA9 NOT in the last position does not trigger it (no false
+    //     reverse). `\xa9day` itself (0xA9 FIRST) takes the FORWARD path, not the
+    //     reverse — covered by `raw_a9_key_resolves_itemlist_through_cross_table`;
+    //     here a `da\xa9y` (0xA9 in the middle) reverses-pattern-misses. ---
+    let mid = KeyName {
+      stripped: String::from_utf8_lossy(b"da\xa9y").into_owned(),
+      full: String::from_utf8_lossy(b"da\xa9y").into_owned(),
+      stripped_raw: b"da\xa9y".to_vec(),
+      full_raw: b"da\xa9y".to_vec(),
+    };
+    let mut k = QuickTimeKeys::new();
+    apply_key(&mid, &str_data("2024-05-06T07:08:09-0500"), &mut k);
+    assert!(
+      k.content_create_date().is_none(),
+      "0xA9 not in the last byte must NOT trigger the reversed-id transform"
+    );
+
+    // A 4-cc that hits the FORWARD cross-table is unaffected by the reversed
+    // branch (the forward hit returns before the reverse is considered): `manu`
+    // ⇒ UserData Make.
+    let manu = KeyName {
+      stripped: "manu".to_string(),
+      full: "manu".to_string(),
+      stripped_raw: b"manu".to_vec(),
+      full_raw: b"manu".to_vec(),
+    };
+    let mut k = QuickTimeKeys::new();
+    apply_key(&manu, &str_data("Acme"), &mut k);
+    assert_eq!(
+      k.convless(),
+      [("Make".into(), TagValue::Str("Acme".into()))]
+    );
+  }
+
+  /// [`reversed_a9_id`] ports the QuickTime.pm:9813-9814 byte-reversal: `^\w{3}
+  /// \xa9$` ⇒ the 4 bytes reversed (`[a,b,c,0xA9]` ⇒ `[0xA9,c,b,a]`), else `None`.
+  #[test]
+  fn reversed_a9_id_transform() {
+    assert_eq!(reversed_a9_id(b"yad\xa9"), Some(*b"\xa9day"));
+    assert_eq!(reversed_a9_id(b"zyx\xa9"), Some(*b"\xa9xyz"));
+    assert_eq!(reversed_a9_id(b"oot\xa9"), Some(*b"\xa9too"));
+    // `_` IS a word char (`\w`).
+    assert_eq!(reversed_a9_id(b"a_b\xa9"), Some(*b"\xa9b_a"));
+    // Last byte not 0xA9 ⇒ no transform.
+    assert_eq!(reversed_a9_id(b"\xa9day"), None);
+    assert_eq!(reversed_a9_id(b"manu"), None);
+    // A non-word char among the first 3 ⇒ no transform (the `\w{3}` gate).
+    assert_eq!(reversed_a9_id(b"a.b\xa9"), None);
+    assert_eq!(reversed_a9_id(b"a b\xa9"), None);
+  }
+
+  /// Parse a `tests/fixtures` MP4/MOV through the production entry and build its
+  /// public [`crate::metadata::MediaMetadata`] projection (`media_metadata`).
+  fn media_metadata_for_fixture(name: &str) -> crate::metadata::MediaMetadata {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read {name}: {e}"));
+    parse_borrowed(&bytes)
+      .unwrap_or_else(|| panic!("{name} parsed"))
+      .media_metadata()
+  }
+
+  /// #364 — the L2 projection must consume the `\xa9day` ContentCreateDate /
+  /// `\xa9xyz` GPSCoordinates landing in the `ItemList` and (cross-table) `Keys`
+  /// slots, so the public `media_metadata()` surfaces the real capture date /
+  /// location for a file whose date+GPS live ONLY there — NOT the stale `mvhd`
+  /// CreateDate / no GPS. Precedence is the ExifTool tag chain: `Keys:CreationDate`
+  /// over ContentCreateDate (ItemList PREFERRED=2 > UserData=1 > cross-table Keys),
+  /// and GPSCoordinates ItemList > UserData > Keys. Both fixtures are ground-truthed
+  /// vs bundled 13.59 (the #361 `MP4_movie_keys.mov` Keys-only and the real-device
+  /// `MP4_parrot_anafi.mp4` ItemList-only goldens).
+  #[test]
+  fn project_sp2_consumes_itemlist_and_cross_table_keys_date_gps() {
+    // --- ItemList-only (Parrot ANAFI): date+GPS live ONLY in ItemList. The
+    //     projected `created` is the LOCAL ItemList ContentCreateDate
+    //     `17:22:10-04:00`, NOT the UTC `mvhd` `21:22:10` — and the GPS comes from
+    //     `ItemList:GPSCoordinates` (previously dropped ⇒ no GpsLocation). ---
+    let md = media_metadata_for_fixture("MP4_parrot_anafi.mp4");
+    assert_eq!(
+      md.media().created(),
+      Some("2025:07:03 17:22:10-04:00"),
+      "ItemList ContentCreateDate must override the mvhd CreateDate"
+    );
+    let gps = md
+      .gps()
+      .expect("ItemList GPSCoordinates must project a GpsLocation");
+    assert!(
+      (gps.latitude().unwrap() - 39.830_642).abs() < 1e-4
+        && (gps.longitude().unwrap() - -81.738_328).abs() < 1e-4,
+      "ItemList GPS lat/lon mismatch: got ({:?}, {:?})",
+      gps.latitude(),
+      gps.longitude()
+    );
+    assert!(
+      (gps.altitude_m().unwrap() - 326.39).abs() < 1e-2,
+      "ItemList GPS altitude mismatch: {:?}",
+      gps.altitude_m()
+    );
+
+    // --- Keys-only (crafted `MP4_movie_keys.mov`): the cross-table `Keys:Content
+    //     CreateDate` (raw-0xA9 / reversed-id landing) + `Keys:GPSCoordinates`
+    //     project when no ItemList/UserData/CreationDate source is present. ---
+    let md = media_metadata_for_fixture("MP4_movie_keys.mov");
+    assert_eq!(
+      md.media().created(),
+      Some("2023:11:12 13:14:15-08:00"),
+      "cross-table Keys:ContentCreateDate must override the mvhd CreateDate"
+    );
+    let gps = md
+      .gps()
+      .expect("Keys:GPSCoordinates must project a GpsLocation");
+    assert!(
+      (gps.latitude().unwrap() - 48.8584).abs() < 1e-4
+        && (gps.longitude().unwrap() - 2.2945).abs() < 1e-4,
+      "Keys GPS lat/lon mismatch: got ({:?}, {:?})",
+      gps.latitude(),
+      gps.longitude()
+    );
+    assert!(
+      gps.altitude_m().is_none(),
+      "the Keys GPS carries no altitude"
+    );
+  }
+
+  /// #364 — a MALFORMED nested `ilst` item atom inside a movie-`meta`(`mdta`)
+  /// `keys`/`ilst` directory (and the audio-track equivalent) must surface the
+  /// `walk_atoms` "Invalid atom size" warning through the diagnostics channel —
+  /// the `keys` resolution does not silently swallow a structurally-invalid item.
+  /// Matches ExifTool's per-directory `ProcessMOV` size check (the same `$warnStr`
+  /// path verified in `walk_atoms_surfaces_contained_malformed_warning`).
+  #[test]
+  fn walk_meta_keys_surfaces_malformed_nested_ilst_warning() {
+    // A 1-entry `keys` box: version/flags(4) + count(4) + entry[ size(4) ns(4)
+    // key ] — `\xa9day` under the `mdta` namespace (size = 8 + 4 = 12).
+    let mut keys_payload = vec![0u8; 8];
+    wr(&mut keys_payload, 4, &1u32.to_be_bytes()); // entry count = 1
+    keys_payload.extend_from_slice(&12u32.to_be_bytes());
+    keys_payload.extend_from_slice(b"mdta");
+    keys_payload.extend_from_slice(b"\xa9day");
+    let keys = atom(b"keys", &keys_payload);
+
+    // A malformed `ilst`: one child whose declared `size == 4` (< 8) is a
+    // structurally-invalid atom ⇒ `walk_atoms` ends the directory with the
+    // warning instead of decoding the item.
+    let mut bad_item = 4u32.to_be_bytes().to_vec(); // declared size 4
+    bad_item.extend_from_slice(&1u32.to_be_bytes()); // index 1 (as the 4-cc)
+    let ilst = atom(b"ilst", &bad_item);
+
+    let mut meta_payload = keys.clone();
+    meta_payload.extend_from_slice(&ilst);
+
+    // Movie-level Keys path ([`walk_meta`]).
+    let mut warn: Option<String> = None;
+    let mut qt = crate::metadata::QuickTimeMeta::new();
+    walk_meta(0, &meta_payload, &mut warn, &mut qt);
+    assert_eq!(
+      warn.as_deref(),
+      Some("Invalid atom size"),
+      "a malformed nested ilst item in the movie Keys directory must warn"
+    );
+    assert!(
+      qt.keys().is_empty(),
+      "the malformed item must not yield a Keys tag"
+    );
+
+    // Audio-track Keys path ([`walk_meta_audio_keys`]) — same directory shape.
+    let mut warn: Option<String> = None;
+    let mut qt = crate::metadata::QuickTimeMeta::new();
+    walk_meta_audio_keys(0, &meta_payload, &mut warn, &mut qt);
+    assert_eq!(
+      warn.as_deref(),
+      Some("Invalid atom size"),
+      "a malformed nested ilst item in the AudioKeys directory must warn"
+    );
+    assert!(qt.audio_keys().is_empty());
+  }
+
+  /// [`derive_keys_name`] ports ExifTool's `ProcessKeys` unknown-key name
+  /// transform (QuickTime.pm:9844-9854) — ucfirst, drop-non-id-chars, CamelCase
+  /// the dotted/spaced path, `_`-handling, `Tag_` for <2 chars. Pinned against
+  /// the bundled-Perl transform output.
+  #[test]
+  fn derive_keys_name_matches_processkeys_transform() {
+    assert_eq!(derive_keys_name("make").as_deref(), Some("Make"));
+    assert_eq!(
+      derive_keys_name("creationdate").as_deref(),
+      Some("Creationdate")
+    );
+    assert_eq!(
+      derive_keys_name("acme.totally.bogus.zzz").as_deref(),
+      Some("AcmeTotallyBogusZzz")
+    );
+    assert_eq!(
+      derive_keys_name("player.movie.audio.foo").as_deref(),
+      Some("PlayerMovieAudioFoo")
+    );
+    // `_` after a lower stays/upper-cases per s/_([a-z])/_\U$1/; an upper after
+    // `_` between lower/upper drops the `_`.
+    assert_eq!(derive_keys_name("foo_bar").as_deref(), Some("FooBar"));
+    assert_eq!(derive_keys_name("x_y").as_deref(), Some("X_Y"));
+    assert_eq!(
+      derive_keys_name("hello world.test").as_deref(),
+      Some("HelloWorldTest")
+    );
+    // A single-char id ⇒ `Tag_` prefix (length < 2).
+    assert_eq!(derive_keys_name("a").as_deref(), Some("Tag_A"));
+    assert_eq!(derive_keys_name("ab").as_deref(), Some("Ab"));
+    // An empty stripped key ⇒ `Tag_mdta` (QuickTime.pm:9804).
+    assert_eq!(derive_keys_name("").as_deref(), Some("Tag_mdta"));
+    // Trailing/consecutive `.` runs (the `(.?)` end-of-string run vanishes); a
+    // `_` before a lower upper-cases it; a lower`_`Upper triple drops the `_`.
+    // Each pinned against the bundled-Perl transform.
+    assert_eq!(derive_keys_name("foo.").as_deref(), Some("Foo"));
+    assert_eq!(derive_keys_name("foo..bar").as_deref(), Some("FooBar"));
+    assert_eq!(derive_keys_name("_lead").as_deref(), Some("_Lead"));
+    assert_eq!(
+      derive_keys_name("mix_ed.Case").as_deref(),
+      Some("MixEdCase")
+    );
+    assert_eq!(
+      derive_keys_name("UPPER.lower").as_deref(),
+      Some("UPPERLower")
+    );
+  }
+
+  /// `read_audio_mute` ports `Mute`'s int8u Format read (QuickTime.pm:10404-10410):
+  /// a numeric flag reads int8u length-adjusted (byte 0 for len 1/3, the int16u/
+  /// int32u for len 2/4); a string flag decodes as a string (Format bypassed); an
+  /// empty atom yields `None`.
+  #[test]
+  fn read_audio_mute_reads_int8u_or_string() {
+    use crate::value::TagValue;
+    // int8u (0x16, 1 byte).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01]
+      }),
+      Some(TagValue::U64(1))
+    );
+    // A 3-byte atom: ExifTool keeps int8u (the `{1,2,4}` length-map misses 3) and
+    // reads byte 0.
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0xff, 0xff]
+      }),
+      Some(TagValue::U64(1))
+    );
+    // String flag (0x01) ⇒ decoded string (Format bypassed).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x01,
+        bytes: b"1".to_vec()
+      }),
+      Some(TagValue::Str("1".into()))
+    );
+    // Empty atom ⇒ None (no usable read).
+    assert_eq!(
+      read_audio_mute(&IlstData {
+        flags: 0x00,
+        bytes: vec![]
+      }),
+      None
+    );
+  }
+
   /// `ilst_data_convless` implements the FULL conv-less `data`-atom cascade
   /// (QuickTime.pm:10396-10416): a `%stringEncoding` flag ⇒ a string; else a
   /// `QuickTimeFormat` numeric flag ⇒ a number; else (no usable format, no
@@ -16895,6 +19901,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let w = tags
@@ -16921,6 +19928,7 @@ mod tests {
       &m,
       EmitOptions::g1(ConvMode::PrintConv, true),
       &mut gate1,
+      &mut std::vec::Vec::new(),
       &mut tags1,
     );
     let w1 = tags1
@@ -16936,6 +19944,7 @@ mod tests {
       &m,
       EmitOptions::g1(ConvMode::PrintConv, false),
       &mut gate2,
+      &mut std::vec::Vec::new(),
       &mut tags2,
     );
     assert!(tags2.is_empty(), "no warning without -ee");
@@ -16971,6 +19980,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
@@ -17015,6 +20025,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
@@ -17063,6 +20074,7 @@ mod tests {
         crate::serialize_key::GroupMode::G3,
       ),
       &mut gate,
+      &mut std::vec::Vec::new(),
       &mut tags,
     );
     let find = |name: &str| -> Option<TagValue> {
@@ -17345,6 +20357,512 @@ mod tests {
       warnings.first().map(String::as_str),
       Some("Invalid atom size"),
       "the atom warning must surface when there is no meta warning, got {warnings:?}"
+    );
+  }
+
+  /// Build a top-level Pittasoft `free` atom whose sole child is a `3gf ` box
+  /// carrying `gf_payload` (the Condition wants `\0\0` then a known 4cc at
+  /// offset 4 — `atom(b"3gf ", …)` already starts `[0,0,0,size,'3','g','f',' ']`).
+  #[cfg(feature = "alloc")]
+  fn pittasoft_free_with_3gf(gf_payload: &[u8]) -> std::vec::Vec<u8> {
+    atom(b"free", &atom(b"3gf ", gf_payload))
+  }
+
+  /// FINDING 1 — a TRUNCATED first `3gf ` record (4-9 bytes: a readable 4-byte
+  /// timecode but no complete 10-byte record) must emit NEITHER `TimeCode` NOR
+  /// `Accelerometer`. `Process_3gf` (QuickTimeStream.pl:2700) reads records while
+  /// `pos + RECORD_SIZE <= length`; a partial first record is never processed, so
+  /// the no-`ee` base path must not fabricate the missing accel axes via a
+  /// zero-fill. Covers every short length 4..=9 (each has a decodable timecode).
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn truncated_3gf_first_record_emits_no_timecode_or_accelerometer() {
+    for len in 4..=9usize {
+      // A non-terminator timecode in the first 4 bytes + however many accel
+      // bytes the short length carries (an incomplete record).
+      let mut gf = std::vec::Vec::new();
+      gf.extend_from_slice(&1234u32.to_be_bytes()); // timecode (not 0xffffffff)
+      gf.extend(std::iter::repeat_n(0x11u8, len - 4)); // 0..5 stray accel bytes
+      assert_eq!(gf.len(), len);
+      let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+      data.extend(pittasoft_free_with_3gf(&gf));
+      let meta = parse_inner(&data, None).expect("accepted");
+      let pit = meta.quicktime().pittasoft();
+      assert_eq!(
+        pit.time_code(),
+        None,
+        "a truncated {len}-byte 3gf record must NOT emit TimeCode"
+      );
+      assert_eq!(
+        pit.accelerometer(),
+        None,
+        "a truncated {len}-byte 3gf record must NOT emit Accelerometer (no zero-fill)"
+      );
+      // The single short record is NOT "more than one record" ⇒ no EEWarn.
+      assert!(
+        !pit.ee_warn(),
+        "a single short 3gf record raises no no-ee EEWarn"
+      );
+    }
+
+    // Control: a COMPLETE 10-byte first record DOES emit both (no regression).
+    let mut gf = std::vec::Vec::new();
+    gf.extend_from_slice(&0u32.to_be_bytes()); // timecode 0 ⇒ TimeCode 0.0
+    gf.extend_from_slice(&(-126i16).to_be_bytes()); // x = -12.6
+    gf.extend_from_slice(&2i16.to_be_bytes()); // y = 0.2
+    gf.extend_from_slice(&31i16.to_be_bytes()); // z = 3.1
+    assert_eq!(gf.len(), 10);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data.extend(pittasoft_free_with_3gf(&gf));
+    let meta = parse_inner(&data, None).expect("accepted");
+    let pit = meta.quicktime().pittasoft();
+    assert_eq!(pit.time_code(), Some(0.0), "complete record emits TimeCode");
+    assert_eq!(
+      pit.accelerometer(),
+      Some("-12.6 0.2 3.1"),
+      "complete record emits Accelerometer"
+    );
+  }
+
+  /// FINDING 2 — the Pittasoft `3gf ` no-`ee` `EEWarn` participates in the
+  /// document-level offset-ordered priority-0 first-wins drain (#159/#361): a
+  /// file whose EARLY `free`/Pittasoft atom raises the `EEWarn` (a multi-record
+  /// `3gf `) FOLLOWED BY a LATER truncated `mdat` (→ the `ProcessMOV` `Truncated
+  /// 'mdat' data` warning) must surface the EARLIER `EEWarn` as the bare
+  /// `ExifTool:Warning` — exactly the offset model, NOT a side hook that blindly
+  /// leads the slot. At `-ee` the `EEWarn` is absent (ExifTool processes every
+  /// record), so the later `mdat` warning leads instead.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn pittasoft_3gf_eewarn_orders_by_offset_against_later_mdat_warning() {
+    // EARLY: a `free`/Pittasoft with a TWO-record `3gf ` (20 bytes > 10 ⇒ EEWarn).
+    let mut gf = std::vec::Vec::new();
+    for tc in [10u32, 20u32] {
+      gf.extend_from_slice(&tc.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+      gf.extend_from_slice(&0i16.to_be_bytes());
+    }
+    assert_eq!(gf.len(), 20);
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let free_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&gf));
+    // LATER: a truncated `mdat` — declared size overruns EOF ⇒ a `ProcessMOV`
+    // `Truncated 'mdat' data …` warning at this (higher) offset.
+    let mdat_off = data.len();
+    data.extend_from_slice(&64u32.to_be_bytes()); // declared 64-byte atom …
+    data.extend_from_slice(b"mdat");
+    data.extend_from_slice(&[0u8; 8]); // … but only 8 payload bytes present
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    let mdat_warning = meta.warning().expect("truncated mdat warns").to_string();
+    // Sanity: the EEWarn fired and is stamped at the EARLIER `free` offset; the
+    // `mdat` truncation is a LATER `ProcessMOV` warning.
+    assert!(
+      meta.quicktime().pittasoft().ee_warn(),
+      "the two-record 3gf raises the no-ee EEWarn"
+    );
+    assert_eq!(
+      meta.quicktime().pittasoft().ee_warn_offset(),
+      Some(free_off),
+      "the EEWarn is stamped at the free/Pittasoft atom offset"
+    );
+    assert!(
+      mdat_warning.starts_with("Truncated 'mdat' data"),
+      "the mdat truncation warns, got {mdat_warning:?}"
+    );
+    assert_eq!(meta.warning_offset(), Some(mdat_off as u64));
+    assert!(
+      free_off < mdat_off as u64,
+      "the free/Pittasoft EEWarn is positioned earlier than the mdat warning"
+    );
+
+    // No-`ee`: the EARLIER EEWarn wins the bare `ExifTool:Warning`, the `mdat`
+    // warning still surfaces (just after it).
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some(EE_WARNING),
+      "the earlier 3gf EEWarn must win the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.contains(&mdat_warning),
+      "the later mdat warning still surfaces, got {warnings:?}"
+    );
+
+    // `-ee`: ExifTool raises no EEWarn (it processes every record), so the LATER
+    // `mdat` warning leads and the EEWarn is absent entirely.
+    let mut ee = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics_with_options(&meta, true, &mut ee);
+    assert_eq!(
+      ee.first_warning(),
+      Some(mdat_warning.as_str()),
+      "at -ee the EEWarn is gone and the mdat warning leads"
+    );
+    assert!(
+      !ee.warnings().iter().any(|w| w == EE_WARNING),
+      "at -ee no 3gf EEWarn is emitted at all"
+    );
+  }
+
+  /// FINDING (R2-follow-up, mirrors #361 R4) — with MULTIPLE `free`/Pittasoft
+  /// atoms the `EEWarn` offset must follow the FIRST atom whose `3gf ` actually
+  /// RAISES it, never a later one. ExifTool's `Warn` `FoundTag`s each message
+  /// once (ExifTool.pm:5635-5639 — a repeat only bumps the `WAS_WARNED` count),
+  /// so the bare-`Warning`'s file position is the FIRST raiser's offset. A later
+  /// `free` (whether it raises the `EEWarn` again or carries a clean single
+  /// record) must NOT overwrite the earlier raiser's stamp — otherwise the
+  /// `EEWarn` would mis-rank against the offset-ordered doc-warning race.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn pittasoft_eewarn_offset_is_first_raiser_across_multiple_free_atoms() {
+    // A `3gf ` payload of `n` complete 10-byte records (all zero accel).
+    let three_gf = |n: usize| {
+      let mut gf = std::vec::Vec::new();
+      for tc in 0..n as u32 {
+        gf.extend_from_slice(&(10 * (tc + 1)).to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+        gf.extend_from_slice(&0i16.to_be_bytes());
+      }
+      gf
+    };
+
+    // EARLY `free`/Pittasoft: a TWO-record `3gf ` (20 > 10 ⇒ raises the EEWarn).
+    let mut data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let early_free_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&three_gf(2)));
+    // A LATER `free`/Pittasoft that ALSO raises (a three-record `3gf `): a later
+    // raiser must NOT overwrite the earlier first-raiser's offset.
+    let later_raiser_off = data.len() as u64;
+    data.extend(pittasoft_free_with_3gf(&three_gf(3)));
+    // A LATER truncated `mdat` ⇒ a `ProcessMOV` warning at this higher offset.
+    let mdat_off = data.len() as u64;
+    data.extend_from_slice(&64u32.to_be_bytes()); // declared 64-byte atom …
+    data.extend_from_slice(b"mdat");
+    data.extend_from_slice(&[0u8; 8]); // … but only 8 payload bytes present
+    assert!(early_free_off < later_raiser_off && later_raiser_off < mdat_off);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      meta.quicktime().pittasoft().ee_warn(),
+      "a multi-record 3gf raises the no-ee EEWarn"
+    );
+    // The crux: the offset is the FIRST (earliest) raising `free` atom — the
+    // later raiser did NOT overwrite it.
+    assert_eq!(
+      meta.quicktime().pittasoft().ee_warn_offset(),
+      Some(early_free_off),
+      "the EEWarn offset must follow the FIRST raising free atom, not a later one"
+    );
+    // And it correctly wins the bare first-wins `ExifTool:Warning` at that early
+    // position over the LATER `mdat` `ProcessMOV` warning.
+    let mdat_warning = meta.warning().expect("truncated mdat warns").to_string();
+    assert!(mdat_warning.starts_with("Truncated 'mdat' data"));
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some(EE_WARNING),
+      "the early-raiser EEWarn wins the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.contains(&mdat_warning),
+      "the later mdat warning still surfaces"
+    );
+
+    // The complementary case: an EARLY raiser followed by a LATER NON-raising
+    // `free` (a clean SINGLE-record `3gf `). The non-raiser must not stamp/move
+    // the offset — it stays at the early raiser.
+    let mut data2 = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let early_off2 = data2.len() as u64;
+    data2.extend(pittasoft_free_with_3gf(&three_gf(2))); // raises
+    data2.extend(pittasoft_free_with_3gf(&three_gf(1))); // single record, no EEWarn
+    let meta2 = parse_inner(&data2, None).expect("accepted");
+    assert!(meta2.quicktime().pittasoft().ee_warn());
+    assert_eq!(
+      meta2.quicktime().pittasoft().ee_warn_offset(),
+      Some(early_off2),
+      "a later non-raising free atom must not overwrite the first-raiser offset"
+    );
+
+    // Mirror-image control: a NON-raising free FIRST, then a raising free — the
+    // offset follows the raiser (the non-raiser left it unstamped).
+    let mut data3 = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    data3.extend(pittasoft_free_with_3gf(&three_gf(1))); // single record, no EEWarn
+    let raiser_off3 = data3.len() as u64;
+    data3.extend(pittasoft_free_with_3gf(&three_gf(2))); // raises
+    let meta3 = parse_inner(&data3, None).expect("accepted");
+    assert!(meta3.quicktime().pittasoft().ee_warn());
+    assert_eq!(
+      meta3.quicktime().pittasoft().ee_warn_offset(),
+      Some(raiser_off3),
+      "the offset follows the first RAISING free atom (the earlier non-raiser stamps nothing)"
+    );
+  }
+
+  /// A top-level `uuid`-XMP atom whose packet is DOUBLE UTF-8-encoded (a byte-0
+  /// `\xef\xbb\xbf` BOM directly before `<?xpacket begin=`, XMP.pm:4351) — so
+  /// `ProcessXMP` both extracts the `XMP-dc:Title` AND raises `XMP is double
+  /// UTF-encoded` (XMP.pm:4493). The 16-byte XMP UUID precedes the packet.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  fn double_encoded_xmp_uuid() -> Vec<u8> {
+    let mut packet = std::vec::Vec::new();
+    packet
+      .extend_from_slice(b"\xef\xbb\xbf<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
+    packet.extend_from_slice(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+    packet.extend_from_slice(b"<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Hi</rdf:li></rdf:Alt></dc:title></rdf:Description>");
+    packet.extend_from_slice(b"</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    let mut body = std::vec::Vec::new();
+    body.extend_from_slice(&XMP_UUID);
+    body.extend_from_slice(&packet);
+    atom(b"uuid", &body)
+  }
+
+  /// A CLEAN top-level `uuid`-XMP atom — the same packet as
+  /// [`double_encoded_xmp_uuid`] but WITHOUT the leading `\xef\xbb\xbf` BOM, so
+  /// `ProcessXMP` extracts `XMP-dc:Title` and raises NO warning. Its `dc:title`
+  /// is `"Clean"` so a later packet's duplicate `Title` proves last-wins.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  fn clean_xmp_uuid() -> Vec<u8> {
+    let mut packet = std::vec::Vec::new();
+    packet.extend_from_slice(b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
+    packet.extend_from_slice(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">");
+    packet.extend_from_slice(b"<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Clean</rdf:li></rdf:Alt></dc:title></rdf:Description>");
+    packet.extend_from_slice(b"</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    let mut body = std::vec::Vec::new();
+    body.extend_from_slice(&XMP_UUID);
+    body.extend_from_slice(&packet);
+    atom(b"uuid", &body)
+  }
+
+  /// #361 R2 — the embedded `uuid`-XMP `ProcessXMP` warning must obey ExifTool's
+  /// priority-0 `Warning` first-wins ordering, NOT always land last. For a NON-
+  /// `HEIC` container ExifTool sets `PRIORITY_DIR = 'XMP'` (QuickTime.pm:10016),
+  /// so the XMP `Warning` is PRIORITY-1 and owns the bare `ExifTool:Warning` over
+  /// a priority-0 `ProcessMOV` atom warning — even when the atom warning sits
+  /// LATER in the file. Ground-truthed vs bundled ExifTool 13.59: an MP4 with an
+  /// EARLY double-encoded `uuid`-XMP + a LATER size-4 `junk` atom reports
+  /// `ExifTool:Warning = "XMP is double UTF-encoded"` (the XMP one), with
+  /// "Invalid atom size" still present under `-a`.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_wins_priority1_over_later_atom_warning() {
+    // ftyp(mp42) + EARLY double-encoded uuid-XMP + LATER size-4 junk atom.
+    let mut data = atom(b"ftyp", b"mp42\0\0\0\0mp42isom");
+    data.extend(double_encoded_xmp_uuid());
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"junk");
+
+    let meta = parse_inner(&data, None).expect("accepted as MP4");
+    // Sanity: BOTH warnings were produced, and the XMP packet's tag extracted.
+    assert_eq!(meta.file_type(), "MP4");
+    assert_eq!(meta.warning(), Some("Invalid atom size"));
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+
+    // The priority-1 XMP warning owns the bare `ExifTool:Warning` slot even
+    // though the `ProcessMOV` atom warning sits LATER in the file.
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "the priority-1 XMP warning must win the first-wins slot, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "Invalid atom size"),
+      "the atom warning still surfaces (after the XMP one), got {warnings:?}"
+    );
+  }
+
+  /// #361 R2 (reverse order) — the priority-1 XMP warning wins the bare slot even
+  /// when an EARLIER priority-0 `ProcessMOV` warning was extracted first. An MP4
+  /// with a `moov` whose `mvhd` child is truncated (warning at the EARLY `moov`
+  /// atom) FOLLOWED BY a double-encoded `uuid`-XMP (warning at a LATER atom) still
+  /// reports `ExifTool:Warning = "XMP is double UTF-encoded"` (ground-truthed vs
+  /// bundled 13.59: PRIORITY_DIR='XMP' promotion beats file order).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_wins_priority1_even_after_earlier_atom_warning() {
+    // ftyp(mp42) + EARLY moov{truncated mvhd} + LATER double-encoded uuid-XMP.
+    let mut moov_body = 100u32.to_be_bytes().to_vec(); // declared size 100
+    moov_body.extend_from_slice(b"mvhd");
+    moov_body.extend_from_slice(b"XXXX"); // only 4 of 92 payload bytes
+    let mut data = atom(b"ftyp", b"mp42\0\0\0\0mp42isom");
+    data.extend(atom(b"moov", &moov_body));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as MP4");
+    assert_eq!(
+      meta.warning(),
+      Some("Truncated 'mvhd' data (missing 88 bytes)")
+    );
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "the priority-1 XMP warning wins even when extracted later, got {warnings:?}"
+    );
+    assert!(
+      warnings
+        .iter()
+        .any(|w| w == "Truncated 'mvhd' data (missing 88 bytes)"),
+      "the earlier atom warning still surfaces, got {warnings:?}"
+    );
+  }
+
+  /// #361 R2 (`HEIC` exception) — for a `HEIC` container ExifTool does NOT set
+  /// `PRIORITY_DIR = 'XMP'` (QuickTime.pm:10016 `unless $fileType eq 'HEIC'`), so
+  /// the embedded-XMP `Warning` is PRIORITY-0 and competes by walk position. An
+  /// EARLY HEIF `iinf` out-of-order warning therefore keeps the bare slot over a
+  /// LATER double-encoded `uuid`-XMP (ground-truthed vs bundled 13.59 — contrast
+  /// the `mif1`/non-`HEIC` HEIF case, where XMP would win).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_is_priority0_under_heic_loses_to_earlier_heif_warning() {
+    // ftyp(heic) + EARLY meta{iinf out-of-order} + LATER double-encoded uuid-XMP.
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    assert_eq!(meta.file_type(), "HEIC");
+    assert_eq!(
+      meta.heif().warning(),
+      Some("Item info entries are out of order")
+    );
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    // PRIORITY-0 on HEIC: the EARLIER HEIF warning (lower offset) keeps the slot.
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Item info entries are out of order"),
+      "on HEIC the earlier priority-0 HEIF warning wins over the later XMP, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the XMP warning still surfaces (after the HEIF one), got {warnings:?}"
+    );
+  }
+
+  /// #361 R3 (multi-XMP `HEIC` ordering) — the embedded-XMP `Warning`'s OFFSET
+  /// must follow the WARNING-PRODUCING packet, NOT the first XMP atom. A `HEIC`
+  /// shaped `[CLEAN uuid-XMP, meta{iinf out-of-order}, double-encoded uuid-XMP]`
+  /// raises the XMP `XMP is double UTF-encoded` warning at the LATER (double-
+  /// encoded) atom — AFTER the HEIF `iinf` warning. On `HEIC` the XMP `Warning`
+  /// is priority-0 (ranked by walk offset), so the EARLIER HEIF warning wins the
+  /// bare `ExifTool:Warning`. The pre-fix bug recorded the FIRST (clean) XMP
+  /// atom's offset (BEFORE the meta box), which wrongly ranked the XMP warning
+  /// first. Ground-truthed vs bundled 13.59: bare `Warning = "Item info entries
+  /// are out of order"` (the HEIF one); the later packet's `Title` dup wins
+  /// last-wins. Contrast the `mif1`/non-`HEIC` shape (priority-1 →
+  /// XMP wins regardless of offset, asserted by the sibling case below).
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_offset_follows_warning_producing_packet_on_heic() {
+    // ftyp(heic) + CLEAN uuid-XMP (no warning) + meta{iinf out-of-order} +
+    // double-encoded uuid-XMP (the warning is raised at THIS later atom).
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    data.extend(clean_xmp_uuid());
+    let meta_off = data.len() as u64;
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    let double_off = data.len() as u64;
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    assert_eq!(meta.file_type(), "HEIC");
+    // The clean packet seeded the XMP; the double-encoded packet's warning was
+    // ADOPTED (first-warning-wins) and its tag accumulated.
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    assert_eq!(
+      meta.heif().warning(),
+      Some("Item info entries are out of order")
+    );
+    // THE FIX: the recorded XMP-warning offset is the LATER (double-encoded)
+    // atom's body offset, NOT the first (clean) XMP atom's — so it is GREATER
+    // than the meta-box offset and the HEIF warning outranks it.
+    assert_eq!(meta.embedded_xmp_offset, Some(double_off + 8));
+    assert!(
+      meta.embedded_xmp_offset > Some(meta.heif().warning_offset().unwrap()),
+      "the XMP warning offset must follow the meta-box warning (not precede it via the clean first atom)"
+    );
+    assert_eq!(meta.heif().warning_offset(), Some(meta_off + 8));
+
+    // PRIORITY-0 on HEIC, ranked by the CORRECT (later) offset: the EARLIER HEIF
+    // warning wins the bare `ExifTool:Warning` (ground-truth: bundled 13.59).
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Item info entries are out of order"),
+      "the intervening HEIF warning must win over the later XMP warning, got {warnings:?}"
+    );
+    assert!(
+      warnings.iter().any(|w| w == "XMP is double UTF-encoded"),
+      "the XMP warning still surfaces (after the HEIF one), got {warnings:?}"
+    );
+    // The later (double-encoded) packet's duplicate `Title` ("Hi") accumulates
+    // AFTER the clean packet's ("Clean") in file order, so last-wins picks it.
+    let title = meta
+      .embedded_xmp
+      .as_ref()
+      .map(crate::formats::xmp::XmpMeta::tags_slice)
+      .into_iter()
+      .flatten()
+      .filter(|t| t.name() == "Title")
+      .filter_map(|t| t.value_ref().scalar_ref())
+      .map(crate::formats::xmp::XmpScalar::text)
+      .next_back();
+    assert_eq!(title, Some("Hi"));
+  }
+
+  /// #361 R3 (multi-XMP non-`HEIC` parity) — the same `[clean, HEIF-warn,
+  /// double-encoded]` shape under a `mif1` (non-`HEIC`) brand: the XMP `Warning`
+  /// is PRIORITY-1 (`PRIORITY_DIR='XMP'`, QuickTime.pm:10016) and owns the bare
+  /// `ExifTool:Warning` regardless of offset, even though it is raised at the
+  /// LATER atom. Ground-truthed vs bundled 13.59: bare `Warning = "XMP is double
+  /// UTF-encoded"` (FileType `HEIF`). Confirms the offset fix is HEIC-scoped and
+  /// does not disturb the priority-1 path.
+  #[cfg(all(feature = "alloc", feature = "xmp"))]
+  #[test]
+  fn embedded_xmp_warning_priority1_wins_for_multi_xmp_non_heic() {
+    let mut data = atom(b"ftyp", b"mif1\0\0\0\0mif1heic");
+    data.extend(clean_xmp_uuid());
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    data.extend(double_encoded_xmp_uuid());
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIF");
+    assert_eq!(meta.file_type(), "HEIF");
+    assert_eq!(
+      meta.embedded_xmp.as_ref().and_then(|x| x.warning()),
+      Some("XMP is double UTF-encoded")
+    );
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("XMP is double UTF-encoded"),
+      "non-HEIC: the priority-1 XMP warning wins regardless of its (later) offset, got {warnings:?}"
+    );
+    assert!(
+      warnings
+        .iter()
+        .any(|w| w == "Item info entries are out of order"),
+      "the HEIF warning still surfaces (after the XMP one), got {warnings:?}"
     );
   }
 
@@ -18679,6 +22197,268 @@ mod tests {
   }
 
   #[test]
+  fn mp4_m4a_override_keys_on_all_handler_codes_not_just_media_handler() {
+    // #348 dual-`hdlr` structural close — the MP4→M4A override
+    // (QuickTime.pm:10619-10624) keys on `$$et{HasHandler}{soun/vide}`, the set
+    // of EVERY walked `hdlr` HandlerType (`$$self{HasHandler}{$val} = 1` runs in
+    // the `%Handler` RawConv for EACH `hdlr` box — QuickTime.pm:8414 — the
+    // `mdia/hdlr` MEDIA handler AND every nested `mdia/minf/hdlr` DATA handler),
+    // NOT just the single `mdia/hdlr` `handler_code()` media 4cc. A `soun`
+    // `mdia/hdlr` whose nested `minf/hdlr` carries `vide` therefore sets
+    // `HasHandler{vide}` ⇒ the override is SUPPRESSED. The pre-fix predicate read
+    // only `handler_code()` (the media 4cc), so it never saw the nested `vide`
+    // and WRONGLY flipped this audio-looking file to M4A.
+    //
+    // Ground truth — bundled ExifTool 13.59 on these exact byte layouts:
+    //   (a) `ftyp isom` + `mdia/hdlr` = soun + `minf/hdlr` = `url ` ⇒
+    //         FileType = M4A,  MIMEType = audio/mp4
+    //   (b) SAME bytes but `minf/hdlr` = `vide` (a nested media code) ⇒
+    //         FileType = MP4,  MIMEType = video/mp4   (HasHandler{vide} suppresses)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal one-entry `mp4a` `stsd` so the audio `minf` walk is well-formed.
+    let stsd = {
+      let entry_body: Vec<u8> = [0u8; 6].iter().copied().chain(1u16.to_be_bytes()).collect();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"mp4a");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    // `mdia/hdlr` MEDIA = soun; nested `minf/hdlr` DATA = `minf_code`.
+    let build = |minf_code: &[u8; 4]| {
+      let mut tkhd = vec![0u8; 84];
+      wr(&mut tkhd, 12, &1u32.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+      let media_hdlr = hdlr(b"mhlr", b"soun", "SoundHandler");
+      let minf = atom(b"minf", &{
+        let mut b = hdlr(b"dhlr", minf_code, "DataHandler");
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&media_hdlr);
+        b.extend_from_slice(&minf);
+        b
+      });
+      let trak = atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      });
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      let moov = atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        b.extend_from_slice(&trak);
+        b
+      });
+      // `ftyp isom` + a non-first `mp42` compat slot ⇒ resolves MP4.
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&moov);
+      full
+    };
+
+    // (a) data handler `url ` ⇒ HasHandler = {soun, url } ⇒ M4A.
+    let a_bytes = build(b"url ");
+    let a = parse_inner(&a_bytes, None).expect("accepted");
+    assert_eq!(
+      a.quicktime().tracks().first().unwrap().handler_code(),
+      Some("soun"),
+      "mdia/hdlr media handler is soun"
+    );
+    assert_eq!(
+      a.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "url ".to_string()],
+      "all_handler_codes lists the media (soun) then the data (url ) hdlr"
+    );
+    assert_eq!(
+      (a.file_type(), a.mime()),
+      ("M4A", "audio/mp4"),
+      "a lone soun media + a url data handler ⇒ M4A (matches bundled 13.59)"
+    );
+
+    // (b) data handler `vide` ⇒ HasHandler = {soun, vide} ⇒ override SUPPRESSED.
+    let b_bytes = build(b"vide");
+    let b = parse_inner(&b_bytes, None).expect("accepted");
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().handler_code(),
+      Some("soun"),
+      "mdia/hdlr media handler is STILL soun (the minf/hdlr vide is the data slot)"
+    );
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "vide".to_string()],
+      "all_handler_codes now contains the nested minf/hdlr vide"
+    );
+    assert_eq!(
+      (b.file_type(), b.mime()),
+      ("MP4", "video/mp4"),
+      "a nested minf/hdlr vide sets HasHandler{{vide}} ⇒ NO M4A (matches bundled 13.59)"
+    );
+  }
+
+  #[test]
+  fn mp4_m4a_override_keys_on_file_global_nontrack_meta_hdlr() {
+    // #348 file-global `HasHandler` — the MP4→M4A override (QuickTime.pm:10619-
+    // 10624) keys on `$$et{HasHandler}{soun/vide}`, which is FILE-GLOBAL: the
+    // `%QuickTime::Handler` RawConv sets `$$self{HasHandler}{$val} = 1`
+    // (QuickTime.pm:8414) for EVERY `hdlr` box the file contains AT ANY LEVEL,
+    // including a NON-track `meta/hdlr` (a `moov`-level `meta` here) that lives
+    // OUTSIDE any `trak`/`mdia`. The per-track `all_handler_codes` model (R8/R9)
+    // never sees such a box, so before this fix an audio-only `moov/meta/hdlr` =
+    // soun (no `soun` `trak`) stayed MP4 and a `moov/meta/hdlr` = vide failed to
+    // suppress the override — both diverging from bundled.
+    //
+    // Ground truth — bundled ExifTool 13.59 on these exact byte layouts:
+    //   (a) `ftyp isom` + `moov{ mvhd, meta(hdlr soun) }` (NO trak) ⇒
+    //         FileType = M4A,  MIMEType = audio/mp4
+    //   (b) `ftyp isom` + `moov{ mvhd, <soun trak>, meta(hdlr vide) }` ⇒
+    //         FileType = MP4,  MIMEType = video/mp4  (file-global HasHandler{vide})
+    //
+    // A `%QuickTime::Movie` `meta` has NO `Start` ⇒ offset-0 (QT plain box), so
+    // the `hdlr` is the first child with no version prefix.
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal well-formed `soun` `trak` (mp4a stsd) — used only by case (b).
+    let soun_trak = || {
+      let stsd = {
+        let entry_body: Vec<u8> = [0u8; 6].iter().copied().chain(1u16.to_be_bytes()).collect();
+        let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+        entry.extend_from_slice(b"mp4a");
+        entry.extend_from_slice(&entry_body);
+        let mut sb = vec![0u8; 4];
+        sb.extend_from_slice(&1u32.to_be_bytes());
+        sb.extend_from_slice(&entry);
+        atom(b"stsd", &sb)
+      };
+      let mut tkhd = vec![0u8; 84];
+      wr(&mut tkhd, 12, &1u32.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+      let minf = atom(b"minf", &{
+        let mut b = hdlr(b"dhlr", b"url ", "DataHandler");
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&hdlr(b"mhlr", b"soun", "SoundHandler"));
+        b.extend_from_slice(&minf);
+        b
+      });
+      atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      })
+    };
+    let build = |with_soun_trak: bool, meta_hdlr: &[u8; 4]| {
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      // `moov/meta` (offset-0 QT box) carrying one `hdlr` of `meta_hdlr`.
+      let meta = atom(b"meta", &hdlr(b"mhlr", meta_hdlr, "Handler"));
+      let moov = atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        if with_soun_trak {
+          b.extend_from_slice(&soun_trak());
+        }
+        b.extend_from_slice(&meta);
+        b
+      });
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&moov);
+      full
+    };
+
+    // (a) NON-track `moov/meta/hdlr` = soun, NO `trak` ⇒ file-global HasHandler
+    // sees soun ⇒ M4A (the per-track model has ZERO tracks here).
+    let a_bytes = build(false, b"soun");
+    let a = parse_inner(&a_bytes, None).expect("accepted");
+    assert!(
+      a.quicktime().tracks().is_empty(),
+      "case (a) has no trak — the soun comes ONLY from the non-track moov/meta/hdlr"
+    );
+    assert_eq!(
+      (a.file_type(), a.mime()),
+      ("M4A", "audio/mp4"),
+      "a non-track moov/meta/hdlr=soun (no trak) flips MP4→M4A (matches bundled 13.59)"
+    );
+
+    // (b) `soun` `trak` + a NON-track `moov/meta/hdlr` = vide ⇒ file-global
+    // HasHandler{vide} SUPPRESSES the override ⇒ MP4 (every track's hdlr is soun).
+    let b_bytes = build(true, b"vide");
+    let b = parse_inner(&b_bytes, None).expect("accepted");
+    assert_eq!(
+      b.quicktime().tracks().first().unwrap().all_handler_codes(),
+      &["soun".to_string(), "url ".to_string()],
+      "the only trak carries soun + url (no vide) — the vide is the non-track meta/hdlr"
+    );
+    assert_eq!(
+      (b.file_type(), b.mime()),
+      ("MP4", "video/mp4"),
+      "a non-track moov/meta/hdlr=vide suppresses the M4A override (matches bundled 13.59)"
+    );
+
+    // (c) a TOP-LEVEL (file-level) `meta/hdlr` = soun (the `%QuickTime::Main`
+    // `meta` is `Start => 4` ⇒ ISO version prefix) sitting BESIDE an empty `moov`
+    // (no `trak`) — the distinct file-level collector site (`parse_inner` Pass 2).
+    // Ground truth bundled 13.59: FileType M4A / audio/mp4.
+    let c_bytes = {
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes());
+      // `%Main` `meta` = `Start => 4`: a 4-byte version prefix before the `hdlr`.
+      let meta = atom(b"meta", &{
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(&hdlr(b"mhlr", b"soun", "SoundHandler"));
+        b
+      });
+      let moov = atom(b"moov", &atom(b"mvhd", &mvhd));
+      let mut full = atom(
+        b"ftyp",
+        &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+      );
+      full.extend_from_slice(&meta);
+      full.extend_from_slice(&moov);
+      full
+    };
+    let c = parse_inner(&c_bytes, None).expect("accepted");
+    assert!(
+      c.quicktime().tracks().is_empty(),
+      "case (c) has no trak — the soun comes ONLY from the file-level meta/hdlr"
+    );
+    assert_eq!(
+      (c.file_type(), c.mime()),
+      ("M4A", "audio/mp4"),
+      "a top-level meta/hdlr=soun (no trak) flips MP4→M4A (matches bundled 13.59)"
+    );
+  }
+
+  #[test]
   fn use_ext_table_is_glv_to_mp4_only() {
     // R11/F1: `%useExt = ( GLV => 'MP4' )` (QuickTime.pm:240) — the WHOLE
     // table is this single entry, and the predicate (QuickTime.pm:10007)
@@ -19386,6 +23166,1001 @@ mod tests {
     assert!(
       map.get("Track2", "TrackID").is_none(),
       "no Track2 group is emitted (Track# resets per moov)"
+    );
+  }
+
+  #[test]
+  fn two_top_level_moovs_dual_hdlr_bare_key_is_last_moov_data_handler() {
+    // #348 — two TOP-LEVEL moovs, each a single `trak` that RESETS to `Track1`
+    // (per-moov `$track`), and each `trak` carries BOTH a `mdia/hdlr` MEDIA
+    // handler (`vide`) and a `mdia/minf/hdlr` DATA handler (`url `). All four
+    // `hdlr`s extract into the SAME `Track1` family-1 group; the bare-key owner
+    // is the LAST-extracted surviving `hdlr` = moov2's `Track1` DATA handler, and
+    // the render-stage same-group filter (exiftool:2745) suppresses moov1's pair
+    // + moov2's media. So bundled ExifTool surfaces ONLY the LATER moov's DATA
+    // handler for `Track1`. The old GLOBAL last-track-index rule emitted moov1's
+    // MEDIA handler here (it won the first-wins gate before moov2's data could
+    // land); the per-`(family1 group)` rule resolves to moov2's data.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout:
+    //   Track1:HandlerType = "URL", HandlerClass = "Data Handler",
+    //   HandlerDescription = "DataHandler2"  (moov2's `minf/hdlr`).
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      // version+flags(4) ComponentType(4) ComponentSubType(4) reserved(12)
+      // then the HandlerDescription C-string (decoded from offset 24).
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    // A minimal one-entry `vide` `stsd` so the `minf` walk is well-formed.
+    let stsd = {
+      let entry_body = [0u8; 6] // reserved
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes()) // data-ref index
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4]; // version+flags
+      sb.extend_from_slice(&1u32.to_be_bytes()); // entry count
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mk_moov = |track_id: u32, media_name: &str, data_name: &str| {
+      let mut tkhd = vec![0u8; 84];
+      wb(&mut tkhd, 0, 0);
+      wr(&mut tkhd, 12, &track_id.to_be_bytes());
+      wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+      let mut mdhd = vec![0u8; 24];
+      wr(&mut mdhd, 12, &90000u32.to_be_bytes()); // MediaTimeScale
+      wr(&mut mdhd, 16, &90000u32.to_be_bytes()); // MediaDuration
+      let media_hdlr = hdlr(b"mhlr", b"vide", media_name);
+      let data_hdlr = hdlr(b"dhlr", b"url ", data_name);
+      let minf = atom(b"minf", &{
+        let mut b = data_hdlr.clone();
+        b.extend_from_slice(&atom(b"stbl", &stsd));
+        b
+      });
+      let mdia = atom(b"mdia", &{
+        let mut b = atom(b"mdhd", &mdhd);
+        b.extend_from_slice(&media_hdlr);
+        b.extend_from_slice(&minf);
+        b
+      });
+      let trak = atom(b"trak", &{
+        let mut b = atom(b"tkhd", &tkhd);
+        b.extend_from_slice(&mdia);
+        b
+      });
+      let mut mvhd = vec![0u8; 100];
+      wr(&mut mvhd, 12, &600u32.to_be_bytes()); // TimeScale
+      atom(b"moov", &{
+        let mut b = atom(b"mvhd", &mvhd);
+        b.extend_from_slice(&trak);
+        b
+      })
+    };
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&mk_moov(1, "VideoHandler1", "DataHandler1"));
+    full.extend_from_slice(&mk_moov(2, "VideoHandler2", "DataHandler2"));
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let tracks = meta.quicktime().tracks();
+    assert_eq!(tracks.len(), 2, "both traks decoded");
+    // Both reset to Track1, and BOTH carry a media (`vide`) + data (`url `) hdlr.
+    assert_eq!(tracks.first().unwrap().track_group(), Some(1));
+    assert_eq!(tracks.get(1).unwrap().track_group(), Some(1));
+    assert_eq!(tracks.first().unwrap().handler_code(), Some("vide"));
+    assert_eq!(
+      tracks
+        .first()
+        .unwrap()
+        .data_handler()
+        .and_then(|d| d.code()),
+      Some("url ")
+    );
+    assert_eq!(
+      tracks
+        .get(1)
+        .unwrap()
+        .data_handler()
+        .and_then(|d| d.description()),
+      Some("DataHandler2")
+    );
+
+    // The bare `Track1:Handler*` triplet = moov2's DATA handler (per-group
+    // last-extracted-owns-bare), NOT moov1's media handler.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "Track1:HandlerType is the LAST moov's data handler (URL), not moov1's vide"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "Track1:HandlerClass is the data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("DataHandler2"),
+      "Track1:HandlerDescription is moov2's DataHandler2"
+    );
+    // No second Track1 media handler leaks in (every earlier-same-group hdlr is
+    // render-suppressed; the data triplet is the sole survivor).
+    assert!(
+      map.get("Track2", "HandlerType").is_none(),
+      "Track# resets per moov: no Track2 group exists"
+    );
+  }
+
+  #[test]
+  fn vide_media_hdlr_with_meta_minf_hdlr_fires_eewarn_and_surfaces_nrt_metadata() {
+    // #348 R3 — a single `trak` whose `mdia/hdlr` MEDIA handler is `vide` (NOT an
+    // EEWarn trigger — `vide` is gated on the `stsd`, QuickTime.pm:8407 `$val eq
+    // 'vide'`) BUT whose nested `mdia/minf/hdlr` DATA handler is the metadata
+    // handler `meta`. ExifTool runs the `%Handler` `HandlerType` RawConv for EVERY
+    // `hdlr` it walks (both this `vide` and the nested `meta`), so the no-`ee`
+    // EEWarn fires on the `meta` code even though the media handler is `vide`. The
+    // R2 per-group owner selection ALSO surfaces that `meta` data handler as
+    // `Track1:HandlerType` = "NRT Metadata" (it is the sole/last `hdlr` owner).
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerType        = "NRT Metadata"  (the `meta` minf/hdlr)
+    //   Track1:HandlerClass       = "Data Handler"
+    //   Track1:HandlerDescription = "MetaDataHandler1"
+    //   Track1:Warning = "[minor] The ExtractEmbedded option may find more tags
+    //                     in the media data"
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = vide (no warn); `minf/hdlr` DATA = meta (warns).
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let data_hdlr = hdlr(b"dhlr", b"meta", "MetaDataHandler1");
+    let minf = atom(b"minf", &{
+      let mut b = data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    assert_eq!(
+      track.data_handler().and_then(|d| d.code()),
+      Some("meta"),
+      "minf/hdlr is the meta data handler"
+    );
+
+    // No `-ee`: faithful emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // R2 owner selection: the `meta` data handler surfaces as the Track1 triplet.
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("NRT Metadata"),
+      "owner selection surfaces the meta minf/hdlr as HandlerType"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the meta data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("MetaDataHandler1")
+    );
+    // R3 fix: the EEWarn fires on the nested `meta` minf/hdlr code, even though
+    // the `mdia/hdlr` media handler (`vide`) is itself not an EEWarn trigger.
+    assert_eq!(
+      map.get_str("Track1", "Warning").as_deref(),
+      Some(EE_WARNING),
+      "the meta minf/hdlr triggers the no-ee ExtractEmbedded warning"
+    );
+  }
+
+  #[test]
+  fn multi_minf_meta_then_url_fires_eewarn_with_url_owner_triplet() {
+    // #348 R4 — the STRUCTURAL close. A single `trak` with `mdia/hdlr` = `vide`
+    // (NOT an EEWarn trigger — gated on the `stsd`) and TWO `minf` boxes: the
+    // FIRST `minf/hdlr` is `meta` (an `%eeBox` trigger), the SECOND is `url ` (a
+    // data-reference handler, NOT a trigger). The parser walks BOTH `minf` boxes,
+    // so the single last-wins `data_handler` slot is OVERWRITTEN from `meta` to
+    // `url ` — yet ExifTool runs the `%Handler` HandlerType RawConv for EVERY
+    // `hdlr` box it walks (vide, meta, url), so the no-`ee` EEWarn STILL fires on
+    // the `meta` even though the surviving owner triplet is the `url `. The R3 fix
+    // (which checked only the single `data_handler` slot) would MISS this, since
+    // the slot holds `url `; the R4 fix iterates the COMPLETE `all_handler_codes`
+    // accumulation (every walked `hdlr`), so the `meta` is seen regardless.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:Warning = "[minor] The ExtractEmbedded option may find more tags
+    //                     in the media data"          (the FIRST minf `meta`)
+    //   Track1:HandlerType        = "URL"             (the LAST `hdlr` = the
+    //                                                  owner triplet, the `url `)
+    //   Track1:HandlerClass       = "Data Handler"
+    //   Track1:HandlerDescription = "UrlDataHandler2"
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = vide (no warn); FIRST `minf/hdlr` = meta (warns); SECOND
+    // `minf/hdlr` = url (the surviving owner triplet, NOT a warn trigger).
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let minf1 = atom(b"minf", &hdlr(b"dhlr", b"meta", "MetaDataHandler1"));
+    let minf2 = atom(b"minf", &hdlr(b"dhlr", b"url ", "UrlDataHandler2"));
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf1);
+      b.extend_from_slice(&minf2);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The single last-wins `data_handler` slot holds the SECOND minf/hdlr (url ),
+    // the OWNER triplet — the `meta` it once held was overwritten.
+    assert_eq!(
+      track.data_handler().and_then(|d| d.code()),
+      Some("url "),
+      "the last minf/hdlr (url) is the surviving data_handler owner"
+    );
+    // The COMPLETE accumulation carries every walked `hdlr` in file order — both
+    // the overwritten `meta` AND the surviving `url ` are present, so the EEWarn
+    // can see the `meta` regardless of which one won the triplet slot.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide", "meta", "url "],
+      "all_handler_codes accumulates every walked hdlr in file order"
+    );
+
+    // No `-ee`: faithful emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // The owner triplet is the LAST `hdlr` = the `url ` data handler (last-wins).
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "owner selection surfaces the LAST (url) minf/hdlr as HandlerType"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the url data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("UrlDataHandler2"),
+      "HandlerDescription is the url data handler's, as a unit"
+    );
+    // The STRUCTURAL fix: the EEWarn FIRES on the FIRST minf/hdlr `meta` even
+    // though the surviving owner triplet (the SECOND minf/hdlr) is `url ` (which
+    // is itself NOT a trigger). The single-slot R3 check would miss it.
+    assert_eq!(
+      map.get_str("Track1", "Warning").as_deref(),
+      Some(EE_WARNING),
+      "the first minf/hdlr meta still triggers the no-ee warning despite the url owner"
+    );
+  }
+
+  #[test]
+  fn empty_minf_hdlr_does_not_suppress_the_vide_media_handler() {
+    // #348 R4 follow-up — a single `trak` whose `mdia/hdlr` MEDIA handler is a
+    // valid `vide`, but whose nested `mdia/minf/hdlr` DATA handler is SHORT/EMPTY
+    // (an 8-byte body: no HandlerType window, all-zero HandlerClass window, no
+    // vendor, no description). Every `%Handler` field of that `minf/hdlr` decodes
+    // to `None` — it is "fully undef": it extracts NO tag. A fully-undef `hdlr`
+    // therefore cannot OWN the bare `Track1:Handler*` key nor SUPPRESS the track's
+    // `mdia/hdlr` media handler. The bug was: the empty data handler was
+    // materialized + counted by `owner_idx` (and chosen by `data_handler`), so the
+    // track emitted NOTHING and the valid `vide` HandlerType was DROPPED. The fix
+    // (`DataReferenceHandler::has_content`) makes the empty data handler not a
+    // valid owner, so the `vide` MEDIA handler surfaces instead.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler"   (the `mdia/hdlr` vide)
+    //   Track1:HandlerType        = "Video Track"
+    //   Track1:HandlerDescription = "VideoHandler1"
+    //   (no Track1:Warning — the empty minf/hdlr carries no `%eeBox` code)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = a valid `vide`; the `minf/hdlr` DATA handler is a SHORT
+    // (8-byte) all-undef box: no HandlerType (8..12 absent), all-zero class
+    // (4..8), no vendor, no description.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let empty_data_hdlr = atom(b"hdlr", &[0u8; 8]);
+    let minf = atom(b"minf", &{
+      let mut b = empty_data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The fully-undef `minf/hdlr` is a NO-OP at the walk source: every `%Handler`
+    // field decoded to `None`, so the candidate carried no content and the
+    // `data_handler` slot was never installed (it stays `None`). It can neither
+    // own the bare key, suppress the media handler, nor clear a prior one.
+    assert!(
+      track.data_handler().is_none(),
+      "an all-undef minf/hdlr is a no-op: the data_handler slot stays None"
+    );
+    // The empty minf/hdlr has no code, so it contributes nothing to the EEWarn
+    // accumulation — only the `vide` media handler's code is present.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide"],
+      "an all-undef minf/hdlr (no code) is not pushed to all_handler_codes"
+    );
+
+    // The valid `vide` MEDIA handler is emitted — NOT dropped/suppressed by the
+    // empty data handler (bundled parity: an undef minf/hdlr produces no
+    // HandlerType, so the media handler shows).
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "the vide media handler is emitted, not dropped by the empty minf/hdlr"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is the mdia/hdlr media handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is the media handler's, as a unit"
+    );
+    // `vide` is gated on the `stsd`, not the handler, and the empty minf/hdlr has
+    // no `%eeBox` code — so NO no-`ee` ExtractEmbedded warning fires.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: the empty minf/hdlr carries no eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn repeated_minf_empty_hdlr_after_contentful_url_keeps_the_url_data_handler() {
+    // #348 R6 — the STRUCTURAL close of the empty-`minf/hdlr` class. A single
+    // `trak` with `mdia/hdlr` = `vide` (media) and TWO `minf` boxes: the FIRST
+    // `minf/hdlr` is a CONTENTFUL `url ` data handler, the SECOND is a SHORT/EMPTY
+    // (8-byte, all-undef) `hdlr`. The walk hits both `minf/hdlr` boxes; the prior
+    // bug overwrote the single `data_handler` slot for EVERY `minf/hdlr` (even
+    // all-None), so the later empty box CLEARED the valid `url ` triplet (every
+    // field → `None`) and the owner-selection then fell back to the `vide` media
+    // handler — LOSING the data handler. The source-level fix only installs the
+    // slot when the candidate `has_content`, so a fully-undef `minf/hdlr` is a
+    // no-op: it cannot own, suppress, OR clear. The slot therefore HOLDS the LAST
+    // CONTENTFUL data handler (the `url ` from `minf1`), the empty box can't erase
+    // it.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Data Handler"   (the `url ` minf1/hdlr)
+    //   Track1:HandlerType        = "URL"
+    //   Track1:HandlerDescription = "UrlDataHandler1"
+    //   (no Track1:Warning — neither the `url ` nor the empty box is an `%eeBox`)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // `mdia/hdlr` MEDIA = a valid `vide`; FIRST `minf/hdlr` = a contentful `url `
+    // (with a well-formed `stbl`); SECOND `minf/hdlr` = a SHORT (8-byte) all-undef
+    // box that must NOT clear the `url ` already in the slot.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let url_hdlr = hdlr(b"dhlr", b"url ", "UrlDataHandler1");
+    let minf1 = atom(b"minf", &{
+      let mut b = url_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let empty_data_hdlr = atom(b"hdlr", &[0u8; 8]);
+    let minf2 = atom(b"minf", &empty_data_hdlr);
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf1);
+      b.extend_from_slice(&minf2);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The data_handler slot HOLDS the contentful `url ` from `minf1`; the later
+    // empty `minf/hdlr` is a no-op and did NOT clear it.
+    let dh = track
+      .data_handler()
+      .expect("the contentful url minf/hdlr installed the slot");
+    assert!(
+      dh.has_content(),
+      "the url data handler carries content and was not cleared by the empty box"
+    );
+    assert_eq!(
+      dh.code(),
+      Some("url "),
+      "the last CONTENTFUL minf/hdlr (url) survives; the empty box did not erase it"
+    );
+    assert_eq!(
+      dh.class(),
+      Some("dhlr"),
+      "the url data handler's class survives"
+    );
+    assert_eq!(
+      dh.description(),
+      Some("UrlDataHandler1"),
+      "the url data handler's description survives the later empty box"
+    );
+    // The empty `minf/hdlr` (no code) contributes nothing to the EEWarn
+    // accumulation; only the `vide` media handler and the `url ` are present.
+    assert_eq!(
+      track.all_handler_codes(),
+      &["vide", "url "],
+      "the all-undef minf/hdlr (no code) is not pushed; only vide + url are"
+    );
+
+    // No `-ee`: faithful emission — the `url ` DATA handler is surfaced as the
+    // Track1 triplet (owner selection), NOT the `vide` media handler.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "the preserved url data handler is the bare-key owner (not the vide media)"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is the url data handler's class"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("UrlDataHandler1"),
+      "HandlerDescription is the url data handler's, preserved past the empty box"
+    );
+    // The `vide` media handler is NOT shown — the url data handler owns the bare
+    // key and the render-stage same-group filter suppresses the media pair.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: neither the url nor the empty box carries an eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn class_only_minf_hdlr_overrides_only_handler_class_keeping_media_type_and_desc() {
+    // #348 round 7 — the PER-FIELD structural model. A single `trak` whose
+    // `mdia/hdlr` MEDIA handler is a full `vide` (HandlerClass=mhlr,
+    // HandlerType=vide, HandlerDescription=VideoHandler1) and whose
+    // `mdia/minf/hdlr` DATA handler is CLASS-ONLY: a 8-byte body (version+flags +
+    // a `dhlr` ComponentType at offset 4) — NO HandlerType window (offset 8 past
+    // the box end) and NO HandlerDescription. ExifTool's `%Handler` is a
+    // binary-data table, so HandlerClass / HandlerType / HandlerDescription are
+    // THREE independent `FoundTag`s: the class-only `dhlr` provides ONLY
+    // HandlerClass, so its global bare key wins HandlerClass (Data Handler), while
+    // HandlerType and HandlerDescription — which the data handler does NOT provide
+    // — KEEP the media handler's values. The prior per-UNIT emission selected the
+    // class-only data handler as a whole and dropped HandlerType + Description;
+    // the per-field merge keeps them.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerType        = "Video Track"   (KEPT from the `vide` media)
+    //   Track1:HandlerDescription = "VideoHandler1" (KEPT from the media)
+    //   Track1:HandlerClass       = "Data Handler"  (the `dhlr` minf/hdlr)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    // CLASS-ONLY `minf/hdlr`: an 8-byte body = version+flags(4) + `dhlr` at
+    // offset 4. Offset 8 (HandlerType) and 24 (HandlerDescription) are past the
+    // box end, so the data handler provides ONLY HandlerClass.
+    let class_only_data = {
+      let mut body = vec![0u8; 8];
+      wr(&mut body, 4, b"dhlr");
+      atom(b"hdlr", &body)
+    };
+    let minf = atom(b"minf", &{
+      let mut b = class_only_data;
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The class-only data handler carries ONLY HandlerClass (`dhlr`); its
+    // HandlerType / HandlerDescription decoded to `None`.
+    let dh = track
+      .data_handler()
+      .expect("class-only minf/hdlr installs the slot");
+    assert_eq!(
+      dh.class(),
+      Some("dhlr"),
+      "the data handler provides HandlerClass"
+    );
+    assert_eq!(dh.code(), None, "no HandlerType window in the 8-byte body");
+    assert_eq!(
+      dh.description(),
+      None,
+      "no HandlerDescription in the 8-byte body"
+    );
+
+    // No `-ee`: faithful PER-FIELD emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // HandlerClass: the data handler's `dhlr` (its global bare key wins).
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Data Handler"),
+      "HandlerClass is overridden by the class-only data handler"
+    );
+    // HandlerType: the data handler does NOT provide it ⇒ the media `vide` is
+    // KEPT (the prior per-unit model wrongly dropped it).
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "HandlerType is KEPT from the media handler (data handler has none)"
+    );
+    // HandlerDescription: likewise KEPT from the media handler.
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is KEPT from the media handler (data handler has none)"
+    );
+    // `vide` is gated on the `stsd`; `dhlr` is not an `%eeBox` code ⇒ no warning.
+    assert!(
+      map.get("Track1", "Warning").is_none(),
+      "no EEWarn: neither vide nor dhlr is an eeBox handler code"
+    );
+  }
+
+  #[test]
+  fn zero_code_minf_hdlr_overrides_only_handler_type_keeping_media_class_and_desc() {
+    // #348 round 7 — the zero-code arm of the PER-FIELD model. A single `trak`
+    // whose `mdia/hdlr` MEDIA handler is a full `vide` and whose `mdia/minf/hdlr`
+    // DATA handler is a 12-byte body: version+flags(4) + an all-zero HandlerClass
+    // window (offset 4, RawConv `\0\0\0\0` → undef) + a present-but-ZERO
+    // HandlerType window (offset 8 = `\0\0\0\0`). The HandlerType RawConv always
+    // returns its value (even a zero code → "Unknown ()"), so the data handler
+    // provides ONLY HandlerType; HandlerClass (all-zero → undef) and
+    // HandlerDescription (absent) do NOT override the media handler. Per the
+    // per-field model: HandlerType = "Unknown ()" (the zero-code data handler),
+    // HandlerClass = "Media Handler" + HandlerDescription = "VideoHandler1" KEPT
+    // from media. The prior per-unit model would have selected the zero-code data
+    // handler as a whole (it `has_content` via its code) and dropped the media
+    // HandlerClass + HandlerDescription.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler" (KEPT from the `vide` media)
+    //   Track1:HandlerDescription = "VideoHandler1" (KEPT from the media)
+    //   Track1:HandlerType        = "Unknown ()"    (the zero-code minf/hdlr; the
+    //     raw `-p` value is `Unknown (\0\0\0\0)`, the JSON writer strips the NULs)
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4);
+      wr(&mut body, 8, type4);
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    // ZERO-CODE `minf/hdlr`: a 12-byte all-zero body. HandlerClass window
+    // (offset 4) is all-zero ⇒ undef; HandlerType window (offset 8) is present
+    // and `\0\0\0\0` ⇒ the RawConv returns it (renders "Unknown ()"); no desc.
+    let zero_code_data = atom(b"hdlr", &[0u8; 12]);
+    let minf = atom(b"minf", &{
+      let mut b = zero_code_data;
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&media_hdlr);
+      b.extend_from_slice(&minf);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The zero-code data handler carries ONLY a (zero) HandlerType code; its
+    // HandlerClass (all-zero → undef) and HandlerDescription decoded to `None`.
+    let dh = track
+      .data_handler()
+      .expect("zero-code minf/hdlr installs the slot");
+    assert_eq!(
+      dh.code(),
+      Some("\0\0\0\0"),
+      "the zero HandlerType code is present"
+    );
+    assert_eq!(dh.class(), None, "all-zero HandlerClass decodes to None");
+    assert_eq!(dh.description(), None, "no HandlerDescription");
+
+    // No `-ee`: faithful PER-FIELD emission.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // HandlerType: the zero-code data handler wins. The RAW value carries the 4
+    // NUL bytes of the code inside the `Unknown ($val)` PrintConv miss; the JSON
+    // writer then strips every NUL (`exiftool:3819` `tr/\0//d`, value.rs), so the
+    // rendered token is "Unknown ()" — bundled parity. Assert BOTH layers.
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Unknown (\0\0\0\0)"),
+      "HandlerType is the zero-code data handler (raw value carries the NUL code)"
+    );
+    assert_eq!(
+      serde_json::to_string(&crate::value::TagValue::Str("Unknown (\0\0\0\0)".into()))
+        .expect("serialize"),
+      "\"Unknown ()\"",
+      "the JSON writer strips the NULs ⇒ the rendered token matches bundled"
+    );
+    // HandlerClass: the data handler does NOT provide it ⇒ media `mhlr` KEPT.
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is KEPT from the media handler (data handler all-zero)"
+    );
+    // HandlerDescription: KEPT from the media handler.
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is KEPT from the media handler (data handler has none)"
+    );
+  }
+
+  #[test]
+  fn reordered_mdia_minf_hdlr_before_media_hdlr_media_wins_per_field_by_file_order() {
+    // #348 round 8 — the ORDERING facet: actual parse/file order, not a
+    // hard-coded media-before-data assumption. A single `trak` whose `mdia` lists
+    // its children REORDERED: the `minf` (carrying a CONTENTFUL `url ` DATA
+    // handler) comes BEFORE the `mdia/hdlr` MEDIA handler (`vide`). The parser
+    // walks `mdia` children in FILE order, so it records the `url ` data box FIRST
+    // and the `vide` media box LAST. ExifTool extracts every `hdlr`'s `%Handler`
+    // fields in that same file order, so the bare `Track1:Handler*` key lands on
+    // the LAST extraction per field = the MEDIA handler (it appears last). The old
+    // resolver hard-coded media-as-first / data-as-last and would have emitted the
+    // `url ` data handler here; the per-field actual-file-order model emits the
+    // media handler (`vide`) — it is last in file order and wins its fields.
+    //
+    // Ground truth — bundled ExifTool 13.59 on this exact byte layout (no `-ee`):
+    //   Track1:HandlerClass       = "Media Handler"  (the `vide` mdia/hdlr, LAST)
+    //   Track1:HandlerType        = "Video Track"
+    //   Track1:HandlerDescription = "VideoHandler1"
+    // (the `url ` data handler appeared FIRST, so it loses every field it sets).
+    let hdlr = |class4: &[u8; 4], type4: &[u8; 4], name: &str| {
+      let mut body = vec![0u8; 24];
+      wr(&mut body, 4, class4); // HandlerClass / ComponentType
+      wr(&mut body, 8, type4); // HandlerType / ComponentSubType
+      body.extend_from_slice(name.as_bytes());
+      atom(b"hdlr", &body)
+    };
+    let stsd = {
+      let entry_body = [0u8; 6]
+        .iter()
+        .copied()
+        .chain(1u16.to_be_bytes())
+        .collect::<Vec<u8>>();
+      let mut entry = (entry_body.len() as u32 + 8).to_be_bytes().to_vec();
+      entry.extend_from_slice(b"avc1");
+      entry.extend_from_slice(&entry_body);
+      let mut sb = vec![0u8; 4];
+      sb.extend_from_slice(&1u32.to_be_bytes());
+      sb.extend_from_slice(&entry);
+      atom(b"stsd", &sb)
+    };
+    let mut tkhd = vec![0u8; 84];
+    wb(&mut tkhd, 0, 0);
+    wr(&mut tkhd, 12, &1u32.to_be_bytes());
+    wr(&mut tkhd, 20, &90000u32.to_be_bytes());
+    let mut mdhd = vec![0u8; 24];
+    wr(&mut mdhd, 12, &90000u32.to_be_bytes());
+    wr(&mut mdhd, 16, &90000u32.to_be_bytes());
+    // CONTENTFUL `url ` data handler + a full `vide` media handler, but the `mdia`
+    // lists the `minf` (data) BEFORE the `mdia/hdlr` (media) — the REORDERED case.
+    let media_hdlr = hdlr(b"mhlr", b"vide", "VideoHandler1");
+    let data_hdlr = hdlr(b"dhlr", b"url ", "DataHandler1");
+    let minf = atom(b"minf", &{
+      let mut b = data_hdlr.clone();
+      b.extend_from_slice(&atom(b"stbl", &stsd));
+      b
+    });
+    // mdia(mdhd, minf(hdlr=url), hdlr=vide) — minf BEFORE the media hdlr.
+    let mdia = atom(b"mdia", &{
+      let mut b = atom(b"mdhd", &mdhd);
+      b.extend_from_slice(&minf);
+      b.extend_from_slice(&media_hdlr);
+      b
+    });
+    let trak = atom(b"trak", &{
+      let mut b = atom(b"tkhd", &tkhd);
+      b.extend_from_slice(&mdia);
+      b
+    });
+    let mut mvhd = vec![0u8; 100];
+    wr(&mut mvhd, 12, &600u32.to_be_bytes());
+    let moov = atom(b"moov", &{
+      let mut b = atom(b"mvhd", &mvhd);
+      b.extend_from_slice(&trak);
+      b
+    });
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&moov);
+
+    let meta = parse_inner(&full, None).expect("accepted");
+    let track = meta.quicktime().tracks().first().expect("one trak");
+    assert_eq!(track.handler_code(), Some("vide"), "mdia/hdlr is vide");
+    // The walk recorded the boxes in FILE order: the `url ` data box FIRST (the
+    // `minf/hdlr` precedes the `mdia/hdlr` here), the `vide` media box LAST.
+    let boxes = track.handler_boxes();
+    assert_eq!(boxes.len(), 2, "two hdlr boxes recorded (data + media)");
+    assert_eq!(
+      boxes.first().and_then(HandlerBox::code),
+      Some("url "),
+      "the data minf/hdlr was walked FIRST (it precedes the media hdlr)"
+    );
+    assert_eq!(
+      boxes.get(1).and_then(HandlerBox::code),
+      Some("vide"),
+      "the media mdia/hdlr was walked LAST in this reordered mdia"
+    );
+
+    // No `-ee`: faithful PER-FIELD emission by ACTUAL FILE ORDER. The MEDIA
+    // handler is LAST in file order, so it wins every field it provides — even
+    // though the `url ` DATA handler appeared first.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track"),
+      "HandlerType is the media vide (last in file order), not the url data"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerClass").as_deref(),
+      Some("Media Handler"),
+      "HandlerClass is the media handler's (it is last in file order)"
+    );
+    assert_eq!(
+      map.get_str("Track1", "HandlerDescription").as_deref(),
+      Some("VideoHandler1"),
+      "HandlerDescription is the media handler's (last in file order)"
+    );
+    // No URL/DataHandler leaks in — the data handler appeared FIRST, so its bare
+    // key lost to the later media handler per field.
+    assert_ne!(
+      map.get_str("Track1", "HandlerType").as_deref(),
+      Some("URL"),
+      "the url data handler (first in file order) does NOT win the bare key"
     );
   }
 
@@ -24682,12 +29457,19 @@ mod tests {
     assert_track1_absent(&e, META_TABLE, "minf(hdlr vide)");
   }
 
-  /// **R5 case K** — `mdia(hdlr vide, minf(hdlr meta, stbl(stsd tmcd)))`. The
-  /// `minf/hdlr` meta OVERRIDES the `mdia/hdlr` vide for the `stsd` routing ⇒
-  /// `MetaFormat=tmcd`, while the flat `HandlerType` tag stays the `mdia/hdlr`'s
-  /// `vide` (the `MediaType` proxy is set ONLY by a `Media`-parented `hdlr`,
-  /// QuickTime.pm:8413 — so `handler_code` is untouched by the `minf/hdlr`). Ground
-  /// truth: bundled ExifTool 13.59 routes `MetaFormat=tmcd` here.
+  /// **R5 case K** — `mdia(hdlr vide, minf(hdlr meta, stbl(stsd tmcd)))`. Two
+  /// things, both ground-truthed vs bundled ExifTool 13.59 on this exact crafted
+  /// MOV: (1) the `minf/hdlr` meta OVERRIDES the `mdia/hdlr` vide for the `stsd`
+  /// ROUTING ⇒ `MetaFormat=tmcd` (the routing handler is set without touching the
+  /// trak-scoped `MediaType`, QuickTime.pm:8413); (2) the surfaced flat
+  /// `HandlerType` TAG is `meta` ("NRT Metadata"), NOT vide — the #348 dual-`hdlr`
+  /// dedup: BOTH `hdlr`s extract into `Track1`, and the LAST one (the `minf/hdlr`
+  /// meta) owns the bare `Track1:HandlerType` key (FoundTag last-wins,
+  /// ExifTool.pm:9564) while the `mdia/hdlr` vide is suppressed as a same-group
+  /// `(n)` duplicate (exiftool:2745). (A standalone single-`trak` IS the "final"
+  /// trak, so it surfaces its `minf/hdlr` — bundled emits exactly `HandlerType =
+  /// "NRT Metadata"` here, with no HandlerClass/HandlerDescription since the
+  /// crafted `hdlr`s zero those fields.)
   #[test]
   fn r5_minf_hdlr_overrides_mdia_hdlr_for_routing() {
     let mut minf_body = hdlr_atom(b"meta");
@@ -24702,13 +29484,12 @@ mod tests {
       Some("tmcd"),
       "minf/hdlr meta overrides mdia/hdlr vide for the stsd route"
     );
-    // The flat HandlerType tag (the mdia/hdlr's MediaType) is still `vide` — the
-    // minf/hdlr does NOT touch `handler_code` (no Visual fields are decoded either,
-    // since the route is Meta).
+    // The surfaced flat HandlerType is the minf/hdlr meta — the final trak's last
+    // `hdlr` owns the bare `Track1:HandlerType` key (matches bundled 13.59).
     assert_eq!(
       track1_str(&e, "HandlerType").as_deref(),
-      Some("Video Track"),
-      "the flat HandlerType stays the mdia/hdlr vide (MediaType)"
+      Some("NRT Metadata"),
+      "the surfaced HandlerType is the minf/hdlr meta (dual-hdlr last-wins)"
     );
     assert_track1_absent(&e, OTHER_TABLE, "mdia vide + minf meta");
   }

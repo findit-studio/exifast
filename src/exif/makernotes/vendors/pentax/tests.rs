@@ -15,8 +15,10 @@ fn populate_typed_resolves_model() {
 
 #[test]
 fn emit_lens_rec_pentax_jpg_pair() {
-  // Pentax.jpg LensRec position 0 = int8u[2] (3, 44).
-  let block = [3u8, 44, 0, 0];
+  // Pentax.jpg LensRec is the 3-byte `03 2c 00`: position 0 = int8u[2] (3, 44);
+  // ExtenderStatus (position 3) is out of range ⇒ only LensType emits (the K10D
+  // has no ExtenderStatus — a 4-byte K-S2 record WOULD emit it).
+  let block = [3u8, 44, 0];
   // -j: the %pentaxLensTypes name.
   let mut em = std::vec::Vec::new();
   emit_lens_rec(&block, true, &mut em);

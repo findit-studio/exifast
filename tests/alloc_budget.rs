@@ -294,8 +294,19 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // what enables the Sony SubDoc GPS Composites), NOT a redundant clone; the
     // `media_metadata` typed path is UNCHANGED (152) since it never runs the
     // Composite post-pass. Ceilings raised to (870, 990).
-    "MakerNotes_Apple.jpg" => (870, 990), // measured (835, 956) — #133 PR 5 family-0 carry
-    "ID3v2_4_big.mp3" => (130, 130),      // measured (118, 117)
+    // RE-BASELINED for #381 (the `Composite:Flash`/`LensID`/`DateTimeCreated`
+    // ports): the `BuildCompositeTags` fixpoint now evaluates THREE more defs
+    // per pass over BOTH views — none builds for Apple (no XMP flash field, no
+    // `LensType`, no IPTC date), but each attempt allocates its per-def
+    // `$val[]`/`$prt[]` scratch pair, so `-j` rises +6 and `-n` +6 (the
+    // engine-overhead cost the existing #133-PR-3 comment already flagged a
+    // future perf PR could shave by reusing the scratch Vecs). The prior `(870,
+    // 990)` ceiling was also already exceeded on the base (the measured drifted
+    // to (884, 1002) before #381 without a re-baseline); the new ceilings cover
+    // BOTH the drift and the #381 +6. `media_metadata` is UNCHANGED by the new
+    // Composites (163, never runs the post-pass).
+    "MakerNotes_Apple.jpg" => (910, 1030), // measured (890, 1008) — #381 +3 Composite defs
+    "ID3v2_4_big.mp3" => (130, 130),       // measured (118, 117)
     // RE-BASELINED for #133 PR 5: a `video/*` QuickTime now RUNS the Composite
     // post-pass (the full-video flip), building `Composite:AvgBitrate`/`ImageSize`/
     // `Megapixels`/`Rotation` + re-emitting the opposite view — `-j` 135 → 195,

@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "DNG_preview_image.dng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "DNG",
+  "File:FileTypeExtension": "dng",
+  "File:MIMEType": "image/x-adobe-dng",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:ImageWidth": 100,
+  "IFD0:ImageHeight": 80,
+  "IFD0:Make": "NIKON",
+  "IFD0:Model": "NIKON D850",
+  "IFD0:DNGVersion": "1.4.0.0",
+  "SubIFD:SubfileType": "Reduced-resolution image",
+  "SubIFD:ImageWidth": 60,
+  "SubIFD:ImageHeight": 40,
+  "SubIFD:StripOffsets": 169,
+  "SubIFD:StripByteCounts": 4,
+  "Composite:ImageSize": "100x80",
+  "Composite:Megapixels": 0.008
+}]

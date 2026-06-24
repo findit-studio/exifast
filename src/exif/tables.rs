@@ -72,6 +72,25 @@ pub const TAG_INTEROP_IFD: u16 = 0xa005;
 /// [`crate::exif::SubDirKind::MakerNote`]).
 pub const TAG_MAKER_NOTE: u16 = 0x927c;
 
+/// `SubIFD` (0x014a, `Exif.pm:1006-1027`) — the classic-TIFF preview/raw
+/// sub-IFD pointer. `Flags => 'SubIFD'`, `SubDirectory => { Start => '$val',
+/// MaxSubdirs => 10 }`, `Groups => { 1 => 'SubIFD' }`. UNLIKE the single-offset
+/// ExifIFD/GPS/Interop pointers, the value carries MULTIPLE int32u offsets
+/// (`@values = split ' ', $val`, `Exif.pm:6930`), each descended as
+/// `SubIFD`/`SubIFD1`/`SubIFD2`/… The DNG raw tower's `JpgFromRaw` lives in
+/// `SubIFD2` (#331-P2). (The conditional A100DataOffset arm, `Exif.pm:1028`,
+/// fires only for a SONY DSLR-A100 ARW — out of scope; for DNG/TIFF the SubIFD
+/// arm always wins.)
+pub const TAG_SUB_IFD: u16 = 0x014a;
+
+/// `Compression` (0x0103, `Exif.pm:512-528`) — the TIFF compression scheme.
+/// Its `RawConv` sets the `$$self{Compression}` DataMember (`Exif.pm:517`,
+/// `return $$self{Compression} = $val`), which the `0x111`/`0x117` conditional
+/// tag lists consult: `$$self{Compression} eq '7'` (JPEG) gates the
+/// `PreviewImage`/`JpgFromRaw` arms vs the plain `StripOffsets` arm
+/// (`Exif.pm:635`/`:735`, #331-P2). `int16u` (SHORT).
+pub const TAG_COMPRESSION: u16 = 0x0103;
+
 /// `SubfileType` (0x00fe, `Exif.pm:444-461`) — the TIFF spec's
 /// `NewSubfileType` (bit field: 0x01 reduced-res, 0x02 single page of
 /// multi-page, 0x04 transparency mask). Bundled's `RawConv` increments
@@ -143,6 +162,18 @@ pub enum Conv {
   /// (the `emit_raw` path) — `PrintHex` affects only the print string, e.g.
   /// `ColorSpace 12` → `"Unknown (0xc)"` (`-j`) / `12` (`-n`).
   IntLabelHex(&'static [(i64, &'static str)]),
+  /// `FileSource` (0xa300) PrintConv (`Exif.pm:2815-2821`). A HASH whose keys
+  /// are the integer codes `1`/`2`/`3` PLUS the literal 4-byte STRING
+  /// `"\x03\x00\x00\x00"` (`Exif.pm:2820`) — Sigma incorrectly gives this
+  /// `Writable => 'undef'` tag a count of 4, so a single value `\x03` matches
+  /// the integer key `3` (the `undef[1] → int8u` carve-out, `Exif.pm:6682`)
+  /// while the 4-byte `\x03\x00\x00\x00` matches the string key →
+  /// `'Sigma Digital Camera'`. The integer codes flow through [`Conv::IntLabel`]
+  /// (the single-byte carve-out makes them a `RawValue::U64`); only the
+  /// multi-byte `undef` value needs the literal-string key handled here, with a
+  /// HASH-miss falling to `Unknown ($val)` over the raw byte string
+  /// (`ExifTool.pm:3614-3634`) exactly as bundled.
+  FileSource(&'static [(i64, &'static str)]),
   /// `ExposureTime` / `ShutterSpeedValue` PrintConv —
   /// `PrintExposureTime` (`Exif.pm:5701-5711`).
   ExposureTime,
@@ -309,11 +340,15 @@ impl ExifTag {
   /// attributes rather than threading a field through all ~215 table literals
   /// (incl. the generated shadow, which the xtask owns).
   ///
-  /// Currently ONLY `ThumbnailOffset` (0x0201) — the camera-relevant IFD1
+  /// The id-DEFAULT spec — `ThumbnailOffset` (0x0201) → the camera-relevant IFD1
   /// thumbnail (`Exif.pm:1168-1171`, `OffsetPair => 0x202`,
-  /// `DataTag => 'ThumbnailImage'`). The other `DataTag` offsets in
-  /// `%Exif::Main` (`PreviewImageStart`/`JpgFromRawStart`/`OtherImageStart`,
-  /// `Exif.pm:649-679`) are P2/P3 follow-ups (#331); when ported, extend this.
+  /// `DataTag => 'ThumbnailImage'`). The CONDITIONAL `PreviewImage` arms — 0x111
+  /// in IFD0/CR2 and 0x201 in IFD0/ARW (`Exif.pm:645-661`/`:1226-1237`, #331-P2)
+  /// — depend on `$$self{TIFF_TYPE}` + `DIR_NAME`, so they live in the
+  /// context-aware [`exif_main_data_tag_spec_in_context`]; this id-only method
+  /// returns the default the walker uses when no context override applies. The
+  /// remaining `%Exif::Main` `DataTag` offsets (`JpgFromRawStart`/`OtherImageStart`,
+  /// `Exif.pm:674-679`) are P3 follow-ups (#331); when ported, extend both.
   #[must_use]
   #[inline]
   pub const fn data_tag_spec(&self) -> Option<DataTagSpec> {
@@ -324,6 +359,281 @@ impl ExifTag {
       }),
       _ => None,
     }
+  }
+}
+
+/// The `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` + `$$self{Compression}` +
+/// `$$self{SubfileType}` context the `0x111`/`0x117`/`0x201`/`0x202` CONDITIONAL
+/// tag lists (`Exif.pm:601-779`/`:1148-1294`) resolve their `Name`/`OffsetPair`/
+/// `DataTag` against — the `DataMember`s a `ProcessExif` directory threads into
+/// `GetTagInfo`'s `Condition` eval. Bundled by [`Walker::emit`] at the resolution
+/// site from the walk's `IfdKind` + `file_type` + the per-IFD
+/// `captured_compression`/`captured_subfile_type` DataMembers.
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetTagContext<'a> {
+  /// `$$self{TIFF_TYPE}` — the detected subtype (`"CR2"`/`"ARW"`/`"SR2"`/
+  /// `"DNG"`/`"TIFF"`/…), `ExifTool.pm:8715`.
+  pub tiff_type: Option<&'a str>,
+  /// `$$self{DIR_NAME} eq 'IFD0'`.
+  pub in_ifd0: bool,
+  /// `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's THIRD
+  /// directory ([`IfdKind::SubIfd(2)`]), where `0x111`/`0x117` name
+  /// `JpgFromRawStart`/`JpgFromRawLength` (`Exif.pm:673-684`/`:769-778`).
+  pub in_subifd2: bool,
+  /// `$$self{Compression}` (the 0x103 DataMember) as the EXACT scalar `$val`
+  /// STRING (`None` ≡ ExifTool's `''` sentinel). The DNG/TIFF `PreviewImage`/
+  /// `JpgFromRaw` arms gate on `Compression eq '7'` (JPEG) with STRING equality;
+  /// `''` (`None`), a count>1 `"7 8"`, and any other value fall to the plain
+  /// `StripOffsets` arm.
+  pub compression: Option<&'a str>,
+  /// `$$self{SubfileType}` (the 0xfe DataMember) as the EXACT scalar `$val`
+  /// STRING (`None` ≡ `''`). The DNG/TIFF preview arms' EXCLUSION of the plain
+  /// `StripOffsets` arm requires `SubfileType ne '0'` (STRING) — `''` (`None`), a
+  /// count>1 `"0 1"`, and any non-`"0"` value SATISFY it (`'' ne '0'` /
+  /// `'0 1' ne '0'` are true in Perl); only an exact `"0"` fails.
+  pub subfile_type: Option<&'a str>,
+}
+
+impl OffsetTagContext<'_> {
+  /// `true` when the DNG/TIFF JPEG-preview gate holds — `$$self{TIFF_TYPE} =~
+  /// /^(DNG|TIFF)$/ and $$self{Compression} eq '7' and $$self{SubfileType} ne
+  /// '0'` (`Exif.pm:635`/`:735`). When this holds, the plain `StripOffsets` arm
+  /// (`Exif.pm:631-643`) is EXCLUDED, so `0x111`/`0x117` resolve to the
+  /// `PreviewImage` arm (`DIR_NAME ne 'SubIFD2'`, `Exif.pm:661-672`) or the
+  /// `JpgFromRaw` arm (the `SubIFD2` fallthrough, `Exif.pm:673-684`).
+  #[must_use]
+  #[inline]
+  fn dng_tiff_jpeg_preview(&self) -> bool {
+    // `TIFF_TYPE =~ /^(DNG|TIFF)$/`.
+    let dng_or_tiff = matches!(self.tiff_type, Some("DNG" | "TIFF"));
+    // `Compression eq '7'` (STRING equality) — a `''`/`None`, a count>1 `"7 8"`,
+    // or any other value is false.
+    let comp7 = self.compression == Some("7");
+    // `SubfileType ne '0'` (STRING inequality) — `''`/`None`, a count>1 `"0 1"`,
+    // and any non-`"0"` value pass; only an exact `"0"` fails.
+    let subfile_ne0 = self.subfile_type != Some("0");
+    dng_or_tiff && comp7 && subfile_ne0
+  }
+}
+
+/// The conditional `Name` override for a `%Exif::Main` offset/length leaf whose
+/// id is a `Condition`-list entry — `Exif.pm`'s `0x111`/`0x117`/`0x201`/`0x202`
+/// are CONDITIONAL TAG LISTS that resolve to a DIFFERENT name depending on
+/// `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` (+ the `Compression`/`SubfileType`
+/// DataMembers for the DNG/TIFF arms). The port's static table carries the
+/// most-common name (`StripOffsets`/`StripByteCounts` for 0x111/0x117,
+/// `ThumbnailOffset`/`ThumbnailLength` for 0x201/0x202); this reproduces the
+/// camera-relevant `PreviewImage`/`JpgFromRaw` arms (#331-P2):
+///
+///  - 0x111 → `PreviewImageStart` / 0x117 → `PreviewImageLength` in **IFD0 of a
+///    CR2** (`Exif.pm:645-661`/`:742-758`, `Condition => '$$self{TIFF_TYPE} eq
+///    "CR2"'`). The DEFAULT `StripOffsets` arm explicitly EXCLUDES this case
+///    (`not ($$self{TIFF_TYPE} eq 'CR2' and $$self{DIR_NAME} eq 'IFD0')`,
+///    `Exif.pm:643`), so a CR2 IFD0 falls through to the `PreviewImageStart` arm.
+///  - 0x201 → `PreviewImageStart` / 0x202 → `PreviewImageLength` in **IFD0 of an
+///    ARW or SR2** (`Exif.pm:1226-1237`, `Condition => '$$self{DIR_NAME} eq
+///    "IFD0" and $$self{TIFF_TYPE} =~ /^(ARW|SR2)$/'`). The FIRST (ThumbnailOffset)
+///    arm matches only IFD1 / RIFF-MOV-IFD0, so an ARW IFD0 reaches this arm.
+///  - 0x111 → `JpgFromRawStart` / 0x117 → `JpgFromRawLength` in a **DNG/TIFF
+///    SubIFD2** carrying `Compression == 7` + `SubfileType != 0`
+///    (`Exif.pm:673-684`/`:769-778` — the `SubIFD2` fallthrough arm). The plain
+///    `StripOffsets` arm is excluded by the JPEG-preview gate, the CR2 arm
+///    misses (not CR2), and the `PreviewImageStart` arm misses (`DIR_NAME eq
+///    'SubIFD2'`), so the JpgFromRaw arm wins.
+///  - 0x111 → `PreviewImageStart` / 0x117 → `PreviewImageLength` in a **DNG/TIFF
+///    NON-SubIFD2** directory carrying `Compression == 7` + `SubfileType != 0`
+///    (`Exif.pm:661-672`/`:758-768` — `DIR_NAME ne 'SubIFD2'`).
+///
+/// `None` ⇒ the table default name is correct (every IFD1 thumbnail keeps
+/// `ThumbnailOffset`/`Length`; a DNG SubIFD strip with NO `Compression=7` keeps
+/// `StripOffsets`/`StripByteCounts` — the plain `StripOffsets` arm wins,
+/// `Exif.pm:631-643`).
+#[must_use]
+#[inline]
+pub fn exif_main_offset_name_override(
+  tag_id: u16,
+  ctx: OffsetTagContext<'_>,
+) -> Option<&'static str> {
+  // IFD0-only `PreviewImageStart` arms (CR2 0x111, ARW/SR2 0x201).
+  if ctx.in_ifd0 {
+    match tag_id {
+      0x0111 if ctx.tiff_type == Some("CR2") => return Some("PreviewImageStart"),
+      0x0117 if ctx.tiff_type == Some("CR2") => return Some("PreviewImageLength"),
+      0x0201 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
+        return Some("PreviewImageStart");
+      }
+      0x0202 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
+        return Some("PreviewImageLength");
+      }
+      _ => {}
+    }
+  }
+  // The DNG/TIFF JPEG-preview arms (0x111/0x117): `JpgFromRawStart`/`Length` in
+  // SubIFD2, `PreviewImageStart`/`Length` elsewhere — both gated on the
+  // JPEG-preview DataMember test (`Compression == 7` + `SubfileType != 0`).
+  if ctx.dng_tiff_jpeg_preview() {
+    match (tag_id, ctx.in_subifd2) {
+      (0x0111, true) => return Some("JpgFromRawStart"),
+      (0x0117, true) => return Some("JpgFromRawLength"),
+      (0x0111, false) => return Some("PreviewImageStart"),
+      (0x0117, false) => return Some("PreviewImageLength"),
+      _ => {}
+    }
+  }
+  None
+}
+
+/// The `%Exif::Main` `OffsetPair`/`DataTag` spec for an offset leaf, RESOLVED in
+/// the IFD's `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` + `Compression`/
+/// `SubfileType` context — the conditional analogue of [`ExifTag::data_tag_spec`]
+/// (which returns only the static `ThumbnailImage` default keyed by id). Mirrors
+/// the [`exif_main_offset_name_override`] rename:
+///
+///  - IFD0 of a CR2: 0x111 → `OffsetPair => 0x117`, `DataTag => 'PreviewImage'`
+///    (`Exif.pm:645-661`).
+///  - IFD0 of an ARW/SR2: 0x201 → `OffsetPair => 0x202`, `DataTag => 'PreviewImage'`
+///    (`Exif.pm:1226-1237`) — overriding the id-default `ThumbnailImage`.
+///  - DNG/TIFF SubIFD2 (`Compression == 7` + `SubfileType != 0`): 0x111 →
+///    `OffsetPair => 0x117`, `DataTag => 'JpgFromRaw'` (`Exif.pm:673-684`).
+///  - DNG/TIFF non-SubIFD2 (`Compression == 7` + `SubfileType != 0`): 0x111 →
+///    `OffsetPair => 0x117`, `DataTag => 'PreviewImage'` (`Exif.pm:661-672`).
+///  - otherwise: the id-default (`ThumbnailOffset` 0x201 → `ThumbnailImage`).
+///
+/// So an IFD1 thumbnail still yields `ThumbnailImage`; only a CR2/ARW/SR2 IFD0
+/// preview leaf yields `PreviewImage`, a DNG/TIFF SubIFD2 JPEG strip yields
+/// `JpgFromRaw`, and a DNG/TIFF non-SubIFD2 JPEG strip yields `PreviewImage`.
+/// `None` ⇒ no `DataTag` binary for this id.
+#[must_use]
+#[inline]
+pub fn exif_main_data_tag_spec_in_context(
+  tag: &ExifTag,
+  ctx: OffsetTagContext<'_>,
+) -> Option<DataTagSpec> {
+  if ctx.in_ifd0 {
+    match tag.id {
+      0x0111 if ctx.tiff_type == Some("CR2") => {
+        return Some(DataTagSpec {
+          offset_pair: 0x0117,
+          data_tag: "PreviewImage",
+        });
+      }
+      0x0201 if matches!(ctx.tiff_type, Some("ARW" | "SR2")) => {
+        return Some(DataTagSpec {
+          offset_pair: 0x0202,
+          data_tag: "PreviewImage",
+        });
+      }
+      _ => {}
+    }
+  }
+  // DNG/TIFF JPEG-preview 0x111 — `JpgFromRaw` in SubIFD2, `PreviewImage`
+  // elsewhere. Only the OFFSET id (0x111) carries a `DataTag` (its `OffsetPair`
+  // points at the 0x117 LENGTH); 0x117 is the length side (no `DataTag` on the
+  // offset-pair OFFSET role), so it is not matched here.
+  if tag.id == 0x0111 && ctx.dng_tiff_jpeg_preview() {
+    return Some(DataTagSpec {
+      offset_pair: 0x0117,
+      data_tag: if ctx.in_subifd2 {
+        "JpgFromRaw"
+      } else {
+        "PreviewImage"
+      },
+    });
+  }
+  tag.data_tag_spec()
+}
+
+/// `%Image::ExifTool::Nikon::PreviewIFD` (`Nikon.pm:5386-5438`) — the small
+/// preview-image sub-IFD an SRW raw's Samsung `0x0035` SubDirectory dispatches
+/// to (`Samsung.pm:307-327`, #242). The rows REUSE the standard `%Exif::Main`
+/// PrintConvs verbatim (`PrintConv => \%Image::ExifTool::Exif::subfileType` /
+/// `…::compression`, and inline `ResolutionUnit`/`YCbCrPositioning` maps equal
+/// to `%Exif`'s), so each leaf resolves through the SAME [`Conv`] machinery a
+/// core Exif IFD uses — what differs from `%Exif::Main` is only the renamed
+/// offset/length pair (`PreviewImageStart`/`Length`, not `ThumbnailOffset`/
+/// `Length`) and the `DataTag => 'PreviewImage'` it names. The table's
+/// `GROUPS => { 1 => PreviewIFD }` family-1 group is applied by the caller (the
+/// Samsung isolated walker's capture, [`crate::exif`]), not stored here. Sorted
+/// by tag id (binary-search-ready).
+pub const NIKON_PREVIEW_IFD_TAGS: &[ExifTag] = &[
+  // 0xfe SubfileType — `PrintConv => \%Image::ExifTool::Exif::subfileType`.
+  ExifTag {
+    id: 0x00fe,
+    name: "SubfileType",
+    conv: Conv::IntLabel(SUBFILE_TYPE),
+  },
+  // 0x103 Compression — `PrintConv => \%Image::ExifTool::Exif::compression`
+  // (absent from the NX500 body; ported for table completeness).
+  ExifTag {
+    id: 0x0103,
+    name: "Compression",
+    conv: Conv::IntLabel(COMPRESSION),
+  },
+  // 0x11a/0x11b XResolution/YResolution — bare `rational64u`, no PrintConv.
+  ExifTag {
+    id: 0x011a,
+    name: "XResolution",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x011b,
+    name: "YResolution",
+    conv: Conv::None,
+  },
+  // 0x128 ResolutionUnit — inline `{ 1=>None, 2=>inches, 3=>cm }` (== `%Exif`'s).
+  ExifTag {
+    id: 0x0128,
+    name: "ResolutionUnit",
+    conv: Conv::IntLabel(RESOLUTION_UNIT),
+  },
+  // 0x201 PreviewImageStart — `Flags => 'IsOffset'`, `OffsetPair => 0x202`,
+  // `DataTag => 'PreviewImage'`; the offset is paired with the 0x202 length via
+  // the post-IFD DataTag pass into the synthetic `PreviewIFD:PreviewImage`. The
+  // emitted leaf value itself is the bare int32u start offset.
+  ExifTag {
+    id: 0x0201,
+    name: "PreviewImageStart",
+    conv: Conv::None,
+  },
+  // 0x202 PreviewImageLength — `OffsetPair => 0x201`, `DataTag => 'PreviewImage'`.
+  ExifTag {
+    id: 0x0202,
+    name: "PreviewImageLength",
+    conv: Conv::None,
+  },
+  // 0x213 YCbCrPositioning — inline `{ 1=>Centered, 2=>Co-sited }` (== `%Exif`'s).
+  ExifTag {
+    id: 0x0213,
+    name: "YCbCrPositioning",
+    conv: Conv::IntLabel(YCBCR_POSITIONING),
+  },
+];
+
+/// Resolve a `%Nikon::PreviewIFD` tag by id (binary search over
+/// [`NIKON_PREVIEW_IFD_TAGS`]). `None` ⇒ an id not in the table — the walker's
+/// verbose-only omit (`Exif.pm:6757`).
+#[must_use]
+pub fn nikon_preview_ifd_lookup(id: u16) -> Option<&'static ExifTag> {
+  match NIKON_PREVIEW_IFD_TAGS.binary_search_by_key(&id, |t| t.id) {
+    Ok(i) => NIKON_PREVIEW_IFD_TAGS.get(i),
+    Err(_) => None,
+  }
+}
+
+/// The `%Nikon::PreviewIFD` `OffsetPair`/`DataTag` spec for `id`, if it is the
+/// `0x201 PreviewImageStart` offset leaf — `OffsetPair => 0x202`,
+/// `DataTag => 'PreviewImage'` (`Nikon.pm:5414-5421`). Distinct from
+/// [`ExifTag::data_tag_spec`], whose `0x201` names `ThumbnailImage` for
+/// `%Exif::Main`; the DataTag pass selects the spec by ACTIVE table (#242).
+#[must_use]
+#[inline]
+pub const fn nikon_preview_ifd_data_tag_spec(id: u16) -> Option<DataTagSpec> {
+  match id {
+    0x0201 => Some(DataTagSpec {
+      offset_pair: 0x0202,
+      data_tag: "PreviewImage",
+    }),
+    _ => None,
   }
 }
 
@@ -355,6 +665,17 @@ const COMPRESSION: &[(i64, &str)] = &[
   (99, "JPEG"),
   (32773, "PackBits"),
   (34892, "Lossy JPEG"),
+  (34925, "LZMA2"),
+  (34926, "Zstd (old)"),
+  (34927, "WebP (old)"),
+  (34933, "PNG"),
+  (34934, "JPEG XR"),
+  (50000, "Zstd"),
+  (50001, "WebP"),
+  (50002, "JPEG XL (old)"),
+  (52546, "JPEG XL"),
+  (65000, "Kodak DCR Compressed"),
+  (65535, "Pentax PEF Compressed"),
 ];
 
 /// `%photometricInterpretation` PrintConv (`Exif.pm:271-289`).
@@ -383,6 +704,25 @@ const SUBFILE_TYPE: &[(i64, &str)] = &[
   (5, "Transparency mask of reduced-resolution image"),
   (6, "Transparency mask of multi-page image"),
   (16, "Enhanced image data"),
+];
+
+/// `0x8830 SensitivityType` PrintConv (`Exif.pm`, the `applies to EXIF:ISO tag`
+/// row). Sorted by key for binary search.
+const SENSITIVITY_TYPE: &[(i64, &str)] = &[
+  (0, "Unknown"),
+  (1, "Standard Output Sensitivity"),
+  (2, "Recommended Exposure Index"),
+  (3, "ISO Speed"),
+  (
+    4,
+    "Standard Output Sensitivity and Recommended Exposure Index",
+  ),
+  (5, "Standard Output Sensitivity and ISO Speed"),
+  (6, "Recommended Exposure Index and ISO Speed"),
+  (
+    7,
+    "Standard Output Sensitivity, Recommended Exposure Index and ISO Speed",
+  ),
 ];
 
 /// `ResolutionUnit` / `FocalPlaneResolutionUnit` PrintConv
@@ -520,11 +860,15 @@ const GAIN_CONTROL: &[(i64, &str)] = &[
   (4, "High gain down"),
 ];
 
-/// `Contrast` / `Sharpness` PrintConv (`Exif.pm:2941-2954`).
+/// `Contrast` PrintConv (`Exif.pm:2924-2932`).
 const CONTRAST: &[(i64, &str)] = &[(0, "Normal"), (1, "Low"), (2, "High")];
 
-/// `Saturation` PrintConv (`Exif.pm:2956-2961`).
+/// `Saturation` PrintConv (`Exif.pm:2936-2944`).
 const SATURATION: &[(i64, &str)] = &[(0, "Normal"), (1, "Low"), (2, "High")];
+
+/// `Sharpness` PrintConv (`Exif.pm:2946-2954`) — DISTINCT from `Contrast`:
+/// `1 => 'Soft'`, `2 => 'Hard'` (not `Low`/`High`).
+const SHARPNESS: &[(i64, &str)] = &[(0, "Normal"), (1, "Soft"), (2, "Hard")];
 
 /// `SubjectDistanceRange` PrintConv (`Exif.pm:2965-2969`).
 const SUBJECT_DISTANCE_RANGE: &[(i64, &str)] =
@@ -724,7 +1068,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0x8830,
     name: "SensitivityType",
-    conv: Conv::None,
+    conv: Conv::IntLabel(SENSITIVITY_TYPE),
   },
   ExifTag {
     id: 0x8832,
@@ -919,7 +1263,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0xa300,
     name: "FileSource",
-    conv: Conv::IntLabel(FILE_SOURCE),
+    conv: Conv::FileSource(FILE_SOURCE),
   },
   ExifTag {
     id: 0xa301,
@@ -974,7 +1318,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0xa40a,
     name: "Sharpness",
-    conv: Conv::IntLabel(CONTRAST),
+    conv: Conv::IntLabel(SHARPNESS),
   },
   // 0xa40b `DeviceSettingDescription` — `Binary => 1` (`Exif.pm:2957-2961`).
   ExifTag {
@@ -1105,14 +1449,27 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 /// with this format regardless of the on-disk format code — the on-disk byte
 /// `$size` is preserved and `$count = int($size / $formatSize[$format])`.
 ///
-/// In the camera-relevant `%Exif::Main` subset ported here exactly ONE tag
-/// carries such an override: `UserComment` (0x9286), `Format => 'undef'`
-/// (`Exif.pm:2500`), with the explicit Phil-Harvey comment "I have seen other
-/// applications write it incorrectly as 'string' or 'int8u'" (`Exif.pm:2499`).
-/// Forcing `undef` BEFORE `ReadValue` is what stops a mis-written `string`
-/// 0x9286 from being NUL-trimmed (`ASCII\0\0\0Hello World` → `ASCII`) so the
-/// later `ConvertExifText` RawConv can strip the 8-byte charset prefix and
-/// recover the payload.
+/// The camera-relevant `%Exif::Main` subset ported here carries four such
+/// overrides:
+/// - `UserComment` (0x9286), `Format => 'undef'` (`Exif.pm:2500`), with the
+///   explicit Phil-Harvey comment "I have seen other applications write it
+///   incorrectly as 'string' or 'int8u'" (`Exif.pm:2499`). Forcing `undef`
+///   BEFORE `ReadValue` is what stops a mis-written `string` 0x9286 from being
+///   NUL-trimmed (`ASCII\0\0\0Hello World` → `ASCII`) so the later
+///   `ConvertExifText` RawConv can strip the 8-byte charset prefix and recover
+///   the payload.
+/// - `XPComment`/`XPKeywords` (0x9c9c/0x9c9e), `Format => 'undef'` (the UCS-2
+///   `WindowsXp` ValueConv must see the exact bytes — see below).
+/// - `ComponentsConfiguration` (0x9101), `Format => 'int8u'` (`Exif.pm:2298`).
+///   The tag is `Writable => 'undef'` but its READ `Format` is `int8u`, so
+///   ExifTool decodes the on-disk value as `int(size/1)` int8u ELEMENTS
+///   REGARDLESS of the declared format code — a mis-written `string`/`int16u`/…
+///   0x9101 is still read as the raw bytes one-per-element (verified against
+///   bundled `exiftool 13.59`: an `int16u[2]` `01 02 03 00` → `1 2 3 0` →
+///   "Y, Cb, Cr, -", NOT the int16u decode `258 768`). Without this override
+///   a wrong-format 0x9101 decoded per its on-disk format and the
+///   `Conv::ComponentsConfiguration` byte-walk diverged (#201). The
+///   `Count => 4` is a WRITE hint only; the read count is `int(size/1)`.
 ///
 /// This `%Exif::Main` override is resolved ONLY for non-GPS IFDs; the GPS IFD
 /// has its own table-scoped sibling [`crate::exif::gps::format_override`] (for
@@ -1127,6 +1484,12 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
   match id {
     0x9286 => Some(crate::exif::ifd::Format::Undef),
+    // `ComponentsConfiguration` (0x9101) — `Format => 'int8u'` (`Exif.pm:2298`).
+    // The on-disk value is re-read as `int(size/1)` int8u elements regardless of
+    // the declared format code, so the `Conv::ComponentsConfiguration` per-byte
+    // PrintConv sees the raw value bytes one-per-element even when the tag was
+    // mis-written as `string`/`int16u`/etc. (#201).
+    0x9101 => Some(crate::exif::ifd::Format::Int8u),
     // `XPComment` (0x9c9c) / `XPKeywords` (0x9c9e) carry `Format => 'undef'`
     // (`Exif.pm:2645`/`:2663`): the on-disk `int8u[N]` value is re-read as raw
     // `undef` bytes so the `WindowsXp` UCS-2(LE) `Decode` ValueConv sees the

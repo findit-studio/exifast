@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "CR2_preview_image.cr2",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "CR2",
+  "File:FileTypeExtension": "CR2",
+  "File:MIMEType": "image/x-canon-cr2",
+  "File:ExifByteOrder": "II",
+  "IFD0:ImageWidth": 100,
+  "IFD0:ImageHeight": 80,
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "Canon EOS",
+  "IFD0:PreviewImageStart": 172,
+  "IFD0:PreviewImageLength": 4,
+  "IFD0:PreviewImage": "(Binary data 4 bytes, use -b option to extract)",
+  "ExifIFD:ExposureTime": 0.00625,
+  "ExifIFD:FNumber": 8
+}]

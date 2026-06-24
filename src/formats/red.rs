@@ -1400,7 +1400,9 @@ fn dispatch_directory_tag<'a>(
       // the JSON output path never routes a R3D tag through it.
       TagValue::U64(n) => Value::I64(n as i64),
       TagValue::F64(n) => Value::F64(n),
-      TagValue::Str(s) => Value::Str(R3dStrCow::Owned(s.to_string())),
+      // A plain or already-classified JSON string both render as a string value
+      // (RED never produces `JsonStr`; kept for exhaustiveness).
+      TagValue::Str(s) | TagValue::JsonStr(s) => Value::Str(R3dStrCow::Owned(s.to_string())),
       TagValue::Bytes(b) => Value::Bytes(b),
       TagValue::Rational(r) => Value::Rational(r),
       TagValue::Bool(b) => Value::I64(i64::from(b)),

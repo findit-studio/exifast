@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_componentsconfig_pair.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "ExifIFD:ComponentsConfiguration": "Y, Cb"
+}]

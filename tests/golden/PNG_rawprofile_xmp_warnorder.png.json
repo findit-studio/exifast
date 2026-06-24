@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "PNG_rawprofile_xmp_warnorder.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "XMP is double UTF-encoded",
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG:eXIf": "(Binary data 17 bytes, use -b option to extract)",
+  "XMP-dc:Format": "image/png",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

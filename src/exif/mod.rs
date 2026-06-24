@@ -95,6 +95,12 @@ pub(crate) mod render;
 // walker); the GPS sub-IFD is decoded through the same block.
 pub mod jpeg;
 mod jpeg_app;
+// JPEG IPTC (APP13 8BIM IIM) + the `COM` `File:Comment` — the Photoshop / IPTC
+// arm of `ProcessJPEG` and the IPTC IIM walker (`IPTC.pm`/`Photoshop.pm`).
+mod iptc;
+// PrintIM (Print Image Matching) — the EXIF IFD0 `0xc4a5` SubDirectory reader
+// (`PrintIM.pm`'s `ProcessPrintIM`), emitting `PrintIM:PrintIMVersion`.
+mod printim;
 
 use std::{string::String, vec::Vec};
 
@@ -102,7 +108,7 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   recovery::Step,
 };
-use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value};
+use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value, read_value_count};
 use makernotes::subdir::{ByteOrderRule, FixBaseMode, ProcessProc, TableRef};
 use tables::Conv;
 
@@ -163,6 +169,22 @@ pub enum IfdKind {
   /// `InteropVersion` in `%Exif::Main`); an ASCII-numeric pointer recurses too
   /// (`split ' '` numifies the string, no integer-format gate).
   BigSubIfd(SubDirKind, u32),
+  /// A classic-TIFF SubIFD reached by the `0x014a SubIFD` pointer's
+  /// `SubDirectory => { Start => '$val', MaxSubdirs => 10 }` (`Exif.pm:1006-1027`)
+  /// — the DNG/TIFF preview/raw sub-IFD tower. The pointer carries MULTIPLE
+  /// offsets (`@values = split ' ', $val`, `Exif.pm:6930`); each is walked as
+  /// its own directory whose family-1 `DirName` is the pointer's
+  /// `Groups => { 1 => 'SubIFD' }` with the directory NUMBER appended for the
+  /// 2nd+ (`$subdirInfo{DirName} =~ s/\d*$/$dirNum/ if $dirNum`, `Exif.pm:7076`).
+  /// So the payload is `$dirNum`: `0 → "SubIFD"`, `1 → "SubIFD1"`,
+  /// `2 → "SubIFD2"`, … ([`as_str`](Self::as_str) renders it via
+  /// [`IfdName::sub_ifd`]). The table is forced to `%Exif::Main`
+  /// ([`table_for_ifd_kind`]) — the pointer carries no `SubDirectory{TagTable}`
+  /// redirect, so the child reuses the inherited Exif table (`Exif.pm:6943`,
+  /// `$newTagTable = $tagTablePtr`). `DIR_NAME eq "SubIFD2"` is what selects the
+  /// `JpgFromRawStart`/`JpgFromRawLength` arms of the `0x111`/`0x117` conditional
+  /// tag lists (`Exif.pm:673-684`/`:769-778`, #331-P2).
+  SubIfd(u32),
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -298,6 +320,52 @@ impl IfdName {
     }
   }
 
+  /// Render a classic-TIFF SubIFD family-1 group name: `"SubIFD"` for the
+  /// FIRST offset (`dirNum == 0`), then `"SubIFD{dirNum}"` for the 2nd+ —
+  /// the faithful `$subdirInfo{DirName} = 'SubIFD'; $subdirInfo{DirName} =~
+  /// s/\d*$/$dirNum/ if $dirNum` (`Exif.pm:7074-7076`): `dirNum 0 → "SubIFD"`
+  /// (the `if $dirNum` guard skips the substitution), `1 → "SubIFD1"`,
+  /// `2 → "SubIFD2"`, … The widest is `"SubIFD"` (6) + `u32::MAX` (10 digits)
+  /// = 16 <= 24 = `buf.len()`.
+  #[must_use]
+  fn sub_ifd(dir_num: u32) -> Self {
+    if dir_num == 0 {
+      return Self::literal("SubIFD");
+    }
+    let bytes = b"SubIFD";
+    let mut buf = [0u8; 24];
+    let n = bytes.len();
+    if let Some(dst) = buf.get_mut(..n) {
+      dst.copy_from_slice(bytes);
+    }
+    // Decimal-render `dir_num` (most-significant first) after the `"SubIFD"`
+    // prefix, into a scratch buffer then a checked copy — the same panic-safe
+    // shape as [`Self::ifd`]/[`Self::literal_suffixed`]. `dir_num > 0` here, so
+    // at least one digit is written.
+    let mut digits = [0u8; 10];
+    let mut value = dir_num;
+    let mut ndigits = 0usize;
+    for slot in &mut digits {
+      *slot = b'0' + (value % 10) as u8;
+      value /= 10;
+      ndigits += 1;
+      if value == 0 {
+        break;
+      }
+    }
+    // `n + ndigits <= 6 + 10 = 16 <= 24`, so `buf.get_mut(n..n+ndigits)` is
+    // `Some`; the unreachable `None` arm leaves the suffix unwritten.
+    if let (Some(src), Some(dst)) = (digits.get(..ndigits), buf.get_mut(n..n + ndigits)) {
+      for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+        *d = *s;
+      }
+    }
+    Self {
+      buf,
+      len: (n + ndigits) as u8,
+    }
+  }
+
   /// The rendered name as a `&str`.
   #[must_use]
   #[inline]
@@ -372,6 +440,10 @@ impl IfdKind {
       // appended for the 2nd+ offset of a multi-offset pointer (`$i = 0` -> no
       // suffix, the dominant single-offset camera shape).
       IfdKind::BigSubIfd(sub, i) => IfdName::literal_suffixed(sub.tag_name(), i),
+      // `$subdirInfo{DirName} = 'SubIFD'` then `s/\d*$/$dirNum/ if $dirNum`
+      // (`Exif.pm:7074-7076`): the classic-TIFF SubIFD tower's `$dirNum`-th
+      // directory is `SubIFD`/`SubIFD1`/`SubIFD2`/…
+      IfdKind::SubIfd(dir_num) => IfdName::sub_ifd(dir_num),
     }
   }
 
@@ -402,6 +474,10 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     // {TagTable}`) — even a `GPSInfo` BigTIFF SubIFD (`Exif::Main`, not
     // `%GPS::Main`). So every payload maps to `Exif`, regardless of the pointer.
     IfdKind::BigSubIfd(_, _) => TableRef::Exif,
+    // A classic-TIFF SubIFD reuses the inherited `%Exif::Main` — the `0x014a`
+    // pointer's SubDirectory carries no `TagTable` redirect, so `$newTagTable =
+    // $tagTablePtr` (`Exif.pm:6943`).
+    IfdKind::SubIfd(_) => TableRef::Exif,
   }
 }
 
@@ -434,6 +510,15 @@ pub enum SubDirKind {
   /// captures the raw bytes. This variant IS the plug-in seam: a MakerNotes
   /// port adds the per-vendor dispatch behind it.
   MakerNote,
+  /// `SubIFD` (0x014a) — the classic-TIFF preview/raw sub-IFD pointer
+  /// (`Exif.pm:1006-1027`, `Flags => 'SubIFD'`, `SubDirectory => { Start =>
+  /// '$val', MaxSubdirs => 10 }`). UNLIKE the single-offset ExifIFD/GPS/Interop
+  /// pointers, this carries MULTIPLE offsets (`@values = split ' ', $val`); the
+  /// walker descends each as an [`IfdKind::SubIfd`] directory (`SubIFD`,
+  /// `SubIFD1`, `SubIFD2`, …) reusing the inherited `%Exif::Main` table. The
+  /// multi-offset descent path is bespoke (see [`Walker::dispatch_classic_subifd`]),
+  /// not the single-offset [`Walker::dispatch_subdir`] arm.
+  SubIfd,
 }
 
 impl SubDirKind {
@@ -452,7 +537,7 @@ impl SubDirKind {
   pub const fn is_sub_ifd(self) -> bool {
     matches!(
       self,
-      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop
+      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop | SubDirKind::SubIfd
     )
   }
 
@@ -470,6 +555,7 @@ impl SubDirKind {
       SubDirKind::Gps => "GPSInfo",
       SubDirKind::Interop => "InteropOffset",
       SubDirKind::MakerNote => "MakerNote",
+      SubDirKind::SubIfd => "SubIFD",
     }
   }
 }
@@ -829,6 +915,12 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // `Leica:LensType` on a Leica body — distinct from the Leica1/Leica10
     // cross-vendor routes (which emit `Panasonic:*` via `%Panasonic::Main`).
     TableRef::Leica(_) => Some("Leica"),
+    // `%Nikon::PreviewIFD` (#242) — `GROUPS => { 1 => 'PreviewIFD' }`
+    // (`Nikon.pm:5389`). The Samsung `0x0035` descent applies this group
+    // per-emission via [`VendorEmission::group1_override`] (the captured leaves
+    // do not flow through this default-group helper), but the mapping is declared
+    // here for completeness with the other vendor tables.
+    TableRef::NikonPreviewIfd => Some("PreviewIFD"),
     TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
@@ -975,6 +1067,10 @@ enum MakerNoteValueConvDecode<'a> {
     order: ByteOrder,
     make: Option<smol_str::SmolStr>,
     model: Option<smol_str::SmolStr>,
+    /// The container's `$$self{TIFF_TYPE}` — the `0x0035 PreviewIFD`
+    /// `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (#242), retained so the
+    /// `-n` recompute descends (or skips) PreviewIFD identically to the `-j` pass.
+    file_type: Option<smol_str::SmolStr>,
   },
   /// Leica2..Leica9 — re-drive the SHARED `Walker`'s Leica variant walk +
   /// emission capture ([`leica_makernote_isolated`]) with `print_conv = false`
@@ -1194,13 +1290,15 @@ impl MakerNoteValueConvDecode<'_> {
         order,
         make,
         model,
+        file_type,
       } => {
         // The `-n` recompute is the isolated walk with `print_conv = false` and
         // the typed slot discarded (the `-n` path needs only the ValueConv
         // emissions), mirroring the other vendors (#210). A blob that walked in
-        // PrintConv walks the SAME way in ValueConv (the `detected` modes are
-        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is
-        // the defensive empty `Vec` for the impossible `None`.
+        // PrintConv walks the SAME way in ValueConv (the `detected` modes +
+        // `file_type` gate are PrintConv-independent), so `Some` always holds;
+        // `unwrap_or_default` is the defensive empty `Vec` for the impossible
+        // `None`.
         samsung_makernote_isolated(
           data,
           *mn_offset,
@@ -1209,6 +1307,7 @@ impl MakerNoteValueConvDecode<'_> {
           *order,
           make.as_deref(),
           model.as_deref(),
+          file_type.as_deref(),
           false,
         )
         .map(|(e, _)| e)
@@ -1690,6 +1789,12 @@ pub struct ExifMeta<'a> {
   /// parsing is deferred to the MakerNotes wave. Borrows from the input
   /// TIFF block — the sole reason `ExifMeta` carries a lifetime.
   maker_note: Option<MakerNote<'a>>,
+  /// The `PrintIMVersion` strings parsed from each PrintIM (`0xc4a5`)
+  /// SubDirectory the IFD walk reached (`PrintIM.pm`'s `ProcessPrintIM`), in walk
+  /// order. [`Taggable::tags`](crate::emit::Taggable::tags) emits each as a
+  /// `PrintIM:PrintIMVersion` tag ([`push_printim_tags`](Self::push_printim_tags)).
+  /// EMPTY for the common no-PrintIM case.
+  printim_versions: Vec<smol_str::SmolStr>,
   /// The synthesized `File:PageCount` value when this `ExifMeta` is the
   /// outer result of a standalone-TIFF walk that triggered the multi-page
   /// gate (`ExifTool.pm:8756-8757`). `Some(n)` ⇒ `serialize_tags` emits
@@ -1731,6 +1836,80 @@ pub struct ExifMeta<'a> {
   /// [`ConvMode::ValueConv`](crate::emit::ConvMode); the print-conv vector
   /// otherwise.
   jpeg_app_tags_n: Vec<crate::emit::EmittedTag>,
+  /// The JPEG IPTC + `COM`-comment parse — the Photoshop / IPTC arm of
+  /// `ProcessJPEG` (`ExifTool.pm:8371-8400`) and the `COM` arm
+  /// (`ExifTool.pm:8429-8432`). Carries the `IPTC:*` ApplicationRecord tags (in
+  /// both conv modes, the values pre-rendered at decode time), the
+  /// `File:CurrentIPTCDigest` (the MD5 of the `0x0404` IPTC block,
+  /// `IPTC.pm:1075`), and each `File:Comment`. [`Taggable::tags`] emits the
+  /// `File:*` digest/comment in the `File`-group prefix and the `IPTC:*` tags
+  /// after the EXIF block. `None` for a JPEG carrying neither an `APP13`
+  /// Photoshop IRB nor a `COM` segment (and for every non-JPEG source).
+  iptc: Option<iptc::IptcMeta>,
+  /// The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment — the
+  /// `^http://ns.adobe.com/xap/1.0/\0` arm of `ProcessJPEG` (`ExifTool.pm:7794-
+  /// 7819`, the `$$valPt =~ /^$xmpAPP1hdr/` branch → `Image::ExifTool::XMP`'s
+  /// `ProcessXMP`). The 29-byte `$xmpAPP1hdr` namespace marker is stripped and
+  /// the remaining XMP packet routed to the shared XMP parser
+  /// ([`crate::formats::xmp::parse_borrowed`]) exactly like a standalone `.xmp`
+  /// sidecar / a QuickTime `uuid`-XMP box (#361) — one shared `ProcessXMP`.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) appends its `XMP-*:*` tags
+  /// (family-0 `XMP`, family-1 the namespace group) via the XMP module's own
+  /// `Taggable` impl, already rendered for the active conv mode; its `Warning`
+  /// (if any) rides the sibling [`Diagnose`](crate::diagnostics::Diagnose)
+  /// channel. `XmpMeta` OWNS its decoded strings (the `'a` is a `PhantomData`
+  /// anchor — the input is transcoded to owned `String`s), so it is stored
+  /// `'static`, independent of the JPEG buffer. `None` for a JPEG carrying no
+  /// XMP `APP1` (and for every non-JPEG source).
+  ///
+  /// A JPEG may carry MULTIPLE XMP `APP1` packets (ExifTool's `Marker:` loop
+  /// runs `ProcessXMP` once per matching `APP1` and `FoundTag` ACCUMULATES, with
+  /// no de-dup, `ExifTool.pm:7794`); the first seeds the slot and each later one
+  /// is absorbed via
+  /// [`XmpMeta::absorb_additional_packet`](crate::formats::xmp::XmpMeta::absorb_additional_packet)
+  /// (concatenate tags + first-wins `Warning`), so the downstream last-wins
+  /// `TagMap` reproduces ExifTool's equal-priority resolution — the same path
+  /// the QuickTime multi-`uuid` case uses. The ExtendedXMP (`http://ns.adobe.com/
+  /// xmp/extension/\0`) APP1 segments are a separate follow-up (no test fixture
+  /// carries one).
+  #[cfg(feature = "xmp")]
+  embedded_xmp: Option<crate::formats::xmp::XmpMeta<'static>>,
+  /// The file (marker) offset of the warning-PRODUCING embedded-XMP `APP1`
+  /// segment — the byte position (`base_offset + segment payload start`) of the
+  /// XMP `APP1` whose `ProcessXMP` raised the adopted `Warning`. `None` when no
+  /// XMP packet warned (a clean XMP, or no XMP at all). It exists ONLY to RANK
+  /// the embedded-XMP `Warning` against the EXIF `APP1`'s warnings by file
+  /// position in [`Diagnose::diagnostics`](crate::diagnostics::Diagnose): ExifTool
+  /// processes JPEG `APPn` markers in FILE ORDER and `Warning` is a priority-0
+  /// `FoundTag` (FIRST by marker position owns the bare `ExifTool:Warning` —
+  /// QuickTime.pm `uuid`-XMP #361 / Pittasoft #362), so a warning-producing XMP
+  /// `APP1` placed BEFORE a malformed/warning EXIF `APP1` must surface its
+  /// warning first, and vice-versa. There is no JPEG `PRIORITY_DIR` promotion
+  /// for XMP (contrast the QuickTime non-`HEIC` path), so it competes purely by
+  /// offset. The first warning-producing packet's position is recorded
+  /// (`get_or_insert`), mirroring [`embedded_xmp`](Self::embedded_xmp)'s
+  /// first-wins `Warning`. `u32` matches the JPEG offset arithmetic (a JPEG
+  /// cannot place an `APP1` past 4 GiB; the capture saturates on a pathological
+  /// rebase). `None` for every non-JPEG source.
+  #[cfg(feature = "xmp")]
+  embedded_xmp_offset: Option<u32>,
+  /// The file (marker) offset of the FIRST EXIF `APP1` segment that contributed
+  /// a `Warning` — the byte position (`base_offset + segment payload start`) of
+  /// the earliest `APP1` whose `ProcessTIFF` walk warned (an IFD-bounds /
+  /// suspicious-offset `$et->Warn`) OR that raised `Malformed APP1 EXIF segment`
+  /// (`ExifTool.pm:7783`). All [`warnings`](Self::warnings) on a merged JPEG
+  /// `ExifMeta` originate from EXIF `APP1` block(s), so this single position is
+  /// the EXIF warnings' file location — the comparator the embedded-XMP
+  /// `Warning` is ranked against in
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) (first-by-position
+  /// wins; see [`embedded_xmp_offset`](Self::embedded_xmp_offset)). `None` when
+  /// no EXIF `APP1` warned (the EXIF warning list is then empty, so the XMP
+  /// warning — if any — leads unconditionally). Recorded ONLY when the `xmp`
+  /// feature is built (the offset is consulted solely for the XMP-vs-EXIF
+  /// ordering); without `xmp` the diagnostics are EXIF-only and need no
+  /// position. `None` for every non-JPEG source.
+  #[cfg(feature = "xmp")]
+  exif_warning_offset: Option<u32>,
   /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — `Some("CRW")`
   /// for a CIFF/CRW raw, the standalone-TIFF candidate's `Parent`
   /// (`"TIFF"`/`"DNG"`/`"NEF"`/`"CR2"`/…) for a standalone TIFF, `None` for an
@@ -1993,6 +2172,7 @@ impl<'a> ExifMeta<'a> {
     warnings_ignorable: Vec<u8>,
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
+    printim_versions: Vec<smol_str::SmolStr>,
   ) -> Self {
     // JPEG `APP1` Exif blocks come through `ProcessTIFF` with
     // `Parent='APP1'` (`ExifTool.pm:7779-7783`), so `TIFF_TYPE='APP1'` and
@@ -2004,6 +2184,7 @@ impl<'a> ExifMeta<'a> {
       warnings,
       warnings_ignorable,
       byte_order,
+      printim_versions,
       maker_note,
       multi_page_count: None,
       // The SOF dimension tags are attached AFTER construction by the JPEG
@@ -2012,6 +2193,26 @@ impl<'a> ExifMeta<'a> {
       sof: None,
       jpeg_app_tags_pc: Vec::new(),
       jpeg_app_tags_n: Vec::new(),
+      // The IPTC + `COM` parse is attached AFTER this construction by the JPEG
+      // marker walk via [`set_jpeg_iptc`](Self::set_jpeg_iptc); a freshly merged
+      // JPEG `ExifMeta` starts with none.
+      iptc: None,
+      // The embedded XMP `APP1` packet is decoded and attached AFTER this
+      // construction by the JPEG marker walk via
+      // [`set_jpeg_embedded_xmp`](Self::set_jpeg_embedded_xmp); a freshly
+      // built JPEG `ExifMeta` starts with none.
+      #[cfg(feature = "xmp")]
+      embedded_xmp: None,
+      // The XMP/EXIF warning marker offsets are recorded by the JPEG marker
+      // walk AFTER this construction (via
+      // [`set_jpeg_embedded_xmp_offset`](Self::set_jpeg_embedded_xmp_offset) /
+      // [`set_jpeg_exif_warning_offset`](Self::set_jpeg_exif_warning_offset)),
+      // so they rank the embedded-XMP `Warning` against the EXIF warnings by
+      // file position; a freshly built JPEG `ExifMeta` has neither yet.
+      #[cfg(feature = "xmp")]
+      embedded_xmp_offset: None,
+      #[cfg(feature = "xmp")]
+      exif_warning_offset: None,
       // A JPEG container's `APP1` Exif block is embedded — `$$self{FILE_TYPE}`
       // is the JPEG ("JPEG"), never "CRW", so the ShotInfo pos-22 CRW clause is
       // correctly off. We model that as `None` (no CRW), matching the embedded
@@ -2071,6 +2272,56 @@ impl<'a> ExifMeta<'a> {
   ) {
     self.jpeg_app_tags_pc = pc;
     self.jpeg_app_tags_n = n;
+  }
+
+  /// Attach the JPEG IPTC + `COM`-comment parse decoded by
+  /// [`iptc::process_app13`] / [`iptc::IptcMeta::push_comment`] during the
+  /// marker walk. [`Taggable::tags`](crate::emit::Taggable::tags) emits its
+  /// `File:CurrentIPTCDigest`/`File:Comment` in the `File`-group prefix and its
+  /// `IPTC:*` ApplicationRecord tags after the EXIF block. (`pub(crate)`: a
+  /// JPEG-front-end construction-time internal.)
+  pub(crate) fn set_jpeg_iptc(&mut self, iptc: iptc::IptcMeta) {
+    self.iptc = Some(iptc);
+  }
+
+  /// Attach the embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
+  /// (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm),
+  /// already parsed by the shared XMP module
+  /// ([`crate::formats::xmp::parse_borrowed`]) during the marker walk. Its
+  /// `XMP-*:*` tags are emitted by [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// (via the XMP module's own `Taggable` impl) and its `Warning` by
+  /// [`Diagnose`](crate::diagnostics::Diagnose). `None` clears any prior packet.
+  /// (`pub(crate)`: a JPEG-front-end construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_embedded_xmp(
+    &mut self,
+    xmp: Option<crate::formats::xmp::XmpMeta<'static>>,
+  ) {
+    self.embedded_xmp = xmp;
+  }
+
+  /// Record the file (marker) offset of the warning-producing embedded-XMP
+  /// `APP1` segment ([`embedded_xmp_offset`](Self::embedded_xmp_offset)) so
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose) can rank the XMP
+  /// `Warning` against the EXIF warnings by file position (first-by-marker-
+  /// position wins, mirroring the QuickTime `uuid`-XMP `#361` / Pittasoft `#362`
+  /// model). Called by the JPEG marker walk for the FIRST XMP `APP1` whose
+  /// `ProcessXMP` raised the adopted warning. (`pub(crate)`: a JPEG-front-end
+  /// construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_embedded_xmp_offset(&mut self, offset: u32) {
+    self.embedded_xmp_offset = Some(offset);
+  }
+
+  /// Record the file (marker) offset of the first EXIF `APP1` that contributed a
+  /// `Warning` ([`exif_warning_offset`](Self::exif_warning_offset)) — the
+  /// comparator the embedded-XMP `Warning` is ranked against in
+  /// [`Diagnose::diagnostics`](crate::diagnostics::Diagnose). Called by the JPEG
+  /// marker walk once, for the earliest warning-producing EXIF `APP1`.
+  /// (`pub(crate)`: a JPEG-front-end construction-time internal.)
+  #[cfg(feature = "xmp")]
+  pub(crate) fn set_jpeg_exif_warning_offset(&mut self, offset: u32) {
+    self.exif_warning_offset = Some(offset);
   }
 
   /// Record the marker (file) position of the EXIF metadata block — the index
@@ -2150,12 +2401,13 @@ impl<'a> ExifMeta<'a> {
       })
   }
 
-  /// Decompose this `ExifMeta` into `(entries, warnings, byte_order,
-  /// maker_note)` — the inverse of [`from_jpeg_parts`](Self::from_jpeg_parts),
-  /// used by the JPEG front-end to merge one decoded `APP1` Exif block into
-  /// the accumulating JPEG-level parts. The `MakerNote` borrows from the input
-  /// TIFF block (the `'a` lifetime), so it threads through the merge unchanged.
-  /// (`pub(crate)`: a merge-time internal, not API surface.)
+  /// Decompose this `ExifMeta` into `(entries, warnings, warnings_ignorable,
+  /// byte_order, maker_note, printim_versions)` — the inverse of
+  /// [`from_jpeg_parts`](Self::from_jpeg_parts), used by the JPEG front-end to
+  /// merge one decoded `APP1` Exif block into the accumulating JPEG-level parts.
+  /// The `MakerNote` borrows from the input TIFF block (the `'a` lifetime), so
+  /// it threads through the merge unchanged. (`pub(crate)`: a merge-time
+  /// internal, not API surface.)
   #[must_use]
   pub(crate) fn into_jpeg_parts(
     self,
@@ -2165,17 +2417,21 @@ impl<'a> ExifMeta<'a> {
     Vec<u8>,
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
+    Vec<smol_str::SmolStr>,
   ) {
     // `multi_page_count` is dropped — the JPEG-merge path constructs the
     // merged `ExifMeta` via `from_jpeg_parts`, which always sets
     // `multi_page_count = None` (`Parent='APP1'`, not 'TIFF', so bundled
-    // suppresses the emit). Restoring it on merge would be incorrect.
+    // suppresses the emit). Restoring it on merge would be incorrect. The
+    // PrintIM versions (IFD0 `0xc4a5`) DO thread through — a JPEG carries its
+    // PrintIM in the `APP1` Exif block, so it must survive the merge.
     (
       self.entries,
       self.warnings,
       self.warnings_ignorable,
       self.byte_order,
       self.maker_note,
+      self.printim_versions,
     )
   }
 }
@@ -2203,13 +2459,28 @@ impl FormatParser for ProcessExif {
   /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
   /// synthesis (`ExifTool.pm:8756-8757`) is active.
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    // Direct standalone-TIFF lib entry: no candidate `Parent` context (the
-    // engine path through `AnyParser::Exif` carries the real type via
-    // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
-    // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
+    // Direct standalone-TIFF lib entry with no candidate `Parent` context. The
+    // finalized subtype `$$self{TIFF_TYPE}` for a plain `.tif` with no `Parent`
+    // is `"TIFF"` (`finalized_tiff_file_type("TIFF", "", _)`: `$t` undef ⇒ the
+    // detected base name stays `"TIFF"`, `ExifTool.pm:8685-8704`) — the SAME
+    // string the engine path threads in for a plain TIFF — so `file_type =
+    // Some("TIFF")`, matching the engine dispatch (`format_parser.rs`). This
+    // enables the DNG/TIFF JPEG-preview gate (`$$self{TIFF_TYPE} =~
+    // /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) for direct callers, so a SubIFD2
+    // JPEG strip resolves `0x111`/`0x117` to `JpgFromRaw` exactly as
+    // `extract_info` does. A `.tif` is never a CRW, so the ShotInfo pos-22 CRW
+    // clause stays off (`"TIFF" ne "CRW"`), and the Samsung2 SRW clause stays
+    // off (`"TIFF" ne "SRW"`) — `Some("TIFF")` keys no other consumer that
+    // `None` did not. The DETECTION-TIME base `$$self{FILE_TYPE}` for a
+    // TIFF-magic file IS `'TIFF'` (`ExifTool.pm:3048`), so `base_file_type =
+    // Some("TIFF")` — the Sony-A100 `0x014a` gate is reachable from this direct
+    // entry exactly as ExifTool would reach it for raw A100 bytes.
     parse_tiff(
-      data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
-      /* file_type */ None,
+      data,
+      /* tiff_type_is_tiff */ true,
+      /* standalone_tiff */ true,
+      /* file_type */ Some("TIFF"),
+      /* base_file_type */ Some("TIFF"),
     )
   }
 }
@@ -2223,11 +2494,21 @@ impl FormatParser for ProcessExif {
 /// tags on the returned [`ExifMeta`], never as a fatal error.
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
-  // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
-  // None` (see [`ProcessExif::parse`]).
+  // Direct standalone-TIFF lib entry — no candidate `Parent`, so the finalized
+  // subtype `$$self{TIFF_TYPE}` is `"TIFF"` (the plain-`.tif` finalization, the
+  // SAME value the engine threads in), hence `file_type = Some("TIFF")`. This
+  // matches the engine path and enables the DNG/TIFF JPEG-preview / `JpgFromRaw`
+  // gate (`Exif.pm:635`/`:735`) for direct callers; `"TIFF"` keys no consumer
+  // beyond that gate (not the `"CRW"` ShotInfo nor the `"SRW"` Samsung2 clause).
+  // The detection-time base `$$self{FILE_TYPE}` is `'TIFF'` (`ExifTool.pm:3048`),
+  // so `base_file_type = Some("TIFF")` (the Sony-A100 `0x014a` gate) (see
+  // [`ProcessExif::parse`]).
   parse_tiff(
-    data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
-    /* file_type */ None,
+    data,
+    /* tiff_type_is_tiff */ true,
+    /* standalone_tiff */ true,
+    /* file_type */ Some("TIFF"),
+    /* base_file_type */ Some("TIFF"),
   )
 }
 
@@ -2257,11 +2538,13 @@ pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
 pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (QuickTime/RIFF/PNG/MakerNotes seam) — the container's
   // `$$self{FILE_TYPE}` is the OUTER type, never "CRW", so `file_type = None`
-  // (the ShotInfo pos-22 CRW clause stays off). `standalone_tiff = false`: an
-  // embedded block has no `$raf`, so the CR2 magic is NOT checked here.
+  // (the ShotInfo pos-22 CRW clause stays off) and `base_file_type = None` (the
+  // outer type is never `'TIFF'`, so the Sony-A100 `0x014a` gate stays off).
+  // `standalone_tiff = false`: an embedded block has no `$raf`, so the CR2 magic
+  // is NOT checked here.
   parse_tiff(
     block, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
-    /* file_type */ None,
+    /* file_type */ None, /* base_file_type */ None,
   )
 }
 
@@ -2279,12 +2562,13 @@ pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 #[must_use]
 pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (JPEG `APP1`, etc.) — the OUTER container type is never
-  // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off).
-  // `standalone_tiff = false`: an embedded `APP1` TIFF has no `$raf`, so the CR2
-  // magic is NOT checked here (a JPEG's embedded TIFF must never become CR2).
+  // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off) and
+  // never `'TIFF'`, so `base_file_type = None` (the Sony-A100 `0x014a` gate stays
+  // off). `standalone_tiff = false`: an embedded `APP1` TIFF has no `$raf`, so the
+  // CR2 magic is NOT checked here (a JPEG's embedded TIFF must never become CR2).
   parse_tiff_with_base(
     block, base, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
-    /* file_type */ None,
+    /* file_type */ None, /* base_file_type */ None,
   )
 }
 
@@ -2303,13 +2587,26 @@ pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_
 /// candidate (`ExifTool.pm:3026-3034`). The `MultiPage` flag itself comes from
 /// the SubfileType / OldSubfileType `RawConv` (`Exif.pm:456`/`:473`).
 ///
-/// `file_type` is that same candidate `Parent` (`$$self{FILE_TYPE}`,
-/// `ExifTool.pm:8715`) — stored on the resulting [`ExifMeta`] and threaded to
-/// the Canon MakerNote decoder for the `Canon::ShotInfo` pos-22 CRW-allows-0
-/// RawConv (`Canon.pm:2977`/`:2990`). The engine dispatch passes
-/// `Some(parent_type)`; it is WRITE-ONLY apart from that single pos-22 read.
-/// (A standalone TIFF/RAW is never a CRW — the CRW path is the unported CIFF
-/// front-end — so this changes no output today.)
+/// `file_type` is the FINALIZED subtype `$$self{TIFF_TYPE}` /
+/// `$$self{FileType}` (`ExifTool.pm:8546`/`:8715`) — the candidate `Parent` run
+/// through `SetFileType` (so a `.arw` is `"ARW"`). Stored on the resulting
+/// [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
+/// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`). The
+/// engine dispatch passes the resolved `File:FileType`; it is WRITE-ONLY apart
+/// from that single pos-22 read. (A standalone TIFF/RAW is never a CRW — the CRW
+/// path is the unported CIFF front-end — so this changes no output today.)
+///
+/// `base_file_type` is the DETECTION-TIME base `$$self{FILE_TYPE}`
+/// (`ExifTool.pm:3048`) — NEVER overwritten by `SetFileType`/`OverrideFileType`,
+/// so it is `Some("TIFF")` for the WHOLE TIFF-rooted family (TIFF/ARW/SRW/DNG/…)
+/// even when `file_type` is the `SetARW`-overridden `Some("ARW")`. The engine
+/// dispatch and the direct lib `.tif` entries pass `Some("TIFF")`; the embedded
+/// CTMD MakerNote re-dispatch passes `None` (its outer `$$self{FILE_TYPE}` is the
+/// container type, never `'TIFF'`). The sole reader is the Sony DSLR-A100
+/// `0x014a` `Condition` (`Exif.pm:1014` `$$self{FILE_TYPE} ne 'TIFF'`,
+/// [`Walker::a100_data_offset_condition`]): it must fire for a real A100 in any
+/// TIFF-rooted container (the real case is an `.arw`, `file_type == "ARW"`), so
+/// the gate keys on the BASE type, NOT the finalized subtype.
 ///
 /// `standalone_tiff` is the CR2-magic `$raf` gate (`ExifTool.pm:8629`): the
 /// genuine top-level standalone-TIFF dispatch passes `true` (the CR2 magic IS
@@ -2325,11 +2622,19 @@ pub fn parse_standalone_tiff_with_base<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   // The returned `ExifMeta<'a>` borrows ONLY from `block` (the IFD bytes); the
-  // `file_type` is copied into an owned `SmolStr` inside `parse_tiff_with_base`,
-  // so its lifetime is independent and need not appear in the return type.
-  parse_tiff_with_base(block, base, tiff_type_is_tiff, standalone_tiff, file_type)
+  // `file_type` / `base_file_type` are copied into owned `SmolStr`s inside
+  // `parse_tiff_with_base`, so their lifetimes are independent of the return.
+  parse_tiff_with_base(
+    block,
+    base,
+    tiff_type_is_tiff,
+    standalone_tiff,
+    file_type,
+    base_file_type,
+  )
 }
 
 /// The Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD re-dispatch
@@ -2357,6 +2662,10 @@ pub fn parse_ctmd_exif_ifd_redispatch(block: &[u8]) -> Option<ExifMeta<'_>> {
     /* tiff_type_is_tiff */ false,
     /* standalone_tiff */ false,
     /* file_type */ None,
+    // The embedded CTMD `0x8769` block's `$$self{FILE_TYPE}` is the outer
+    // container type, never `'TIFF'` ⇒ the Sony-A100 `0x014a` gate stays off.
+    /* base_file_type */
+    None,
     /* no_raf */ true,
     /* ifd0_kind */ IfdKind::Ifd0,
   )
@@ -2384,6 +2693,11 @@ pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
     /* tiff_type_is_tiff */ false,
     /* standalone_tiff */ false,
     /* file_type */ None,
+    // The embedded CR3 `CMT4` GPS block's `$$self{FILE_TYPE}` is the outer
+    // QuickTime/CR3 type, never `'TIFF'` ⇒ the Sony-A100 `0x014a` gate stays off
+    // (and a GPS-table top IFD never carries `0x014a` anyway).
+    /* base_file_type */
+    None,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Gps,
   )
@@ -2415,8 +2729,16 @@ fn parse_tiff<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
-  parse_tiff_with_base(data, 0, tiff_type_is_tiff, standalone_tiff, file_type)
+  parse_tiff_with_base(
+    data,
+    0,
+    tiff_type_is_tiff,
+    standalone_tiff,
+    file_type,
+    base_file_type,
+  )
 }
 
 /// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
@@ -2440,19 +2762,36 @@ fn parse_tiff<'a>(
 /// callers — DISTINCT from `tiff_type_is_tiff` (see
 /// [`parse_tiff_with_base_no_raf`]).
 ///
-/// `file_type` is the container's detected `$$self{FILE_TYPE}` — stored on the
-/// resulting [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
-/// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
-/// The standalone-TIFF dispatch passes the candidate `Parent`
-/// (`"TIFF"`/`"DNG"`/…); the embedded-block callers pass `None` (a JPEG/PNG
-/// container is never "CRW"). It is otherwise WRITE-ONLY — it changes no
-/// other tag, and no reachable input is a CRW today (no CIFF/CRW parser).
+/// `file_type` is the container's FINALIZED subtype `$$self{TIFF_TYPE}` /
+/// `$$self{FileType}` (`ExifTool.pm:8546`/`:8715`) — stored on the resulting
+/// [`ExifMeta`] and threaded into the walk as `$$self{TIFF_TYPE}` everywhere a
+/// `Condition` reads it: the conditional `0x111`/`0x117`/`0x201`/`0x202`
+/// offset-tag resolution (the DNG/TIFF `JpgFromRaw`/`PreviewImage` and CR2/ARW
+/// preview arms — [`OffsetTagContext::tiff_type`](tables::OffsetTagContext),
+/// `Exif.pm:601-779`/`:1148-1294`), the `Canon::ShotInfo` pos-22 CRW-allows-0
+/// RawConv (`Canon.pm:2977`/`:2990`), and the `MakerNoteSamsung2` SRW clause
+/// (`MakerNotes.pm:969`). The standalone-TIFF dispatch AND the direct lib `.tif`
+/// entries ([`ProcessExif::parse`] / [`parse_borrowed`]) pass the resolved
+/// `File:FileType` (`"TIFF"`/`"DNG"`/`"ARW"`/…, `"TIFF"` for a plain `.tif`);
+/// the embedded-block callers pass `None` (a JPEG/PNG container is never "CRW"
+/// nor "TIFF"). No reachable input is a CRW today (no CIFF/CRW parser).
+///
+/// `base_file_type` is the DETECTION-TIME base `$$self{FILE_TYPE}`
+/// (`ExifTool.pm:3048`), which `ProcessTIFF`/`SetFileType`/`OverrideFileType`
+/// never overwrite — so it stays `Some("TIFF")` for the WHOLE TIFF-rooted family
+/// (TIFF/ARW/SRW/DNG/…), DISTINCT from the `SetARW`-overridden `file_type`. The
+/// standalone-TIFF dispatch (and the direct lib `.tif` entries) pass
+/// `Some("TIFF")`; the embedded-block callers pass `None` (the outer container
+/// type is never `'TIFF'`). The sole reader is the Sony DSLR-A100 `0x014a`
+/// `Condition` (`Exif.pm:1014`), which must fire for a real A100 in any
+/// TIFF-rooted container (the real case is an `.arw`, `file_type == "ARW"`).
 fn parse_tiff_with_base<'a>(
   data: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   parse_tiff_with_base_no_raf(
     data,
@@ -2460,6 +2799,7 @@ fn parse_tiff_with_base<'a>(
     tiff_type_is_tiff,
     standalone_tiff,
     file_type,
+    base_file_type,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Ifd0,
   )
@@ -2496,6 +2836,7 @@ fn parse_tiff_with_base_no_raf<'a>(
   tiff_type_is_tiff: bool,
   standalone_tiff: bool,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
   no_raf: bool,
   ifd0_kind: IfdKind,
 ) -> Option<ExifMeta<'a>> {
@@ -2530,7 +2871,15 @@ fn parse_tiff_with_base_no_raf<'a>(
     if !standalone_tiff {
       return None;
     }
-    return parse_bigtiff(data, order, base, file_type, no_raf, ifd0_kind);
+    return parse_bigtiff(
+      data,
+      order,
+      base,
+      file_type,
+      base_file_type,
+      no_raf,
+      ifd0_kind,
+    );
   }
   // `my $offset = Get32u($dataPt, 4); $offset >= 8 or return 0`.
   let ifd0_offset = get_u32(data, 4, order)? as usize;
@@ -2594,13 +2943,16 @@ fn parse_tiff_with_base_no_raf<'a>(
     && data.get(8..16).is_some()
     && data.get(8..12) == Some(b"CR\x02\0".as_slice());
 
-  // The container `$$self{FILE_TYPE}` — owned once so it can be both threaded
-  // to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk time)
-  // and stored on the resulting `ExifMeta`.
+  // The container subtype `$$self{TIFF_TYPE}` — owned once so it can be both
+  // threaded to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk
+  // time) and stored on the resulting `ExifMeta`.
   let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
+  // The detection-time base `$$self{FILE_TYPE}` (the Sony-A100 `0x014a` gate).
+  let base_file_type: Option<smol_str::SmolStr> = base_file_type.map(smol_str::SmolStr::new);
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -2608,6 +2960,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     // COMMON path: a fresh per-block set ⇒ silent trailing-chain revisit
@@ -2618,7 +2971,10 @@ fn parse_tiff_with_base_no_raf<'a>(
     page_count: 0,
     multi_page: false,
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
     file_type: file_type.clone(),
+    base_file_type,
     // RAF-backed framing — every caller of this function has an effective RAF
     // (the block IS the whole readable buffer). The no-RAF CTMD `0x8769` hop
     // uses [`parse_ctmd_exif_ifd_redispatch`] instead.
@@ -2681,12 +3037,22 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     multi_page_count,
     // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
     // has no JPEG SOF segment.
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A standalone-TIFF walk is not a JPEG marker walk — no APP13 IPTC / `COM`.
+    iptc: None,
+    // A standalone-TIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     file_type,
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
@@ -2734,6 +3100,7 @@ fn parse_bigtiff<'a>(
   order: ByteOrder,
   base: u32,
   file_type: Option<&str>,
+  base_file_type: Option<&str>,
   no_raf: bool,
   ifd0_kind: IfdKind,
 ) -> Option<ExifMeta<'a>> {
@@ -2754,10 +3121,35 @@ fn parse_bigtiff<'a>(
   // `>= 8`; `ProcessBigIFD`'s seek/read bounds-check it.)
   let ifd0_offset = usize::try_from(get_u64(data, 8, order)?).ok()?;
 
-  let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
+  // `$$self{TIFF_TYPE}` is the EMPTY STRING (`''`) for the WHOLE BigTIFF walk, so
+  // the caller's container `file_type` candidate is DELIBERATELY IGNORED here
+  // (the walker's `file_type` below is forced to `None` ≡ `''`). `ProcessBTF` /
+  // `ProcessBigIFD` (`BigTIFF.pm`) is dispatched from `DoProcessTIFF`'s
+  // `$identifier == 0x2b` arm and `return 1`s at `ExifTool.pm:8668` BEFORE
+  // `$$self{TIFF_TYPE} = $fileType` (`:8715`), so `TIFF_TYPE` stays its
+  // constructor default `''` (`:4369`) — it is NEVER set to `'TIFF'`/`'BTF'`
+  // during the BigTIFF walk. (`SetFileType('BTF')` at `BigTIFF.pm:246` sets only
+  // `$$self{FileType}`, the `File:FileType` tag, not `TIFF_TYPE`.) Verified on
+  // bundled 13.59: a BigTIFF's internal `TIFF_TYPE` is empty for `.btf`/`.tif`/
+  // dotless alike. This makes the `0x111`/`0x117` DNG/TIFF JPEG-preview gate
+  // (`$$self{TIFF_TYPE} =~ /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) FALSE, so a
+  // SubfileType=1 + Compression=7 strip keeps the default `StripOffsets`/
+  // `StripByteCounts` arm instead of being renamed `PreviewImage`/`JpgFromRaw`.
+  let _ = file_type;
+  // BigTIFF's detection-time base `$$self{FILE_TYPE}` is `'BTF'` for a `.btf`
+  // extension but `'TIFF'` for a `.tif`/dotless BigTIFF (the TIFF magic `(II|MM)`
+  // matches first in the detection loop — verified on bundled 13.59); the engine
+  // / direct entries thread the literal `'TIFF'` detection base, matching the
+  // `.tif`/dotless case. Either way the Sony-A100 `0x014a` gate (`base_file_type
+  // eq 'TIFF'`) is UNREACHABLE here — BigTIFF walks via `walk_big_ifd_chain`, not
+  // the classic `0x014a` SubIFD dispatch — so `base_file_type` has no behavioral
+  // effect on the BigTIFF walk; it is threaded only for parity with the classic
+  // walker's struct.
+  let base_file_type: Option<smol_str::SmolStr> = base_file_type.map(smol_str::SmolStr::new);
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -2765,6 +3157,7 @@ fn parse_bigtiff<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
@@ -2773,7 +3166,16 @@ fn parse_bigtiff<'a>(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    file_type: file_type.clone(),
+    captured_compression: None,
+    captured_subfile_type: None,
+    // `$$self{TIFF_TYPE} == ''` for a BigTIFF walk (the dispatch `return 1`s
+    // before `ExifTool.pm:8715`) ⇒ `None` (the `''` sentinel), NOT the inherited
+    // caller candidate — so the `0x111`/`0x117` DNG/TIFF JPEG-preview gate is
+    // false (see the `let _ = file_type` rationale above). The ExifMeta below
+    // still finalizes `File:FileType = BTF` (`SetFileType('BTF')`), a SEPARATE
+    // signal from this walk-time `TIFF_TYPE`.
+    file_type: None,
+    base_file_type,
     no_raf,
     warn_count: 0,
     // The BigTIFF walker keys its leaf lookup off `kind` directly
@@ -2811,6 +3213,7 @@ fn parse_bigtiff<'a>(
     // local `order`.
     byte_order: None,
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     // `File:PageCount` IS emitted for a BigTIFF whose IFD chain tripped `MultiPage`
     // (a `SubfileType == 2` / `OldSubfileType == 3` `RawConv` tap in `Walker::emit`,
     // `Exif.pm:456`/`:473`) — the `:8667` `FoundTag` gates on `$$self{MultiPage}`
@@ -2827,14 +3230,25 @@ fn parse_bigtiff<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // A BigTIFF walk is not a JPEG marker walk — no APP13 IPTC / `COM`.
+    iptc: None,
+    // A BigTIFF walk is not a JPEG marker walk — no embedded XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) FORCES the file
     // type to `BTF` on the 0x2b magic, REGARDLESS of extension — so a BigTIFF
     // named `.tif` / dotless still finalizes `File:FileType = BTF`. Carry that
     // signal HERE (the ExifMeta's `file_type`), overriding the passed detection
     // candidate (which is `TIFF` for a `.tif` BigTIFF); `finalize_file_type`'s
     // `AnyMeta::Exif` arm maps a `Some("BTF")` signal to an explicit BTF type +
-    // `image/x-tiff-big` MIME. (The WALKER above keeps the passed container
-    // `file_type` for the Canon-CRW RawConv gate — `BTF` ≠ `CRW`, so unaffected.)
+    // `image/x-tiff-big` MIME. This is the `File:FileType` output signal, SEPARATE
+    // from the walk-time `$$self{TIFF_TYPE}` (the WALKER above uses `None` ≡ the
+    // `''` TIFF_TYPE, so the JPEG-preview gate is off — a `BTF`/`TIFF` TIFF_TYPE is
+    // NEVER seen during the BigTIFF walk).
     file_type: Some(smol_str::SmolStr::new("BTF")),
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
@@ -2944,6 +3358,7 @@ fn parse_tiff_with_base_shared<'a>(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     base,
     // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
     value_offset_base: 0,
@@ -2951,6 +3366,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
     // SHARED path: the external `$$et{PROCESSED}` map. A chain-IFD revisit —
@@ -2968,9 +3384,14 @@ fn parse_tiff_with_base_shared<'a>(
     // PNG `eXIf` / CTMD `0x8769` parse, never the standalone-TIFF dispatch, so
     // the DNG override (gated on `FILE_TYPE eq 'TIFF'`) is unreachable from it.
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
     // Embedded block (PNG `eXIf`): `$$self{FILE_TYPE}` is "PNG", never "CRW",
     // so the ShotInfo pos-22 CRW clause is off — model it as `None`.
     file_type: None,
+    // PNG `eXIf`: the detection base `$$self{FILE_TYPE}` is "PNG", never "TIFF",
+    // so the Sony-A100 `0x014a` gate (`base_file_type eq 'TIFF'`) is off — `None`.
+    base_file_type: None,
     // PNG `eXIf` is a self-contained block read into memory; its value offsets
     // resolve within the block (an effective RAF, like the standalone path), so
     // the RAF-backed framing is faithful. Only the CTMD `0x8769` hop is no-RAF.
@@ -3001,6 +3422,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    printim_versions: w.printim_versions,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
     multi_page_count: None,
@@ -3008,6 +3430,15 @@ fn parse_tiff_with_base_shared<'a>(
     sof: None,
     jpeg_app_tags_pc: Vec::new(),
     jpeg_app_tags_n: Vec::new(),
+    // An embedded eXIf / CTMD block is not a JPEG marker walk — no IPTC / `COM`.
+    iptc: None,
+    // An embedded eXIf / CTMD block is not a JPEG marker walk — no XMP `APP1`.
+    #[cfg(feature = "xmp")]
+    embedded_xmp: None,
+    #[cfg(feature = "xmp")]
+    embedded_xmp_offset: None,
+    #[cfg(feature = "xmp")]
+    exif_warning_offset: None,
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
     captured_make: w.captured_make.map(smol_str::SmolStr::from),
@@ -3130,6 +3561,15 @@ struct Walker<'a, 'g> {
   data: &'a [u8],
   /// The TIFF byte order.
   order: ByteOrder,
+  /// The RESOLVED (probed) byte order of the most recent `ProcessProc::Unknown`
+  /// SubDirectory walk — the order [`process_subdir`] used INSIDE the sub-walk,
+  /// captured here (unlike [`Self::order`], which `process_subdir` restores to
+  /// the parent order on return). The Pentax `%Main` binary sub-tables that
+  /// declare no explicit `ByteOrder` inherit THIS order (e.g. the K-x `Pentax.avi`
+  /// MakerNote IFD probes to BigEndian even though its RIFF parent is
+  /// LittleEndian; the K-S2 JPEG probes to LittleEndian). `None` until a
+  /// `ProcessUnknown` walk resolves one.
+  resolved_subdir_order: Option<ByteOrder>,
   /// ExifTool's `$base` for the walk (`Exif.pm:6287` `$base = $$dirInfo{Base}
   /// || 0`). All IFD offsets remain relative to the start of `data`, but an
   /// `IsOffset` value tag (`StripOffsets` 0x0111, `ThumbnailOffset` 0x0201,
@@ -3181,6 +3621,13 @@ struct Walker<'a, 'g> {
   warnings_ignorable: Vec<u8>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
+  /// The `PrintIMVersion` strings parsed from each PrintIM SubDirectory
+  /// (`0xc4a5` in a core IFD, `PrintIM.pm`'s `ProcessPrintIM`) reached during the
+  /// walk, in walk order. ExifTool's `%PrintIM::Main` emits `PrintIMVersion`
+  /// under `GROUPS => { 0 => 'PrintIM', 1 => 'PrintIM' }`; the engine surfaces
+  /// each as a `PrintIM:PrintIMVersion` tag ([`ExifMeta::push_printim_tags`]).
+  /// Almost always EMPTY (no PrintIM) or a single `"0300"`/`"0250"`.
+  printim_versions: Vec<smol_str::SmolStr>,
   /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
   /// the MakerNotes dispatcher (`MakerNotes.pm`'s `$$self{Make}`
   /// conditions) sees it when the ExifIFD's 0x927c is reached. For a
@@ -3274,13 +3721,73 @@ struct Walker<'a, 'g> {
   /// [`RawValue::is_perl_truthy`](crate::exif::ifd::RawValue::is_perl_truthy)
   /// (a count-0 / scalar-`0` `DNGVersion` is falsy → not set) but never emitted.
   dng_version: bool,
-  /// The container's detected `$$self{FILE_TYPE}` (`ExifTool.pm:8715`).
-  /// Threaded into the Canon MakerNote decoder so `Canon::ShotInfo` position
-  /// 22's RawConv (`Canon.pm:2977`/`:2990`) can keep a raw-0 ExposureTime for
-  /// a CRW container. `None` for an embedded Exif block (PNG `eXIf`, JPEG
-  /// `APP1` — never "CRW") or when the type is unknown. WRITE-ONLY apart from
-  /// that single pos-22 read; it influences no other tag.
+  /// `$$self{Compression}` DataMember (`Exif.pm:512-528`, `Compression` 0x0103's
+  /// `RawConv` `return $$self{Compression} = $val`) — the LAST-decoded
+  /// `Compression` value in the CURRENT IFD, stored as the EXACT post-`ReadValue`
+  /// scalar STRING `$val` (`join(' ', @vals)`: a count-1 value is `"7"`, a count>1
+  /// value is the space-joined `"7 8"`). RESET to `None` at the start of every
+  /// directory body ([`walk_one_ifd_body`]), mirroring ExifTool's per-`ProcessExif`
+  /// `$$self{Compression} = '' ` (`Exif.pm:6447`, "make sure that Compression and
+  /// SubfileType are defined for this IFD (for Condition's)"). The `0x111`/`0x117`
+  /// conditional tag lists read it with STRING `eq`: the `PreviewImage`/
+  /// `JpgFromRaw` arms require `$$self{Compression} eq '7'`
+  /// (`Exif.pm:635`/`:735`/`:616`/`:624`, #331-P2). `None` ≡ ExifTool's `''`
+  /// (the empty-string sentinel — a `Compression eq '7'` test is false). The
+  /// scalar-string form is load-bearing: a count>1 `Compression` `int16u[2]` of
+  /// `7, 8` stringifies to `"7 8"`, and `'7 8' eq '7'` is FALSE, so the
+  /// JPEG-preview gate misses and the plain `StripOffsets` arm fires — exactly as
+  /// ExifTool 13.59 (a stored `Some(7)` integer would WRONGLY match `eq '7'`).
+  captured_compression: Option<smol_str::SmolStr>,
+  /// `$$self{SubfileType}` DataMember (`Exif.pm:444-461`, `SubfileType` 0x00fe's
+  /// `RawConv` `$$self{SubfileType} = $val`) — the LAST-decoded `SubfileType`
+  /// value in the CURRENT IFD, stored as the EXACT post-`ReadValue` scalar STRING
+  /// `$val` (the space-joined `join(' ', @vals)`, like
+  /// [`captured_compression`](Self::captured_compression)). RESET to `None` per
+  /// directory ([`walk_one_ifd_body`]) (the same `Exif.pm:6447` reset). The plain
+  /// `StripOffsets` arm's EXCLUSION reads it with STRING `ne`
+  /// (`not (… $$self{Compression} eq '7' and $$self{SubfileType} ne '0')`,
+  /// `Exif.pm:635`/`:735`): the JPEG-preview/JpgFromRaw arms fire only when
+  /// `SubfileType ne '0'`. `None` ≡ ExifTool's `''` sentinel (a `SubfileType ne
+  /// '0'` test is TRUE for `''`, matching Perl string inequality); only an exact
+  /// `Some("0")` fails it — a count>1 `"0 1"` SATISFIES `ne '0'` (the arm fires),
+  /// which a stored `Some(0)` integer would WRONGLY suppress. The `SubfileType ==
+  /// 1` Sony-A100 gate ([`Walker::a100_data_offset_condition`]) coerces this string
+  /// in Perl-numeric context. This is the SAME 0x00fe value the PageCount tap
+  /// reads; tracked separately because the PageCount counter is a file-level
+  /// running total, not the per-IFD condition member.
+  captured_subfile_type: Option<smol_str::SmolStr>,
+  /// The container's FINALIZED subtype — `$$self{TIFF_TYPE}` /
+  /// `$$self{VALUE}{FileType}` (`ExifTool.pm:8546`/`:8715`): the candidate
+  /// `Parent` (`"TIFF"`/`"DNG"`/`"ARW"`/…) the engine resolves to the emitted
+  /// `File:FileType`. Threaded into the Canon MakerNote decoder so
+  /// `Canon::ShotInfo` position 22's RawConv (`Canon.pm:2977`/`:2990`) can keep
+  /// a raw-0 ExposureTime for a CRW container. `None` for an embedded Exif block
+  /// (PNG `eXIf`, JPEG `APP1` — never "CRW") or when the type is unknown.
+  /// WRITE-ONLY apart from that single pos-22 read; it influences no other tag.
+  ///
+  /// DISTINCT from [`base_file_type`](Self::base_file_type): for an `.arw` A100
+  /// this is `Some("ARW")` (the `SetARW`-overridden subtype) while the base
+  /// detection type is `Some("TIFF")`.
   file_type: Option<smol_str::SmolStr>,
+  /// The container's DETECTION-TIME base `$$self{FILE_TYPE}` (`ExifTool.pm:3048`
+  /// `$$self{FILE_TYPE} = $type`) — the type the file was first identified as,
+  /// NEVER overwritten by `ProcessTIFF`/`SetFileType`/`OverrideFileType` (which
+  /// touch only `$$self{FileType}` / `$$self{TIFF_TYPE}`, `ExifTool.pm:9712`/
+  /// `:9727`). For EVERY TIFF-rooted container (TIFF/ARW/SRW/DNG/NEF/CR2/…) the
+  /// classic-TIFF magic resolves `$type = 'TIFF'`, so this is `Some("TIFF")` for
+  /// the whole family — even when [`file_type`](Self::file_type) is the
+  /// `SetARW`-overridden `Some("ARW")`. `None` for an embedded Exif block
+  /// (JPEG `APP1` / PNG `eXIf` / QuickTime `EXIF` / a MakerNote / GPS
+  /// re-dispatch — `$$self{FILE_TYPE}` is then the OUTER container type, which is
+  /// never `'TIFF'` for those, so `None` faithfully fails the `eq 'TIFF'` test).
+  ///
+  /// The sole reader is the Sony DSLR-A100 `0x014a` `Condition`
+  /// (`Exif.pm:1014` `$$self{FILE_TYPE} ne 'TIFF'`,
+  /// [`a100_data_offset_condition`](Self::a100_data_offset_condition)): it must
+  /// fire for a real A100 in ANY TIFF-rooted container (the real case is an
+  /// `.arw`, [`file_type`](Self::file_type) `Some("ARW")`), so the gate keys on
+  /// the BASE type, NOT the finalized subtype.
+  base_file_type: Option<smol_str::SmolStr>,
   /// `true` when this TIFF block is re-dispatched FROM MEMORY with NO RAF —
   /// the Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD hop (`Canon.pm:10745`
   /// → `ProcessTIFF` with `$dataPt` = the embedded block, no `RAF`). ExifTool's
@@ -3415,6 +3922,16 @@ impl Walker<'_, '_> {
   fn warn(&mut self, message: String) {
     self.warnings.push(message);
     self.warnings_ignorable.push(0);
+  }
+
+  /// Record a MINOR `$et->Warn(msg, 1)` (ignorable `1` ⇒ `[minor]`, applied by
+  /// `run_diagnostics`), keeping [`warnings`](Self::warnings) and
+  /// [`warnings_ignorable`](Self::warnings_ignorable) index-aligned. Used for
+  /// the `ProcessPrintIM` empty-block warning (`PrintIM.pm:52`,
+  /// `$et->Warn('Empty PrintIM data', 1)`).
+  fn warn_minor(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(1);
   }
 
   /// Record a MINOR-WITH-BEHAVIOURAL-CHANGE `$et->Warn(msg, 2)` (ignorable
@@ -3620,6 +4137,19 @@ impl Walker<'_, '_> {
     // reuses ONE `Walker` across the whole chain + every sub-IFD recursion, so
     // the field is shared state that must be re-zeroed per directory).
     self.warn_count = 0;
+    // `$$et{Compression} = $$et{SubfileType} = ''` (`Exif.pm:6447`, "make sure
+    // that Compression and SubfileType are defined for this IFD (for
+    // Condition's)") — `ProcessExif` clears these DataMembers at the START of
+    // every directory so a `0x111`/`0x117` Condition (`PreviewImage`/`JpgFromRaw`
+    // vs plain `StripOffsets`, #331-P2) tests THIS IFD's `Compression`/
+    // `SubfileType`, not a sibling/parent's stale value. `None` is the port's
+    // `''` sentinel; the per-entry `emit` taps re-populate them as the
+    // `SubfileType` (0xfe) / `Compression` (0x103) leaves are walked. (Reset only
+    // here, the classic `ProcessExif` body — `ProcessBigIFD`, the BigTIFF walk,
+    // has no such reset, matching ExifTool, so a BigTIFF SubIFD inherits the
+    // member like ExifTool's object-level state.)
+    self.captured_compression = None;
+    self.captured_subfile_type = None;
     // `$numEntries = Get16u($dataPt, $dirStart)` (Exif.pm:6344). The count
     // is readable only when `$dirStart <= $dataLen-2` (Exif.pm:6343); if
     // not, `$dirSize` is left undef and — with no RAF to read the IFD
@@ -4381,6 +4911,9 @@ impl Walker<'_, '_> {
       // payload). An unknown id yields `None` (the deferred SubDirectory /
       // binary rows are absent from the tables), the verbose-only omit.
       TableRef::Leica(v) => makernotes::vendors::leica::tags::lookup(v, tag_id).map(|t| t.name()),
+      // `%Nikon::PreviewIFD` (#242) — the warning-form name resolves against the
+      // PreviewIFD table (its renamed `PreviewImageStart`/`Length` leaves).
+      TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -4765,9 +5298,109 @@ impl Walker<'_, '_> {
         // is NOT walked: [`Step::Skip`].
         return Step::Skip;
       }
-      self.dispatch_subdir(sub, value_offset, read_len, format, count);
+      // `0x014a SubIFD` (`Exif.pm:1006-1027`) — a MULTI-offset SubDirectory
+      // (`MaxSubdirs => 10`, `@values = split ' ', $val`), descended via the
+      // bespoke [`dispatch_classic_subifd`]; the single-offset ExifIFD/GPS/
+      // Interop/MakerNote pointers stay on [`dispatch_subdir`].
+      if matches!(sub, SubDirKind::SubIfd) {
+        // DEFERRED for SRW: a Samsung `.srw` raw's `0x014a` SubIFD is the RAW
+        // image sub-IFD chain whose `%Exif::Main` rows resolve to SRW-SPECIFIC
+        // names the port has not yet ported — `0x0101`/`0x0102` are
+        // `JpgFromRawStart`/`JpgFromRawLength` in a SUBIFD of an SRW
+        // (`Exif.pm:1202-1257`, `Condition => DIR_NAME eq "SubIFD"`), NOT the
+        // default `ThumbnailOffset`/`Length`, plus `SamsungRawPointers`/
+        // `SamsungRawByteOrder` (`Exif.pm:834-848`). Walking it generically would
+        // emit DIVERGING tags (wrongly named `ThumbnailOffset` + a spurious
+        // `ThumbnailImage`), so the SRW raw SubIFD stays DEFERRED (the SamsungNX
+        // goldens drop `SubIFD:all`/`SubIFD1:all` for exactly this reason). The
+        // separate `%Nikon::PreviewIFD` path (the Samsung `0x0035` SubDirectory,
+        // #242) still emits `PreviewIFD:*`. This `#331-P2` SubIFD walk targets the
+        // DNG/TIFF preview/`JpgFromRaw` tower; the SRW raw SubIFD sub-tables are a
+        // separate port. The pointer itself emits no leaf (`Step::Keep`), exactly
+        // as before this walk landed (`0x014a` was an unhandled — thus dropped —
+        // tag for the SRW).
+        //
+        // DEFERRED for the Sony DSLR-A100: `0x014a` is a CONDITIONAL tag list
+        // (`Exif.pm:1006-1037`). Its SECOND arm (`#16 A100DataOffset`,
+        // `Exif.pm:1028-1036`) is selected when the first (`SubIFD`) arm's
+        // `Condition` is FALSE — i.e. for an original A100 ARW where `0x014a` is a
+        // pointer to the RAW DATA, NOT a directory. Walking that raw-data offset as
+        // an IFD would emit bogus SubIFD tags/warnings. [`a100_data_offset_condition`]
+        // ports the exact `Condition` (+ `Sony::SetARW`, `Sony.pm:11393-11414`):
+        // IFD0 of a SONY-make `FILE_TYPE eq 'TIFF'` with `SubfileType == 1` +
+        // `Compression == 6`, `Model eq 'DSLR-A100'`, a 4-byte `0x014a` value, and
+        // the offset NOT a valid IFD ([`validate_ifd`]). When it holds, treat
+        // `0x014a` as `A100DataOffset` (defer/skip the SubIFD walk), as ExifTool.
+        if self.file_type.as_deref() != Some("SRW")
+          && !self.a100_data_offset_condition(kind, value_offset, read_len, format)
+        {
+          self.dispatch_classic_subifd(value_offset, read_len, format, count);
+        }
+      } else {
+        self.dispatch_subdir(sub, value_offset, read_len, format, count);
+      }
       // The SubDirectory was dispatched (recursed/captured) — a normal entry:
       // [`Step::Keep`].
+      return Step::Keep;
+    }
+
+    // ---- PrintIM (`0xc4a5`) SubDirectory -------------------------------------
+    // `%Exif::Main` `0xc4a5` is a `SubDirectory => { TagTable => PrintIM::Main }`
+    // (Exif.pm:3280) carried in a CORE IFD (IFD0 in practice). It is NOT an
+    // IFD-chain pointer (so `sub_dir_for` returns `None` and it falls through
+    // here), but a self-contained binary block. Parse it via `ProcessPrintIM`
+    // (`printim::parse_version`) and record the `PrintIMVersion`; the engine
+    // emits it as `PrintIM:PrintIMVersion` (`ExifMeta::push_printim_tags`). Read
+    // the value SPAN exactly as the MakerNote / Canon-special paths do —
+    // `value_offset .. value_offset + read_len` (the out-of-line / inline value
+    // pointer + on-disk byte size, already bounds-resolved above). The vendor
+    // MakerNote `0x0e00` PrintIM is handled inside each vendor body, not here.
+    //
+    // The gate is the `%Exif::Main` table SCOPE, NOT [`is_core_ifd`] — the
+    // `0xc4a5` PrintIM SubDirectory lives ONLY in `%Exif::Main` (Exif.pm:3280),
+    // never in `%GPS::Main` (`is_core_ifd` would also fire for [`TableRef::Gps`],
+    // where a crafted `0xc4a5` entry is just an unknown GPS tag — parsing it as
+    // PrintIM would emit a spurious `[minor] Empty PrintIM data`). `%Exif::Main`
+    // is the table for IFD0/IFD1/ExifIFD/SubIFDs ([`TableRef::Exif`]) AND the
+    // Interop IFD, which reuses `%Exif::Main` ([`TableRef::Interop`],
+    // Exif.pm:6939) — so ExifTool would parse a `0xc4a5` there too. GPS is
+    // excluded.
+    if matches!(self.active_table, TableRef::Exif | TableRef::Interop) && tag_id == 0xc4a5 {
+      let end = value_offset.saturating_add(read_len).min(self.data.len());
+      // Resolve the `ProcessPrintIM` outcome BEFORE touching `&mut self`: the
+      // window borrow of `self.data` must end before `self.warn`/the version
+      // push (which need `&mut self`). The `Err` is a `&'static str`, the `Ok` an
+      // owned `SmolStr`, so the resolved `Result` carries no borrow.
+      let outcome = self
+        .data
+        .get(value_offset..end)
+        .map(|bytes| printim::parse_version(bytes, self.order));
+      match outcome {
+        // A structurally-valid block: record the `PrintIMVersion`; the engine
+        // emits it as `PrintIM:PrintIMVersion`.
+        Some(Ok(version)) => self.printim_versions.push(version),
+        // A malformed block: surface ExifTool's faithful file-level Warning on
+        // the shared warning channel at its EXACT `sub Warn` level, emitting NO
+        // version (`ProcessPrintIM` returns 0 without `HandleTag`). The empty
+        // case is `$et->Warn('Empty PrintIM data', 1)` (PrintIM.pm:52) — a MINOR
+        // warning (`[minor] ` prefix) routed to `warn_minor`; the other three
+        // ('Bad PrintIM data' / 'Invalid PrintIM header' / 'Bad PrintIM size')
+        // are plain `$et->Warn(msg)` (level 0) → `warn`.
+        Some(Err(warning)) => {
+          let message = String::from(warning.message());
+          if warning.is_minor() {
+            self.warn_minor(message);
+          } else {
+            self.warn(message);
+          }
+        }
+        // An out-of-bounds value window (the pointer/size did not resolve to a
+        // readable span) — nothing to parse or warn, matching the prior gate.
+        None => {}
+      }
+      // The PrintIM SubDirectory was processed (or rejected) — a normal entry,
+      // its pointer leaf is not separately emitted (ExifTool drops the
+      // SubDirectory tag itself): [`Step::Keep`].
       return Step::Keep;
     }
 
@@ -5428,6 +6061,14 @@ impl Walker<'_, '_> {
     self.dir_len = self.dir_len.map(|d| d.saturating_sub(locate_delta));
     self.active_table = table;
     self.order = resolved_order;
+    // Capture the resolved order for an inheriting binary sub-table read AFTER the
+    // walk returns (the Pentax `%Main` sub-tables) — `self.order` is restored
+    // below, but `resolved_subdir_order` persists. Only a `ProcessUnknown` walk
+    // (the maker-note probe path) records it; the core `Exif`/`Canon`/`BinaryData`
+    // sub-IFDs leave it untouched (their `resolved_order == self.order` anyway).
+    if matches!(process, ProcessProc::Unknown) {
+      self.resolved_subdir_order = Some(resolved_order);
+    }
     let _ = self.walk_one_ifd(ifd_start, kind);
     self.dir_len = saved_dir_len;
     self.warn_count = saved_warn_count;
@@ -5723,6 +6364,7 @@ impl Walker<'_, '_> {
           SubDirKind::Gps => IfdKind::Gps,
           SubDirKind::Interop => IfdKind::Interop,
           SubDirKind::MakerNote => unreachable!("MakerNote handled below"),
+          SubDirKind::SubIfd => unreachable!("SubIFD routed to dispatch_classic_subifd"),
         };
         // `unless (IsInt($newStart)) { ... }` passes for a negative `$val`
         // (`IsInt` is `/^[+-]?\d+$/`, ExifTool.pm:5943), but the subsequent
@@ -6315,8 +6957,12 @@ impl Walker<'_, '_> {
                 // the generic offset-correction one, not the PENTAX make arm).
                 let make = self.captured_make.as_deref();
                 let model = self.captured_model.as_deref();
+                // `$$self{TIFF_TYPE}` for the `0x0035 PreviewIFD`
+                // `Condition => '… eq "SRW"'` gate (#242). `self.file_type` is the
+                // finalized `$$self{FILE_TYPE}` (== `TIFF_TYPE` for SRW, `"SRW"`).
+                let tiff_type = self.file_type.as_deref();
                 if let Some((emi_pc, typed_pc)) = samsung_makernote_isolated(
-                  self.data, mn_offset, mn_len, detected, self.order, make, model, true,
+                  self.data, mn_offset, mn_len, detected, self.order, make, model, tiff_type, true,
                 ) {
                   meta.set_samsung(typed_pc);
                   cached_pc = emi_pc;
@@ -6328,6 +6974,7 @@ impl Walker<'_, '_> {
                     order: self.order,
                     make: make.map(smol_str::SmolStr::new),
                     model: model.map(smol_str::SmolStr::new),
+                    file_type: tiff_type.map(smol_str::SmolStr::new),
                   };
                 }
               }
@@ -6343,6 +6990,253 @@ impl Walker<'_, '_> {
           }
         }
       }
+      // `0x014a SubIFD` is routed to [`dispatch_classic_subifd`] by the caller
+      // (the multi-offset descent), never to this single-offset entry point.
+      SubDirKind::SubIfd => unreachable!("SubIFD routed to dispatch_classic_subifd"),
+    }
+  }
+
+  /// `true` when the `0x014a` value is the Sony DSLR-A100 RAW-DATA offset
+  /// (`A100DataOffset`), NOT a SubIFD directory pointer — so the multi-offset
+  /// SubIFD walk MUST be skipped (the offset points at raw image data; walking it
+  /// as an IFD would emit bogus tags/warnings).
+  ///
+  /// Ports `0x014a`'s conditional tag list (`Exif.pm:1006-1037`): the FIRST arm
+  /// (`Name => 'SubIFD'`) is taken when its `Condition` (`Exif.pm:1013-1020`) is
+  /// TRUE, the SECOND (`#16 A100DataOffset`, `Exif.pm:1028-1036`) otherwise. This
+  /// returns `true` ⇔ that `Condition` is FALSE, i.e. ALL of its `or`-clauses fail:
+  ///   * `$$self{DIR_NAME} ne 'IFD0'` fails ⇒ `kind == IFD0`;
+  ///   * `$$self{FILE_TYPE} ne 'TIFF'` fails ⇒ `base_file_type == "TIFF"` (the
+  ///     DETECTION-TIME base type — `'TIFF'` for the whole TIFF-rooted family,
+  ///     NOT the `SetARW`-overridden finalized subtype `self.file_type`, which is
+  ///     `"ARW"` for a real A100 `.arw`);
+  ///   * `$$self{Make} !~ /^SONY/` fails ⇒ `Make` begins `"SONY"`;
+  ///   * `not $$self{SubfileType} or $$self{SubfileType} != 1` fails ⇒ `SubfileType`
+  ///     is truthy AND numifies to `1` (Perl-numeric on the scalar `$val` string);
+  ///   * `not $$self{Compression} or $$self{Compression} != 6` fails ⇒ `Compression`
+  ///     is truthy AND numifies to `6`;
+  ///   * `not require Sony` fails ⇒ always available here;
+  ///   * `Sony::SetARW($self, $valPt)` returns FALSE — `SetARW` (`Sony.pm:11393-11414`)
+  ///     returns false ONLY when `$$et{Model} eq 'DSLR-A100'` AND
+  ///     `length $$valPt == 4` (the `0x014a` value is exactly 4 bytes) AND
+  ///     [`Self::validate_ifd`] (`ValidateIFD`, the `Get32u($valPt,0)` start)
+  ///     reports the offset is NOT a valid IFD.
+  ///
+  /// The `SetARW` side effect (`OverrideFileType('ARW')` + `$$self{TIFF_TYPE} =
+  /// 'ARW'`, `Sony.pm:11398`) — which fires for EVERY Sony arm, not just the A100 —
+  /// is OUT OF SCOPE for the `#331-P2` SubIFD walk (a separate Sony ARW file-type
+  /// port) and is deliberately NOT modelled here; only the A100 raw-data DEFER is.
+  fn a100_data_offset_condition(
+    &self,
+    kind: IfdKind,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+  ) -> bool {
+    // `$$self{DIR_NAME} eq 'IFD0'`.
+    if !matches!(kind, IfdKind::Ifd0) {
+      return false;
+    }
+    // `$$self{FILE_TYPE} eq 'TIFF'` — the DETECTION-TIME base type
+    // (`self.base_file_type`, `ExifTool.pm:3048`), NOT the `SetARW`-overridden
+    // finalized subtype (`self.file_type`, which is `Some("ARW")` for a real
+    // A100 `.arw`). `$$self{FILE_TYPE}` is `'TIFF'` for the whole TIFF-rooted
+    // family (TIFF/ARW/SRW/DNG/…), so the defer fires for an A100 in ANY such
+    // container; an embedded Exif block (outer type ≠ `'TIFF'`, `None`) fails it.
+    if self.base_file_type.as_deref() != Some("TIFF") {
+      return false;
+    }
+    // `$$self{Make} =~ /^SONY/` and `$$self{Model} eq 'DSLR-A100'` — the IFD0
+    // DataMembers captured at 0x010f/0x0110 (decoded before 0x014a in tag-id
+    // order).
+    if !self
+      .captured_make
+      .as_deref()
+      .is_some_and(|m| m.starts_with("SONY"))
+    {
+      return false;
+    }
+    if self.captured_model.as_deref() != Some("DSLR-A100") {
+      return false;
+    }
+    // `$$self{SubfileType} == 1` and `$$self{Compression} == 6` — Perl-numeric on
+    // the scalar `$val` string, AND Perl-truthy (a `''`/`None` or `"0"` is falsy ⇒
+    // the SubIFD arm, not A100).
+    if !data_member_truthy_eq(self.captured_subfile_type.as_deref(), 1)
+      || !data_member_truthy_eq(self.captured_compression.as_deref(), 6)
+    {
+      return false;
+    }
+    // `length $$valPt == 4` (`Sony.pm:11401`) — the `0x014a` value is exactly 4
+    // bytes on disk (a single LONG). A multi-offset / non-4-byte `0x014a` makes
+    // `SetARW` return 1 (the SubIFD arm), so do NOT defer.
+    if read_len != 4 || !format.is_int() {
+      return false;
+    }
+    // `Sony::SetARW`'s `%subdir = (DirStart => Get32u($valPt,0), Base => 0, …)`
+    // then `ValidateIFD`: the start is the 4-byte value read as an int32u in the
+    // walk's byte order (== `Get32u($valPt,0)`), from base 0 (the block start).
+    // `SetARW` returns FALSE (⇒ A100DataOffset) when that offset is NOT a valid
+    // IFD; defer only then.
+    let Some(start) = get_u32(self.data, value_offset, self.order) else {
+      return false;
+    };
+    !self.validate_ifd(start as usize)
+  }
+
+  /// `Image::ExifTool::ValidateIFD` (`WriteExif.pl:285-310`) for an in-memory
+  /// directory at `dir_start` (from base 0) — the validity probe `Sony::SetARW`
+  /// uses to tell an A100 SubIFD offset from a raw-data offset. Reads from
+  /// [`self.data`](Self::data) (the `RAF` analogue); a short/out-of-bounds read is
+  /// the `Read(...) != $len` / `Seek` failure ⇒ `false` (invalid).
+  ///
+  /// Returns `true` ⇔ all of: the 2-byte entry count is `> 1 and < 64`; the full
+  /// `12 * numEntries` entry block is present; and EVERY entry has `format > 0 and
+  /// format <= 13` and `count > 0`. The tag-id ascending check is bypassed
+  /// (`SetARW` passes `AllowOutOfOrderTags => 1`, `Sony.pm:11411`).
+  fn validate_ifd(&self, dir_start: usize) -> bool {
+    // `$raf->Read($buff,2) == 2 or return 0` then `$numEntries = Get16u(\$buff,0)`.
+    let Some(num_entries) = get_u16(self.data, dir_start, self.order) else {
+      return false;
+    };
+    let num_entries = num_entries as usize;
+    // `$numEntries > 1 and $numEntries < 64 or return 0`.
+    if num_entries <= 1 || num_entries >= 64 {
+      return false;
+    }
+    // `$raf->Read($buff, $len) == $len or return 0` ($len = 12 * numEntries): the
+    // whole entry block must be present.
+    let entries_start = dir_start.saturating_add(2);
+    for index in 0..num_entries {
+      let entry = entries_start.saturating_add(index.saturating_mul(12));
+      // `$format = Get16u(\$buff, $entry+2); $format > 0 and $format <= 13 or return 0`.
+      let Some(format_code) = get_u16(self.data, entry.saturating_add(2), self.order) else {
+        return false; // a truncated read ($len shortfall).
+      };
+      if format_code == 0 || format_code > 13 {
+        return false;
+      }
+      // `$count = Get32u(\$buff, $entry+4); $count > 0 or return 0`.
+      let Some(count) = get_u32(self.data, entry.saturating_add(4), self.order) else {
+        return false;
+      };
+      if count == 0 {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// Dispatch the classic-TIFF `0x014a SubIFD` pointer — a MULTI-offset
+  /// SubDirectory (`Exif.pm:1006-1027`, `SubDirectory => { Start => '$val',
+  /// MaxSubdirs => 10 }`). UNLIKE the single-offset ExifIFD/GPS/Interop
+  /// pointers ([`dispatch_subdir`]), the pointer's value is a LIST of int32u
+  /// offsets (`@values = split ' ', $val`, `Exif.pm:6930`); each is walked as
+  /// its own [`IfdKind::SubIfd`] directory whose family-1 group is `SubIFD`
+  /// (1st) then `SubIFD1`/`SubIFD2`/… (`$subdirInfo{DirName} =~ s/\d*$/$dirNum/
+  /// if $dirNum`, `Exif.pm:7074-7076`), reusing the inherited `%Exif::Main`
+  /// table (`$newTagTable = $tagTablePtr`, `Exif.pm:6943` — the pointer carries
+  /// no `SubDirectory{TagTable}` redirect).
+  ///
+  /// `MaxSubdirs => 10` (`Exif.pm:6929-6938`): if the pointer carries more than
+  /// ten offsets, ExifTool warns `Ignoring N SubIFD directories` and processes
+  /// only the first ten — reproduced here so a hostile pointer with thousands
+  /// of offsets cannot fan out the walk.
+  ///
+  /// The byte order is INHERITED (the `0x014a` SubDirectory declares no
+  /// `ByteOrder`, so `$newByteOrder = $oldByteOrder`, `Exif.pm:6995-6996`), and
+  /// the directory start is the offset value directly (`Start => '$val'` with
+  /// the walk's `base`; `dispatch_subdir` resolves the single-offset pointers
+  /// the same way). Each child is descended through the shared [`process_subdir`]
+  /// entry point, which save/set/restores the active table + warn count + order
+  /// around the recursion — so a malformed SubIFD cannot leak a table or abort
+  /// the parent IFD0's warn count, and the `SubfileType`/`Compression`
+  /// DataMembers (reset per-IFD in [`walk_one_ifd_body`]) the JpgFromRaw/
+  /// PreviewImage conditions read are scoped to each child directory.
+  ///
+  /// `value_offset .. value_offset + read_len` is the pointer's value window
+  /// (already bounds-resolved by the caller). A degenerate offset (negative /
+  /// past EOF / `> usize`) is SKIPPED but KEEPS its `$dirNum` slot, so a later
+  /// offset still takes the correct number — the Perl `for ($dirNum...)` index
+  /// advances regardless.
+  fn dispatch_classic_subifd(
+    &mut self,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+    count: usize,
+  ) {
+    // `MaxSubdirs => 10` (`Exif.pm:1025`).
+    const MAX_SUBDIRS: usize = 10;
+    // `my $over = @values - $$subdir{MaxSubdirs}; if ($over > 0) { Warn("Ignoring
+    // $over $tagStr directories"); splice @values, $$subdir{MaxSubdirs} }`
+    // (`Exif.pm:6932-6936`). ExifTool reads the FULL value then splices to ten; a
+    // naive port would `ReadValue` + `split ' ', $val` the WHOLE list first — but a
+    // hostile, huge-but-in-bounds `0x014a` count (e.g. an `int8u[400000]` pointing
+    // into a large read window) would materialize a 400 000-element `RawValue` +
+    // `Vec` + `$val` string BEFORE the cap, a TIFF-controlled memory/CPU DoS (this
+    // branch was previously unwalked). Bound BEFORE materializing: the on-disk
+    // format is proven integer by the caller's `Wrong format` gate, so the number
+    // of `split ' '` tokens `@values` equals the decoded integer element count,
+    // which [`read_value_count`] derives WITHOUT decoding any value. The overage
+    // warning comes from that integer count; only the first ten offsets are then
+    // materialized (a capped `read_value` — `subdir_offsets` over <= 10 elements).
+    let n = read_value_count(self.data, value_offset, format, count, read_len).unwrap_or(0);
+    if n > MAX_SUBDIRS {
+      let over = n - MAX_SUBDIRS;
+      self.warn(std::format!("Ignoring {over} SubIFD directories"));
+    }
+    // Materialize ONLY the first `min(n, MaxSubdirs)` offsets — a capped
+    // `read_value` reads element `0 .. min(count, 10)` from the window (the SAME
+    // leading offsets ExifTool keeps after `splice @values, 10`), so the
+    // `RawValue`/`Vec`/string is bounded to <= 10 entries regardless of the on-disk
+    // count. `subdir_offsets` is the faithful `split ' ', $val` per-token
+    // numification (each integer element -> its offset, in order). A non-decodable
+    // value yields no offsets (no walk).
+    let offsets = match read_value(
+      self.data,
+      value_offset,
+      format,
+      count.min(MAX_SUBDIRS),
+      read_len,
+      self.order,
+    ) {
+      Some(raw) => raw.subdir_offsets(),
+      None => return,
+    };
+    for (dir_num, off) in offsets.into_iter().enumerate() {
+      // A negative / non-finite / `> u64::MAX` token is `None` (the `$subdirStart
+      // < 0` → `Bad SubDirectory start` analogue); a `Some` past `usize` on this
+      // target is likewise unwalkable. Skip but KEEP the `$dirNum` slot.
+      let Some(off) = off else {
+        continue;
+      };
+      let Ok(child_start) = usize::try_from(off) else {
+        continue;
+      };
+      // `$subdirInfo{DirName} =~ s/\d*$/$dirNum/ if $dirNum` (`Exif.pm:7076`) —
+      // the 1st offset is `SubIFD` (the `if $dirNum` guard skips the number),
+      // the 2nd+ are `SubIFD1`/`SubIFD2`/… A pointer with `> u32::MAX` offsets is
+      // structurally impossible (the `MaxSubdirs => 10` cap above bounds it at
+      // ten), but saturate defensively so the `u32` payload is well-defined.
+      let dir_num = u32::try_from(dir_num).unwrap_or(u32::MAX);
+      let child_kind = IfdKind::SubIfd(dir_num);
+      // Descend through the shared sub-directory entry point. The classic SubIFD
+      // declares no `ByteOrder` (inherit `self.order`) and no `Base` (the child
+      // inherits `self.base`); `FixBaseMode::No` makes every pre-walk hook inert,
+      // so this is the same machinery the core ExifIFD/GPS/Interop recursions use,
+      // forced to `%Exif::Main` ([`table_for_ifd_kind`]) + the `SubIFD<dirNum>`
+      // group. `process_subdir` bounds-checks the start (`walk_one_ifd` → the
+      // `Bad SubIFD directory` abort for an offset past EOF) and the
+      // ancestor-cycle guard breaks a SubIFD pointing back at an ancestor.
+      self.process_subdir(
+        child_start,
+        child_kind,
+        table_for_ifd_kind(child_kind),
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
     }
   }
 
@@ -6400,16 +7294,31 @@ impl Walker<'_, '_> {
     // normal TIFF (where `active_table == table_for_ifd_kind(kind)` for every
     // core IFD that carries these tags).
     if matches!(self.active_table, TableRef::Exif | TableRef::Interop) {
-      if tag_id == tables::TAG_SUBFILE_TYPE
-        && let Some(v) = first_uint(&raw)
-      {
-        // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
-        if v == (v & 0x02) {
+      if tag_id == tables::TAG_SUBFILE_TYPE {
+        // The PageCount/MultiPage gate runs in Perl-NUMERIC context — `$val == ($val
+        // & 0x02)` and `$val == 2` numify the scalar `$val` (a count>1 `"7 8"` →
+        // 7), so the leading integer ([`first_uint`]) is the faithful operand for
+        // the bitwise/equality tests. A non-integer shape (no `first_uint`) takes
+        // no PageCount side effect (Perl's bitwise `&` on a non-numeric `$val`
+        // yields 0; the gate's behaviour there is irrelevant to the camera fixtures).
+        if let Some(v) = first_uint(&raw)
+          && v == (v & 0x02)
+        {
+          // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
           self.page_count = self.page_count.saturating_add(1);
           if v == 2 || self.page_count > 1 {
             self.multi_page = true;
           }
         }
+        // `$$self{SubfileType} = $val` (`Exif.pm:460`) — the DataMember is
+        // assigned UNCONDITIONALLY (the `$val == ($val & 0x02)` test above gates
+        // only the PageCount side effect, NOT the member), as the EXACT scalar
+        // `$val` STRING (a count>1 `int16u[2]` of `0, 1` is `"0 1"`, NOT `0`). The
+        // `0x111`/`0x117` conditional tag lists read it with STRING `ne`: the plain
+        // `StripOffsets` arm's exclusion is `not (… $$self{SubfileType} ne '0')`
+        // (`Exif.pm:635`/`:735`, #331-P2) — `'0 1' ne '0'` is TRUE (the
+        // JPEG-preview arm fires), a stored `Some(0)` integer would suppress it.
+        self.captured_subfile_type = Some(raw.raw_conv_val_string().into());
       } else if tag_id == tables::TAG_OLD_SUBFILE_TYPE
         && let Some(v) = first_uint(&raw)
       {
@@ -6420,6 +7329,18 @@ impl Walker<'_, '_> {
             self.multi_page = true;
           }
         }
+      } else if tag_id == tables::TAG_COMPRESSION {
+        // `return $$self{Compression} = $val` (`Exif.pm:517`) — the `Compression`
+        // (0x103) DataMember, assigned each time the leaf is decoded, as the EXACT
+        // scalar `$val` STRING (`ReadValue`'s `join(' ', @vals)`: count-1 → `"7"`,
+        // count>1 → `"7 8"`). The `0x111`/`0x117` `PreviewImage`/`JpgFromRaw` arms
+        // gate on `$$self{Compression} eq '7'` (#331-P2) with STRING equality —
+        // `'7 8' eq '7'` is FALSE, so a count>1 Compression falls to the plain
+        // `StripOffsets` arm (ground-truthed on ExifTool 13.59: `int16u[2]` `7, 8`
+        // → `SubIFD2:StripOffsets`, NOT `JpgFromRaw`). A stored `Some(7)` integer
+        // would WRONGLY match. (The leaf is ALSO emitted below — bundled keeps the
+        // `Compression` tag, e.g. `SubIFD2:Compression = "Unknown (7 8)"`.)
+        self.captured_compression = Some(raw.raw_conv_val_string().into());
       }
     }
 
@@ -6491,9 +7412,18 @@ impl Walker<'_, '_> {
     // `active_table = Gps`) and vendor walks; byte-identical for a normal TIFF
     // (where the IsOffset-bearing IFDs resolve against `Exif`/`Interop`).
     let raw = if self.base != 0
-      && matches!(self.active_table, TableRef::Exif | TableRef::Interop)
+      && matches!(
+        self.active_table,
+        TableRef::Exif | TableRef::Interop | TableRef::NikonPreviewIfd
+      )
       && is_offset_tag(tag_id)
     {
+      // `%Nikon::PreviewIFD`'s `0x201 PreviewImageStart` is `IsOffset`
+      // (`Nikon.pm:5416`), and Samsung's `0x0035` SubDirectory carries no `Base`
+      // ⇒ the child inherits the parent base, so a PreviewIFD reached from a
+      // base-shifted (e.g. JPEG-embedded) walk rebases its preview offset just as
+      // `%Exif::Main`'s `ThumbnailOffset` does. A standalone SRW has `base == 0`
+      // ⇒ a no-op.
       add_offset_base(raw, self.base)
     } else {
       raw
@@ -6602,11 +7532,110 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Leica(v, t)),
         None => return,
       },
+      // `%Nikon::PreviewIFD` (#242) — a small sub-IFD REUSING the `%Exif::Main`
+      // leaf type (the rows carry the standard EXIF PrintConvs), so the resolved
+      // leaf rides in `ResolvedConv::Exif` and renders via `emit_exif_value`
+      // exactly like a core Exif leaf. The PreviewIFD-specific names
+      // (`PreviewImageStart`/`Length`) come from the PreviewIFD table; its
+      // `DataTag => 'PreviewImage'` is selected by ACTIVE table in the DataTag
+      // collection below. An id not in the table is skipped (the verbose-only
+      // omit).
+      TableRef::NikonPreviewIfd => match tables::nikon_preview_ifd_lookup(tag_id) {
+        Some(t) => (t.name, ResolvedConv::Exif(t)),
+        None => return,
+      },
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
       },
     };
+
+    // ExifTool's `0x111`/`0x117`/`0x201`/`0x202` are CONDITIONAL tag lists whose
+    // resolved `Name` depends on `$$self{TIFF_TYPE}` + `$$self{DIR_NAME}` — the
+    // static table holds the common name, so reapply the camera-relevant
+    // `PreviewImage` arms HERE (#331-P2): an IFD0 CR2 0x111/0x117 becomes
+    // `PreviewImageStart`/`Length` (`Exif.pm:645-661`/`:742-758`), and an IFD0
+    // ARW/SR2 0x201/0x202 becomes `PreviewImageStart`/`Length`
+    // (`Exif.pm:1226-1237`) instead of the default `ThumbnailOffset`/`Length`.
+    // CORE-EXIF-SCOPED: the override keys on `%Exif::Main` ids in a core IFD0
+    // walk; a GPS/vendor/PreviewIFD leaf (its own arm above) is untouched, and an
+    // IFD1 thumbnail / a DNG SubIFD strip (not IFD0, or no CR2/ARW `TIFF_TYPE`)
+    // keeps its table name. `tiff_type` is `$$self{TIFF_TYPE}` (the detected
+    // subtype the entry threads in, `ExifTool.pm:8715`, set BEFORE the IFD walk).
+    // The `0x111`/`0x117`/`0x201`/`0x202` conditional-tag-list resolution context
+    // (`$$self{TIFF_TYPE}`/`DIR_NAME`/`Compression`/`SubfileType`), bundled from
+    // the walk's `kind` + `file_type` + the per-IFD `captured_*` DataMembers; read
+    // by BOTH the name override AND the DataTag spec resolution (#331-P2).
+    let offset_ctx = tables::OffsetTagContext {
+      tiff_type: self.file_type.as_deref(),
+      in_ifd0: matches!(kind, IfdKind::Ifd0),
+      // `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's third
+      // directory (`IfdKind::SubIfd(2)`), where 0x111/0x117 name JpgFromRaw.
+      in_subifd2: matches!(kind, IfdKind::SubIfd(2)),
+      compression: self.captured_compression.as_deref(),
+      subfile_type: self.captured_subfile_type.as_deref(),
+    };
+    let name = if matches!(self.active_table, TableRef::Exif)
+      && let Some(renamed) = tables::exif_main_offset_name_override(tag_id, offset_ctx)
+    {
+      renamed
+    } else {
+      name
+    };
+
+    // `0x0035 PreviewIFD` (`Samsung.pm:307-327`, #242) — a SubDirectory descended
+    // IN-WALK, here, while `self.base`/`self.value_offset_base` hold the
+    // FixBase-corrected values the Samsung Type2 walk set (Samsung's absolute
+    // offsets are relative to the maker-note start, so the child IFD at
+    // `$val + Base` resolves only with the correction applied) — exactly as
+    // ExifTool descends the SubDirectory inside `ProcessExif`. The parent pointer
+    // emits NOTHING (`return` after descending), like ExifTool. The descent runs
+    // ONLY for the SRW gate:
+    //   * MAIN arm `$$self{TIFF_TYPE} eq "SRW" and $$self{Model} ne "EK-GN120"`
+    //     ⇒ `Start => '$val'`;
+    //   * EK-GN120 arm `$$self{TIFF_TYPE} eq "SRW"` ⇒ `Start => '$val - 36'`.
+    // `%Nikon::PreviewIFD` is walked under `ByteOrder => Unknown` (probe the child
+    // count word) with NO `Base` (the child inherits `self.base`). Its leaves
+    // resolve to `ResolvedConv::Exif`, appended to `self.entries` at this walk
+    // position; the `0x201`/`0x202` pair is collected into the DataTag channel and
+    // resolved by the post-IFD `finalize_data_tags` pass into `PreviewImage`.
+    if self.active_table == TableRef::Samsung
+      && let ResolvedConv::Samsung(stag) = &conv
+      && stag.sub_table() == Some(makernotes::vendors::samsung::SubTable::PreviewIfd)
+    {
+      if self.file_type.as_deref() == Some("SRW")
+        && let Some(val) = first_uint(&raw)
+      {
+        // `Start => '$val'` (main) / `'$val - 36'` (EK-GN120). `$val` is a
+        // maker-note-relative offset (Samsung's absolute-from-maker-note-start
+        // scheme); the file-absolute child IFD index into `self.data` is
+        // `$val + value_offset_base` — the SAME maker-note-relative → absolute
+        // mapping an out-of-line value pointer uses (`raw_off + value_offset_base`,
+        // `Exif.pm:6546`), since `$val` IS an offset. A degenerate EK-GN120
+        // underflow (`val < 36`) skips the descent (no walkable IFD).
+        let dir_start = if self.captured_model.as_deref() == Some("EK-GN120") {
+          val.checked_sub(36)
+        } else {
+          Some(val)
+        };
+        let abs = dir_start
+          .and_then(|d| i64::try_from(d).ok())
+          .map(|d| d.saturating_add(self.value_offset_base))
+          .and_then(|a| usize::try_from(a).ok());
+        if let Some(start) = abs {
+          self.process_subdir(
+            start,
+            kind,
+            TableRef::NikonPreviewIfd,
+            ByteOrderRule::Unknown,
+            FixBaseMode::No,
+            ProcessProc::Exif,
+          );
+        }
+      }
+      // The SubDirectory pointer itself is never emitted as a value.
+      return;
+    }
 
     // `%offsetInfo` collection (`Exif.pm:7173-7174`): the IFD's `DataTag`
     // offset/length pairs are DEFERRED to the post-IFD [`finalize_data_tags`]
@@ -6628,7 +7657,21 @@ impl Walker<'_, '_> {
       // (a) The OFFSET leaf (`ThumbnailOffset` 0x0201, `IsOffset` + `DataTag`).
       //     The offset is read from the post-`add_offset_base` `raw`, so it is
       //     already file-absolute — the `$val[0]` ExifTool hands `ExtractImage`.
-      if let Some(spec) = t.data_tag_spec()
+      //     The `DataTag` NAME is table-scoped AND `Condition`-scoped:
+      //       * `%Nikon::PreviewIFD`'s 0x201 names `PreviewImage` (`Nikon.pm:5414`,
+      //         selected by ACTIVE table, #242);
+      //       * `%Exif::Main`'s 0x201 names `ThumbnailImage` in IFD1 but
+      //         `PreviewImage` in IFD0 of an ARW/SR2 (`Exif.pm:1226-1237`), and
+      //         0x111 (no id-default spec) names `PreviewImage` in IFD0 of a CR2
+      //         (`Exif.pm:645-661`) — both selected by `TIFF_TYPE`+`DIR_NAME`
+      //         (#331-P2) via [`tables::exif_main_data_tag_spec_in_context`], which
+      //         falls back to the id-default for every other IFD0/IFD1 leaf.
+      let spec = if self.active_table == TableRef::NikonPreviewIfd {
+        tables::nikon_preview_ifd_data_tag_spec(tag_id)
+      } else {
+        tables::exif_main_data_tag_spec_in_context(t, offset_ctx)
+      };
+      if let Some(spec) = spec
         && let Some(offset) = first_uint(&raw)
       {
         self.data_tag_pairs.push(DataTagPair {
@@ -6952,14 +7995,25 @@ const fn is_offset_tag(tag_id: u16) -> bool {
 /// identity) so it can pair offset↔length without rescanning
 /// [`Walker::entries`].
 ///
-/// Currently only `ThumbnailLength` (0x0202), the pair of `ThumbnailOffset`
-/// 0x0201 (`OffsetPair => 0x202`, `Exif.pm:1170`). This is the LENGTH-side
-/// mirror of [`is_offset_tag`]; when a further `DataTag` offset is ported (its
-/// `OffsetPair` length added to `%Exif::Main`), extend BOTH in lockstep with
-/// [`tables::ExifTag::data_tag_spec`].
+/// The two LENGTH ids some [`tables::DataTagSpec::offset_pair`] points at:
+///  - `ThumbnailLength` 0x0202, the pair of `ThumbnailOffset` 0x0201
+///    (`OffsetPair => 0x202`, `Exif.pm:1170`) — ALSO the `PreviewImageLength`
+///    pair of the IFD0/ARW `PreviewImageStart` arm (#331-P2, `Exif.pm:1237`);
+///  - `StripByteCounts` 0x0117, the pair of `StripOffsets`/`PreviewImageStart`
+///    0x0111 (`OffsetPair => 0x117`) — the LENGTH side of the IFD0/CR2
+///    `PreviewImage` arm (#331-P2, `Exif.pm:742-758`).
+///
+/// Recording 0x0117 universally is harmless: the post-pass only CONSUMES a
+/// length when an offset leaf in the SAME emitted directory has a spec naming it
+/// (`length_tag_id`), and 0x0111→0x0117 is a `PreviewImage` pair ONLY for an
+/// IFD0 CR2 — a normal multi-strip `StripByteCounts` is collected but never
+/// paired (no `PreviewImage`/`ThumbnailImage` offset references it), so existing
+/// goldens are unaffected. This is the LENGTH-side mirror of [`is_offset_tag`];
+/// when a further `DataTag` offset is ported, extend BOTH in lockstep with
+/// [`tables::exif_main_data_tag_spec_in_context`].
 #[inline]
 const fn is_offset_pair_length_tag(tag_id: u16) -> bool {
-  matches!(tag_id, 0x0202)
+  matches!(tag_id, 0x0117 | 0x0202)
 }
 
 /// Add the offset base to each integer of an `IsOffset` tag's value
@@ -6998,6 +8052,13 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
     tables::TAG_GPS_IFD => Some(SubDirKind::Gps),
     tables::TAG_INTEROP_IFD => Some(SubDirKind::Interop),
     tables::TAG_MAKER_NOTE => Some(SubDirKind::MakerNote),
+    // `0x014a SubIFD` (`Exif.pm:1006-1027`) — the multi-offset classic-TIFF
+    // preview/raw sub-IFD pointer (DNG raw tower). Routed to the bespoke
+    // multi-offset descent (`dispatch_classic_subifd`), NOT the single-offset
+    // `dispatch_subdir` arm. The A100DataOffset alt-arm (`Exif.pm:1028`) is a
+    // SONY-A100-only IsOffset leaf, out of scope — for DNG/TIFF the SubIFD arm
+    // is the one that fires.
+    tables::TAG_SUB_IFD => Some(SubDirKind::SubIfd),
     _ => None,
   }
 }
@@ -7064,6 +8125,29 @@ impl ExifMeta<'_> {
     }
   }
 
+  /// Append the captured PrintIM versions as `PrintIM:PrintIMVersion`
+  /// [`EmittedTag`](crate::emit::EmittedTag)s — the `%PrintIM::Main`
+  /// `PrintIMVersion` tag (PrintIM.pm:24-27, `GROUPS => { 0 => 'PrintIM',
+  /// 1 => 'PrintIM' }`, `PrintConv => undef` so identical in `-j`/`-n`).
+  ///
+  /// Family-0 AND family-1 are both `"PrintIM"`; the value is the raw 4-char
+  /// version string (`"0300"`/`"0250"`). `unknown:false` (a real extracted tag).
+  /// Emitted right after the EXIF/MakerNote block — ExifTool reaches the IFD0
+  /// `0xc4a5` SubDirectory mid-IFD-walk, but the `-G1 -j` conformance compares
+  /// the key MULTISET (`src/jsondiff.rs`), so the exact position is insensitive.
+  /// Almost always EMPTY (no PrintIM) or a single version.
+  fn push_printim_tags(&self, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    out.reserve(self.printim_versions.len());
+    for version in &self.printim_versions {
+      out.push(crate::emit::EmittedTag::new(
+        crate::value::Group::new("PrintIM", "PrintIM"),
+        smol_str::SmolStr::new_static("PrintIMVersion"),
+        crate::value::TagValue::Str(version.clone()),
+        false,
+      ));
+    }
+  }
+
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
   /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Emitted
@@ -7099,10 +8183,16 @@ impl ExifMeta<'_> {
                 emissions: &[makernotes::VendorEmission]| {
       out.reserve(emissions.len());
       for e in emissions {
+        // The family-1 group: the captured MakerNote's `group1` by default, OR
+        // the emission's own override when set — the Samsung `0x0035 PreviewIFD`
+        // descent emits its `%Nikon::PreviewIFD` leaves under `PreviewIFD`
+        // (`GROUPS => { 1 => PreviewIFD }`) while the sibling Samsung leaves keep
+        // `Samsung` (#242). The family-0 group is always `MakerNotes`.
+        let g1 = e.group1_override().unwrap_or(group1);
         // Carry the emission's `Priority => N` into the `EmittedTag` so the sink
         // applies the general duplicate-override rule (`ExifTool.pm:9544-9560`).
         out.push(crate::emit::EmittedTag::new_with_priority(
-          crate::value::Group::new("MakerNotes", group1),
+          crate::value::Group::new("MakerNotes", g1),
           smol_str::SmolStr::new(e.name()),
           e.value().clone(),
           e.unknown(),
@@ -7281,6 +8371,16 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
+    // The JPEG IPTC / `COM` `File:*` tags: `File:CurrentIPTCDigest` (the MD5 of
+    // the `0x0404` IPTC block, `FoundTag`'d inside `ProcessIPTC`,
+    // `IPTC.pm:1083`) and each `File:Comment` (`ExifTool.pm:8432`). Both are
+    // family-0 `File`, so they ride this prefix (object key order is
+    // conformance-insensitive — `src/jsondiff.rs`). `Comment` carries
+    // `Priority => 0` (`ExifTool.pm:1315`). `None` for a JPEG with neither an
+    // `APP13` Photoshop IRB nor a `COM` segment, and for every non-JPEG source.
+    if let Some(iptc) = &self.iptc {
+      iptc.push_file_tags(&mut tags);
+    }
     // The JPEG `File:*` Start-Of-Frame dimension tags (`ImageWidth`/
     // `ImageHeight`/`EncodingProcess`/`BitsPerSample`/`ColorComponents`/
     // `YCbCrSubSampling`). `HandleTag`'d in `ProcessJPEG` from the FIRST SOF
@@ -7347,6 +8447,10 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       self.push_exif_tags(print_conv, &mut tags);
       self.push_maker_note_tags(print_conv, &mut tags);
     }
+    // The PrintIM `PrintIM:PrintIMVersion` (IFD0 `0xc4a5`) — emitted after the
+    // EXIF/MakerNote block (the key MULTISET is position-insensitive). EMPTY for
+    // the common no-PrintIM case.
+    self.push_printim_tags(&mut tags);
     // The JPEG auxiliary `APP`-segment tags (JFIF / MPF / DJI thermal) decoded
     // by [`jpeg_app::process_app_markers`] — appended after the EXIF block. The
     // `-G1 -j` conformance compares the key MULTISET (`src/jsondiff.rs`), so
@@ -7360,6 +8464,38 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       &self.jpeg_app_tags_n
     };
     tags.extend(app_tags.iter().cloned());
+    // The JPEG IPTC ApplicationRecord tags (`IPTC:*`, the `0x0404` resource's
+    // IIM stream — `ProcessIPTC`, `IPTC.pm:1129-1263`). ExifTool `FoundTag`s
+    // these at the `APP13` `Marker:`-loop position (after the `APP1` EXIF block
+    // in the realistic camera layout), so appending them after the EXIF block
+    // reproduces that order; family-1 `IPTC` never collides with the EXIF
+    // `IFD0:*`/`GPS:*` family-1 keys in the `-G1` output. The PrintConv mode
+    // selects the pre-rendered vector (values converted at decode time). `None`
+    // for a JPEG with no IPTC block.
+    if let Some(iptc) = &self.iptc {
+      iptc.push_iptc_tags(print_conv, &mut tags);
+    }
+    // The embedded XMP `APP1` packet (`ExifTool.pm:7794`, the
+    // `$$valPt =~ /^$xmpAPP1hdr/` → `Image::ExifTool::XMP::ProcessXMP` arm). Its
+    // `XMP-*` tags are produced by the shared XMP parser's own `Taggable` impl
+    // (family-0 `XMP`, family-1 the namespace group — `XMP-tiff` / `XMP-dc` /
+    // `XMP-drone-dji` / `XMP-crs` / …), already rendered for the active conv
+    // mode. Emitting via that impl keeps the JPEG path byte-identical to a
+    // standalone `.xmp` sidecar / the QuickTime `uuid`-XMP box (#361) — exactly
+    // what bundled does (one shared `ProcessXMP`). XMP is equal-priority with
+    // EXIF/MakerNote in `FoundTag`, and ExifTool reaches the EXIF `APP1` BEFORE
+    // the XMP `APP1` in `Marker:`-loop file order (the realistic camera layout),
+    // so a same-named tag's EXIF value is FoundTag'd first; appending the XMP
+    // tags here (after the EXIF block) reproduces that order, and the downstream
+    // last-wins `TagMap` then keeps the later same-named XMP value only where
+    // ExifTool would (a bare same-name key in the same priority class) — but the
+    // `XMP-*` family-1 groups never collide with the EXIF `IFD0:*`/`ExifIFD:*`
+    // family-1 keys in the `-G1` output, so in practice both coexist. The XMP
+    // `Warning` (if any) rides the sibling `Diagnose` channel, not this stream.
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      tags.extend(crate::emit::Taggable::tags(xmp, opts));
+    }
     tags.into_iter()
   }
 }
@@ -7368,7 +8504,23 @@ impl crate::emit::Taggable for ExifMeta<'_> {
 impl crate::diagnostics::Diagnose for ExifMeta<'_> {
   /// The EXIF `$et->Warn(...)` corpus (IFD-bounds checks, `Malformed APP1 EXIF
   /// segment`, suspicious-offset, …) as [`Diagnostic`](crate::diagnostics::Diagnostic)
-  /// warnings, in emission order. `File:ExifByteOrder` is a real TAG emitted by
+  /// warnings, in emission order, INTERLEAVED with the embedded JPEG `APP1` XMP
+  /// packet's own decode/walk `$et->Warn` (if any — `ProcessXMP` records at most
+  /// one first-occurrence warning, e.g. `XMP is double UTF-encoded`
+  /// XMP.pm:4491) BY APP1 MARKER FILE POSITION. ExifTool processes JPEG `APPn`
+  /// markers in FILE ORDER and `Warning` is a priority-0 `FoundTag` (the FIRST
+  /// warning by marker position owns the bare `ExifTool:Warning` — the same
+  /// first-by-position model as the QuickTime `uuid`-XMP `#361` and the
+  /// Pittasoft `3gf ` `#362` doc warnings), so the warning of whichever `APP1`
+  /// (EXIF or XMP) is EARLIER in the file leads. There is no JPEG `PRIORITY_DIR`
+  /// promotion for XMP (contrast the QuickTime non-`HEIC` path), so the two
+  /// compete purely by offset:
+  /// [`exif_warning_offset`](Self::exif_warning_offset) (the EXIF warnings' file
+  /// position) vs [`embedded_xmp_offset`](Self::embedded_xmp_offset) (the
+  /// warning-producing XMP `APP1`'s). The realistic camera layout (EXIF `APP1`
+  /// before XMP `APP1`) keeps the EXIF warnings first — and no golden fixture
+  /// carries the XMP-warns-before-EXIF-warns combination, so all stay
+  /// byte-identical. `File:ExifByteOrder` is a real TAG emitted by
   /// [`tags`](crate::emit::Taggable::tags) (not a diagnostic), so only the
   /// warnings appear here — the same loop the retired `AnyMeta::drain_diagnostics`
   /// EXIF arm ran. EXIF raises no `$et->Error` (a rejected block returns
@@ -7387,18 +8539,42 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
       self.warnings_ignorable.len(),
       "warnings/warnings_ignorable must stay index-aligned",
     );
-    self
-      .warnings()
-      .iter()
-      .enumerate()
-      .map(
-        |(i, w)| match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+    let exif_warnings = || {
+      self.warnings().iter().enumerate().map(|(i, w)| {
+        match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
           1 => Diagnostic::warn_minor(w.as_str()),
           2 => Diagnostic::warn_minor_behavioral(w.as_str()),
           _ => Diagnostic::warn(w.as_str()),
-        },
-      )
-      .collect()
+        }
+      })
+    };
+    // Interleave the embedded JPEG `APP1` XMP packet's warning with the EXIF
+    // warnings by APP1 marker file position (first-by-position wins, mirroring
+    // `#361`/`#362`). The XMP `Diagnose` impl yields at most one document-level
+    // warning, raised at `embedded_xmp_offset`; the EXIF warnings all originate
+    // from EXIF `APP1` block(s) and so share `exif_warning_offset`. An
+    // unpositioned side saturates to `u32::MAX` (it then trails). When the XMP
+    // `APP1` is EARLIER than the warning-producing EXIF `APP1`, the XMP warning
+    // leads — owning the bare `ExifTool:Warning`; otherwise the EXIF warnings
+    // lead (the realistic camera order, byte-identical to before).
+    #[cfg(feature = "xmp")]
+    if let Some(xmp) = self.embedded_xmp.as_ref() {
+      let xmp_diags = crate::diagnostics::Diagnose::diagnostics(xmp);
+      // Only a warning-producing XMP packet competes for position (an empty
+      // diagnostics list — a clean XMP — leaves the EXIF warnings untouched).
+      let xmp_is_earlier = !xmp_diags.is_empty()
+        && self.embedded_xmp_offset.unwrap_or(u32::MAX)
+          < self.exif_warning_offset.unwrap_or(u32::MAX);
+      if xmp_is_earlier {
+        let mut out = xmp_diags;
+        out.extend(exif_warnings());
+        return out;
+      }
+      let mut out: std::vec::Vec<Diagnostic> = exif_warnings().collect();
+      out.extend(xmp_diags);
+      return out;
+    }
+    exif_warnings().collect()
   }
 }
 
@@ -7430,6 +8606,28 @@ trait ExifSink {
     name: &str,
     value: &str,
   ) -> Result<(), core::convert::Infallible>;
+  /// An already-`EscapeJSON`-classified JSON STRING → [`TagValue::JsonStr`]: the
+  /// content is emitted as a QUOTED string VERBATIM, bypassing the serializer's
+  /// boolean/number gate. Used by the raw-byte EXIF paths
+  /// ([`emit_exif_value`]'s `Bytes` arm / [`emit_gps_value`]'s `GpsConv::VersionId`)
+  /// for a NUL-split value whose `tr/\0//d` + `FixUTF8` PRODUCES a number/boolean
+  /// lexeme (`31 00 32 00` → `"12"`): the NUL-bearing original failed the gate, so
+  /// the result is a string, not a bare token (`escape_json_raw_bytes_classified`).
+  ///
+  /// The provided default delegates to [`write_str`](Self::write_str) — correct
+  /// for sinks that DISCARD scalar writes (the capture-only
+  /// [`VendorEmissionSink`]/[`PreviewIfdSink`]); the value-storing sinks
+  /// ([`EmittedTagSink`], and the test [`TagMap`]) override it to push
+  /// [`TagValue::JsonStr`].
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    self.write_str(group, name, value)
+  }
   /// An `i64` value → [`TagValue::I64`].
   fn write_i64(
     &mut self,
@@ -7524,6 +8722,20 @@ impl ExifSink for crate::tagmap::TagMap {
     value: &str,
   ) -> Result<(), core::convert::Infallible> {
     crate::tagmap::TagMap::write_str(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_value(
+      self,
+      group,
+      name,
+      crate::value::TagValue::JsonStr(value.into()),
+    )
   }
   #[inline(always)]
   fn write_i64(
@@ -7649,6 +8861,19 @@ impl ExifSink for EmittedTagSink<'_> {
     // numeric — the apparent cases are stale fixtures or the digit-cap the gate
     // already handles).
     self.push(group, name, crate::value::TagValue::Str(value.into()));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    // `EscapeJSON` already decided this is a JSON STRING (the NUL-bearing
+    // original failed the boolean/number gate). Store [`TagValue::JsonStr`] so
+    // the serializer quotes it VERBATIM — NOT re-gated to a bare number/boolean.
+    self.push(group, name, crate::value::TagValue::JsonStr(value.into()));
     Ok(())
   }
   #[inline(always)]
@@ -7826,6 +9051,143 @@ impl ExifSink for VendorEmissionSink<'_> {
         value,
         unknown,
         priority,
+      ));
+    Ok(())
+  }
+}
+
+/// A CAPTURE sink that turns each CORE-Exif scalar write into a
+/// [`VendorEmission`](makernotes::VendorEmission) under a FIXED family-1 group
+/// override — the bridge letting a `ResolvedConv::Exif` sub-IFD (the Samsung
+/// `0x0035 PreviewIFD` → `%Nikon::PreviewIFD` descent, #242) render through the
+/// SAME `emit_exif_value` machinery a core EXIF leaf uses, yet land in the
+/// MakerNote's cached-emission `Vec` tagged `MakerNotes:PreviewIFD:*`.
+///
+/// Unlike [`VendorEmissionSink`] (whose scalar writers DROP the value — Canon
+/// emissions all go through `write_vendor_value`), THIS sink's scalar writers are
+/// the ACTIVE path: every PreviewIFD leaf plus the synthetic `PreviewImage`
+/// placeholder is a core scalar (`write_str`/`write_u64`/`write_f64`/…), captured
+/// as a [`VendorEmission::new_with_group1`] carrying [`group1`](Self::group1) so
+/// [`ExifMeta::push_maker_note_tags`] emits it under `("MakerNotes", group1)`. The
+/// `_group` argument the core writers pass (the kind-derived `IfdName`) is
+/// DISCARDED — the family-1 group is the fixed override, faithful to
+/// `%Nikon::PreviewIFD`'s `GROUPS => { 1 => PreviewIFD }`.
+#[cfg(feature = "alloc")]
+struct PreviewIfdSink<'v> {
+  /// The destination [`VendorEmission`] buffer (borrowed) — pushed in walk order.
+  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>,
+  /// The family-1 group every captured emission carries (`"PreviewIFD"`).
+  group1: &'static str,
+}
+
+#[cfg(feature = "alloc")]
+impl ExifSink for PreviewIfdSink<'_> {
+  #[inline(always)]
+  fn write_str(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::Str(smol_str::SmolStr::new(value)),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_i64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: i64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::I64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_u64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: u64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::U64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_f64(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: f64,
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::F64(value),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_bytes(
+    &mut self,
+    _group: &str,
+    name: &str,
+    value: &[u8],
+  ) -> Result<(), core::convert::Infallible> {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        crate::value::TagValue::Bytes(value.to_vec()),
+        false,
+        self.group1,
+      ));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_vendor_value_with_priority(
+    &mut self,
+    _family0: &str,
+    _family1: &str,
+    name: &str,
+    value: crate::value::TagValue,
+    unknown: bool,
+    _priority: u8,
+  ) -> Result<(), core::convert::Infallible> {
+    // Not reached for a `ResolvedConv::Exif` PreviewIFD leaf (those render via
+    // the scalar writers above); kept for trait completeness, applying the same
+    // family-1 override so a future vendor-valued PreviewIFD row would group
+    // correctly.
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_with_group1(
+        smol_str::SmolStr::new(name),
+        value,
+        unknown,
+        self.group1,
       ));
     Ok(())
   }
@@ -8180,7 +9542,18 @@ fn emit_pentax_value<S: ExifSink>(
   {
     return Ok(());
   }
-  let value = pentax_tag.conv.apply(raw, print_conv);
+  // `0x000e AFPointSelected` (`Pentax.pm:1219-1408`) is a `$$self{Model}`-keyed
+  // array-of-variants: the element-0/element-1 PrintConv hashes differ for
+  // `/(K-1|645Z)\b/`, `/(K-3|KP)\b/` and the "other models". The `Copy` conv
+  // dispatched by `apply` has no model context, so 0x000e renders through the
+  // model-aware [`af_point_selected_for_model`](makernotes::vendors::pentax::printconv)
+  // here (where `model` is threaded), exactly as the encrypted `0x005d` shutter
+  // count is handled outside the conv. #311.
+  let value = if entry.tag_id == 0x000e {
+    makernotes::vendors::pentax::printconv::af_point_selected_for_model(raw, print_conv, model)
+  } else {
+    pentax_tag.conv.apply(raw, print_conv)
+  };
   // Thread the row's ExifTool `Priority => N` (`0` for the walked `0x0012
   // ExposureTime` / `0x0013 FNumber` rows, `1` otherwise) so a `Priority => 0`
   // leaf never overrides an earlier same-`(doc, family1, name)` value
@@ -8991,6 +10364,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
   let mut w = Walker {
     data: blob,
     order,
+    resolved_subdir_order: None,
     // `%Apple::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value — `base: 0` resolves an out-of-line offset at `blob[off]`,
     // byte-identical to the oracle's `Base => '$start - 14'` blob-relative read.
@@ -9005,6 +10379,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // The parent IFD0 `Make`, threaded from the dispatch — the format-16
     // (`int64u`) Apple carve-out in the per-entry gate requires
     // `captured_make == Some("Apple")` (`Exif.pm:6464` `$$et{Make} eq 'Apple'`),
@@ -9023,8 +10398,12 @@ pub(in crate::exif) fn apple_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Apple tag reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Apple tag reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The captured blob IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -9191,6 +10570,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // Both Main variants inherit the parent base (no `Base =>` override), so the
     // walk never adds `base` to a value — `base: 0` resolves an out-of-line offset
     // at `data[off]`, byte-identical to the oracle's TIFF-relative read.
@@ -9205,6 +10585,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the four conditional-ARRAY AF tags + the single-HASH
     // `Condition` rows; the Sony walk itself reads no model-conditional structure,
@@ -9220,8 +10601,12 @@ pub(in crate::exif) fn sony_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Sony Main leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Sony Main leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -9472,6 +10857,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // `%Panasonic::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value — `base: 0`. The DC-FT7 `Base => 12` out-of-line shift is
     // the SEPARATE `value_offset_base` below (the `$dataPos`-shift addend), NOT
@@ -9493,6 +10879,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` selects the 0x0f AFAreaMode / 0x2c ContrastMode branches; the
     // Panasonic walk itself reads no model-conditional structure, but the captured
@@ -9508,8 +10895,12 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Panasonic Main leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Panasonic Main leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is
+    // not IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -9749,6 +11140,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
   let mut w = Walker {
     data: walk_data,
     order,
+    resolved_subdir_order: None,
     base: 0,
     // ★ CRUX #1 — the out-of-line value base: 10 for type-3 (embedded-TIFF
     // `Base => '$start - 8'`), 0 for type-2 / headerless. Reproduces the oracle's
@@ -9761,6 +11153,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the AFInfo BigEndian read + the LensData Z telemetry;
     // it is threaded into the capture-loop emitters (NOT the walk), so leave it
@@ -9775,8 +11168,12 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Nikon Main/Type2 leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Nikon Main/Type2 leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is
+    // not IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     // The chosen walk buffer IS the readable buffer (an effective RAF), like the
     // dispatch walk.
     no_raf: false,
@@ -10085,6 +11482,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -10093,6 +11491,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the FixBase heuristic
     // (`GetMakerNoteOffset`'s `make.starts_with("PENTAX")` absolute-addressing
     // arm, `MakerNotes.pm:1215-1220`) the AOC/Asahi primaries run via
@@ -10108,8 +11507,12 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Pentax leaf reads `$$self{FILE_TYPE}`.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Pentax leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Pentax)` swaps it to the
@@ -10171,6 +11574,15 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     }
   }
   {
+    // The RESOLVED Pentax `%Main` IFD byte order — a Pentax binary sub-table that
+    // declares no explicit `ByteOrder` inherits it (e.g. `CameraInfo`/`KelvinWB`/
+    // `LevelInfo`/`FilterInfo`). `w.order` is restored to the PARENT order after
+    // the walk, so it is wrong for the K-x `Pentax.avi` (RIFF-LittleEndian parent,
+    // but the MakerNote IFD probes to BigEndian); `resolved_subdir_order` holds the
+    // probed order the entries were actually walked with (BE for the K10D JPEG +
+    // the K-x AVI, LE for the K-S2 JPEG). The tables that declare `ByteOrder =>
+    // 'BigEndian'` (`BatteryInfo`/`AFInfo`) pass `ByteOrder::Big` regardless.
+    let parent_order = w.resolved_subdir_order.unwrap_or(w.order);
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
       // Only `ResolvedConv::Pentax` entries live in this run; a defensive
@@ -10213,9 +11625,15 @@ pub(in crate::exif) fn pentax_makernote_isolated(
               &mut *sink.emissions,
             );
           }
+          // `%Pentax::AEInfo` (0x0206) is a `$count`-keyed variant LIST. The K10D
+          // `$count <= 25` records use `emit_aeinfo`; the `$count == 48 or 64`
+          // records (K-1mkII/K-3/K-30/K-50/K-S2/K-70/KP) use `%Pentax::AEInfo3`
+          // (`emit_aeinfo3`). Each emitter re-checks its `$count` gate, so only the
+          // matching variant emits (the K-S2 record is 48 ⇒ AEInfo3).
           SubTable::AEInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_aeinfo(block, count, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_aeinfo3(block, count, print_conv, &mut *sink.emissions);
           }
           // The nested `%Pentax::LensData` SubDirectory inside `%Pentax::LensInfo2`
           // (#262 Phase 2b). `emit_lens_info` re-checks the K10D `$count`
@@ -10223,9 +11641,21 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // emits nothing), slices the offset-4 `undef[17]` `LensData` span, and
           // emits ONLY the five nested lens-detail leaves. The offset-0 `LensType`
           // is NOT re-emitted — Phase 1's `0x003f LensRec` owns it.
+          // `%Pentax::LensInfo` (0x0207) is a `$count`-keyed variant LIST.
+          // `emit_lens_info` handles the K10D `%LensInfo2` (`LensData` at offset
+          // 4); `emit_lens_info5` handles the `$count == 80 or 128` `%LensInfo5`
+          // (K-01/K-30/K-50/K-3/K-S1/K-S2/K-70/KP — `LensData` at offset 15). Each
+          // re-checks its `$count` gate; the K-S2 record is 128 ⇒ LensInfo5.
           SubTable::LensInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_lens_info(
+              block,
+              count,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+            pentax::subtables::emit_lens_info5(
               block,
               count,
               model,
@@ -10244,14 +11674,21 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // InternalSerialNumber); the offset-0 PentaxModelID is owned by the
           // Phase-1 0x0005 leaf and is NOT re-emitted here.
           SubTable::CameraInfo => {
-            pentax::subtables::emit_camera_info(block, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_camera_info(
+              block,
+              parent_order,
+              print_conv,
+              &mut *sink.emissions,
+            );
           }
-          // `%Pentax::SRInfo` (0x005c) — the `$count == 4` variant gate
-          // (`Pentax.pm:2260`); a 2-byte K-3 record (`SRInfo2`) emits nothing
-          // (the scope-fence). #173.
+          // `%Pentax::SRInfo` (0x005c) is a `$count`-keyed pair. `emit_sr_info`
+          // handles the `$count == 4` `%SRInfo`; `emit_sr_info2` handles the
+          // 2-byte `%SRInfo2` (K-3/K-S1/K-S2/K-70 — ShakeReduction only). Each
+          // re-checks its gate; the K-S2 record is 2 bytes ⇒ SRInfo2. #173.
           SubTable::SrInfo => {
             let count = pentax_subdir_count(entry);
             pentax::subtables::emit_sr_info(block, count, print_conv, &mut *sink.emissions);
+            pentax::subtables::emit_sr_info2(block, count, print_conv, &mut *sink.emissions);
           }
           // `%Pentax::BatteryInfo` (0x0216) — UNCONDITIONAL (BigEndian); its
           // leaves are `$$self{Model}`-gated, so the threaded `model` selects the
@@ -10272,6 +11709,117 @@ pub(in crate::exif) fn pentax_makernote_isolated(
           // Emits WBShiftAB / WBShiftGM. #173.
           SubTable::ColorInfo => {
             pentax::subtables::emit_color_info(block, print_conv, &mut *sink.emissions);
+          }
+          // The #311 world-time / lens-correction / face / AWB / EV-step / level /
+          // Kelvin-WB / CAF / filter sub-tables. Per-table byte-order rule
+          // (`Pentax.pm`): `KelvinWB` (int16u[4]) and the K-3III `LevelInfo`
+          // (int16s) declare NO `ByteOrder` ⇒ inherit `parent_order`; `FilterInfo`
+          // (int16u) is `$$self{Make}`-FORCED (RICOH→LE / else→BE, NOT the parent
+          // order); the int8u/int8s tables are order-immaterial. The K-S2 selects
+          // them via its IFD.
+          SubTable::TimeInfo => {
+            pentax::subtables::emit_time_info(block, print_conv, &mut *sink.emissions);
+          }
+          SubTable::LensCorr => {
+            pentax::subtables::emit_lens_corr(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::FaceInfo` (0x0060) — UNCONDITIONAL, unlike the model-variant
+          // `LevelInfo` arm below. The Main `0x0060` row (`Pentax.pm:2293-2297`)
+          // is a single `{...}` with NO `Condition`, so every body (the K-3 Mark
+          // III included) routes 0x0060 through `%FaceInfo`. The K-3III's distinct
+          // `%FaceInfoK3III` is a SEPARATE Main tag id (0x040b), not a 0x0060
+          // model variant — so there is correctly no `is_k3_mark_iii` gate here.
+          SubTable::FaceInfo => {
+            pentax::subtables::emit_face_info(block, &mut *sink.emissions);
+          }
+          SubTable::AwbInfo => {
+            pentax::subtables::emit_awb_info(block, print_conv, &mut *sink.emissions);
+          }
+          SubTable::EvStepInfo => {
+            pentax::subtables::emit_evstep_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::LevelInfo` (0x022b) is `$$self{Model}`-VARIANT-SELECTED
+          // (`Pentax.pm:3044-3051`): a `/K-3 Mark III/` body reads the distinct
+          // `%LevelInfoK3III` re-layout; every OTHER body reads `%LevelInfo`. The
+          // K3III `int16s` RollAngle/PitchAngle carry no per-table `ByteOrder`, so
+          // they inherit the probed parent IFD order (`parent_order`). No active
+          // fixture is a K-3III, so the normal path serves all goldens, but the
+          // selection mirrors ExifTool's condition ORDER faithfully.
+          SubTable::LevelInfo => {
+            if pentax::subtables::is_k3_mark_iii(model) {
+              pentax::subtables::emit_level_info_k3iii(
+                block,
+                parent_order,
+                print_conv,
+                &mut *sink.emissions,
+              );
+            } else {
+              pentax::subtables::emit_level_info(block, print_conv, &mut *sink.emissions);
+            }
+          }
+          SubTable::KelvinWb => {
+            pentax::subtables::emit_kelvin_wb(block, parent_order, &mut *sink.emissions);
+          }
+          SubTable::CafPointInfo => {
+            pentax::subtables::emit_caf_point_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::FilterInfo` (0x022a) byte order is `$$self{Make}`-FORCED, NOT
+          // the parent order: RICOH bodies read LittleEndian, all others BigEndian
+          // (`Pentax.pm:3030-3043`). `emit_filter_info` decides from the threaded
+          // `make`. (The K-S2 / K-1 / K-3 / KP / K-70 report `Make => "RICOH …"`
+          // ⇒ LE; the K-5 II reports `"PENTAX"` ⇒ BE.)
+          SubTable::FilterInfo => {
+            pentax::subtables::emit_filter_info(block, make, &mut *sink.emissions);
+          }
+          // `%Pentax::AFPointInfo` (0x0245) — a plain SubDirectory (UNCONDITIONAL).
+          // The int16u NumAFPoints inherits the resolved MakerNote (`parent_order`)
+          // order; the offset-4 AFPointsInFocus/Selected/Special leaves are
+          // `/K(P|-1|-70)\b/`-model-gated (`emit_af_point_info` decides from the
+          // threaded `model` — the K-1/KP/K-70 fixtures emit them, no other body
+          // writes a 0x0245). #311.
+          SubTable::AfPointInfo => {
+            pentax::subtables::emit_af_point_info(
+              block,
+              parent_order,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          // `%Pentax::PixelShiftInfo` (0x0243) — `int8u`, UNCONDITIONAL. Emits
+          // PixelShiftResolution (@0). #393.
+          SubTable::PixelShiftInfo => {
+            pentax::subtables::emit_pixel_shift_info(block, print_conv, &mut *sink.emissions);
+          }
+          // `%Pentax::TempInfo` (0x03ff) — the Main row gates on `$$self{Model} =~
+          // /K-(01|3|30|5|50|500)\b/`; `emit_temp_info` re-applies the K-3III leaf
+          // gates (ShotNumber @0x0a, SensorTemperature @0x2a, int16s BE inherited).
+          // #393.
+          SubTable::TempInfo => {
+            pentax::subtables::emit_temp_info(
+              block,
+              parent_order,
+              model,
+              print_conv,
+              &mut *sink.emissions,
+            );
+          }
+          // `%Pentax::FaceInfoK3III` (0x040b) — `int32u` (BigEndian inherited).
+          // FaceImageSize/CAFArea/FacesDetectedA/B; the per-face leaves gate on
+          // FacesA (0 here). #393.
+          SubTable::FaceInfoK3iii => {
+            pentax::subtables::emit_face_info_k3iii(block, parent_order, &mut *sink.emissions);
+          }
+          // `%Pentax::AFInfoK3III` (0x040c) — `int16u` (BigEndian inherited).
+          // AFMode/AFSelectionMode/MaxNumAFPoints/NumAFPoints + the AF-area leaves.
+          // #393.
+          SubTable::AfInfoK3iii => {
+            pentax::subtables::emit_af_info_k3iii(
+              block,
+              parent_order,
+              print_conv,
+              &mut *sink.emissions,
+            );
           }
         }
         continue;
@@ -10371,6 +11919,11 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   parent_order: ByteOrder,
   make: Option<&str>,
   model: Option<&str>,
+  // The container's `$$self{TIFF_TYPE}` — the `0x0035 PreviewIFD` SubDirectory's
+  // `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (`Samsung.pm:309`, #242).
+  // `None` (the `from_blob` standalone-blob path / an embedded JPEG body) ⇒ the
+  // SRW gate fails, so PreviewIFD is not descended.
+  file_type: Option<&str>,
   print_conv: bool,
 ) -> Option<(
   std::vec::Vec<makernotes::VendorEmission>,
@@ -10439,6 +11992,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -10447,6 +12001,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
     // Samsung walk reads no model-conditional structure (no PENTAX-style make
     // arm), but thread them for parity with the other vendors.
@@ -10459,8 +12014,17 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // No Samsung leaf reads `$$self{FILE_TYPE}`.
-    file_type: None,
+    captured_compression: None,
+    captured_subfile_type: None,
+    // `$$self{TIFF_TYPE}` for the `0x0035 PreviewIFD`
+    // `Condition => '$$self{TIFF_TYPE} eq "SRW"'` gate (#242), which
+    // [`Walker::emit`] reads to decide the in-walk PreviewIFD descent. `None` (the
+    // `from_blob` / embedded-JPEG path) ⇒ the SRW gate fails, so no descent.
+    file_type: file_type.map(smol_str::SmolStr::new),
+    // A Samsung MakerNote sub-walk is not IFD0-of-a-standalone-TIFF (the
+    // Sony-A100 `0x014a` gate needs `kind == Ifd0` of the container), so
+    // `base_file_type` is irrelevant here ⇒ `None`.
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Samsung)` swaps it to
@@ -10489,9 +12053,26 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     fix_base_mode,
     ProcessProc::Unknown,
   );
+  // The `0x0035 PreviewIFD` SubDirectory (`Samsung.pm:307-327`, #242) is descended
+  // IN-WALK by [`Walker::emit`] — while `w.base`/`w.value_offset_base` hold the
+  // FixBase-corrected values the Type2 walk computed (Samsung's absolute offsets
+  // are relative to the maker-note start) — so the child IFD resolves correctly,
+  // exactly as ExifTool descends it inside `ProcessExif`. The `%Nikon::PreviewIFD`
+  // leaves (all `ResolvedConv::Exif`) land interleaved in `w.entries`; the capture
+  // loop below emits each `ResolvedConv::Exif` entry under the `PreviewIFD`
+  // family-1 group via [`PreviewIfdSink`].
+  //
+  // Resolve the PreviewIFD `0x201`/`0x202` offset pair the in-walk descent
+  // collected into the synthetic `PreviewIFD:PreviewImage` placeholder
+  // (`ExtractImage`, `Exif.pm:6216-6244`), appended to `w.entries`. Inert (a
+  // no-op) when no PreviewIFD was descended (non-SRW / absent / out-of-range) —
+  // `data_tag_pairs` is then empty.
+  w.finalize_data_tags();
   // Capture the walked `ResolvedConv::Samsung` leaves + the PictureWizard child
   // into the vendor-emission `Vec`; build the typed `MakerNotesSamsung` from the
-  // SAME entries (the typed leaf set is disjoint from PictureWizard).
+  // SAME entries (the typed leaf set is disjoint from PictureWizard). The
+  // interleaved `%Nikon::PreviewIFD` leaves (`ResolvedConv::Exif`) are emitted
+  // under the `PreviewIFD` group.
   let g1 = vendor_group1_of(TableRef::Samsung).unwrap_or("Samsung");
   let mut emissions = std::vec::Vec::new();
   let mut typed = MakerNotesSamsung::new();
@@ -10505,10 +12086,34 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     // `$key or return undef`).
     let mut encryption_key: std::vec::Vec<i64> = std::vec::Vec::new();
     for entry in &w.entries {
-      // Only `ResolvedConv::Samsung` entries live in this run; a defensive
-      // non-Samsung conv (never produced under `TableRef::Samsung`) is skipped.
-      let ResolvedConv::Samsung(samsung_tag) = entry.conv else {
-        continue;
+      // The walk produces `ResolvedConv::Samsung` Type2 leaves PLUS — when the
+      // `0x0035 PreviewIFD` SubDirectory was descended in-walk — the
+      // `%Nikon::PreviewIFD` leaves (`ResolvedConv::Exif`) and the synthetic
+      // `PreviewImage` (`&SYNTHETIC_DATA_TAG`, also `ResolvedConv::Exif`). Render a
+      // PreviewIFD `Exif` entry through the SAME `emit_exif_value` a core Exif leaf
+      // uses, capturing the value under the `PreviewIFD` family-1 group
+      // (`%Nikon::PreviewIFD`'s `GROUPS => { 1 => PreviewIFD }`). `parent_order` is
+      // irrelevant to these convs (no `ExifText` row), threaded for the signature.
+      let samsung_tag = match entry.conv {
+        ResolvedConv::Samsung(t) => t,
+        ResolvedConv::Exif(tag) => {
+          let mut pv = PreviewIfdSink {
+            emissions: &mut *sink.emissions,
+            group1: "PreviewIFD",
+          };
+          let Ok(()) = emit_exif_value(
+            "PreviewIFD",
+            entry.name,
+            entry.value.raw(),
+            tag.conv,
+            parent_order,
+            print_conv,
+            &mut pv,
+          );
+          continue;
+        }
+        // A defensive non-Samsung/non-Exif conv (never produced under this walk).
+        _ => continue,
       };
       if let Some(sub) = samsung_tag.sub_table() {
         match sub {
@@ -10524,6 +12129,11 @@ pub(in crate::exif) fn samsung_makernote_isolated(
             };
             samsung::emit_picture_wizard(members, print_conv, &mut *sink.emissions);
           }
+          // `0x0035 PreviewIFD` — the SubDirectory POINTER itself never reaches this
+          // loop: `Walker::emit` descends it in-walk and `return`s without pushing a
+          // `0x0035` entry. The descent's `%Nikon::PreviewIFD` leaves are the
+          // `ResolvedConv::Exif` entries handled above.
+          SubTable::PreviewIfd => {}
         }
         continue;
       }
@@ -10685,6 +12295,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
   let mut w = Walker {
     data,
     order: parent_order,
+    resolved_subdir_order: None,
     base: 0,
     value_offset_base,
     entries: Vec::new(),
@@ -10693,6 +12304,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
     // leaf reads Make.
     captured_make: None,
@@ -10704,7 +12316,12 @@ pub(in crate::exif) fn leica_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
+    captured_compression: None,
+    captured_subfile_type: None,
+    // No Leica leaf reads `$$self{FILE_TYPE}`; a MakerNote sub-walk is not
+    // IFD0-of-a-standalone-TIFF, so the Sony-A100 `0x014a` gate is unreachable.
     file_type: None,
+    base_file_type: None,
     no_raf: false,
     warn_count: 0,
     // Starts on the Exif table; `process_subdir(TableRef::Leica(variant))` swaps
@@ -10855,6 +12472,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
   let mut w = Walker {
     data,
     order,
+    resolved_subdir_order: None,
     // Canon's `%Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
     // `base` to a value (`is_offset_tag` matches only 0x0111/0x0201, absent from
     // `%Canon::Main`) — `base: 0` is byte-identical to the parent-context walk.
@@ -10869,6 +12487,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` (the conditional `SerialNumber` PrintConv is `-j`-only, but
     // the model also gates the 0x96 SerialInfo LIST + ShotInfo branches the `-n`
@@ -10884,8 +12503,18 @@ pub(in crate::exif) fn canon_makernote_isolated(
     page_count: 0,
     multi_page: false,
     dng_version: false,
-    // `$$self{FILE_TYPE}` — the `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv.
+    captured_compression: None,
+    captured_subfile_type: None,
+    // `$$self{TIFF_TYPE}` / `$$self{FileType}` — the `Canon::ShotInfo` pos-22
+    // CRW-allows-0 RawConv. (The `FILE_TYPE eq "CRW"` Perl source reads the
+    // detection base, but the port threads the finalized subtype here for the
+    // pos-22 gate; either way the CRW branch is provably dead — no CIFF/CRW
+    // front-end — so this is the established behaviour.)
     file_type: file_type.map(smol_str::SmolStr::new),
+    // A Canon MakerNote sub-walk is not IFD0-of-a-standalone-TIFF, so the
+    // Sony-A100 `0x014a` gate (`kind == Ifd0`) is unreachable ⇒ `base_file_type`
+    // is irrelevant here ⇒ `None`.
+    base_file_type: None,
     // The parent TIFF block IS the readable buffer (an effective RAF), like the
     // dispatch walk — only the CTMD `0x8769` hop is no-RAF.
     no_raf: false,
@@ -11004,6 +12633,58 @@ fn emit_exif_value<S: ExifSink>(
     Conv::None => emit_raw(group, name, raw, out),
     Conv::IntLabel(slice) => emit_int_label(group, name, raw, slice, print_conv, out, false),
     Conv::IntLabelHex(slice) => emit_int_label(group, name, raw, slice, print_conv, out, true),
+    Conv::FileSource(slice) => {
+      // `FileSource` (0xa300) HASH PrintConv (`Exif.pm:2815-2821`). The integer
+      // codes `1`/`2`/`3` arrive as a single `undef` byte re-read int8u (the
+      // `Format::Undef` + `count == 1` carve-out, `Exif.pm:6682`, applied by the
+      // Walker), so a `RawValue::U64` singleton flows through the shared
+      // `emit_int_label` exactly like any other integer enumeration (`3` →
+      // "Digital Camera"; a miss → `Unknown (N)`; `-n` → the bare number).
+      //
+      // ONLY a multi-byte `undef` value lands as `RawValue::Bytes` — the case
+      // ExifTool reserves for the literal string key `"\x03\x00\x00\x00"` Sigma
+      // (mis)writes (`Exif.pm:2820`). Match the exact 4 bytes →
+      // "Sigma Digital Camera" under printconv; any other multi-byte `undef` is a
+      // HASH MISS → `Unknown ($val)` over the raw byte string
+      // (`ExifTool.pm:3614-3634`). `-n` (and the HASH-miss `$val` inside
+      // `Unknown (…)`) shows the post-`ReadValue` byte string itself, rendered
+      // through ExifTool's `EscapeJSON` tail — `convert::escape_json_raw_bytes`
+      // applies the exact order: `tr/\0//d` (`exiftool:3820`) deletes the NULs
+      // FIRST, THEN `FixUTF8` (`exiftool:3824`). So the Sigma `\x03\x00\x00\x00`
+      // shows as the single surviving `0x03` byte under `-n`, the miss text
+      // drops its NULs, and a NUL-split UTF-8 value (`\xc2\x00\xa9\x00`)
+      // reassembles to `©` AFTER the NUL deletion — matching bundled
+      // `exiftool 13.59` (which yields `Unknown (©)` / `©`). Rendering the
+      // bytes alone then wrapping in `Unknown (…)` is byte-identical to
+      // wrapping then escaping: the `Unknown (`/`)` literals carry no NULs and
+      // are valid ASCII, so they neither create nor split a sequence.
+      if let RawValue::Bytes(b) = raw {
+        if print_conv {
+          if b.as_slice() == [0x03, 0x00, 0x00, 0x00] {
+            out.write_str(group, name, "Sigma Digital Camera")?;
+          } else {
+            out.write_str(
+              group,
+              name,
+              &std::format!("Unknown ({})", crate::convert::escape_json_raw_bytes(b)),
+            )?;
+          }
+        } else {
+          // `-n` shows the bare `$val` byte string through ExifTool's FULL
+          // `EscapeJSON` order: CLASSIFY the ORIGINAL `$val` (with NULs) against
+          // the boolean/number gate FIRST, then — only for a non-match —
+          // `tr/\0//d` + `FixUTF8`. A NUL-bearing original (e.g. a NUL-split
+          // numeric `31 00 32 00`) FAILS the gate, so it is a QUOTED string
+          // (`"12"`), NOT a bare number; a NUL-free clean number stays bare.
+          match crate::convert::escape_json_raw_bytes_classified(b, false) {
+            crate::convert::EscapedJson::Bare(v) => out.write_str(group, name, &v)?,
+            crate::convert::EscapedJson::Quoted(v) => out.write_json_string(group, name, &v)?,
+          }
+        }
+        return Ok(());
+      }
+      emit_int_label(group, name, raw, slice, print_conv, out, false)
+    }
     Conv::StrLabel(slice) => {
       // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
       // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
@@ -11025,18 +12706,95 @@ fn emit_exif_value<S: ExifSink>(
       }
       emit_raw(group, name, raw, out)
     }
-    Conv::ExposureTime | Conv::ShutterSpeedApex => {
-      // ExposureTime: raw rational seconds → PrintExposureTime.
-      // ShutterSpeedValue: ValueConv `2 ** -$val` first (Exif.pm:2346),
-      // then PrintExposureTime. `-n` mode emits the post-ValueConv scalar.
-      let secs = match conv {
-        Conv::ShutterSpeedApex => first_scalar(raw).map(shutter_speed_value_conv),
-        _ => first_scalar(raw),
+    Conv::ExposureTime => {
+      // `ExposureTime` (0x829a) is a `rational64u` — its value IS the rational
+      // seconds (no ValueConv), fed to `PrintExposureTime`. The
+      // `RoundFloat(n/d, 10)` rounding is a property of the rational read, so it
+      // is shape-specific (`rational_read`): a single `Rational` yields the
+      // rounded quotient or the `inf`/`undef` word; a single non-rational scalar
+      // yields its EXACT `ReadValue` token (the unrounded native scalar — a
+      // `>2**53` integer stays exact, a non-finite float its titlecase word,
+      // #385); a count>1 value is the space-joined `$val`.
+      match rational_read(raw) {
+        Some(RationalRead::Finite(s)) if print_conv => {
+          // `PrintExposureTime` of the read value (the 10-sig-fig quotient for a
+          // rational, e.g. `1/60` → `0.01666666667` → `"1/60"`) → `1/724` (out of
+          // gate ⇒ string) or a whole/`%.1f` second count like `30` (in gate ⇒ a
+          // bare JSON number).
+          emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
+        }
+        // `-n`: the read value, gated (a finite rational re-parses to the
+        // 10-sig-fig f64 that also feeds `Composite:ShutterSpeed`/`LightValue`
+        // byte-exact).
+        Some(RationalRead::Finite(s)) => emit_gated_f64(group, name, s, out)?,
+        // A single NON-rational scalar (`int64u`/`int64s`/float/double): emit the
+        // EXACT `ReadValue` token. `-n` is the bare token (the exact integer —
+        // `>2**53` stays exact, never scientific; the `%.15g` float; the
+        // titlecase non-finite word) gated by `EscapeJSON` (a `>15`-digit integer
+        // / a non-finite word is out of gate ⇒ a quoted string, byte-identical to
+        // bundled). Print `PrintExposureTime` IsFloat-gates the token
+        // (`Exif.pm:5704`, `value.is_finite() == IsFloat(token)` here): an
+        // integer/finite-float token (`IsFloat` true) is `%.1f`/`1/N`-formatted on
+        // the NUMIFIED `value` (Perl numifies `$val` in `sprintf("%.1f", $val)`),
+        // a non-finite word token (`IsFloat` false) is returned verbatim — Perl's
+        // titlecase `Inf` casing (#385).
+        Some(RationalRead::Scalar { token, value }) if print_conv => {
+          if value.is_finite() {
+            emit_gated_number(group, name, &tables::print_exposure_time(value), out)?;
+          } else {
+            // `IsFloat($val)` false ⇒ `PrintExposureTime` returns `$secs` (the
+            // titlecase `Inf`/`-Inf`/`NaN` word) unchanged.
+            emit_gated_number(group, name, &token, out)?;
+          }
+        }
+        Some(RationalRead::Scalar { token, .. }) => {
+          emit_gated_number(group, name, &token, out)?;
+        }
+        // The zero-denominator word `undef`/`inf`: `PrintExposureTime` returns a
+        // non-float input verbatim (`Exif.pm:5704`) and `-n` is the same word, so
+        // both modes emit the word; `emit_gated_number` quotes it (out of the
+        // number gate), identical to the no-conv `emit_raw` single-rational path.
+        Some(RationalRead::Degenerate(word)) => emit_gated_number(group, name, word, out)?,
+        // A count>1 (malformed) `ExposureTime`: `$val` is the space-joined read
+        // (`ExifTool.pm:6330`). `IsFloat($val)` is false (the space) ⇒
+        // `PrintExposureTime` returns it verbatim (`Exif.pm:5704`), and `-n` is
+        // the same `$val`. Both modes emit `joined`; `emit_gated_number` quotes
+        // it (the space is out of the number gate).
+        Some(RationalRead::Joined { joined, .. }) => {
+          emit_gated_number(group, name, &joined, out)?;
+        }
+        None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::ShutterSpeedApex => {
+      // `ShutterSpeedValue` (0x9201) ValueConv `IsFloat($val) && abs($val)<100 ?
+      // 2**(-$val) : 0` (Exif.pm:2346); the result feeds `PrintExposureTime`, and
+      // `-n` emits the post-ValueConv scalar. `$val` is the `rational64s` read,
+      // so the `RoundFloat($num/$den, 10)` rounding (`Exif.pm:6112`) is a property
+      // of the RATIONAL read alone (`rational_read`): a single `Rational` rounds
+      // its quotient, but a wrong-format FLOAT/DOUBLE `ShutterSpeedValue` is read
+      // by `GetFloat`/`GetDouble` WITHOUT that rounding (the rounded apex is then
+      // exponentiated + feeds `Composite:ShutterSpeed`/`LightValue`, so an
+      // over-broad round changes a crafted double-stored value's bytes). A
+      // zero-denominator rational reads as the word `inf`/`undef`, and a count>1
+      // value is the space-joined `$val` — both non-float ⇒ `IsFloat($val)` is
+      // false ⇒ the ValueConv yields `0`.
+      let secs = match rational_read(raw) {
+        Some(RationalRead::Finite(apex)) => Some(shutter_speed_value_conv(apex)),
+        // A single NON-rational scalar's numeric `value` is the apex Perl numifies
+        // (#385): `IsFloat($val) && abs($val)<100 ? 2**(-$val) : 0`.
+        // `shutter_speed_value_conv` applies BOTH guards — a `>2**53` integer
+        // value (`abs >= 100`) and a non-finite `F64` value (whose token is the
+        // `IsFloat`-false word) both fall to `0`, matching ExifTool.
+        Some(RationalRead::Scalar { value, .. }) => Some(shutter_speed_value_conv(value)),
+        // `IsFloat("inf"/"undef")` and `IsFloat(<space-joined>)` are both false ⇒
+        // the ValueConv's `: 0` branch.
+        Some(RationalRead::Degenerate(_) | RationalRead::Joined { .. }) => Some(0.0),
+        None => None,
       };
       match secs {
         Some(s) if print_conv => {
-          // PrintExposureTime → `1/724` (out of gate ⇒ string) or a whole/`%.1f`
-          // second count like `30` (in gate ⇒ a bare JSON number). Gate it.
           emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
         }
         Some(s) => emit_gated_f64(group, name, s, out)?,
@@ -11095,19 +12853,56 @@ fn emit_exif_value<S: ExifSink>(
       Some(_) | None => emit_raw(group, name, raw, out),
     },
     Conv::ApertureApex => {
-      // ValueConv `2 ** ($val / 2)` (Exif.pm:2356); PrintConv
-      // `sprintf("%.1f",$val)` (Exif.pm:2358).
-      match first_scalar(raw) {
+      // `ApertureValue`/`MaxApertureValue` ValueConv `2 ** ($val / 2)`
+      // (Exif.pm:2356); PrintConv `sprintf("%.1f",$val)` (Exif.pm:2358). `$val` is
+      // the `rational64u`/`s` read, so the `RoundFloat($num/$den, 10)` rounding
+      // (`Exif.pm:6112`/`:6119`) is a property of the RATIONAL read alone
+      // (`rational_read`): a single `Rational` rounds its quotient — e.g.
+      // `16205/3734` → `4.339850027`, NOT the full-precision `4.33985002678`, and
+      // `2**(4.339850027/2) = 4.50000003760988` differs from the full-precision
+      // result in the low bits — but a wrong-format FLOAT/DOUBLE apex is read by
+      // `GetFloat`/`GetDouble` WITHOUT that rounding (the rounded apex is then
+      // exponentiated + feeds `Composite:Aperture`/`LightValue`, so an over-broad
+      // round changes a crafted double-stored value's bytes). The unguarded `2**`
+      // NUMIFIES a non-float `$val` the way Perl coerces a string scalar: a
+      // zero-denominator word — `"inf"` → ∞ ⇒ `2**(∞/2) = Inf`; `"undef"` → 0 ⇒
+      // `2**(0/2) = 1` — and a count>1 space-joined `$val` to its LEADING token
+      // (Perl's leading-numeric-prefix coercion: `"4.339850027 5"` → `4.339…`).
+      let apex = match rational_read(raw) {
+        Some(RationalRead::Finite(apex)) => Some(apex),
+        // A single NON-rational scalar's numeric `value` is the apex the unguarded
+        // `2**($val/2)` numifies (#385): an integer's `f64` (a `>2**53` value
+        // exponentiates to `Inf`), the float verbatim, `+∞`→`2**∞ = Inf`,
+        // `NaN`→`NaN`. (The `token` matters only to `ExposureTime`; the apex math
+        // is on the numeric value.)
+        Some(RationalRead::Scalar { value, .. }) => Some(value),
+        // Perl numifies the bare `GetRational*` word in `$val / 2`: a
+        // non-numeric `"undef"` → `0`, `"inf"` → `+inf` (never `-inf`).
+        Some(RationalRead::Degenerate("inf")) => Some(f64::INFINITY),
+        Some(RationalRead::Degenerate(_)) => Some(0.0),
+        // A count>1 join: `$val / 2` numifies the leading token (already the
+        // first element's `Get…` read coerced to `f64` — `undef`→0, `inf`→∞).
+        Some(RationalRead::Joined { leading, .. }) => Some(leading),
+        None => None,
+      };
+      match apex {
         Some(apex) => {
           let v = 2f64.powf(apex / 2.0);
           if print_conv {
             // PrintConv `sprintf("%.1f",$val)` → `16.0` — an in-gate JSON
-            // number. Gate it (the `%.1f` text is always in-gate, but the
-            // gate keeps every numeric path uniform).
-            emit_gated_number(group, name, &std::format!("{v:.1}"), out)?;
+            // number. Gate it (the `%.1f` text is always in-gate, but the gate
+            // keeps every numeric path uniform). A non-finite `$val` is Perl's
+            // titlecase word (`sprintf("%.1f",Inf)` == `"Inf"`, not Rust's
+            // lowercase `"inf"`), out of gate ⇒ quoted; `perl_nonfinite_str`
+            // matches `EscapeJSON`'s quoted `Inf`/`-Inf`/`NaN`.
+            match crate::value::perl_nonfinite_str(v) {
+              Some(word) => emit_gated_number(group, name, word, out)?,
+              None => emit_gated_number(group, name, &std::format!("{v:.1}"), out)?,
+            }
           } else {
             // `-n` ⇒ the post-ValueConv scalar, gated as ExifTool would
-            // stringify-then-`EscapeJSON` it.
+            // stringify-then-`EscapeJSON` it (`emit_gated_f64` routes a
+            // non-finite value through the same titlecase serializer).
             emit_gated_f64(group, name, v, out)?;
           }
           Ok(())
@@ -11147,31 +12942,59 @@ fn emit_exif_value<S: ExifSink>(
       emit_raw(group, name, raw, out)
     }
     Conv::ComponentsConfiguration => {
-      // Per-byte label join (Exif.pm:2304-2317): 0→"-", 1→"Y", 2→"Cb",
-      // 3→"Cr", 4→"R", 5→"G", 6→"B". `-n` emits the space-joined integers.
-      if let RawValue::Bytes(b) = raw {
-        if print_conv {
-          let parts: Vec<&str> = b
-            .iter()
-            .map(|&c| match c {
-              0 => "-",
-              1 => "Y",
-              2 => "Cb",
-              3 => "Cr",
-              4 => "R",
-              5 => "G",
-              6 => "B",
-              _ => "?",
-            })
-            .collect();
-          out.write_str(group, name, &parts.join(", "))?;
-        } else {
-          let parts: Vec<String> = b.iter().map(|&c| std::format!("{c}")).collect();
-          out.write_str(group, name, &parts.join(" "))?;
-        }
-        return Ok(());
+      // Per-element label join (Exif.pm:2304-2333). The PrintConv hash maps the
+      // INTEGER element codes 0→"-", 1→"Y", 2→"Cb", 3→"Cr", 4→"R", 5→"G",
+      // 6→"B"; the `OTHER` sub `split`s the space-joined `$val` and renders each
+      // element `$$conv{$_} || "Err ($_)"` (so an UNKNOWN code N → `"Err (N)"`,
+      // NOT `"?"`). `-n` emits the space-joined `$val` integers.
+      //
+      // 0x9101 carries `Format => 'int8u'` (`Exif.pm:2298`,
+      // `tables::format_override`), so ExifTool re-reads the on-disk value as
+      // `int(size/1)` int8u ELEMENTS regardless of the declared format code —
+      // the Walker's override makes `raw` a `RawValue::U64` of those byte
+      // values for EVERY shape (a mis-written `string`/`int16u`/… 0x9101 is read
+      // as the raw bytes one-per-element, #201; verified byte-identical to
+      // bundled `exiftool 13.59`). Read the integer code list from `U64`; a bare
+      // `Bytes` (no override applied) keeps the same byte→code reading so the
+      // conv is robust either way.
+      use std::borrow::Cow;
+      let codes: Cow<'_, [u64]> = match raw {
+        RawValue::U64(v) => Cow::Borrowed(v),
+        RawValue::Bytes(b) => Cow::Owned(b.iter().map(|&c| u64::from(c)).collect()),
+        _ => return emit_raw(group, name, raw, out),
+      };
+      if print_conv {
+        let parts: Vec<Cow<'_, str>> = codes
+          .iter()
+          .map(|&c| match c {
+            0 => Cow::Borrowed("-"),
+            1 => Cow::Borrowed("Y"),
+            2 => Cow::Borrowed("Cb"),
+            3 => Cow::Borrowed("Cr"),
+            4 => Cow::Borrowed("R"),
+            5 => Cow::Borrowed("G"),
+            6 => Cow::Borrowed("B"),
+            // `$$conv{$_} || "Err ($_)"` — the un-hashed code (`Exif.pm:2330`).
+            other => Cow::Owned(std::format!("Err ({other})")),
+          })
+          .collect();
+        out.write_str(group, name, &parts.join(", "))?;
+      } else if let [c] = codes.as_ref() {
+        // `-n` emits the post-`ReadValue` raw SCALAR. A SINGLETON 0x9101 (a
+        // crafted 1-byte / `int(size/1)==1` value, #201) is one int8u code, so —
+        // exactly as `emit_raw` renders a `RawValue::U64([v])` — it goes through
+        // the EscapeJSON number gate ⇒ a BARE JSON number (`1`, NOT the string
+        // `"1"`). The gate caps the integer width, so an int8u code is always
+        // in-gate. A multi-element value joins below.
+        emit_gated_number(group, name, &std::format!("{c}"), out)?;
+      } else {
+        // A multi-element (or empty) list is the space-joined `$val` integers
+        // (`ReadValue` joins COUNT>1 with single spaces, ExifTool.pm:6330) ⇒ out
+        // of the number gate, a quoted JSON string — same as `emit_raw`'s
+        // multi-`U64` `join_nums` arm.
+        out.write_str(group, name, &join_nums(&codes))?;
       }
-      emit_raw(group, name, raw, out)
+      Ok(())
     }
     Conv::WindowsXp => {
       // Windows `XP*` tags — `ValueConv => '$self->Decode($val,"UCS2","II")'`
@@ -11348,10 +13171,9 @@ fn emit_exif_value<S: ExifSink>(
       // so every real-camera path is unchanged; the unification just removes the
       // dead/lossy `Text` arm and keeps the conv robust if a future `ExifText`
       // tag lacks the override (it would then byte-walk `Text.raw`, not the
-      // lossy FixUTF8 text). NOTE: `convert_exif_text`'s ASCII branch renders an
-      // invalid-UTF-8 payload byte via `from_utf8_lossy` (U+FFFD), whereas
-      // bundled ExifTool's JSON writer emits `?` for it — a separate, pre-
-      // existing charset-rendering gap (NOT a byte-walk loss), out of #198 scope.
+      // lossy FixUTF8 text). `convert_exif_text` now routes each invalid-UTF-8
+      // payload byte through `FixUTF8` → `?` (matching bundled ExifTool's JSON
+      // writer), not the `from_utf8_lossy` U+FFFD it used pre-#200.
       let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
@@ -11411,6 +13233,28 @@ fn first_uint(raw: &RawValue) -> Option<u64> {
   }
 }
 
+/// A stored `RawConv` DataMember scalar-string (`None` ≡ ExifTool's `''`) is
+/// Perl-TRUTHY **and** numifies to `target` — the `$$self{X} and $$self{X} ==
+/// target` idiom (e.g. the Sony-A100 `SubfileType == 1` / `Compression == 6`
+/// gate, `Exif.pm:1016-1017`).
+///
+/// Perl truthiness of a string: every value EXCEPT `''` and `'0'` is true
+/// (`None`/`''` and the exact string `"0"` are falsy). The equality is Perl-NUMERIC
+/// (`$str == target`), so the leading-number coercion ([`crate::convert::perl_str_to_f64`],
+/// the same `0 + $val` grammar the offset/Composite ports use) must equal
+/// `target` exactly — a count>1 `"1 0"` numifies to `1` (true for `target == 1`),
+/// while `"0"` is filtered by the truthiness guard first.
+fn data_member_truthy_eq(member: Option<&str>, target: u64) -> bool {
+  let Some(s) = member else {
+    return false; // `''` — falsy.
+  };
+  if s.is_empty() || s == "0" {
+    return false; // Perl-falsy strings.
+  }
+  // `$str == target` in Perl-numeric context.
+  crate::convert::perl_str_to_f64(s) == target as f64
+}
+
 // ====================================================================// GPS value emission — applies a `GpsConv` to a `RawValue`
 // ====================================================================
 /// Render a [`RawValue`] under a [`gps::GpsConv`] into the sink.
@@ -11428,12 +13272,49 @@ fn emit_gps_value<S: ExifSink>(
   match conv {
     GpsConv::Plain(c) => emit_exif_value(group, name, raw, c, order, print_conv, out),
     GpsConv::VersionId => {
-      // `$val =~ tr/ /./; $val` (GPS.pm:61) — the int8u quadruple is the
-      // space-joined integers under -n, dot-joined under -j.
-      if let RawValue::U64(vals) = raw {
-        let joined: Vec<String> = vals.iter().map(|v| std::format!("{v}")).collect();
-        let sep = if print_conv { "." } else { " " };
-        out.write_str(group, name, &joined.join(sep))?;
+      // PrintConv `$val =~ tr/ /./; $val` (GPS.pm:62) runs on the post-`ReadValue`
+      // `$val` — the space-joined integers for the normal `int8u[4]` (and any
+      // numeric / `string` shape `value_space_joined` covers), the raw byte
+      // string for an `undef`/wrong-format shape. `tr/ /./` (printconv only)
+      // turns every space into `.` (the normal `2 3 0 0` → `2.3.0.0`); under `-n`
+      // the bare `$val` is shown. Bundled `exiftool 13.59` was used to pin the
+      // `undef[4]` and `int8s[4]` shapes below.
+      //
+      // The `undef`/`Bytes` shape is the one `value_space_joined` does NOT cover
+      // (it carries no numeric `ReadValue` form). `$val` is then the raw byte
+      // string, rendered through ExifTool's FULL `EscapeJSON` order
+      // (`escape_json_raw_bytes_classified`): CLASSIFY the ORIGINAL `$val`
+      // (NULs intact) against the boolean/number gate FIRST, and ONLY for a
+      // non-match `tr/\0//d` (`exiftool:3820`) then `FixUTF8` (`exiftool:3824`).
+      // So an `undef[4]` `02 03 00 00` → the 2 surviving control bytes (a
+      // QUOTED `""`, matching bundled); a NUL-split UTF-8 value
+      // `c2 00 a9 00` reassembles to `©` AFTER the NUL deletion (QUOTED `"©"`,
+      // bundled `exiftool 13.59`), NOT the two `?`s a FixUTF8-before-NUL-strip
+      // order would produce; and the load-bearing NUL-split NUMERIC `31 00 32 00`
+      // is a QUOTED `"12"` (the NUL-bearing original fails the gate, so it is a
+      // string — NOT a bare `12`), while a NUL-free clean number `31 32 33 34`
+      // → bare `1234`. `tr/ /./` (PrintConv only, GPS.pm:62) runs on the raw
+      // `$val` BEFORE the gate (so `"1 2"` → `"1.2"` → bare `1.2`); the space is
+      // ASCII and COMMUTES with the NUL-strip + `FixUTF8`, so applying it to the
+      // raw bytes inside the helper is byte-identical to ExifTool's
+      // `tr/ /./`-then-`EscapeJSON` order.
+      if let RawValue::Bytes(b) = raw {
+        match crate::convert::escape_json_raw_bytes_classified(b, print_conv) {
+          crate::convert::EscapedJson::Bare(v) => out.write_str(group, name, &v)?,
+          crate::convert::EscapedJson::Quoted(v) => out.write_json_string(group, name, &v)?,
+        }
+        return Ok(());
+      }
+      if let Some(mut v) = value_space_joined(raw) {
+        // Numeric / `string` shapes: `tr/ /./` on the space-joined `$val`. The
+        // `int8u[4]`/`int8s[4]` `2 3 0 0` → `2.3.0.0` (printconv) / `2 3 0 0`
+        // (`-n`); a SINGLE-element value is its bare scalar, emitted through the
+        // serializer's `EscapeJSON` number gate (a numeric scalar stays a bare
+        // JSON number — `TagValue::Str` self-classifies, `value.rs`).
+        if print_conv {
+          v = v.replace(' ', ".");
+        }
+        out.write_str(group, name, &v)?;
         return Ok(());
       }
       emit_raw(group, name, raw, out)
@@ -11510,11 +13391,10 @@ fn emit_gps_value<S: ExifSink>(
       // bytes (the original on-disk `$val`), NOT the lossy FixUTF8 display
       // text the prior `text.as_bytes()` arm read. The real-camera path is
       // `undef` → `RawValue::Bytes`, which `val_bytes()` borrows verbatim, so
-      // every real GPS path stays byte-identical. NOTE: `convert_exif_text`'s
-      // ASCII branch renders an invalid-UTF-8 payload byte via
-      // `from_utf8_lossy` (U+FFFD) whereas bundled ExifTool's JSON writer
-      // emits `?` — a separate, pre-existing charset-rendering gap (#200), NOT
-      // a byte-walk loss, out of #198 scope.
+      // every real GPS path stays byte-identical. `convert_exif_text` now routes
+      // each invalid-UTF-8 payload byte through `FixUTF8` → `?` (matching
+      // bundled ExifTool's JSON writer), not the `from_utf8_lossy` U+FFFD it
+      // used pre-#200.
       let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
@@ -11781,6 +13661,203 @@ fn emit_int_label<S: ExifSink>(
   }
 }
 
+/// The single value ExifTool's `ReadValue` hands a scalar EXIF conv, modelling
+/// the shape-specific `Get…` read for the tags whose `RoundFloat(n/d, sig)`
+/// rounding is a property of the *rational* read alone (`ExposureTime`,
+/// `ShutterSpeedValue`, `ApertureValue`/`MaxApertureValue`).
+///
+/// ExifTool's `RoundFloat($num/$den, $sig)` rounding (`ExifTool.pm:6098`/`6105`/
+/// `6112`/`6119`) is applied by `GetRational32*`/`GetRational64*` — the rational
+/// reader — NOT as a post-coercion step. A tag stored as a different on-disk
+/// shape is read by its own getter (a FLOAT/DOUBLE by `GetFloat`/`GetDouble`, an
+/// integer by `Get…u`, `ExifTool.pm:6085-6086`) WITHOUT that rounding. And the
+/// rational reader returns the bare word `'undef'` (numerator 0) / `'inf'`
+/// (numerator ≠ 0) for a zero denominator (`… or return $ratNumer ? 'inf' :
+/// 'undef'`), NOT a float.
+///
+/// `ReadValue` joins a COUNT>1 value with single spaces (`ExifTool.pm:6330`
+/// `return join(' ', @vals) if @vals > 1`) — each element first reduced to its
+/// own `Get…` read (`@vals`: a rational element is its `RoundFloat`-rounded
+/// decimal or the `inf`/`undef` word; an int/float element its native scalar
+/// string). The joined `$val` then carries a space, so `IsFloat($val)` is FALSE
+/// and an arithmetic ValueConv numifies only its LEADING token (Perl's string→
+/// number coercion takes the leading numeric prefix). This enum therefore covers
+/// EVERY `RawValue` shape the EXIF value path produces:
+///   * a single `Rational` with a non-zero denominator → [`Self::Finite`] of the
+///     `RoundFloat(n/d, sig)`-rounded quotient (`exiftool_val_str` re-parsed,
+///     carrying the rational's own 7-/10-sig width — the dominant EXIF apex
+///     width is `rational64` ⇒ the 10-sig `RoundFloat($num/$den, 10)`);
+///   * a single `Rational` with a zero denominator → [`Self::Degenerate`] of the
+///     `inf`/`undef` word (each consuming arm renders it per its own ValueConv:
+///     `ExposureTime` emits the word verbatim, `ShutterSpeedValue`'s
+///     `IsFloat($val)` guard yields `0`, `ApertureValue`'s unguarded `2 **`
+///     numifies the word — `inf`→∞, `undef`→0);
+///   * a single non-rational shape (crafted FLOAT/DOUBLE `[f]`, or integer
+///     `U64[n]`/`I64[n]`) → [`Self::Scalar`] carrying BOTH the EXACT `ReadValue`
+///     token (the UNROUNDED native scalar — `Get64u`/`Get64s`'s exact integer
+///     even above `2**53`, `GetFloat`/`GetDouble`'s `%.15g` / titlecase
+///     `Inf`/`-Inf`/`NaN`) AND its numeric `f64` value, so `ExposureTime`'s
+///     `-n`/verbatim keeps the exact token while the apex `2**` ValueConvs
+///     numify the value (#385);
+///   * a COUNT>1 value of ANY numeric shape (multi `Rational`/`U64`/`I64`/`F64`)
+///     → [`Self::Joined`] carrying BOTH the space-joined `$val` (the verbatim
+///     `ReadValue` string — each element rendered as `emit_raw`/`GetRational`
+///     would) AND the Perl-numified leading token (the first element's `Get…`
+///     read coerced to `f64`: a finite quotient/scalar, `undef`→0, `inf`→∞),
+///     so the `IsFloat`-false PrintConv (`ExposureTime`) emits the join verbatim,
+///     the `IsFloat`-guarded ValueConv (`ShutterSpeedValue`) collapses to `0`,
+///     and the unguarded `2 **` ValueConv (`ApertureValue`) exponentiates the
+///     leading token — each byte-identical to bundled `exiftool`;
+///   * a non-scalar shape (`Text`/`Bytes`) or an EMPTY (count-0) numeric list →
+///     `None` (no scalar element), so the caller falls back to [`emit_raw`].
+enum RationalRead {
+  /// A finite scalar value: the `RoundFloat`-rounded quotient of a single
+  /// `Rational`. This is the numeric `$val` an arithmetic ValueConv
+  /// (`2 ** -$val`, `2 ** ($val/2)`) consumes, and the value
+  /// `PrintExposureTime`/`-n` renders.
+  ///
+  /// A single NON-rational scalar (`U64`/`I64`/`F64`) is [`Self::Scalar`]
+  /// instead — it must preserve the EXACT `ReadValue` token (an `int64u`/`int64s`
+  /// above `2**53` would lose its exact integer through an `f64` cast, and a
+  /// non-finite `F64` its titlecase print word) alongside the numeric value the
+  /// apex arithmetic consumes (#385).
+  Finite(f64),
+  /// A single NON-rational on-disk scalar (`U64`/`I64`/`F64`), carrying BOTH the
+  /// EXACT `ReadValue` token (`&$proc` = `Get64u`/`Get64s`/`GetFloat`/`GetDouble`,
+  /// `ExifTool.pm:6322-6331`) AND the numeric value (#385). `ReadValue` returns
+  /// the bare native scalar — `Get64u`/`Get64s` an EXACT integer (Perl 64-bit IV,
+  /// never scientific even above `2**53`), `GetFloat`/`GetDouble` the NV that
+  /// stringifies `%.15g` (titlecase `Inf`/`-Inf`/`NaN` when non-finite). The
+  /// shapes differ:
+  ///   * a verbatim/`-n` PrintConv (`ExposureTime`) emits the `token` (the exact
+  ///     integer, the `%.15g` float, or the titlecase non-finite word) — NOT the
+  ///     `f64`-cast value, so a `>2**53` integer stays exact;
+  ///   * `PrintExposureTime` (`ExposureTime` print) IsFloat-gates the token
+  ///     (`Exif.pm:5704`): an integer/finite-float token (`IsFloat` true) is
+  ///     `%.1f`/`1/N`-formatted on the NUMIFIED `value`; a non-finite word token
+  ///     (`IsFloat` false) is returned verbatim — Perl's titlecase `Inf` casing;
+  ///   * an arithmetic ValueConv (`ShutterSpeedValue`/`ApertureValue`) consumes
+  ///     the numeric `value` (Perl numifies `$val`: the exact integer's `f64`,
+  ///     `Inf`→∞, `NaN`→NaN) and is itself `IsFloat`-guarded
+  ///     (`ShutterSpeedValue`) or not (`ApertureValue`).
+  ///
+  /// `value.is_finite()` is exactly `IsFloat(token)` here: a finite value always
+  /// yields an integer/finite-float token (`IsFloat` true), and the only way to a
+  /// non-finite value is a non-finite `F64`, whose token is the `IsFloat`-false
+  /// word. So the consuming arms gate on `value.is_finite()`.
+  Scalar {
+    /// The EXACT `ReadValue` scalar token — the exact integer string for
+    /// `U64`/`I64` (NOT `f64`-cast, so `>2**53` stays exact), the `%.15g` render
+    /// for a finite `F64`, the titlecase `Inf`/`-Inf`/`NaN` word for a non-finite
+    /// `F64`.
+    token: String,
+    /// The numeric `value` the apex arithmetic numifies (the integer's `f64`, the
+    /// float verbatim, `+∞`/`NaN` for a non-finite `F64`).
+    value: f64,
+  },
+  /// A single `Rational` with a zero denominator: `GetRational*` returned the
+  /// bare word `"undef"` (numerator 0) or `"inf"` (numerator ≠ 0 — always
+  /// `'inf'`, never `'-inf'`). The consuming arm decides how its ValueConv treats
+  /// the non-float word.
+  Degenerate(&'static str),
+  /// A COUNT>1 numeric value: the space-joined `$val` `ReadValue` returns
+  /// (`join(' ', @vals)`, each element a `Get…`-read string), plus the
+  /// `leading` token Perl numifies (the first element's `Get…` read as an
+  /// `f64`). The join carries a space ⇒ `IsFloat($val)` is false, so each
+  /// consuming arm decides: a verbatim-string PrintConv emits `joined`, an
+  /// `IsFloat`-guarded ValueConv collapses to `0`, an unguarded `2 **`
+  /// ValueConv exponentiates `leading`.
+  Joined {
+    /// The verbatim space-joined `$val` (`ReadValue`'s `join(' ', @vals)`).
+    joined: String,
+    /// The first element's `Get…` read coerced to `f64` (Perl's numify of the
+    /// join's leading token): a finite quotient/native scalar, `undef`→`0.0`,
+    /// `inf`→`+∞`.
+    leading: f64,
+  },
+}
+
+/// Read a [`RawValue`] as the single `$val` ExifTool's `ReadValue` hands a
+/// scalar EXIF conv, with the shape-specific `RoundFloat`-is-a-rational-read
+/// semantics and the count>1 space-join (see [`RationalRead`]). `None` for a
+/// value with no scalar element (an empty numeric list or a `Bytes`/`Text`
+/// shape) — the caller falls back to [`emit_raw`].
+fn rational_read(raw: &RawValue) -> Option<RationalRead> {
+  // A COUNT>1 numeric value: `ReadValue` joins `@vals` with spaces
+  // (`ExifTool.pm:6330`). The joined `$val` carries a space ⇒ the consuming
+  // ValueConv sees a non-float; carry the verbatim join AND the Perl-numified
+  // leading token so each arm applies its own ValueConv faithfully.
+  if raw.count() > 1 {
+    let joined = value_space_joined(raw)?;
+    return Some(RationalRead::Joined {
+      joined,
+      leading: numify_leading(raw),
+    });
+  }
+  match raw {
+    // A single rational IS the `GetRational*` read: a finite quotient is
+    // `RoundFloat(n/d, sig)`-rounded (`exiftool_val_str` for a non-zero
+    // denominator == `format_g(n/d, sig)`), a zero denominator is the
+    // `inf`/`undef` word.
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => Some(if r.denominator() == 0 {
+      RationalRead::Degenerate(if r.numerator() != 0 { "inf" } else { "undef" })
+    } else {
+      // `exiftool_val_str` of a non-zero-denominator rational is the
+      // `RoundFloat(n/d, sig)` decimal; it always re-parses to a finite f64.
+      RationalRead::Finite(
+        r.exiftool_val_str()
+          .parse()
+          .unwrap_or_else(|_| rational_quotient(r)),
+      )
+    }),
+    // A single non-rational on-disk shape (crafted FLOAT/DOUBLE/integer) is read
+    // by its own getter WITHOUT the rational rounding — its native scalar,
+    // unrounded — carrying the EXACT `ReadValue` token (an `int64u`/`int64s`
+    // above `2**53` would lose its exact integer through an `f64` cast; a
+    // non-finite `F64` its titlecase print word) alongside the numeric value the
+    // apex arithmetic consumes (#385).
+    _ => scalar_token_value(raw).map(|(token, value)| RationalRead::Scalar { token, value }),
+  }
+}
+
+/// Perl's numeric coercion of the LEADING token of a count>1 value's joined
+/// `$val` (`ReadValue`'s `join(' ', @vals)`) — what an arithmetic ValueConv
+/// (`2 ** ($val / 2)`) consumes when `$val` carries a space (`IsFloat` false).
+/// Perl numifies a string by its leading numeric prefix, so `$val / 2` reduces
+/// to the FIRST element's `Get…` read coerced to `f64`. Computed from that
+/// first element directly (rather than re-parsing the join) so it is exactly
+/// the value Perl numifies for EVERY shape: a finite rational element is its
+/// `RoundFloat`-rounded quotient string re-parsed (byte-identical to the join's
+/// rounded leading token), a zero-denominator rational the word `undef`→`0.0`
+/// or `inf`→`+∞` (Perl: `"undef"+0 == 0`, `"inf"+0 == Inf`), an integer its
+/// value, a float its `%.15g` render re-parsed (matching the join's lossy
+/// leading token, which can differ from the raw `f64` in the last ULP). A
+/// count-0 list (no leading token) numifies the empty string ⇒ `0.0`.
+fn numify_leading(raw: &RawValue) -> f64 {
+  match raw {
+    RawValue::Rational(rs) => match rs.first() {
+      Some(r) if r.denominator() == 0 => {
+        if r.numerator() != 0 {
+          f64::INFINITY
+        } else {
+          0.0
+        }
+      }
+      // The rounded decimal string the join's leading token holds, re-parsed.
+      Some(r) => r.exiftool_val_str().parse().unwrap_or(0.0),
+      None => 0.0,
+    },
+    RawValue::U64(v) => v.first().map_or(0.0, |&n| n as f64),
+    RawValue::I64(v) => v.first().map_or(0.0, |&n| n as f64),
+    // The `%.15g` token the join holds, re-parsed — Perl numifies that text, not
+    // the raw `f64`, so round-trip through `format_g(_, 15)` to match it.
+    RawValue::F64(v) => v.first().map_or(0.0, |&f| {
+      crate::value::format_g(f, 15).parse().unwrap_or(0.0)
+    }),
+    RawValue::Text { .. } | RawValue::Bytes(_) => 0.0,
+  }
+}
+
 /// The first scalar of a [`RawValue`] as an `f64` — for the scalar-conv
 /// paths (FNumber/ExposureTime/etc.). A `Rational` yields its quotient.
 fn first_scalar(raw: &RawValue) -> Option<f64> {
@@ -11790,6 +13867,40 @@ fn first_scalar(raw: &RawValue) -> Option<f64> {
     RawValue::F64(v) => v.first().copied(),
     RawValue::Rational(rs) => rs.first().map(rational_quotient),
     _ => None,
+  }
+}
+
+/// A single NON-rational scalar (`U64`/`I64`/`F64`) as its EXACT `ReadValue`
+/// token AND its numeric `f64` value (#385) — `None` for a `Rational` (handled
+/// by the rational arm) or a non-scalar (`Bytes`/`Text`) or empty list.
+///
+/// The token mirrors `ReadValue`'s bare native scalar (`ExifTool.pm:6322-6331`,
+/// `return $vals[0]`):
+///   * `U64`/`I64` → the EXACT integer string (`Get64u`/`Get64s` is a Perl
+///     64-bit IV; even above `2**53` it stringifies exactly, never scientific —
+///     an `f64` cast would lose it);
+///   * a finite `F64` → `%.15g` ([`crate::value::format_g`] with precision 15,
+///     Perl's default NV stringification — the same render `emit_gated_f64`
+///     applies, so a finite-float scalar's `-n` is byte-unchanged);
+///   * a non-finite `F64` → Perl's titlecase `Inf`/`-Inf`/`NaN`
+///     ([`crate::value::perl_nonfinite_str`]) — the print word `PrintExposureTime`
+///     returns verbatim (`IsFloat` false).
+///
+/// The `value` is the numeric scalar the apex `2**` ValueConvs numify (an
+/// integer's `f64`, the float verbatim, `+∞`/`NaN` for a non-finite `F64`).
+#[cfg(feature = "alloc")]
+fn scalar_token_value(raw: &RawValue) -> Option<(String, f64)> {
+  match raw {
+    RawValue::U64(v) => v.first().map(|&n| (std::format!("{n}"), n as f64)),
+    RawValue::I64(v) => v.first().map(|&n| (std::format!("{n}"), n as f64)),
+    RawValue::F64(v) => v.first().map(|&f| {
+      let token = crate::value::perl_nonfinite_str(f).map_or_else(
+        || crate::value::format_g(f, 15),
+        std::string::ToString::to_string,
+      );
+      (token, f)
+    }),
+    RawValue::Rational(_) | RawValue::Text { .. } | RawValue::Bytes(_) => None,
   }
 }
 
@@ -13671,6 +15782,132 @@ mod tests {
     );
   }
 
+  /// THROUGH-THE-WALKER (`#381` Codex [medium]): a malformed PrintIM
+  /// SubDirectory (`0xc4a5`) in IFD0 surfaces ExifTool's `ProcessPrintIM`
+  /// warning at its EXACT `sub Warn` severity on the document diagnostic
+  /// channel. ExifTool's empty-block guard is `$et->Warn('Empty PrintIM data',
+  /// 1)` (PrintIM.pm:52) — the trailing `1` ⇒ MINOR, so `run_diagnostics`
+  /// renders `[minor] Empty PrintIM data`; the other guards
+  /// (`$et->Warn('Invalid PrintIM header')`, PrintIM.pm:60) are plain `Warn` ⇒
+  /// NORMAL (no prefix). Drive the FULL TIFF walker (`parse_exif_block`) then
+  /// the document `run_diagnostics` drain (the `sub Warn` analogue that applies
+  /// the prefix), not just `parse_version`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn printim_empty_block_warns_minor_through_the_walker() {
+    // A single IFD0 entry: PrintIM (0xc4a5), format undef (7), count 0 ⇒ size 0
+    // ⇒ INLINE, a zero-length value window. `ProcessPrintIM`'s `unless ($size)`
+    // fires ⇒ `$et->Warn('Empty PrintIM data', 1)` (minor).
+    let empty = entry(0xc4a5, 7 /* undef */, 0, [0u8; 4]);
+    let t = tiff_with_entries(&[empty]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // The document drain applies the `[minor] ` prefix from the ignorable level.
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert_eq!(
+      tm.first_warning(),
+      Some("[minor] Empty PrintIM data"),
+      "the empty-block guard is `Warn(.., 1)` ⇒ a [minor] warning; warnings = {:?}",
+      tm.warnings()
+    );
+  }
+
+  /// THROUGH-THE-WALKER companion to the empty-block test: a `0xc4a5` block with
+  /// a bad header surfaces a NORMAL (unprefixed) `Invalid PrintIM header`
+  /// (PrintIM.pm:60, plain `$et->Warn(msg)`), confirming only the empty case is
+  /// minor.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn printim_bad_header_warns_normal_through_the_walker() {
+    // PrintIM (0xc4a5), format undef (7), count 20 ⇒ size 20 (> 4) ⇒ OUT-OF-LINE
+    // at offset 26 (header 8 + count 2 + entry 12 + nextIFD 4). The 20 bytes do
+    // NOT start with "PrintIM" ⇒ `Invalid PrintIM header`.
+    let val_off: u32 = 26;
+    let bad = entry(0xc4a5, 7 /* undef */, 20, val_off.to_be_bytes());
+    let mut t = tiff_with_entries(&[bad]);
+    assert_eq!(t.len(), val_off as usize, "out-of-line region starts at 26");
+    t.extend_from_slice(&[0u8; 20]); // 20 bytes, header "PrintIM" absent
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert_eq!(
+      tm.first_warning(),
+      Some("Invalid PrintIM header"),
+      "a bad-header block is a NORMAL `Warn(msg)` (no [minor]); warnings = {:?}",
+      tm.warnings()
+    );
+  }
+
+  /// GPS-IFD REGRESSION (`#381` Codex [medium]): the `0xc4a5` PrintIM
+  /// SubDirectory lives ONLY in `%Exif::Main` (Exif.pm:3280), NEVER in
+  /// `%GPS::Main` — so a `0xc4a5` entry walked under the GPS table
+  /// ([`TableRef::Gps`], via [`parse_gps_block`]) must be treated as an ordinary
+  /// unknown GPS tag, NOT parsed as PrintIM. The gate was previously
+  /// `is_core_ifd()`, which ALSO matches `TableRef::Gps`, so a crafted GPS
+  /// `0xc4a5` would mis-parse: an EMPTY (count 0) block ⇒ a spurious `[minor]
+  /// Empty PrintIM data`, and a structurally-valid block ⇒ a spurious
+  /// `PrintIM:PrintIMVersion`. Both must be absent now that the gate is the
+  /// `%Exif::Main` table scope (`TableRef::Exif | TableRef::Interop`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn gps_ifd_c4a5_is_not_parsed_as_printim() {
+    // (a) A STRUCTURALLY-VALID PrintIM block (16 bytes: "PrintIM\0" header,
+    //     version "0300" at +8, num=0 at +14 ⇒ size 16 >= 16) at offset 26 in a
+    //     GPS top-level IFD. Under `%Exif::Main` this would push
+    //     `PrintIMVersion="0300"`; under `%GPS::Main` it must NOT (no PrintIM
+    //     SubDirectory there). `0xc4a5`, format undef (7), count 16 ⇒ OUT-OF-LINE.
+    let val_off: u32 = 26;
+    let valid = entry(0xc4a5, 7 /* undef */, 16, val_off.to_be_bytes());
+    let mut t = tiff_with_entries(&[valid]);
+    assert_eq!(t.len(), val_off as usize, "out-of-line region starts at 26");
+    t.extend_from_slice(b"PrintIM\0"); // 8-byte header
+    t.extend_from_slice(b"0300"); // version at +8
+    t.extend_from_slice(&[0u8, 0u8]); // +12 (unused)
+    t.extend_from_slice(&[0u8, 0u8]); // +14 num = 0 ⇒ size 16 >= 16 + 0
+    // Walk the TOP-LEVEL IFD as a GPS IFD (`TableRef::Gps`) — the CR3 `CMT4`
+    // path. Were the gate `is_core_ifd()`, this would parse as PrintIM.
+    let meta = parse_gps_block(&t).expect("valid TIFF");
+    assert!(
+      meta.printim_versions.is_empty(),
+      "a GPS-table 0xc4a5 must NOT be parsed as PrintIM (no PrintIMVersion); \
+       versions = {:?}",
+      meta.printim_versions
+    );
+    // No PrintIM warning either (the valid block emits none, but assert the
+    // channel is clear of any PrintIM diagnostic).
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta, &mut tm);
+    assert!(
+      !tm.warnings().iter().any(|w| w.contains("PrintIM")),
+      "no PrintIM diagnostic for a GPS-table 0xc4a5; warnings = {:?}",
+      tm.warnings()
+    );
+
+    // (b) An EMPTY (count 0 ⇒ inline, zero-length window) `0xc4a5` GPS entry —
+    //     the case that under the buggy `is_core_ifd()` gate hit
+    //     `ProcessPrintIM`'s `unless ($size)` ⇒ `$et->Warn('Empty PrintIM data',
+    //     1)`. The GPS table has no PrintIM SubDirectory ⇒ NO such warning.
+    let empty = entry(0xc4a5, 7 /* undef */, 0, [0u8; 4]);
+    let te = tiff_with_entries(&[empty]);
+    let meta_e = parse_gps_block(&te).expect("valid TIFF");
+    assert!(
+      meta_e.printim_versions.is_empty(),
+      "an empty GPS-table 0xc4a5 emits no PrintIMVersion; versions = {:?}",
+      meta_e.printim_versions
+    );
+    let mut tm_e = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(&meta_e, &mut tm_e);
+    assert!(
+      !tm_e
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Empty PrintIM data")),
+      "an empty GPS-table 0xc4a5 must NOT warn `[minor] Empty PrintIM data`; \
+       warnings = {:?}",
+      tm_e.warnings()
+    );
+  }
+
   #[test]
   #[cfg(feature = "alloc")]
   fn excessive_count_does_not_apply_to_string_or_undef() {
@@ -13932,12 +16169,14 @@ mod tests {
     Walker {
       data,
       order: ByteOrder::Big,
+      resolved_subdir_order: None,
       base: 0,
       value_offset_base: 0,
       entries: Vec::new(),
       warnings: Vec::new(),
       warnings_ignorable: Vec::new(),
       maker_note: None,
+      printim_versions: Vec::new(),
       captured_make: None,
       captured_model: None,
       chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
@@ -13946,7 +16185,14 @@ mod tests {
       page_count: 0,
       multi_page: false,
       dng_version: false,
+      captured_compression: None,
+      captured_subfile_type: None,
       file_type: None,
+      // `None` (matching `file_type`) so the white-box helper's A100 `0x014a`
+      // gate stays off by default — exactly the pre-change behaviour (the OLD
+      // `self.file_type == Some("TIFF")` check was likewise false for this
+      // helper). The end-to-end ARW A100 coverage drives `extract_info` instead.
+      base_file_type: None,
       // RAF-backed (the standalone-TIFF model the existing tests assume); the
       // no-RAF CTMD `0x8769` path is covered via `parse_ctmd_exif_ifd_redispatch`.
       no_raf: false,
@@ -14183,6 +16429,603 @@ mod tests {
     // mm"`, the value verbatim).
     let frac = RawValue::Rational(std::vec![crate::value::Rational::rational64(75, 2)]);
     assert_eq!(emit_conv(&frac, conv, true), "37.5 mm");
+  }
+
+  // -- #380: ExposureTime rounding is RATIONAL-READ-shape-specific -----------
+
+  /// A finite `rational64u` `ExposureTime` (`1/60`, the K-70 happy path) is
+  /// read via `GetRational64u` = `RoundFloat(n/d, 10)` (`ExifTool.pm:6114-6120`)
+  /// BEFORE the PrintConv: `-n` is the 10-sig-fig quotient `0.01666666667` (NOT
+  /// the full-precision `0.0166666666666667`), and `PrintExposureTime` of that
+  /// rounded value fractionizes to `1/60`. (The same rounded value feeds
+  /// `Composite:ShutterSpeed`/`LightValue`, kept byte-exact by the golden.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_finite_rational_rounds_to_10_sig_figs() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 60)]);
+    // print mode → `PrintExposureTime(0.01666666667)` → `"1/60"`.
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/60");
+    // `-n` mode → the 10-sig-fig-rounded f64 (in-gate ⇒ a bare number), NOT the
+    // unrounded `0.0166666666666667`.
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.016_666_666_67)),
+      "a finite rational ExposureTime is RoundFloat(n/d, 10)-rounded at -n"
+    );
+  }
+
+  /// A zero-denominator `rational64u` `ExposureTime` is NOT a float: the
+  /// rational reader returns the bare word `undef` (numerator 0) or `inf`
+  /// (numerator ≠ 0) — `... or return $ratNumer ? 'inf' : 'undef'`
+  /// (`ExifTool.pm:6118-6119`). `PrintExposureTime` returns a non-float input
+  /// verbatim (`Exif.pm:5704`), and `-n` is the same word. Rounding the raw
+  /// quotient unconditionally would coerce `0/0` to `NaN` and leak `"NaN"`;
+  /// the shape-specific rational read preserves the faithful token.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_zero_denominator_rational_keeps_undef_inf_token() {
+    // `0/0` → the word `undef` (both print and `-n`), a quoted JSON string.
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(emit_conv(&undef, Conv::ExposureTime, true), "undef");
+    assert_eq!(emit_conv(&undef, Conv::ExposureTime, false), "undef");
+    // `1/0` (numerator ≠ 0) → the word `inf`.
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(emit_conv(&inf, Conv::ExposureTime, true), "inf");
+    assert_eq!(emit_conv(&inf, Conv::ExposureTime, false), "inf");
+  }
+
+  /// A crafted `ExposureTime` stored as a FLOAT/DOUBLE (the tag has no `Format`
+  /// override forcing rational64) is read by `GetFloat`/`GetDouble`
+  /// (`ExifTool.pm:6085-6086`) WITHOUT the rational read's `RoundFloat(n/d, 10)`.
+  /// So `-n` keeps the full-precision scalar (`0.0166666666666667`), NOT the
+  /// 10-sig-fig `0.01666666667` the over-broad R1 fix would have produced. The
+  /// integer path is likewise unrounded (a no-op for whole values).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    // A 16-significant-digit float ExposureTime. `-n` renders `%.15g` =
+    // `0.0166666666666667` (in-gate ⇒ a bare number) — the UNROUNDED value. The
+    // rational-read rounding would instead give `0.01666666667`.
+    let raw = RawValue::F64(std::vec![0.016_666_666_666_666_7]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.016_666_666_666_666_7)),
+      "a float/double ExposureTime must NOT be rational-rounded at -n"
+    );
+    // print mode → `PrintExposureTime` of the unrounded scalar still fractionizes
+    // to `1/60` (both round and unrounded collapse there).
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/60");
+  }
+
+  // -- #385: a single non-rational scalar preserves its EXACT ReadValue token --
+  //
+  // `ReadValue` returns the bare native scalar for a count-1 non-rational shape
+  // (`ExifTool.pm:6322-6331`, `return $vals[0]`): `Get64u`/`Get64s` an EXACT Perl
+  // 64-bit integer (never scientific, even above `2**53`), `GetFloat`/`GetDouble`
+  // the NV stringified `%.15g` (titlecase `Inf`/`-Inf`/`NaN` when non-finite).
+  // The pre-#385 helper cast EVERY count-1 non-rational scalar through `first_
+  // scalar` → `f64`, so a `>2**53` `int64u`/`int64s` `ExposureTime` lost its
+  // exact integer (rendered `9.00719925474099e15` instead of the exact token) and
+  // a non-finite `F64` mishandled the print casing. These pin the token-preserving
+  // [`RationalRead::Scalar`]. Reachable: the EXIF walker reads a known tag's
+  // on-disk format unless a `Format` override applies, and `ExposureTime`/
+  // `ShutterSpeedValue`/`ApertureValue` have none. Verified against bundled
+  // `exiftool` 13.59 (`ReadValue` + `IsFloat` + `PrintExposureTime` + the apex
+  // ValueConvs).
+
+  /// A crafted `int64u` `ExposureTime` above `2**53` (`9007199254740993`,
+  /// malformed format / BigTIFF) reads via `Get64u` as the EXACT integer: `-n` is
+  /// the exact integer TOKEN, NOT the `f64`-cast `9.00719925474099e15` (the
+  /// pre-#385 scientific render). `EscapeJSON` quotes a `>15`-digit integer, so
+  /// the value is a JSON STRING `"9007199254740993"` (byte-identical to bundled).
+  /// Print `PrintExposureTime`: `IsFloat("9007199254740993")` is TRUE (the regex
+  /// matches a bare integer) ⇒ `sprintf("%.1f", $val)` NUMIFIES `$val` to `f64`
+  /// and strips `.0` → `9007199254740992` (the `f64`-rounded value, exactly what
+  /// bundled emits in print mode — `2**53` is the f64 integer limit).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_int64u_above_2pow53_keeps_exact_token() {
+    let raw = RawValue::U64(std::vec![9_007_199_254_740_993]);
+    // `-n`: the EXACT integer token, quoted (16 digits ⇒ out of the EscapeJSON
+    // gate). NOT `9.00719925474099e15`.
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "9007199254740993",
+      "a >2**53 int64u ExposureTime keeps its exact integer token at -n, not f64-scientific"
+    );
+    // print: `IsFloat` true ⇒ `sprintf(\"%.1f\", numify($val))` ⇒ the f64-rounded
+    // `9007199254740992` (== bundled `PrintExposureTime`).
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "9007199254740992"
+    );
+  }
+
+  /// A crafted `int64s` `ExposureTime` below `-2**53` (`-9007199254740993`) reads
+  /// via `Get64s` as the EXACT signed integer: `-n` is the exact token
+  /// `"-9007199254740993"` (quoted — `>15` significant digits), NOT the
+  /// `f64`-scientific `-9.00719925474099e15`. Print numifies to the f64-rounded
+  /// `-9007199254740992`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_int64s_below_neg_2pow53_keeps_exact_token() {
+    let raw = RawValue::I64(std::vec![-9_007_199_254_740_993]);
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "-9007199254740993",
+      "a <-2**53 int64s ExposureTime keeps its exact signed integer token at -n"
+    );
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "-9007199254740992"
+    );
+  }
+
+  /// A non-finite `F64` `ExposureTime` (a crafted double-stored `+Inf`/`-Inf`/
+  /// `NaN`) stringifies (Perl NV) as the titlecase word `Inf`/`-Inf`/`NaN`.
+  /// `IsFloat` is FALSE for that word ⇒ `PrintExposureTime` returns it verbatim
+  /// (`Exif.pm:5704`) — Perl's TITLECASE casing, NOT Rust's lowercase `inf`. `-n`
+  /// is the same word. Both modes emit the titlecase word, quoted (out of the
+  /// number gate).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_non_finite_f64_uses_titlecase_print_word() {
+    for (f, word) in [
+      (f64::INFINITY, "Inf"),
+      (f64::NEG_INFINITY, "-Inf"),
+      (f64::NAN, "NaN"),
+    ] {
+      let raw = RawValue::F64(std::vec![f]);
+      assert_eq!(
+        emit_conv(&raw, Conv::ExposureTime, true),
+        word,
+        "a non-finite F64 ExposureTime prints Perl's titlecase {word}, not lowercase"
+      );
+      assert_eq!(
+        emit_conv(&raw, Conv::ExposureTime, false),
+        word,
+        "a non-finite F64 ExposureTime -n is the titlecase {word} token"
+      );
+    }
+  }
+
+  /// A finite `F64` `ExposureTime` is byte-UNCHANGED by #385: the token is still
+  /// `%.15g` (`format_g(_, 15)`, exactly what the pre-#385 `emit_gated_f64`
+  /// emitted), so `-n` keeps the unrounded full-precision scalar and print
+  /// fractionizes the numified value. (Pins that token preservation did not
+  /// perturb the finite-float scalar path.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_finite_f64_scalar_token_is_unchanged() {
+    use crate::value::TagValue;
+    let raw = RawValue::F64(std::vec![0.005]);
+    // print → `1/200` (`$val < 0.25001` fraction branch on the numified value).
+    assert_eq!(emit_conv(&raw, Conv::ExposureTime, true), "1/200");
+    // `-n` → `%.15g` = `0.005`, an in-gate bare number (`F64(0.005)`), byte-equal
+    // to the pre-#385 `emit_gated_f64` render.
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ExposureTime,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(map.get("IFD0", "T"), Some(&TagValue::F64(0.005)));
+  }
+
+  /// The apex `2**` ValueConvs consume the NUMERIC value of a single non-rational
+  /// scalar (#385) — token preservation must not break the apex math. A SMALL
+  /// `int32u` apex still exponentiates: `ShutterSpeedValue` `8` →
+  /// `IsFloat && abs<100 ? 2**(-8) : 0` = `0.00390625` (print `PrintExposureTime`
+  /// → `1/256`); `ApertureValue` `8` → `2**(8/2)` = `16.0` (print `%.1f` → `16.0`).
+  /// A `>2**53` integer apex still numifies to `f64`: `ShutterSpeedValue` `abs >=
+  /// 100` ⇒ `0`; `ApertureValue` `2**(4.5e15)` ⇒ `Inf`. All byte-identical to
+  /// bundled.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apex_scalar_numeric_value_still_exponentiates() {
+    use crate::value::TagValue;
+    let stored = |raw: &RawValue, conv: Conv, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value("IFD0", "T", raw, conv, ByteOrder::Big, print, &mut map).unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // -- small int apex does real arithmetic on the numeric value --
+    let small = RawValue::U64(std::vec![8]);
+    // ShutterSpeedValue 8 → 2**(-8) = 0.00390625; print → `1/256`.
+    assert_eq!(emit_conv(&small, Conv::ShutterSpeedApex, true), "1/256");
+    assert_eq!(
+      stored(&small, Conv::ShutterSpeedApex, false),
+      Some(TagValue::F64(0.003_906_25))
+    );
+    // ApertureValue 8 → 2**(8/2) = 16; print `%.1f` → `16.0` (JSON-faithful
+    // `F64(16.0)`; `-n` is the in-gate integer token `16` ⇒ `U64(16)`).
+    assert_eq!(
+      stored(&small, Conv::ApertureApex, true),
+      Some(TagValue::F64(16.0))
+    );
+    assert_eq!(
+      stored(&small, Conv::ApertureApex, false),
+      Some(TagValue::U64(16))
+    );
+    // -- a >2**53 integer apex still numifies to f64 (the token doesn't gate the
+    // math) --
+    let big = RawValue::U64(std::vec![9_007_199_254_740_993]);
+    // ShutterSpeedValue: `abs(value) >= 100` ⇒ the `: 0` branch ⇒ `0`.
+    assert_eq!(emit_conv(&big, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&big, Conv::ShutterSpeedApex, true), "0");
+    // ApertureValue: `2**(9007199254740992/2)` overflows to `Inf` ⇒ `-n` is the
+    // non-finite `F64(Inf)`; print `%.1f` of `Inf` is the titlecase `"Inf"` word.
+    assert_eq!(
+      stored(&big, Conv::ApertureApex, false),
+      Some(TagValue::F64(f64::INFINITY))
+    );
+    assert_eq!(
+      stored(&big, Conv::ApertureApex, true),
+      Some(TagValue::Str("Inf".into()))
+    );
+  }
+
+  // -- #380: the apex `2**` ValueConvs share the rational-read shape split ----
+  //
+  // `ShutterSpeedValue`/`ApertureValue`/`MaxApertureValue` exponentiate `$val`
+  // (the APEX), so the `RoundFloat(n/d, 10)` rational read must NOT be applied to
+  // a non-rational shape: a crafted FLOAT/DOUBLE-stored apex is read by
+  // `GetFloat`/`GetDouble` UNROUNDED, and the `2**` of the unrounded value differs
+  // in the low bits from the rounded-rational path (the value that also feeds
+  // `Composite:ShutterSpeed`/`Aperture`/`LightValue`). These pin the same
+  // shape-split the over-broad `first_scalar.map(round)` violated for `ExposureTime`.
+
+  /// A finite `rational64s` `ShutterSpeedValue` is the `GetRational64s` read =
+  /// `RoundFloat(n/d, 10)` BEFORE the ValueConv `2**(-$val)`: `16205/3734`
+  /// rounds to `4.339850027`, so `-n` is `2**(-4.339850027) = 0.0493827152239257`
+  /// (the 10-sig-fig path), and `PrintExposureTime` of that fractionizes to
+  /// `1/20`. NOT the full-precision `2**(-4.33985002678093) = 0.0493827152314243`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_finite_rational_rounds_before_2pow() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(16205, 3734)]);
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, true), "1/20");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ShutterSpeedApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.049_382_715_223_925_7)),
+      "a finite rational ShutterSpeedValue rounds (RoundFloat,10) before 2**(-val)"
+    );
+  }
+
+  /// A crafted FLOAT/DOUBLE `ShutterSpeedValue` (the apex stored full-precision)
+  /// is read by `GetFloat`/`GetDouble` WITHOUT the rational `RoundFloat(n/d, 10)`,
+  /// so `2**(-$val)` consumes the UNROUNDED apex: `-n` is `2**(-4.33985002678093)
+  /// = 0.0493827152314243`, byte-different from the rounded-rational
+  /// `0.0493827152239257` above. (The over-broad pre-fix rounded the float too.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    // The full-precision apex `16205/3734` as an on-disk double.
+    let raw = RawValue::F64(std::vec![16205.0 / 3734.0]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ShutterSpeedApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(0.049_382_715_231_424_3)),
+      "a float/double ShutterSpeedValue apex must NOT be rational-rounded before 2**(-val)"
+    );
+  }
+
+  /// A zero-denominator `ShutterSpeedValue` reads as the word `inf`/`undef`,
+  /// which is not a float ⇒ `IsFloat($val)` is false ⇒ the ValueConv's `: 0`
+  /// branch: `-n` and print are both `0` (`PrintExposureTime(0)` → `"0"`). The
+  /// over-broad path coerced the rational to `NaN`/`inf` first, but the
+  /// `IsFloat`-guarded conv collapses both to `0` regardless.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_zero_denominator_yields_zero() {
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(emit_conv(&undef, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&undef, Conv::ShutterSpeedApex, true), "0");
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(emit_conv(&inf, Conv::ShutterSpeedApex, false), "0");
+    assert_eq!(emit_conv(&inf, Conv::ShutterSpeedApex, true), "0");
+  }
+
+  /// A finite `rational64u` `ApertureValue` is the `GetRational64u` read =
+  /// `RoundFloat(n/d, 10)` BEFORE the ValueConv `2**($val/2)`: `16205/3734`
+  /// rounds to `4.339850027`, so `-n` is `2**(4.339850027/2) = 4.50000003760988`
+  /// (the active-golden value), print `%.1f` is `4.5`. NOT the full-precision
+  /// `2**(4.33985002678093/2) = 4.50000003726823`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_finite_rational_rounds_before_2pow() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![crate::value::Rational::rational64(16205, 3734)]);
+    assert_eq!(emit_conv(&raw, Conv::ApertureApex, true), "4.5");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_609_88)),
+      "a finite rational ApertureValue rounds (RoundFloat,10) before 2**(val/2)"
+    );
+  }
+
+  /// A crafted FLOAT/DOUBLE `ApertureValue` (the apex stored full-precision) is
+  /// read by `GetFloat`/`GetDouble` WITHOUT the rational `RoundFloat(n/d, 10)`,
+  /// so `2**($val/2)` consumes the UNROUNDED apex: `-n` is
+  /// `2**(4.33985002678093/2) = 4.50000003726823`, byte-different from the
+  /// rounded-rational `4.50000003760988` above.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_float_double_stored_is_not_rationally_rounded() {
+    use crate::value::TagValue;
+    let raw = RawValue::F64(std::vec![16205.0 / 3734.0]);
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_268_23)),
+      "a float/double ApertureValue apex must NOT be rational-rounded before 2**(val/2)"
+    );
+  }
+
+  /// A zero-denominator `ApertureValue` reads as the word `inf`/`undef`, which
+  /// the UNGUARDED `2**($val/2)` NUMIFIES the Perl way: `"undef"` → `0` ⇒
+  /// `2**(0/2) = 1`; `"inf"` → ∞ ⇒ `2**(∞/2) = Inf`. (`MaxApertureValue` shares
+  /// this conv.) Assertions are on the stored `TagValue` — the JSON writer's
+  /// faithful input (`F64(1.0)`→`1.0`, `Str("Inf")`→quoted `"Inf"`) — NOT the
+  /// `get_str` Display, which collapses `1.0`→`1` and lowercases `inf`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_zero_denominator_numifies_word() {
+    use crate::value::TagValue;
+    // Drive one tag through `emit_exif_value` in the given mode and take the
+    // stored `TagValue` (the value the JSON serializer renders).
+    let stored = |raw: &RawValue, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value(
+        "IFD0",
+        "T",
+        raw,
+        Conv::ApertureApex,
+        ByteOrder::Big,
+        print,
+        &mut map,
+      )
+      .unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // `0/0` → word `undef` → numifies to 0 → `2**0 = 1`. `-n`: the in-gate
+    // integer token `1` ⇒ `U64(1)`. Print `%.1f` → `"1.0"`, an in-gate
+    // non-integer ⇒ `F64(1.0)` (serialized as `1.0`, matching ExifTool's `1.0`).
+    let undef = RawValue::Rational(std::vec![crate::value::Rational::rational64(0, 0)]);
+    assert_eq!(stored(&undef, false), Some(TagValue::U64(1)));
+    assert_eq!(stored(&undef, true), Some(TagValue::F64(1.0)));
+    // `1/0` → word `inf` → numifies to ∞ → `2**∞ = Inf`. `-n`: the non-finite
+    // f64 ⇒ `F64(Inf)` (serialized titlecase `"Inf"`). Print `%.1f` of `Inf` is
+    // Perl's titlecase word `"Inf"` (NOT Rust's lowercase `"inf"`), out of the
+    // number gate ⇒ a quoted `Str("Inf")`.
+    let inf = RawValue::Rational(std::vec![crate::value::Rational::rational64(1, 0)]);
+    assert_eq!(stored(&inf, false), Some(TagValue::F64(f64::INFINITY)));
+    assert_eq!(stored(&inf, true), Some(TagValue::Str("Inf".into())));
+  }
+
+  // -- #380 (comprehensive close): the COUNT>1 space-join shape --------------
+  //
+  // `ReadValue` joins a count>1 value with single spaces (`ExifTool.pm:6330`
+  // `return join(' ', @vals) if @vals > 1`), each element first reduced to its
+  // own `Get…` read (a rational element its `RoundFloat`-rounded decimal or the
+  // `inf`/`undef` word). The joined `$val` carries a space, so `IsFloat($val)`
+  // is false and an arithmetic ValueConv numifies only its LEADING token. These
+  // pin every arm's faithful count>1 behaviour so a malformed multi-rational
+  // (or multi-int/multi-float) apex/exposure tag is not silently reduced to its
+  // leading quotient by `first_scalar` (the pre-fix bug). Verified against
+  // bundled `exiftool` 13.59 (`ReadValue` + each ValueConv).
+
+  /// A count>1 `ExposureTime` (`rational64u[2]` `1/60 1/30`): `$val` is the
+  /// space-joined read `"0.01666666667 0.03333333333"` (each element
+  /// `RoundFloat(n/d, 10)`). `IsFloat($val)` is false ⇒ `PrintExposureTime`
+  /// returns it verbatim (`Exif.pm:5704`) and `-n` is the same `$val`. Both
+  /// modes emit the join (the space is out of the number gate ⇒ a quoted
+  /// string). The pre-fix path emitted only the leading `0.01666666667`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_multi_rational_joins_with_spaces() {
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(1, 60),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, true),
+      "0.01666666667 0.03333333333"
+    );
+    assert_eq!(
+      emit_conv(&raw, Conv::ExposureTime, false),
+      "0.01666666667 0.03333333333"
+    );
+  }
+
+  /// A count>1 `ExposureTime` of an integer (`int32u[2]` `2 3`) and a float
+  /// (`double[2]`) shape likewise space-join verbatim (`2 3` / the `%.15g`
+  /// join), `IsFloat`-false in both modes — the shape table's multi-int /
+  /// multi-float exposure rows.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn exposure_time_multi_int_and_float_join_with_spaces() {
+    let ints = RawValue::U64(std::vec![2, 3]);
+    assert_eq!(emit_conv(&ints, Conv::ExposureTime, true), "2 3");
+    assert_eq!(emit_conv(&ints, Conv::ExposureTime, false), "2 3");
+    // `%.15g` join of `16205/3734` and `5.5` (the leading element is rendered to
+    // `4.33985002678093`, exactly as `ReadValue`'s `@vals[0]`).
+    let floats = RawValue::F64(std::vec![16205.0 / 3734.0, 5.5]);
+    assert_eq!(
+      emit_conv(&floats, Conv::ExposureTime, false),
+      "4.33985002678093 5.5"
+    );
+  }
+
+  /// A count>1 `ShutterSpeedValue` (`rational64s[2]` `3/1 4/1`): `$val` is the
+  /// space-joined `"3 4"`, `IsFloat($val)` is false ⇒ the ValueConv's `: 0`
+  /// branch ⇒ both modes are `0` (`PrintExposureTime(0)` → `"0"`), exactly the
+  /// degenerate-rational result. (The pre-fix path fed the leading `3` to
+  /// `2**(-3) = 0.125`, a wrong non-zero value.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn shutter_speed_apex_multi_rational_yields_zero() {
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(3, 1),
+      crate::value::Rational::rational64(4, 1),
+    ]);
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, true), "0");
+    assert_eq!(emit_conv(&raw, Conv::ShutterSpeedApex, false), "0");
+    // A multi-int ShutterSpeedValue (`6 7`) is likewise `IsFloat`-false ⇒ `0`.
+    let ints = RawValue::U64(std::vec![6, 7]);
+    assert_eq!(emit_conv(&ints, Conv::ShutterSpeedApex, false), "0");
+  }
+
+  /// A count>1 `ApertureValue`/`MaxApertureValue` ValueConv `2 ** ($val / 2)`
+  /// numifies the space-joined `$val`'s LEADING token (Perl's leading-numeric-
+  /// prefix coercion). `rational64u[2]` `16205/3734 5/1` → `$val =
+  /// "4.339850027 5"` → `2**(4.339850027/2) = 4.50000003760988` (the leading
+  /// element's `RoundFloat`-rounded read, byte-identical to the count-1 rational
+  /// `16205/3734`); print `%.1f` is `4.5`. (The pre-fix path read the same
+  /// leading quotient but via `first_scalar`'s UNROUNDED quotient — byte-wrong.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_multi_rational_numifies_leading_rounded_token() {
+    use crate::value::TagValue;
+    let raw = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(16205, 3734),
+      crate::value::Rational::rational64(5, 1),
+    ]);
+    assert_eq!(emit_conv(&raw, Conv::ApertureApex, true), "4.5");
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::ApertureApex,
+      ByteOrder::Big,
+      false,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(
+      map.get("IFD0", "T"),
+      Some(&TagValue::F64(4.500_000_037_609_88)),
+      "a count>1 ApertureValue numifies the leading RoundFloat-rounded token before 2**(val/2)"
+    );
+  }
+
+  /// The count>1 `ApertureValue` leading-token numify covers the degenerate +
+  /// multi-int leading elements exactly as Perl coerces a string scalar: a
+  /// leading `undef` (`0/0 …`) → `0` ⇒ `2**0 = 1`; a leading `inf` (`1/0 …`) →
+  /// ∞ ⇒ `2**∞ = Inf`; a multi-int leading `4` (`4 9`) → `2**(4/2) = 4`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn aperture_apex_multi_leading_degenerate_and_int() {
+    use crate::value::TagValue;
+    let stored = |raw: &RawValue, print: bool| -> Option<TagValue> {
+      let mut map = crate::tagmap::TagMap::new();
+      emit_exif_value(
+        "IFD0",
+        "T",
+        raw,
+        Conv::ApertureApex,
+        ByteOrder::Big,
+        print,
+        &mut map,
+      )
+      .unwrap();
+      map.get("IFD0", "T").cloned()
+    };
+    // Leading `undef` (`0/0`) → numifies to 0 → `2**0 = 1`.
+    let undef = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(0, 0),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(stored(&undef, false), Some(TagValue::U64(1)));
+    assert_eq!(stored(&undef, true), Some(TagValue::F64(1.0)));
+    // Leading `inf` (`1/0`) → numifies to ∞ → `2**∞ = Inf`.
+    let inf = RawValue::Rational(std::vec![
+      crate::value::Rational::rational64(1, 0),
+      crate::value::Rational::rational64(1, 30),
+    ]);
+    assert_eq!(stored(&inf, false), Some(TagValue::F64(f64::INFINITY)));
+    assert_eq!(stored(&inf, true), Some(TagValue::Str("Inf".into())));
+    // Multi-int leading `4` (`4 9`) → `2**(4/2) = 4`. `-n`: the in-gate integer
+    // token `4` ⇒ `U64(4)`; print `%.1f` → `"4.0"`, an in-gate non-integer ⇒
+    // `F64(4.0)` (the JSON-faithful value `4.0`; `get_str` Display would collapse
+    // it to `4`, so assert the stored `TagValue` like the degenerate test above).
+    let ints = RawValue::U64(std::vec![4, 9]);
+    assert_eq!(stored(&ints, false), Some(TagValue::U64(4)));
+    assert_eq!(stored(&ints, true), Some(TagValue::F64(4.0)));
   }
 
   // -- Fix 7: Conv::Version strips only TRAILING NULs ------------------------
@@ -19389,6 +22232,9 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         ByteOrder::Little,
         Some("SAMSUNG"),
         None,
+        // This crafted Type2 blob carries no `0x0035 PreviewIFD`; `None` keeps the
+        // SRW PreviewIFD descent inert (the test exercises SerialNumber).
+        None,
         print_conv,
       )
       .expect("a well-formed Samsung2 IFD ⇒ Some");
@@ -19425,6 +22271,493 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         None,
         "a non-word byte in the first five positions fails the Condition"
       );
+    }
+  }
+
+  // -- #331-P2 round 2: classic-TIFF SubIFD walk hardening (Codex findings) ---
+  //
+  // Shared little-endian TIFF builders for the `0x014a SubIFD` DoS bound
+  // (Finding 1), the `Compression`/`SubfileType` scalar-string DataMember
+  // semantics (Finding 2), and the Sony DSLR-A100 `0x014a` raw-data DEFER
+  // (Finding 3). Offsets are buffer-relative (`base == 0` for a standalone TIFF).
+  mod subifd_walk_hardening {
+    use super::*;
+
+    /// A 12-byte little-endian IFD entry `tag | format | count | value/offset`.
+    fn le_entry(tag: u16, format: u16, count: u32, value: [u8; 4]) -> [u8; 12] {
+      let mut e = [0u8; 12];
+      e[0..2].copy_from_slice(&tag.to_le_bytes());
+      e[2..4].copy_from_slice(&format.to_le_bytes());
+      e[4..8].copy_from_slice(&count.to_le_bytes());
+      e[8..12].copy_from_slice(&value);
+      e
+    }
+
+    /// Assemble a little-endian TIFF: `II*` header → IFD0 at offset 8 holding
+    /// `entries` (ascending tag id) with next-IFD = 0 → `trailing` appended right
+    /// after the IFD0 block (its first byte is at `ifd0_end`). Returns the buffer.
+    fn le_tiff(entries: &[[u8; 12]], trailing: &[u8]) -> (Vec<u8>, usize) {
+      let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      let n = entries.len() as u16;
+      t.extend_from_slice(&n.to_le_bytes());
+      for e in entries {
+        t.extend_from_slice(e);
+      }
+      t.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+      let ifd0_end = t.len();
+      t.extend_from_slice(trailing);
+      (t, ifd0_end)
+    }
+
+    /// A minimal valid SubIFD body (1 entry: `ImageWidth` `int32u` = `width`,
+    /// next-IFD = 0) — `2 + 12 + 4 = 18` bytes. Used as the shared target the
+    /// DoS-bound offsets point at.
+    fn subifd_body(width: u32) -> Vec<u8> {
+      let mut b: Vec<u8> = Vec::new();
+      b.extend_from_slice(&1u16.to_le_bytes()); // numEntries = 1
+      b.extend_from_slice(&le_entry(0x0100, 4, 1, width.to_le_bytes()));
+      b.extend_from_slice(&[0u8, 0, 0, 0]); // next-IFD = 0
+      b
+    }
+
+    /// FINDING 1 [high] — the `0x014a SubIFD` DoS bound. A malformed pointer with
+    /// a HUGE in-bounds count must NOT materialize the full `RawValue`/`Vec`/`$val`
+    /// string before the `MaxSubdirs => 10` cap: the overage warning is derived
+    /// from the integer count and only the first ten offsets are decoded. Here
+    /// `0x014a` is `int8u[200]` (200 one-byte offsets, all pointing at one shared
+    /// valid SubIFD body), so ExifTool's `@values - 10 == 190` ⇒ `Ignoring 190
+    /// SubIFD directories`, and only `SubIFD`..`SubIFD9` are walked (NOT
+    /// `SubIFD10`+). Mirrors `Exif.pm:6932-6936`.
+    #[test]
+    fn classic_subifd_count_bound_warns_and_caps_at_ten() {
+      // Layout: header(8) + IFD0[ count(2) + 2 entries(24) + next(4) = 30 ] ⇒
+      // ifd0_end = 38. Put the shared SubIFD body there; the 200-byte 0x014a value
+      // block follows. Every offset byte = 38 (the body), so each walked offset
+      // descends the SAME body.
+      let body = subifd_body(111);
+      let body_off = 38u8; // ifd0_end for a 2-entry IFD0
+      let mut trailing = body.clone();
+      // The out-of-line 0x014a value: 200 bytes, all == body_off.
+      let val_off = 38 + trailing.len();
+      trailing.extend(std::iter::repeat_n(body_off, 200));
+
+      // IFD0: 0x0100 ImageWidth (inert marker) + 0x014a SubIFD int8u[200] @ val_off.
+      let img = le_entry(0x0100, 4, 1, 500u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 1, 200, (val_off as u32).to_le_bytes());
+      let (data, ifd0_end) = le_tiff(&[img, subifd], &trailing);
+      assert_eq!(ifd0_end, 38, "2-entry IFD0 ends at 38");
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+
+      // `@values - MaxSubdirs == 200 - 10 == 190`.
+      assert!(
+        meta
+          .warnings()
+          .iter()
+          .any(|w| w == "Ignoring 190 SubIFD directories"),
+        "the overage warning must come from the integer count (200 - 10), got {:?}",
+        meta.warnings()
+      );
+      // The shared body emits ImageWidth=111 under SubIFD..SubIFD9 (the first ten),
+      // but NEVER SubIFD10+ — the cap held BEFORE decoding the full list.
+      let groups: Vec<String> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.tag_id() == 0x0100 && e.group().starts_with("SubIFD"))
+        .map(|e| e.group().to_string())
+        .collect();
+      assert!(
+        groups.iter().any(|g| g == "SubIFD") && groups.iter().any(|g| g == "SubIFD9"),
+        "the first ten offsets walk as SubIFD..SubIFD9, got {groups:?}"
+      );
+      assert!(
+        !groups
+          .iter()
+          .any(|g| g == "SubIFD10" || g == "SubIFD11" || g == "SubIFD199"),
+        "offsets beyond the tenth must be spliced out (no SubIFD10+), got {groups:?}"
+      );
+      assert_eq!(
+        groups.len(),
+        10,
+        "exactly ten SubIFD directories walked, got {groups:?}"
+      );
+    }
+
+    /// FINDING 2 [medium] — `Compression` (0x103) is a RawConv DataMember stored as
+    /// the FULL scalar `$val` STRING; the `0x111`/`0x117` JPEG-preview gate uses
+    /// STRING `eq '7'`. A count>1 `Compression` `int16u[2] = 7, 8` stringifies to
+    /// `"7 8"`, and `'7 8' eq '7'` is FALSE ⇒ the plain `StripOffsets` arm fires
+    /// (NOT `JpgFromRaw`). Ground-truthed on ExifTool 13.59 (`int16u[2]` `7, 8` →
+    /// `SubIFD2:StripOffsets`, `SubIFD2:Compression = "Unknown (7 8)"`). A stored
+    /// `Some(7)` integer would WRONGLY select `JpgFromRaw`.
+    #[test]
+    fn classic_subifd2_compression_count2_is_string_ne_seven() {
+      // IFD0 0x014a → three SubIFD offsets; SubIFD2 carries SubfileType=1 +
+      // Compression int16u[2]=7,8 + 0x0111/0x0117. Build the three bodies.
+      // SubIFD0 @ b0: SubfileType=1, ImageWidth (so it is a normal strip dir).
+      let mut sub0: Vec<u8> = Vec::new();
+      sub0.extend_from_slice(&1u16.to_le_bytes());
+      sub0.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      sub0.extend_from_slice(&[0u8, 0, 0, 0]);
+      // SubIFD1 @ b1: one inert leaf.
+      let sub1 = subifd_body(7);
+      // SubIFD2 @ b2: SubfileType=1, Compression int16u[2]=7,8 (inline: 4 bytes),
+      // 0x0111 StripOffsets=245, 0x0117 StripByteCounts=4.
+      let mut sub2: Vec<u8> = Vec::new();
+      sub2.extend_from_slice(&4u16.to_le_bytes());
+      sub2.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      // int16u[2] = 7, 8 stored inline (07 00 08 00).
+      sub2.extend_from_slice(&le_entry(0x0103, 3, 2, [0x07, 0x00, 0x08, 0x00]));
+      sub2.extend_from_slice(&le_entry(0x0111, 4, 1, 245u32.to_le_bytes()));
+      sub2.extend_from_slice(&le_entry(0x0117, 4, 1, 4u32.to_le_bytes()));
+      sub2.extend_from_slice(&[0u8, 0, 0, 0]);
+
+      // Layout: header(8) + IFD0[ count(2) + 2 entries(24) + next(4) = 30 ] = 38.
+      // Then the 0x014a value block (3 LONG offsets = 12 bytes) @ 38, then the
+      // three bodies.
+      let b0 = 38 + 12;
+      let b1 = b0 + sub0.len();
+      let b2 = b1 + sub1.len();
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(&(b0 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b1 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b2 as u32).to_le_bytes());
+      trailing.extend_from_slice(&sub0);
+      trailing.extend_from_slice(&sub1);
+      trailing.extend_from_slice(&sub2);
+
+      let img = le_entry(0x0100, 4, 1, 100u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 3, 38u32.to_le_bytes());
+      let (data, _) = le_tiff(&[img, subifd], &trailing);
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+
+      // The headline: SubIFD2 0x0111/0x0117 stay StripOffsets/StripByteCounts (NOT
+      // JpgFromRawStart/Length), and NO JpgFromRaw DataTag is synthesized.
+      let names: Vec<(&str, u16)> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.group() == "SubIFD2")
+        .map(|e| (e.name(), e.tag_id()))
+        .collect();
+      assert!(
+        names.iter().any(|(n, _)| *n == "StripOffsets")
+          && names.iter().any(|(n, _)| *n == "StripByteCounts"),
+        "count>1 Compression '7 8' ne '7' ⇒ SubIFD2 keeps plain StripOffsets/Counts, got {names:?}"
+      );
+      assert!(
+        !names
+          .iter()
+          .any(|(n, _)| n.starts_with("JpgFromRaw") || *n == "JpgFromRaw"),
+        "'7 8' must NOT select JpgFromRaw, got {names:?}"
+      );
+      assert!(
+        meta.entries().iter().all(|e| e.name() != "JpgFromRaw"),
+        "no JpgFromRaw DataTag for a count>1 Compression"
+      );
+    }
+
+    /// FINDING 2 control — the SINGLE-value `Compression == 7` (`int16u[1]`) path
+    /// STILL selects `JpgFromRaw` in SubIFD2 (`'7' eq '7'`), proving the
+    /// scalar-string change did not break the count-1 case the
+    /// `TIFF_jpgfromraw.tif` golden relies on.
+    #[test]
+    fn classic_subifd2_compression_count1_still_jpgfromraw() {
+      let mut sub2: Vec<u8> = Vec::new();
+      sub2.extend_from_slice(&4u16.to_le_bytes());
+      sub2.extend_from_slice(&le_entry(0x00fe, 4, 1, 1u32.to_le_bytes()));
+      // int16u[1] = 7 (inline 07 00 00 00).
+      sub2.extend_from_slice(&le_entry(0x0103, 3, 1, [0x07, 0x00, 0x00, 0x00]));
+      sub2.extend_from_slice(&le_entry(0x0111, 4, 1, 245u32.to_le_bytes()));
+      sub2.extend_from_slice(&le_entry(0x0117, 4, 1, 4u32.to_le_bytes()));
+      sub2.extend_from_slice(&[0u8, 0, 0, 0]);
+      // A single SubIFD chain: 0x014a → [SubIFD0, SubIFD1, SubIFD2]; SubIFD0/1 are
+      // tiny placeholders so SubIFD2 is the THIRD directory (DIR_NAME 'SubIFD2').
+      let sub0 = subifd_body(60);
+      let sub1 = subifd_body(7);
+      let b0 = 38 + 12;
+      let b1 = b0 + sub0.len();
+      let b2 = b1 + sub1.len();
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(&(b0 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b1 as u32).to_le_bytes());
+      trailing.extend_from_slice(&(b2 as u32).to_le_bytes());
+      trailing.extend_from_slice(&sub0);
+      trailing.extend_from_slice(&sub1);
+      trailing.extend_from_slice(&sub2);
+      let img = le_entry(0x0100, 4, 1, 100u32.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 3, 38u32.to_le_bytes());
+      let (data, _) = le_tiff(&[img, subifd], &trailing);
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD2" && e.name() == "JpgFromRawStart"),
+        "count-1 Compression '7' ⇒ SubIFD2 0x0111 = JpgFromRawStart (the golden path), got {:?}",
+        meta
+          .entries()
+          .iter()
+          .filter(|e| e.group() == "SubIFD2")
+          .map(|e| e.name())
+          .collect::<Vec<_>>()
+      );
+    }
+
+    /// FINDING 3 [medium] — the Sony DSLR-A100 `0x014a` is the RAW-DATA offset
+    /// (`A100DataOffset`), NOT a SubIFD: with `FILE_TYPE eq 'TIFF'`, `Make =~
+    /// /^SONY/`, `Model eq 'DSLR-A100'`, `SubfileType == 1`, `Compression == 6`, a
+    /// 4-byte `0x014a` value, and the offset NOT a valid IFD, ExifTool emits
+    /// `IFD0:A100DataOffset` and does NOT walk it (ground-truthed on 13.59). The
+    /// port must NOT descend it as a SubIFD (no `SubIFD:*` tags/warnings).
+    #[test]
+    fn classic_subifd_a100_raw_data_offset_not_walked() {
+      // IFD0 entries (ascending): 0x00fe SubfileType=1, 0x0103 Compression=6,
+      // 0x010f Make "SONY\0"(off), 0x0110 Model "DSLR-A100\0"(off), 0x014a → a
+      // NON-IFD location (a 0xFFFF entry-count = invalid per ValidateIFD).
+      // IFD0: count(2) + 5 entries(60) + next(4) = 66 ⇒ ifd0_end = 8 + 66 = 74.
+      let make_off = 74u32;
+      let model_off = make_off + 5; // "SONY\0" = 5 bytes
+      let raw_off = model_off + 10; // "DSLR-A100\0" = 10 bytes
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 1, raw_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A100\0");
+      // At raw_off: a ONE-entry IFD (`ImageWidth = 777`). `ValidateIFD` rejects it
+      // (`numEntries > 1` fails) ⇒ `SetARW` returns FALSE ⇒ A100DataOffset, so the
+      // walk MUST be skipped — yet WITHOUT the defer the walker would happily emit
+      // `SubIFD:ImageWidth = 777` (a structurally valid 1-entry directory). The
+      // discriminator: the offset is walkable, so a missing defer is observable.
+      // Ground-truthed on ExifTool 13.59 (A100 + 1-entry `0x014a` → `A100DataOffset`,
+      // no `SubIFD:*`).
+      trailing.extend_from_slice(&1u16.to_le_bytes());
+      trailing.extend_from_slice(&le_entry(0x0100, 4, 1, 777u32.to_le_bytes()));
+      trailing.extend_from_slice(&[0u8, 0, 0, 0]);
+      let (data, ifd0_end) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+      assert_eq!(ifd0_end, 74, "5-entry IFD0 ends at 74");
+
+      // The standalone-TIFF entry's DETECTION base `FILE_TYPE = 'TIFF'`
+      // (the `base_file_type` arg = the A100 gate's `$$self{FILE_TYPE} eq 'TIFF'`),
+      // exactly as the engine parses a `.tif`. See the sibling
+      // `a100_defer_fires_for_arw_subtype_end_to_end` test for the real ARW path
+      // where the finalized subtype is `ARW` yet the base stays `'TIFF'`.
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      // No SubIFD walk: NO entry in any SubIFD-family group, and the would-be
+      // `ImageWidth = 777` from the deferred offset never appears.
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .all(|e| !e.group().starts_with("SubIFD")),
+        "the A100 0x014a raw-data offset must NOT be walked as a SubIFD, got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .all(|e| !(e.tag_id() == 0x0100 && e.value_ref().raw() == &RawValue::U64(vec![777]))),
+        "the deferred raw-data offset's ImageWidth=777 must NOT be emitted"
+      );
+      // The IFD0 Make/Model/SubfileType/Compression still emit normally.
+      assert!(
+        meta.entry("Make").is_some_and(|e| e.group() == "IFD0"),
+        "IFD0:Make still emits"
+      );
+    }
+
+    /// FINDING 3 boundary — when the A100-shape's `0x014a` DOES point at a VALID
+    /// IFD (`ValidateIFD` true ⇒ `SetARW` returns 1), it IS a SubIFD and the walk
+    /// proceeds — so the DEFER is correctly scoped to the raw-data (invalid-IFD)
+    /// case only, never suppressing a real A100 IDC-edited SubIFD.
+    #[test]
+    fn classic_subifd_a100_valid_ifd_is_walked() {
+      // A valid SubIFD needs `numEntries > 1 and < 64`, every entry `format ∈
+      // 1..=13` + `count > 0`. Build a 2-entry body: ImageWidth + ImageHeight.
+      let mut valid_sub: Vec<u8> = Vec::new();
+      valid_sub.extend_from_slice(&2u16.to_le_bytes());
+      valid_sub.extend_from_slice(&le_entry(0x0100, 4, 1, 321u32.to_le_bytes()));
+      valid_sub.extend_from_slice(&le_entry(0x0101, 4, 1, 240u32.to_le_bytes()));
+      valid_sub.extend_from_slice(&[0u8, 0, 0, 0]);
+
+      let make_off = 74u32;
+      let model_off = make_off + 5;
+      let sub_off = model_off + 10; // valid IFD here
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      let subifd = le_entry(0x014a, 4, 1, sub_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A100\0");
+      trailing.extend_from_slice(&valid_sub);
+      let (data, _) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD" && e.tag_id() == 0x0100),
+        "a VALID A100 0x014a IFD (SetARW true) IS walked as SubIFD, got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+    }
+
+    /// FINDING 3 scope — a NON-A100 Sony shape (same gates but `Model` is NOT
+    /// `DSLR-A100`) is ALWAYS a SubIFD (`SetARW` returns 1 immediately), so the
+    /// `0x014a` is walked even though the offset is a raw-data-shaped non-IFD: the
+    /// DEFER must key on the A100 model, not merely the Sony+SubfileType+Compression
+    /// shape.
+    #[test]
+    fn classic_subifd_non_a100_sony_still_walks() {
+      // Same as the A100 raw-data case but Model = "DSLR-A700" ⇒ NOT deferred.
+      let make_off = 74u32;
+      let model_off = make_off + 5;
+      let raw_off = model_off + 10;
+      let subfile = le_entry(0x00fe, 4, 1, 1u32.to_le_bytes());
+      let comp = le_entry(0x0103, 3, 1, [0x06, 0x00, 0x00, 0x00]);
+      let make = le_entry(0x010f, 2, 5, make_off.to_le_bytes());
+      let model = le_entry(0x0110, 2, 10, model_off.to_le_bytes());
+      // 0x014a → a valid 2-entry SubIFD (so the walk has something to emit).
+      let subifd = le_entry(0x014a, 4, 1, raw_off.to_le_bytes());
+      let mut trailing: Vec<u8> = Vec::new();
+      trailing.extend_from_slice(b"SONY\0");
+      trailing.extend_from_slice(b"DSLR-A700\0");
+      // A valid SubIFD body at raw_off.
+      trailing.extend_from_slice(&2u16.to_le_bytes());
+      trailing.extend_from_slice(&le_entry(0x0100, 4, 1, 99u32.to_le_bytes()));
+      trailing.extend_from_slice(&le_entry(0x0101, 4, 1, 88u32.to_le_bytes()));
+      trailing.extend_from_slice(&[0u8, 0, 0, 0]);
+      let (data, _) = le_tiff(&[subfile, comp, make, model, subifd], &trailing);
+
+      let meta = parse_standalone_tiff_with_base(&data, 0, true, true, Some("TIFF"), Some("TIFF"))
+        .expect("TIFF parses");
+      assert!(
+        meta
+          .entries()
+          .iter()
+          .any(|e| e.group() == "SubIFD" && e.tag_id() == 0x0100),
+        "a non-A100 Sony 0x014a is a SubIFD (SetARW returns 1), got {:?}",
+        meta
+          .entries()
+          .iter()
+          .map(|e| (e.group(), e.name()))
+          .collect::<Vec<_>>()
+      );
+    }
+  }
+
+  // -- #331-P2: the DIRECT standalone-TIFF public API resolves JpgFromRaw -----
+  //
+  // The conformance golden `TIFF_jpgfromraw.tif` exercises only `extract_info`
+  // (the engine `AnyParser::Exif` path), which threads `file_type =
+  // Some("TIFF")` so the DNG/TIFF JPEG-preview gate (`$$self{TIFF_TYPE} =~
+  // /^(DNG|TIFF)$/`, `Exif.pm:635`/`:735`) holds and a SubIFD2 JPEG strip
+  // resolves `0x111`/`0x117` to `JpgFromRawStart`/`JpgFromRawLength` + the
+  // `JpgFromRaw` DataTag. The DIRECT lib entries [`parse_borrowed`] /
+  // [`ProcessExif::parse`] must do the same — they now pass `file_type =
+  // Some("TIFF")` too. This drives the SAME real fixture bytes through
+  // `parse_borrowed`/`parse` and asserts the SubIFD2 JpgFromRaw output the
+  // golden pins, so the direct public API the golden misses can no longer
+  // silently regress to plain `SubIFD2:StripOffsets`.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  mod direct_api_jpgfromraw {
+    use super::*;
+
+    /// The committed `TIFF_jpgfromraw.tif` conformance fixture's bytes (read at
+    /// `CARGO_MANIFEST_DIR`, the SAME file the golden harness loads).
+    fn fixture_bytes() -> Vec<u8> {
+      std::fs::read(std::concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/TIFF_jpgfromraw.tif"
+      ))
+      .expect("read TIFF_jpgfromraw.tif fixture")
+    }
+
+    /// The SubIFD2 offset/length/DataTag triple as the engine emits it (`-G1`,
+    /// PrintConv), for an [`ExifMeta`] from a direct lib entry.
+    fn subifd2(meta: &ExifMeta<'_>) -> (Option<String>, Option<String>, Option<String>) {
+      let mut map = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(
+        meta,
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+        &mut map,
+      );
+      (
+        map.get_str("SubIFD2", "JpgFromRawStart"),
+        map.get_str("SubIFD2", "JpgFromRawLength"),
+        map.get_str("SubIFD2", "JpgFromRaw"),
+      )
+    }
+
+    /// Assert the SubIFD2 JpgFromRaw triple matches the golden
+    /// (`JpgFromRawStart` 245, `JpgFromRawLength` 4, `JpgFromRaw` the 4-byte
+    /// binary placeholder) for the given direct-entry meta.
+    fn assert_jpgfromraw(meta: &ExifMeta<'_>, via: &str) {
+      // The structural leaves are in `entries()` directly: the SubIFD2 0x0111/
+      // 0x0117 resolved to JpgFromRaw* (NOT plain StripOffsets/Counts).
+      let names: Vec<&str> = meta
+        .entries()
+        .iter()
+        .filter(|e| e.group() == "SubIFD2")
+        .map(super::ExifEntry::name)
+        .collect();
+      assert!(
+        names.contains(&"JpgFromRawStart") && names.contains(&"JpgFromRawLength"),
+        "{via}: SubIFD2 0x0111/0x0117 must resolve to JpgFromRaw* (the file_type \
+         gate), got {names:?}"
+      );
+      assert!(
+        !names.contains(&"StripOffsets") && !names.contains(&"StripByteCounts"),
+        "{via}: the JpgFromRaw arm must EXCLUDE the plain StripOffsets arm, got {names:?}"
+      );
+      // The rendered values match the conformance golden exactly.
+      let (start, len, jpg) = subifd2(meta);
+      assert_eq!(
+        start.as_deref(),
+        Some("245"),
+        "{via}: SubIFD2:JpgFromRawStart"
+      );
+      assert_eq!(len.as_deref(), Some("4"), "{via}: SubIFD2:JpgFromRawLength");
+      assert_eq!(
+        jpg.as_deref(),
+        Some("(Binary data 4 bytes, use -b option to extract)"),
+        "{via}: SubIFD2:JpgFromRaw binary placeholder (the golden marker the \
+         direct API must also emit)"
+      );
+    }
+
+    #[test]
+    fn parse_borrowed_emits_subifd2_jpgfromraw() {
+      let data = fixture_bytes();
+      let meta = parse_borrowed(&data).expect("TIFF_jpgfromraw.tif parses via parse_borrowed");
+      assert_jpgfromraw(&meta, "parse_borrowed");
+    }
+
+    #[test]
+    fn process_exif_parse_emits_subifd2_jpgfromraw() {
+      let data = fixture_bytes();
+      let meta = FormatParser::parse(&ProcessExif, data.as_slice())
+        .expect("TIFF_jpgfromraw.tif parses via ProcessExif::parse");
+      assert_jpgfromraw(&meta, "ProcessExif::parse");
     }
   }
 

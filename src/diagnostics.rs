@@ -269,6 +269,22 @@ pub trait Diagnose {
   fn diagnostics(&self) -> Vec<Diagnostic> {
     Vec::new()
   }
+
+  /// Yield this `Meta`'s [`Diagnostic`]s when the `ExtractEmbedded` (`-ee`) mode
+  /// is `extract_embedded`. The default IGNORES the flag and delegates to
+  /// [`Self::diagnostics`] — only a format whose DOCUMENT-level diagnostic
+  /// stream differs by `-ee` overrides it. The lone such producer is QuickTime,
+  /// whose Pittasoft `3gf ` `EEWarn` ("the `-ee` option may find more tags") is
+  /// raised ONLY at no-`ee` (`!extract_embedded`) — under `-ee` ExifTool
+  /// processes every record and the warning is absent (QuickTimeStream.pl:2693).
+  /// This is the single seam the serializer's mode reaches the offset-ordered
+  /// `Warning` first-wins drain through, so the `EEWarn` participates in the
+  /// established priority-0 / file-position ordering rather than a side hook.
+  #[must_use]
+  fn diagnostics_with_options(&self, extract_embedded: bool) -> Vec<Diagnostic> {
+    let _ = extract_embedded;
+    self.diagnostics()
+  }
 }
 
 /// Drive any [`Diagnose`] into the [`TagMap`](crate::tagmap::TagMap) sink, in
@@ -349,14 +365,35 @@ pub trait Diagnose {
 /// faithfully, so the gate is a localized follow-up: a single
 /// `if ignore_minor && d.ignorable() >= 1 { continue }` here once an options
 /// surface exists. Default behaviour (option off) is unchanged + faithful.
+///
+/// The 2-arg convenience (no-`ee`, the faithful base mode) is a TEST-only
+/// shorthand: production always knows its `-ee` mode and drives
+/// [`run_diagnostics_with_options`] directly (the serializer's single
+/// mode-carrying entry), so the `-ee`-sensitive QuickTime `EEWarn` participates
+/// in the established priority-0 / file-position first-wins ordering.
+#[cfg(test)]
 pub(crate) fn run_diagnostics<D: Diagnose + ?Sized>(meta: &D, out: &mut crate::tagmap::TagMap) {
+  run_diagnostics_with_options(meta, false, out);
+}
+
+/// [`run_diagnostics`] threaded with the `ExtractEmbedded` (`-ee`) mode — the
+/// serializer's single mode-carrying entry to the document-level diagnostics
+/// drain. Routes through [`Diagnose::diagnostics_with_options`] so a format whose
+/// doc-level `Warning` stream depends on `-ee` (QuickTime's Pittasoft `3gf `
+/// `EEWarn`, raised only at no-`ee`) participates in the SAME priority-0 /
+/// file-position first-wins ordering as every other doc warning.
+pub(crate) fn run_diagnostics_with_options<D: Diagnose + ?Sized>(
+  meta: &D,
+  extract_embedded: bool,
+  out: &mut crate::tagmap::TagMap,
+) {
   // Document-level `WAS_WARNED` (`ExifTool.pm:5632`): the PREFIXED message in
   // first-occurrence order + its occurrence count. A `Vec` keeps the order
   // (the document surfaces the FIRST distinct message); the count drives the
   // ` [x$n]` suffix. Warning corpora are tiny (≤ a handful per file), so the
   // linear find is cheaper than a map + a side order list.
   let mut warned: Vec<WasWarned> = Vec::new();
-  for d in meta.diagnostics() {
+  for d in meta.diagnostics_with_options(extract_embedded) {
     match (d.group(), d.severity()) {
       // Document-level (`SET_GROUP1` unset ⇒ `ExifTool:Warning`/`:Error`).
       (None, Severity::Warn) => {

@@ -7,5 +7,6 @@
   "XMP-exif:Flash": {
     "Fired": true,
     "Mode": "On"
-  }
+  },
+  "Composite:Flash": "On, Fired"
 }]

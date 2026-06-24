@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "ARW_preview_image.arw",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "ARW",
+  "File:FileTypeExtension": "ARW",
+  "File:MIMEType": "image/x-sony-arw",
+  "File:ExifByteOrder": "II",
+  "IFD0:ImageWidth": 100,
+  "IFD0:ImageHeight": 80,
+  "IFD0:Make": "SONY",
+  "IFD0:Model": "ILCE-7M4",
+  "IFD0:PreviewImageStart": 102,
+  "IFD0:PreviewImageLength": 4,
+  "IFD0:PreviewImage": "(Binary data 4 bytes, use -b option to extract)",
+  "Composite:ImageSize": "100 80",
+  "Composite:Megapixels": 0.008
+}]

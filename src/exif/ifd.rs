@@ -864,6 +864,63 @@ fn ratio_f64(n: i64, d: i64) -> Option<f64> {
 // ReadValue — the faithful port of ExifTool.pm:6275-6321
 // ===========================================================================
 
+/// The NUMBER OF ELEMENTS [`read_value`] will decode for these inputs — equal to
+/// the count of `split ' '` tokens its `$val` yields — computed WITHOUT
+/// materializing the values, sharing `read_value`'s exact count-clamping
+/// (`ExifTool.pm:6285-6293` + the window re-shorten) so the two can never diverge.
+///
+/// Returns:
+///  - `None` — the `read_value` `return undef` cases (`$count < 1` after the
+///    `$len*$count > $size` re-clamp, or nothing fits the window);
+///  - `Some(0)` — ONLY the `count == 0 && size < len` empty-value path
+///    (`read_value` returns `Some(empty_value)`, whose `$val` is the empty string
+///    ⇒ zero `split ' '` tokens);
+///  - `Some(n)` (n >= 1) — the final clamped element count.
+///
+/// The DoS-bounded `0x014a SubIFD` parser ([`Walker::dispatch_classic_subifd`])
+/// reads this to derive the `MaxSubdirs` overage (`@values - 10`,
+/// `Exif.pm:6932`) from the integer count WITHOUT building the full
+/// `RawValue`/`Vec`/`$val` string a hostile, huge-but-in-bounds count would
+/// materialize.
+#[must_use]
+pub fn read_value_count(
+  data: &[u8],
+  offset: usize,
+  format: Format,
+  mut count: usize,
+  size: usize,
+) -> Option<usize> {
+  let len = format.byte_size();
+  if len == 0 {
+    return None; // Unknown format — `read_value` returns `None` likewise.
+  }
+  // `unless ($count) { ... $count = int($size / $len) }` (ExifTool.pm:6285-6288).
+  if count == 0 {
+    if size < len {
+      return Some(0); // `read_value` -> `Some(empty_value)`: an empty `$val`.
+    }
+    count = size / len;
+  }
+  // `if ($len * $count > $size) { $count = int($size / $len); ... }`
+  // (ExifTool.pm:6290-6293).
+  if len.saturating_mul(count) > size {
+    count = size / len;
+    if count < 1 {
+      return None; // `$count < 1 and return undef`.
+    }
+  }
+  // The window re-shorten (`read_value`'s `avail = window.len() / len`): bound the
+  // count by the bytes actually present from `offset`. `window.len() = min(len*count,
+  // data.len() - offset)` (for `offset <= data.len()`).
+  let window_end = offset.saturating_add(len.saturating_mul(count));
+  let window_len = window_end.min(data.len()).saturating_sub(offset);
+  let count = count.min(window_len / len);
+  if count == 0 {
+    return None; // `read_value`'s final `if count == 0 { return None }`.
+  }
+  Some(count)
+}
+
 /// Decode `count` values of `format` from `data` starting at `offset` — the
 /// faithful port of `ReadValue` (`ExifTool.pm:6275-6321`).
 ///
@@ -880,7 +937,7 @@ pub fn read_value(
   data: &[u8],
   offset: usize,
   format: Format,
-  mut count: usize,
+  count: usize,
   size: usize,
   order: ByteOrder,
 ) -> Option<RawValue> {
@@ -888,33 +945,21 @@ pub fn read_value(
   if len == 0 {
     return None; // Unknown format — `ReadValue` warns + len=1; walker pre-rejects.
   }
-  // `unless ($count) { ... $count = int($size / $len) }` (ExifTool.pm:6285-6288)
-  if count == 0 {
-    if size < len {
-      return Some(empty_value(format));
-    }
-    count = size / len;
-  }
-  // `if ($len * $count > $size) { $count = int($size / $len); ... }`
-  // (ExifTool.pm:6290-6293)
-  if len.saturating_mul(count) > size {
-    count = size / len;
-    if count < 1 {
-      return None; // `$count < 1 and return undef`
-    }
-  }
+  let count = match read_value_count(data, offset, format, count, size) {
+    // `read_value_count` returns `None` for the `read_value` `return undef` cases,
+    // `Some(0)` ONLY for the `count == 0 && size < len` empty-value path, and
+    // `Some(n)` (n>=1) for the clamped element count.
+    None => return None,
+    Some(0) => return Some(empty_value(format)),
+    Some(n) => n,
+  };
   // The byte window the values are read from. The IFD walker guarantees
   // `offset + len*count <= data.len()` for the inline (≤4-byte) case and the
-  // out-of-line case alike; defend anyway (Perl's unpack would just stop).
+  // out-of-line case alike; defend anyway (Perl's unpack would just stop). The
+  // count is already clamped to the window by `read_value_count`, so the slice
+  // never truncates here.
   let window_end = offset.saturating_add(len.saturating_mul(count));
   let window = data.get(offset..window_end.min(data.len()))?;
-  // Re-shorten if the slice truncated the window (mirrors Perl's `unpack`
-  // simply yielding fewer items for a short buffer).
-  let avail = window.len() / len;
-  let count = count.min(avail);
-  if count == 0 {
-    return None;
-  }
 
   // `count` is now `count.min(window.len() / len)` with `count >= 1`, so
   // `count * len <= window.len()`: every `window` access below is dominated by
@@ -1056,16 +1101,27 @@ fn empty_value(format: Format) -> RawValue {
   }
 }
 
-/// Decode a TIFF `string`-format byte slice to a Rust `String`. ExifTool
-/// treats `string` as bytes under the `CharsetEXIF` charset (default UTF-8 —
-/// `ExifTool.pm:6296-6300`); for byte-equivalence with the JSON oracle we
-/// keep valid UTF-8 verbatim and `from_utf8_lossy`-replace the rare invalid
-/// byte (no bundled camera fixture exercises a non-UTF-8 EXIF string).
+/// Decode a TIFF `string`/`utf8`-format byte slice to the display `String` that
+/// becomes the emitted `TagValue::Str` (Make/Model/Software/UserComment/…).
+///
+/// ExifTool treats `string` as bytes under the `CharsetEXIF` charset (default
+/// UTF-8 — `ExifTool.pm:6296-6300`) and applies its `FixUTF8` ONLY at the JSON
+/// serialization boundary (`exiftool:3823` `EscapeJSON` →
+/// `Image::ExifTool::XMP::FixUTF8(\$str)`, default `$bad = '?'`). exifast has no
+/// per-string FixUTF8 pass in the `-j` serializer (`JsonTagValue` emits a
+/// non-numeric `Str` verbatim), so the FixUTF8 must be applied HERE, at decode,
+/// where the resulting bytes are byte-identical to ExifTool's late JSON pass for
+/// any value that survives to output.
+///
+/// A valid-UTF-8 string passes through verbatim (the all-ASCII camera-fixture
+/// case is unchanged); an INVALID byte/sequence is replaced with the single
+/// ASCII `?` (`0x3F`) per `XMP.pm:2969` — NOT the Unicode REPLACEMENT CHARACTER
+/// U+FFFD that `from_utf8_lossy` would substitute (bundled `-j` on a crafted
+/// `Make = A\xFF\xFEB` emits `"A??B"`, not `"A\u{FFFD}\u{FFFD}B"`; #200).
+/// [`crate::convert::fix_utf8`] is the shared byte-walker port of `FixUTF8`
+/// (overlong/surrogate/non-character handling included).
 fn lossy_string(raw: &[u8]) -> std::string::String {
-  match core::str::from_utf8(raw) {
-    Ok(s) => s.to_string(),
-    Err(_) => std::string::String::from_utf8_lossy(raw).into_owned(),
-  }
+  crate::convert::fix_utf8(raw)
 }
 
 #[cfg(test)]
@@ -1451,5 +1507,43 @@ mod tests {
     let data = [0u8; 2];
     // 4-byte int32u, count 1, only 2 bytes ⇒ None.
     assert!(read_value(&data, 0, Format::Int32u, 1, 2, ByteOrder::Big).is_none());
+  }
+
+  /// `read_value_count` (the DoS-bound element-count probe, #331-P2 Finding 1)
+  /// must report EXACTLY what `read_value` decodes — the count of `split ' '`
+  /// tokens its `$val` yields — across every clamp branch, WITHOUT materializing
+  /// the values. Sweep representative shapes (incl. a large in-bounds count: the
+  /// DoS case) and assert the two never diverge.
+  #[test]
+  fn read_value_count_matches_read_value_element_count() {
+    let data = [0u8; 4096];
+    let order = ByteOrder::Little;
+    // (format, count, size) cases: exact-fit, count==0 derive, len*count>size
+    // re-clamp, window truncation, a HUGE in-bounds count (DoS), and a
+    // nothing-fits None.
+    let cases: &[(Format, usize, usize)] = &[
+      (Format::Int32u, 3, 12),     // exact: 3 elements.
+      (Format::Int16u, 0, 10),     // count==0 ⇒ 10/2 = 5.
+      (Format::Int8u, 0, 0),       // count==0, size<len ⇒ empty (0 tokens).
+      (Format::Int32u, 100, 12),   // len*count>size ⇒ re-clamp to 3.
+      (Format::Int8u, 4096, 4096), // HUGE in-bounds count: the DoS shape ⇒ 4096.
+      (Format::Int8u, 1000, 50),   // re-clamp to 50.
+      (Format::Int32u, 1, 2),      // nothing fits ⇒ None / 0.
+    ];
+    for &(format, count, size) in cases {
+      let probed = read_value_count(&data, 0, format, count, size);
+      let actual = read_value(&data, 0, format, count, size, order);
+      let actual_tokens = match &actual {
+        // The empty-value case (`count==0 && size<len`) ⇒ an empty `$val` ⇒ 0
+        // split tokens; `read_value_count` reports `Some(0)`.
+        Some(v) if v.count() == 0 => Some(0usize),
+        Some(v) => Some(v.count()),
+        None => None,
+      };
+      assert_eq!(
+        probed, actual_tokens,
+        "read_value_count != read_value element count for {format:?} count={count} size={size}"
+      );
+    }
   }
 }

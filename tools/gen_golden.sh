@@ -103,16 +103,37 @@ case "$FIX" in
   # its derived composites (`CircleOfConfusion`/`FOV`/`FocalLength35efl`/
   # `HyperfocalDistance`) stay excluded with it. Drop only the unported lens/
   # MakerNote Composites by name (NOT `Composite:all`). Precede the generic `XMP*`.
+  # #381: `Composite:Flash` is NOW emitted (the XMP-Flash bitmask from the
+  # structured `XMP-exif:Flash` `{Mode=2,…}` ⇒ 16 ⇒ "Off, Did not fire") — no
+  # longer excluded. The unported lens chain (`ScaleFactor35efl` +
+  # `CircleOfConfusion`/`FOV`/`FocalLength35efl`/`HyperfocalDistance`) stays
+  # dropped (the Canon-rational ScaleFactor deferral above).
   XMP.xmp)
-    EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl -x Composite:Flash \
+    EXCLUDE_ARR+=(-x Composite:ScaleFactor35efl \
                   -x Composite:CircleOfConfusion -x Composite:FOV \
                   -x Composite:FocalLength35efl -x Composite:HyperfocalDistance) ;;
+  # #381: `XMP_exif_printconv.xmp` / `XMP_nodeid_flash.xmp` carry ONLY a
+  # `Composite:Flash` (no other composite) — bundled emits it from the XMP flash
+  # fields ("No Flash" from the scalar `exif:Flash=5`; "On, Fired" from the
+  # `{Fired=True,Mode=1}` nodeID-recombined struct). exifast now emits the same,
+  # so these two keep `Composite:Flash` (NOT the generic `XMP*` `Composite:all`
+  # strip). They must precede the generic `XMP*` arm (first match wins).
+  XMP_exif_printconv.xmp | XMP_nodeid_flash.xmp) : ;;
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
   # The PNG raw-profile fixtures (#179): #133 PR 5 flips PNG into the Composite
   # allow-list, so exifast NOW emits `Composite:ImageSize`/`Megapixels` (from the
   # IHDR dimensions), byte-matching bundled. They are no longer excluded — the
   # decoded profile content (`XMP-*`) PLUS the two ported Composites are compared.
   PNG_rawprofile_*) : ;;
+  # The PNG crafted-input hardening fixtures (#180 post-IEND Trailer family-1
+  # group; #178-item1 nested-zXIf warning text): minimal 1x1 PNGs whose only
+  # variation is a malformed trailer/zXIf chunk. PNG is in the Composite
+  # allow-list, so the ported `Composite:ImageSize`/`Megapixels` are kept (no
+  # exclusion). The deferred-subsystem keys bundled adds — `Trailer:ICC_Profile`
+  # (no ICC_Profile sub-port) for the trailer-iCCP fixture and `PNG:zxIf` (the
+  # eXIf/zxIf binary-block placeholder the port suppresses) for the nested-zXIf
+  # fixture — stay in the golden; the conformance `check_excluding` drops them.
+  PNG_trailer_*|PNG_nested_*) : ;;
   # ── #133 PR 5 video/container Composite arms ─────────────────────────────────
   # The full-video-activation fixtures keep their ported Composites
   # (ImageSize/Megapixels/AvgBitrate/Rotation/Duration + the GPS-group SubDoc
@@ -130,27 +151,126 @@ case "$FIX" in
   # `ISOBMFF_iso5_brand.mp4`: the `mvex/mehd` `MovieFragmentSequence` container
   # tag stays unported; the ported `ImageSize`/`Megapixels` are kept.
   ISOBMFF_iso5_brand.mp4) EXCLUDE_ARR+=(-x MovieFragmentSequence) ;;
-  # `Pentax.avi`: the Pentax-AVI MakerNote tail tags + `Composite:LensID` are
-  # unported (the AVI Pentax MakerNote subset); the ported ImageSize/Megapixels/
-  # Duration are kept.
+  # `Pentax.avi`: #311 P1 ports the nine UNCONDITIONAL `%Pentax::Main` scalar
+  # leaves the K-x AVI exercises — `Hue` (0x0067), `HighLowKeyAdj` (0x006c),
+  # `MonochromeFilterEffect` (0x0073), `MonochromeToning` (0x0074),
+  # `CrossProcess` (0x007b), `SerialNumber` (0x0229), `Artist` (0x022e),
+  # `Copyright` (0x022f), `FirmwareVersion` (0x0230) — so they are NO LONGER
+  # excluded (the golden now carries them). #311 P2-P4 added the `0x003f LensRec`
+  # position-3 `ExtenderStatus` (the K-x AVI record is 4 bytes ⇒ 'Not attached'),
+  # so it is NO LONGER excluded either. Still deferred (binary SubDirectory /
+  # `$$self{AEInfoSize}==24`-conditional, P2/P3): the AEInfo size-24 leaves
+  # `AEMeteringMode2`/`AEWhiteBalance`/`LevelIndicator`. #381: `Composite:LensID`
+  # is NOW emitted (the unambiguous K-x LensType `7 222` ⇒ "smc PENTAX-DA L
+  # 18-55mm F3.5-5.6" IS the resolved name `$prt[0]`) — no longer excluded. The
+  # ported ImageSize/Megapixels/Duration are kept.
   Pentax.avi)
-    EXCLUDE_ARR+=(-x Composite:LensID -x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
-                  -x Pentax:Artist -x Pentax:Copyright -x Pentax:CrossProcess \
-                  -x Pentax:ExtenderStatus -x Pentax:FirmwareVersion -x Pentax:HighLowKeyAdj \
-                  -x Pentax:Hue -x Pentax:LevelIndicator -x Pentax:MonochromeFilterEffect \
-                  -x Pentax:MonochromeToning -x Pentax:SerialNumber) ;;
-  # `QuickTime_gopro_gpmf.mp4`: the QuickTime GPSCoordinates Composites (the
-  # `LocationInformation`-derived GPS) + the udta atoms this port does not decode
-  # (`ItemList:all` = ©too Encoder, `UserData:all` = LocationInformation) + the
-  # MOVIE-LEVEL `1QuickTime:HandlerType`/`HandlerVendorID` (the `1` prefix is
-  # ExifTool's family-1 qualifier — drops ONLY the moov-level "Metadata" handler
-  # exifast does not emit, KEEPING the `Track<N>:HandlerType` it does). The ported
+    EXCLUDE_ARR+=(-x Pentax:AEMeteringMode2 -x Pentax:AEWhiteBalance \
+                  -x Pentax:LevelIndicator) ;;
+  # `QuickTime_gopro_gpmf.mp4`: the `LocationInformation`-derived QuickTime GPS
+  # Composites (the same `%QuickTime::Composite` deferral as the SP2/anafi arms).
+  # #361 — the udta atoms ARE now decoded byte-exact: `ItemList:Encoder` (©too),
+  # `UserData:LocationInformation` (`loci`), and the moov-level
+  # `QuickTime:HandlerType` ("Metadata", `mdir`) + `HandlerVendorID` ("Apple",
+  # `appl`). So `ItemList:all`/`UserData:all`/`1QuickTime:Handler*` are NO LONGER
+  # excluded. exifast emits NO `Composite:GPS*` here (no XMP altitude to seed the
+  # XMP composite), so a golden-only `-x` suffices. The ported
   # ImageSize/Megapixels/AvgBitrate/Rotation are kept.
   QuickTime_gopro_gpmf.mp4)
     EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
-                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition \
-                  -x ItemList:all -x UserData:all \
-                  -x 1QuickTime:HandlerType -x 1QuickTime:HandlerVendorID) ;;
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude -x Composite:GPSPosition) ;;
+  # `QuickTime_gopro_hero6_gpmf.mp4` (#211): real GoPro HERO6 Black with the live
+  # `gpmd` timed-GPS/sensor track (Track4) + the `fdsc` identity track (Track5).
+  # UNLIKE `QuickTime_gopro_gpmf.mp4`, the moov-level GPS is the simple `udta`
+  # `GPSCoordinates` string (a `gps `-box ISO6709 → `UserData:GPSCoordinates`)
+  # that exifast DOES emit, so `UserData:all` is NOT dropped — only the
+  # `GPSCoordinates`-derived Composites (`GPSLatitude`/`Longitude`/`Altitude`/
+  # `AltitudeRef` + the dependent `GPSPosition`, the unported QuickTime.pm:8668
+  # GPSCoordinates Composite table) are dropped by name. There is no moov-level
+  # `meta` handler nor `ItemList`. The ported ImageSize/Megapixels/AvgBitrate/
+  # Rotation are kept. The `-ee` timed GPMF (Track4 sensor/GPS + Track5 fdsc) is
+  # byte-exact with the same exclusions (`EE=1`).
+  QuickTime_gopro_hero6_gpmf.mp4)
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSPosition) ;;
+  # `MP4_parrot_anafi.mp4` (#122): real Parrot Anafi drone MP4. exifast emits the
+  # full QuickTime/Track structure + the `udta` Parrot `manu`/`modl`
+  # (`UserData:Make`/`Model`) + the ported ImageSize/Megapixels/AvgBitrate/
+  # Rotation Composites byte-exact. The `-ee` output is byte-IDENTICAL to the
+  # base (the `mett` metadata track carries NO per-sample timed telemetry that
+  # bundled 13.59 surfaces — verified `-ee` == base), so there is no `.ee.*`
+  # golden.
+  #
+  # #361: the embedded XMP packet, the udta/meta ItemList + HandlerVendorID, the
+  # moov/meta Keys, the audio-track AudioKeys, and the `loci` LocationInformation
+  # are ALL now decoded byte-exact (the `uuid`-XMP routes to the shared XMP
+  # parser; the `udta/meta`(`mdir`) `ilst` resolves via `%QuickTime::ItemList`;
+  # the `moov/meta`(`mdta`) `keys` add CompatibleBrands/MajorBrand/Balance; the
+  # audio `trak/meta`(`mdta`) `keys` → `AudioKeys:Balance`; `loci` →
+  # `UserData:LocationInformation`). So NONE of those are excluded anymore.
+  #
+  # ONLY the `Composite:GPS*` remain deferred: bundled synthesizes
+  # `Composite:GPSLatitude`/`Longitude`/`Altitude`/`AltitudeRef` from the
+  # `%QuickTime::Composite` `GPSCoordinates`/`LocationInformation` tables
+  # (QuickTime.pm:8668-8728) — NOT ported — which OVERRIDE the XMP-derived ones;
+  # plus `Composite:GPSLatitudeRef`/`GPSLongitudeRef` (the XMP composites) and the
+  # composite-on-composite `Composite:GPSPosition`. This is the SAME port-wide
+  # `%QuickTime::Composite` GPS deferral the GoPro/SP2 arms carry (it changes ~12
+  # goldens and needs same-name composite override resolution). exifast DOES
+  # emit one XMP-derived `Composite:GPSAltitude` (`326.3 m Above Sea Level`,
+  # byte-exact vs bundled for an XMP-only file but OVERRIDDEN here by the QT
+  # `326.39 m`), so the conformance test drops the `Composite:GPS*` from BOTH
+  # sides via its `excluded` arg (a golden-only `-x` would leave exifast's
+  # diverging value); the golden itself keeps the `-x` so the bundled side
+  # matches.
+  # `MP4_audiokeys_mute.mp4` (#361 R4/R7): a CRAFTED audio-only MP4 whose `soun`
+  # `trak/meta`(`mdta`) `keys` carries the full `%QuickTime::AudioKeys` spread —
+  # `Balance` (shared with `%Keys`), `Mute` (the int8u `Off`/`On` PrintConv
+  # entry, the table's SOLE conv), three NON-AudioKeys keys (`make`,
+  # `creationdate`, `acme.totally.bogus.zzz`) that `ProcessKeys` emits via its
+  # unknown-key DERIVE path (`AudioKeys:Make`/`Creationdate`/`AcmeTotallyBogusZzz`,
+  # conv-less — NOT the `%Keys` date conversion), the `manu`/`modl` UserData
+  # cross-table ids (`AudioKeys:Make`=CanonManu / `Model`), AND (#361 R7) two RAW
+  # `0xA9`-prefixed 4-cc ids `\xa9day`/`\xa9too` whose raw bytes reach the
+  # ItemList cross-table → `AudioKeys:ContentCreateDate` (`%iso8601Date`) /
+  # `AudioKeys:Encoder`. No GPS/XMP, so only the ported `Composite:AvgBitrate` is
+  # synthesized and KEPT (byte-exact). `System:all` is the sole exclusion.
+  MP4_audiokeys_mute.mp4) EXCLUDE_ARR+=(-x System:all) ;;
+  # `MP4_blackvue_dr770x.mp4` (#362): the REAL BlackVue DR770X dashcam (Pittasoft).
+  # exifast decodes the top-level `free`/`%QuickTime::Pittasoft` SubDirectory
+  # (Copyright/StartTime/OriginalFileName + the PreviewImage/GPSLog binary
+  # placeholders + the no-`ee` first-record TimeCode/Accelerometer from `3gf `)
+  # AND the audio `chan` `%QuickTime::ChannelLayout` (LayoutFlags/
+  # AudioChannelTypes/NumChannelDescriptions), byte-exact at both `-j`/`-n`. The
+  # ported `Composite:ImageSize`/`Megapixels`/`AvgBitrate`/`Rotation` are KEPT
+  # (no GPS Composite — the `gps ` GPSLog stays a binary placeholder, bundled
+  # surfaces no timed GPS even at `-ee`). `System:all` is the sole exclusion. No
+  # `.ee.*` golden: `-ee` adds no timed metadata (the only `-ee` delta is the
+  # `mdat`-trailer warning, which the no-`ee` `EEWarn` outranks at base).
+  MP4_blackvue_dr770x.mp4) EXCLUDE_ARR+=(-x System:all) ;;
+  # `MP4_movie_keys.mov` (#361 R7): a CRAFTED movie-level `moov/meta`(`mdta`)
+  # `keys` box → the GENERIC `%QuickTime::Keys` resolver (a video trak, so NOT
+  # AudioKeys). Exercises the COMPLETE `ProcessKeys` order for the movie path:
+  #  * `com.apple.quicktime.acme.totally.bogus.zzz` → `Keys:AcmeTotallyBogusZzz`
+  #    (the unknown-key DERIVE — previously DROPPED, the [high] fix);
+  #  * raw `\xa9day` → `Keys:ContentCreateDate` (ItemList, `%iso8601Date`);
+  #  * raw `\xa9xyz` → `Keys:GPSCoordinates` (ItemList, ConvertISO6709 +
+  #    PrintGPSCoordinates);
+  #  * `manu` → `Keys:Make` (UserData, conv-less).
+  # As with the SP2/anafi arms, the unported `%QuickTime::Composite` GPS table
+  # (QuickTime.pm:8668, `Require => QuickTime:GPSCoordinates`) synthesizes
+  # `Composite:GPSLatitude`/`Longitude`/`GPSPosition` from `Keys:GPSCoordinates`;
+  # exifast emits none, so they are dropped by name. The ported
+  # ImageSize/Megapixels/AvgBitrate/Rotation are KEPT.
+  MP4_movie_keys.mov)
+    EXCLUDE_ARR+=(-x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSPosition) ;;
+  MP4_parrot_anafi.mp4)
+    EXCLUDE_ARR+=(-x Composite:GPSAltitude -x Composite:GPSAltitudeRef \
+                  -x Composite:GPSLatitude -x Composite:GPSLongitude \
+                  -x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
+                  -x Composite:GPSPosition) ;;
   # The SP2 `Keys`/`UserData` GPSCoordinates fixtures: ExifTool's QuickTime
   # GPSCoordinates Composites (GPSLatitude/Longitude/Altitude/AltitudeRef/Position)
   # are unported; the ported ImageSize/Megapixels/AvgBitrate/Rotation are kept.
@@ -187,7 +307,8 @@ case "$FIX" in
   QuickTime_insta360_badstride.mp4 | QuickTime_insta360_chained.mp4 | \
   QuickTime_insta360_short300.mp4 | QuickTime_mebx_camm.mov | QuickTime_moov_gps.mov | \
   QuickTime_fmas_n2s.mov | QuickTime_wolfbox_redtiger_f9.mov | \
-  QuickTime_fmas_empty_then_valid.mov | \
+  QuickTime_fmas_empty_then_valid.mov | MP4_viofo_a119_gps.mp4 | \
+  QuickTime_rove_r2_4k.MP4 | \
   QuickTime_text_mini0806.mov | QuickTime_text_roadhawk.mov | \
   QuickTime_text_thinkware.mov | QuickTime_text_dji_telemetry.mov | \
   QuickTime_text_empty_then_valid.mov | \
@@ -216,20 +337,23 @@ case "$FIX" in
   # MakerNote-derived `LensID`/`LensSpec`/`AutoFocus`/`RedBalance`/`BlueBalance`/
   # `AvgBitrate`). So these goldens KEEP the ported Composites and drop ONLY the
   # unported ones BY NAME (never `Composite:all`), byte-matching exifast — PLUS
-  # any non-Composite port deferrals each golden already excluded (the IPTC/
-  # XMP JPEG segments for `ExifGPS.jpg`/`DJIPhantom4.jpg`; the codec-config
-  # property atoms for `HEIF`/`AVIF`). `IFD1:ThumbnailImage` is NO LONGER
-  # excluded — #331 emits it via the EXIF `DataTag` channel (the IFD1
+  # any non-Composite port deferrals each golden already excluded (the
+  # codec-config property atoms for `HEIF`/`AVIF`). `IFD1:ThumbnailImage` is NO
+  # LONGER excluded — #331 emits it via the EXIF `DataTag` channel (the IFD1
   # ThumbnailOffset/ThumbnailLength pair → the `(Binary data N bytes …)`
   # placeholder), byte-matching bundled. `ExifGPS.tif` carries only GPS
-  # Composites + no deferred segments → default path (no arm).
-  ExifGPS.jpg)
-    EXCLUDE_ARR+=(-x IPTC:all -x File:CurrentIPTCDigest) ;;
+  # Composites + no deferred segments → default path (no arm). `ExifGPS.jpg`
+  # NOW emits its `IPTC:*` ApplicationRecord tags + `File:CurrentIPTCDigest`
+  # byte-exact (the JPEG IPTC port — `IPTC.pm`/`Photoshop.pm` APP13 8BIM IIM +
+  # the in-crate RFC-1321 MD5), so the former `-x IPTC:all -x
+  # File:CurrentIPTCDigest` exclusion is dropped and it takes the DEFAULT path.
   # PR 4: the full lens chain now builds (DJI, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). Only the
-  # non-Composite port deferrals remain.
-  DJIPhantom4.jpg)
-    EXCLUDE_ARR+=(-x XMP:all) ;;
+  # `$foc35/$focal` ScaleFactor path: 20/3.61 = 5.54016620498615). The XMP `APP1`
+  # packet (`http://ns.adobe.com/xap/1.0/\0` → `ProcessXMP`, #37) is NOW emitted
+  # byte-exact via the shared XMP parser — all 23 `XMP-*` tags (`XMP-drone-dji`/
+  # `XMP-crs`/`XMP-tiff`/`XMP-dc`/`XMP-xmp`/`XMP-rdf`), so the former `-x XMP:all`
+  # is dropped and DJIPhantom4 takes the DEFAULT path (no arm) — its golden KEEPS
+  # the full XMP packet (like DJI_Matrice30T.jpg, which has no XMP `APP1`).
   # NEW PR-3 arms (these relied on a regen-time `EXCLUDE` env before — now baked
   # in so `tools/gen_golden.sh <fix>` reproduces them with no env). Each drops
   # only the unported lens/MakerNote Composites by name.
@@ -245,15 +369,19 @@ case "$FIX" in
                   -x Composite:BlueBalance -x Composite:RedBalance \
                   -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec) ;;
   # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
-  # extraction, unported) + `PrintIM:PrintIMVersion`. `IFD1:ThumbnailImage` is
-  # NOW emitted via the #331 EXIF `DataTag` channel (no longer excluded; the
-  # Pentax:PreviewImage IsOffset binary stays deferred — P2/P3 of #331).
+  # extraction, unported). `IFD1:ThumbnailImage` is NOW emitted via the #331 EXIF
+  # `DataTag` channel (no longer excluded; the Pentax:PreviewImage IsOffset binary
+  # stays deferred — P2/P3 of #331). `PrintIM:PrintIMVersion` is NOW emitted (the
+  # IFD0 `0xc4a5` PrintIM directory, #381) — no longer excluded.
   # PR 4: the full lens chain now builds (PENTAX, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). The MakerNote `Composite:
-  # LensID` + the non-Composite port deferrals remain.
+  # `$foc35/$focal` ScaleFactor path: 15/10 = 1.5). `Composite:LensID` STAYS
+  # excluded: the K10D LensType `3 44` is the AMBIGUOUS `%pentaxLensTypes` "Sigma
+  # or Tamron Lens (3 44)" — bundled disambiguates to "Sigma AF 10-20mm F4-5.6 EX
+  # DC" via `PrintLensID`'s focal-length matching, which the #381 unambiguous-
+  # LensType subset DEFERS (exifast emits no LensID here). The non-Composite port
+  # deferrals remain.
   Pentax.jpg)
     EXCLUDE_ARR+=(-x Pentax:PreviewImageStart -x Pentax:PreviewImage \
-                  -x PrintIM:PrintIMVersion \
                   -x Composite:LensID) ;;
   # DJI_Matrice30T.jpg: PR 4's full lens chain builds (DJI, NOT Canon — the
   # simple `$foc35/$focal` ScaleFactor path: 40/9.1 = 4.3956043956044), no
@@ -307,11 +435,31 @@ case "$FIX" in
   #    so exifast has no bare `ImageWidth` to build them (it carries only
   #    `ExifIFD:ExifImageWidth`, a `Desire`). A documented sub-IFD deferral.
   # (NOT `-x Composite:all`, which the conformance `EXCLUDE` env previously used.)
-  # The non-Composite SRW/PreviewIFD sub-IFD deferrals (`PreviewIFD:all`/
-  # `SubIFD:all`/`SubIFD1:all`) are retained.
-  SamsungNX500.srw)
-    EXCLUDE_ARR+=(-x PreviewIFD:all -x SubIFD:all -x SubIFD1:all \
-                  -x Composite:LensID -x Composite:WB_RGGBLevels \
+  # #242: the `0x0035 PreviewIFD` Nikon-PreviewIFD sub-IFD is now WALKED — its 8
+  # tags (SubfileType/XResolution/YResolution/ResolutionUnit/PreviewImageStart/
+  # PreviewImageLength/YCbCrPositioning + the PreviewImage blob via the DataTag
+  # channel) emit byte-exact, so `-x PreviewIFD:all` is REMOVED. The raw SRW image
+  # sub-IFDs `SubIFD:all`/`SubIFD1:all` stay deferred (the raw strips + the
+  # embedded JpgFromRaw JPEG, not walked).
+  # SamsungNX1.srw (#210): the REAL Samsung NX1 raw — the SAME Type2 MakerNote
+  # surface as the NX500 (identical 45 `Samsung:*` leaves incl. the 16 decrypted
+  # #242 Crypt rows, the 8-tag PreviewIFD, and the ported EXIF+lens Composite
+  # chain), so it takes the SAME exclusions as the NX500 arm: drop the deferred
+  # raw SRW image sub-IFDs (`SubIFD:all`/`SubIFD1:all` — the raw strips +
+  # JpgFromRaw JPEG, not walked) and the MakerNote-synthesized Composites
+  # (`LensID`/`WB_RGGBLevels`/`RedBalance`/`BlueBalance`/`CFAPattern`, unported;
+  # `ImageSize`/`Megapixels`, whose `Require`d ImageWidth/Height live in the
+  # deferred `SubIFD1`). exifast emits the residual (IFD0/ExifIFD/Samsung/
+  # PreviewIFD/the 8 ported Composites) byte-exact vs bundled ExifTool 13.59.
+  # #381: `Composite:LensID` is NOW emitted (the unambiguous Samsung LensType —
+  # `Samsung NX 45mm F1.8` / `Samsung NX 16-50mm F2-2.8 S ED OIS` — IS the
+  # resolved name `$prt[0]`, no disambiguation needed), so it is NO LONGER
+  # excluded. The other MakerNote-derived Composites (`WB_RGGBLevels`/`RedBalance`/
+  # `BlueBalance`/`CFAPattern`) + the `SubIFD1`-deferred `ImageSize`/`Megapixels`
+  # stay dropped.
+  SamsungNX500.srw | SamsungNX1.srw)
+    EXCLUDE_ARR+=(-x SubIFD:all -x SubIFD1:all \
+                  -x Composite:WB_RGGBLevels \
                   -x Composite:RedBalance -x Composite:BlueBalance \
                   -x Composite:CFAPattern -x Composite:ImageSize \
                   -x Composite:Megapixels) ;;
@@ -325,6 +473,53 @@ case "$FIX" in
   # `System:all` excludes the filesystem tags as for the other synthetic TIFFs.
   CR2_imagesize.cr2)
     EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
+  # The #331-P2 PreviewImage `DataTag` fixtures (#352/#353): minimal RAW TIFFs
+  # whose IFD0 offset-pair drives the synthetic `IFD0:PreviewImage` binary blob
+  # (a 4-byte SOI+EOI), faithful to ExifTool 13.59.
+  #
+  # CR2_preview_image.cr2 — 0x0111/0x0117 (`PreviewImageStart`/`Length` in IFD0
+  # of CR2, `Exif.pm:645-661`/`:742-758`, gated `$$self{TIFF_TYPE} eq "CR2"`).
+  # CR2 is one of the RAW subtypes (`$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|
+  # IIQ|EIP)$/`, Exif.pm:4759) for which exifast's Composite post-pass DEFERS
+  # every Composite (no `TIFF_TYPE` handle — same rationale as `CR2_imagesize.cr2`
+  # above), so `-x Composite:all` drops the bundled `Aperture`/`ShutterSpeed`/
+  # `ImageSize`/`Megapixels` the port does not build.
+  CR2_preview_image.cr2)
+    EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
+  # ARW_preview_image.arw — 0x0201/0x0202 (`PreviewImageStart`/`Length` in IFD0
+  # of ARW, `Exif.pm:1226-1237`, gated `DIR_NAME eq "IFD0" and TIFF_TYPE =~
+  # /^(ARW|SR2)$/`). ARW is NOT a RAW-ImageSize subtype, so exifast BUILDS the
+  # ported `Composite:ImageSize`/`Megapixels` (from IFD0 ImageWidth/Height,
+  # `100x80` / `0.008`) byte-exact with bundled — KEEP them (no `-x Composite`).
+  ARW_preview_image.arw)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # DNG_preview_image.dng — IFD0→SubIFD (0x014a) with `SubfileType=1` +
+  # StripOffsets/StripByteCounts and NO `Compression`, so 0x0111 takes the plain
+  # `StripOffsets` arm (`Exif.pm:639-653` — the CR2/IFD0 and `Compression=7`
+  # exclusions both miss) ⇒ NO PreviewImage. The classic-TIFF `SubIFD` (0x014a)
+  # multi-offset walk NOW lands (#331-P2), so the port emits the SubIFD's
+  # `SubfileType`/`ImageWidth`/`ImageHeight`/`StripOffsets`/`StripByteCounts`; the
+  # fixture stays NOT_ACTIVE only because `IFD0:DNGVersion` (0xc612) is not yet an
+  # emitted leaf (a deferred leaf-table item — the walker taps it for the
+  # `$$self{DNGVersion}` DataMember but does not display it). `-x System:all` only,
+  # composites KEPT.
+  DNG_preview_image.dng)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # TIFF_jpgfromraw.tif — the #331-P2 SubIFD2:JpgFromRaw verifier: a minimal
+  # little-endian TIFF whose IFD0 0x014a SubIFD pointer carries THREE offsets
+  # (`SubIFD`/`SubIFD1`/`SubIFD2`). SubIFD2 carries `SubfileType=1` +
+  # `Compression=7` (JPEG) + 0x0111/0x0117, which `Exif.pm:673-684`/`:769-778`
+  # resolve to `JpgFromRawStart`/`JpgFromRawLength` (the plain `StripOffsets` arm
+  # is excluded by the DNG/TIFF JPEG-preview gate, the CR2 arm misses, and the
+  # `PreviewImage` arm misses because `DIR_NAME eq "SubIFD2"`). The offset-pair
+  # drives the synthetic `SubIFD2:JpgFromRaw = (Binary data 4 bytes, …)` via the
+  # EXIF DataTag channel. SubIFD0 carries plain `StripOffsets`/`StripByteCounts`
+  # (no `Compression`, so the plain arm wins → NO DataTag) — the SubIFD-context
+  # StripOffsets path P1 could not reach. TIFF is NOT a RAW-ImageSize subtype, so
+  # exifast BUILDS `Composite:ImageSize`/`Megapixels` byte-exact (KEEP them);
+  # `-x System:all` only.
+  TIFF_jpgfromraw.tif)
+    EXCLUDE_ARR+=(-x System:all) ;;
 esac
 
 # Run from the fixtures dir and pass only the basename so the embedded

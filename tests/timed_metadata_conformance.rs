@@ -272,6 +272,17 @@ fn gsen_ee_byte_exact() {
 /// adds: with `-ee` the per-sample GPMF timed block is what changes, and it IS
 /// byte-exact. With those two frame rates now emitted, the FULL hero8 document
 /// (container + gpmd/fdsc `Doc<N>`) is byte-exact at `-ee` with NO exclusions.
+///
+/// This is also the **#189 per-track-grouping guard**: hero8 is a DUAL-SOURCE
+/// GoPro file — a `udta/GPMF` box AND a `gpmd` `trak` — so the `-ee -G1` golden
+/// pins BOTH family-1 groups at once: the `udta/GPMF` device tags under `GoPro:`
+/// (`GoPro:DeviceName` = "Highlights", `GoPro:CameraSerialNumber`) and the gpmd
+/// stream's tags under `Track4:` (`Track4:DeviceName` = "HERO8 Black",
+/// `Track4:Accelerometer`, `Track4:GPSDateTime`). The SAME scalar name
+/// (`DeviceName`) survives in BOTH groups with different values — the exact
+/// divergence #189 fixes (a flat collapse would drop one). A regression that
+/// re-collapsed the `gpmd` trak into `GoPro:` would delete every `Track4:*` key
+/// here and fail this byte-exact check.
 #[test]
 fn gopro_hero8_gpmd_ee_byte_exact() {
   // `-ee -G1`: the doc axis collapsed first-wins — Track4's first `DEVC` block
@@ -288,6 +299,33 @@ fn gopro_hero8_gpmd_ee_byte_exact() {
     "QuickTime_gopro_hero8_gpmf.mp4",
     "QuickTime_gopro_hero8_gpmf.mp4.ee.g3.json",
     true,
+  );
+}
+
+/// Real GoPro HERO6 Black MP4 (from gopro/gpmf-parser, 8.8 MB, 23.6 s) — the
+/// `gpmd` timed-GPS/sensor `Doc<N>` port (#211). Like hero8, the `gpmd` `trak`
+/// (Track4) carries one GPMF `DEVC` per sample and the `fdsc` `trak` (Track5)
+/// the per-sample identity. At `-ee -G1` the doc axis collapses first-wins to
+/// the first sample's block, emitted under `Track4:` / `Track5:`. Unlike hero8,
+/// this HERO6 sample exercises the camera-vision GPMF streams hero8 lacks —
+/// `FaceNumbers` (FCNM int32u count list), `FaceDetected` (FACE `?`-format face
+/// box), `ISOSpeeds` (ISOE int32u list), `ExposureTimes` (SHUT `1/x` rational
+/// render), `ColorTemperatures` (WBAL 16-bit list), `WhiteBalanceRGB` (WRGB
+/// binary placeholder), `CameraTemperature` (TMPC `" C"` suffix) — plus the
+/// shared `Accelerometer` (ACCL) / `Gyroscope` (GYRO) binary placeholders and
+/// the `GPS5` scalars (GPS5/GPSU/GPSF/GPSP). Byte-exact vs bundled
+/// ExifTool 13.59. No `.ee.g3.json` is pinned (the single collapsed `-G1` block
+/// is the document of interest; the base `.json`/`.n.json` are the activation
+/// gate in `conformance.rs`).
+#[test]
+fn gopro_hero6_gpmd_ee_byte_exact() {
+  // `-ee -G1`: Track4's first `DEVC` block (DeviceName, the sensor/camera-vision
+  // streams, the GPS scalars + first `GPS5` row's lat/lon/alt/speed) + Track5's
+  // `fdsc` identity — byte-exact.
+  check_ee(
+    "QuickTime_gopro_hero6_gpmf.mp4",
+    "QuickTime_gopro_hero6_gpmf.mp4.ee.json",
+    false,
   );
 }
 
@@ -344,6 +382,35 @@ fn wolfbox_redtiger_f9_gpmd_ee_byte_exact() {
   check_ee(
     "QuickTime_wolfbox_redtiger_f9.mov",
     "QuickTime_wolfbox_redtiger_f9.mov.ee.g3.json",
+    true,
+  );
+}
+
+// #138 / #348 — Viofo A119 dashcam: the LigoGPS freeGPS atom's timed GPS. The 7
+// GPS samples (`Doc<N>:QuickTime:GPS…`, the LigoGPS embedded-in-freeGPS Type-5
+// path) surface only under `-ee`; the GPS itself is byte-exact at both family-1
+// and the `Doc<N>` axis.
+//
+// The audio `trak` carries BOTH a `mdia/hdlr` (`soun` → Media Handler / Audio
+// Track / SoundHandler) AND a nested `minf/hdlr` data-reference handler (`url `
+// → Data Handler / URL / DataHandler, QuickTime.pm:7319). Bundled keeps the
+// `url ` (dref) triplet for the AUDIO track yet the `vide` (media) triplet for
+// the VIDEO track — the dual-`hdlr` dedup asymmetry now reproduced (#348): the
+// FINAL `trak`'s `minf/hdlr` owns the bare `Track<N>:Handler*` key, every
+// earlier `trak` keeps its `mdia/hdlr`. So the whole document is byte-exact —
+// the former `Track2:Handler*` exclusion is gone.
+#[test]
+fn viofo_a119_ligogps_ee_byte_exact() {
+  // `-ee -G1`: the LAST GPS sample's `QuickTime:GPS…` (movie-level, last-wins).
+  check_ee(
+    "MP4_viofo_a119_gps.mp4",
+    "MP4_viofo_a119_gps.mp4.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the 7 per-sample `Doc1..Doc7:QuickTime:GPS…` — byte-exact.
+  check_ee(
+    "MP4_viofo_a119_gps.mp4",
+    "MP4_viofo_a119_gps.mp4.ee.g3.json",
     true,
   );
 }
@@ -3699,6 +3766,104 @@ fn camm_2track_ee_global_doc_byte_exact() {
     "QuickTime_camm_2track.mov",
     "QuickTime_camm_2track.mov.ee.g3.json",
     true,
+    NO_EXCL,
+  );
+}
+
+// `QuickTime_camm_2track_dupwarn.mov` — two `camm` `trak`s, EACH whose lone
+// sample carries an `Unknown camm record type 0` (type-0 is not in `%size`, so
+// `ProcessCAMM` `$et->Warn`s, last). The crux: ExifTool's `WAS_WARNED` is a
+// FILE-GLOBAL hash keyed on the warning TEXT (`ExifTool.pm` `sub Warn`
+// 5632-5639) — so the SAME warning string raised in Track1 AND Track2 is
+// recorded ONCE (the first occurrence's `FoundTag('Warning', …)`) and the later
+// one only bumps the count, yielding a single `Warning` whose end-of-extraction
+// `[x$n]` suffix (`ExifTool.pm:3196-3203`) reflects the file-wide total. The
+// oracle (`-ee -G1`) is therefore `Track1:Warning "Unknown camm record type 0
+// [x2]"` with NO `Track2:Warning` (Track2 keeps only its own SampleTime/
+// SampleDuration); at `-ee -G3` it is `Doc1:Track1:Warning … [x2]` with
+// `Doc2:Track2` carrying timing but NO Warning — the dedup spans the doc/track
+// boundary. RED before the fix (the `-G1` `first_seen(family1,"Warning")` gate
+// is per-track, so Track1 AND Track2 each emitted a `Warning`; #215); GREEN
+// after threading the file-wide `WAS_WARNED` text gate. Every tag (incl.
+// `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn camm_2track_dupwarn_file_global_was_warned_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The two-track dup-warn fixture at no-`ee`: camm is a `meta`-handler `trak`, so
+// the per-sample dispatch is `-ee`-only — the no-`ee` path shows the standard
+// `[minor] ExtractEmbedded` warning and NO per-sample record (same shape as the
+// other camm fixtures). Pins that the file-global `WAS_WARNED` threading leaks
+// no record into the no-`ee` path.
+#[test]
+fn camm_2track_dupwarn_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_camm_2track_dupwarn.mov",
+    "QuickTime_camm_2track_dupwarn.mov.json",
+    NO_EXCL,
+  );
+}
+
+// `QuickTime_camm_2track_distinct_collision.mov` — the #215-R1 reviewer case for
+// the file-global `WAS_WARNED` SET-AT-WARN-TIME semantics. Track1 raises TWO
+// DISTINCT warnings (sample0 camm0 ⇒ A "Unknown camm record type 0"; sample1
+// truncated camm5 ⇒ B "Truncated camm record 5"); Track2's lone sample repeats B
+// (truncated camm5). ExifTool keys `WAS_WARNED` on the message TEXT at WARN-TIME
+// (`ExifTool.pm:5635`), file-wide and INDEPENDENT of any per-track tag slot — so
+// B is recorded when Track1 raises it, even though Track1's `-G1` priority-0
+// `Warning` slot is already held by A (the `TagMap`'s first-wins, exifast's
+// accepted divergence from ExifTool's numbered `Warning (i)` copies). Track2's
+// later B is therefore a REPEAT: no new `Warning`, only `++[xN]`.
+//
+// Oracle (bundled 13.59): `-ee -G1` ⇒ ONLY `Track1:Warning = A` and NO
+// `Track2:Warning` (B never reaches G1 — its lone position is Track1's full
+// slot); `-ee -G3` ⇒ `Doc1:Track1:Warning A`, `Doc2:Track1:Warning "Truncated
+// camm record 5 [x2]"` (the `[x2]` is the FILE-GLOBAL count over Track1's Doc2 +
+// Track2's Doc3), `Doc3:Track2` timing only.
+//
+// RED before the fix: R1 recorded the text in `was_warned` only INSIDE the
+// `first_seen(family1,"Warning")` slot gate, so B (slot-blocked behind A on
+// Track1) was NEVER added to the file-global set → Track2's B looked first-time
+// and emitted a SPURIOUS `Track2:Warning`. GREEN after recording `was_warned` at
+// warn-time, before the G1 slot gate. Every tag (incl. `Track<N>:MetaFormat`) is
+// byte-exact.
+#[test]
+fn camm_2track_distinct_collision_was_warned_at_warn_time_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The distinct-collision fixture at no-`ee`: camm is a `meta`-handler `trak`, so
+// the per-sample dispatch is `-ee`-only — both tracks show the standard `[minor]
+// ExtractEmbedded` warning and NO per-sample record. Pins that the warn-time
+// `WAS_WARNED` recording leaks nothing into the no-`ee` path.
+#[test]
+fn camm_2track_distinct_collision_noee_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_camm_2track_distinct_collision.mov",
+    "QuickTime_camm_2track_distinct_collision.mov.json",
     NO_EXCL,
   );
 }

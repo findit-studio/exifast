@@ -367,6 +367,23 @@ pub(crate) enum CompositePrintConv {
   /// degrees, identity PrintConv (no PrintConv on the def), so BOTH modes emit
   /// the bare numeric angle (`0`/`90`/`180`/`270`).
   Rotation,
+  /// `Composite:Flash` PrintConv (`PrintConv => \%Image::ExifTool::Exif::flash`,
+  /// XMP.pm:2834) — the `%flash` enumerated label under `-j` (`Off, Did not
+  /// fire`); the bare numeric `$val` (the assembled bitmask, e.g. `16`) under
+  /// `-n`. A value absent from `%flash` renders `Unknown (0x%x)` (`PrintHex`).
+  Flash,
+  /// `Composite:LensID` PrintConv (Exif.pm:5341 `PrintLensID(...)`) for the
+  /// UNAMBIGUOUS-LensType case (the Pentax bodies): the resolved lens name IS the
+  /// LensType's own PrintConv value `$prt[0]` (a single `%pentaxLensTypes` hit,
+  /// no `.1` collision / converter), so PrintConv renders `$prt[0]` under `-j`;
+  /// the ValueConv `$val` (`= $val[0]`, the raw LensType value e.g. `"8 61"`)
+  /// under `-n`. See [`lens_id`] for the build guard that restricts the def to
+  /// this case (the ambiguous / non-HASH / cross-vendor-DB paths stay deferred).
+  LensId,
+  /// `Composite:DateTimeCreated` PrintConv (`$self->ConvertDateTime($val)`,
+  /// IPTC.pm:953) — the identity at exifast's option set, in BOTH modes (the
+  /// RawConv-assembled `Text` `"$DateCreated $TimeCreated"`).
+  DateTimeCreated,
 }
 
 impl CompositePrintConv {
@@ -644,6 +661,48 @@ impl CompositePrintConv {
         let n = raw.as_num().unwrap_or(f64::NAN);
         TagValue::F64(n)
       }
+      CompositePrintConv::Flash => {
+        // `$val` is the assembled bitmask (`Num`). `-n` the bare f64; `-j` the
+        // `%flash` enumerated label (`PrintHex` `Unknown (0x%x)` on a miss).
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::exif::flash_print_conv(n as i64).into())
+          }
+        }
+      }
+      CompositePrintConv::LensId => {
+        // The UNAMBIGUOUS Pentax-LensType case: `Composite:LensID`'s ValueConv is
+        // `$val` (`= $val[0]`, the raw LensType, carried as `Scalar`), and the
+        // resolved lens name IS the LensType's own PrintConv value `$prt[0]`
+        // (`PrintLensID` returns `$$printConv{$lensType}` for a single hit). So
+        // `-n` emits the raw LensType scalar verbatim; `-j` emits `$prt[0]`.
+        let CompositeRaw::Scalar(v) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => v.clone(),
+          ConvMode::PrintConv => prts
+            .first()
+            .and_then(Option::as_ref)
+            .cloned()
+            .unwrap_or_else(|| v.clone()),
+        }
+      }
+      CompositePrintConv::DateTimeCreated => {
+        // ValueConv == PrintConv (ConvertDateTime is the identity here) — the
+        // RawConv `"$DateCreated $TimeCreated"` `Text` in both modes.
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::datetime::convert_date_time(s).into())
+          }
+        }
+      }
     }
   }
 }
@@ -807,6 +866,22 @@ const fn qt_req(name: &'static str) -> CompositeInput {
     kind: InputKind::Require,
     groups: &[],
     group0: Some("QuickTime"),
+    name,
+  }
+}
+
+/// `Desire`d input qualified by family-0 `"XMP"` (ExifTool's `Desire =>
+/// 'XMP:FlashFired'` / `'XMP:Flash'`, XMP.pm:2812-2817) — matches an XMP tag in
+/// ANY `XMP-*` family-1 group (every XMP namespace carries family-0 `XMP`,
+/// family-1 the namespace group `XMP-exif`/`XMP-aux`/…). The family-1 set is
+/// empty (any), the family-0 qualifier restricts to XMP so a same-named EXIF /
+/// MakerNote leaf does not satisfy it.
+#[cfg(feature = "exif")]
+const fn xmp_des(name: &'static str) -> CompositeInput {
+  CompositeInput {
+    kind: InputKind::Desire,
+    groups: &[],
+    group0: Some("XMP"),
     name,
   }
 }
@@ -1183,6 +1258,294 @@ fn aperture(
   }
   // `($val[0] || $val[1]) ? $val : undef` — neither truthy ⇒ undef.
   None
+}
+
+/// One Flash ingredient `$val[i]` as the XMP-Flash ValueConv reads it — either a
+/// directly-resolved flat `XMP:FlashFired`/… (the `$val[0..4]` Desires) or a
+/// field copied OUT of the structured `XMP:Flash` HASH (`$val[5]{Fired}`/…). The
+/// bit math interprets BOOLEAN fields as `lc($val) eq 'true'` and the NUMERIC
+/// fields (`Return`/`Mode`) via Perl `($val || 0) << n` — so each ingredient is
+/// the RAW (ValueConv) text it carries (`"True"`/`"False"`, `"0"`/`"2"`).
+///
+/// `$val[5]{$_}` copies the struct field's RAW (post-ValueConv) value; the
+/// XMP-exif Flash struct's `Fired`/`Function`/`RedEyeMode` are `Writable =>
+/// 'boolean'` with a PrintConv-only `%boolConv` (so their ValueConv value is the
+/// literal `"True"`/`"False"`), and `Return`/`Mode` are `Writable => 'integer'`
+/// (ValueConv `"0"`/`"2"`). exifast stores every XMP scalar as a `Str`, so a
+/// resolved ingredient is read as its `value_text`.
+#[cfg(feature = "exif")]
+fn flash_field_truthy_true(text: Option<&str>) -> bool {
+  // `$val[i] and lc($val[i]) eq 'true'` (XMP.pm:2828-2832) — a present field
+  // equal (case-insensitively) to "true". A `Missing`/`undef` field is false.
+  text.is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
+/// Perl `($val[i] || 0) << shift` (XMP.pm:2829-2830) on a Flash NUMERIC field
+/// (`Return`/`Mode`). The Perl `||` yields the FIRST truthy operand: a present
+/// Perl-truthy field is numified (its leading numeric prefix), otherwise `0`. A
+/// string `"0"` is Perl-FALSY, so it contributes `0`; `"2"` numifies to `2`.
+#[cfg(feature = "exif")]
+fn flash_field_shifted(text: Option<&str>, shift: u32) -> i64 {
+  let n = match text {
+    // `$val[i] || 0` — a Perl-FALSY field (`""`, `"0"`, `"0.0"` numeric-zero,
+    // undef) takes the `0`; a truthy field numifies to its leading float.
+    Some(s) if crate::convert::perl_boolean_truthy(&TagValue::Str(s.into())) => {
+      crate::convert::perl_str_to_f64(s) as i64
+    }
+    _ => 0,
+  };
+  n << shift
+}
+
+/// `Composite:Flash` ValueConv (XMP.pm:2823-2833) — assemble the EXIF Flash
+/// bitmask from the XMP flash fields. `$val[0..4]` are the flat
+/// `XMP:FlashFired`/`FlashReturn`/`FlashMode`/`FlashFunction`/`FlashRedEyeMode`
+/// Desires; `$val[5]` is the structured `XMP:Flash` HASH. When `$val[5]` is a
+/// HASH its `Fired`/`Return`/`Mode`/`Function`/`RedEyeMode` fields OVERRIDE
+/// `$val[0..4]` (XMP.pm:2824-2827):
+///
+/// ```perl
+/// if (ref $val[5] eq 'HASH') {
+///     my $i = 0;
+///     $val[$i++] = $val[5]{$_} foreach qw(Fired Return Mode Function RedEyeMode);
+/// }
+/// return((($val[0] and lc($val[0]) eq 'true') ? 0x01 : 0) |
+///        (($val[1] || 0) << 1) |
+///        (($val[2] || 0) << 3) |
+///        (($val[3] and lc($val[3]) eq 'true') ? 0x20 : 0) |
+///        (($val[4] and lc($val[4]) eq 'true') ? 0x40 : 0));
+/// ```
+///
+/// The result is the EXIF Flash bitmask (`Num`), rendered via the `%flash`
+/// PrintConv. The composite has NO `RawConv` guard, so it ALWAYS builds when the
+/// engine attempts it — but the Desires are ALL `Desire`, so with no XMP flash
+/// field present every operand is `0` and `$val == 0` (`"No Flash"`).
+#[cfg(feature = "exif")]
+fn composite_flash(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$val[5]` — the structured `XMP:Flash`. When it is a HASH (a `Map`), its
+  // fields OVERRIDE the flat `$val[0..4]`; otherwise (a scalar `XMP:Flash` like
+  // the `exif:Flash=5` integer, or absent) the flat fields stand.
+  let flash_struct = v.get(5).and_then(CompositeValue::value).and_then(|val| {
+    if let TagValue::Map(fields) = val {
+      Some(fields)
+    } else {
+      None
+    }
+  });
+  // Resolve each of the five fields: the struct field (if `$val[5]` is a HASH),
+  // else the flat `$val[i]` ingredient. Returns the field's RAW text.
+  let field = |i: usize, key: &str| -> Option<std::string::String> {
+    if let Some(fields) = flash_struct {
+      fields
+        .iter()
+        .find(|(k, _)| k.as_str() == key)
+        .map(|(_, fv)| crate::composite::value_text(fv).into_owned())
+    } else {
+      v.get(i)
+        .and_then(CompositeValue::as_text)
+        .map(|c| c.into_owned())
+    }
+  };
+  // ExifTool's `BuildCompositeTags` `$found` gate (ExifTool.pm:4082-4095): an
+  // all-`Desire` composite is built ONLY when AT LEAST ONE input is present
+  // (`defined $$rawValue{$reqTag}` for some index sets `$found = 1`). The
+  // XMP-Flash ValueConv has no `? : undef` guard (it always returns a bitmask),
+  // so WITHOUT this gate it would synthesize `Composite:Flash = 0` ("No Flash")
+  // for EVERY file with no XMP flash data (every AIFF/APE/…). Mirror the gate
+  // here: no present input ⇒ `None` ⇒ not built. (For `XMP_exif_printconv.xmp`
+  // a SCALAR `XMP:Flash=5` IS present — `$val[5]` resolves — so it builds and
+  // yields `0`/"No Flash", matching bundled, since the scalar is not a HASH and
+  // the flat `$val[0..4]` are absent.)
+  if v.iter().all(|input| !input.is_present()) {
+    return None;
+  }
+  let fired = field(0, "Fired");
+  let ret = field(1, "Return");
+  let mode = field(2, "Mode");
+  let function = field(3, "Function");
+  let red_eye = field(4, "RedEyeMode");
+
+  let bits = (if flash_field_truthy_true(fired.as_deref()) {
+    0x01
+  } else {
+    0
+  }) | flash_field_shifted(ret.as_deref(), 1)
+    | flash_field_shifted(mode.as_deref(), 3)
+    | (if flash_field_truthy_true(function.as_deref()) {
+      0x20
+    } else {
+      0
+    })
+    | (if flash_field_truthy_true(red_eye.as_deref()) {
+      0x40
+    } else {
+      0
+    });
+  Some(CompositeRaw::Num(bits as f64))
+}
+
+/// `Composite:LensID` ValueConv (Exif.pm:5337 `$val`) + RawConv guard
+/// (Exif.pm:5325-5332), the UNAMBIGUOUS-LensType subset.
+///
+/// ExifTool's `Composite:LensID` `Require`s `LensType` and renders
+/// `PrintLensID($self, $prt[0], $pcv, $prt[8], @val)` (Exif.pm:5353). For a
+/// LensType whose `PrintConv` is a `HASH` and resolves to a SINGLE unambiguous
+/// lens (no `"$lensType.1"` collision, no Sony LensType2 / Canon RFLensType
+/// branch, no teleconverter), `PrintLensID` returns `$$printConv{$lensType}` —
+/// which IS the LensType's own PrintConv value `$prt[0]`. The ValueConv is the
+/// bare `$val` (`= $val[0]`, the raw LensType, e.g. Pentax `"8 61"`).
+///
+/// exifast's post-pass cannot inspect the LensType `PrintConv` ref or run the
+/// full `PrintLensID` lens-DB / focal-length disambiguation, so this derive
+/// ports ONLY the case the resolved data already settles: BUILD iff the
+/// PrintConv-view `$prt[0]` is a CONFIRMED resolved lens NAME — it contains a
+/// focal-length / aperture token (`mm` or `\d/F`, mirroring the RawConv's
+/// `$val[0] =~ /(mm|\d\/F)/`) AND is NOT an AMBIGUOUS placeholder (`" or "`, the
+/// `%pentaxLensTypes` "Sigma or Tamron Lens (…)" form) NOR a raw `(N N)`
+/// fallback. In that case the composite's `-j` output == `$prt[0]` and its `-n`
+/// output == `$val[0]` (carried as `Scalar`). Every other LensType (the Nikon
+/// bitfield `"D"`, the ambiguous Pentax `"Sigma or Tamron Lens (3 44)"`, a
+/// vendor LensID needing its own `Canon::PrintLensID` / focal-range DB) stays
+/// DEFERRED — the derive returns `None`, so no wrong `Composite:LensID` is
+/// emitted (those fixtures' goldens keep `Composite:LensID` excluded).
+///
+/// A VENDOR DISAMBIGUATOR also forces deferral: ExifTool's PrintConv
+/// (Exif.pm:5335-5366) does NOT simply key off `$val[0]`/`$prt[0]` when a
+/// Sony LensType2 (`$val[9]`), Canon RFLensType (`$val[12]`), or Pentax
+/// converter (`$val[11]`+`$val[1]`) ingredient is present and active — it
+/// SUBSTITUTES the LensType2/LensType3/RFLensType base (a different lens-DB
+/// lookup) or APPENDS a `+ Nx converter` suffix. exifast can't reproduce those
+/// vendor-DB / suffix branches, so when any of them FIRES (see
+/// [`lens_id_disambiguator_active`]) the derive returns `None` rather than
+/// emit the stale plain-LensType name. The branch GUARDS are mirrored exactly,
+/// so a present-but-inactive disambiguator (Canon RFLensType `0` = "n/a", a
+/// Sony LensType2 that fails the `0x8000`/`0` mask) does NOT defer — the
+/// unambiguous Pentax/Samsung path (those ingredients absent/inactive) still
+/// emits byte-identically.
+#[cfg(feature = "exif")]
+fn lens_id(
+  v: &[CompositeValue],
+  prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$val[0]` — the raw LensType (the `Require`d input). Absent ⇒ no build.
+  let raw_lens_type = v.first()?.value()?.clone();
+  // A vendor disambiguator (Sony LensType2 / Canon RFLensType / Pentax
+  // converter) that ExifTool's PrintConv would act on ⇒ the LensID is NOT the
+  // plain LensType name; defer rather than mis-emit a stale value.
+  if lens_id_disambiguator_active(v) {
+    return None;
+  }
+  // `$prt[0]` — the LensType PrintConv value (the resolved lens name candidate).
+  let name = prts.first().and_then(Option::as_ref)?;
+  let name_text = crate::composite::value_text(name);
+  // Confirmed resolved lens name: carries a focal-length / aperture token
+  // (`PrintLensID`'s lens-name shape) AND is not an ambiguity placeholder.
+  if !lens_name_is_resolved(&name_text) {
+    return None;
+  }
+  // ValueConv `$val` = `$val[0]` (raw LensType) carried verbatim; the PrintConv
+  // renders `$prt[0]` (= `name`).
+  Some(CompositeRaw::Scalar(raw_lens_type))
+}
+
+/// Does a vendor disambiguator ingredient FIRE one of ExifTool's
+/// `Composite:LensID` PrintConv branches (Exif.pm:5335-5366), making the LensID
+/// something other than the plain LensType name?
+///
+/// The compact input layout (see [`LENS_ID`]) is `[0]`=LensType,
+/// `[1]`=FocalLength, `[2]`=LensType2, `[3]`=LensType3, `[4]`=LensFocalLength,
+/// `[5]`=RFLensType — each carrying the RAW (ValueConv) `$val[i]`, exactly what
+/// the Perl branches test. The three branches, mirrored:
+///
+/// * Sony LensType2 (`if (defined $val[9] and ($val[9] & 0x8000 or $val[9] ==
+///   0))`, :5338): substitutes the LensType2/LensType3 base + PrintConv ⇒
+///   different lens DB. Fires when LensType2 is present and its integer value
+///   has bit `0x8000` set OR is `0`.
+/// * Canon RFLensType (`if ($val[12])`, :5350): substitutes the RFLensType
+///   base ⇒ Canon RF DB. Fires when RFLensType is present and TRUTHY (a `0` /
+///   "n/a" RFLensType is falsy ⇒ does NOT fire — the `CanonRaw_ctmd.cr3`
+///   fixture's `RFLensType=0` keeps its plain-LensType LensID).
+/// * Pentax converter (Exif.pm:5357-5361): the `+ Nx converter` suffix is
+///   appended by `$lens .= sprintf(' + %.1fx converter', $conv) if $conv > 1.1`
+///   where `$conv = $val[1] / $val[11]` (FocalLength / LensFocalLength), guarded
+///   by `if ($val[11] and $val[1] and $lens)`. So a real teleconverter is
+///   detected ONLY when both are truthy AND that ratio exceeds 1.1; this defers
+///   exactly then. A bare lens with `LensFocalLength` ≈ `FocalLength` (ratio
+///   ≤ 1.1, e.g. the `JPEG_pentax_k70` 28/27.5 = 1.018) appends NOTHING and
+///   stays the plain byte-exact name.
+#[cfg(feature = "exif")]
+fn lens_id_disambiguator_active(v: &[CompositeValue]) -> bool {
+  // Sony LensType2 (`$val[9]`): present AND (bit 0x8000 set OR == 0).
+  let lens_type2_fires = v.get(2).is_some_and(|lt2| {
+    lt2
+      .coerce_numeric()
+      .is_some_and(|n| (n as i64) & 0x8000 != 0 || (n as i64) == 0)
+  });
+  // Canon RFLensType (`$val[12]`): present AND truthy (Perl `if ($val[12])`).
+  let rf_lens_type_fires = v.get(5).is_some_and(CompositeValue::is_truthy);
+  // Pentax converter: BOTH LensFocalLength (`$val[11]`) and FocalLength
+  // (`$val[1]`) truthy AND `$val[1] / $val[11] > 1.1` (an actual teleconverter).
+  // `coerce_numeric` is the faithful `0 + $val` the Perl division uses.
+  let converter_fires = match (
+    v.get(1).and_then(CompositeValue::coerce_numeric),
+    v.get(4).and_then(CompositeValue::coerce_numeric),
+  ) {
+    (Some(focal), Some(lens_focal))
+      if v.get(1).is_some_and(CompositeValue::is_truthy)
+        && v.get(4).is_some_and(CompositeValue::is_truthy)
+        && lens_focal != 0.0 =>
+    {
+      focal / lens_focal > 1.1
+    }
+    _ => false,
+  };
+  lens_type2_fires || rf_lens_type_fires || converter_fires
+}
+
+/// Is `prt0` (the LensType `$prt[0]`) a CONFIRMED single-lens name — the only
+/// `Composite:LensID` case exifast's resolved-data passthrough handles?
+///
+/// Mirrors the RawConv lens-name shape (`/(mm|\d\/F)/`, Exif.pm:5331) plus the
+/// "unambiguous" requirement `PrintLensID` enforces (it returns the LensType
+/// PrintConv only when there is no `.1` collision): the name must carry a
+/// focal-length / aperture token and must NOT be an AMBIGUOUS placeholder
+/// (`%pentaxLensTypes`'s "X or Y Lens (N N)" form, marked by `" or "`) or a raw
+/// `(N N)`-style unresolved fallback.
+#[cfg(feature = "exif")]
+fn lens_name_is_resolved(prt0: &str) -> bool {
+  // `$val[0] =~ /(mm|\d\/F)/` — a focal-length (`18-55mm`) or `\d/F` aperture
+  // token marks a real lens name (vs the Nikon bitfield `"D"`, `"n/a"`, a bare
+  // numeric raw value).
+  let has_lens_token = prt0.contains("mm")
+    || prt0
+      .as_bytes()
+      .windows(2)
+      .any(|w| w[0].is_ascii_digit() && w[1] == b'/');
+  // An ambiguous `%pentaxLensTypes` value (`"Sigma or Tamron Lens (3 44)"`)
+  // needs `PrintLensID`'s focal-length disambiguation that exifast lacks — defer.
+  let is_ambiguous = prt0.contains(" or ");
+  has_lens_token && !is_ambiguous
+}
+
+/// `Composite:DateTimeCreated` ValueConv (IPTC.pm:952 `"$val[0] $val[1]"`).
+/// `$val[0]`=`IPTC:DateCreated` (Require), `$val[1]`=`IPTC:TimeCreated` (Require)
+/// — concatenated with a single space into the `Text` `$val` (the PrintConv is
+/// `ConvertDateTime`, the identity at exifast's option set). Both inputs are
+/// `Require`d, so the engine only attempts the build when both are present.
+#[cfg(feature = "exif")]
+fn datetime_created(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let date = v.first()?.as_text()?;
+  let time = v.get(1)?.as_text()?;
+  Some(CompositeRaw::Text(std::format!("{date} {time}")))
 }
 
 /// The shared `%subSecConv` derivation (Exif.pm:4726) for the three SubSec
@@ -1904,6 +2267,82 @@ const APERTURE: CompositeDef = CompositeDef {
   sort_key: "Composite-Aperture",
 };
 
+/// `Composite:Flash` (XMP.pm:2808, the `Image::ExifTool::XMP` Composite table).
+/// `Desire`s the flat `XMP:FlashFired`/`FlashReturn`/`FlashMode`/`FlashFunction`/
+/// `FlashRedEyeMode` (indices 0-4) + the structured `XMP:Flash` (index 5); the
+/// ValueConv [`composite_flash`] assembles the EXIF Flash bitmask, rendered via
+/// the `%flash` PrintConv. All `Desire`, so it builds whenever the engine
+/// attempts it (a file with no XMP flash data yields `0` ⇒ `"No Flash"` — but
+/// such a file has no flash ingredient to trigger the attempt, so none is built).
+#[cfg(feature = "exif")]
+const FLASH: CompositeDef = CompositeDef {
+  name: "Flash",
+  inputs: &[
+    xmp_des("FlashFired"),
+    xmp_des("FlashReturn"),
+    xmp_des("FlashMode"),
+    xmp_des("FlashFunction"),
+    xmp_des("FlashRedEyeMode"),
+    xmp_des("Flash"),
+  ],
+  derive: composite_flash,
+  print_conv: CompositePrintConv::Flash,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "XMP-Flash",
+};
+
+/// `Composite:LensID` (Exif.pm:5303, the `Image::ExifTool::Exif` Composite table).
+/// `Require`s `LensType`; the UNAMBIGUOUS-LensType subset (see [`lens_id`]) builds
+/// the resolved lens name from the LensType PrintConv `$prt[0]` (ValueConv `$val`
+/// = the raw LensType `$val[0]`).
+///
+/// The ExifTool `Desire`s 1-12 (FocalLength/MaxAperture/LensType2/RFLensType/…)
+/// drive `PrintLensID`'s disambiguation / vendor-DB branches. exifast ports only
+/// the plain-LensType case, but it MUST KNOW when a vendor disambiguator is
+/// present so it can DEFER (return `None`) instead of mis-emitting a stale
+/// LensType name (a Canon RFLensType / Sony LensType2 file would otherwise emit
+/// the wrong lens). So the inputs carry the disambiguators the PrintConv
+/// branches on, in a COMPACT internal layout (`lens_id` reads them by THESE
+/// indices, not ExifTool's numbered slots): `[0]`=LensType (Require),
+/// `[1]`=FocalLength, `[2]`=LensType2, `[3]`=LensType3, `[4]`=LensFocalLength,
+/// `[5]`=RFLensType (all Desire). The remaining ExifTool Desires
+/// (MaxAperture/MaxApertureValue/MinFocalLength/MaxFocalLength/LensModel/
+/// LensFocalRange/LensSpec) only feed `PrintLensID`'s lens-DB lookup that this
+/// subset defers wholesale, so they are still omitted.
+#[cfg(feature = "exif")]
+const LENS_ID: CompositeDef = CompositeDef {
+  name: "LensID",
+  inputs: &[
+    bare_req("LensType"),
+    bare_des("FocalLength"),
+    bare_des("LensType2"),
+    bare_des("LensType3"),
+    bare_des("LensFocalLength"),
+    bare_des("RFLensType"),
+  ],
+  derive: lens_id,
+  print_conv: CompositePrintConv::LensId,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Exif-LensID",
+};
+
+/// `Composite:DateTimeCreated` (IPTC.pm:943, the `Image::ExifTool::IPTC`
+/// Composite table). `Require`s `IPTC:DateCreated` + `IPTC:TimeCreated`;
+/// [`datetime_created`] concatenates them with a space, rendered through
+/// `ConvertDateTime` (the identity at exifast's option set).
+#[cfg(feature = "exif")]
+const DATETIME_CREATED: CompositeDef = CompositeDef {
+  name: "DateTimeCreated",
+  inputs: &[req(&["IPTC"], "DateCreated"), req(&["IPTC"], "TimeCreated")],
+  derive: datetime_created,
+  print_conv: CompositePrintConv::DateTimeCreated,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "IPTC-DateTimeCreated",
+};
+
 /// `Composite:SubSecDateTimeOriginal` (Exif.pm:5164). `Require`s
 /// `EXIF:DateTimeOriginal`, `Desire`s `EXIF:SubSecTimeOriginal` +
 /// `EXIF:OffsetTimeOriginal`; the shared `%subSecConv` assembles the result.
@@ -2241,6 +2680,12 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   SHUTTER_SPEED,
   #[cfg(feature = "exif")]
   APERTURE,
+  #[cfg(feature = "exif")]
+  FLASH,
+  #[cfg(feature = "exif")]
+  LENS_ID,
+  #[cfg(feature = "exif")]
+  DATETIME_CREATED,
   #[cfg(feature = "exif")]
   SUBSEC_DATETIME_ORIGINAL,
   #[cfg(feature = "exif")]
