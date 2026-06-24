@@ -923,7 +923,15 @@ pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
   // Perl's NV default — titlecase `Inf`/`-Inf`/`NaN` (NOT Rust's lowercase
   // `inf`/`-inf` from `{}`). `perl_nonfinite_str` produces Perl's casing.
   if !bitrate.is_finite() {
-    return w.write_str(crate::value::perl_nonfinite_str(bitrate).unwrap_or("NaN"));
+    // The `!is_finite()` guard above means `bitrate` is NaN/±Inf, so
+    // `perl_nonfinite_str` returns `Some` by construction (it yields `None`
+    // ONLY for finite inputs). A panic here would be a programming-logic bug
+    // (the guard and the helper's None-condition diverged), never a data
+    // edge — so `expect` an invariant rather than silently degrade a finite
+    // value to a wrong "NaN" token (#53/FU-12).
+    let non_finite = crate::value::perl_nonfinite_str(bitrate)
+      .expect("perl_nonfinite_str is Some for every non-finite f64 (is_finite-guarded)");
+    return w.write_str(non_finite);
   }
   const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
   let mut b = bitrate;
@@ -1368,6 +1376,20 @@ pub(crate) enum EscapedJson {
   /// JSON string ([`crate::value::TagValue::JsonStr`]) so it is NOT re-coerced to
   /// a bare token by the serializer's number/boolean gate.
   Quoted(SmolStr),
+}
+
+impl EscapedJson {
+  /// The RENDERED content of either verdict — the bare token ([`Self::Bare`]) or
+  /// the escaped, NUL-stripped, `FixUTF8`'d string ([`Self::Quoted`]). The
+  /// classify verdict (which way the value serializes to JSON) lives in the
+  /// variant; this is the plain UTF-8 text a typed/domain consumer wants.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn as_str(&self) -> &str {
+    match self {
+      Self::Bare(s) | Self::Quoted(s) => s,
+    }
+  }
 }
 
 /// Replicate ExifTool's COMPLETE `EscapeJSON` order (`exiftool:3804-3824`, the

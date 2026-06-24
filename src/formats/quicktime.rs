@@ -12553,21 +12553,27 @@ fn push_insta360_identity_tags(
   group: &crate::value::Group,
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
+  use crate::convert::EscapedJson;
   use crate::emit::EmittedTag;
   use crate::value::TagValue;
   for (val, name) in [
-    (id.serial_number(), "SerialNumber"),
-    (id.model(), "Model"),
-    (id.firmware(), "Firmware"),
-    (id.parameters(), "Parameters"),
+    (id.serial_number_json(), "SerialNumber"),
+    (id.model_json(), "Model"),
+    (id.firmware_json(), "Firmware"),
+    (id.parameters_json(), "Parameters"),
   ] {
     if let Some(v) = val {
-      out.push(EmittedTag::new(
-        group.clone(),
-        name.into(),
-        TagValue::Str(v.into()),
-        false,
-      ));
+      // The `EscapeJSON` verdict decides the JSON shape: a value the gate
+      // accepted (the NUL-FREE clean number/boolean original) is a BARE token
+      // via `TagValue::Str` (the serializer renders it bare, identity on
+      // NUL-free ASCII); everything else — every real device string, and a
+      // NUL-split numeric/boolean whose post-strip lexeme would otherwise be
+      // mis-coerced — is forced-quoted via `TagValue::JsonStr` (#53).
+      let value = match v {
+        EscapedJson::Bare(s) => TagValue::Str(s.clone()),
+        EscapedJson::Quoted(s) => TagValue::JsonStr(s.clone()),
+      };
+      out.push(EmittedTag::new(group.clone(), name.into(), value, false));
     }
   }
 }
@@ -16578,6 +16584,53 @@ mod tests {
     );
     assert_eq!(unpack_h_star(&[0xca, 0xfe, 0xf0, 0x0d]), "cafef00d");
     assert_eq!(unpack_h_star(&[]), "");
+  }
+
+  /// `push_insta360_identity_tags` maps each field's `EscapeJSON` verdict to the
+  /// right `TagValue` (#53): `Quoted`→`JsonStr` (forced-quoted, the serializer
+  /// does NOT re-coerce the NUL-stripped text to a bare token) and `Bare`→`Str`
+  /// (the gate renders it bare). The NUL-split numeric `"12"` must serialize as
+  /// the QUOTED `"12"`, a clean number `1234` as the BARE `1234`.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn insta360_identity_emit_quoted_vs_bare_tagvalue() {
+    use crate::convert::EscapedJson;
+    use crate::metadata::Insta360Identity;
+    use crate::value::{Group, TagValue};
+
+    let mut id = Insta360Identity::new();
+    // A NUL-split numeric serial (`31 00 32 00`) classified QUOTED → content
+    // `"12"`; a clean numeric model (`1234`, no NUL) classified BARE; a normal
+    // string firmware QUOTED.
+    id.set_serial_number_json(Some(EscapedJson::Quoted("12".into())));
+    id.set_model_json(Some(EscapedJson::Bare("1234".into())));
+    id.set_firmware_json(Some(EscapedJson::Quoted("1.0.07".into())));
+
+    let group = Group::new("Trailer", "Insta360");
+    let mut out = std::vec::Vec::new();
+    push_insta360_identity_tags(&id, &group, &mut out);
+
+    let find = |name: &str| {
+      out
+        .iter()
+        .find(|t| t.tag().name() == name)
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // QUOTED serial → JsonStr (forced quoted), NOT bare.
+    assert_eq!(find("SerialNumber"), Some(TagValue::JsonStr("12".into())));
+    // BARE clean number → Str (gate renders bare).
+    assert_eq!(find("Model"), Some(TagValue::Str("1234".into())));
+    assert_eq!(find("Firmware"), Some(TagValue::JsonStr("1.0.07".into())));
+
+    // End-to-end JSON shape: JsonStr forces quotes (`"12"`), Str's clean number
+    // renders bare (`1234`) through the serializer's own gate.
+    #[cfg(feature = "json")]
+    {
+      let json_of = |v: &TagValue| serde_json::to_string(v).expect("serialize");
+      assert_eq!(json_of(&find("SerialNumber").unwrap()), "\"12\"");
+      assert_eq!(json_of(&find("Model").unwrap()), "1234");
+      assert_eq!(json_of(&find("Firmware").unwrap()), "\"1.0.07\"");
+    }
   }
 
   /// The GENERATED conv-less maps resolve only their verified-allowlist atoms
