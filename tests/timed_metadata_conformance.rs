@@ -272,6 +272,17 @@ fn gsen_ee_byte_exact() {
 /// adds: with `-ee` the per-sample GPMF timed block is what changes, and it IS
 /// byte-exact. With those two frame rates now emitted, the FULL hero8 document
 /// (container + gpmd/fdsc `Doc<N>`) is byte-exact at `-ee` with NO exclusions.
+///
+/// This is also the **#189 per-track-grouping guard**: hero8 is a DUAL-SOURCE
+/// GoPro file — a `udta/GPMF` box AND a `gpmd` `trak` — so the `-ee -G1` golden
+/// pins BOTH family-1 groups at once: the `udta/GPMF` device tags under `GoPro:`
+/// (`GoPro:DeviceName` = "Highlights", `GoPro:CameraSerialNumber`) and the gpmd
+/// stream's tags under `Track4:` (`Track4:DeviceName` = "HERO8 Black",
+/// `Track4:Accelerometer`, `Track4:GPSDateTime`). The SAME scalar name
+/// (`DeviceName`) survives in BOTH groups with different values — the exact
+/// divergence #189 fixes (a flat collapse would drop one). A regression that
+/// re-collapsed the `gpmd` trak into `GoPro:` would delete every `Track4:*` key
+/// here and fail this byte-exact check.
 #[test]
 fn gopro_hero8_gpmd_ee_byte_exact() {
   // `-ee -G1`: the doc axis collapsed first-wins — Track4's first `DEVC` block
