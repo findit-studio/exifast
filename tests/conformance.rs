@@ -378,6 +378,64 @@ fn riff_junk_conformance() {
 }
 
 #[test]
+fn riff_strd_conformance() {
+  // The ported `%RIFF::StreamData` subset (RIFF.pm:1250-1276, `ProcessStreamData`
+  // at RIFF.pm:1699-1748, #158), each on a HAND-CRAFTED minimal AVI: a `RIFF`/
+  // `AVI ` + `LIST_hdrl` (`avih` + `LIST_strl` carrying a single `strd` chunk).
+  // `ProcessStreamData` keys the table by the `strd` chunk's leading 4-byte tag
+  // ID. Every fixture's bundled `-G1 -j` output is oracle-confirmed to carry
+  // ONLY File:/RIFF:/Casio: + the ported Composites (ImageSize/Megapixels/
+  // Duration, emitted byte-exact). The three rows render mode-independently
+  // (`-j` ≡ `-n`: the tags carry no PrintConv/ValueConv).
+  //
+  // `AVI_strd_zora.avi` — `Zora` (Samsung PL90, RIFF.pm:1270 `Zora =>
+  // 'VendorName'`). A plain tag (no Format) ⇒ ExifTool's default string render
+  // (`tr/\0//d`): the WHOLE payload "Zora"+"SAMSUNG"+"\0" → `RIFF:VendorName` =
+  // "ZoraSAMSUNG" (the tag ID is included; the trailing NUL is deleted).
+  check("AVI_strd_zora.avi", "AVI_strd_zora.avi.json", true);
+  check("AVI_strd_zora.avi", "AVI_strd_zora.avi.n.json", false);
+
+  // `AVI_strd_casi.avi` — `CASI` (Casio GV-10, RIFF.pm:1266-1269 → `%Casio::AVI`,
+  // `Casio.pm:2006-2015`). `ProcessBinaryData` offset-0 `Software` `Format =>
+  // 'string'` reads from the `CASI` tag ID itself (no `Start` override) as a
+  // C-string ⇒ `Casio:Software` = "CASICasio GV-10 Software" (family-0
+  // `MakerNotes`, family-1 `Casio`).
+  check("AVI_strd_casi.avi", "AVI_strd_casi.avi.json", true);
+  check("AVI_strd_casi.avi", "AVI_strd_casi.avi.n.json", false);
+
+  // `AVI_strd_unknown.avi` — the `unknown` fallback (RIFF.pm:1271-1275). The
+  // `XVND`-tagged strd matches no named row; its all-printable payload passes the
+  // `UnknownData` RawConv `/^[^\0-\x1f\x7f-\xff]+$/` ⇒ `RIFF:UnknownData` =
+  // "XVNDGenericVendorData" (the whole payload, tag ID included).
+  check("AVI_strd_unknown.avi", "AVI_strd_unknown.avi.json", true);
+  check("AVI_strd_unknown.avi", "AVI_strd_unknown.avi.n.json", false);
+
+  // `AVI_strd_multi.avi` — a TWO-STREAM AVI: `LIST_hdrl` carries `avih` + two
+  // `LIST_strl`, each with its own `strd` of a DIFFERENT `%RIFF::StreamData`
+  // variant — stream 0 `XVND…` (the `unknown` fallback ⇒ `RIFF:UnknownData`),
+  // stream 1 `Zora…` (⇒ `RIFF:VendorName`). ExifTool runs `ProcessStreamData`
+  // on EVERY `strd` it walks (one per stream), so BOTH leaves emit; the #158
+  // first-match-wins capture dropped the second `strd` entirely. Oracle-pinned
+  // vs bundled 13.59 (`-G1 -j`/`-n` carry BOTH `RIFF:UnknownData` AND
+  // `RIFF:VendorName` + the ported Composites) — this case FAILS on the old
+  // single-slot capture and PASSES once each matched `strd` is recorded in walk
+  // order and emitted.
+  check("AVI_strd_multi.avi", "AVI_strd_multi.avi.json", true);
+  check("AVI_strd_multi.avi", "AVI_strd_multi.avi.n.json", false);
+
+  // `AVI_strd_dup.avi` — a TWO-STREAM AVI whose two `strd` chunks are the SAME
+  // variant (both `Zora…`, payloads "ZoraFIRST" then "ZoraSECOND"), so each
+  // renders to the SAME tag `RIFF:VendorName`. Both records emit in walk order
+  // and the `TagMap` priority-1 duplicate rule keeps the LAST-walked one —
+  // exactly bundled 13.59's default-duplicate last-wins (`RIFF:VendorName` =
+  // "ZoraSECOND", NOT the first "ZoraFIRST"). Confirms the ordered-Vec fix
+  // defers same-key resolution to the normal dedup path rather than blocking at
+  // capture (which would have wrongly frozen the FIRST value).
+  check("AVI_strd_dup.avi", "AVI_strd_dup.avi.json", true);
+  check("AVI_strd_dup.avi", "AVI_strd_dup.avi.n.json", false);
+}
+
+#[test]
 fn riff_wav_extensible_encoding_conformance() {
   // Finding 1 (full `%audioEncoding`, RIFF.pm:90-335). A crafted WAV whose
   // `fmt ` Encoding is `0xfffe` = `WAVE_FORMAT_EXTENSIBLE` (RIFF.pm:333) —

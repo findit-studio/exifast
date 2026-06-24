@@ -113,10 +113,22 @@
 //!   `AVI_textjunk`/`AVI_pentaxjunk`/`AVI_pentaxjunk2` fixtures.
 //! - **`LIST_ncdt` / `LIST_hydt` / `LIST_pntx`.** Nikon/Pentax AVI maker
 //!   notes; depend on Nikon/Pentax module ports (separate Phase-2 items).
-//! - **`StreamData` Camera AVIF/CASI.** RIFF.pm:1250-1276 — Canon AVIF
-//!   sub-IFD + Casio CASI sub-IFD inside `strd`. The `strd` chunk is read
-//!   into the typed stream record so it's reachable for a future Exif/
-//!   Casio sub-port; no decode today.
+//! - **`strd` StreamData (PARTIALLY PORTED, #158).** The `%RIFF::StreamData`
+//!   table (RIFF.pm:1250-1276, `ProcessStreamData` at RIFF.pm:1699-1748) keys
+//!   on the `strd` chunk's leading 4-byte tag ID and is dispatched in
+//!   [`Walker::dispatch_strd`]. PORTED: `Zora` (`RIFF:VendorName` — the whole
+//!   payload, NULs deleted), `CASI` (`%Casio::AVI` `Software` — the whole
+//!   payload as a C-string, `Casio.pm:2006-2015`), and the `unknown` fallback
+//!   (`RIFF:UnknownData` — the whole payload iff all-printable). Still DEFERRED:
+//!   `AVIF` (Canon, RIFF.pm:1257-1265 → `Exif::Main` IFD0 with `Start => 8`,
+//!   forced `LittleEndian`) — it re-dispatches a HEADERLESS IFD0 (no TIFF
+//!   byte-order/magic header) through `ProcessExif` with the `ProcessStreamData`
+//!   `Base`/`DataPos` offset arithmetic (RIFF.pm:1716-1737), a re-dispatch entry
+//!   exifast's `exif` module does not yet expose, and the IsOffset/thumbnail
+//!   mechanics it carries need a real Canon AVIF to pin byte-exact (the same
+//!   embedded-EXIF `Start`/`Base` deferral the `CasioJunk` JUNK variant carries).
+//!   The bundled `RIFF.avi`/`Pentax.avi` fixtures have no `strd`, so the ported
+//!   subset fires only for the crafted `AVI_strd_{zora,casi,unknown}` fixtures.
 //! - **Top-level XMP / SEAL / C2PA / `_PMX` / aXML / iXML** (RIFF.pm:493-
 //!   507, 633-637, 670-673). XMP/JUMBF/SEAL are separate Phase-3+ ports.
 //! - **BikeBro `SGLT`/`SLLT`** (RIFF.pm:619-632).
@@ -435,6 +447,50 @@ enum PentaxJunkVariant {
   Junk2,
 }
 
+/// Which `%RIFF::StreamData` row the `strd` chunk's leading 4-byte tag ID
+/// matched (`RIFF.pm:1250-1276`, `ProcessStreamData` at `RIFF.pm:1699-1748`).
+/// `ProcessStreamData` keys the table by the first 4 bytes of the chunk
+/// (`my $tag = substr($$dataPt, $start, 4)`, `RIFF.pm:1709`); the matched
+/// payload is captured for the emit-time decode (`tags()`), mirroring the
+/// `pentax_junk` re-dispatch. The leaf renderings are tiny fixed string
+/// conversions, so the variant alone selects the right one.
+///
+/// The Canon `AVIF` row (`RIFF.pm:1257-1265` → `Exif::Main` IFD0 with
+/// `Start => 8`, forced `LittleEndian`) is NOT a variant here: it re-dispatches
+/// a HEADERLESS IFD0 (no TIFF byte-order/magic header) through `ProcessExif`
+/// with the `ProcessStreamData` `Base`/`DataPos` offset arithmetic
+/// (`RIFF.pm:1716-1737`) — a re-dispatch entry exifast's `exif` module does not
+/// yet expose, and the IsOffset/thumbnail mechanics it carries need a real
+/// Canon AVIF to pin byte-exact. Deferred (see the module doc + #158).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrdVariant {
+  /// `Zora` — Samsung PL90 AVI (`RIFF.pm:1270` `Zora => 'VendorName'`). A plain
+  /// tag (NO `SubDirectory`/`Format`), so `ProcessStreamData` falls into the
+  /// `HandleTag` else-branch (`RIFF.pm:1738-1745`) with `Start => $start, Size
+  /// => $size` — i.e. the value is the WHOLE `strd` payload (INCLUDING the
+  /// 4-byte `Zora` tag ID), run through ExifTool's default string rendering
+  /// (`EscapeJSON`'s `tr/\0//d` — DELETE every NUL — then `FixUTF8`). Emits
+  /// `RIFF:VendorName` (the table declares only `GROUPS{2}=Video`, so
+  /// family-0/1 default to the module name `RIFF`).
+  VendorName,
+  /// `CASI` — Casio GV-10 AVI (`RIFF.pm:1266-1269` → `%Casio::AVI`,
+  /// `Casio.pm:2006-2015`). A `ProcessBinaryData` table with one leaf: offset 0
+  /// `Software` `Format => 'string'`. `ProcessStreamData` enters the table at
+  /// `DirStart = $start` (no `Start` override ⇒ `$offset = 0`), so offset 0 is
+  /// the `CASI` tag ID itself ⇒ `Software` = the WHOLE payload (including
+  /// `CASI`) read as a C-string (TRUNCATED at the first NUL, then `FixUTF8`).
+  /// Emits `Casio:Software` (family-0 `MakerNotes`, family-1 `Casio`).
+  CasioData,
+  /// The `unknown` fallback (`RIFF.pm:1271-1275`). `ProcessStreamData` looks up
+  /// the `unknown` row when the 4-byte tag ID matches no named row
+  /// (`RIFF.pm:1711-1713`); `UnknownData`'s `RawConv =>
+  /// '$_=$val; /^[^\0-\x1f\x7f-\xff]+$/ ? $_ : undef'` keeps the value ONLY when
+  /// the WHOLE payload (tag ID included) is printable ASCII (0x20-0x7e) with NO
+  /// control/high byte and NO trailing NUL (unlike the JUNK `TextJunk` RawConv,
+  /// which DOES allow trailing NULs). Emits `RIFF:UnknownData`.
+  UnknownData,
+}
+
 /// Typed RIFF metadata — the lib-first output of [`ProcessRiff`].
 ///
 /// D8 convention: no public fields; accessors only.
@@ -509,6 +565,18 @@ pub struct RiffMeta<'a> {
   /// `JUNK` chunk that matched no vendor signature or the `TextJunk` fallback
   /// (#154).
   pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
+  /// The matched `strd` (StreamData) chunks whose leading 4-byte tag ID hit a
+  /// `%RIFF::StreamData` row (`Zora`/`CASI`/the `unknown` fallback —
+  /// `RIFF.pm:1250-1276`), in WALK ORDER. ExifTool runs `ProcessStreamData` on
+  /// EVERY `strd` it walks (one per `LIST_strl`), so a multi-stream AVI retains
+  /// a record per matched `strd` (each rendered under its variant's tag); a
+  /// later same-named record is resolved by the normal `TagMap` duplicate rules
+  /// at emit (last-wins for these undef-priority tags), not dropped at capture.
+  /// Each payload is a sub-slice BORROWED from the input (zero-copy); decoded at
+  /// emit time through the variant's tiny fixed string conversion. Empty for a
+  /// non-vendor / absent `strd`; a Canon `AVIF` strd is recognized-but-deferred
+  /// (see [`StrdVariant`]) so it neither emits nor blocks a later `strd` (#158).
+  strd_records: Vec<(StrdVariant, &'a [u8])>,
 }
 
 impl Default for RiffMeta<'_> {
@@ -525,6 +593,7 @@ impl Default for RiffMeta<'_> {
       webp_meta: Vec::new(),
       webp_ext_override: false,
       pentax_junk: None,
+      strd_records: Vec::new(),
     }
   }
 }
@@ -700,6 +769,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     webp_ext_override: false,
     webp_meta: Vec::new(),
     pentax_junk: None,
+    strd_records: Vec::new(),
   };
 
   // RIFF.pm:2058: `my $riffEnd = Get32u(\$buff, 4) + 8; $riffEnd += $riffEnd & 0x01;`
@@ -731,6 +801,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     webp_meta: walker.webp_meta,
     webp_ext_override,
     pentax_junk: walker.pentax_junk,
+    strd_records: walker.strd_records,
   })
 }
 
@@ -803,6 +874,16 @@ struct Walker<'a> {
   /// (the conditions are mutually exclusive on the leading signature anyway).
   /// `None` until such a `JUNK` is seen (#154).
   pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
+  /// The matched `%RIFF::StreamData` rows (`Zora`/`CASI`/`unknown`,
+  /// `RIFF.pm:1250-1276`) and their borrowed `strd` payloads, in WALK ORDER —
+  /// ExifTool's `ProcessStreamData` runs on EVERY `strd` chunk it walks (one per
+  /// `LIST_strl`, RIFF.pm:1110-1140), so a multi-stream AVI yields one record
+  /// per matched `strd`, not a single slot. Each payload is borrowed from `data`
+  /// (zero-copy); replayed at emit time through the variant's tiny fixed string
+  /// conversion. Empty until such a `strd` is seen; a later record with the same
+  /// rendered tag is resolved by the normal `TagMap` duplicate rules at emit,
+  /// not blocked here (#158).
+  strd_records: Vec<(StrdVariant, &'a [u8])>,
 }
 
 impl<'a> Walker<'a> {
@@ -1256,11 +1337,13 @@ impl<'a> Walker<'a> {
             }
           }
         }
-        // `strd` StreamData — bundled hops into `%StreamData` (RIFF.pm:
-        // 1250-1276) for Canon AVIF / Casio CASI / Samsung Zora. Deferred:
-        // we keep the byte buffer reachable through `streams()` but emit
-        // nothing.
-        b"strd" => {}
+        // `strd` StreamData — bundled hops into `%StreamData`
+        // (`RIFF.pm:1250-1276`, `ProcessStreamData` at `RIFF.pm:1699-1748`) and
+        // keys the table by the leading 4-byte tag ID. PORTED (#158): the
+        // `Zora` (`RIFF:VendorName`) / `CASI` (`Casio:Software`) / `unknown`
+        // (`RIFF:UnknownData`) rows — see [`Walker::dispatch_strd`]. The Canon
+        // `AVIF` IFD0 re-dispatch is deferred (see [`StrdVariant`]).
+        b"strd" => self.dispatch_strd(payload),
         _ => {}
       }
       p += len + (len & 1);
@@ -1374,6 +1457,73 @@ impl<'a> Walker<'a> {
       ));
     }
   }
+
+  /// Dispatch a `strd` (StreamData) chunk through `%RIFF::StreamData`
+  /// (`RIFF.pm:1250-1276`, `ProcessStreamData` at `RIFF.pm:1699-1748`). The
+  /// table is keyed by the leading 4-byte tag ID (`my $tag = substr($$dataPt,
+  /// $start, 4)`, `RIFF.pm:1709`); a hit appends `(variant, payload)` for the
+  /// emit-time decode, the unrecognized-but-printable case falls to the
+  /// `unknown` row, and everything else is dropped. ExifTool re-runs
+  /// `ProcessStreamData` on EVERY `strd` chunk it walks (one per `LIST_strl`,
+  /// each calling `HandleTag` at its walk position), so a multi-stream AVI with
+  /// several `strd` chunks records EACH — there is no first-match-wins gate.
+  /// Same-named records (e.g. two `Zora` streams) are resolved by the normal
+  /// `TagMap` duplicate rules at emit (last-wins for these undef-priority tags),
+  /// matching bundled 13.59.
+  ///
+  /// Ported rows:
+  /// - `Zora` (`RIFF.pm:1270`) → `RIFF:VendorName` — captured.
+  /// - `CASI` (`RIFF.pm:1266-1269`, `%Casio::AVI`) → `Casio:Software` — captured.
+  /// - `unknown` (`RIFF.pm:1271-1275`) → `RIFF:UnknownData` — captured iff the
+  ///   payload passes the all-printable `RawConv` (checked here so a binary
+  ///   `strd` is dropped without storing).
+  ///
+  /// Deferred row (checked here ONLY so it is NOT mis-captured as `unknown`):
+  /// - `AVIF` (`RIFF.pm:1257-1265`, Canon) → `Exif::Main` IFD0 — the headerless
+  ///   IFD0 re-dispatch (see [`StrdVariant`]). Recognized so it is skipped
+  ///   without capture, yet does NOT abort the walk of any later `strd`.
+  ///
+  /// `body` is the full `strd` chunk payload (already bounds-checked by the
+  /// caller). `ProcessStreamData` requires `$size >= 4` (`RIFF.pm:1705`) — a
+  /// shorter chunk has no 4-byte tag ID and emits nothing.
+  fn dispatch_strd(&mut self, body: &'a [u8]) {
+    // `RIFF.pm:1705` `return 0 if $size < 4` — no tag ID, nothing to key on.
+    let Some(tag) = body.get(0..4) else {
+      return;
+    };
+    match tag {
+      // `RIFF.pm:1270` `Zora => 'VendorName'`.
+      b"Zora" => self.strd_records.push((StrdVariant::VendorName, body)),
+      // `RIFF.pm:1266-1269` `CASI` → `%Casio::AVI` (`Software`).
+      b"CASI" => self.strd_records.push((StrdVariant::CasioData, body)),
+      // `RIFF.pm:1257-1265` `AVIF` → `Exif::Main` IFD0 — deferred (the
+      // headerless-IFD0 re-dispatch + `Base`/offset mechanics; see
+      // [`StrdVariant`]). Recognized so it does NOT fall to `unknown`.
+      b"AVIF" => {}
+      // `RIFF.pm:1271-1275` `unknown` fallback: keep the whole payload as
+      // `UnknownData` ONLY when its `RawConv` accepts it (all printable, no
+      // trailing NUL). A binary/unprintable payload is dropped.
+      _ => {
+        if unknown_data_raw_conv(body) {
+          self.strd_records.push((StrdVariant::UnknownData, body));
+        }
+      }
+    }
+  }
+}
+
+/// `%RIFF::StreamData` `UnknownData` RawConv (`RIFF.pm:1274`):
+/// `$_=$val; /^[^\0-\x1f\x7f-\xff]+$/ ? $_ : undef`.
+///
+/// Returns `true` iff the WHOLE value is a non-empty run of printable bytes
+/// (0x20-0x7e — neither a control 0x00-0x1f nor a high byte 0x7f-0xff), with NO
+/// trailing NUL allowance. This is STRICTER than the JUNK `TextJunk` RawConv
+/// (`RIFF.pm:490`, `/^([^\0-\x1f\x7f-\xff]+)\0*$/`), which captures a leading
+/// printable run followed by trailing NULs: here a single trailing NUL fails the
+/// `$`-anchored whole-string match (verified vs bundled 13.59: `XXXXhello` →
+/// `UnknownData`, `XXXXhello\0` → no tag).
+fn unknown_data_raw_conv(body: &[u8]) -> bool {
+  !body.is_empty() && body.iter().all(|&b| (0x20..=0x7e).contains(&b))
 }
 
 /// `TextJunk` RawConv (RIFF.pm:490):
@@ -3414,6 +3564,22 @@ impl crate::emit::Taggable for RiffMeta<'_> {
     if let Some((variant, payload)) = self.pentax_junk {
       emit_pentax_junk(variant, payload, print_conv, &mut tags);
     }
+    // `strd` StreamData (`Zora`/`CASI`/`unknown`, `%RIFF::StreamData`,
+    // `RIFF.pm:1250-1276`): decode EACH captured payload in WALK ORDER through
+    // the matched row's fixed string conversion and emit its leaf. The three
+    // ported rows carry NO PrintConv/ValueConv (plain `VendorName`/`Software`/
+    // `UnknownData` strings), so the rendering is mode-independent (`-j` ≡ `-n`)
+    // — no `print_conv` arg. ExifTool walks the `strd` inside `LIST_strl` (after
+    // the `strh`/`strf` siblings), once per stream, so a multi-stream AVI emits
+    // one leaf per matched `strd`; a same-named repeat (two `Zora` streams →
+    // `RIFF:VendorName` twice) is resolved by the `TagMap` priority-1 duplicate
+    // rule downstream (last-walked wins, matching bundled 13.59). Appends after
+    // the `RIFF:`/`File:` stream (the conformance gate is key-order-insensitive
+    // regardless).
+    #[cfg(feature = "alloc")]
+    for &(variant, payload) in &self.strd_records {
+      emit_strd(variant, payload, &mut tags);
+    }
     // WEBP embedded EXIF/XMP (`EXIF`/`Exif` + `XMP `/`XMP\0` chunks,
     // RIFF.pm:557-587): replay EVERY captured chunk in WALK ORDER. Each EXIF
     // chunk's TIFF block is re-walked through the shared `ProcessTIFF` parser
@@ -3622,6 +3788,63 @@ fn emit_pentax_junk(
       // chunk anyway).
     }
   }
+}
+
+/// Emit the single leaf for a matched `strd` (StreamData) chunk
+/// (`%RIFF::StreamData`, `RIFF.pm:1250-1276`). Each ported row maps the WHOLE
+/// `strd` payload (the 4-byte tag ID INCLUDED — `ProcessStreamData` keeps `Start
+/// => $start`, never skipping the tag, `RIFF.pm:1742`) through a fixed string
+/// conversion:
+///
+/// - [`StrdVariant::VendorName`] (`Zora`): a PLAIN tag (no `Format`) ⇒ ExifTool's
+///   default string rendering, which DELETES every NUL then `FixUTF8`s
+///   ([`crate::convert::escape_json_raw_bytes`] — exactly `EscapeJSON`'s
+///   `tr/\0//d` order). Emits `RIFF:VendorName` (family-0/1 `RIFF`). Verified vs
+///   bundled 13.59: `Zora` + `AB\0CD\0\0` → `"ZoraABCD"` (internal NUL removed).
+/// - [`StrdVariant::CasioData`] (`CASI`): `%Casio::AVI` offset-0 `Software`
+///   `Format => 'string'` ⇒ a C-string TRUNCATED at the first NUL then `FixUTF8`
+///   ([`string_field`] over the whole payload). Emits `Casio:Software` (family-0
+///   `MakerNotes`, family-1 `Casio` — the `%Casio::AVI` `GROUPS`,
+///   `Casio.pm:2008`). Verified: `CASI` + `XY\0ZW\0` → `"CASIXY"` (truncated).
+/// - [`StrdVariant::UnknownData`] (`unknown` fallback): the value already passed
+///   the all-printable `RawConv` ([`unknown_data_raw_conv`]) at capture, so it
+///   carries no NUL/control/high byte — emitted verbatim as `RIFF:UnknownData`.
+#[cfg(feature = "alloc")]
+fn emit_strd(variant: StrdVariant, payload: &[u8], tags: &mut Vec<crate::emit::EmittedTag>) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+
+  let (group, name, value): (Group, &'static str, String) = match variant {
+    // `Zora => 'VendorName'` (`RIFF.pm:1270`). Default-string ⇒ delete-all-NULs.
+    StrdVariant::VendorName => (
+      Group::new("RIFF", "RIFF"),
+      "VendorName",
+      crate::convert::escape_json_raw_bytes(payload),
+    ),
+    // `CASI` → `%Casio::AVI` offset-0 `Software` `Format => 'string'`
+    // (`Casio.pm:2011-2014`) ⇒ truncate-at-first-NUL. `string_field` over the
+    // whole payload (offset 0, full length) reproduces the C-string read.
+    StrdVariant::CasioData => (
+      Group::new("MakerNotes", "Casio"),
+      "Software",
+      string_field(payload, 0, payload.len()).unwrap_or_default(),
+    ),
+    // `unknown` fallback (`RIFF.pm:1271-1275`). Already all-printable (no NUL),
+    // so a verbatim UTF-8 string. `escape_json_raw_bytes` is identity here (no
+    // NUL to strip; the bytes are ASCII so `FixUTF8` is a no-op) — used for a
+    // single conversion path.
+    StrdVariant::UnknownData => (
+      Group::new("RIFF", "RIFF"),
+      "UnknownData",
+      crate::convert::escape_json_raw_bytes(payload),
+    ),
+  };
+  tags.push(EmittedTag::new(
+    group,
+    name.into(),
+    TagValue::Str(value.into()),
+    false,
+  ));
 }
 
 /// `%Pentax::Junk2` `FNumber` (`rational64u`, `PrintConv => 'sprintf("%.1f",$val)'`,
@@ -4723,6 +4946,7 @@ mod tests {
       webp_ext_override: false,
       webp_meta: Vec::new(),
       pentax_junk: None,
+      strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
     assert_eq!(walker.streams.len(), 1, "one strl → one stream record");
@@ -4760,6 +4984,7 @@ mod tests {
       webp_ext_override: false,
       webp_meta: Vec::new(),
       pentax_junk: None,
+      strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
     assert_eq!(walker.streams.len(), 1);
@@ -5161,6 +5386,7 @@ mod tests {
       webp_ext_override: false,
       webp_meta: Vec::new(),
       pentax_junk: None,
+      strd_records: Vec::new(),
     };
     walker.process_chunks_hydt(&body);
     let captured = walker
@@ -5241,6 +5467,7 @@ mod tests {
       webp_ext_override: false,
       webp_meta: Vec::new(),
       pentax_junk: None,
+      strd_records: Vec::new(),
     };
     walker.walk_top();
     assert_eq!(
