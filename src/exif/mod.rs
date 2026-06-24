@@ -5129,7 +5129,7 @@ impl Walker<'_, '_> {
       TableRef::Gps => {
         #[cfg(feature = "gps")]
         {
-          gps::lookup(tag_id).map(|t| t.name)
+          gps::lookup(tag_id).map(|t| t.name())
         }
         // `gps` feature OFF ⇒ the GPS module is "not loaded": ExifTool's
         // `GetTagInfo` yields nothing, so the warning uses the unknown-tag
@@ -5183,8 +5183,8 @@ impl Walker<'_, '_> {
       TableRef::Leica(v) => makernotes::vendors::leica::tags::lookup(v, tag_id).map(|t| t.name()),
       // `%Nikon::PreviewIFD` (#242) — the warning-form name resolves against the
       // PreviewIFD table (its renamed `PreviewImageStart`/`Length` leaves).
-      TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name),
-      _ => tables::lookup(tag_id).map(|t| t.name),
+      TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name()),
+      _ => tables::lookup(tag_id).map(|t| t.name()),
     }
   }
 
@@ -7802,7 +7802,7 @@ impl Walker<'_, '_> {
         #[cfg(feature = "gps")]
         {
           match gps::lookup(tag_id) {
-            Some(t) => (t.name, ResolvedConv::Gps(t)),
+            Some(t) => (t.name(), ResolvedConv::Gps(t)),
             None => return, // unknown GPS tag — verbose-only, omit.
           }
         }
@@ -7906,11 +7906,11 @@ impl Walker<'_, '_> {
       // collection below. An id not in the table is skipped (the verbose-only
       // omit).
       TableRef::NikonPreviewIfd => match tables::nikon_preview_ifd_lookup(tag_id) {
-        Some(t) => (t.name, ResolvedConv::Exif(t)),
+        Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
-        Some(t) => (t.name, ResolvedConv::Exif(t)),
+        Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
       },
     };
@@ -8337,11 +8337,8 @@ impl Walker<'_, '_> {
 /// (the [`render::render_value`] `Text` → `TagValue::Str` path). The `id`/`name`
 /// are placeholders; the real name overrides via the `ExifEntry`'s own `name`,
 /// and `Conv::None` ignores the id.
-static SYNTHETIC_DATA_TAG: tables::ExifTag = tables::ExifTag {
-  id: 0,
-  name: "ThumbnailImage",
-  conv: tables::Conv::None,
-};
+static SYNTHETIC_DATA_TAG: tables::ExifTag =
+  tables::ExifTag::new(0, "ThumbnailImage", tables::Conv::None);
 
 /// The large-array placeholder value — `"(large array of $count $formatStr
 /// values)"` (`Exif.pm:6777`). `$formatStr` is ExifTool's format NAME (e.g.
@@ -9965,9 +9962,11 @@ fn emit_entry<S: ExifSink>(
   // already-rendered `TagValue` — cannot reproduce byte-identically for a
   // multi-element value or preserve in TagValue shape; #243 Codex R1/R2.)
   match entry.conv {
-    ResolvedConv::Exif(tag) => emit_exif_value(group, name, raw, tag.conv, order, print_conv, out),
+    ResolvedConv::Exif(tag) => {
+      emit_exif_value(group, name, raw, tag.conv(), order, print_conv, out)
+    }
     #[cfg(feature = "gps")]
-    ResolvedConv::Gps(tag) => emit_gps_value(group, name, raw, tag.conv, order, print_conv, out),
+    ResolvedConv::Gps(tag) => emit_gps_value(group, name, raw, tag.conv(), order, print_conv, out),
     // `%Canon::Main` vendor leaf (Step A, #243 phase 2) — render via the Canon
     // `PrintConv` (`CanonPrintConv::apply`) and emit under the vendor group
     // `("MakerNotes","Canon")`, mirroring `parse_in_tiff` + `push_maker_note_tags`.
@@ -12819,7 +12818,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
             "PreviewIFD",
             entry.name,
             entry.value.raw(),
-            tag.conv,
+            tag.conv(),
             parent_order,
             print_conv,
             &mut pv,
@@ -14895,14 +14894,14 @@ const EXIF_MAIN_GAP_IDS: &[u16] = &[
 /// generated table therefore stays a SUPERSET of the hand table (the
 /// `generated_shadow_matches_hand_table` parity test asserts hand ⊆ generated,
 /// which the extra gap ids preserve). `#[doc(hidden)]`: this is the generator's
-/// allowlist source, NOT public API — the hand table itself (`ExifTag`, with
-/// its `const`-init public fields) stays `pub(crate)` per D8.
+/// allowlist source, NOT public API — the hand table itself (`ExifTag`, whose
+/// fields are private with `const`-fn accessors) stays `pub(crate)` per D8.
 #[doc(hidden)]
 #[must_use]
 pub fn exif_main_tag_ids() -> Vec<u16> {
   tables::EXIF_TAGS
     .iter()
-    .map(|t| t.id)
+    .map(|t| t.id())
     .chain(EXIF_MAIN_GAP_IDS.iter().copied())
     .collect()
 }
@@ -14914,7 +14913,7 @@ pub fn exif_main_tag_ids() -> Vec<u16> {
 #[doc(hidden)]
 #[must_use]
 pub fn gps_main_tag_ids() -> Vec<u16> {
-  gps::GPS_TAGS.iter().map(|t| t.id).collect()
+  gps::GPS_TAGS.iter().map(|t| t.id()).collect()
 }
 
 // ====================================================================// Unit tests
@@ -16745,7 +16744,7 @@ mod tests {
     // Compression (no PrintHex): an off-table code → `Unknown (12)` with
     // print_conv ON (ExifTool.pm:3627), the bare `12` with it OFF.
     let raw = RawValue::U64(std::vec![12]);
-    let conv = tables::lookup(0x0103).expect("Compression").conv;
+    let conv = tables::lookup(0x0103).expect("Compression").conv();
     assert_eq!(emit_conv(&raw, conv, true), "Unknown (12)");
     assert_eq!(emit_conv(&raw, conv, false), "12");
     // A known code still maps through the hash.
@@ -16759,11 +16758,11 @@ mod tests {
     // ColorSpace (PrintHex => 1, Exif.pm:2693): an off-table code → `Unknown
     // (0xc)` with print_conv ON, the bare DECIMAL `12` with it OFF.
     let raw = RawValue::U64(std::vec![12]);
-    let conv = tables::lookup(0xa001).expect("ColorSpace").conv;
+    let conv = tables::lookup(0xa001).expect("ColorSpace").conv();
     assert_eq!(emit_conv(&raw, conv, true), "Unknown (0xc)");
     assert_eq!(emit_conv(&raw, conv, false), "12");
     // Flash (PrintHex) miss → `Unknown (0x63)` for 99.
-    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    let flash = tables::lookup(0x9209).expect("Flash").conv();
     assert_eq!(
       emit_conv(&RawValue::U64(std::vec![99]), flash, true),
       "Unknown (0x63)"
@@ -16781,7 +16780,7 @@ mod tests {
   #[test]
   #[cfg(feature = "alloc")]
   fn flash_print_conv_matches_bundled_flash_hash() {
-    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    let flash = tables::lookup(0x9209).expect("Flash").conv();
     let label = |code: u64| emit_conv(&RawValue::U64(std::vec![code]), flash, true);
 
     // The bug under fix: 0x18 is "Auto, Did not fire" in `%flash`, NOT the old
@@ -16861,7 +16860,7 @@ mod tests {
       (0x5d, "Auto, Fired, Red-eye reduction, Return not detected"),
       (0x5f, "Auto, Fired, Red-eye reduction, Return detected"),
     ];
-    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    let flash = tables::lookup(0x9209).expect("Flash").conv();
     for code in 0u64..=0xff {
       let got = emit_conv(&RawValue::U64(std::vec![code]), flash, true);
       match BUNDLED.iter().find(|&&(k, _)| k == code) {
@@ -17074,7 +17073,7 @@ mod tests {
   #[test]
   #[cfg(feature = "alloc")]
   fn interop_index_string_keyed_print_conv() {
-    let conv = tables::lookup(0x0001).expect("InteropIndex").conv;
+    let conv = tables::lookup(0x0001).expect("InteropIndex").conv();
     // Hits map to the full DCF label with print_conv ON, raw token with OFF.
     assert_eq!(
       emit_conv(&text_rv("R98"), conv, true),
