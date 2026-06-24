@@ -2239,6 +2239,89 @@ fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
   last
 }
 
+/// The outcome of decoding a `Meta`-routed `stsd` box's `MetaType` — a tri-state
+/// that DISTINGUISHES a per-entry RawConv `undef` (a real clear) from the absence
+/// of any processed entry (no assignment at all).
+///
+/// ExifTool's `ProcessSampleDesc` (QuickTime.pm:9640-9648) runs the per-entry
+/// `%MetaSampleDesc` `MetaType` RawConv (`$$self{MetaType} = ($val=~
+/// /(application[^\0]+)/ ? $1 : undef)`, QuickTime.pm:7769-7774) ONLY inside the
+/// `for ($i=0; $i<$num; ++$i)` entry loop. So:
+///   * a `stsd` with ZERO entries (`$num == 0`, or every entry truncated past the
+///     box) NEVER runs the RawConv ⇒ `$$self{MetaType}` is UNTOUCHED — modelled
+///     by [`StsdMetaType::NoEntryProcessed`];
+///   * the LAST processed entry's RawConv result — `Some(run)` for a matched
+///     `application/...` run, or `None` (the `undef` arm) for an entry with no
+///     such run — is the new value, modelled by
+///     [`StsdMetaType::EntryProcessed`].
+/// The `Meta` route assigns `MetaType` only for `EntryProcessed` (clearing on its
+/// `None`); a `NoEntryProcessed` leaves the earlier value standing (so a crafted
+/// empty/duplicate `stsd` cannot erase a prior entry's `application/arcore-*`
+/// MetaType and route the `mett` payload off the ARCore path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StsdMetaType {
+  /// No sample-description entry was processed (a zero-count or wholly-truncated
+  /// `stsd`) — the per-entry RawConv never ran, so make NO `MetaType` assignment.
+  NoEntryProcessed,
+  /// The LAST processed entry's RawConv outcome: `Some` for a captured
+  /// `application/...` run, `None` for the RawConv `undef` (a real per-entry
+  /// clear — an entry WAS processed and carried no `application/...` run).
+  EntryProcessed(Option<String>),
+}
+
+/// Read the `stsd` (Sample Description) box's `MetaType` (the `application/...`
+/// run, `undef[$size-8]` at offset 8 of the sample-description entry,
+/// QuickTime.pm:7769-7774). ExifTool's per-entry `RawConv => '$$self{MetaType} =
+/// ($val=~/(application[^\0]+)/ ? $1 : undef)'` SETS the result on EVERY processed
+/// entry (last-wins) — including CLEARING it (undef) when an entry carries no
+/// `application/...` run (so an earlier ARCore entry does not leak into a later
+/// plain entry). This walks ALL entries and returns the LAST processed entry's
+/// outcome as [`StsdMetaType::EntryProcessed`] (`Some` when that entry matched,
+/// `None` for the RawConv `undef`). When NO entry was processed at all (a
+/// zero-count / wholly-truncated `stsd`), the RawConv never ran, so this returns
+/// [`StsdMetaType::NoEntryProcessed`] — the caller must NOT clear the prior value
+/// (an empty/absent `stsd` makes no assignment, faithful to ExifTool's per-entry
+/// model). A single entry (the universal shape) resolves to its own outcome.
+fn decode_stsd_meta_type(payload: &[u8]) -> StsdMetaType {
+  let mut result = StsdMetaType::NoEntryProcessed;
+  for_each_stsd_entry(payload, |_dir_start, entry| {
+    // QuickTime.pm:7771 — `MetaType` reads `undef[$size-8]` starting at offset
+    // 8 of the entry; the RawConv then captures the first `application[^\0]+`
+    // run within that tail. Entries with `size < 8` cannot carry it (the
+    // `for_each_stsd_entry` bound already enforces `size >= 8`). An entry WAS
+    // processed here (the closure ran), so this is `EntryProcessed` — even when
+    // the scan yields `None` (the RawConv `undef` clear), distinct from the
+    // initial `NoEntryProcessed` absence.
+    result = StsdMetaType::EntryProcessed(entry.get(8..).and_then(scan_stsd_application_string));
+  });
+  result
+}
+
+/// Capture the first `application[^\0]+` run in `bytes` (QuickTime.pm:7773
+/// `RawConv` regex), or `None` when absent. The `+` requires AT LEAST ONE
+/// non-NUL byte after the literal `application`: the run extends from the
+/// `application` literal up to (not including) the first NUL byte (or end of
+/// buffer), and a bare `application` or `application\0` (no following non-NUL
+/// byte) FAILS the match → `None` (the RawConv's `undef` clear). Mirrors
+/// `crate::formats::quicktime_stream::scan_application_string`.
+fn scan_stsd_application_string(bytes: &[u8]) -> Option<String> {
+  const NEEDLE: &[u8] = b"application";
+  let i = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+  let mut end = i + NEEDLE.len();
+  while bytes.get(end).is_some_and(|&b| b != 0) {
+    end += 1;
+  }
+  // The `[^\0]+` quantifier requires ≥1 non-NUL byte; if the needle is
+  // immediately followed by NUL or buffer-end (`end` never advanced past it),
+  // the regex does not match → `undef`.
+  if end == i + NEEDLE.len() {
+    return None;
+  }
+  bytes
+    .get(i..end)
+    .map(|m| String::from_utf8_lossy(m).into_owned())
+}
+
 /// Faithful `Image::ExifTool::QuickTime::CalcSampleRate` (QuickTime.pm:8856-8868)
 /// for the `stts` (time-to-sample) box: the average sample rate of a video
 /// track. The `stts` body is `unpack('N*', ...)` (big-endian `int32u`s):
@@ -3991,6 +4074,33 @@ fn walk_trak_threaded(
                             SampleDescRoute::Meta => {
                               if let Some(fmt) = decode_stsd_meta_format(sbody) {
                                 track.set_meta_format(Some(fmt));
+                              }
+                              // QuickTime.pm:7769-7774 — the `%MetaSampleDesc`
+                              // offset-8 `MetaType` (`undef[$size-8]` + the
+                              // `(application[^\0]+)` RawConv). The RawConv runs
+                              // PER PROCESSED ENTRY (inside ExifTool's
+                              // `ProcessSampleDesc` entry loop, QuickTime.pm:
+                              // 9640-9648), so the assignment is tri-state:
+                              //  * `EntryProcessed(Some(mt))` — set `mt`;
+                              //  * `EntryProcessed(None)` — a real per-entry
+                              //    RawConv `undef` (an entry WAS processed and
+                              //    carried no `application/...` run), so CLEAR
+                              //    LAST-WINS across `stsd` atoms (an earlier
+                              //    ARCore entry does not leak into a later plain
+                              //    entry);
+                              //  * `NoEntryProcessed` — a zero-count / wholly-
+                              //    truncated `stsd`: the RawConv never ran, so
+                              //    make NO assignment — the earlier value STANDS
+                              //    (a crafted empty/duplicate `stsd` cannot erase
+                              //    a prior `application/arcore-*` MetaType and
+                              //    route the `mett` payload off the ARCore path).
+                              // Drives `Track<N>:MetaType` — the Parrot
+                              // `application/arcore-*` selector.
+                              match decode_stsd_meta_type(sbody) {
+                                StsdMetaType::EntryProcessed(mt) => {
+                                  track.set_meta_type(mt);
+                                }
+                                StsdMetaType::NoEntryProcessed => {}
                               }
                             }
                             // `hint` SEEN BEFORE this `stsd`: `%HintSampleDesc`'s
@@ -9376,6 +9486,25 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // MetaType (`%MetaSampleDesc` offset 8, QuickTime.pm:7769-7774): the
+      // `application/...` run captured from a `Meta`-routed `stsd` entry,
+      // emitted verbatim in both modes (no PrintConv — `Format =>
+      // 'undef[$size-8]'`; the RawConv only stashes `$$self{MetaType}` and
+      // captures the substring). `None` when no entry carried an `application/`
+      // string (the RawConv `undef` — e.g. the Parrot Anafi drone `mett`, whose
+      // `mett` track has no MetaType). Positioned right AFTER `MetaFormat` (the
+      // golden order — Parrot ARCore: `Track<N>:MetaType =
+      // application/arcore-accel`).
+      if let Some(mt) = track.meta_type()
+        && first_seen(grp, "MetaType")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MetaType".into(),
+          TagValue::Str(mt.into()),
+          false,
+        ));
+      }
       // Balance (`minf/smhd` AudioHeader key 2 ⇒ byte 4, `fixed16s`,
       // QuickTime.pm:7350): the rounded 8.8 fixed-point, emitted for an audio
       // track with an `smhd` (`-n` and `-j` identical — ValueConv-shaped only).
@@ -10928,8 +11057,11 @@ impl crate::emit::Taggable for Meta<'_> {
     // The per-sample GPS + flight telemetry decoded from a Parrot `mett` track
     // (`Process_mett`, Parrot.pm:791-854) on the shared `-ee` `Doc<N>` /
     // `Track<N>` axis — same machinery as the rtmd / CTMD arms above. See
-    // [`emit_parrot`] for the per-version offset order + per-tag PrintConv.
-    emit_parrot(&self.parrot, opts, print_conv, &mut tags);
+    // [`emit_parrot`] for the per-version offset order + per-tag PrintConv. The
+    // ARCore `Process_mett` warnings ride the in-stream group-scoped
+    // `Track<N>:Warning` via the shared file-global `WAS_WARNED` set (threaded
+    // across all `-ee` producers, like camm / ctmd / dji).
+    emit_parrot(&self.parrot, opts, print_conv, &mut was_warned, &mut tags);
 
     // ── #163: DJI `djmd` protobuf timed metadata (Image::ExifTool::DJI) ────
     // The per-sample drone / handheld-cam GNSS + camera settings + orientation
@@ -13054,6 +13186,41 @@ fn parrot_vec_value(components: &[f64]) -> crate::value::TagValue {
   crate::value::TagValue::Str(s.into())
 }
 
+/// Emit ONE ARCore accel/gyro reading (`ARCoreAccel`/`ARCoreGyro` +the `0`
+/// variants, Parrot.pm:663-739). The bundled `RawConv` joins three `GetFloat`s
+/// with single spaces (`GetFloat($val,0) . " " . GetFloat($val,5) . " " .
+/// GetFloat($val,10)`) — each `f32` promoted to NV and stringified `%.15g`
+/// ([`crate::value::format_g`]), an OUT-OF-RANGE component rendering as an EMPTY
+/// slot (Perl's uninitialized-value concatenation, e.g. `"0 0 "`). The value is
+/// a STRING with NO ValueConv/PrintConv, so `-n` and `-j` are identical (this
+/// helper takes no `print_conv`). The tag NAME is `Accelerometer` or `Gyroscope`
+/// per the subtable ([`crate::metadata::ParrotArCoreTagKind::tag_name`]).
+#[cfg(feature = "alloc")]
+fn parrot_emit_arcore(
+  s: &crate::metadata::ParrotArCoreSample,
+  group: &crate::value::Group,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::value::{TagValue, format_g};
+  let mut joined = std::string::String::new();
+  for (i, comp) in s.components().iter().enumerate() {
+    if i != 0 {
+      joined.push(' ');
+    }
+    // `GetFloat` undef (out-of-range) ⇒ empty slot; `f32 as f64` promotes to NV
+    // exactly as Perl's `unpack('f')` does before `%.15g` stringification.
+    if let Some(v) = comp {
+      joined.push_str(&format_g(f64::from(*v), 15));
+    }
+  }
+  out.push(crate::emit::EmittedTag::new(
+    group.clone(),
+    s.kind().tag_name().into(),
+    TagValue::Str(joined.into()),
+    false,
+  ));
+}
+
 /// Parrot `FlyingState` PrintConv display (Parrot.pm:203-211 V1 / :328-338 V2 /
 /// :509-519 V3). V1 only defines keys 0..=5; V2 / V3 add 6..=8. A value with no
 /// table entry renders as the raw integer (ExifTool's PrintConv-hash miss).
@@ -13168,6 +13335,7 @@ fn emit_parrot(
   meta: &crate::metadata::ParrotMeta,
   opts: crate::emit::EmitOptions,
   print_conv: bool,
+  was_warned: &mut std::vec::Vec<smol_str::SmolStr>,
   tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::EmittedTag;
@@ -13180,11 +13348,57 @@ fn emit_parrot(
   let flight = meta.flight_samples();
   let follow_me = meta.follow_me_samples();
   let automation = meta.automation_samples();
-  if gps.is_empty() && flight.is_empty() && follow_me.is_empty() && automation.is_empty() {
+  // ARCore phone-camera readings — the `application/arcore-*` MetaType branch
+  // (Parrot.pm:60-83). A `mett` track is EITHER the drone P/E records OR ARCore
+  // (the MetaType selects the walker), so these carry their own `Doc<N>` set.
+  let arcore = meta.arcore_samples();
+  // ARCore `Process_mett` walker warnings (timed records) — the overflow
+  // `[minor] Unexpected length for $metaType record` (warning-only sample, no
+  // vector) + the `RawConv … uninitialized value` (truncated-float sample, the
+  // warning AHEAD of the partial vector). A warning-only sample still emits its
+  // `Doc<N>:Track<N>:SampleTime`/`SampleDuration`/`Warning` at `-ee`, so the
+  // warnings count toward the non-empty guard AND open their own docs below.
+  let arcore_warnings = meta.arcore_warnings();
+  if gps.is_empty()
+    && flight.is_empty()
+    && follow_me.is_empty()
+    && automation.is_empty()
+    && arcore.is_empty()
+    && arcore_warnings.is_empty()
+  {
     return;
   }
   let g3 = matches!(opts.group_mode, GroupMode::G3);
-  // Distinct `Doc<N>` values across ALL FOUR record vectors, in ascending
+  // The FINAL rendered warning text (the `[minor] ` prefix applied for a minor
+  // warning) — the string the file-global `WAS_WARNED` set keys on and that
+  // bundled emits (before the ` [x$n]` suffix). Mirrors [`emit_ctmd_warnings`].
+  let rendered = |w: &crate::metadata::ParrotArCoreWarning| -> std::string::String {
+    if w.minor() {
+      std::format!("[minor] {}", w.message())
+    } else {
+      w.message().to_string()
+    }
+  };
+  // `WAS_WARNED` occurrence count over ALL ARCore warnings, keyed on the FINAL
+  // rendered string, so the ` [x$n]` suffix reflects the file-wide total even
+  // though only the first occurrence emits a `Warning` tag (oracle `trunc2`:
+  // TWO duplicate-text truncated samples → one `Warning "… [x2]"`).
+  let count_of = |msg: &str| -> usize {
+    arcore_warnings
+      .iter()
+      .filter(|w| rendered(w) == msg)
+      .count()
+  };
+  let warning_value = |msg: &str| -> TagValue {
+    let n = count_of(msg);
+    let text = if n > 1 {
+      smol_str::SmolStr::from(std::format!("{msg} [x{n}]"))
+    } else {
+      smol_str::SmolStr::from(msg)
+    };
+    TagValue::Str(text)
+  };
+  // Distinct `Doc<N>` values across ALL record vectors, in ascending
   // (= walk) order. Every production record carries a non-zero stamped doc;
   // unit-built samples (doc == 0) all share document 0, which still emits as one
   // group. `ProcessSamples` opens ONE `Doc<N>` per `mett` SAMPLE, so a P-record
@@ -13197,6 +13411,11 @@ fn emit_parrot(
     .chain(flight.iter().map(|s| s.doc()))
     .chain(follow_me.iter().map(|s| s.doc()))
     .chain(automation.iter().map(|s| s.doc()))
+    .chain(arcore.iter().map(|s| s.doc()))
+    // A warning-only ARCore sample (an overflow TLV) decodes NO vector but still
+    // opens a `Doc<N>` (its `SampleTime`/`SampleDuration`/`Warning` emit), so its
+    // doc must join the walk-ordered set.
+    .chain(arcore_warnings.iter().map(|w| w.doc()))
   {
     if !docs.contains(&d) {
       docs.push(d);
@@ -13215,15 +13434,23 @@ fn emit_parrot(
     let f = flight.iter().find(|s| s.doc() == doc);
     let e2 = follow_me.iter().find(|s| s.doc() == doc);
     let e3 = automation.iter().find(|s| s.doc() == doc);
+    let ar = arcore.iter().find(|s| s.doc() == doc);
+    // The FIRST ARCore warning of this doc — its track/timing seed a
+    // warning-only sample (an overflow TLV decoded no vector, so `ar` is `None`
+    // here but the doc still emits its `SampleTime`/`SampleDuration`/`Warning`).
+    let aw = arcore_warnings.iter().find(|w| w.doc() == doc);
     // The family-1 `Track<N>` + the sample-table timing come from whichever
-    // sample carries them (flight / E2 / E3 hold SampleTime/SampleDuration). A
-    // `0` (unstamped, unit-built) track index renders `Track1` like the other
+    // sample carries them (flight / E2 / E3 / ARCore vector — or the ARCore
+    // warning for a warning-only sample — hold SampleTime/SampleDuration). A `0`
+    // (unstamped, unit-built) track index renders `Track1` like the other
     // timed-sample emitters.
     let track_index = f
       .map(crate::metadata::ParrotFlightSample::track_index)
       .or_else(|| g.map(crate::metadata::ParrotGpsSample::track_index))
       .or_else(|| e2.map(crate::metadata::ParrotFollowMeSample::track_index))
       .or_else(|| e3.map(crate::metadata::ParrotAutomationSample::track_index))
+      .or_else(|| ar.map(crate::metadata::ParrotArCoreSample::track_index))
+      .or_else(|| aw.map(crate::metadata::ParrotArCoreWarning::track_index))
       .filter(|&t| t != 0)
       .unwrap_or(1);
     let track = std::format!("Track{track_index}");
@@ -13234,28 +13461,31 @@ fn emit_parrot(
     };
     scratch.clear();
     // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
-    // `-n`) — emitted ONLY at `-G3` ahead of the payload (the `mett` track's
-    // `ProcessSamples` timing); at `-G1` the cross-kind min-doc precompute owns
-    // the single `Track<N>:SampleTime`, so do not duplicate it here. The timing
-    // comes from whichever record of this doc carries it.
+    // `-n`) — the `mett` track's `ProcessSamples` per-sample timing, emitted
+    // ahead of the payload. At `-G3` each `Doc<N>` carries its own; at `-G1` the
+    // across-doc FIRST-wins collapse below keeps the single
+    // `Track<N>:SampleTime`/`SampleDuration` of the MINIMUM `doc()` (the docs are
+    // walked in ascending order, so the first iteration owns the surviving pair —
+    // matching ExifTool's `%noDups` first-wins on the cross-sample timing). The
+    // timing comes from whichever record of this doc carries it.
     let (sample_time, sample_duration) = f
       .map(|f| (f.sample_time(), f.sample_duration()))
       .or_else(|| e2.map(|s| (s.sample_time(), s.sample_duration())))
       .or_else(|| e3.map(|s| (s.sample_time(), s.sample_duration())))
+      .or_else(|| ar.map(|s| (s.sample_time(), s.sample_duration())))
+      .or_else(|| aw.map(|w| (w.sample_time(), w.sample_duration())))
       .unwrap_or((None, None));
-    if g3 {
-      for (val, name) in [
-        (sample_time, "SampleTime"),
-        (sample_duration, "SampleDuration"),
-      ] {
-        if let Some(secs) = val {
-          let value = if print_conv {
-            TagValue::Str(crate::datetime::convert_duration(secs).into())
-          } else {
-            TagValue::F64(secs)
-          };
-          scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
-        }
+    for (val, name) in [
+      (sample_time, "SampleTime"),
+      (sample_duration, "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
       }
     }
     let version = f
@@ -13270,6 +13500,63 @@ fn emit_parrot(
     }
     if let Some(s) = e3 {
       parrot_emit_automation(s, &group, print_conv, &mut scratch);
+    }
+    // ARCore `Process_mett` warning(s) + accel/gyro vector of THIS sample,
+    // INTERLEAVED in TLV WALK ORDER (ascending `seq`) — matching bundled's
+    // `HandleTag`/`Warn` order: a RawConv `Warn` of the decoded TLV fires AS the
+    // value is built (lower `seq`) so its `Warning` precedes the `Accelerometer`;
+    // a valid TLV's vector precedes a LATER overflow TLV's `Warning` (higher
+    // `seq`). Draining all warnings first (the prior shape) misplaced a
+    // valid-vector-then-overflow sample (it emitted `Warning` before
+    // `Accelerometer`). The ARCore branch is disjoint from the drone P/E records
+    // (a `mett` track is one or the other), so these ride the same per-doc group
+    // for uniformity, after any drone payload.
+    //
+    // Each item is emitted in `seq` order; a warning emits a `Warning` tag gated
+    // by the file-global `WAS_WARNED` text set (a repeat — in THIS doc, another
+    // doc, or a sibling camm/ctmd/dji producer — adds no further `Warning`, only
+    // its own timing/value), with the ` [x$n]` count file-global. The vector
+    // emits via [`parrot_emit_arcore`]. At `-G3` the rows ride this doc's group;
+    // at `-G1` the cross-doc first-wins `(Track<N>, Name)` slot is owned by the
+    // `committed` collapse below — so when a RawConv `Warning` (lower `seq`) and a
+    // later DISTINCT overflow `Warning` (higher `seq`) share the doc, the EARLIER
+    // one wins the single `(Track<N>, Warning)` slot (ExifTool priority-0
+    // first-wins on the tag KEY — distinct text does NOT add a second row; the
+    // `TagMap` sink collapses both same-key `Warning`s to the first walked).
+    {
+      // Walk-order ordinals of THIS doc's items. `arcore` holds one vector per
+      // doc (decode-once); `arcore_warnings` may hold the RawConv warning and/or
+      // an overflow warning. A stable sort by `seq` reproduces the walk order
+      // (equal seqs cannot occur across an item set within one sample).
+      enum ArItem<'a> {
+        Warn(&'a crate::metadata::ParrotArCoreWarning),
+        Vector(&'a crate::metadata::ParrotArCoreSample),
+      }
+      let mut items: std::vec::Vec<(u32, ArItem<'_>)> = std::vec::Vec::new();
+      for w in arcore_warnings.iter().filter(|w| w.doc() == doc) {
+        items.push((w.seq(), ArItem::Warn(w)));
+      }
+      if let Some(s) = ar {
+        items.push((s.seq(), ArItem::Vector(s)));
+      }
+      items.sort_by_key(|&(seq, _)| seq);
+      for (_, item) in items {
+        match item {
+          ArItem::Warn(w) => {
+            let msg = rendered(w);
+            if !was_warned.iter().any(|m| m.as_str() == msg) {
+              was_warned.push(smol_str::SmolStr::from(msg.as_str()));
+              scratch.push(EmittedTag::new(
+                group.clone(),
+                "Warning".into(),
+                warning_value(&msg),
+                false,
+              ));
+            }
+          }
+          ArItem::Vector(s) => parrot_emit_arcore(s, &group, &mut scratch),
+        }
+      }
     }
     if g3 {
       tags.append(&mut scratch);
@@ -26804,6 +27091,150 @@ mod tests {
     payload.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
     payload.extend_from_slice(b"rtmd");
     assert!(decode_stsd_meta_format(&payload).is_none());
+  }
+
+  // ── stsd MetaType tri-state (no-entry absence vs per-entry RawConv undef) ─────
+  //
+  // [`decode_stsd_meta_type`] must DISTINGUISH a per-entry RawConv `undef` (a
+  // real clear — an entry WAS processed and carried no `application/...` run)
+  // from the absence of any processed entry (a zero-count / wholly-truncated
+  // `stsd` — the RawConv never ran). ExifTool's `ProcessSampleDesc`
+  // (QuickTime.pm:9640-9648) runs the `%MetaSampleDesc` `MetaType` RawConv only
+  // inside its `for ($i=0; $i<$num; ++$i)` entry loop, so a `stsd` with no
+  // entries makes NO assignment to `$$self{MetaType}` (the prior value stands).
+
+  /// Build a `Meta`-route `stsd` BODY (`[version/flags:4][count:4]` then each
+  /// entry `[size:4][format:4][reserved:6][data-ref-index:2][tail…]`). Each
+  /// `(format, tail)` becomes one entry; `tail` is the bytes AFTER the 8-byte
+  /// SampleEntry header (where the offset-8 `MetaType` RawConv scans).
+  fn meta_stsd_body(entries: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0, 0, 0, 0]); // version/flags
+    body.extend_from_slice(&(entries.len() as u32).to_be_bytes()); // entry count
+    for (format, tail) in entries {
+      let size = 4 + 4 + 6 + 2 + tail.len(); // size + format + reserved + idx + tail
+      body.extend_from_slice(&(size as u32).to_be_bytes());
+      body.extend_from_slice(*format);
+      body.extend_from_slice(&[0; 8]); // reserved(6) + data-ref-index(2)
+      body.extend_from_slice(tail);
+    }
+    body
+  }
+
+  #[test]
+  fn scan_stsd_application_string_requires_non_nul_run() {
+    // QuickTime.pm:7773 `(application[^\0]+)` — the `+` requires ≥1 non-NUL
+    // byte after the `application` literal. The normal ARCore run captures up
+    // to (not including) the first NUL.
+    assert_eq!(
+      scan_stsd_application_string(b"application/arcore-accel\0trailing"),
+      Some("application/arcore-accel".to_string()),
+    );
+    // Runs to end-of-buffer when no NUL follows.
+    assert_eq!(
+      scan_stsd_application_string(b"application/x-foo"),
+      Some("application/x-foo".to_string()),
+    );
+    // Bare `application` (buffer ends right after the needle) → no non-NUL byte
+    // → `[^\0]+` fails → `None` (the RawConv `undef` clear).
+    assert_eq!(scan_stsd_application_string(b"application"), None);
+    // `application\0` (needle immediately followed by NUL) → also `None`.
+    assert_eq!(scan_stsd_application_string(b"application\0"), None);
+    // No `application` substring at all → `None`.
+    assert_eq!(scan_stsd_application_string(b"random opaque bytes"), None);
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_single_entry_application_run_is_entry_processed_some() {
+    // The universal real-world shape: one `mett` entry carrying the ARCore
+    // `application/arcore-accel` run ⇒ `EntryProcessed(Some(..))`.
+    let body = meta_stsd_body(&[(b"mett", b"application/arcore-accel\0")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(Some("application/arcore-accel".to_string())),
+    );
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_processed_entry_without_run_is_entry_processed_none() {
+    // An entry WAS processed but its offset-8 tail holds no `application/...`
+    // run ⇒ the RawConv `undef` arm ⇒ `EntryProcessed(None)` (a REAL clear,
+    // distinct from the no-entry absence below).
+    let body = meta_stsd_body(&[(b"mett", b"no-app-here\0")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(None),
+    );
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_bare_application_is_entry_processed_none() {
+    // QuickTime.pm:7773 `(application[^\0]+)` — the `+` requires ≥1 non-NUL
+    // byte AFTER `application`. A processed entry whose offset-8 tail ends in a
+    // BARE `application` (no following non-NUL byte) FAILS the match ⇒ the
+    // RawConv `undef` arm ⇒ `EntryProcessed(None)` (a clear), NOT
+    // `EntryProcessed(Some("application"))`. The entry WAS processed, so this
+    // stays distinct from the `NoEntryProcessed` absence below.
+    let body = meta_stsd_body(&[(b"mett", b"application")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(None),
+    );
+    // `application\0` (the needle immediately followed by NUL) also fails the
+    // `[^\0]+` ⇒ clear.
+    let body = meta_stsd_body(&[(b"mett", b"application\0")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(None),
+    );
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_zero_count_is_no_entry_processed() {
+    // A zero-count `stsd` (`$num == 0`): the per-entry RawConv never runs ⇒
+    // `NoEntryProcessed` (NOT a clear). This is the crafted empty/duplicate
+    // `stsd` case — the Meta route must leave the earlier MetaType standing.
+    let body = meta_stsd_body(&[]);
+    assert_eq!(decode_stsd_meta_type(&body), StsdMetaType::NoEntryProcessed);
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_truncated_entry_is_no_entry_processed() {
+    // A `count = 1` whose lone entry's declared `size` overruns the box: the
+    // `for_each_stsd_entry` bound breaks BEFORE invoking the closure, so no
+    // entry is processed ⇒ `NoEntryProcessed` (the prior value stands, no
+    // spurious clear from a truncated duplicate `stsd`).
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0, 0, 0, 0]); // version/flags
+    body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+    body.extend_from_slice(&0xffff_ffffu32.to_be_bytes()); // size overruns
+    body.extend_from_slice(b"mett");
+    assert_eq!(decode_stsd_meta_type(&body), StsdMetaType::NoEntryProcessed);
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_last_processed_entry_wins() {
+    // Multi-entry last-wins WITHIN one `stsd`: a later plain entry's RawConv
+    // `undef` clears an earlier ARCore run (both entries ARE processed) ⇒
+    // `EntryProcessed(None)`. (Faithful per-entry override — the later ABSENT
+    // run clears, unlike a NO-entry box.)
+    let body = meta_stsd_body(&[
+      (b"mett", b"application/arcore-accel\0"),
+      (b"mett", b"plain\0"),
+    ]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(None),
+    );
+    // And the reverse order: a later ARCore run overrides an earlier plain entry.
+    let body = meta_stsd_body(&[
+      (b"mett", b"plain\0"),
+      (b"mett", b"application/arcore-gyro\0"),
+    ]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(Some("application/arcore-gyro".to_string())),
+    );
   }
 
   // ── stsd multi-entry sample-description (ProcessSampleDesc per-tag last-wins) ──

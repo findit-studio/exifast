@@ -19,9 +19,13 @@
 //!     incoming `MetaType` (e.g. `"application/arcore-accel"`) is a
 //!     key in the `%mett` table, each record is `[0x0a][len:u8][payload
 //!     :len bytes]` (a TLV walk). The `MetaType` value selects the
-//!     ARCore-specific subtable. ARCore data is phone-camera AR
-//!     telemetry, NOT drone-side GPS, so this port WALKS the records
-//!     faithfully but discards their values (camera-indexing scope).
+//!     ARCore-specific subtable (`ARCoreAccel`/`ARCoreGyro` + their `0`
+//!     variants, Parrot.pm:663-739), whose `Accelerometer`/`Gyroscope`
+//!     RawConv joins three little-endian floats. NOTE: the per-record
+//!     `HandleTag` does NOT pass `Start`/`Size`, so each ProcessBinaryData
+//!     subdir re-reads the WHOLE sample from offset 0 (ExifTool.pm:9366-
+//!     9385) — every record yields the same fixed-offset tag, deduped to
+//!     one (see [`process_mett`]).
 //!  2. **ID-keyed (Parrot drones)** — Parrot.pm:823-852. Each record
 //!     is `[id:2 bytes][nwords:u16-BE][payload]` where:
 //!      - `id` is `"P1"` / `"P2"` / `"P3"` for a basic record, or
@@ -67,13 +71,10 @@
 //!    [`ParrotFollowMeSample`];
 //!  - **`E3 Automation`** — framing + destination waypoints +
 //!    animation/flags → [`ParrotAutomationSample`].
-//!
-//! ## What this port walks but discards
-//!
-//! Faithful but unsurfaced (the walker visits, the typed layer discards):
-//!  - **ARCore subtables** — phone-side AR telemetry, not drone-side
-//!    GPS. The TLV walker still steps over the records; their values are
-//!    discarded (flagged separately for the user).
+//!  - **ARCore Accelerometer / Gyroscope** (`application/arcore-*` MetaType)
+//!    — the three-component float vector of the `ARCoreAccel`/`ARCoreGyro`
+//!    subtables → [`ParrotArCoreSample`]. Phone-side AR telemetry, surfaced
+//!    at `-ee` but not projected into the camera-indexing domain.
 //!
 //! ## GPS priority chain
 //!
@@ -88,9 +89,9 @@
 use smol_str::SmolStr;
 
 use crate::metadata::{
-  ParrotAutomationAnimation, ParrotAutomationSample, ParrotFlightSample, ParrotFlyingState,
-  ParrotFollowMeAnimation, ParrotFollowMeSample, ParrotGpsSample, ParrotMeta, ParrotPilotingMode,
-  ParrotRecordVersion,
+  ParrotArCoreSample, ParrotArCoreTagKind, ParrotArCoreWarning, ParrotAutomationAnimation,
+  ParrotAutomationSample, ParrotFlightSample, ParrotFlyingState, ParrotFollowMeAnimation,
+  ParrotFollowMeSample, ParrotGpsSample, ParrotMeta, ParrotPilotingMode, ParrotRecordVersion,
 };
 
 // ===========================================================================
@@ -652,18 +653,41 @@ pub fn process_mett(data: &[u8], meta_type: Option<&str>, out: &mut ParrotMeta) 
 
   // Parrot.pm:802 — `if ($$tagTbl{$metaType})`. The bundled `%mett`
   // table includes the ARCore string keys (`application/arcore-accel`
-  // etc.). exifast does not decode the ARCore subtables (phone-side AR
-  // telemetry, not camera-indexing). Faithful walker for the ARCore
-  // case still needs to STEP over the records (so a future port can
-  // hook in) — bundled `Process_mett` returns 1 after the loop in either
-  // branch (Parrot.pm:821 / :853).
+  // etc.), each routing to a `ProcessBinaryData` subtable
+  // (Parrot.pm:60-83 → :663-749). The `application/arcore-*` MetaType branch
+  // dispatches the per-record `HandleTag` against the matching subtable.
   let is_arcore = meta_type.is_some_and(is_arcore_meta_type);
   if is_arcore {
+    let layout = meta_type.and_then(arcore_layout);
     // Parrot.pm:804-820 — TLV loop: `[0x0a][len:u8][payload:len bytes]`.
     // Oracle bound `while ($pos < $dirEnd - 2)` — a record needs the 0x0a tag
     // byte + the length byte + at least one payload byte, so `pos + 2 < dir_end`
     // (NOT `<=`; the trailing record must have a non-empty payload). Written
     // additively to avoid the `dir_end - 2` underflow when `dir_end < 2`.
+    //
+    // KEY FAITHFULNESS NOTE — the per-record `HandleTag` (Parrot.pm:812-818)
+    // passes `DirStart => $pos, DirLen => $len`, but `HandleTag` reads the
+    // SubDirectory bounds from `$parms{Start}`/`$parms{Size}` (NOT `DirStart`/
+    // `DirLen`, ExifTool.pm:9366-9367) — which are UNDEFINED here. So the
+    // SubDirectory falls back to `$subdirStart = 0` / `$subdirLen = length
+    // $$dataPt` (the WHOLE sample, ExifTool.pm:9384-9385 is for the RawConv
+    // case, but the plain undef DirStart/DirLen ⇒ `ProcessBinaryData`'s
+    // `$dirStart = DirStart || 0 = 0`, `$size = DirLen` undef ⇒ `$maxLen` =
+    // whole sample, ExifTool.pm:9882-9890). I.e. the TLV per-record framing is
+    // IGNORED — every record's `HandleTag` re-processes the WHOLE sample from
+    // offset 0, so all records produce the IDENTICAL accel/gyro tag (read at a
+    // FIXED buffer offset 5/9), which the `TagMap` dedups to one. So decode the
+    // whole buffer ONCE, on the first record that would `HandleTag`, and push a
+    // single sample. (Verified vs bundled 13.59: a two-TLV-record sample emits
+    // only the first record's value.) The loop still STEPS to preserve the
+    // overflow warning on a later record.
+    let mut decoded = false;
+    // Per-sample TLV WALK-ORDER ordinal — a monotonic counter the loop assigns
+    // to each emitted item (the RawConv warning + vector of the decoded TLV, and
+    // a later overflow TLV's warning) in `HandleTag`/`Warn` order, so
+    // `emit_parrot` can interleave them at their walk positions (vector AHEAD of
+    // a later overflow warning) rather than draining all warnings first.
+    let mut seq: u32 = 0;
     while pos + 2 < dir_end {
       // Parrot.pm:805 `last unless substr(.., $pos, 1) eq "\x0a"`.
       if data.get(pos) != Some(&0x0a) {
@@ -674,25 +698,48 @@ pub fn process_mett(data: &[u8], meta_type: Option<&str>, out: &mut ParrotMeta) 
       };
       let len_byte = len_raw as usize;
       let total = pos.saturating_add(len_byte).saturating_add(2);
-      // Parrot.pm:807-810 — overflow ⇒ first-only warning + stop.
+      // Parrot.pm:807-810 — the TLV length overflows the sample ⇒ `$et->Warn`
+      // then `last` BEFORE the `HandleTag`, so this record (and the sample, if it
+      // is the first record) decodes NO vector. The warning is `Warn(.., 1)` ⇒
+      // MINOR (rendered `[minor] …`) and INTERPOLATES `$metaType` verbatim (e.g.
+      // `Unexpected length for application/arcore-accel record`), NOT a fixed
+      // string. Pushed as a TIMED record (the dispatch stamps its `Doc<N>`/
+      // `Track<N>`/timing) so a warning-only ARCore sample still emits its
+      // `Doc<N>:Track<N>:SampleTime`/`SampleDuration`/`Warning` at `-ee`.
       if total > dir_end {
-        out.set_warning(SmolStr::new("Unexpected length for ARCore mett record"));
+        // The overflow `Warn` fires at THIS TLV's position — AFTER any earlier
+        // decoded TLV's vector — so it takes the current (highest-so-far)
+        // ordinal, landing after the vector at emit time (walk order).
+        out.push_arcore_warning(
+          ParrotArCoreWarning::new(
+            SmolStr::from(std::format!(
+              "Unexpected length for {} record",
+              meta_type.unwrap_or("")
+            )),
+            true,
+          )
+          .with_seq(seq),
+        );
         break;
+      }
+      // Parrot.pm:812-818 `$et->HandleTag(...)` — fires here. The subtable
+      // re-reads the WHOLE sample from offset 0 (see the framing note above), so
+      // decode once and dedup. `ARCoreVideo`/`ARCoreCustom` have empty tables
+      // (`layout == None`) ⇒ nothing to emit, but the loop still steps.
+      if !decoded {
+        decoded = true;
+        if let Some((kind, base)) = layout
+          && let Some(sample) = decode_arcore(data, kind, base, &mut seq, out)
+        {
+          out.push_arcore_sample(sample);
+        }
       }
       // Parrot.pm:811 `$len or $len = $dirEnd - $pos - 2` — len 0 means
       // "use the rest of the record".
-      let effective_len = if len_byte == 0 {
-        dir_end - pos - 2
-      } else {
-        len_byte
-      };
-      // FOLLOW-UP: decode the ARCore subtables (Parrot::ARCoreAccel /
-      // ARCoreAccel0 / ARCoreGyro / ARCoreGyro0 / ARCoreVideo /
-      // ARCoreCustom). Phone-side AR telemetry, not camera identity.
-      let _ = effective_len;
       pos += len_byte + 2;
       if len_byte == 0 {
-        // Defensive: a len-0 record means "consume the rest", so stop.
+        // A len-0 record consumes the rest (`$pos += 0 + 2`, then the next
+        // iteration's `$pos < $dirEnd - 2` typically fails), so stop.
         break;
       }
     }
@@ -872,6 +919,102 @@ fn is_arcore_meta_type(s: &str) -> bool {
       | "application/arcore-video-0"
       | "application/arcore-custom-event"
   )
+}
+
+/// Map an ARCore MetaType string to its `ProcessBinaryData` subtable layout —
+/// `(tag kind, buffer base offset)` — for the single accel/gyro vector each
+/// non-empty subtable surfaces (Parrot.pm:663-739). The base offset is the
+/// `undef`-format tag's byte offset (the start of the 14-byte buffer the
+/// `RawConv` reads three `GetFloat`s from). `application/arcore-video-0`
+/// (`ARCoreVideo`) and `application/arcore-custom-event` (`ARCoreCustom`) have
+/// EMPTY tables (Parrot.pm:741-749) ⇒ `None` (nothing to decode).
+fn arcore_layout(meta_type: &str) -> Option<(ParrotArCoreTagKind, usize)> {
+  match meta_type {
+    // ARCoreAccel — `Accelerometer` @ offset 5 (Parrot.pm:675-679).
+    "application/arcore-accel" => Some((ParrotArCoreTagKind::Accelerometer, 5)),
+    // ARCoreAccel0 — `Accelerometer` @ offset 9 (Parrot.pm:701-705).
+    "application/arcore-accel-0" => Some((ParrotArCoreTagKind::Accelerometer, 9)),
+    // ARCoreGyro — `Gyroscope` @ offset 5 (Parrot.pm:721-725).
+    "application/arcore-gyro" => Some((ParrotArCoreTagKind::Gyroscope, 5)),
+    // ARCoreGyro0 — `Gyroscope` @ offset 9 (Parrot.pm:734-738).
+    "application/arcore-gyro-0" => Some((ParrotArCoreTagKind::Gyroscope, 9)),
+    _ => None,
+  }
+}
+
+/// Read a little-endian `f32` at `off` (`ByteOrder => 'II'`, Parrot.pm:62/66/
+/// 70/74). Returns `None` when the 4 bytes are not all in range — mirroring
+/// `GetFloat`'s `unpack('f', <4-bytes)` returning `undef` on a short read
+/// (ExifTool.pm:6052-6066 `DoUnpack`).
+fn le_f32(b: &[u8], off: usize) -> Option<f32> {
+  Some(f32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+}
+
+/// Decode one ARCore accel/gyro vector from the WHOLE `mett` sample buffer.
+///
+/// The bundled `ProcessBinaryData` reads the `undef[14]` value at `base`
+/// (`$val = substr($dataPt, base, 14)`, truncated to what's available) then the
+/// `RawConv` joins `GetFloat($val,0)`, `GetFloat($val,5)`, `GetFloat($val,10)`
+/// with spaces (Parrot.pm:678/704/724/737). Each `GetFloat` reads at the
+/// ABSOLUTE buffer offset `base + {0,5,10}` and yields `Some` iff its 4 bytes
+/// are in range — so a short record drops the out-of-range component(s) to an
+/// empty slot in the join. `ProcessBinaryData` only reaches the tag when `base
+/// < size` (`next if $entry >= $size`, ExifTool.pm:9938; `last if $more <= 0`,
+/// :9964) — so when `base >= len` NO tag is emitted at all (returns `None`).
+///
+/// Raises the `RawConv <Kind>: Use of uninitialized value in concatenation (.)
+/// or string` warning when any component is out of range — matching ExifTool's
+/// uninitialized-value warning (the `GetFloat`-join `RawConv` concatenating an
+/// `undef` component; NON-minor, no `[minor]` prefix). Pushed as a TIMED record
+/// ([`ParrotArCoreWarning`]) so it rides the sample's `Doc<N>:Track<N>:Warning`
+/// at `-ee` (AHEAD of the partial `Accelerometer`/`Gyroscope` value). One
+/// warning per truncated sample; the file-global `WAS_WARNED` dedup + ` [x$n]`
+/// count are applied at emit time.
+///
+/// `seq` is the per-sample TLV WALK-ORDER counter ([`ParrotArCoreSample::seq`]):
+/// the RawConv warning (raised as the value is built) takes the CURRENT ordinal
+/// and the vector takes the NEXT, so the warning interleaves AHEAD of the vector
+/// at emit time, and a later overflow TLV's warning (higher ordinal) lands
+/// after it — reproducing ExifTool's `HandleTag`/`Warn` walk order.
+fn decode_arcore(
+  data: &[u8],
+  kind: ParrotArCoreTagKind,
+  base: usize,
+  seq: &mut u32,
+  out: &mut ParrotMeta,
+) -> Option<ParrotArCoreSample> {
+  // `next if $entry >= $size` / `last if $more <= 0` (ExifTool.pm:9938/9964):
+  // the `undef` tag at `base` is skipped entirely when `base >= len` ⇒ no tag.
+  if base >= data.len() {
+    return None;
+  }
+  let components = [
+    le_f32(data, base),
+    le_f32(data, base + 5),
+    le_f32(data, base + 10),
+  ];
+  if components.iter().any(Option::is_none) {
+    // The RawConv `Warn` fires AS the join is built — AHEAD of the (partial)
+    // vector — so it takes the current ordinal and the vector the next.
+    out.push_arcore_warning(
+      ParrotArCoreWarning::new(
+        SmolStr::new(match kind {
+          ParrotArCoreTagKind::Accelerometer => {
+            "RawConv Accelerometer: Use of uninitialized value in concatenation (.) or string"
+          }
+          ParrotArCoreTagKind::Gyroscope => {
+            "RawConv Gyroscope: Use of uninitialized value in concatenation (.) or string"
+          }
+        }),
+        false,
+      )
+      .with_seq(*seq),
+    );
+    *seq += 1;
+  }
+  let sample = ParrotArCoreSample::new(kind, components).with_seq(*seq);
+  *seq += 1;
+  Some(sample)
 }
 
 // ===========================================================================
@@ -1208,11 +1351,13 @@ mod tests {
     s1.extend_from_slice(&2u16.to_be_bytes());
     s1.extend_from_slice(&111_000u64.to_be_bytes());
     s1.extend_from_slice(&[0u8; 4]);
-    let (g0, f0, fm0, a0) = (
+    let (g0, f0, fm0, a0, ac0, aw0) = (
       m.gps_sample_count(),
       m.flight_sample_count(),
       m.follow_me_sample_count(),
       m.automation_sample_count(),
+      m.arcore_sample_count(),
+      m.arcore_warning_count(),
     );
     process_mett(&s1, None, &mut m);
     m.stamp_doc_from(
@@ -1220,6 +1365,8 @@ mod tests {
       f0,
       fm0,
       a0,
+      ac0,
+      aw0,
       /*doc=*/ 1,
       /*track=*/ 1,
       Some(0.0),
@@ -1232,11 +1379,13 @@ mod tests {
     s2.extend_from_slice(&2u16.to_be_bytes());
     s2.extend_from_slice(&222_000u64.to_be_bytes());
     s2.extend_from_slice(&[0u8; 4]);
-    let (g1, f1, fm1, a1) = (
+    let (g1, f1, fm1, a1, ac1, aw1) = (
       m.gps_sample_count(),
       m.flight_sample_count(),
       m.follow_me_sample_count(),
       m.automation_sample_count(),
+      m.arcore_sample_count(),
+      m.arcore_warning_count(),
     );
     process_mett(&s2, None, &mut m);
     m.stamp_doc_from(
@@ -1244,6 +1393,8 @@ mod tests {
       f1,
       fm1,
       a1,
+      ac1,
+      aw1,
       /*doc=*/ 2,
       /*track=*/ 1,
       Some(1.0),
@@ -1266,17 +1417,298 @@ mod tests {
     assert_eq!(s2_flight.track_index(), 1);
   }
 
-  #[test]
-  fn arcore_meta_type_walks_without_panic() {
-    // Build a TLV record `[0x0a][len=4][4 bytes payload]` — the walker
-    // should step over it, not push any samples.
+  /// Build an ARCore Accel/Gyro TLV record `[0x0a][len][payload]` whose three
+  /// `Accelerometer`/`Gyroscope` floats sit at record offsets 5/10/15 (buffer
+  /// offsets 0/5/10 of the `undef[14]` value at @5). Mirrors the crafted fixture
+  /// (`tools/gen_parrot_arcore_fixture.py`).
+  fn arcore_offset5_record(fx: f32, fy: f32, fz: f32) -> Vec<u8> {
+    let mut body = [0u8; 34];
+    body[0] = 16;
+    body[1] = 1;
+    body[2] = 29; // record offset 4 (Unknown[0])
+    body[3..7].copy_from_slice(&fx.to_le_bytes()); // record offset 5
+    body[7] = 37;
+    body[8..12].copy_from_slice(&fy.to_le_bytes()); // record offset 10
+    body[12] = 45;
+    body[13..17].copy_from_slice(&fz.to_le_bytes()); // record offset 15
+    body[17] = 48;
     let mut buf = Vec::new();
     buf.push(0x0a);
-    buf.push(4);
-    buf.extend_from_slice(&[0u8; 4]);
+    buf.push(body.len() as u8);
+    buf.extend_from_slice(&body);
+    buf
+  }
+
+  /// The `*0` ARCore variants put the float at buffer offset 9 (record offsets
+  /// 9/14/19). Pad the record to >= 23 bytes so all three floats fit.
+  fn arcore_offset9_record(fx: f32, fy: f32, fz: f32) -> Vec<u8> {
+    let mut body = [0u8; 30];
+    body[0] = 16;
+    body[1] = 5;
+    body[7..11].copy_from_slice(&fx.to_le_bytes()); // record offset 9
+    body[12..16].copy_from_slice(&fy.to_le_bytes()); // record offset 14
+    body[17..21].copy_from_slice(&fz.to_le_bytes()); // record offset 19
+    let mut buf = Vec::new();
+    buf.push(0x0a);
+    buf.push(body.len() as u8);
+    buf.extend_from_slice(&body);
+    buf
+  }
+
+  /// Render the decoded ARCore vector the way `parrot_emit_arcore` does — the
+  /// `%.15g` space-join with empty slots for out-of-range floats — so a test can
+  /// assert the exact bundled string.
+  fn arcore_joined(s: &crate::metadata::ParrotArCoreSample) -> String {
+    let mut out = String::new();
+    for (i, c) in s.components().iter().enumerate() {
+      if i != 0 {
+        out.push(' ');
+      }
+      if let Some(v) = c {
+        out.push_str(&crate::value::format_g(f64::from(*v), 15));
+      }
+    }
+    out
+  }
+
+  #[test]
+  fn arcore_accel_decodes_one_vector() {
+    // Bundled (`-ee -G1`): `Track1:Accelerometer = "0.125 -0.25 9.8125"`.
+    let buf = arcore_offset5_record(0.125, -0.25, 9.8125);
     let mut m = ParrotMeta::new();
     process_mett(&buf, Some("application/arcore-accel"), &mut m);
-    assert!(m.is_empty());
+    assert_eq!(m.arcore_samples().len(), 1);
+    let s = &m.arcore_samples()[0];
+    assert_eq!(s.kind(), ParrotArCoreTagKind::Accelerometer);
+    assert_eq!(arcore_joined(s), "0.125 -0.25 9.8125");
+    assert!(m.arcore_warnings().is_empty());
+  }
+
+  #[test]
+  fn arcore_gyro_decodes_one_vector_with_g15_precision() {
+    // Bundled (`-ee -G1`): the non-exact f32s render at `%.15g`:
+    // `Track1:Gyroscope = "0.00100000004749745 0.0020000000949949
+    // -0.00300000002607703"`.
+    let buf = arcore_offset5_record(0.001, 0.002, -0.003);
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-gyro"), &mut m);
+    assert_eq!(m.arcore_samples().len(), 1);
+    let s = &m.arcore_samples()[0];
+    assert_eq!(s.kind(), ParrotArCoreTagKind::Gyroscope);
+    assert_eq!(
+      arcore_joined(s),
+      "0.00100000004749745 0.0020000000949949 -0.00300000002607703"
+    );
+  }
+
+  #[test]
+  fn arcore_accel0_and_gyro0_use_offset_9() {
+    // Bundled (`-ee -G1`): `application/arcore-accel-0` → `Accelerometer =
+    // "0.5 0.625 -0.75"`; `application/arcore-gyro-0` → `Gyroscope =
+    // "0.100000001490116 -0.200000002980232 0.300000011920929"`.
+    let buf = arcore_offset9_record(0.5, 0.625, -0.75);
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel-0"), &mut m);
+    assert_eq!(m.arcore_samples().len(), 1);
+    assert_eq!(
+      m.arcore_samples()[0].kind(),
+      ParrotArCoreTagKind::Accelerometer
+    );
+    assert_eq!(arcore_joined(&m.arcore_samples()[0]), "0.5 0.625 -0.75");
+
+    let buf = arcore_offset9_record(0.1, -0.2, 0.3);
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-gyro-0"), &mut m);
+    assert_eq!(m.arcore_samples()[0].kind(), ParrotArCoreTagKind::Gyroscope);
+    assert_eq!(
+      arcore_joined(&m.arcore_samples()[0]),
+      "0.100000001490116 -0.200000002980232 0.300000011920929"
+    );
+  }
+
+  #[test]
+  fn arcore_video_and_custom_emit_nothing() {
+    // `ARCoreVideo`/`ARCoreCustom` have EMPTY ProcessBinaryData tables
+    // (Parrot.pm:741-749) — bundled emits no tag (only the MetaType).
+    for mt in [
+      "application/arcore-video-0",
+      "application/arcore-custom-event",
+    ] {
+      let buf = arcore_offset5_record(1.0, 2.0, 3.0);
+      let mut m = ParrotMeta::new();
+      process_mett(&buf, Some(mt), &mut m);
+      assert!(m.arcore_samples().is_empty(), "{mt} should emit no sample");
+    }
+  }
+
+  #[test]
+  fn arcore_truncated_record_drops_out_of_range_floats() {
+    // A record too short to reach the third float (buffer offset 10): bundled
+    // renders the empty trailing slot `"0 0 "` + a `RawConv … uninitialized
+    // value` warning. Payload of 12 bytes ⇒ whole sample 14 bytes; the `undef`
+    // value at @5 is 9 bytes ⇒ float[0]@5 (in range), float[1]@10 (in range),
+    // float[2]@15 (offset 15+4 > 14 ⇒ undef).
+    let mut buf = Vec::new();
+    buf.push(0x0a);
+    buf.push(12);
+    buf.extend_from_slice(&[16, 1, 29]);
+    buf.extend_from_slice(&[0u8; 9]);
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel"), &mut m);
+    assert_eq!(m.arcore_samples().len(), 1);
+    let s = &m.arcore_samples()[0];
+    assert_eq!(s.components()[0], Some(0.0));
+    assert_eq!(s.components()[1], Some(0.0));
+    assert_eq!(s.components()[2], None);
+    assert_eq!(arcore_joined(s), "0 0 ");
+    // The truncation raises the uninitialized-value RawConv warning as a TIMED
+    // record (NON-minor) — emitted in-stream as a group-scoped `Track<N>:Warning`
+    // at `-ee` by `emit_parrot`.
+    assert_eq!(m.arcore_warnings().len(), 1);
+    let w = &m.arcore_warnings()[0];
+    assert!(!w.minor());
+    assert_eq!(
+      w.message(),
+      "RawConv Accelerometer: Use of uninitialized value in concatenation (.) or string"
+    );
+  }
+
+  #[test]
+  fn arcore_multi_record_in_one_sample_dedups_to_first() {
+    // Two TLV records in ONE sample: `HandleTag` re-processes the WHOLE sample
+    // from offset 0 for EACH record (the per-record DirStart/DirLen is ignored,
+    // ExifTool.pm:9366-9385), so both read the FIRST record's float @5 ⇒ bundled
+    // emits a single `Accelerometer` = the first record's value. exifast pushes
+    // ONE sample (decode-once on the first record).
+    let mut buf = arcore_offset5_record(1.5, 2.5, 3.5);
+    buf.extend_from_slice(&arcore_offset5_record(10.5, 20.5, 30.5));
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel"), &mut m);
+    assert_eq!(m.arcore_samples().len(), 1);
+    assert_eq!(arcore_joined(&m.arcore_samples()[0]), "1.5 2.5 3.5");
+  }
+
+  /// Build a TLV `[0x0a][len][payload]` from explicit bytes.
+  fn arcore_tlv(len_byte: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0x0a);
+    buf.push(len_byte);
+    buf.extend_from_slice(payload);
+    buf
+  }
+
+  /// One overflow TLV (declared length far past the sample) — mirrors the
+  /// `…_overflow.mp4` fixture's `overflow_record()`.
+  fn arcore_overflow_tlv() -> Vec<u8> {
+    arcore_tlv(200, &[0x10, 0x01, 0x1d, 0x00, 0x00])
+  }
+
+  #[test]
+  fn arcore_valid_then_overflow_orders_vector_before_warning() {
+    // ONE sample: a full-vector valid TLV FOLLOWED by an overflow TLV. The
+    // decoded TLV's vector is `HandleTag`'d at seq 0; the later overflow `Warn`
+    // fires at seq 1 — so the vector's walk ordinal is BELOW the warning's,
+    // and `emit_parrot` emits `Accelerometer` AHEAD of the overflow `Warning`
+    // (bundled 13.59: `Accelerometer` then `[minor] Unexpected length …`).
+    let mut buf = arcore_offset5_record(0.125, -0.25, 9.8125);
+    buf.extend_from_slice(&arcore_overflow_tlv());
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel"), &mut m);
+    // Exactly one vector (decode-once) + one overflow warning.
+    assert_eq!(m.arcore_samples().len(), 1);
+    let s = &m.arcore_samples()[0];
+    assert_eq!(arcore_joined(s), "0.125 -0.25 9.8125");
+    assert_eq!(s.seq(), 0, "the valid vector is the first walked event");
+    assert_eq!(m.arcore_warnings().len(), 1);
+    let w = &m.arcore_warnings()[0];
+    assert!(w.minor(), "overflow warning is MINOR");
+    assert_eq!(
+      w.message(),
+      "Unexpected length for application/arcore-accel record"
+    );
+    assert!(
+      w.seq() > s.seq(),
+      "the overflow warning (later TLV) outranks the vector — emits AFTER it"
+    );
+  }
+
+  #[test]
+  fn arcore_trunc_then_overflow_orders_rawconv_vector_overflow() {
+    // ONE sample (18 bytes): a truncated-float TLV (partial vector + RawConv
+    // Warning, ahead of the value) FOLLOWED by an overflow TLV. Walk order:
+    // RawConv Warning (seq 0), vector (seq 1), overflow Warning (seq 2). Both
+    // Warnings are DISTINCT text but share the `(Doc,Track,Warning)` key, so the
+    // sink keeps only the first (RawConv); here we assert the producer emits BOTH
+    // with the right ordinals (the first-wins collapse is asserted by the golden
+    // `timed_metadata_conformance` test).
+    let mut buf = vec![0x0a, 12];
+    buf.resize(18, 0);
+    buf[5..9].copy_from_slice(&0.125f32.to_le_bytes()); // float[0] @ buffer 5
+    buf[10..14].copy_from_slice(&(-0.25f32).to_le_bytes()); // float[1] @ buffer 10
+    buf[14] = 0x0a; // TLV2 tag
+    buf[15] = 200; // TLV2 overflow length
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel"), &mut m);
+    // Partial vector: float[2] @ buffer 10 (record offset 15, bytes 15..18) is
+    // out of range for the 18-byte sample ⇒ empty trailing slot.
+    assert_eq!(m.arcore_samples().len(), 1);
+    let s = &m.arcore_samples()[0];
+    assert_eq!(arcore_joined(s), "0.125 -0.25 ");
+    // Two DISTINCT warnings: the RawConv (NON-minor) AHEAD of the vector, then
+    // the overflow (MINOR) after it.
+    assert_eq!(m.arcore_warnings().len(), 2);
+    let rawconv = &m.arcore_warnings()[0];
+    assert!(!rawconv.minor());
+    assert_eq!(
+      rawconv.message(),
+      "RawConv Accelerometer: Use of uninitialized value in concatenation (.) or string"
+    );
+    let overflow = &m.arcore_warnings()[1];
+    assert!(overflow.minor());
+    assert_eq!(
+      overflow.message(),
+      "Unexpected length for application/arcore-accel record"
+    );
+    // Walk-order ordinals: RawConv (0) < vector (1) < overflow (2).
+    assert_eq!(rawconv.seq(), 0);
+    assert_eq!(s.seq(), 1);
+    assert_eq!(overflow.seq(), 2);
+  }
+
+  #[test]
+  fn arcore_sample_not_starting_with_0a_emits_nothing() {
+    // The TLV loop breaks immediately when the sample does not start with 0x0a
+    // (`last unless substr(.., $pos, 1) eq "\x0a"`, Parrot.pm:805) ⇒ no HandleTag
+    // ⇒ no tag.
+    let mut buf = Vec::new();
+    buf.push(0xff);
+    buf.extend_from_slice(&arcore_offset5_record(1.0, 2.0, 3.0));
+    let mut m = ParrotMeta::new();
+    process_mett(&buf, Some("application/arcore-accel"), &mut m);
+    assert!(m.arcore_samples().is_empty());
+  }
+
+  #[test]
+  fn arcore_layout_maps_metatype_to_offset() {
+    assert_eq!(
+      arcore_layout("application/arcore-accel"),
+      Some((ParrotArCoreTagKind::Accelerometer, 5))
+    );
+    assert_eq!(
+      arcore_layout("application/arcore-accel-0"),
+      Some((ParrotArCoreTagKind::Accelerometer, 9))
+    );
+    assert_eq!(
+      arcore_layout("application/arcore-gyro"),
+      Some((ParrotArCoreTagKind::Gyroscope, 5))
+    );
+    assert_eq!(
+      arcore_layout("application/arcore-gyro-0"),
+      Some((ParrotArCoreTagKind::Gyroscope, 9))
+    );
+    // Empty-table variants ⇒ None.
+    assert_eq!(arcore_layout("application/arcore-video-0"), None);
+    assert_eq!(arcore_layout("application/arcore-custom-event"), None);
   }
 
   #[test]

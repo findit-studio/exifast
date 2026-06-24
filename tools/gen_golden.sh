@@ -287,6 +287,50 @@ case "$FIX" in
                   -x Composite:GPSLatitude -x Composite:GPSLongitude \
                   -x Composite:GPSLatitudeRef -x Composite:GPSLongitudeRef \
                   -x Composite:GPSPosition) ;;
+  # `QuickTime_parrot_arcore.mp4` (#123): a CRAFTED minimal Parrot `mett` track
+  # whose `stsd` MetaType is `application/arcore-accel` (the ARCore phone-camera
+  # branch, Parrot.pm:60-83 → the `ARCoreAccel` ProcessBinaryData subtable,
+  # Parrot.pm:663-693). Three timed samples carry distinct accel vectors. exifast
+  # emits the ported `Composite:AvgBitrate` (the `mdat`-size/Duration composite)
+  # byte-exact, so only `System:all` is dropped (NO `Composite` strip). The base
+  # (no-`ee`) golden carries the `Track1:Warning` ExtractEmbedded hint + no accel;
+  # the `-ee` goldens (`EE=1`) carry `Track1:Accelerometer` (one collapsed `-G1`
+  # value; per-`Doc<N>` at `-G3`). No GPS ⇒ no GPS Composite.
+  QuickTime_parrot_arcore.mp4) EXCLUDE_ARR+=(-x System:all) ;;
+  # `QuickTime_parrot_arcore_trunc.mp4` / `…_overflow.mp4` (#123 follow-up): the
+  # two MALFORMED ARCore `mett` fixtures. `_trunc` carries one TRUNCATED-float
+  # ARCore sample (the third float overflows the `undef[14]` value) ⇒ bundled
+  # emits the partial `Accelerometer "0.125 -0.25 "` AHEAD of which rides the
+  # `RawConv Accelerometer: Use of uninitialized value …` Warning. `_overflow`
+  # carries one OVERFLOW TLV (declared length past the sample) ⇒ `Process_mett`
+  # `last`s with ONLY the `[minor] Unexpected length for application/arcore-accel
+  # record` Warning (no vector). Both keep `Composite:AvgBitrate`, drop System.
+  #
+  # `…_valid_overflow.mp4` / `…_trunc_overflow.mp4` (#123 intra-sample ordering):
+  # ONE sample whose records emit MULTIPLE events in WALK order. `_valid_overflow`
+  # = a full-vector valid TLV THEN an overflow TLV ⇒ `Accelerometer` BEFORE the
+  # `[minor] Unexpected length …` Warning (the vector's `HandleTag` precedes the
+  # later overflow `Warn`). `_trunc_overflow` = a truncated-float TLV (partial
+  # vector + RawConv Warning, ahead of the value) THEN an overflow TLV ⇒ the walk
+  # order is RawConv `Warning`, partial `Accelerometer`, overflow `Warning`; both
+  # `Warning`s share the `(Doc1,Track1,Warning)` key so priority-0 first-wins
+  # keeps only the RawConv one. Both keep `Composite:AvgBitrate`, drop System.
+  QuickTime_parrot_arcore_trunc.mp4 | QuickTime_parrot_arcore_overflow.mp4 | \
+  QuickTime_parrot_arcore_valid_overflow.mp4 | QuickTime_parrot_arcore_trunc_overflow.mp4)
+    EXCLUDE_ARR+=(-x System:all) ;;
+  # `QuickTime_parrot_arcore_dup_stsd.mp4` (#123 Codex [medium]): the base ARCore
+  # `mett` track (one valid `stsd` entry = `application/arcore-accel`) with a
+  # SECOND, EMPTY duplicate `stsd` box (entry count 0) appended in the same
+  # `stbl`. ExifTool's `ProcessSampleDesc` loop (QuickTime.pm:9640-9648) runs
+  # `for ($i=0; $i<$num; ++$i)` — with `$num == 0` NO entry is processed, so the
+  # per-entry `%MetaSampleDesc` `MetaType` RawConv (QuickTime.pm:7769-7774) never
+  # fires and `$$self{MetaType}` is NOT touched. So bundled 13.59 RETAINS
+  # `Track1:MetaType = application/arcore-accel` from the first `stsd` and STILL
+  # emits the three `Track1:Accelerometer` ARCore vectors at `-ee` (verified — an
+  # empty/absent `stsd` makes no MetaType assignment, NOT a clear). Same golden
+  # set + exclusions as the base arcore fixture (keep `Composite:AvgBitrate`,
+  # drop `System:all`).
+  QuickTime_parrot_arcore_dup_stsd.mp4) EXCLUDE_ARR+=(-x System:all) ;;
   # The SP2 `Keys`/`UserData` GPSCoordinates fixtures: ExifTool's QuickTime
   # GPSCoordinates Composites (GPSLatitude/Longitude/Altitude/AltitudeRef/Position)
   # are unported; the ported ImageSize/Megapixels/AvgBitrate/Rotation are kept.

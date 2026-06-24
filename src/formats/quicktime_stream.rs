@@ -2544,6 +2544,8 @@ fn decode_one_sample(
     let flight_start = parrot_out.flight_sample_count();
     let follow_me_start = parrot_out.follow_me_sample_count();
     let automation_start = parrot_out.automation_sample_count();
+    let arcore_start = parrot_out.arcore_sample_count();
+    let warning_start = parrot_out.arcore_warning_count();
     let doc = out.open_doc();
     crate::formats::parrot::process_mett(buff, meta_type, parrot_out);
     parrot_out.stamp_doc_from(
@@ -2551,6 +2553,8 @@ fn decode_one_sample(
       flight_start,
       follow_me_start,
       automation_start,
+      arcore_start,
+      warning_start,
       doc,
       track_index,
       sample.time,
@@ -2868,12 +2872,14 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
   track.meta_keys = merged_keys;
 }
 
-/// QuickTime.pm:7773 — extract the first `application/...` substring
+/// QuickTime.pm:7773 — extract the first `application[^\0]+` substring
 /// from a `stsd` sample-description entry body, terminated by NUL or
-/// end-of-buffer. Returns an empty string when no match is found.
-/// Faithful: the bundled regex `(application[^\0]+)` matches greedily
-/// from the first occurrence of `"application"` up to (but not
-/// including) the first `\0` byte after that point.
+/// end-of-buffer. Returns an empty string (the RawConv `undef` clear)
+/// when no match is found. Faithful: the bundled regex `(application[^\0]+)`
+/// matches greedily from the first occurrence of `"application"` up to (but
+/// not including) the first `\0` byte after that point. The `+` requires AT
+/// LEAST ONE non-NUL byte after `application`, so a bare `application` or
+/// `application\0` (no following non-NUL byte) FAILS the match → empty.
 fn scan_application_string(bytes: &[u8]) -> alloc::string::String {
   const NEEDLE: &[u8] = b"application";
   // Sliding window over `bytes` looking for `NEEDLE` (checked via
@@ -2885,6 +2891,12 @@ fn scan_application_string(bytes: &[u8]) -> alloc::string::String {
   let mut end = i + NEEDLE.len();
   while bytes.get(end).is_some_and(|&b| b != 0) {
     end += 1;
+  }
+  // The `[^\0]+` quantifier requires ≥1 non-NUL byte; if the needle is
+  // immediately followed by NUL or buffer-end (`end` never advanced past it),
+  // the regex does not match → `undef` (empty).
+  if end == i + NEEDLE.len() {
+    return alloc::string::String::new();
   }
   // Faithful to Perl: the regex matches the entire `application[^\0]+`
   // run as one capture. Stay UTF-8-lossy-tolerant (the typed layer
@@ -5278,6 +5290,12 @@ mod tests {
     // Runs all the way to end-of-buffer when no NUL is present.
     let unterminated = scan_application_string(b"application/x-foo");
     assert_eq!(unterminated, "application/x-foo");
+    // The `[^\0]+` quantifier requires ≥1 non-NUL byte after `application`. A
+    // BARE `application` (buffer ends right after the needle) fails the match ⇒
+    // empty string (the RawConv `undef` clear), NOT `"application"`.
+    assert!(scan_application_string(b"application").is_empty());
+    // `application\0` (needle immediately followed by NUL) also fails ⇒ empty.
+    assert!(scan_application_string(b"application\0").is_empty());
   }
 
   /// `walk_stsd` must assign `MetaType` on EVERY
