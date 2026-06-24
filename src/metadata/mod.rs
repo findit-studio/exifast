@@ -74,9 +74,9 @@ pub use insta360::{
 pub(crate) use ligogps::LigoSource;
 pub use ligogps::{LigoGpsMeta, LigoGpsSample};
 pub use parrot::{
-  ParrotAutomationAnimation, ParrotAutomationSample, ParrotFlightSample, ParrotFlyingState,
-  ParrotFollowMeAnimation, ParrotFollowMeSample, ParrotGpsSample, ParrotMeta, ParrotPilotingMode,
-  ParrotRecordVersion,
+  ParrotArCoreSample, ParrotArCoreTagKind, ParrotArCoreWarning, ParrotAutomationAnimation,
+  ParrotAutomationSample, ParrotFlightSample, ParrotFlyingState, ParrotFollowMeAnimation,
+  ParrotFollowMeSample, ParrotGpsSample, ParrotMeta, ParrotPilotingMode, ParrotRecordVersion,
 };
 #[cfg(feature = "png")]
 pub use png::{

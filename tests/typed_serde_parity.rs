@@ -1415,7 +1415,50 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// synthesis for an unknown key (some_unknown_tag → `DJI:Some_Unknown_Tag`,
 /// `ExifTool.pm:9312-9317`). `%DJI::Info` has no Conv, so `-j`/`-n` are
 /// identical. Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 612;
+/// 612 → 613 (#123, the Parrot ARCore phone-camera `mett` subtable) adds
+/// `QuickTime_parrot_arcore.mp4` — a crafted minimal Parrot `mett` track whose
+/// `stsd` MetaType is `application/arcore-accel` (the ARCore branch,
+/// Parrot.pm:60-83 → the `ARCoreAccel` ProcessBinaryData subtable,
+/// Parrot.pm:663-693). The base (no-`ee`) golden carries the `Track1:Warning`
+/// ExtractEmbedded hint + the ported `Composite:AvgBitrate`; the `-ee` goldens
+/// pin `Track1:Accelerometer` (a `%.15g`-joined float triple, one collapsed
+/// `-G1` value / per-`Doc<N>` at `-G3`). Additive — every PRE-EXISTING golden
+/// stays byte-identical.
+/// 613 → 615 (#123 follow-up, the MALFORMED ARCore `mett` warning paths) adds
+/// `QuickTime_parrot_arcore_trunc.mp4` (one TRUNCATED-float sample — the partial
+/// `Accelerometer` + the NON-minor `RawConv … uninitialized value` Warning, both
+/// at `-ee`) and `QuickTime_parrot_arcore_overflow.mp4` (one OVERFLOW TLV — a
+/// WARNING-ONLY sample emitting only the MINOR `[minor] Unexpected length for
+/// application/arcore-accel record` Warning, no vector). The base (no-`ee`)
+/// goldens carry the `Track1:Warning` ExtractEmbedded hint + `Composite:
+/// AvgBitrate` (same shape as the well-formed fixture); the `-ee` warning truth
+/// is pinned in `timed_metadata_conformance`. Additive — every PRE-EXISTING
+/// golden stays byte-identical.
+/// 615 → 617 (#123 follow-up, the INTRA-SAMPLE ordering class) adds
+/// `QuickTime_parrot_arcore_valid_overflow.mp4` (ONE sample = a full-vector valid
+/// TLV THEN an overflow TLV ⇒ `Accelerometer` BEFORE the overflow `Warning` in
+/// walk order) and `QuickTime_parrot_arcore_trunc_overflow.mp4` (ONE sample = a
+/// truncated TLV — RawConv Warning + partial vector — THEN an overflow TLV ⇒ the
+/// RawConv `Warning`, then `Accelerometer`, with the later distinct overflow
+/// `Warning` suppressed by the `(Doc1,Track1,Warning)` priority-0 first-wins).
+/// The base (no-`ee`) goldens carry the `Track1:Warning` ExtractEmbedded hint +
+/// `Composite:AvgBitrate`; the `-ee` walk-order truth is pinned in
+/// `timed_metadata_conformance`. Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+/// 617 → 618 (#123 Codex [medium], the no-entry-vs-entry-undef MetaType
+/// tri-state) adds `QuickTime_parrot_arcore_dup_stsd.mp4` — the base ARCore
+/// `mett` track (one valid `application/arcore-accel` `stsd` entry) with a
+/// SECOND, EMPTY duplicate `stsd` box (entry count 0) appended in the same
+/// `stbl`. ExifTool's `ProcessSampleDesc` runs the per-entry `MetaType` RawConv
+/// ONLY inside its `for ($i=0; $i<$num; ++$i)` loop, so the zero-count second
+/// `stsd` makes NO assignment and bundled 13.59 RETAINS
+/// `Track1:MetaType = application/arcore-accel` + STILL emits the three
+/// `Track1:Accelerometer` vectors at `-ee` (byte-identical to the base arcore
+/// goldens modulo SourceFile). The base (no-`ee`) golden carries the
+/// `Track1:Warning` ExtractEmbedded hint + `Track1:MetaType` +
+/// `Composite:AvgBitrate`. Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 618;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

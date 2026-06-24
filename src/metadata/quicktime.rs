@@ -1583,6 +1583,14 @@ pub struct MediaTrack {
   /// without the two clobbering one shared slot (the per-`stsd` route carry of
   /// #309). Drives `Track<N>:MetaFormat`.
   meta_format: Option<String>,
+  /// `stsd` `MetaType` — the `(application/...)` run scanned from offset 8 of a
+  /// `Meta`-routed sample-description entry (`undef[$size-8]` + the RawConv
+  /// `$$self{MetaType} = ($val=~/(application[^\0]+)/ ? $1 : undef)`,
+  /// QuickTime.pm:7769-7774). `None` when no entry carried an `application/...`
+  /// string (the RawConv's `undef`). For Parrot, the `application/arcore-*`
+  /// strings select the ARCore `mett` subtable. Drives `Track<N>:MetaType`,
+  /// emitted right after `MetaFormat` (the `%MetaSampleDesc` offset-8 field).
+  meta_type: Option<String>,
   /// `stsd` sample-description 4-byte format code of a `stsd` decoded through
   /// the **`Other` route** (the `%OtherSampleDesc` fallback — an unmatched or
   /// EMPTY handler-so-far, QuickTime.pm:7802-7806; ExifTool stores it in the
@@ -1741,6 +1749,7 @@ impl MediaTrack {
       handler_code: None,
       handler: None,
       meta_format: None,
+      meta_type: None,
       other_format: None,
       handler_vendor_id: None,
       handler_description: None,
@@ -1908,6 +1917,16 @@ impl MediaTrack {
   #[must_use]
   pub fn meta_format(&self) -> Option<&str> {
     self.meta_format.as_deref()
+  }
+
+  /// The `MetaType` (`application/...`) run scanned from a `Meta`-routed `stsd`
+  /// entry (QuickTime.pm:7769-7774), or `None` when no entry carried one. Drives
+  /// `Track<N>:MetaType`; for Parrot the `application/arcore-*` strings select
+  /// the ARCore `mett` subtable.
+  #[inline(always)]
+  #[must_use]
+  pub fn meta_type(&self) -> Option<&str> {
+    self.meta_type.as_deref()
   }
 
   /// The `OtherFormat` 4cc of a `stsd` decoded through the `Other` route (the
@@ -2257,6 +2276,15 @@ impl MediaTrack {
   #[inline(always)]
   pub fn set_meta_format(&mut self, v: Option<String>) -> &mut Self {
     self.meta_format = v;
+    self
+  }
+
+  /// Set the `Meta`-route `MetaType` (`application/...`) run (filled by the
+  /// parser alongside `MetaFormat` when a `Meta`-routed `stsd` entry carries an
+  /// `application/...` string, QuickTime.pm:7769-7774).
+  #[inline(always)]
+  pub fn set_meta_type(&mut self, v: Option<String>) -> &mut Self {
+    self.meta_type = v;
     self
   }
 

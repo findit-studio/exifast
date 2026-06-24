@@ -4873,3 +4873,207 @@ fn m2ts_h264_mdpm_ee_byte_exact() {
   check_ee("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.ee.json", false);
   check_ee("M2TS_h264_mdpm.mts", "M2TS_h264_mdpm.mts.ee.g3.json", true);
 }
+
+// ── Parrot: ARCore phone-camera `mett` subtable (#123) ───────────────────────
+//
+// `QuickTime_parrot_arcore.mp4` is a CRAFTED minimal Parrot `mett` track whose
+// `stsd` MetaType is `application/arcore-accel` (the ARCore phone-camera branch
+// of `%Parrot::mett`, Parrot.pm:60-83 → the `ARCoreAccel` ProcessBinaryData
+// subtable, Parrot.pm:663-693). Three timed samples carry distinct accel
+// vectors. `Process_mett` (Parrot.pm:802) takes the `if ($$tagTbl{$metaType})`
+// ARCore branch and `HandleTag`s the `Parrot::ARCoreAccel` subtable, whose
+// `Accelerometer` RawConv joins three little-endian floats (`%.15g`).
+//
+// The no-`ee` `.json`/`.n.json` (the `Track1:Warning` ExtractEmbedded hint +
+// `Track1:MetaType` + the ported `Composite:AvgBitrate`) are pinned by the
+// `typed_serde_parity` active-set checkpoint (this fixture is one of its 613).
+// Here we pin the `-ee` axis the active set never reaches:
+//
+//   * `-ee -G1` (`.ee.json`) — the doc axis collapses to the FIRST sample's
+//     `Track1:Accelerometer = "0.125 -0.25 9.8125"` (`%noDups` first-wins).
+//   * `-ee -G3:1` (`.ee.g3.json`) — each sample is its own `Doc<N>`:
+//     `Doc1/2/3:Track1:Accelerometer` with the three distinct vectors + the
+//     per-doc `SampleTime`/`SampleDuration`.
+//   * `-ee -n` (`.ee.n.json`) — the `Accelerometer` is a RawConv STRING with no
+//     ValueConv/PrintConv, so `-n` is byte-identical to `-j`; this pins that.
+//
+// Goldens are bundled `perl exiftool` 13.59, `System:*` stripped (the crafted
+// fixture's filesystem tags); `Composite:AvgBitrate` is KEPT (ported, byte-exact).
+#[test]
+fn parrot_arcore_mett_ee_byte_exact() {
+  check_ee(
+    "QuickTime_parrot_arcore.mp4",
+    "QuickTime_parrot_arcore.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore.mp4",
+    "QuickTime_parrot_arcore.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore.mp4",
+    "QuickTime_parrot_arcore.mp4.ee.n.json",
+  );
+}
+
+// ── Parrot: empty/duplicate `stsd` preserves the ARCore MetaType (#123 Codex) ─
+//
+// `QuickTime_parrot_arcore_dup_stsd.mp4` is the base ARCore `mett` track (one
+// valid `stsd` entry = `application/arcore-accel`) with a SECOND, EMPTY
+// duplicate `stsd` box (entry count 0) appended in the same `stbl`. ExifTool's
+// `ProcessSampleDesc` (QuickTime.pm:9640-9648) runs the per-entry
+// `%MetaSampleDesc` `MetaType` RawConv (QuickTime.pm:7769-7774) ONLY inside its
+// `for ($i=0; $i<$num; ++$i)` entry loop, so the zero-count second `stsd` makes
+// NO assignment to `$$self{MetaType}` — bundled 13.59 RETAINS
+// `Track1:MetaType = application/arcore-accel` from the first `stsd` and STILL
+// emits the three `Track1:Accelerometer` vectors at `-ee` (the `-ee` goldens are
+// byte-identical to the base arcore goldens modulo SourceFile).
+//
+// This is the regression guard for the Codex [medium]: before the tri-state fix
+// (`decode_stsd_meta_type` → `NoEntryProcessed` / `EntryProcessed(Option<_>)`),
+// the Meta route's unconditional `set_meta_type(decode_stsd_meta_type(..))` let
+// the zero-count second `stsd` (decoded as a bare `None`) ERASE the valid ARCore
+// MetaType, routing the `mett` payload off the ARCore path (dropping the vector
+// /warnings). The fix clears MetaType ONLY on a PROCESSED-entry `None`; a
+// no-entry `stsd` leaves the earlier value standing. The base (no-`ee`)
+// `Track1:MetaType` retention is pinned by the `typed_serde_parity` active set.
+#[test]
+fn parrot_arcore_dup_stsd_preserves_metatype_ee_byte_exact() {
+  check_ee(
+    "QuickTime_parrot_arcore_dup_stsd.mp4",
+    "QuickTime_parrot_arcore_dup_stsd.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore_dup_stsd.mp4",
+    "QuickTime_parrot_arcore_dup_stsd.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore_dup_stsd.mp4",
+    "QuickTime_parrot_arcore_dup_stsd.mp4.ee.n.json",
+  );
+}
+
+// ── Parrot: MALFORMED ARCore `mett` warnings (#123 follow-up) ────────────────
+//
+// The two malformed ARCore fixtures pin the bundled-13.59 `Process_mett` WARNING
+// paths (Parrot.pm:802-820 + the `ARCoreAccel` `Accelerometer` RawConv) as
+// FIRST-CLASS in-stream group-scoped `Track<N>:Warning` timed records:
+//
+//   * `QuickTime_parrot_arcore_trunc.mp4` — one TRUNCATED-float sample: the third
+//     `GetFloat` overflows the `undef[14]` value, so bundled emits the PARTIAL
+//     `Accelerometer = "0.125 -0.25 "` AND the NON-minor `Warning = RawConv
+//     Accelerometer: Use of uninitialized value in concatenation (.) or string`
+//     AHEAD of it. The Warning + the partial value BOTH emit (the RawConv
+//     `Warn` fires as the value is built). Order at `-G3:1`: `Doc1:SampleTime`,
+//     `SampleDuration`, `Warning`, `Accelerometer`; `-G1` collapses to the one
+//     `Track1:` row set.
+//   * `QuickTime_parrot_arcore_overflow.mp4` — one OVERFLOW TLV (declared length
+//     past the sample): `Process_mett` `$et->Warn(.., 1)` then `last`s BEFORE
+//     any `HandleTag`, so the sample emits ONLY the MINOR `Warning = [minor]
+//     Unexpected length for application/arcore-accel record` (the `$metaType`
+//     interpolated verbatim) — NO `Accelerometer`. This is a WARNING-ONLY sample
+//     that still emits its `Doc<N>:Track<N>:SampleTime`/`SampleDuration`.
+//
+// Both KEEP the ported `Composite:AvgBitrate`; `System:*` stripped (the crafted
+// fixtures' filesystem tags). `-ee -n` is byte-identical to `-ee -j` (the
+// Accelerometer is a RawConv STRING; the Warning has no PrintConv).
+#[test]
+fn parrot_arcore_malformed_mett_ee_byte_exact() {
+  // Truncated-float: partial Accelerometer + the RawConv Warning, both emit.
+  check_ee(
+    "QuickTime_parrot_arcore_trunc.mp4",
+    "QuickTime_parrot_arcore_trunc.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore_trunc.mp4",
+    "QuickTime_parrot_arcore_trunc.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore_trunc.mp4",
+    "QuickTime_parrot_arcore_trunc.mp4.ee.n.json",
+  );
+  // Overflow: the MINOR warning-only sample (no vector).
+  check_ee(
+    "QuickTime_parrot_arcore_overflow.mp4",
+    "QuickTime_parrot_arcore_overflow.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore_overflow.mp4",
+    "QuickTime_parrot_arcore_overflow.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore_overflow.mp4",
+    "QuickTime_parrot_arcore_overflow.mp4.ee.n.json",
+  );
+}
+
+// ── Parrot: INTRA-SAMPLE TLV walk-order ordering (#123 follow-up) ────────────
+//
+// A SINGLE ARCore `mett` sample is a sequence of `[0x0a][len][payload]` TLV
+// records; `Process_mett` (Parrot.pm:802-820) `HandleTag`s each in WALK ORDER,
+// emitting either a vector OR a `Warn` at that position. So when one sample
+// holds MORE THAN ONE event, their emission order is the TLV walk order — NOT
+// all-warnings-then-vector. These two crafted fixtures pin that (verified vs
+// bundled 13.59 `-ee -G1`/`-G3:1`):
+//
+//   * `QuickTime_parrot_arcore_valid_overflow.mp4` — a full-vector valid ARCore
+//     Accel TLV (`Accelerometer = "0.125 -0.25 9.8125"`) FOLLOWED BY an overflow
+//     TLV. `HandleTag` emits the vector at TLV1, THEN the walk reaches TLV2 and
+//     `Warn`s the overflow — so the order is `Accelerometer` BEFORE `Warning`
+//     (`[minor] Unexpected length …`). The prior drain-all-warnings-then-vector
+//     shape mis-emitted `Warning` first; the seq-ordinal interleave fixes it.
+//   * `QuickTime_parrot_arcore_trunc_overflow.mp4` — a truncated-float TLV
+//     (partial `Accelerometer = "0.125 -0.25 "` + the NON-minor RawConv Warning,
+//     raised AS the value is built) FOLLOWED BY an overflow TLV. Walk order:
+//     RawConv `Warning` (TLV1), `Accelerometer` (TLV1), the MINOR overflow
+//     `Warning` (TLV2). All three events are DISTINCT, but both `Warning`s share
+//     the `(Doc1,Track1,Warning)` tag key, so ExifTool's priority-0 first-wins
+//     keeps only the FIRST (the RawConv) — the JSON shows the RawConv `Warning`
+//     + the partial `Accelerometer`, NOT a second overflow `Warning` row. This
+//     pins both the walk-order interleave (warning-ahead-of-its-own-vector) AND
+//     that a distinct LATER warning does not add a second `Warning` row.
+//
+// Both KEEP `Composite:AvgBitrate`; `System:*` stripped; `-ee -n` is
+// byte-identical to `-ee -j` (the Accelerometer is a RawConv STRING; the
+// Warnings have no PrintConv).
+#[test]
+fn parrot_arcore_multi_tlv_ordering_ee_byte_exact() {
+  // Valid vector THEN overflow warning: `Accelerometer` BEFORE `Warning`.
+  check_ee(
+    "QuickTime_parrot_arcore_valid_overflow.mp4",
+    "QuickTime_parrot_arcore_valid_overflow.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore_valid_overflow.mp4",
+    "QuickTime_parrot_arcore_valid_overflow.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore_valid_overflow.mp4",
+    "QuickTime_parrot_arcore_valid_overflow.mp4.ee.n.json",
+  );
+  // RawConv warning + partial vector THEN overflow warning (distinct later
+  // warning suppressed by the same-key priority-0 first-wins).
+  check_ee(
+    "QuickTime_parrot_arcore_trunc_overflow.mp4",
+    "QuickTime_parrot_arcore_trunc_overflow.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_parrot_arcore_trunc_overflow.mp4",
+    "QuickTime_parrot_arcore_trunc_overflow.mp4.ee.g3.json",
+    true,
+  );
+  check_ee_n(
+    "QuickTime_parrot_arcore_trunc_overflow.mp4",
+    "QuickTime_parrot_arcore_trunc_overflow.mp4.ee.n.json",
+  );
+}

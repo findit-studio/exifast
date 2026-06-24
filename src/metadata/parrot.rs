@@ -11,10 +11,10 @@
 //!
 //! ## What this sub-port surfaces (FULL mett parity)
 //!
-//! Per Parrot.pm:86-660, EVERY field of the per-version drone tables
-//! (V1 / V2 / V3) and the extension records (E1 / E2 / E3) is decoded
-//! and emitted (only the ARCore phone-side subtables are walk-and-discard
-//! — see below):
+//! Per Parrot.pm:86-749, EVERY field of the per-version drone tables
+//! (V1 / V2 / V3), the extension records (E1 / E2 / E3), and the ARCore
+//! phone-camera subtables (the `application/arcore-*` MetaType branch) is
+//! decoded and emitted:
 //!
 //!  - **GPS fix (records `P1` / `P2` / `P3`)** — `GPSLatitude` /
 //!    `GPSLongitude` / `GPSAltitude` / `GPSSatellites` in a fixed-offset
@@ -61,15 +61,16 @@
 //!    fires whenever any `mett` record decoded — the drone-name string
 //!    (Anafi / Bebop / …) MUST come from the container's udta.
 //!
-//! ## What this sub-port deliberately does NOT decode
-//!
-//! Faithfully but as walked-only (the walker visits, the typed layer
-//! discards):
-//!  - **ARCore phone-camera metadata** (`application/arcore-*` records,
-//!    Parrot.pm:60-83) — Parrot drones also pass through ARCore
-//!    accel/gyro on the controlling phone, but those records are phone-
-//!    side AR data, not drone-side GPS. Walked but discarded (camera-
-//!    indexing scope; flagged separately for a future port).
+//!  - **ARCore phone-camera metadata** (`application/arcore-*` MetaType
+//!    branch, Parrot.pm:60-83 → the `ARCoreAccel`/`ARCoreGyro`
+//!    ProcessBinaryData subtables, Parrot.pm:663-739) — Parrot bodies
+//!    pass ARCore accel/gyro through when recorded on an ARCore phone.
+//!    The `Accelerometer` / `Gyroscope` three-component vector is decoded
+//!    (the `RawConv` `%.15g`-joined float triple, per [`ParrotArCoreSample`]).
+//!    `ARCoreVideo` / `ARCoreCustom` (Parrot.pm:741-749) have empty tables
+//!    and surface nothing. These are phone-side AR telemetry (NOT the
+//!    drone's GPS) so they are EMITTED at `-ee` but not projected into the
+//!    camera-indexing domain.
 //!
 //! ## Projection scope note
 //!
@@ -1628,6 +1629,299 @@ impl Default for ParrotAutomationSample {
 }
 
 // ===========================================================================
+// ParrotArCoreSample — the ARCore phone-camera mett subtables
+// ===========================================================================
+
+/// Which ARCore subtable produced a sample — selects the emitted tag NAME.
+/// Parrot.pm:60-83 maps six `application/arcore-*` MetaType strings onto four
+/// distinct `ProcessBinaryData` tables, but only two tag NAMES are ever
+/// surfaced (the others are `Unknown`/empty): `Accelerometer`
+/// (`ARCoreAccel`/`ARCoreAccel0`, Parrot.pm:663-706) and `Gyroscope`
+/// (`ARCoreGyro`/`ARCoreGyro0`, Parrot.pm:709-739). `ARCoreVideo`/`ARCoreCustom`
+/// (Parrot.pm:741-749) have empty tables and emit nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParrotArCoreTagKind {
+  /// `Accelerometer` (Parrot.pm:676 / :702).
+  Accelerometer,
+  /// `Gyroscope` (Parrot.pm:722 / :735).
+  Gyroscope,
+}
+
+impl ParrotArCoreTagKind {
+  /// The ExifTool tag Name this kind emits.
+  #[inline(always)]
+  #[must_use]
+  pub const fn tag_name(self) -> &'static str {
+    match self {
+      Self::Accelerometer => "Accelerometer",
+      Self::Gyroscope => "Gyroscope",
+    }
+  }
+}
+
+/// One ARCore accel/gyro reading decoded from a Parrot `mett` sample whose
+/// `MetaType` is an `application/arcore-*` string (Parrot.pm:60-83 dispatch).
+///
+/// The bundled tables decode a three-component vector via a Perl `RawConv`
+/// (`GetFloat($val,0) . " " . GetFloat($val,5) . " " . GetFloat($val,10)`,
+/// Parrot.pm:678 / :704 / :724 / :737) — three little-endian `float`s read at
+/// `undef`-buffer offsets 0 / 5 / 10, space-joined. The value is a STRING (the
+/// `RawConv` result) with NO ValueConv/PrintConv, so `-n` and `-j` render
+/// identically. Each component is `Some` iff its 4 bytes are in range
+/// (`GetFloat` returns `undef` on a short read, ExifTool.pm:6065-6066); a
+/// missing component renders as an EMPTY slot in the join (e.g. `"0 0 "` when
+/// the third float is past the record end), faithful to Perl's
+/// uninitialized-value concatenation.
+///
+/// **D8 compliance.** Every field is private; access through the accessors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParrotArCoreSample {
+  /// Which subtable produced this reading (selects the tag NAME).
+  kind: ParrotArCoreTagKind,
+  /// The three space-joined float components (offsets 0 / 5 / 10 of the
+  /// `undef` buffer). `None` when the component's 4 bytes were out of range
+  /// (a truncated record) — rendered as an empty slot in the join.
+  components: [Option<f32>; 3],
+  /// The 1-based GLOBAL `Doc<N>` ordinal. `0` until stamped.
+  doc: u32,
+  /// The 1-based moov `Track<N>` index. `0` until stamped.
+  track_index: u32,
+  /// The sample-table `SampleTime` (seconds). `None` until stamped.
+  sample_time: Option<f64>,
+  /// The sample-table `SampleDuration` (seconds). `None` until stamped.
+  sample_duration: Option<f64>,
+  /// The TLV WALK-ORDER ordinal within the raising `mett` sample — a
+  /// per-sample monotonic counter the walker assigns in `HandleTag`/`Warn`
+  /// order (a RawConv warning of the decoded TLV gets a LOWER ordinal than the
+  /// vector it precedes; a later overflow TLV's warning gets a HIGHER one).
+  /// `emit_parrot` interleaves the per-doc vector + warning records by this
+  /// ordinal so a valid-TLV vector emits AHEAD of a later overflow-TLV warning
+  /// (walk order), not all-warnings-then-vector. `0` for unit-built samples
+  /// (they share one doc + ordinal, keeping stable insertion order).
+  seq: u32,
+}
+
+impl ParrotArCoreSample {
+  /// Build an ARCore reading of the given kind from three optional float
+  /// components.
+  #[inline]
+  #[must_use]
+  pub const fn new(kind: ParrotArCoreTagKind, components: [Option<f32>; 3]) -> Self {
+    Self {
+      kind,
+      components,
+      doc: 0,
+      track_index: 0,
+      sample_time: None,
+      sample_duration: None,
+      seq: 0,
+    }
+  }
+
+  /// Set the TLV walk-order ordinal (see [`Self::seq`]) — the walker stamps it
+  /// at `HandleTag` position so `emit_parrot` can interleave vectors + warnings
+  /// in original walk order.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn with_seq(mut self, seq: u32) -> Self {
+    self.seq = seq;
+    self
+  }
+
+  /// Which subtable produced this reading.
+  #[inline(always)]
+  #[must_use]
+  pub const fn kind(&self) -> ParrotArCoreTagKind {
+    self.kind
+  }
+
+  /// The three float components (offsets 0 / 5 / 10; `None` = out-of-range).
+  #[inline(always)]
+  #[must_use]
+  pub const fn components(&self) -> [Option<f32>; 3] {
+    self.components
+  }
+
+  /// The 1-based GLOBAL `Doc<N>` ordinal (`0` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn doc(&self) -> u32 {
+    self.doc
+  }
+
+  /// The 1-based moov `Track<N>` index (`0` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn track_index(&self) -> u32 {
+    self.track_index
+  }
+
+  /// The sample-table `SampleTime` in seconds (`None` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// The sample-table `SampleDuration` in seconds (`None` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
+
+  /// The TLV walk-order ordinal within the raising sample (see [`Self::seq`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn seq(&self) -> u32 {
+    self.seq
+  }
+}
+
+// ===========================================================================
+// ParrotArCoreWarning — a `Process_mett` ARCore warning as a TIMED record
+// ===========================================================================
+
+/// One ARCore `Process_mett` warning raised while walking an `application/
+/// arcore-*` `mett` sample (Parrot.pm:802-820), carried as a FIRST-CLASS TIMED
+/// record (NOT a single unscoped string) so it can ride the in-stream
+/// group-scoped `Doc<N>:Track<N>:Warning` axis exactly like the sibling
+/// [`crate::metadata::CammWarning`] / [`crate::metadata::CanonCtmdWarning`] /
+/// [`crate::metadata::DjiWarning`] producers.
+///
+/// Two `Process_mett` warnings exist on the ARCore branch:
+///  - **`Unexpected length for $metaType record`** (Parrot.pm:808,
+///    `$et->Warn(.., 1)` ⇒ MINOR ⇒ rendered `[minor] …`) — the TLV length
+///    overflows the sample, so the loop `last`s BEFORE the `HandleTag`: the
+///    sample emits ONLY this warning (no accel/gyro vector). `$metaType` is
+///    interpolated (e.g. `application/arcore-accel`), NOT a fixed string.
+///  - **`RawConv <Kind>: Use of uninitialized value in concatenation (.) or
+///    string`** (Parrot.pm:678/704/724/737, a Perl runtime `Warn` from the
+///    `GetFloat`-join `RawConv`; NON-minor) — a truncated record drops an
+///    out-of-range float component to an empty slot, so the sample emits BOTH
+///    the partial `Accelerometer`/`Gyroscope` value AND this warning (the
+///    warning AHEAD of the value, the RawConv firing as the value is built).
+///
+/// ExifTool emits each as `Track<N>:Warning` (priority-0 first-wins, file-global
+/// `WAS_WARNED` text dedup with a ` [x$n]` repeat count) at the raising sample's
+/// walk position — verified vs bundled 13.59 (`-ee -G1`/`-G3`).
+///
+/// **D8 compliance.** Every field is private; access through the accessors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParrotArCoreWarning {
+  /// The warning string WITHOUT any `[minor]` prefix (applied at emit time from
+  /// [`Self::minor`]).
+  message: SmolStr,
+  /// `true` for the `Warn(.., 1)` MINOR `Unexpected length for $metaType record`
+  /// warning; `false` for the `RawConv … uninitialized value` warning.
+  minor: bool,
+  /// The 1-based GLOBAL `Doc<N>` ordinal of the ARCore sample that raised the
+  /// warning (`0` until stamped). Surfaced as the `Doc<N>:` family-3 prefix at
+  /// `-G3`; collapsed away at `-G1`.
+  doc: u32,
+  /// The 1-based moov `Track<N>` index the warning is scoped to (`0` until
+  /// stamped; defaults to `Track1` at emit time).
+  track_index: u32,
+  /// `SampleTime` (seconds) of the sample that raised the warning — emitted
+  /// ahead of the `Warning` under that sample's `Doc<N>`. `None` until stamped.
+  sample_time: Option<f64>,
+  /// `SampleDuration` (seconds) of the sample that raised the warning (paired
+  /// with [`Self::sample_time`]). `None` until stamped.
+  sample_duration: Option<f64>,
+  /// The TLV WALK-ORDER ordinal within the raising `mett` sample — a per-sample
+  /// monotonic counter the walker assigns in `HandleTag`/`Warn` order. A RawConv
+  /// warning (raised while the decoded TLV's value is built) gets a LOWER
+  /// ordinal than that TLV's vector; a later overflow TLV's warning gets a
+  /// HIGHER ordinal than the vector. `emit_parrot` interleaves the per-doc
+  /// vector + warning records by this ordinal so each lands at its walk
+  /// position (the RawConv warning AHEAD of the partial vector, a later overflow
+  /// warning AFTER it). `0` for unit-built warnings.
+  seq: u32,
+}
+
+impl ParrotArCoreWarning {
+  /// Build a warning carrying `message` and the `minor` flag (no track / doc /
+  /// timing / seq yet — the dispatch arm stamps the doc/track/timing after the
+  /// `process_mett` call; the walker stamps the seq in-place via
+  /// [`Self::with_seq`]).
+  #[inline(always)]
+  #[must_use]
+  pub fn new(message: SmolStr, minor: bool) -> Self {
+    Self {
+      message,
+      minor,
+      doc: 0,
+      track_index: 0,
+      sample_time: None,
+      sample_duration: None,
+      seq: 0,
+    }
+  }
+
+  /// Set the TLV walk-order ordinal (see [`Self::seq`]) — the walker stamps it
+  /// at the `Warn` position so `emit_parrot` can interleave this warning with
+  /// the sample's vector in original walk order.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn with_seq(mut self, seq: u32) -> Self {
+    self.seq = seq;
+    self
+  }
+
+  /// The warning string WITHOUT the `[minor]` prefix.
+  #[inline(always)]
+  #[must_use]
+  pub fn message(&self) -> &str {
+    self.message.as_str()
+  }
+
+  /// `true` for the MINOR `Unexpected length for $metaType record` warning
+  /// (`Warn(.., 1)`) — the emission prepends `[minor] `.
+  #[inline(always)]
+  #[must_use]
+  pub const fn minor(&self) -> bool {
+    self.minor
+  }
+
+  /// The 1-based GLOBAL `Doc<N>` ordinal of the sample that raised this warning
+  /// (`0` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn doc(&self) -> u32 {
+    self.doc
+  }
+
+  /// The 1-based moov `Track<N>` index this warning is scoped to (`0` when
+  /// unstamped; defaults to `Track1` at emit time).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn track_index(&self) -> u32 {
+    self.track_index
+  }
+
+  /// The sample-table `SampleTime` in seconds (`None` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// The sample-table `SampleDuration` in seconds (`None` when unstamped).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
+
+  /// The TLV walk-order ordinal within the raising sample (see [`Self::seq`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn seq(&self) -> u32 {
+    self.seq
+  }
+}
+
+// ===========================================================================
 // ParrotMeta — the aggregate per-track result
 // ===========================================================================
 
@@ -1651,9 +1945,15 @@ pub struct ParrotMeta {
   follow_me_samples: Vec<ParrotFollowMeSample>,
   /// `E3` Automation extension records in source order (Parrot.pm:595-660).
   automation_samples: Vec<ParrotAutomationSample>,
-  /// First-only walker warning ("Unexpected length for $metaType record",
-  /// Parrot.pm:808).
-  warning: Option<SmolStr>,
+  /// ARCore accel/gyro readings in source order — the `application/arcore-*`
+  /// MetaType branch (Parrot.pm:60-83 + the `ARCoreAccel`/`ARCoreGyro` tables).
+  arcore_samples: Vec<ParrotArCoreSample>,
+  /// ARCore `Process_mett` walker warnings as TIMED records (the overflow
+  /// `Unexpected length for $metaType record` + the truncated-float `RawConv …
+  /// uninitialized value`, Parrot.pm:808/678) — each carrying its sample's
+  /// `Doc<N>`/`Track<N>`/timing so it rides the in-stream group-scoped
+  /// `Warning` axis (the camm/ctmd/dji pattern), in source order.
+  arcore_warnings: Vec<ParrotArCoreWarning>,
 }
 
 impl ParrotMeta {
@@ -1666,7 +1966,8 @@ impl ParrotMeta {
       flight_samples: Vec::new(),
       follow_me_samples: Vec::new(),
       automation_samples: Vec::new(),
-      warning: None,
+      arcore_samples: Vec::new(),
+      arcore_warnings: Vec::new(),
     }
   }
 
@@ -1698,14 +1999,30 @@ impl ParrotMeta {
     self.automation_samples.as_slice()
   }
 
-  /// The first decoded walker warning.
+  /// All ARCore accel/gyro readings in source order.
   #[inline(always)]
   #[must_use]
-  pub fn warning(&self) -> Option<&str> {
-    self.warning.as_deref()
+  pub fn arcore_samples(&self) -> &[ParrotArCoreSample] {
+    self.arcore_samples.as_slice()
   }
 
-  /// `true` when no record decoded successfully.
+  /// All ARCore `Process_mett` walker warnings (timed records) in source order.
+  #[inline(always)]
+  #[must_use]
+  pub fn arcore_warnings(&self) -> &[ParrotArCoreWarning] {
+    self.arcore_warnings.as_slice()
+  }
+
+  /// `true` when this `mett` track produced NO `-ee` emission — no decoded
+  /// record AND no ARCore walker warning.
+  ///
+  /// Gates the EMISSION early-return in
+  /// [`crate::formats::quicktime::emit_parrot`]: a warning-only ARCore sample
+  /// (an overflow TLV that `last`s before any `HandleTag`) decodes NO vector
+  /// but STILL emits its `Doc<N>:Track<N>:SampleTime`/`SampleDuration`/`Warning`
+  /// at `-ee`, so the ARCore warnings count here. Distinct from
+  /// [`Self::has_drone_records`], which gates the camera/GPS PROJECTION (drone
+  /// records only — ARCore is phone telemetry, never projected).
   #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
@@ -1713,6 +2030,27 @@ impl ParrotMeta {
       && self.flight_samples.is_empty()
       && self.follow_me_samples.is_empty()
       && self.automation_samples.is_empty()
+      && self.arcore_samples.is_empty()
+      && self.arcore_warnings.is_empty()
+  }
+
+  /// `true` when this track decoded at least one Parrot DRONE record — a `P`
+  /// GPS / flight sample, an `E2` FollowMe, or an `E3` Automation record.
+  ///
+  /// Gates the camera-indexing PROJECTION (`Make = "Parrot"` + GPS + capture)
+  /// in [`Self::project_into`]. ARCore (`application/arcore-*`) samples are
+  /// PHONE telemetry, NOT a Parrot drone camera — an ARCore-only `mett` track
+  /// emits at `-ee` (so it is NOT [`Self::is_empty`]) but must project NOTHING
+  /// into the normalized camera domain. So this is the projection-eligibility
+  /// predicate, deliberately SPLIT from the emission non-emptiness above:
+  /// `arcore_samples` / `arcore_warnings` do NOT count here.
+  #[inline(always)]
+  #[must_use]
+  pub fn has_drone_records(&self) -> bool {
+    !self.gps_samples.is_empty()
+      || !self.flight_samples.is_empty()
+      || !self.follow_me_samples.is_empty()
+      || !self.automation_samples.is_empty()
   }
 
   /// The FIRST GPS sample whose `latitude` AND `longitude` are populated —
@@ -1754,6 +2092,22 @@ impl ParrotMeta {
     self
   }
 
+  /// Append an ARCore accel/gyro reading.
+  #[inline(always)]
+  pub fn push_arcore_sample(&mut self, v: ParrotArCoreSample) -> &mut Self {
+    self.arcore_samples.push(v);
+    self
+  }
+
+  /// Append an ARCore `Process_mett` walker warning (timed record). The
+  /// dispatch arm stamps its `Doc<N>`/`Track<N>`/timing after the
+  /// `process_mett` call, alongside the sample vectors.
+  #[inline(always)]
+  pub fn push_arcore_warning(&mut self, v: ParrotArCoreWarning) -> &mut Self {
+    self.arcore_warnings.push(v);
+    self
+  }
+
   /// The number of GPS samples decoded so far — a watermark the stream walker
   /// takes BEFORE one `process_mett` call so it can stamp the `Doc<N>` / track
   /// coordinates onto exactly the GPS samples that call appended (mirrors
@@ -1788,6 +2142,24 @@ impl ParrotMeta {
     self.automation_samples.len()
   }
 
+  /// The number of ARCore accel/gyro readings decoded so far — the ARCore
+  /// watermark (the `application/arcore-*` MetaType branch advances independently
+  /// of the drone P/E-records; a `mett` track is one or the other).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn arcore_sample_count(&self) -> usize {
+    self.arcore_samples.len()
+  }
+
+  /// The number of ARCore walker warnings recorded so far — the warning
+  /// watermark (an overflow TLV pushes a warning but NO sample, so the warning
+  /// vector advances independently of `arcore_samples`).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn arcore_warning_count(&self) -> usize {
+    self.arcore_warnings.len()
+  }
+
   /// Stamp the GLOBAL `Doc<N>` ordinal, the `Track<N>` index, and the
   /// sample-table `SampleTime`/`SampleDuration` (seconds) onto every GPS and
   /// flight sample at or after the given watermarks — exactly the records ONE
@@ -1803,6 +2175,8 @@ impl ParrotMeta {
     flight_start: usize,
     follow_me_start: usize,
     automation_start: usize,
+    arcore_start: usize,
+    warning_start: usize,
     doc: u32,
     track_index: u32,
     sample_time: Option<f64>,
@@ -1838,6 +2212,22 @@ impl ParrotMeta {
         s.sample_duration = sample_duration;
       }
     }
+    if let Some(slice) = self.arcore_samples.get_mut(arcore_start..) {
+      for s in slice {
+        s.doc = doc;
+        s.track_index = track_index;
+        s.sample_time = sample_time;
+        s.sample_duration = sample_duration;
+      }
+    }
+    if let Some(slice) = self.arcore_warnings.get_mut(warning_start..) {
+      for w in slice {
+        w.doc = doc;
+        w.track_index = track_index;
+        w.sample_time = sample_time;
+        w.sample_duration = sample_duration;
+      }
+    }
   }
 
   /// `&mut` to the LAST appended flight sample, or `None` when none
@@ -1856,16 +2246,6 @@ impl ParrotMeta {
   #[must_use]
   pub(crate) fn flight_samples_mut_last(&mut self) -> Option<&mut ParrotFlightSample> {
     self.flight_samples.last_mut()
-  }
-
-  /// Set the FIRST walker warning (subsequent calls are ignored, matching
-  /// bundled's `-j` rendering).
-  #[inline]
-  pub fn set_warning(&mut self, msg: SmolStr) -> &mut Self {
-    if self.warning.is_none() {
-      self.warning = Some(msg);
-    }
-    self
   }
 }
 
@@ -1908,15 +2288,26 @@ impl ParrotMeta {
   /// (timestamps live on the E1 extension as a microsecond counter, not
   /// an Exif date+time pair), so `gps.timestamp()` stays `None` here.
   ///
-  /// **Warnings:** the walker's `warning()` channel (`Unexpected length
-  /// for ARCore mett record` etc.) is surfaced through the per-format
-  /// diagnostics path at emission time — NOT through [`MediaMetadata`]
-  /// (which carries no warnings channel; mirrors the other timed-metadata
-  /// ports). See the `TODO(#126 audit)` below.
+  /// **Projection eligibility (DRONE records only):** the camera/GPS/capture
+  /// projection is gated on [`Self::has_drone_records`], NOT [`Self::is_empty`].
+  /// An ARCore (`application/arcore-*`) `mett` track is PHONE telemetry, not a
+  /// Parrot drone camera — it emits at `-ee` (so it is NOT `is_empty`) but must
+  /// project NOTHING into the normalized camera domain. So an ARCore-only file
+  /// (no `[EP]\d` drone record) populates no `CameraInfo`/`GpsLocation`/
+  /// `CaptureSettings`; only a real Parrot drone record stamps `Make = "Parrot"`.
+  ///
+  /// **Warnings:** the ARCore `Process_mett` walker warnings are FIRST-CLASS
+  /// timed records ([`Self::arcore_warnings`]) emitted as in-stream
+  /// group-scoped `Doc<N>:Track<N>:Warning` at `-ee` by
+  /// [`crate::formats::quicktime::emit_parrot`] — NOT projected through
+  /// [`MediaMetadata`] (which carries no warnings channel; mirrors the other
+  /// timed-metadata ports).
   pub(crate) fn project_into(&self, md: &mut MediaMetadata) {
-    let is_empty = self.is_empty();
+    // PROJECTION eligibility = DRONE records only (the camera identity); ARCore
+    // phone telemetry is deliberately excluded (see `has_drone_records`).
+    let has_drone = self.has_drone_records();
     // ── CameraInfo ─────────────────────────────────────────────────────
-    if md.camera().is_none() && !is_empty {
+    if md.camera().is_none() && has_drone {
       let mut cam = CameraInfo::new();
       cam.update_make(Some("Parrot".into()));
       if !cam.is_empty() {
@@ -1951,14 +2342,11 @@ impl ParrotMeta {
         .update_timestamp(None);
       md.set_gps(gps);
     }
-    // TODO(#126 audit): the walker's `warning()` channel (e.g. "Unexpected
-    // length for ARCore mett record") is NOT propagated here — `MediaMetadata`
-    // has no warnings channel in the current architecture (it was added to
-    // bfb245b against an older `MediaMetadata`). The other timed-metadata
-    // ports (camm / sony_rtmd / canon_ctmd) surface their per-sample warnings
-    // through the per-format diagnostics path at `-ee` emission time; the
-    // cluster faithful-emission audit wires `ParrotMeta::warning()` the same
-    // way. The warning is still STORED on the typed surface (`self.warning()`).
+    // ARCore `Process_mett` warnings are NOT projected into `MediaMetadata`
+    // (which has no warnings channel) — they ride the in-stream group-scoped
+    // `Doc<N>:Track<N>:Warning` axis at `-ee` ([`Self::arcore_warnings`] →
+    // [`crate::formats::quicktime::emit_parrot`]), like the sibling camm / ctmd
+    // / dji producers.
   }
 }
 
@@ -1974,9 +2362,10 @@ mod tests {
   fn empty_meta_is_empty() {
     let m = ParrotMeta::new();
     assert!(m.is_empty());
+    assert!(!m.has_drone_records());
     assert!(m.gps_samples().is_empty());
     assert!(m.flight_samples().is_empty());
-    assert!(m.warning().is_none());
+    assert!(m.arcore_warnings().is_empty());
     assert!(m.first_fix().is_none());
   }
 
@@ -2094,11 +2483,23 @@ mod tests {
   }
 
   #[test]
-  fn set_warning_only_first_wins() {
+  fn arcore_warnings_accumulate_as_timed_records() {
+    // ARCore warnings are now FIRST-CLASS timed records (the file-global
+    // `WAS_WARNED` dedup + ` [x$n]` count are applied at emit time, NOT at push
+    // time), so every raised warning is RETAINED in source order — distinct from
+    // the prior single first-wins string field.
     let mut m = ParrotMeta::new();
-    m.set_warning(SmolStr::new("first"));
-    m.set_warning(SmolStr::new("second"));
-    assert_eq!(m.warning(), Some("first"));
+    m.push_arcore_warning(ParrotArCoreWarning::new(SmolStr::new("first"), false));
+    m.push_arcore_warning(ParrotArCoreWarning::new(SmolStr::new("second"), true));
+    assert_eq!(m.arcore_warnings().len(), 2);
+    assert_eq!(m.arcore_warnings()[0].message(), "first");
+    assert!(!m.arcore_warnings()[0].minor());
+    assert_eq!(m.arcore_warnings()[1].message(), "second");
+    assert!(m.arcore_warnings()[1].minor());
+    // A warning-only track is NOT empty (it still emits at `-ee`) but has NO
+    // drone records (so it projects no camera identity).
+    assert!(!m.is_empty());
+    assert!(!m.has_drone_records());
   }
 
   // P3-D project_into round-trips.
@@ -2129,23 +2530,50 @@ mod tests {
   }
 
   #[test]
-  fn warning_is_retained_on_the_typed_surface() {
-    // TODO(#126 audit): warnings no longer propagate into `MediaMetadata`
-    // (it carries no warnings channel — the bfb245b `md.push_warning` path was
-    // written against an older `MediaMetadata`). The cluster faithful-emission
-    // audit surfaces `warning()` through the per-format diagnostics path like
-    // the other timed-metadata ports. For now assert the warning is STORED on
-    // the typed surface and that `project_into` is a safe no-op for it.
+  fn arcore_only_track_projects_no_camera_identity() {
+    // FINDING 2: an ARCore-only `mett` track (PHONE telemetry — accel/gyro
+    // samples and/or `Process_mett` warnings, NO `[EP]\d` drone record) emits at
+    // `-ee` (so it is NOT `is_empty`) but must project NOTHING into the
+    // normalized camera domain (`Make = "Parrot"` is a DRONE identity). The
+    // projection is gated on `has_drone_records`, NOT `is_empty`.
     let mut m = ParrotMeta::new();
-    m.set_warning(SmolStr::new("Unexpected length for ARCore mett record"));
-    assert_eq!(
-      m.warning(),
-      Some("Unexpected length for ARCore mett record")
-    );
+    m.push_arcore_sample(ParrotArCoreSample::new(
+      ParrotArCoreTagKind::Accelerometer,
+      [Some(0.1), Some(0.2), Some(0.3)],
+    ));
+    m.push_arcore_warning(ParrotArCoreWarning::new(
+      SmolStr::new("Unexpected length for application/arcore-accel record"),
+      true,
+    ));
+    // Emits at `-ee` (non-empty) but is NOT a drone camera.
+    assert!(!m.is_empty());
+    assert!(!m.has_drone_records());
     let mut md = MediaMetadata::new();
     m.project_into(&mut md);
-    assert!(md.camera().is_none());
+    assert!(
+      md.camera().is_none(),
+      "ARCore-only must not stamp Make=Parrot"
+    );
     assert!(md.gps().is_none());
     assert!(md.capture().is_none());
+  }
+
+  #[test]
+  fn drone_record_still_projects_make_parrot_alongside_arcore() {
+    // A Parrot file with a DRONE record STILL projects `Make = "Parrot"` even
+    // when ARCore phone samples are also present — `has_drone_records` is true.
+    let mut m = ParrotMeta::new();
+    let mut sample = ParrotGpsSample::new(ParrotRecordVersion::V1);
+    sample.set_latitude(Some(48.85)).set_longitude(Some(2.35));
+    m.push_gps_sample(sample);
+    m.push_arcore_sample(ParrotArCoreSample::new(
+      ParrotArCoreTagKind::Gyroscope,
+      [Some(0.0), Some(0.0), Some(0.0)],
+    ));
+    assert!(m.has_drone_records());
+    let mut md = MediaMetadata::new();
+    m.project_into(&mut md);
+    assert_eq!(md.camera().expect("camera").make(), Some("Parrot"));
+    assert_eq!(md.gps().expect("gps").latitude(), Some(48.85));
   }
 }
