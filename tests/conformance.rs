@@ -8995,6 +8995,172 @@ fn exif_componentsconfig_wrongfmt_conformance() {
   );
 }
 #[test]
+fn exif_gps_versionid_undef_conformance() {
+  // #399 item 1 — `GPSVersionID` (0x0000) written with the WRONG on-disk format
+  // (`undef[4]`, not the spec `int8u[4]`). GPSVersionID has `Writable => 'int8u'`
+  // and `PrintConv => '$val =~ tr/ /./; $val'` (GPS.pm:59-62) but NO `Format =>`
+  // directive, so ExifTool reads it with the on-disk format — it does NOT re-read
+  // an `undef` value as int8u. For `undef[4]` `02 03 00 00`, `ReadValue` returns
+  // the raw 4 bytes, the PrintConv `tr/ /./` is a no-op (no space bytes), and the
+  // JSON writer's `EscapeJSON` `tr/\0//d` (exiftool:3819) strips the trailing NULs
+  // before `\u`-escaping the survivors — `-j` and `-n` BOTH emit "\u0002\u0003"
+  // (the 2 non-NUL bytes), NOT the dotted "2.3.0.0" (that form is only for the
+  // correct int8u/int8s on-disk shape). Pre-fix the `GpsConv::VersionId` arm
+  // rendered only `RawValue::U64`; an `undef` value fell to `emit_raw` → the
+  // binary `write_bytes` placeholder. Verified byte-identical to bundled
+  // `perl exiftool` 13.59.
+  check(
+    "Exif_gps_versionid_undef.tif",
+    "Exif_gps_versionid_undef.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_versionid_undef.tif",
+    "Exif_gps_versionid_undef.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_filesource_sigma_conformance() {
+  // #399 item 2 — `FileSource` (0xa300) carrying the literal Sigma 4-byte value
+  // `\x03\x00\x00\x00`. FileSource is `Writable => 'undef'` with a HASH PrintConv
+  // whose keys are the integer codes 1/2/3 PLUS the literal 4-byte string
+  // `"\3\0\0\0" => 'Sigma Digital Camera'` (Exif.pm:2820, "handle the case where
+  // Sigma incorrectly gives this tag a count of 4"). A normal single byte `\x03`
+  // takes the `undef[1] → int8u` carve-out (Exif.pm:6682) and matches the integer
+  // key 3 → "Digital Camera"; only the 4-byte form matches the string key:
+  //   -j → "Sigma Digital Camera"
+  //   -n → "\u0003"   (the raw bytes 03 00 00 00, EscapeJSON `tr/\0//d`-stripped)
+  // Pre-fix exifast's `Conv::IntLabel` handled only the single-byte int8u code;
+  // the 4-byte `RawValue::Bytes` fell to `emit_raw` → the binary `write_bytes`
+  // placeholder. The new `Conv::FileSource` matches the literal key (and falls to
+  // `Unknown ($val)` over the raw byte string for any other multi-byte `undef`,
+  // exactly as a HASH-PrintConv miss does). Verified byte-identical to bundled
+  // `perl exiftool` 13.59.
+  check(
+    "Exif_filesource_sigma.tif",
+    "Exif_filesource_sigma.tif.json",
+    true,
+  );
+  check(
+    "Exif_filesource_sigma.tif",
+    "Exif_filesource_sigma.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_gps_versionid_nulsplit_conformance() {
+  // #399 (Codex [medium]) — the EscapeJSON ORDER for the raw-byte render path.
+  // `GPSVersionID` (0x0000) as `undef[4]` `C2 00 A9 00` — a NUL byte SPLITS a
+  // valid 2-byte UTF-8 sequence (`C2 A9` = `©`). ExifTool's `EscapeJSON` deletes
+  // NULs FIRST (`tr/\0//d`, exiftool:3820) THEN runs `FixUTF8` (exiftool:3824),
+  // so the survivors `C2 A9` reassemble into a single `©` for BOTH `-j` and `-n`.
+  // The pre-fix `GpsConv::VersionId` arm ran `fix_utf8` on the raw bytes BEFORE
+  // the serializer's `tr/\0//d`, validating `C2` and `A9` separately (the NUL
+  // between them broke the sequence) → two `?`s → "??" after the late NUL-strip.
+  // The fix routes the bytes through `convert::escape_json_raw_bytes`
+  // (NUL-strip → FixUTF8), matching bundled `perl exiftool` 13.59 (`©`).
+  check(
+    "Exif_gps_versionid_nulsplit.tif",
+    "Exif_gps_versionid_nulsplit.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_versionid_nulsplit.tif",
+    "Exif_gps_versionid_nulsplit.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_filesource_nulsplit_conformance() {
+  // #399 (Codex [medium]) — the same EscapeJSON ORDER fix on the non-Sigma
+  // multi-byte `FileSource` HASH-miss path. `FileSource` (0xa300) as `undef[4]`
+  // `C2 00 A9 00` is NOT the Sigma literal key, so it is a HASH miss →
+  // `Unknown ($val)` (printconv) / the bare `$val` (`-n`), where `$val` is the
+  // raw byte string. ExifTool's `EscapeJSON` deletes the NULs FIRST then runs
+  // `FixUTF8`, so the NUL-split `C2 A9` reassembles into `©`:
+  //   -j → "Unknown (©)"   -n → "©"
+  // (The `Unknown (` / `)` literals carry no NULs and are ASCII, so wrapping the
+  // escaped value is byte-identical to ExifTool wrapping then escaping.) Verified
+  // byte-identical to bundled `perl exiftool` 13.59.
+  check(
+    "Exif_filesource_nulsplit.tif",
+    "Exif_filesource_nulsplit.tif.json",
+    true,
+  );
+  check(
+    "Exif_filesource_nulsplit.tif",
+    "Exif_filesource_nulsplit.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_gps_versionid_nulnum_conformance() {
+  // #399 (Codex [medium]) — the EscapeJSON ORDER for a NUL-SPLIT NUMERIC raw-byte
+  // value. `GPSVersionID` (0x0000) as `undef[4]` `31 00 32 00` (`"1\02\0"`): the
+  // `tr/\0//d` NUL deletion PRODUCES the number-shaped lexeme `12`. ExifTool
+  // classifies the ORIGINAL `$val` (WITH NULs) against the number gate BEFORE the
+  // NUL strip (exiftool:3810), so the NUL-bearing original FAILS the gate and the
+  // value is a QUOTED string `"12"` — NOT a bare `12` — for BOTH `-j` and `-n`.
+  // The pre-fix path NUL-stripped FIRST and handed `"12"` to the serializer's own
+  // number gate, which (wrongly) emitted a BARE number. The fix
+  // (`escape_json_raw_bytes_classified` → `TagValue::JsonStr`) classifies the
+  // original first, matching bundled `perl exiftool` 13.59 (quoted `"12"`). The
+  // golden's STRING type (not number) is what the type-strict comparator pins.
+  check(
+    "Exif_gps_versionid_nulnum.tif",
+    "Exif_gps_versionid_nulnum.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_versionid_nulnum.tif",
+    "Exif_gps_versionid_nulnum.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_gps_versionid_nulbool_conformance() {
+  // #399 (Codex [medium]) — the same EscapeJSON ORDER for a NUL-SPLIT BOOLEAN.
+  // `GPSVersionID` (0x0000) as `undef[8]` `74 00 72 00 75 00 65 00`
+  // (`"t\0r\0u\0e\0"`): the NUL deletion PRODUCES the boolean word `true`.
+  // ExifTool's `/^(true|false)$/i` boolean coercion (exiftool:3805) runs on the
+  // ORIGINAL `$val` (WITH NULs) BEFORE the NUL strip, so the NUL-bearing original
+  // does NOT match → the value is a QUOTED string `"true"`, NOT a bare JSON
+  // boolean `true`, for BOTH `-j` and `-n`. Pins that the fix gates the boolean
+  // coercion on the original too (the `TagValue::JsonStr` forced-string path).
+  // Byte-identical to bundled `perl exiftool` 13.59.
+  check(
+    "Exif_gps_versionid_nulbool.tif",
+    "Exif_gps_versionid_nulbool.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_versionid_nulbool.tif",
+    "Exif_gps_versionid_nulbool.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_filesource_nulnum_conformance() {
+  // #399 (Codex [medium]) — the EscapeJSON ORDER on the `FileSource` HASH-miss
+  // `-n` path for a NUL-SPLIT NUMERIC value. `FileSource` (0xa300) as `undef[4]`
+  // `31 00 32 00` is a HASH miss → `Unknown ($val)` (printconv) / the bare `$val`
+  // (`-n`). The `tr/\0//d` produces `12`; the NUL-bearing original fails the
+  // number gate, so `-n` is a QUOTED string `"12"` (NOT a bare `12`). The `-j`
+  // `Unknown (12)` is quoted regardless (the parens defeat the gate), but it is
+  // included to pin both render modes. Byte-identical to bundled 13.59.
+  check(
+    "Exif_filesource_nulnum.tif",
+    "Exif_filesource_nulnum.tif.json",
+    true,
+  );
+  check(
+    "Exif_filesource_nulnum.tif",
+    "Exif_filesource_nulnum.tif.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_gps_after_interop_conformance() {
   // PR #36 Codex R12 F2 — the Windows Phone 7.5 InteropIFD/GPS pointer
   // collision. IFD0's GPSInfo (0x8825) and ExifIFD's InteropOffset

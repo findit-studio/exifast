@@ -1822,6 +1822,9 @@ fn emitted_tag_value(v: &TagValue) -> TagValue {
   match v {
     // `write_str` ⇒ TagValue::Str (clone the borrowed contents).
     TagValue::Str(s) => TagValue::Str(s.clone()),
+    // An already-classified JSON string round-trips its variant (APE Main never
+    // produces one — kept for exhaustiveness).
+    TagValue::JsonStr(s) => TagValue::JsonStr(s.clone()),
     // `write_i64`/`write_u64`/`write_f64` ⇒ same scalar variant.
     TagValue::I64(n) => TagValue::I64(*n),
     TagValue::U64(n) => TagValue::U64(*n),

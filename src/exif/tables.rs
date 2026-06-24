@@ -162,6 +162,18 @@ pub enum Conv {
   /// (the `emit_raw` path) — `PrintHex` affects only the print string, e.g.
   /// `ColorSpace 12` → `"Unknown (0xc)"` (`-j`) / `12` (`-n`).
   IntLabelHex(&'static [(i64, &'static str)]),
+  /// `FileSource` (0xa300) PrintConv (`Exif.pm:2815-2821`). A HASH whose keys
+  /// are the integer codes `1`/`2`/`3` PLUS the literal 4-byte STRING
+  /// `"\x03\x00\x00\x00"` (`Exif.pm:2820`) — Sigma incorrectly gives this
+  /// `Writable => 'undef'` tag a count of 4, so a single value `\x03` matches
+  /// the integer key `3` (the `undef[1] → int8u` carve-out, `Exif.pm:6682`)
+  /// while the 4-byte `\x03\x00\x00\x00` matches the string key →
+  /// `'Sigma Digital Camera'`. The integer codes flow through [`Conv::IntLabel`]
+  /// (the single-byte carve-out makes them a `RawValue::U64`); only the
+  /// multi-byte `undef` value needs the literal-string key handled here, with a
+  /// HASH-miss falling to `Unknown ($val)` over the raw byte string
+  /// (`ExifTool.pm:3614-3634`) exactly as bundled.
+  FileSource(&'static [(i64, &'static str)]),
   /// `ExposureTime` / `ShutterSpeedValue` PrintConv —
   /// `PrintExposureTime` (`Exif.pm:5701-5711`).
   ExposureTime,
@@ -1251,7 +1263,7 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0xa300,
     name: "FileSource",
-    conv: Conv::IntLabel(FILE_SOURCE),
+    conv: Conv::FileSource(FILE_SOURCE),
   },
   ExifTag {
     id: 0xa301,

@@ -520,7 +520,7 @@ static EXIF_SENSINGMETHOD: ExifTag = ExifTag {
 static EXIF_FILESOURCE: ExifTag = ExifTag {
   id: 0xa300,
   name: "FileSource",
-  conv: Conv::IntLabel(super::FILE_SOURCE),
+  conv: Conv::FileSource(super::FILE_SOURCE),
 };
 static EXIF_SCENETYPE: ExifTag = ExifTag {
   id: 0xa301,

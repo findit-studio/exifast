@@ -657,7 +657,7 @@ pub fn perl_str_to_f64(s: &str) -> f64 {
 #[allow(dead_code)] // Used by `feature = "ape"` + the Composite engine; pruned otherwise.
 pub(crate) fn perl_boolean_truthy(v: &TagValue) -> bool {
   match v {
-    TagValue::Str(s) => !s.is_empty() && s.as_str() != "0",
+    TagValue::Str(s) | TagValue::JsonStr(s) => !s.is_empty() && s.as_str() != "0",
     TagValue::I64(n) => *n != 0,
     TagValue::U64(n) => *n != 0,
     #[allow(clippy::float_cmp)]
@@ -1152,8 +1152,8 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
       n.to_string()
     }),
     // A string value is its own Perl scalar (e.g. AIFF `CompressionType`
-    // `"sowt"`/`"NONE"`).
-    TagValue::Str(s) => Some(s.to_string()),
+    // `"sowt"`/`"NONE"`). An already-classified JSON string keys the same way.
+    TagValue::Str(s) | TagValue::JsonStr(s) => Some(s.to_string()),
     // Rare for a hash PrintConv; Perl's boolean-ish scalars are not
     // `"true"`/`"false"`, but this port models a real `Bool`. The
     // documented, acceptable form: Rust `b.to_string()` ("true"/"false").
@@ -1324,6 +1324,109 @@ pub fn fix_utf8(bytes: &[u8]) -> String {
   // `String::from_utf8` (no unsafe) — falling back to lossy *just* in
   // case (panic-free contract, `#![forbid(unsafe_code)]`).
   String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Render a raw on-disk byte string the way ExifTool's `EscapeJSON` tail does:
+/// **delete every NUL first, THEN run `FixUTF8`** (`exiftool:3820` `tr/\0//d`
+/// precedes `exiftool:3824` `FixUTF8`). The ordering is load-bearing whenever a
+/// NUL byte SPLITS a UTF-8 sequence — e.g. a `GPSVersionID`/`FileSource`
+/// `undef[4]` written as `C2 00 A9 00`: the NUL-strip reassembles `C2 A9`
+/// (valid UTF-8 `©`), whereas validating the raw bytes first would flag `C2`
+/// and `A9` separately (the NUL between them breaks the sequence) and emit two
+/// `?`s. The downstream serializer's own `tr/\0//d` ([`crate::value`]) is then a
+/// no-op on the result (it carries no NULs), so this path is single-processed —
+/// `fix_utf8` runs exactly once, AFTER the NUL deletion, never before.
+#[must_use]
+pub fn escape_json_raw_bytes(bytes: &[u8]) -> String {
+  if bytes.contains(&0) {
+    let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+    fix_utf8(&stripped)
+  } else {
+    // No NUL splits the value — the order is moot, so skip the copy and run
+    // `FixUTF8` over the bytes directly (byte-identical to the NUL-stripped
+    // path when there are no NULs).
+    fix_utf8(bytes)
+  }
+}
+
+/// The outcome of running ExifTool's FULL `EscapeJSON` classify-then-escape over
+/// a raw on-disk byte string: a value the boolean/number gate accepted is a
+/// [`Self::Bare`] token; everything else is a [`Self::Quoted`] string. See
+/// [`escape_json_raw_bytes_classified`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EscapedJson {
+  /// The ORIGINAL string matched `/^(true|false)$/i` or the conservative number
+  /// regex, so `EscapeJSON` returns it VERBATIM as a BARE JSON token (`return
+  /// $str`). A clean number/boolean original carries no NUL, so the escaped form
+  /// equals the original ASCII; the caller emits it as a plain string the
+  /// serializer's own gate renders bare.
+  Bare(SmolStr),
+  /// The original did NOT match the boolean/number gate (it is non-numeric, or —
+  /// the load-bearing case — it carries a NUL that the gate's anchored regexes
+  /// reject), so `EscapeJSON` produces a QUOTED string. The payload is the
+  /// post-`tr/\0//d` post-`FixUTF8` content; the caller must emit it as a forced
+  /// JSON string ([`crate::value::TagValue::JsonStr`]) so it is NOT re-coerced to
+  /// a bare token by the serializer's number/boolean gate.
+  Quoted(SmolStr),
+}
+
+/// Replicate ExifTool's COMPLETE `EscapeJSON` order (`exiftool:3804-3824`, the
+/// `$json < 2` branch) for a raw on-disk byte string `bytes`:
+///
+/// 1. CLASSIFY the value AS-IS — the ORIGINAL string, NULs and all — against the
+///    boolean gate (`/^(true|false)$/i`, line 3805) then the conservative number
+///    gate (line 3810). If it matches, `EscapeJSON` returns it VERBATIM as a BARE
+///    JSON boolean/number (`return $str`).
+/// 2. Otherwise it is a QUOTED string: escape specials, `tr/\0//d` delete every
+///    NUL (line 3820), `\u`-escape the remaining controls (handled downstream by
+///    the serde string escaper), then `FixUTF8` (line 3824).
+///
+/// The ordering is load-bearing for a NUL-SPLIT value whose NUL deletion / UTF-8
+/// repair PRODUCES a number- or boolean-shaped lexeme. The classify in step 1
+/// runs BEFORE `tr/\0//d`, so a NUL-bearing original ALWAYS fails the gate (its
+/// regexes are anchored and admit no NUL) and is a QUOTED string — e.g. a
+/// `GPSVersionID`/`FileSource` `undef[4]` `31 00 32 00` (`"1\02\0"`) → quoted
+/// `"12"`, NOT a bare `12`; `74 00 72 00 75 00 65 00` (`"t\0r\0u\0e\0"`) → quoted
+/// `"true"`, NOT a bare `true`. A NUL-FREE clean-number/boolean original
+/// (`31 32 33 34` → `1234`, `74 72 75 65` → `true`) DOES pass the gate and is
+/// emitted BARE, byte-identical to bundled.
+///
+/// `space_to_dot` applies the `GPSVersionID` PrintConv `tr/ /./` (GPS.pm:62) to
+/// `$val` BEFORE the classify — ExifTool runs that `tr` on the raw `$val` (with
+/// NULs), then `EscapeJSON` classifies the result, so a space-bearing value can
+/// become a number (`"1 2"` → `tr/ /./` → `"1.2"` → bare `1.2`). The space is
+/// ASCII and commutes with the NUL-strip + `FixUTF8`, so applying it to the raw
+/// bytes here is byte-identical to ExifTool's `tr`-then-`EscapeJSON` order. The
+/// non-PrintConv (`-n`) and HASH-miss raw paths pass `false`.
+#[must_use]
+pub(crate) fn escape_json_raw_bytes_classified(bytes: &[u8], space_to_dot: bool) -> EscapedJson {
+  // ExifTool's `tr/ /./` runs on the raw `$val` (NULs intact) BEFORE the gate.
+  let owned;
+  let val: &[u8] = if space_to_dot && bytes.contains(&b' ') {
+    owned = bytes
+      .iter()
+      .map(|&b| if b == b' ' { b'.' } else { b })
+      .collect::<Vec<u8>>();
+    &owned
+  } else {
+    bytes
+  };
+  // Step 1: classify the ORIGINAL `$val` (with NULs). The boolean/number gate
+  // accepts only pure-ASCII tokens; a NUL or any high byte that does not form a
+  // matching token fails it. `from_utf8` succeeds for a NUL-bearing ASCII value
+  // (NUL is valid UTF-8) — and the gate then rejects it for the NUL — and fails
+  // for non-UTF-8 high bytes (also a gate miss). Either non-match ⇒ quoted.
+  if let Ok(s) = core::str::from_utf8(val)
+    && (s.eq_ignore_ascii_case("true")
+      || s.eq_ignore_ascii_case("false")
+      || crate::value::escape_json_is_number(s))
+  {
+    // Clean number/boolean original ⇒ BARE, VERBATIM (`return $str`). It carries
+    // no NUL, so `escape_json_raw_bytes` is identity on it.
+    return EscapedJson::Bare(SmolStr::new(s));
+  }
+  // Step 2: a non-matching value is a QUOTED string — `tr/\0//d` then `FixUTF8`.
+  EscapedJson::Quoted(SmolStr::new(escape_json_raw_bytes(val)))
 }
 
 /// Emit one codepoint as Perl's `pack('C0U', $n)` would (variable-length
@@ -1648,7 +1751,7 @@ fn scalar_text(v: &TagValue) -> String {
       }
     }
     TagValue::Rational(r) => r.exiftool_val_str(),
-    TagValue::Str(s) => s.to_string(),
+    TagValue::Str(s) | TagValue::JsonStr(s) => s.to_string(),
     TagValue::Bool(b) => b.to_string(),
     TagValue::Bytes(_) | TagValue::List(_) | TagValue::Map(_) => String::new(),
   }
@@ -3478,6 +3581,114 @@ mod tests {
     assert_eq!(fix_utf8(b"\xe0\xa0"), "??");
     // Multi-byte lead followed by ASCII (continuation pattern fails).
     assert_eq!(fix_utf8(b"\xe2A"), "?A");
+  }
+
+  #[test]
+  fn escape_json_raw_bytes_strips_nuls_before_fixutf8() {
+    // #399 — ExifTool's `EscapeJSON` order: NUL-delete (exiftool:3820) THEN
+    // FixUTF8 (exiftool:3824). The load-bearing case: a NUL SPLITS a 2-byte
+    // sequence. `C2 00 A9 00` → NUL-strip `C2 A9` → FixUTF8 → "©" (U+00A9).
+    assert_eq!(escape_json_raw_bytes(b"\xc2\x00\xa9\x00"), "©");
+    // A 3-byte sequence split by NULs across both gaps reassembles too:
+    // E2 00 82 00 AC = `€` (U+20AC) once the NULs are gone.
+    assert_eq!(escape_json_raw_bytes(b"\xe2\x00\x82\x00\xac"), "€");
+
+    // CONTRAST: doing FixUTF8 FIRST (the BUG) would validate each fragment
+    // separately. Prove the order matters — `fix_utf8` on the raw NUL-bearing
+    // bytes yields the broken form (`?` per stray byte, NULs preserved), which
+    // is NOT what the ordered helper produces.
+    assert_eq!(fix_utf8(b"\xc2\x00\xa9\x00"), "?\0?\0");
+    assert_ne!(escape_json_raw_bytes(b"\xc2\x00\xa9\x00"), "??");
+
+    // No-NUL fast path is byte-identical to `fix_utf8` (the order is moot):
+    // a valid multi-byte value passes through, an invalid byte → `?`.
+    assert_eq!(escape_json_raw_bytes("©".as_bytes()), "©");
+    assert_eq!(escape_json_raw_bytes(b"A\xffB"), "A?B");
+
+    // Trailing/embedded NULs around ASCII control bytes are dropped (matches
+    // the GPSVersionID `02 03 00 00` and FileSource Sigma `03 00 00 00` shapes
+    // → the surviving control bytes only, NO NUL split here).
+    assert_eq!(escape_json_raw_bytes(b"\x02\x03\x00\x00"), "\u{2}\u{3}");
+    assert_eq!(escape_json_raw_bytes(b"\x03\x00\x00\x00"), "\u{3}");
+
+    // All-NUL input collapses to empty (every byte deleted before FixUTF8).
+    assert_eq!(escape_json_raw_bytes(b"\x00\x00"), "");
+    // Empty input.
+    assert_eq!(escape_json_raw_bytes(b""), "");
+  }
+
+  #[test]
+  fn escape_json_raw_bytes_classified_gates_the_original_before_nul_strip() {
+    use EscapedJson::{Bare, Quoted};
+    // #399 — the FULL EscapeJSON order: CLASSIFY the ORIGINAL (with NULs) FIRST,
+    // and ONLY a non-match is NUL-stripped + FixUTF8'd.
+
+    // NUL-split NUMERIC: the NUL-bearing original `"1\02\0"` FAILS the number gate
+    // (anchored regex admits no NUL) ⇒ QUOTED string of the stripped `"12"`, NOT
+    // a bare token. This is the bug the fix closes.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"1\x002\x00", false),
+      Quoted("12".into())
+    );
+    // NUL-split BOOLEAN: the original `"t\0r\0u\0e\0"` does NOT match
+    // `/^(true|false)$/i` (the NULs break it) ⇒ QUOTED `"true"`, not bare boolean.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"t\x00r\x00u\x00e\x00", false),
+      Quoted("true".into())
+    );
+    // NUL-FREE clean NUMBER passes the gate AS-IS ⇒ BARE, verbatim.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"1234", false),
+      Bare("1234".into())
+    );
+    // NUL-FREE clean BOOLEAN passes the gate ⇒ BARE.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"true", false),
+      Bare("true".into())
+    );
+    // A negative / fractional clean number is bare too (the number gate admits
+    // `-?(\d|[1-9]\d{1,14})(\.\d{1,16})?`).
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"-12.5", false),
+      Bare("-12.5".into())
+    );
+    // R1 control bytes (`02 03 00 00`) are NON-numeric ⇒ QUOTED (the surviving
+    // controls; the serde escaper renders them ``). Unchanged.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"\x02\x03\x00\x00", false),
+      Quoted("\u{2}\u{3}".into())
+    );
+    // R2 NUL-split UTF-8 (`C2 00 A9 00`) ⇒ NON-numeric ⇒ QUOTED `"©"`. Unchanged.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"\xc2\x00\xa9\x00", false),
+      Quoted("©".into())
+    );
+    // A plain string stays quoted.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"Sigma", false),
+      Quoted("Sigma".into())
+    );
+
+    // `space_to_dot` (GPSVersionID PrintConv `tr/ /./`) runs on the raw `$val`
+    // BEFORE the gate, so a space-bearing value can become a number:
+    //   "1 2"  --tr/ /./-->  "1.2"  --gate-->  BARE 1.2
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"1 2", true),
+      Bare("1.2".into())
+    );
+    // …but with `space_to_dot=false` (the `-n`/FileSource path) the space keeps
+    // it OUT of the number gate ⇒ QUOTED "1 2".
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"1 2", false),
+      Quoted("1 2".into())
+    );
+    // The space→dot transform also maps the NORMAL `2 3 0 0` quadruple display
+    // (a non-number after the dots: `2.3.0.0`) ⇒ QUOTED, matching the
+    // printconv `2.3.0.0` render.
+    assert_eq!(
+      escape_json_raw_bytes_classified(b"2 3 0 0", true),
+      Quoted("2.3.0.0".into())
+    );
   }
 
   #[test]

@@ -110,7 +110,12 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   hp(0x9208, "Conv::IntLabel(super::LIGHT_SOURCE)"),
   hp(0xa210, "Conv::IntLabel(super::RESOLUTION_UNIT)"),
   hp(0xa217, "Conv::IntLabel(super::SENSING_METHOD)"),
-  hp(0xa300, "Conv::IntLabel(super::FILE_SOURCE)"),
+  // `FileSource` (0xa300) — the `%Exif::Main` HASH has the integer codes 1/2/3
+  // PLUS the literal 4-byte STRING key `"\3\0\0\0" => 'Sigma Digital Camera'`
+  // (`Exif.pm:2820`), which `-listx` cannot represent. The dedicated
+  // `Conv::FileSource` carries the int labels (the `super::FILE_SOURCE` slice)
+  // AND the Sigma literal-key handling (#399).
+  hp(0xa300, "Conv::FileSource(super::FILE_SOURCE)"),
   // `Sharpness` (0xa40a) — `{0:Normal,1:Soft,2:Hard}` (Exif.pm:2946), DISTINCT
   // from `Contrast` (`{0:Normal,1:Low,2:High}`); pin the hand `SHARPNESS` slice.
   hp(0xa40a, "Conv::IntLabel(super::SHARPNESS)"),

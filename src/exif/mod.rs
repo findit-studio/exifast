@@ -8606,6 +8606,28 @@ trait ExifSink {
     name: &str,
     value: &str,
   ) -> Result<(), core::convert::Infallible>;
+  /// An already-`EscapeJSON`-classified JSON STRING → [`TagValue::JsonStr`]: the
+  /// content is emitted as a QUOTED string VERBATIM, bypassing the serializer's
+  /// boolean/number gate. Used by the raw-byte EXIF paths
+  /// ([`emit_exif_value`]'s `Bytes` arm / [`emit_gps_value`]'s `GpsConv::VersionId`)
+  /// for a NUL-split value whose `tr/\0//d` + `FixUTF8` PRODUCES a number/boolean
+  /// lexeme (`31 00 32 00` → `"12"`): the NUL-bearing original failed the gate, so
+  /// the result is a string, not a bare token (`escape_json_raw_bytes_classified`).
+  ///
+  /// The provided default delegates to [`write_str`](Self::write_str) — correct
+  /// for sinks that DISCARD scalar writes (the capture-only
+  /// [`VendorEmissionSink`]/[`PreviewIfdSink`]); the value-storing sinks
+  /// ([`EmittedTagSink`], and the test [`TagMap`]) override it to push
+  /// [`TagValue::JsonStr`].
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    self.write_str(group, name, value)
+  }
   /// An `i64` value → [`TagValue::I64`].
   fn write_i64(
     &mut self,
@@ -8700,6 +8722,20 @@ impl ExifSink for crate::tagmap::TagMap {
     value: &str,
   ) -> Result<(), core::convert::Infallible> {
     crate::tagmap::TagMap::write_str(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_value(
+      self,
+      group,
+      name,
+      crate::value::TagValue::JsonStr(value.into()),
+    )
   }
   #[inline(always)]
   fn write_i64(
@@ -8825,6 +8861,19 @@ impl ExifSink for EmittedTagSink<'_> {
     // numeric — the apparent cases are stale fixtures or the digit-cap the gate
     // already handles).
     self.push(group, name, crate::value::TagValue::Str(value.into()));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_json_string(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    // `EscapeJSON` already decided this is a JSON STRING (the NUL-bearing
+    // original failed the boolean/number gate). Store [`TagValue::JsonStr`] so
+    // the serializer quotes it VERBATIM — NOT re-gated to a bare number/boolean.
+    self.push(group, name, crate::value::TagValue::JsonStr(value.into()));
     Ok(())
   }
   #[inline(always)]
@@ -12584,6 +12633,58 @@ fn emit_exif_value<S: ExifSink>(
     Conv::None => emit_raw(group, name, raw, out),
     Conv::IntLabel(slice) => emit_int_label(group, name, raw, slice, print_conv, out, false),
     Conv::IntLabelHex(slice) => emit_int_label(group, name, raw, slice, print_conv, out, true),
+    Conv::FileSource(slice) => {
+      // `FileSource` (0xa300) HASH PrintConv (`Exif.pm:2815-2821`). The integer
+      // codes `1`/`2`/`3` arrive as a single `undef` byte re-read int8u (the
+      // `Format::Undef` + `count == 1` carve-out, `Exif.pm:6682`, applied by the
+      // Walker), so a `RawValue::U64` singleton flows through the shared
+      // `emit_int_label` exactly like any other integer enumeration (`3` →
+      // "Digital Camera"; a miss → `Unknown (N)`; `-n` → the bare number).
+      //
+      // ONLY a multi-byte `undef` value lands as `RawValue::Bytes` — the case
+      // ExifTool reserves for the literal string key `"\x03\x00\x00\x00"` Sigma
+      // (mis)writes (`Exif.pm:2820`). Match the exact 4 bytes →
+      // "Sigma Digital Camera" under printconv; any other multi-byte `undef` is a
+      // HASH MISS → `Unknown ($val)` over the raw byte string
+      // (`ExifTool.pm:3614-3634`). `-n` (and the HASH-miss `$val` inside
+      // `Unknown (…)`) shows the post-`ReadValue` byte string itself, rendered
+      // through ExifTool's `EscapeJSON` tail — `convert::escape_json_raw_bytes`
+      // applies the exact order: `tr/\0//d` (`exiftool:3820`) deletes the NULs
+      // FIRST, THEN `FixUTF8` (`exiftool:3824`). So the Sigma `\x03\x00\x00\x00`
+      // shows as the single surviving `0x03` byte under `-n`, the miss text
+      // drops its NULs, and a NUL-split UTF-8 value (`\xc2\x00\xa9\x00`)
+      // reassembles to `©` AFTER the NUL deletion — matching bundled
+      // `exiftool 13.59` (which yields `Unknown (©)` / `©`). Rendering the
+      // bytes alone then wrapping in `Unknown (…)` is byte-identical to
+      // wrapping then escaping: the `Unknown (`/`)` literals carry no NULs and
+      // are valid ASCII, so they neither create nor split a sequence.
+      if let RawValue::Bytes(b) = raw {
+        if print_conv {
+          if b.as_slice() == [0x03, 0x00, 0x00, 0x00] {
+            out.write_str(group, name, "Sigma Digital Camera")?;
+          } else {
+            out.write_str(
+              group,
+              name,
+              &std::format!("Unknown ({})", crate::convert::escape_json_raw_bytes(b)),
+            )?;
+          }
+        } else {
+          // `-n` shows the bare `$val` byte string through ExifTool's FULL
+          // `EscapeJSON` order: CLASSIFY the ORIGINAL `$val` (with NULs) against
+          // the boolean/number gate FIRST, then — only for a non-match —
+          // `tr/\0//d` + `FixUTF8`. A NUL-bearing original (e.g. a NUL-split
+          // numeric `31 00 32 00`) FAILS the gate, so it is a QUOTED string
+          // (`"12"`), NOT a bare number; a NUL-free clean number stays bare.
+          match crate::convert::escape_json_raw_bytes_classified(b, false) {
+            crate::convert::EscapedJson::Bare(v) => out.write_str(group, name, &v)?,
+            crate::convert::EscapedJson::Quoted(v) => out.write_json_string(group, name, &v)?,
+          }
+        }
+        return Ok(());
+      }
+      emit_int_label(group, name, raw, slice, print_conv, out, false)
+    }
     Conv::StrLabel(slice) => {
       // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
       // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
@@ -13171,12 +13272,49 @@ fn emit_gps_value<S: ExifSink>(
   match conv {
     GpsConv::Plain(c) => emit_exif_value(group, name, raw, c, order, print_conv, out),
     GpsConv::VersionId => {
-      // `$val =~ tr/ /./; $val` (GPS.pm:61) — the int8u quadruple is the
-      // space-joined integers under -n, dot-joined under -j.
-      if let RawValue::U64(vals) = raw {
-        let joined: Vec<String> = vals.iter().map(|v| std::format!("{v}")).collect();
-        let sep = if print_conv { "." } else { " " };
-        out.write_str(group, name, &joined.join(sep))?;
+      // PrintConv `$val =~ tr/ /./; $val` (GPS.pm:62) runs on the post-`ReadValue`
+      // `$val` — the space-joined integers for the normal `int8u[4]` (and any
+      // numeric / `string` shape `value_space_joined` covers), the raw byte
+      // string for an `undef`/wrong-format shape. `tr/ /./` (printconv only)
+      // turns every space into `.` (the normal `2 3 0 0` → `2.3.0.0`); under `-n`
+      // the bare `$val` is shown. Bundled `exiftool 13.59` was used to pin the
+      // `undef[4]` and `int8s[4]` shapes below.
+      //
+      // The `undef`/`Bytes` shape is the one `value_space_joined` does NOT cover
+      // (it carries no numeric `ReadValue` form). `$val` is then the raw byte
+      // string, rendered through ExifTool's FULL `EscapeJSON` order
+      // (`escape_json_raw_bytes_classified`): CLASSIFY the ORIGINAL `$val`
+      // (NULs intact) against the boolean/number gate FIRST, and ONLY for a
+      // non-match `tr/\0//d` (`exiftool:3820`) then `FixUTF8` (`exiftool:3824`).
+      // So an `undef[4]` `02 03 00 00` → the 2 surviving control bytes (a
+      // QUOTED `""`, matching bundled); a NUL-split UTF-8 value
+      // `c2 00 a9 00` reassembles to `©` AFTER the NUL deletion (QUOTED `"©"`,
+      // bundled `exiftool 13.59`), NOT the two `?`s a FixUTF8-before-NUL-strip
+      // order would produce; and the load-bearing NUL-split NUMERIC `31 00 32 00`
+      // is a QUOTED `"12"` (the NUL-bearing original fails the gate, so it is a
+      // string — NOT a bare `12`), while a NUL-free clean number `31 32 33 34`
+      // → bare `1234`. `tr/ /./` (PrintConv only, GPS.pm:62) runs on the raw
+      // `$val` BEFORE the gate (so `"1 2"` → `"1.2"` → bare `1.2`); the space is
+      // ASCII and COMMUTES with the NUL-strip + `FixUTF8`, so applying it to the
+      // raw bytes inside the helper is byte-identical to ExifTool's
+      // `tr/ /./`-then-`EscapeJSON` order.
+      if let RawValue::Bytes(b) = raw {
+        match crate::convert::escape_json_raw_bytes_classified(b, print_conv) {
+          crate::convert::EscapedJson::Bare(v) => out.write_str(group, name, &v)?,
+          crate::convert::EscapedJson::Quoted(v) => out.write_json_string(group, name, &v)?,
+        }
+        return Ok(());
+      }
+      if let Some(mut v) = value_space_joined(raw) {
+        // Numeric / `string` shapes: `tr/ /./` on the space-joined `$val`. The
+        // `int8u[4]`/`int8s[4]` `2 3 0 0` → `2.3.0.0` (printconv) / `2 3 0 0`
+        // (`-n`); a SINGLE-element value is its bare scalar, emitted through the
+        // serializer's `EscapeJSON` number gate (a numeric scalar stays a bare
+        // JSON number — `TagValue::Str` self-classifies, `value.rs`).
+        if print_conv {
+          v = v.replace(' ', ".");
+        }
+        out.write_str(group, name, &v)?;
         return Ok(());
       }
       emit_raw(group, name, raw, out)
