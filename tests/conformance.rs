@@ -8545,6 +8545,32 @@ fn exif_conformance() {
   check("Exif.tif", "Exif.tif.n.json", false);
 }
 #[test]
+fn dji_ae_dbg_info_conformance() {
+  // #115: the DJI `ae_dbg_info` debug MakerNote — a 0x927C value that is a
+  // `[key:val]…` bracketed-string run, NOT an IFD. `MakerNotes.pm:93-97` routes
+  // a value matching `^\[ae_dbg_info:/` (`NotIFD => 1`) to `%DJI::Info` /
+  // `ProcessDJIInfo` (`DJI.pm:74-95` table, `:960-983` proc), which walks the
+  // brackets and emits one `DJI:*` tag per `[key:val]` pair.
+  //
+  // Fixture `tests/fixtures/DJI_ae_dbg_info.tif` (crafted by
+  // `tools/gen_exif_fixtures.py`, little-endian) carries IFD0 `Make=DJI` and a
+  // 0x927C MakerNote
+  //   [ae_dbg_info:…][ae_histogram_info:…][awb_dbg_info:…]
+  //   [GimbalDegree(Y,P,R):…][FlightDegree(Y,P,R):…][sensor_id:…]
+  //   [some_unknown_tag:hello world]
+  // pinning:
+  //   - the named-key renames (`%DJI::Info`): ae_dbg_info → AEDebugInfo,
+  //     ae_histogram_info → AEHistogramInfo, awb_dbg_info → AWBDebugInfo,
+  //     GimbalDegree(Y,P,R) → GimbalDegree, FlightDegree(Y,P,R) → FlightDegree,
+  //     sensor_id → SensorID;
+  //   - the `MakeTagInfo => 1` synthesis for an UNKNOWN key
+  //     (some_unknown_tag → `DJI:Some_Unknown_Tag`, `ExifTool.pm:9312-9317`).
+  // All seven values are printable ASCII ⇒ string emissions. `%DJI::Info` has
+  // no PrintConv/ValueConv, so the `-j` and `-n` renderings are IDENTICAL.
+  check("DJI_ae_dbg_info.tif", "DJI_ae_dbg_info.tif.json", true);
+  check("DJI_ae_dbg_info.tif", "DJI_ae_dbg_info.tif.n.json", false);
+}
+#[test]
 fn bigtiff_subifd_conformance() {
   // #240 — BigTIFF SubIFD pointer recursion (`ProcessBigIFD`'s `$$tagInfo{SubIFD}`
   // branch, `BigTIFF.pm:171-198`). The bundled `BigTIFF.btf` is a FLAT single-IFD

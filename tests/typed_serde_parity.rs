@@ -1405,7 +1405,17 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// same `RIFF:VendorName`, pinning the `TagMap` last-wins duplicate resolution
 /// (`"ZoraSECOND"`) against bundled 13.59. Additive — every PRE-EXISTING golden
 /// (incl. the three single-`strd` fixtures) stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 611;
+/// 611 → 612 (#115, the DJI `ae_dbg_info` bracketed-string debug MakerNote)
+/// adds `DJI_ae_dbg_info.tif` — a crafted minimal TIFF whose 0x927C value is a
+/// `[key:val]…` bracket run (NOT an IFD), routed by `MakerNotes.pm:93-97`
+/// (`^\[ae_dbg_info:/`, `NotIFD => 1`) to `%DJI::Info` / `ProcessDJIInfo`
+/// (`DJI.pm:74-95`/:960-983). Pins the named-key renames (ae_dbg_info →
+/// `DJI:AEDebugInfo`, awb_dbg_info → `DJI:AWBDebugInfo`, GimbalDegree(Y,P,R) →
+/// `DJI:GimbalDegree`, sensor_id → `DJI:SensorID`, …) plus the `MakeTagInfo`
+/// synthesis for an unknown key (some_unknown_tag → `DJI:Some_Unknown_Tag`,
+/// `ExifTool.pm:9312-9317`). `%DJI::Info` has no Conv, so `-j`/`-n` are
+/// identical. Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 612;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

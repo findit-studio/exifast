@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "DJI_ae_dbg_info.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "DJI",
+  "DJI:AEDebugInfo": "Ver=1.0,exp=auto",
+  "DJI:AEHistogramInfo": "0 1 2 3 4 5",
+  "DJI:AWBDebugInfo": "r=1.5 g=1.0 b=1.8",
+  "DJI:GimbalDegree": "-12.3,4.5,0.0",
+  "DJI:FlightDegree": "10,20,30",
+  "DJI:SensorID": "ABC123",
+  "DJI:Some_Unknown_Tag": "hello world"
+}]

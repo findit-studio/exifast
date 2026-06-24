@@ -389,6 +389,49 @@ def make_exif_makernote_tif():
     return b.build([ifd0, exif_ifd])
 
 
+def make_dji_ae_dbg_info_tif():
+    r"""DJI debug-MakerNote TIFF (#115) — a 0x927C value that is NOT an IFD but
+    a `[ae_dbg_info:...]` bracketed-string run (`%DJI::Info`).
+
+    `MakerNotes.pm:93-97` routes a 0x927C value matching `^\[ae_dbg_info:/`
+    (`NotIFD => 1`) to `%DJI::Info` / `ProcessDJIInfo` (`DJI.pm:74-95`/:960-983),
+    which walks `[key:val]` pairs and emits one DJI:* tag per pair. This fixture
+    pins:
+      - named keys -> canonical names: ae_dbg_info -> AEDebugInfo,
+        ae_histogram_info -> AEHistogramInfo, awb_dbg_info -> AWBDebugInfo,
+        GimbalDegree(Y,P,R) -> GimbalDegree, FlightDegree(Y,P,R) -> FlightDegree,
+        sensor_id -> SensorID;
+      - an unknown key -> the MakeTagInfo synthesis (ExifTool.pm:9312-9317):
+        some_unknown_tag -> DJI:Some_Unknown_Tag.
+    All seven values are printable ASCII -> emitted as strings. IFD0 carries
+    Make=DJI (a real DJI image does; the DJIInfo Condition is Make-independent,
+    so the dispatch does not need it). Little-endian (II).
+
+    (Verified byte-identical against bundled `perl exiftool` 13.59.)"""
+    bo = '<'
+    b = TiffBuilder(bo)
+    maker = (b"[ae_dbg_info:Ver=1.0,exp=auto]"
+             b"[ae_histogram_info:0 1 2 3 4 5]"
+             b"[awb_dbg_info:r=1.5 g=1.0 b=1.8]"
+             b"[GimbalDegree(Y,P,R):-12.3,4.5,0.0]"
+             b"[FlightDegree(Y,P,R):10,20,30]"
+             b"[sensor_id:ABC123]"
+             b"[some_unknown_tag:hello world]")
+    exif_ifd = {
+        'entries': [
+            (0x927c, UNDEF, len(maker), maker),  # MakerNote (DJIInfo)
+        ],
+    }
+    ifd0 = {
+        'entries': [
+            (0x010f, ASCII, 4, b'DJI\x00'),  # Make
+            (0x8769, LONG, 1, 0),            # ExifOffset -> ExifIFD
+        ],
+        'sub': {0x8769: 1},
+    }
+    return b.build([ifd0, exif_ifd])
+
+
 # ===========================================================================
 # Adversarial fixtures — PR #36 Codex R1 (F1/F2/F3 conformance)
 # ===========================================================================
@@ -1942,6 +1985,8 @@ if __name__ == '__main__':
         f.write(make_exif_gps_shared_pointer_tif())
     with open(f'{out_dir}/Exif_makernote.tif', 'wb') as f:
         f.write(make_exif_makernote_tif())
+    with open(f'{out_dir}/DJI_ae_dbg_info.tif', 'wb') as f:
+        f.write(make_dji_ae_dbg_info_tif())
     with open(f'{out_dir}/Exif_badoffset_low.tif', 'wb') as f:
         f.write(make_exif_badoffset_low_tif())
     with open(f'{out_dir}/Exif_badoffset_eof.tif', 'wb') as f:
