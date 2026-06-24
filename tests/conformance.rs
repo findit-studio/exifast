@@ -11236,3 +11236,11 @@ fn pef_pentax_istd_conformance() {
     check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.json", true);
     check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.n.json", false);
 }
+
+// #128 — MPEG-2 video + AC3 audio in MPEG-TS (stream types 0x02, 0x81)
+#[test]
+#[ignore]
+fn mpeg2_ts_mpeg2video_conformance() {
+    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.json", true);
+    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.n.json", false);
+}
