@@ -231,6 +231,11 @@ const NOT_ACTIVE: &[&str] = &[
   // ACTIVE: #393 ported their MakerNote variants byte-exact, so they moved out of
   // NOT_ACTIVE into the active set with per-fixture FIXTURE_EXCLUDED_KEYS for the
   // non-MakerNote residuals.)
+  // #128 / #408 — the teammate added this MPEG-2 video transport-stream fixture
+  // with bundled goldens, but the `MPEG:ImageWidth/Height/FrameRate/VideoBitrate`
+  // video-PES decode is deferred (#128), so exifast does not yet emit the golden's
+  // tag set. Accept-deferred until the MPEG-2 video PES decoder lands + activates.
+  "MPEG2_TS_mpeg2video.ts",
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
