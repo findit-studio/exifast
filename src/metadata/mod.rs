@@ -89,7 +89,7 @@ pub use quicktime::{
   QuickTimeMeta, QuickTimeUserData, SampleDescRoute, TcMediaInfo, VisualSampleDesc,
 };
 pub use quicktime_brand::{
-  Cr3Block, Cr3CmtKind, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta,
+  Av1Config, Cr3Block, Cr3CmtKind, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta,
 };
 pub use quicktime_stream::{GpmdTimingOnly, GpsSample, MebxSample, QuickTimeStreamMeta};
 pub(crate) use quicktime_stream::{GpsOrigin, TextExtras};

@@ -632,6 +632,12 @@ pub fn walk_heif_meta(
   // cannot overflow a narrower counter and alias one property index onto another.
   let mut ispe_props: Vec<(u32, u32, u32)> = Vec::new();
   let mut ipma_assoc: Vec<(u32, Vec<u16>)> = Vec::new();
+  // #149 — the decoded `av1C` (AV1 Codec Configuration) from `ipco`. Collected
+  // into a local (NOT written through `out`) so the inner `ipco` property-walk
+  // closure does not capture `out` mutably — the surrounding `iprp` closure
+  // already holds it (the same nesting reason `ispe_props` is a local). Written
+  // to `out` after the walk; the LAST `av1C` in the surviving `ipco` wins.
+  let mut av1_config_found: Option<crate::metadata::Av1Config> = None;
   // #218 — the iloc extent budget is CUMULATIVE across every `iloc` child of
   // this `meta` AND across every OTHER `meta` box in the file: `walk_heif_meta`
   // does NOT own it. The caller ([`scan_quicktime_brands`]) holds ONE
@@ -840,6 +846,12 @@ pub fn walk_heif_meta(
               // = its width). The list is input-bounded — each `ispe` box is
               // ≥20 bytes in the file, so the count cannot exceed `len / 20`.
               let mut this_ipco: Vec<(u32, u32, u32)> = Vec::new();
+              // A FRESH per-`ipco` `av1C` slot — like `this_ipco`, it OVERWRITES
+              // the pending value (a later `ipco` with no `av1C` clears an
+              // earlier one, matching ExifTool processing only the LAST stored
+              // `ItemPropertyContainer`). Multiple `av1C` boxes WITHIN this
+              // `ipco` MERGE per tag (see the walk below). #149.
+              let mut this_av1c: Option<crate::metadata::Av1Config> = None;
               let mut prop_index: u32 = 0;
               walk_boxes(child.body, 0, Size0Behavior::Stop, |prop| {
                 let Some(next) = prop_index.checked_add(1) else {
@@ -851,8 +863,30 @@ pub fn walk_heif_meta(
                 {
                   this_ipco.push((prop_index, w, hh));
                 }
+                // av1C (AV1 Codec Configuration, QuickTime.pm:3079-3082 → the
+                // `AV1Config` ProcessBinaryData table). ExifTool walks every
+                // `ipco` child and re-runs `AV1Config` on each `av1C` box; each
+                // re-run FoundTag-overwrites the tags THAT box contains, so
+                // duplicate `av1C` boxes resolve PER TAG (last-wins per tag, not
+                // whole-record). MERGE each decoded box into the pending one: a
+                // later truncated `av1C` overwrites only `AV1ConfigurationVersion`
+                // and leaves an earlier `ChromaFormat`/`ChromaSamplePosition`
+                // intact (oracle: full 4-byte then 1-byte `av1C` → chroma from
+                // the first, version from the second). The `ispe`-vs-`av1C`
+                // resolution differs from the dimension path (an `av1C` is NOT
+                // item-associated), so this is independent of `ispe_props`/`ipma`.
+                // #149.
+                else if prop.tag == b"av1C"
+                  && let Some(cfg) = decode_av1c(prop.body)
+                {
+                  match &mut this_av1c {
+                    Some(existing) => existing.merge(cfg),
+                    None => this_av1c = Some(cfg),
+                  }
+                }
               });
               ispe_props = this_ipco;
+              av1_config_found = this_av1c;
             }
             b"ipma" => {
               ipma_order_walk(child.body, meta_abs_offset, out, &mut ipma_assoc);
@@ -882,6 +916,26 @@ pub fn walk_heif_meta(
   // (last-wins).
   if !ispe_props.is_empty() {
     emit_ispe_dimensions(&ispe_props, &ipma_assoc, out);
+  }
+  // #149 — record the `av1C` config decoded from this `meta`'s surviving `ipco`.
+  // Only WRITE when this `meta` actually decoded one, so (like the `ispe`
+  // dimensions) a later `av1C`-less `meta` over the SHARED `HeifMeta` leaves an
+  // earlier config intact. A later `av1C` MERGES per tag into the earlier (the
+  // same per-tag last-wins ExifTool's whole-file FoundTag applies — each
+  // non-list scalar tag is overwritten by the last box that contains it,
+  // regardless of which `meta`), so a later truncated `av1C` overrides only the
+  // fields it carries. A real AVIF has exactly one `meta` carrying exactly one
+  // `av1C`.
+  if let Some(cfg) = av1_config_found {
+    match out.av1_config() {
+      Some(mut existing) => {
+        existing.merge(cfg);
+        out.set_av1_config(Some(existing));
+      }
+      None => {
+        out.set_av1_config(Some(cfg));
+      }
+    }
   }
 }
 
@@ -1130,6 +1184,50 @@ fn decode_ispe(body: &[u8]) -> Option<(u32, u32)> {
   let width = be_u32(body, 4)?;
   let height = be_u32(body, 8)?;
   Some((width, height))
+}
+
+/// Decode an `av1C` (AV1 Codec Configuration Record) box body into the three
+/// non-`Unknown` `AV1Config` fields (#149).
+///
+/// Faithful to `%Image::ExifTool::QuickTime::AV1Config` (QuickTime.pm:3308-3367),
+/// a `ProcessBinaryData` table (`FIRST_ENTRY => 0`, no `FORMAT` ⇒ each entry is
+/// an `int8u` at its byte offset). The box body is the raw
+/// `AV1CodecConfigurationRecord` — NO version/flags FullBox prefix. Each `Mask`d
+/// field is `($byte & Mask) >> BitShift`, where `BitShift` is the mask's
+/// trailing-zero count (ExifTool.pm:5916-5921 + :10079):
+///   * byte 0: `AV1ConfigurationVersion` = `b0 & 0x7f` (BitShift 0).
+///   * byte 2: `ChromaFormat` = `(b2 & 0x1c) >> 2`, `ChromaSamplePosition` =
+///     `b2 & 0x03` (BitShift 0).
+///
+/// The `Unknown => 1` fields (`SeqProfile`/`SeqLevelIdx0` at byte 1,
+/// `SeqTier0`/`HighBitDepth`/`TwelveBit` at byte 2, `InitialDelaySamples` at
+/// byte 3) are not surfaced (exifast does not emit `-U`/`Unknown` tags), so they
+/// are not decoded.
+///
+/// PER-FIELD availability matches `ProcessBinaryData` (ExifTool.pm:9963-9964):
+/// each tag emits IFF its byte offset is within the body length —
+/// `len >= 1` → `AV1ConfigurationVersion` (byte 0), INDEPENDENTLY of byte 2;
+/// `len >= 3` → `ChromaFormat` + `ChromaSamplePosition` (byte 2).
+/// So a 1- or 2-byte truncated `av1C` decodes ONLY `AV1ConfigurationVersion`
+/// (`chroma_*` left `None`), and a 3+-byte body decodes all three (oracle:
+/// crafted 1/2-byte AVIF → version only; 3+-byte → all three). A real record is
+/// always ≥ 4 bytes; the truncated cases are only reached for a crafted box.
+///
+/// Returns `None` only for an EMPTY body (byte 0 absent ⇒ no field emits) — the
+/// caller then leaves any earlier `av1C` config untouched.
+fn decode_av1c(body: &[u8]) -> Option<crate::metadata::Av1Config> {
+  let &b0 = body.first()?;
+  let version = b0 & 0x7f;
+  // byte 2 (`ChromaFormat`/`ChromaSamplePosition`) only when the body reaches it.
+  let (chroma_format, chroma_sample_position) = match body.get(2) {
+    Some(&b2) => (Some((b2 & 0x1c) >> 2), Some(b2 & 0x03)),
+    None => (None, None),
+  };
+  Some(crate::metadata::Av1Config::new(
+    Some(version),
+    chroma_format,
+    chroma_sample_position,
+  ))
 }
 
 /// Emit `File:ImageWidth`/`File:ImageHeight` from this `meta`'s decoded `ipco`
@@ -6370,5 +6468,159 @@ mod tests {
     assert_eq!(m.ihdr_compression(), Some(7));
     // The ihdr block location is recorded too (offset past the 4+4 header).
     assert!(m.ihdr().is_some(), "size-0 ihdr block location recorded");
+  }
+
+  /// Wrap one-or-more `av1C` bodies in a minimal `meta { iprp { ipco { av1C+ } } }`
+  /// so the brand walk decodes them through the real `ipco` property-walk path.
+  fn meta_with_av1c(av1c_bodies: &[&[u8]]) -> Vec<u8> {
+    let mut ipco = Vec::new();
+    for body in av1c_bodies {
+      ipco.extend(box_bytes(b"av1C", body));
+    }
+    let iprp = box_bytes(b"iprp", &box_bytes(b"ipco", &ipco));
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&[0, 0, 0, 0]); // meta version+flags
+    meta.extend(iprp);
+    box_bytes(b"meta", &meta)
+  }
+
+  // A canonical 4-byte `av1C` record: byte0 = 0x81 (marker bit + version 1 ⇒
+  // `& 0x7f` == 1), byte2 = 0x0C ⇒ ChromaFormat `(0x0C & 0x1c) >> 2` == 3
+  // (YUV 4:2:0), ChromaSamplePosition `0x0C & 0x03` == 0 (Unknown). Matches the
+  // crafted-oracle bytes run against bundled ExifTool 13.59.
+  const AV1C_FULL: [u8; 4] = [0x81, 0x00, 0x0C, 0x00];
+
+  #[test]
+  fn decode_av1c_three_bytes_emits_all_three() {
+    // 3-byte body (byte 2 present) ⇒ all three tags, like a real 4-byte record.
+    // Oracle (crafted 3-byte AVIF, bundled 13.59): AV1ConfigurationVersion 1,
+    // ChromaFormat "YUV 4:2:0"/3, ChromaSamplePosition "Unknown"/0.
+    let cfg = decode_av1c(&AV1C_FULL[..3]).expect("3-byte av1C decodes");
+    assert_eq!(cfg.version(), Some(1));
+    assert_eq!(cfg.chroma_format(), Some(3));
+    assert_eq!(cfg.chroma_sample_position(), Some(0));
+  }
+
+  #[test]
+  fn decode_av1c_one_byte_emits_version_only() {
+    // 1-byte body: byte 0 present (AV1ConfigurationVersion) but byte 2 absent, so
+    // ChromaFormat/ChromaSamplePosition do NOT emit — ProcessBinaryData skips a
+    // tag whose offset is past the data length (ExifTool.pm:9963-9964). Oracle
+    // (crafted 1-byte AVIF, bundled 13.59): AV1ConfigurationVersion 1 ONLY.
+    let cfg = decode_av1c(&AV1C_FULL[..1]).expect("1-byte av1C decodes version");
+    assert_eq!(cfg.version(), Some(1));
+    assert_eq!(cfg.chroma_format(), None, "byte 2 absent ⇒ no ChromaFormat");
+    assert_eq!(
+      cfg.chroma_sample_position(),
+      None,
+      "byte 2 absent ⇒ no ChromaSamplePosition"
+    );
+  }
+
+  #[test]
+  fn decode_av1c_two_bytes_emits_version_only() {
+    // 2-byte body: byte 2 still absent ⇒ version only (oracle: crafted 2-byte
+    // AVIF, bundled 13.59 → AV1ConfigurationVersion 1 ONLY).
+    let cfg = decode_av1c(&AV1C_FULL[..2]).expect("2-byte av1C decodes version");
+    assert_eq!(cfg.version(), Some(1));
+    assert_eq!(cfg.chroma_format(), None);
+    assert_eq!(cfg.chroma_sample_position(), None);
+  }
+
+  #[test]
+  fn decode_av1c_empty_body_is_none() {
+    // An empty `av1C` body has no byte 0 ⇒ no field emits ⇒ no record at all.
+    assert!(decode_av1c(&[]).is_none(), "empty av1C ⇒ None");
+  }
+
+  #[test]
+  fn walk_av1c_one_byte_meta_emits_version_only() {
+    // End-to-end through the `ipco` walk: a 1-byte `av1C` populates only the
+    // version field on the shared `HeifMeta`.
+    let blob = meta_with_av1c(&[&AV1C_FULL[..1]]);
+    let mut m = HeifMeta::new();
+    scan_heif_meta(&blob, &mut m);
+    let cfg = m.av1_config().expect("1-byte av1C recorded");
+    assert_eq!(cfg.version(), Some(1));
+    assert_eq!(cfg.chroma_format(), None);
+    assert_eq!(cfg.chroma_sample_position(), None);
+  }
+
+  #[test]
+  fn walk_av1c_three_byte_meta_emits_all_three() {
+    let blob = meta_with_av1c(&[&AV1C_FULL[..3]]);
+    let mut m = HeifMeta::new();
+    scan_heif_meta(&blob, &mut m);
+    let cfg = m.av1_config().expect("3-byte av1C recorded");
+    assert_eq!(cfg.version(), Some(1));
+    assert_eq!(cfg.chroma_format(), Some(3));
+    assert_eq!(cfg.chroma_sample_position(), Some(0));
+  }
+
+  #[test]
+  fn walk_av1c_duplicate_full_then_truncated_is_per_tag_last_wins() {
+    // Two `av1C` boxes in one `ipco`: a full 4-byte record then a 1-byte
+    // truncated one whose byte 0 = 0x82 (version `& 0x7f` == 2). ProcessBinaryData
+    // re-runs per box and FoundTag-overwrites PER TAG, so the second box
+    // overwrites AV1ConfigurationVersion (→ 2) but leaves the first box's
+    // ChromaFormat/ChromaSamplePosition intact. Oracle (crafted dup AVIF,
+    // bundled 13.59): ChromaFormat "YUV 4:2:0"/3, ChromaSamplePosition
+    // "Unknown"/0, AV1ConfigurationVersion 2.
+    let truncated = [0x82u8];
+    let blob = meta_with_av1c(&[&AV1C_FULL, &truncated]);
+    let mut m = HeifMeta::new();
+    scan_heif_meta(&blob, &mut m);
+    let cfg = m.av1_config().expect("duplicate av1C recorded");
+    assert_eq!(
+      cfg.version(),
+      Some(2),
+      "later 1-byte av1C overwrites version"
+    );
+    assert_eq!(
+      cfg.chroma_format(),
+      Some(3),
+      "earlier full av1C ChromaFormat survives a later truncated box"
+    );
+    assert_eq!(
+      cfg.chroma_sample_position(),
+      Some(0),
+      "earlier full av1C ChromaSamplePosition survives"
+    );
+  }
+
+  #[test]
+  fn walk_av1c_duplicate_truncated_then_full_overwrites_all() {
+    // Reverse order: a 1-byte box (version 2) then a full 4-byte box (version 1 +
+    // chroma). The second box contains every tag, so it overwrites all three —
+    // version reverts to 1 and chroma is set (per-tag last-wins, full box last).
+    let truncated = [0x82u8];
+    let blob = meta_with_av1c(&[&truncated, &AV1C_FULL]);
+    let mut m = HeifMeta::new();
+    scan_heif_meta(&blob, &mut m);
+    let cfg = m.av1_config().expect("duplicate av1C recorded");
+    assert_eq!(cfg.version(), Some(1), "later full av1C overwrites version");
+    assert_eq!(cfg.chroma_format(), Some(3));
+    assert_eq!(cfg.chroma_sample_position(), Some(0));
+  }
+
+  #[test]
+  fn walk_av1c_two_meta_boxes_merge_per_tag() {
+    // Two separate `meta` boxes over the SAME `HeifMeta`: meta1 a full av1C,
+    // meta2 a 1-byte truncated av1C (version 2). ExifTool's whole-file FoundTag
+    // is per-tag last-wins regardless of which meta, so the result is meta1's
+    // chroma + meta2's version (the cross-meta merge mirrors the within-ipco one).
+    let truncated = [0x82u8];
+    let mut blob = meta_with_av1c(&[&AV1C_FULL]);
+    blob.extend(meta_with_av1c(&[&truncated]));
+    let mut m = HeifMeta::new();
+    scan_heif_meta(&blob, &mut m);
+    let cfg = m.av1_config().expect("av1C recorded across meta boxes");
+    assert_eq!(cfg.version(), Some(2), "second meta's version wins");
+    assert_eq!(
+      cfg.chroma_format(),
+      Some(3),
+      "first meta's ChromaFormat survives a later truncated meta"
+    );
+    assert_eq!(cfg.chroma_sample_position(), Some(0));
   }
 }

@@ -329,6 +329,107 @@ impl HeifItem {
 }
 
 // ===========================================================================
+// Av1Config — the `av1C` AV1 Codec Configuration record
+// ===========================================================================
+
+/// The decoded `av1C` box (AV1 Codec Configuration Record), faithful to the
+/// `%Image::ExifTool::QuickTime::AV1Config` `ProcessBinaryData` table
+/// (QuickTime.pm:3308-3367). The box is an `ipco` item property whose body is
+/// the raw `AV1CodecConfigurationRecord` (no version/flags fullbox prefix —
+/// `FIRST_ENTRY => 0`, format `int8u`).
+///
+/// SP4 surfaces only the three NON-`Unknown` tags ExifTool emits by default:
+/// `AV1ConfigurationVersion` (byte 0, `Mask 0x7f`), `ChromaFormat` (byte 2,
+/// `Mask 0x1c`), and `ChromaSamplePosition` (byte 2, `Mask 0x03`). The
+/// `Unknown => 1` fields (`SeqProfile`/`SeqLevelIdx0`/`SeqTier0`/`HighBitDepth`/
+/// `TwelveBit`/`InitialDelaySamples`) are not extracted unless `-U`/`Unknown`
+/// is set, which exifast does not surface — so they are not stored. The stored
+/// values are the MASKED-and-BITSHIFTED ints (`($byte & Mask) >> BitShift`,
+/// ExifTool.pm:5916-5921 + :10079), i.e. the keys into the PrintConv maps.
+///
+/// Each field is an [`Option`] tracking PER-FIELD PRESENCE — `ProcessBinaryData`
+/// emits a tag IFF its byte offset is within the data length (ExifTool.pm:
+/// 9963-9964: `my $more = $size - $entry; last if $more <= 0`). So a truncated
+/// `av1C` whose body stops short of byte 2 emits only `AV1ConfigurationVersion`
+/// (byte 0), leaving `chroma_format`/`chroma_sample_position` `None`. A real
+/// record is ≥ 4 bytes and populates all three; the `Option`s only diverge for a
+/// crafted/truncated box. Duplicate `av1C` boxes merge PER TAG via [`Self::merge`]
+/// — a later truncated box overwrites only the fields it contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Av1Config {
+  version: Option<u8>,
+  chroma_format: Option<u8>,
+  chroma_sample_position: Option<u8>,
+}
+
+impl Av1Config {
+  /// Construct an `Av1Config` from the per-field masked/bitshifted values, each
+  /// `Some` only when its source byte was present in the `av1C` body.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(
+    version: Option<u8>,
+    chroma_format: Option<u8>,
+    chroma_sample_position: Option<u8>,
+  ) -> Self {
+    Self {
+      version,
+      chroma_format,
+      chroma_sample_position,
+    }
+  }
+
+  /// `AV1ConfigurationVersion` — byte 0 `& 0x7f` (QuickTime.pm:3312-3315). No
+  /// PrintConv ⇒ a bare int in both modes. `None` when byte 0 was absent (an
+  /// empty `av1C` body).
+  #[must_use]
+  #[inline(always)]
+  pub const fn version(&self) -> Option<u8> {
+    self.version
+  }
+
+  /// `ChromaFormat` — `(byte 2 & 0x1c) >> 2` (QuickTime.pm:3341-3351); the
+  /// PrintConv key (`0`/`2`/`3`/`7` ⇒ the YUV / Monochrome label). `None` when
+  /// the body stopped short of byte 2 (a 1- or 2-byte truncated `av1C`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn chroma_format(&self) -> Option<u8> {
+    self.chroma_format
+  }
+
+  /// `ChromaSamplePosition` — byte 2 `& 0x03` (QuickTime.pm:3352-3361); the
+  /// PrintConv key (`0`/`1`/`2`/`3` ⇒ Unknown / Vertical / Colocated /
+  /// (reserved)). `None` when the body stopped short of byte 2.
+  #[must_use]
+  #[inline(always)]
+  pub const fn chroma_sample_position(&self) -> Option<u8> {
+    self.chroma_sample_position
+  }
+
+  /// Merge a later `av1C`'s fields into this one with PER-TAG last-wins, matching
+  /// `ProcessBinaryData`: re-running the `AV1Config` table on a second `av1C`
+  /// FoundTag-overwrites each tag the second box CONTAINS, but a tag the second
+  /// box lacks (truncated past its byte offset) keeps the earlier value. So a
+  /// later 1-byte `av1C` overwrites `AV1ConfigurationVersion` only, leaving an
+  /// earlier `ChromaFormat`/`ChromaSamplePosition` intact (oracle: full 4-byte
+  /// then 1-byte `av1C` → `ChromaFormat` from the first, `AV1ConfigurationVersion`
+  /// from the second). Each present (`Some`) field of `next` replaces this
+  /// field's value; an absent (`None`) field of `next` leaves this one unchanged.
+  #[inline]
+  pub const fn merge(&mut self, next: Self) {
+    if next.version.is_some() {
+      self.version = next.version;
+    }
+    if next.chroma_format.is_some() {
+      self.chroma_format = next.chroma_format;
+    }
+    if next.chroma_sample_position.is_some() {
+      self.chroma_sample_position = next.chroma_sample_position;
+    }
+  }
+}
+
+// ===========================================================================
 // HeifMeta — the full HEIF meta-box parse
 // ===========================================================================
 
@@ -374,6 +475,14 @@ pub struct HeifMeta {
   image_width: Option<u32>,
   /// `File:ImageHeight` from the same main-document `ispe` (#146).
   image_height: Option<u32>,
+  /// The decoded `av1C` (AV1 Codec Configuration) box from `ipco`
+  /// (QuickTime.pm:3079-3082 → the `AV1Config` table). `None` for a non-AVIF
+  /// `meta` box (or one without an `av1C` property). Duplicate `av1C` boxes
+  /// resolve PER TAG — ExifTool walks every `ipco` child positionally and
+  /// re-runs the `AV1Config` ProcessBinaryData per `av1C` box, each FoundTag
+  /// overwriting only the tags THAT box contains (last-wins per tag, see
+  /// [`Av1Config::merge`]). A real AVIF carries exactly one. #149.
+  av1_config: Option<Av1Config>,
   warning: Option<String>,
   /// The absolute file offset of the `meta` box whose walk produced
   /// [`Self::warning`] — recorded first-wins alongside the warning so the
@@ -398,6 +507,7 @@ impl HeifMeta {
       idat_length: None,
       image_width: None,
       image_height: None,
+      av1_config: None,
       warning: None,
       warning_offset: None,
     }
@@ -449,6 +559,14 @@ impl HeifMeta {
   #[inline(always)]
   pub const fn image_height(&self) -> Option<u32> {
     self.image_height
+  }
+
+  /// The decoded `av1C` AV1 Codec Configuration (#149). `None` for a non-AVIF
+  /// `meta` box (no `av1C` property).
+  #[must_use]
+  #[inline(always)]
+  pub const fn av1_config(&self) -> Option<Av1Config> {
+    self.av1_config
   }
 
   /// First non-fatal warning surfaced during the meta-box walk
@@ -579,6 +697,14 @@ impl HeifMeta {
   #[inline(always)]
   pub const fn set_image_height(&mut self, v: Option<u32>) -> &mut Self {
     self.image_height = v;
+    self
+  }
+
+  /// Setter (`av1C` AV1 Codec Configuration — last-wins per `ipco` walk order,
+  /// #149).
+  #[inline(always)]
+  pub const fn set_av1_config(&mut self, v: Option<Av1Config>) -> &mut Self {
+    self.av1_config = v;
     self
   }
 
