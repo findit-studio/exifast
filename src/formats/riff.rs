@@ -95,12 +95,22 @@
 //!   (RIFF.pm:2173-2181) skips ahead but never increments `DOC_NUM` here
 //!   (we only emit one stream's worth; sub-document handling is a
 //!   forward item, exifast-phase2-forward-items.md).
-//! - **Vendor JUNK variants.** `OlympusJunk`/`CasioJunk`/`RicohJunk`/
-//!   `PentaxJunk`/`PentaxJunk2`/`LucasJunk` (RIFF.pm:442-492) all
-//!   route into other tag tables (Olympus/Casio/Pentax/Lucas — separate
-//!   ports). The `TextJunk` ASCII-only fallback is also deferred (we
-//!   skip JUNK entirely). Their absence is invisible on the bundled
-//!   `RIFF.avi` fixture (it has no JUNK chunks with metadata).
+//! - **Vendor JUNK variants (PARTIALLY PORTED, #154).** The `%Main` `JUNK`
+//!   Condition list (RIFF.pm:442-492) is dispatched in [`Walker::dispatch_junk`].
+//!   PORTED: `PentaxJunk` (`^IIII\x01\0` → `%Pentax::Junk`, one `Model`
+//!   `string[32]`) + `PentaxJunk2` (`^PENTDigital Camera` → `%Pentax::Junk2`,
+//!   Make/Model/FNumber/DateTime1/DateTime2 + thumbnail dims) — both emit under
+//!   `MakerNotes:Pentax:*`; and `TextJunk` (the ASCII-only RawConv fallback →
+//!   `RIFF:TextJunk`). Still DEFERRED (vendor subsystems / need a real sample):
+//!   `OlympusJunk` (`%Olympus::AVI` — a 332-entry `%olympusCameraTypes`
+//!   PrintConv + `ThumbInfo` SubDirectory), `CasioJunk` (`%Exif::Main` IFD0
+//!   `Start=>10`/BigEndian — the embedded-EXIF offset/Base mechanics need a real
+//!   Casio EX-S600 AVI), `RicohJunk` (`%Ricoh::AVI` sub-chunk processor + a
+//!   `%Ricoh::Main` MakerNote), `LucasJunk` (`%QuickTime::Stream` via
+//!   `ProcessLucas`, a timed-metadata subsystem), and the `PentaxJunk2`
+//!   `ThumbnailImage` binary leaf (`ValidateImage`). The bundled `RIFF.avi`
+//!   fixture has no JUNK chunk, so the ported subset only fires for the crafted
+//!   `AVI_textjunk`/`AVI_pentaxjunk`/`AVI_pentaxjunk2` fixtures.
 //! - **`LIST_ncdt` / `LIST_hydt` / `LIST_pntx`.** Nikon/Pentax AVI maker
 //!   notes; depend on Nikon/Pentax module ports (separate Phase-2 items).
 //! - **`StreamData` Camera AVIF/CASI.** RIFF.pm:1250-1276 — Canon AVIF
@@ -406,6 +416,25 @@ enum WebpMetaChunk<'a> {
   },
 }
 
+/// Which Pentax `%Main` JUNK SubDirectory matched the `JUNK` chunk's leading
+/// signature (RIFF.pm:469-478). Both are `ProcessBinaryData` camera tables
+/// emitting under family-0 `MakerNotes`, family-1 `Pentax`
+/// (`Pentax.pm:6409-6418` / `:6610-6658`). The matched payload is captured for
+/// the emit-time decode (`tags()`), mirroring the `pentax_makernote` re-dispatch
+/// — the field offsets/formats are tiny fixed binary-data leaves, so the
+/// variant alone selects the right offset map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PentaxJunkVariant {
+  /// `PentaxJunk` — Optio RS1000 (`$$valPt =~ /^IIII\x01\0/`,
+  /// `%Pentax::Junk`, RIFF.pm:469-473). A single `Model` `string[32]` at 0x0c.
+  Junk,
+  /// `PentaxJunk2` — Optio RZ18 (`$$valPt =~ /^PENTDigital Camera/`,
+  /// `%Pentax::Junk2`, RIFF.pm:474-478). `Make`/`Model`/`FNumber`/`DateTime1`/
+  /// `DateTime2` (+ the thumbnail leaves at 0x12b+, captured-but-out-of-range
+  /// for a minimal chunk).
+  Junk2,
+}
+
 /// Typed RIFF metadata — the lib-first output of [`ProcessRiff`].
 ///
 /// D8 convention: no public fields; accessors only.
@@ -471,6 +500,15 @@ pub struct RiffMeta<'a> {
   /// WEBP gets its `webp` extension from the `%fileTypeExt` default, not this
   /// flag.
   webp_ext_override: bool,
+  /// `Some((variant, payload))` when a `JUNK` chunk matched a Pentax vendor
+  /// SubDirectory signature (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478). The
+  /// payload is a sub-slice BORROWED from the input (zero-copy); decoded at
+  /// emit time through the variant's tiny `ProcessBinaryData` offset map and
+  /// emitted under family-0 `MakerNotes`, family-1 `Pentax`. The FIRST matching
+  /// `JUNK` wins (a single vendor JUNK per file in practice). `None` for a
+  /// `JUNK` chunk that matched no vendor signature or the `TextJunk` fallback
+  /// (#154).
+  pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
 }
 
 impl Default for RiffMeta<'_> {
@@ -486,6 +524,7 @@ impl Default for RiffMeta<'_> {
       pentax_makernote: None,
       webp_meta: Vec::new(),
       webp_ext_override: false,
+      pentax_junk: None,
     }
   }
 }
@@ -660,6 +699,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     webp_file_type_override: None,
     webp_ext_override: false,
     webp_meta: Vec::new(),
+    pentax_junk: None,
   };
 
   // RIFF.pm:2058: `my $riffEnd = Get32u(\$buff, 4) + 8; $riffEnd += $riffEnd & 0x01;`
@@ -690,6 +730,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     pentax_makernote: walker.pentax_makernote,
     webp_meta: walker.webp_meta,
     webp_ext_override,
+    pentax_junk: walker.pentax_junk,
   })
 }
 
@@ -757,6 +798,11 @@ struct Walker<'a> {
   /// through [`crate::exif::parse_exif_block`] / [`crate::formats::xmp::parse_borrowed`].
   /// Empty until a metadata chunk is seen.
   webp_meta: Vec<WebpMetaChunk<'a>>,
+  /// The matched Pentax vendor `JUNK` SubDirectory (`PentaxJunk`/`PentaxJunk2`,
+  /// RIFF.pm:469-478) and its borrowed payload. The FIRST matching `JUNK` wins
+  /// (the conditions are mutually exclusive on the leading signature anyway).
+  /// `None` until such a `JUNK` is seen (#154).
+  pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
 }
 
 impl<'a> Walker<'a> {
@@ -1051,9 +1097,18 @@ impl<'a> Walker<'a> {
         b"ICCP" => {}
         // Skip image-data / index chunks (RIFF.pm:2148-2150).
         b"data" | b"idx1" => {}
-        // JUNK (vendor maker-note variants + TextJunk fallback) — all
-        // deferred (see module doc).
-        b"JUNK" | b"JUNQ" => {}
+        // JUNK — the `%Main` `JUNK` Condition list (RIFF.pm:442-492). The
+        // ported subset: `PentaxJunk`/`PentaxJunk2` (captured for the emit-time
+        // `MakerNotes:Pentax:*` decode) and the `TextJunk` ASCII fallback
+        // (emitted as `RIFF:TextJunk`). The remaining vendor variants
+        // (`OlympusJunk`/`CasioJunk`/`RicohJunk`/`LucasJunk`) route into
+        // separate vendor subsystems and are still deferred — see
+        // [`Walker::dispatch_junk`] / the module doc.
+        b"JUNK" => self.dispatch_junk(body),
+        // JUNQ — `%Main` `OldXMP` (`Binary => 1`, RIFF.pm:498-502), a SEPARATE
+        // tag from the JUNK Condition list (it is NOT a `JUNK` variant). The
+        // Adobe Bridge old-XMP backup; deferred (no XMP-block re-dispatch here).
+        b"JUNQ" => {}
         // Top-level XMP / SEAL / C2PA / etc. — deferred.
         _ => {
           // Unrecognized outer chunk — skip silently.
@@ -1249,6 +1304,111 @@ impl<'a> Walker<'a> {
       p += len + (len & 1);
     }
   }
+
+  /// Dispatch a `JUNK` chunk through the `%Main` `JUNK` Condition list
+  /// (RIFF.pm:442-492). The list is tried IN ORDER; the FIRST matching
+  /// `$$valPt` signature wins (the bundled `HandleTag` array-of-conditions
+  /// semantics). Ported subset:
+  /// - `PentaxJunk`  — `^IIII\x01\0`        → captured (`MakerNotes:Pentax:*`).
+  /// - `PentaxJunk2` — `^PENTDigital Camera` → captured (`MakerNotes:Pentax:*`).
+  /// - `TextJunk`    — RawConv ASCII fallback → `RIFF:TextJunk`.
+  ///
+  /// Still-deferred vendor variants whose signatures are checked here ONLY so a
+  /// matching chunk is NOT mis-emitted as `TextJunk` (they route into separate
+  /// vendor subsystems / need a real sample — #154):
+  /// - `OlympusJunk` — `^OLYMDigital Camera`  → `%Olympus::AVI` (a 332-entry
+  ///   `%olympusCameraTypes` PrintConv + a `ThumbInfo` SubDirectory).
+  /// - `CasioJunk`   — `^QVMI`                → `%Exif::Main` IFD0 (`Start=>10`,
+  ///   BigEndian) — the embedded-EXIF `Start`/`Base` offset mechanics need a
+  ///   real Casio EX-S600 AVI to pin byte-exact.
+  /// - `RicohJunk`   — `^ucmt`                → `%Ricoh::AVI` sub-chunk
+  ///   processor (`ucmt`/`mnrt`/`rdc2`/`thum`, incl. a `%Ricoh::Main` MakerNote).
+  /// - `LucasJunk`   — `^0G(DA|PS)`           → `%QuickTime::Stream` via
+  ///   `ProcessLucas` (a timed-metadata subsystem).
+  ///
+  /// `body` is the full `JUNK` chunk payload (already bounds-checked by the
+  /// caller). The first matching Pentax `JUNK` is captured (zero-copy borrow);
+  /// the `TextJunk` value is decoded + pushed immediately.
+  fn dispatch_junk(&mut self, body: &'a [u8]) {
+    // RIFF.pm:445 `OlympusJunk` `^OLYMDigital Camera` — deferred (subsystem).
+    if body.starts_with(b"OLYMDigital Camera") {
+      return;
+    }
+    // RIFF.pm:450 `CasioJunk` `^QVMI` — deferred (needs a real sample).
+    if body.starts_with(b"QVMI") {
+      return;
+    }
+    // RIFF.pm:463 `RicohJunk` `^ucmt` — deferred (subsystem).
+    if body.starts_with(b"ucmt") {
+      return;
+    }
+    // RIFF.pm:471 `PentaxJunk` `^IIII\x01\0` — Optio RS1000.
+    if body.starts_with(b"IIII\x01\x00") {
+      if self.pentax_junk.is_none() {
+        self.pentax_junk = Some((PentaxJunkVariant::Junk, body));
+      }
+      return;
+    }
+    // RIFF.pm:476 `PentaxJunk2` `^PENTDigital Camera` — Optio RZ18.
+    if body.starts_with(b"PENTDigital Camera") {
+      if self.pentax_junk.is_none() {
+        self.pentax_junk = Some((PentaxJunkVariant::Junk2, body));
+      }
+      return;
+    }
+    // RIFF.pm:481 `LucasJunk` `^0G(DA|PS)` — Lucas LK-7900 Ace; deferred.
+    if body.starts_with(b"0GDA") || body.starts_with(b"0GPS") {
+      return;
+    }
+    // RIFF.pm:488 `TextJunk` — the ASCII fallback. RawConv
+    // `$val =~ /^([^\0-\x1f\x7f-\xff]+)\0*$/ ? $1 : undef`: a NON-EMPTY leading
+    // run of printable bytes (0x20-0x7e — neither a control 0x00-0x1f nor a
+    // high byte 0x7f-0xff), followed ONLY by NUL padding to the end. On a match
+    // the captured `$1` (the printable run) becomes `RIFF:TextJunk`; otherwise
+    // the tag is dropped (undef).
+    if let Some(text) = text_junk_raw_conv(body) {
+      self.entries.push(RiffEntry::new(
+        "RIFF",
+        "TextJunk",
+        RiffValue::Str(text.into()),
+      ));
+    }
+  }
+}
+
+/// `TextJunk` RawConv (RIFF.pm:490):
+/// `$val =~ /^([^\0-\x1f\x7f-\xff]+)\0*$/ ? $1 : undef`.
+///
+/// Returns `Some($1)` — the leading run of printable bytes (0x20-0x7e) — iff the
+/// WHOLE value is that non-empty run followed only by trailing NULs; otherwise
+/// `None` (the tag is dropped). The match is start- AND end-anchored, so ANY
+/// byte that is neither printable nor a trailing NUL (e.g. a control byte, a
+/// high byte, or a NUL with a printable byte after it) fails the whole match.
+/// The captured run is pure 0x20-0x7e, so it is valid UTF-8 (a [`SmolStr`] is
+/// built directly).
+#[cfg(feature = "alloc")]
+fn text_junk_raw_conv(body: &[u8]) -> Option<SmolStr> {
+  // `[^\0-\x1f\x7f-\xff]+` — the leading printable run (bytes 0x20..=0x7e).
+  let printable_end = body
+    .iter()
+    .position(|&b| !(0x20..=0x7e).contains(&b))
+    .unwrap_or(body.len());
+  // `+` ⇒ the run must be non-empty.
+  if printable_end == 0 {
+    return None;
+  }
+  // `\0*$` — every remaining byte must be a NUL (the run is end-anchored).
+  if !body
+    .get(printable_end..)
+    .is_some_and(|tail| tail.iter().all(|&b| b == 0))
+  {
+    return None;
+  }
+  // `$1` — the printable run (guaranteed 0x20..=0x7e ⇒ valid UTF-8/ASCII).
+  body
+    .get(..printable_end)
+    .and_then(|run| core::str::from_utf8(run).ok())
+    .map(SmolStr::new)
 }
 
 // ===========================================================================
@@ -1615,15 +1775,30 @@ fn emit_audio_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
 }
 
 /// Read a fixed-width `string[N]` field at byte `off` (faithful to ExifTool's
-/// `ReadValue($_, 'string', N)` — exactly `N` bytes, trailing NULs trimmed,
-/// invalid UTF-8 rendered as `?` per the JSON FixUTF8 step). Returns `None`
-/// when the window runs past the chunk (a short read ⇒ no emission, matching
-/// `ProcessBinaryData`'s skip of an out-of-range entry).
+/// `ReadValue($_, 'string', N)` — exactly `N` bytes). ExifTool's `string` format
+/// TRUNCATES at the first NUL (`$val =~ s/\0.*//s if $format eq 'string'`,
+/// `ExifTool.pm:6311`, `:10038`), so an EMBEDDED NUL ends the value — the bytes
+/// after it are dropped, NOT retained. Invalid UTF-8 is rendered as `?` per the
+/// JSON FixUTF8 step. Returns `None` when the window runs past the chunk (a short
+/// read ⇒ no emission, matching `ProcessBinaryData`'s skip of an out-of-range
+/// entry).
+///
+/// Every caller is a genuine ExifTool `string[N]` field (bext `Description`/
+/// `Originator`/`OriginatorReference`/`DateTimeOriginal`/`CodingHistory`,
+/// `%Pentax::Junk*` `Make`/`Model`/`DateTime1`/`DateTime2`), so the first-NUL
+/// truncation is correct for all of them. The `undef[N]` fields (`BWF_UMID`)
+/// take their own ValueConv path, NOT this helper.
 #[cfg(feature = "alloc")]
 fn string_field(payload: &[u8], off: usize, len: usize) -> Option<String> {
-  payload
-    .get(off..off.saturating_add(len))
-    .map(string_trim_nulls)
+  payload.get(off..off.saturating_add(len)).map(|window| {
+    // `string` format: end the value at the first NUL (the C-string terminator),
+    // then FixUTF8 (`string_trim_nulls`'s trailing-NUL trim is then a no-op). The
+    // `..end` index is `position`-bounded (`< window.len()`) or the full length,
+    // so `get` always succeeds; the panic-free `get` keeps `indexing_slicing`
+    // clean.
+    let end = window.iter().position(|&b| b == 0).unwrap_or(window.len());
+    string_trim_nulls(window.get(..end).unwrap_or(window))
+  })
 }
 
 /// `bext` BroadcastExtension (RIFF.pm:712-759) — the Broadcast Audio Extension
@@ -3229,6 +3404,16 @@ impl crate::emit::Taggable for RiffMeta<'_> {
         ));
       }
     }
+    // Pentax vendor `JUNK` (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478): decode
+    // the captured payload through the variant's tiny `ProcessBinaryData` offset
+    // map (`%Pentax::Junk` / `%Pentax::Junk2`, `Pentax.pm:6409` / `:6610`) and
+    // emit each leaf under family-0 `MakerNotes`, family-1 `Pentax` (the table
+    // `GROUPS` — `exiftool -G1 -j` emits `Pentax:Model` etc.). Mode-aware so the
+    // `FNumber` `%.1f` PrintConv applies only under `-j`.
+    #[cfg(feature = "alloc")]
+    if let Some((variant, payload)) = self.pentax_junk {
+      emit_pentax_junk(variant, payload, print_conv, &mut tags);
+    }
     // WEBP embedded EXIF/XMP (`EXIF`/`Exif` + `XMP `/`XMP\0` chunks,
     // RIFF.pm:557-587): replay EVERY captured chunk in WALK ORDER. Each EXIF
     // chunk's TIFF block is re-walked through the shared `ProcessTIFF` parser
@@ -3336,6 +3521,203 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
   // never override the `VP8X` canvas `ImageWidth`/`ImageHeight` (RIFF.pm:1301/
   // 1312/1329/1340); every other RIFF tag keeps the default `Priority => 1`.
   EmittedTag::new_with_priority(g(), name.into(), value, false, entry.priority())
+}
+
+/// Decode + emit a Pentax vendor `JUNK` payload (`PentaxJunk`/`PentaxJunk2`,
+/// RIFF.pm:469-478 → `%Pentax::Junk` / `%Pentax::Junk2`, `Pentax.pm:6409-6418` /
+/// `:6610-6658`). Both are `ProcessBinaryData` tables under family-0
+/// `MakerNotes`, family-1 `Pentax`; each fixed-offset leaf emits independently
+/// iff its window is in range (`ProcessBinaryData` skips an out-of-range entry).
+///
+/// `FNumber` is a `rational64u` (two LE `int32u`: numerator, denominator) decoded
+/// by [`pentax_fnumber_value`] — the `sprintf("%.1f",$val)` PrintConv under `-j`
+/// (a bare JSON number, `.0` preserved), the raw quotient / `"inf"`/`"undef"` word
+/// under `-n`, with a zero denominator EMITTED (not suppressed) so the derived
+/// `Composite:Aperture` follows.
+/// `ThumbnailImage` (`PentaxJunk2` 0x133, `undef[$val{0x12f}]` + `ValidateImage`)
+/// is the lone DEFERRED leaf (the binary preview needs the `ValidateImage`/
+/// Composite-preview path); its dimension siblings (`ThumbnailWidth`/`Height`/
+/// `Length`) are plain ints and ARE emitted when in range.
+#[cfg(feature = "alloc")]
+fn emit_pentax_junk(
+  variant: PentaxJunkVariant,
+  payload: &[u8],
+  print_conv: bool,
+  tags: &mut Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+
+  // Family-0 `MakerNotes`, family-1 `Pentax` (the `%Pentax::Junk*` `GROUPS`).
+  // A free helper (not a `tags`-capturing closure) keeps each push an
+  // independent `&mut` borrow.
+  fn push_str(
+    tags: &mut Vec<EmittedTag>,
+    payload: &[u8],
+    name: &'static str,
+    off: usize,
+    len: usize,
+  ) {
+    if let Some(s) = string_field(payload, off, len) {
+      tags.push(EmittedTag::new(
+        Group::new("MakerNotes", "Pentax"),
+        name.into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
+    }
+  }
+  let group = || Group::new("MakerNotes", "Pentax");
+
+  match variant {
+    // `%Pentax::Junk` (`Pentax.pm:6409-6418`): one `Model` `string[32]` @ 0x0c.
+    PentaxJunkVariant::Junk => {
+      push_str(tags, payload, "Model", 0x0c, 32);
+    }
+    // `%Pentax::Junk2` (`Pentax.pm:6610-6658`).
+    PentaxJunkVariant::Junk2 => {
+      // 0x12 Make string[24]; 0x2c Model string[24].
+      push_str(tags, payload, "Make", 0x12, 24);
+      push_str(tags, payload, "Model", 0x2c, 24);
+      // 0x5e FNumber rational64u, PrintConv `sprintf("%.1f",$val)`.
+      if let Some(window) = payload.get(0x5e..0x5e + 8) {
+        let num = le_u32_at(window, 0);
+        let denom = le_u32_at(window, 4);
+        if let Some(value) = pentax_fnumber_value(num, denom, print_conv) {
+          tags.push(EmittedTag::new(group(), "FNumber".into(), value, false));
+        }
+      }
+      // 0x83 DateTime1 string[24]; 0x9d DateTime2 string[24].
+      push_str(tags, payload, "DateTime1", 0x83, 24);
+      push_str(tags, payload, "DateTime2", 0x9d, 24);
+      // 0x12b ThumbnailWidth int16u; 0x12d ThumbnailHeight int16u;
+      // 0x12f ThumbnailLength int32u (the dimension siblings of the deferred
+      // 0x133 `ThumbnailImage`). Each emits iff its window is in range.
+      if let Some(w) = payload.get(0x12b..0x12b + 2) {
+        tags.push(EmittedTag::new(
+          group(),
+          "ThumbnailWidth".into(),
+          TagValue::U64(u64::from(le_u16_at(w, 0))),
+          false,
+        ));
+      }
+      if let Some(h) = payload.get(0x12d..0x12d + 2) {
+        tags.push(EmittedTag::new(
+          group(),
+          "ThumbnailHeight".into(),
+          TagValue::U64(u64::from(le_u16_at(h, 0))),
+          false,
+        ));
+      }
+      if let Some(l) = payload.get(0x12f..0x12f + 4) {
+        tags.push(EmittedTag::new(
+          group(),
+          "ThumbnailLength".into(),
+          TagValue::U64(u64::from(le_u32_at(l, 0))),
+          false,
+        ));
+      }
+      // 0x133 ThumbnailImage `undef[$val{0x12f}]` + `ValidateImage` — DEFERRED
+      // (the binary preview / `ValidateImage` path; out of range for a minimal
+      // chunk anyway).
+    }
+  }
+}
+
+/// `%Pentax::Junk2` `FNumber` (`rational64u`, `PrintConv => 'sprintf("%.1f",$val)'`,
+/// `Pentax.pm:6633-6636`) as the [`TagValue`](crate::value::TagValue) for `mode`.
+///
+/// `$val` is ExifTool's `ReadValue` of the `rational64u` — the
+/// `RoundFloat(num/denom, 10)` quotient for a nonzero denominator, or the bare
+/// word `"inf"` (numerator ≠ 0) / `"undef"` (`0/0`) for a zero denominator
+/// (`ExifTool.pm` `GetRational64u`). Shared with [`crate::value::Rational`] via
+/// `exiftool_val_str` so the `$val` text is identical to every other rational.
+///
+/// * `-n` (`print_conv == false`) → the `$val` LEXEME ITSELF, emitted as a
+///   [`Str`](crate::value::TagValue::Str): the exact `RoundFloat(num/denom, 10)`
+///   token for a nonzero denominator, or the bare word `"inf"`/`"undef"` for a
+///   zero one. The token is an `escape_json_is_number` string, so the production
+///   JSON renderer writes it BARE, byte-for-byte (`4/1` → `4`, `4000000001/4` →
+///   `1000000000`, `225/100` → `2.25`, `1/3` → `0.3333333333`, `28/10` → `2.8`,
+///   AND exponent-form `1/100000` → `1e-05`, `1/30000` → `3.333333333e-05`),
+///   while `"inf"`/`"undef"` fail the gate and stay QUOTED. Emitting the LEXEME
+///   (not a float the serializer re-renders) preserves every case with NO
+///   round-trip — a `serialize_f64`/Ryū re-render of a scientific-notation `$val`
+///   diverges (`1e-05` → `0.00001`, `1e-06` → `1e-6`). This is ALSO the value
+///   `Composite:Aperture` selects as its operand (the composite resolves `$val[i]`
+///   from the ValueConv view): the numeric-string FNumber is Perl-truthy, selected
+///   verbatim, and `PrintFNumber` formats it under `-j` (`4` → `4.0`, `0.3333333333`
+///   → `0.33`, `1e-05` → `0.00`) / passes it through under `-n`; a zero-denominator
+///   FNumber carries the literal `"inf"`/`"undef"` through unchanged.
+/// * `-j` (`print_conv == true`) → `sprintf("%.1f",$val)` as a
+///   [`Str`](crate::value::TagValue::Str): `format!("{:.1}")` of the RoundFloat'd
+///   `$val` (Rust's `{:.1}` is round-HALF-EVEN, byte-identical to Perl's `%.1f` —
+///   `225/100` → `"2.2"`, `235/100` → `"2.4"`, `1/3` → `"0.3"`), rendered as a BARE
+///   JSON number by the EscapeJSON gate (`4/1` → `4.0`, `.0` PRESERVED). A
+///   zero-denominator `$val`
+///   numifies through Perl's `%.1f`: `"inf"` → `Inf` → `sprintf("%.1f",Inf)` =
+///   `"Inf"` (titlecase, QUOTED, NOT a number); `"undef"` → numeric `0` →
+///   `sprintf("%.1f",0)` = `"0.0"` (a bare JSON `0.0`).
+///
+/// Never returns `None` for an in-range window — a zero-denominator rational is
+/// EMITTED (the `"inf"`/`"undef"`/`"Inf"`/`"0.0"` forms), NOT suppressed, matching
+/// bundled (which emits `Pentax:FNumber` + the derived `Composite:Aperture` for a
+/// degenerate rational). `None` is reserved for a future ValueConv that drops a
+/// value, keeping the call site uniform with the other leaves.
+#[cfg(feature = "alloc")]
+fn pentax_fnumber_value(num: u32, denom: u32, print_conv: bool) -> Option<crate::value::TagValue> {
+  use crate::value::{Rational, TagValue};
+  // The ExifTool `$val` text (`RoundFloat(n/d, 10)` quotient, or `"inf"`/`"undef"`).
+  let rat = Rational::rational64(i64::from(num), i64::from(denom));
+  if denom == 0 {
+    // `$val` is the bare word `"inf"`/`"undef"` (`exiftool_val_str`).
+    let word = rat.exiftool_val_str();
+    return Some(if print_conv {
+      // `sprintf("%.1f",$val)`: Perl numifies the word — `"inf"` → `Inf` →
+      // `"Inf"` (titlecase), `"undef"` → `0` → `"0.0"`.
+      TagValue::Str(if num != 0 { "Inf".into() } else { "0.0".into() })
+    } else {
+      // The raw `$val` word, rendered as a quoted JSON string.
+      TagValue::Str(word.into())
+    });
+  }
+  // ExifTool's `$val` for a `rational64u` is `RoundFloat(num/denom, 10)` — the
+  // quotient rounded to 10 significant figures (`exiftool_val_str` = `format_g(_,
+  // 10)`) — applied BEFORE both the `%.1f` PrintConv AND the `-n`/Composite
+  // ValueConv view. This `$val` STRING (ExifTool's exact `ReadValue` token) is the
+  // SINGLE source of truth for both views; deriving either from a re-rendered f64
+  // loses the token (`format_g(_, 10)` emits scientific notation at exponent < -4
+  // with a 2-digit exponent — a tiny `1/100000` is `$val` `1e-05`, but a
+  // `serialize_f64` round-trip is `0.00001`; `1/1000000` is `1e-06` but Ryū is
+  // `1e-6`; `4000000001/4` raw `1000000000.25` rounds to `1000000000`; `1/3` raw
+  // 15-digit rounds to `0.3333333333`).
+  let val = rat.exiftool_val_str();
+  Some(if print_conv {
+    // `sprintf("%.1f",$val)` of the RoundFloat'd value. Numify the `$val` token to
+    // the f64 it denotes, then `format!("{:.1}")` (round-HALF-EVEN, matching Perl's
+    // `%.1f`); the resulting numeric string (`"4.0"`/`"2.2"`/`"1000000000.0"`/
+    // `"0.3"`, and `"0.0"` for a tiny exponent value like `1e-05`) renders as a
+    // BARE JSON number through the serializer's EscapeJSON gate, `.0` preserved.
+    let rounded: f64 = val
+      .parse()
+      .unwrap_or_else(|_| f64::from(num) / f64::from(denom));
+    TagValue::Str(std::format!("{rounded:.1}").into())
+  } else {
+    // `-n` / the `Composite:Aperture` ValueConv operand: emit the `$val` LEXEME
+    // DIRECTLY (the exact `RoundFloat(num/denom, 10)` token), NOT a float that the
+    // serializer re-renders. The token is an `escape_json_is_number` string, so the
+    // production JSON renderer (`JsonTagValue` → `RawValue`) writes it BARE,
+    // byte-for-byte — preserving every case with no round-trip: WHOLE (`4/1` → `4`,
+    // `4000000001/4` → `1000000000`), FRACTIONAL (`225/100` → `2.25`, `1/3` →
+    // `0.3333333333`, real `28/10` → `2.8`), and EXPONENT-form (`1/100000` →
+    // `1e-05`, `1/30000` → `3.333333333e-05`) — exactly bundled's `-n` token, which
+    // a `serialize_f64`/Ryū round-trip of the same value would diverge from. As the
+    // `Composite:Aperture` operand it is Perl-truthy (a nonzero numeric string),
+    // selected verbatim (`selected_scalar`), and rendered by `PrintFNumber` under
+    // `-j` (the `Str` is IsFloat-classified: `4` → `4.0`, `1e-05` → `0.00`) /
+    // passed through under `-n` (the bare lexeme).
+    TagValue::Str(val.into())
+  })
 }
 
 /// PrintConv for `Str`-typed values. `RIFF:StreamType` maps the FourCC to a
@@ -4340,6 +4722,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
+      pentax_junk: None,
     };
     walker.process_chunks_strl(&body);
     assert_eq!(walker.streams.len(), 1, "one strl → one stream record");
@@ -4376,6 +4759,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
+      pentax_junk: None,
     };
     walker.process_chunks_strl(&body);
     assert_eq!(walker.streams.len(), 1);
@@ -4776,6 +5160,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
+      pentax_junk: None,
     };
     walker.process_chunks_hydt(&body);
     let captured = walker
@@ -4855,6 +5240,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
+      pentax_junk: None,
     };
     walker.walk_top();
     assert_eq!(

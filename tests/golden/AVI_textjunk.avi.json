@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "AVI_textjunk.avi",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "AVI",
+  "File:FileTypeExtension": "avi",
+  "File:MIMEType": "video/x-msvideo",
+  "RIFF:FrameRate": 24,
+  "RIFF:MaxDataRate": "0 kB/s",
+  "RIFF:FrameCount": 10,
+  "RIFF:StreamCount": 1,
+  "RIFF:ImageWidth": 320,
+  "RIFF:ImageHeight": 240,
+  "RIFF:TextJunk": "Hello RIFF Junk Text",
+  "Composite:ImageSize": "320x240",
+  "Composite:Megapixels": 0.077,
+  "Composite:Duration": "0.42 s"
+}]

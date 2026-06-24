@@ -1371,7 +1371,14 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// PNG IEND chunk` warning; exifast now emits all of them, so a PLAIN compare
 /// (no `FIXTURE_EXCLUDED_KEYS`). Additive — every PRE-EXISTING golden stays
 /// byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 602;
+/// 602 → 605 (#154, the faithfully-craftable RIFF (AVI) `JUNK` variants) adds
+/// `AVI_textjunk.avi` (`RIFF:TextJunk`), `AVI_pentaxjunk.avi`
+/// (`MakerNotes:Pentax:Model` via `%Pentax::Junk`) + `AVI_pentaxjunk2.avi`
+/// (`%Pentax::Junk2` + `Composite:Aperture`) — crafted minimal AVIs (`RIFF.pm:442-492`).
+/// The Olympus/Ricoh/Lucas JUNK variants (vendor subsystems) + CasioJunk (needs a
+/// real EX-S600 AVI) stay deferred. Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 605;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
