@@ -683,11 +683,13 @@ fn expo_value(secs: f64, print_conv: bool) -> TagValue {
 /// layout — those are deferred, so this emitter emits NOTHING for such a record
 /// (never a bogus decode through the K10D `LensData` offsets). The *ist /
 /// Samsung GX-1 old-`LensInfo` (`Pentax.pm:2825-2833`, table `LensInfo`) is a
-/// distinct earlier layout also deferred; ExifTool tests it FIRST — before the
-/// `$count` condition — via a Model+byte-20 regex, so this emitter mirrors that
-/// order with the old-`LensInfo` gate at the top of the body, which returns zero
-/// emissions for an *ist / GX-1[LS] (or an old-format K100D/K110D) record. The
-/// K10D (which fails that regex) falls through to the `$count` test and decodes.
+/// distinct earlier layout whose nested `%Pentax::LensData` sits at offset 3
+/// (`IS_SUBDIR => [3]`); ExifTool tests it FIRST — before the `$count` condition —
+/// via a Model+byte-20 regex, so this emitter mirrors that order with the
+/// old-`LensInfo` gate at the top of the body, decoding the shared `LensData`
+/// leaves from `block[3..20]` for an *ist / GX-1[LS] (or an old-format
+/// K100D/K110D) record. The K10D (which fails that regex) falls through to the
+/// `$count` test and decodes the offset-4 `LensInfo2` span.
 ///
 /// ## `LensType` is NOT re-emitted
 ///
@@ -722,19 +724,25 @@ pub(crate) fn emit_lens_info(
   // The `*ist` series and the Samsung `GX-1[LS]` ALWAYS use the old format; the
   // `K100D`/`K110D`/`K100D Super` use it only when byte 20 of the record is `0xff`
   // or bytes 20..22 are `00 00` (the old-vs-new marker). The old `%Pentax::LensInfo`
-  // table (`LensData` at offset 3, a distinct earlier layout) is DEFERRED, so —
-  // mirroring ExifTool's ordered variant list — when this condition matches we emit
-  // NOTHING here (the scope-fence) rather than misdecoding through the offset-4
-  // `LensInfo2` `LensData`. `$$valPt` is the verbatim record (`block`); the
-  // `/^.{20}.../s` regex simply fails to match on a record shorter than 21/22 bytes
-  // (byte 20/21 absent ⇒ NOT old-format), so a short block falls through to the
-  // `$count` test below — hence the bounds-checked `block.get` reads.
+  // table is the `*istD` layout — `LensType` `int8u[2]` at offset 0 (owned by the
+  // Phase-1 `0x003f LensRec`, NOT re-emitted) + a `LensData` `undef[17]`
+  // SubDirectory at offset 3 (`IS_SUBDIR => [3]`, `Pentax.pm:4218-4237`) — so,
+  // mirroring ExifTool's ordered variant list, when this condition matches we
+  // decode the SAME nested `%Pentax::LensData` leaves from the offset-3 span
+  // (`block[3..20]`) instead of the offset-4 `LensInfo2` span. `$$valPt` is the
+  // verbatim record (`block`); the `/^.{20}.../s` regex simply fails to match on a
+  // record shorter than 21/22 bytes (byte 20/21 absent ⇒ NOT old-format), so a
+  // short block falls through to the `$count` test below — hence the bounds-checked
+  // `block.get` reads.
   if let Some(m) = model {
     let ist_or_gx1 = m.contains("*ist") || m.contains("GX-1L") || m.contains("GX-1S");
     let k100_k110_old = (m.contains("K100D") || m.contains("K110D"))
       && (block.get(20) == Some(&0xff)
         || (block.get(20) == Some(&0x00) && block.get(21) == Some(&0x00)));
     if ist_or_gx1 || k100_k110_old {
+      // Old `%Pentax::LensInfo`: `LensData` `undef[17]` at offset 3.
+      let lens_data: &[u8] = block.get(3..20).or_else(|| block.get(3..)).unwrap_or(&[]);
+      emit_lens_data_leaves(lens_data, model, print_conv, out);
       return;
     }
   }
@@ -1213,6 +1221,86 @@ fn battery_ad_print(val: i64, empty: f64, range: f64) -> SmolStr {
   SmolStr::from(std::format!("{val} ({volts:.1}V, {pct}%)"))
 }
 
+/// `%Pentax::BatteryInfo` `BodyBatteryVoltage`/`GripBatteryVoltage` (K-3III,
+/// offsets 4/18, `Pentax.pm:4927-4933`/`:4979-4987`) — int32u `ValueConv =>
+/// '$val * 4e-8 + 0.27219'`; PrintConv `sprintf("%.2f V", $val)`. `-n` ⇒ the
+/// post-ValueConv `f64`.
+fn battery_voltage32(raw: u32, print_conv: bool) -> TagValue {
+  let v = f64::from(raw) * 4e-8 + 0.27219;
+  if print_conv {
+    TagValue::Str(SmolStr::from(std::format!("{v:.2} V")))
+  } else {
+    TagValue::F64(v)
+  }
+}
+
+/// Decode the K-3 Mark III `%Pentax::BatteryInfo` re-layout (`#PH forum15976`,
+/// `Pentax.pm:4780-4988`) — all leaves BigEndian (the table order). The byte
+/// offsets are the ExifTool element indices observed in the record: PowerSource +
+/// PowerAvailable share byte 0 (mask 0x0f / 0xf0); BodyBatteryState @ 2,
+/// BodyBatteryPercent @ 3, BodyBatteryVoltage @ 4 (int32u); GripBatteryState @ 16,
+/// GripBatteryPercent @ 17, GripBatteryVoltage @ 18 (int32u). Each read is
+/// bounds-checked (a truncated record skips the out-of-range leaves).
+fn emit_battery_info_k3iii(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let b = |i: usize| block.get(i).copied();
+  // 0.1: PowerSource (mask 0x0f). 0.2: PowerAvailable (mask 0xf0, BITMASK).
+  if let Some(v) = b(0) {
+    push(
+      out,
+      "PowerSource",
+      hash(
+        print_conv,
+        mask(i64::from(v), 0x0f),
+        printconv::POWER_SOURCE_K3III,
+      ),
+    );
+    push(
+      out,
+      "PowerAvailable",
+      bitmask0(
+        print_conv,
+        mask(i64::from(v), 0xf0),
+        "(none)",
+        printconv::POWER_AVAILABLE_K3III_BITS,
+      ),
+    );
+  }
+  // 2: BodyBatteryState (full byte, hash). 3: BodyBatteryPercent (raw).
+  if let Some(v) = b(2) {
+    push(
+      out,
+      "BodyBatteryState",
+      hash(print_conv, i64::from(v), printconv::BATTERY_STATE_K3III),
+    );
+  }
+  if let Some(v) = b(3) {
+    push(out, "BodyBatteryPercent", int_value(i64::from(v)));
+  }
+  // 4: BodyBatteryVoltage (int32u BE).
+  if let Some(v) = read_u32(block, 4, ByteOrder::Big) {
+    push(out, "BodyBatteryVoltage", battery_voltage32(v, print_conv));
+  }
+  // 16: GripBatteryState (full byte, hash). 17: GripBatteryPercent (raw).
+  if let Some(v) = b(16) {
+    push(
+      out,
+      "GripBatteryState",
+      hash(print_conv, i64::from(v), printconv::BATTERY_STATE_K3III),
+    );
+  }
+  if let Some(v) = b(17) {
+    push(out, "GripBatteryPercent", int_value(i64::from(v)));
+  }
+  // 18: GripBatteryVoltage (int32u BE).
+  if let Some(v) = read_u32(block, 18, ByteOrder::Big) {
+    push(out, "GripBatteryVoltage", battery_voltage32(v, print_conv));
+  }
+}
+
 /// Decode `%Pentax::BatteryInfo` (`0x0216`, `Pentax.pm:4757-4989`) — a BigEndian
 /// `ProcessBinaryData` record. The Main `0x0216` row is UNCONDITIONAL (no
 /// `$count` gate), but EVERY leaf is `$$self{Model}`-gated and several offsets
@@ -1258,22 +1346,30 @@ pub(crate) fn emit_battery_info(
   let grip_ad_load = is_grip_ad_load(model); // offset 5
   let b = |i: usize| block.get(i).copied();
 
+  // The K-3 Mark III re-lays the whole `%BatteryInfo` record (`#PH forum15976`,
+  // `Pentax.pm:4780-4988`): PowerSource (offset 0, mask 0x0f, a 3-entry hash) +
+  // PowerAvailable (offset 0, mask 0xf0, BITMASK) + BodyBatteryState (offset 2,
+  // full byte) + BodyBatteryPercent (offset 3) + BodyBatteryVoltage (offset 4,
+  // int32u `$val*4e-8 + 0.27219`) + GripBatteryState (offset 16) +
+  // GripBatteryPercent (offset 17) + GripBatteryVoltage (offset 18, int32u). All
+  // BigEndian (the table's declared order). The standard-model leaves below are
+  // model-gated OFF for a K-3III, so this branch is the sole emitter for it.
+  if is_k3iii {
+    emit_battery_info_k3iii(block, print_conv, out);
+    return;
+  }
   // 0.1: PowerSource (mask 0x0f) — `Condition => '$$self{Model} !~ /K-3 Mark
-  // III/'` (`Pentax.pm:4767-4779`). The K-3III variant (a DIFFERENT 3-entry
-  // hash) + the K-3III-only `0.2 PowerAvailable` are DEFERRED ⇒ for a K-3III the
-  // leaf emits nothing here.
-  if !is_k3iii {
-    if let Some(v) = b(0) {
-      push(
-        out,
-        "PowerSource",
-        hash(
-          print_conv,
-          mask(i64::from(v), 0x0f),
-          printconv::POWER_SOURCE,
-        ),
-      );
-    }
+  // III/'` (`Pentax.pm:4767-4779`).
+  if let Some(v) = b(0) {
+    push(
+      out,
+      "PowerSource",
+      hash(
+        print_conv,
+        mask(i64::from(v), 0x0f),
+        printconv::POWER_SOURCE,
+      ),
+    );
   }
   // 1.1: BodyBatteryState (mask 0xf0) — variant A
   // `/(\*ist|K100D|K200D|K10D|GX10|K20D|GX20|GX-1[LS]?)\b/` (the 4-entry hash,
@@ -1629,7 +1725,131 @@ pub(crate) fn emit_af_info(
       );
     }
   }
+  // The K-3 Mark III-only `%AFInfo` leaves (`#KG`, `Pentax.pm:5101-5198`). All are
+  // `Condition => '$$self{Model} =~ /K-3 Mark III/'`. The two `Unknown => 1`
+  // leaves (0x14 AFPointValues, 0x18f AFPointsUnknown) are suppressed without `-U`.
+  if is_k3_mark_iii(model) {
+    // 0x12a (298): AFPointsSelected — int8u[101]; `AFPointNamesK3III` renders the
+    // value==1 (and ==2) positions as the sorted grid-label list (`,`-joined);
+    // `-n` ⇒ the raw 101-byte run. (`value 1 = selected point, 2 = center`.)
+    let af = block.get(0x12a..0x12a + 101).or_else(|| block.get(0x12a..));
+    if let Some(slice) = af {
+      push(
+        out,
+        "AFPointsSelected",
+        af_point_names_k3iii(slice, print_conv),
+      );
+    }
+    // 0x1fa (506): LiveView — `{0=>Off,1=>On}`.
+    if let Some(v) = b(0x1fa) {
+      push(
+        out,
+        "LiveView",
+        hash(print_conv, i64::from(v), printconv::OFF_ON),
+      );
+    }
+    // 0x21f (543): FirstFrameActionInAFC.
+    if let Some(v) = b(0x21f) {
+      push(
+        out,
+        "FirstFrameActionInAFC",
+        hash(
+          print_conv,
+          i64::from(v),
+          printconv::FIRST_FRAME_ACTION_IN_AFC,
+        ),
+      );
+    }
+    // 0x220 (544): ActionInAFCCont.
+    if let Some(v) = b(0x220) {
+      push(
+        out,
+        "ActionInAFCCont",
+        hash(print_conv, i64::from(v), printconv::ACTION_IN_AFC_CONT),
+      );
+    }
+    // 545: AFCHold (mask 0x03), AFCPointTracking (mask 0x0c), AFCSensitivity
+    // (mask 0x70, PrintConv `5 - $val`) — three leaves sharing byte 545.
+    if let Some(v) = b(545) {
+      let n = i64::from(v);
+      push(
+        out,
+        "AFCHold",
+        hash(print_conv, mask(n, 0x03), printconv::AFC_HOLD),
+      );
+      push(
+        out,
+        "AFCPointTracking",
+        hash(print_conv, mask(n, 0x0c), printconv::AFC_POINT_TRACKING),
+      );
+      // AFCSensitivity — `Mask => 0x70`; PrintConv `'5 - $val'` (a numeric
+      // expression — the rendered value is the integer `5 - masked`). `-n` ⇒ the
+      // raw masked value.
+      let masked = mask(n, 0x70);
+      push(
+        out,
+        "AFCSensitivity",
+        if print_conv {
+          int_value(5 - masked)
+        } else {
+          int_value(masked)
+        },
+      );
+    }
+    // 0x960 (2400): SubjectRecognition — `{0=>Off,1=>On}`.
+    if let Some(v) = b(0x960) {
+      push(
+        out,
+        "SubjectRecognition",
+        hash(print_conv, i64::from(v), printconv::OFF_ON),
+      );
+    }
+  }
 }
+
+/// `Image::ExifTool::Pentax::AFPointNamesK3III` (`Pentax.pm:6759-6770`) with the
+/// default (no-match-value) branch: collect the grid label `@k3iiiAF[i]` for every
+/// position `i` whose byte is non-zero, SORT the labels, join with `,`; `(none)`
+/// if none. `-n` ⇒ the raw int8u run space-joined. (The AFPointsSelected leaf has
+/// no `$match`, so a byte value of 1 OR 2 selects the position — `$a[$_]` truthy.)
+fn af_point_names_k3iii(slice: &[u8], print_conv: bool) -> TagValue {
+  if !print_conv {
+    let joined = slice
+      .iter()
+      .map(|b| b.to_string())
+      .collect::<std::vec::Vec<_>>()
+      .join(" ");
+    return TagValue::Str(SmolStr::from(joined));
+  }
+  // `$a[$_] and push @pts, $k3iiiAF[$_] || "Unknown($_)"` — a non-zero byte selects
+  // position `i`; emit its grid label, or `Unknown(i)` for a position past the grid.
+  let mut pts: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  for (i, &byte) in slice.iter().enumerate() {
+    if byte != 0 {
+      match K3III_AF.get(i) {
+        Some(&label) => pts.push(label.to_string()),
+        None => pts.push(std::format!("Unknown({i})")),
+      }
+    }
+  }
+  if pts.is_empty() {
+    return TagValue::Str(SmolStr::new_static("(none)"));
+  }
+  pts.sort();
+  TagValue::Str(SmolStr::from(pts.join(",")))
+}
+
+/// `@k3iiiAF` — the K-3 III 101-point AF grid labels (`Pentax.pm:755-764`), in
+/// ExifTool's array ORDER (index = AF-point position).
+const K3III_AF: &[&str] = &[
+  "C1", "E1", "G1", "I1", "K1", "C3", "E3", "G3", "I3", "K3", "C5", "E5", "G5", "I5", "K5", "C7",
+  "E7", "G7", "I7", "K7", "C9", "E9", "G9", "I9", "K9", "A5", "M5", "B3", "L3", "B5", "L5", "B7",
+  "L7", "B1", "L1", "B9", "L9", "A3", "M3", "A7", "M7", "D1", "F1", "H1", "J1", "D3", "F3", "H3",
+  "J3", "D5", "F5", "H5", "J5", "D7", "F7", "H7", "J7", "D9", "F9", "H9", "J9", "C2", "E2", "G2",
+  "I2", "K2", "C4", "E4", "G4", "I4", "K4", "C6", "E6", "G6", "I6", "K6", "C8", "E8", "G8", "I8",
+  "K8", "B2", "L2", "B4", "L4", "B6", "L6", "B8", "L8", "A1", "M1", "A2", "M2", "A4", "M4", "A6",
+  "M6", "A8", "M8", "A9", "M9",
+];
 
 /// `true` when `model` matches the AFPointsInFocus EXCLUSION regex
 /// `/(K-(1|3|70|S1|S2)|KP)\b/` (`Pentax.pm:5070`) — i.e. the K-1, K-3, K-70,
@@ -2372,6 +2592,292 @@ pub(crate) fn emit_sr_info2(
       hash(print_conv, i64::from(*v), printconv::SHAKE_REDUCTION2),
     );
   }
+}
+
+/// Decode `%Pentax::PixelShiftInfo` (`0x0243`, `Pentax.pm:6057-6065`) — `int8u`.
+/// Emits PixelShiftResolution (@0, `{0=>'Off',1=>'On'}`).
+pub(crate) fn emit_pixel_shift_info(
+  block: &[u8],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  if let Some(v) = block.first() {
+    push(
+      out,
+      "PixelShiftResolution",
+      hash(print_conv, i64::from(*v), printconv::OFF_ON),
+    );
+  }
+}
+
+/// Decode `%Pentax::TempInfo` (`0x03ff`, `Pentax.pm:6102-6166`) — `int8u`/
+/// `FIRST_ENTRY 0`, the temperature leaves are `int16s` (inherit the parent IFD
+/// `order`). The Main row selects this table for `/K-(01|3|30|5|50|500)\b/`; this
+/// emitter additionally applies the per-leaf K-3III gate. For a K-3III emits
+/// ShotNumber (@0x0a, `$val+1`) and SensorTemperature (@0x2a, int16s `$val/10`,
+/// `%.1f C`); the non-K-3III SensorTemperature/SensorTemperature2 (@0x0c/0x0e) +
+/// CameraTemperature4/5 (K-5, @0x14/0x16) variants are model-gated (deferred — no
+/// non-K-3III TempInfo fixture).
+pub(crate) fn emit_temp_info(
+  block: &[u8],
+  order: ByteOrder,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  if !is_k3_mark_iii(model) {
+    return;
+  }
+  // 0x0a ShotNumber — `ValueConv => '$val+1'` (no PrintConv ⇒ same -j/-n).
+  if let Some(v) = block.get(0x0a) {
+    push(out, "ShotNumber", int_value(i64::from(*v) + 1));
+  }
+  // 0x2a SensorTemperature — int16s, `ValueConv => '$val/10'`; PrintConv
+  // `sprintf("%.1f C", $val)`. `-n` ⇒ the `/10` f64.
+  if let Some(raw) = read_u16(block, 0x2a, order) {
+    let v = f64::from(raw as i16) / 10.0;
+    push(
+      out,
+      "SensorTemperature",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{v:.1} C")))
+      } else {
+        TagValue::F64(v)
+      },
+    );
+  }
+}
+
+/// Decode `%Pentax::FaceInfoK3III` (`0x040b`, `Pentax.pm:5803-5881`) — `int32u`/
+/// `FIRST_ENTRY 0` (element offset N = byte 4N); inherits the parent IFD `order`.
+/// Emits FaceImageSize (@0, int32u[2]), CAFArea (@2, int32u[4]), FacesDetectedA
+/// (@6) and FacesDetectedB (@8). The whole-structure `0.1 FaceInfoK3III` leaf is
+/// `Unknown => 1` (suppressed); the per-face Area/Eye leaves are `$$self{FacesA}`-
+/// gated and emit nothing when no faces are detected (the fixture has FacesA 0).
+/// No PrintConv on any emitted leaf ⇒ identical for `-j`/`-n`.
+pub(crate) fn emit_face_info_k3iii(
+  block: &[u8],
+  order: ByteOrder,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  // 0: FaceImageSize — int32u[2] (elements 0..=1 = bytes 0..8), space-joined.
+  if let (Some(a), Some(b)) = (read_u32(block, 0, order), read_u32(block, 4, order)) {
+    push(
+      out,
+      "FaceImageSize",
+      TagValue::Str(SmolStr::from(std::format!("{a} {b}"))),
+    );
+  }
+  // 2: CAFArea — int32u[4] (elements 2..=5 = bytes 8..24), space-joined.
+  if let (Some(a), Some(b), Some(c), Some(d)) = (
+    read_u32(block, 8, order),
+    read_u32(block, 12, order),
+    read_u32(block, 16, order),
+    read_u32(block, 20, order),
+  ) {
+    push(
+      out,
+      "CAFArea",
+      TagValue::Str(SmolStr::from(std::format!("{a} {b} {c} {d}"))),
+    );
+  }
+  // 6: FacesDetectedA (byte 24). 8: FacesDetectedB (byte 32). No conv.
+  if let Some(v) = read_u32(block, 24, order) {
+    push(out, "FacesDetectedA", int_value(i64::from(v)));
+  }
+  if let Some(v) = read_u32(block, 32, order) {
+    push(out, "FacesDetectedB", int_value(i64::from(v)));
+  }
+}
+
+/// Decode `%Pentax::AFInfoK3III` (`0x040c`, `Pentax.pm:5883-5973`) — `int16u`/
+/// `FIRST_ENTRY 0` (element offset N = byte 2N); inherits the parent IFD `order`.
+/// The whole-structure `0 AFInfoK3III` leaf is `Unknown => 1` (suppressed). Emits
+/// AFMode (@0.1), AFSelectionMode (@1, PrintHex), MaxNumAFPoints (@2), NumAFPoints
+/// (@3); and — when `NumAFPoints > 0` — AFFrameSize (@7, int16u[2], `s/ /x/`),
+/// AFAreas (@7, int16u[7*NumAFPoints] via `AFAreasK3III`) and AFAreaSize (@11,
+/// int16u[2], `s/ /x/`, only when the area is non-zero = contrast-detect).
+pub(crate) fn emit_af_info_k3iii(
+  block: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let u16_at = |elem: usize| read_u16(block, elem * 2, order);
+  // 0.1: AFMode (the `0` whole-structure leaf is Unknown ⇒ skipped).
+  if let Some(v) = u16_at(0) {
+    push(
+      out,
+      "AFMode",
+      hash(print_conv, i64::from(v), printconv::AF_MODE_K3III),
+    );
+  }
+  // 1: AFSelectionMode — `PrintHex => 1`.
+  if let Some(v) = u16_at(1) {
+    push(
+      out,
+      "AFSelectionMode",
+      hash_hex(print_conv, i64::from(v), printconv::AF_SELECTION_MODE_K3III),
+    );
+  }
+  // 2: MaxNumAFPoints. 3: NumAFPoints.
+  if let Some(v) = u16_at(2) {
+    push(out, "MaxNumAFPoints", int_value(i64::from(v)));
+  }
+  let num_af = u16_at(3);
+  if let Some(v) = num_af {
+    push(out, "NumAFPoints", int_value(i64::from(v)));
+  }
+  // AFAreas (7.1) carries NO Condition in %AFInfoK3III — only AFFrameSize (7) and
+  // AFAreaSize (11) are gated on `$$self{NumAFPoints} > 0`. AFAreas is emitted for
+  // any record whose row start (element 7, byte 14) lies within the data, even when
+  // `int16u[7 * NumAFPoints]` evaluates to a zero count.
+  let num = num_af.map_or(0, i64::from);
+  // 7: AFFrameSize — int16u[2] (elements 7..=8 = bytes 14..18); `Condition =>
+  // '$$self{NumAFPoints} > 0'`; PrintConv `s/ /x/` (`-n` ⇒ the space-joined run).
+  if num > 0 {
+    push_int16u_pair_k3iii(block, 7, order, print_conv, "AFFrameSize", out);
+  }
+  // 7.1: AFAreas — int16u[7 * NumAFPoints] (from element 7), no Condition.
+  // `AFAreasK3III` renders an `[ "x,y(flags)" ]` LIST; `-n` ⇒ the whole
+  // space-joined run.
+  //
+  // The boundary mirrors ProcessBinaryData + ReadValue at EVERY offset. The AFAreas
+  // row starts at element 7 = byte 14, so ProcessBinaryData's `$more = $size - 14`
+  // and `last if $more <= 0`: the row is dispatched IFF `$size > 14`, i.e.
+  // `block.len() > 14` — only byte 14 need be present, NOT a full int16u (byte 15).
+  // `ReadValue($dataPt, 14, 'int16u', 7*NumAFPoints, $more)` then decides the value:
+  //   - count == 0 (NumAFPoints == 0): `unless($count){ return '' if defined $count }`
+  //     returns the DEFINED empty value BEFORE any int16u-fits check — emitted even
+  //     when only byte 14 is present (bundled: AFAreas=`(none)` for PrintConv, `""`
+  //     for `-n`).
+  //   - count  > 0: the run is shortened to `int($more/2)` WHOLE int16u; if none fit
+  //     (`$count < 1`) ReadValue returns undef and ProcessBinaryData's `next unless
+  //     defined $val` SKIPS the tag — so byte 14 alone with NumAFPoints > 0 emits
+  //     nothing; otherwise the whole-int16u prefix is emitted.
+  // (Ground-truthed against ExifTool 13.59 ReadValue: count=0/size=1 → `''`;
+  // count=7/size=1 → undef; count=7/size=6 → (600,400,300).)
+  if block.len() > 14 {
+    let count = (7usize).saturating_mul(num.max(0) as usize);
+    if count == 0 {
+      // Zero-count `int16u[0]` ⇒ ReadValue's defined empty value (emitted as a row).
+      push_af_areas_k3iii(&[], print_conv, out);
+    } else {
+      let mut areas: std::vec::Vec<u16> = std::vec::Vec::with_capacity(count);
+      for k in 0..count {
+        match u16_at(7 + k) {
+          Some(v) => areas.push(v),
+          None => break,
+        }
+      }
+      // count > 0 shortened to 0 whole int16u ⇒ ReadValue undef ⇒ SKIP (no row).
+      if !areas.is_empty() {
+        push_af_areas_k3iii(&areas, print_conv, out);
+      }
+    }
+  }
+  // 11: AFAreaSize — int16u[2] (elements 11..=12 = bytes 22..26); `Condition =>
+  // '$$self{NumAFPoints} > 0 and $$valPt !~ /^\0\0\0\0/'` (only contrast-detect).
+  // `$$valPt` is the AVAILABLE leaf bytes (`substr($$dataPt, byte22, $more)`), so a
+  // record shorter than byte 26 can still satisfy `!~ /^\0\0\0\0/` (the regex needs
+  // 4 leading NUL bytes, unreachable when fewer than 4 are present). PrintConv `s/ /x/`.
+  let first4_zero = block.get(22..26) == Some(&[0u8, 0, 0, 0][..]);
+  if num > 0 && !first4_zero {
+    push_int16u_pair_k3iii(block, 11, order, print_conv, "AFAreaSize", out);
+  }
+}
+
+/// Emit a fixed `int16u[2]` `%AFInfoK3III` leaf (AFFrameSize @7, AFAreaSize @11)
+/// faithfully to `ProcessBinaryData` + `ReadValue`. The row starts at byte `2*elem`;
+/// `$more = $size - 2*elem`. `ReadValue` keeps `min(2, floor($more / 2))` WHOLE
+/// int16u and returns `undef` (skip) when none fit — so a record that ends mid-pair
+/// emits the single readable value (e.g. `600`), and one that ends before the row
+/// start emits nothing. PrintConv `s/ /x/` rewrites the one inter-value space (the
+/// 2-value case → `WxH`); `-n` keeps the space-joined run.
+fn push_int16u_pair_k3iii(
+  block: &[u8],
+  elem: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  name: &'static str,
+  out: &mut std::vec::Vec<VendorEmission>,
+) {
+  let mut vals: std::vec::Vec<u16> = std::vec::Vec::with_capacity(2);
+  for k in 0..2 {
+    match read_u16(block, (elem + k) * 2, order) {
+      Some(v) => vals.push(v),
+      None => break,
+    }
+  }
+  if vals.is_empty() {
+    return;
+  }
+  let joined = vals
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<std::vec::Vec<_>>()
+    .join(if print_conv { "x" } else { " " });
+  push(out, name, TagValue::Str(SmolStr::from(joined)));
+}
+
+/// `Image::ExifTool::Pentax::AFAreasK3III` (`Pentax.pm:6798-6812`). The value is
+/// `int16u[7 * NumAFPoints]`; each 7-tuple is `(frameW, frameH, X, Y, areaW, areaH,
+/// flags)`. For `-j` (the `List => 1` PrintConv returning an ARRAYREF) each tuple
+/// renders `"X,Y(<flags>)"` where flags is the `,`-joined subset of
+/// `[0x10→'central', 0x08→(unset)→'peripheral', 0x04→'in-focus']`; the per-element
+/// strings become a JSON ARRAY. `-n` ⇒ the whole space-joined int16u run (no
+/// PrintConv applied); a zero-count run is the raw empty value (`""`). The `(none)`
+/// scalar is purely the PrintConv `return '(none)' unless $val` and so appears only
+/// in PrintConv mode (bundled `-n` of a NumAFPoints==0 record yields `AFAreas=''`).
+fn push_af_areas_k3iii(vals: &[u16], print_conv: bool, out: &mut std::vec::Vec<VendorEmission>) {
+  if !print_conv {
+    // `-n`: no PrintConv — the raw int16u run, space-joined; empty when zero-count.
+    let joined = vals
+      .iter()
+      .map(|v| v.to_string())
+      .collect::<std::vec::Vec<_>>()
+      .join(" ");
+    push(out, "AFAreas", TagValue::Str(SmolStr::from(joined)));
+    return;
+  }
+  if vals.is_empty() {
+    // `return '(none)' unless $val` — the PrintConv scalar for an empty value.
+    push(out, "AFAreas", TagValue::Str(SmolStr::new_static("(none)")));
+    return;
+  }
+  // PrintConv: a LIST of `"X,Y(flags)"` strings (one per complete 7-tuple).
+  let mut strs: std::vec::Vec<TagValue> = std::vec::Vec::new();
+  let mut i = 0usize;
+  while i + 7 <= vals.len() {
+    // SAFETY of indexing: the `i + 7 <= len` guard bounds every `vals[i+k]`.
+    let x = vals.get(i + 2).copied().unwrap_or(0);
+    let y = vals.get(i + 3).copied().unwrap_or(0);
+    let flags = vals.get(i + 6).copied().unwrap_or(0);
+    // `@flags = ([0x10,0x10,'central'],[0x08,0,'peripheral'],[0x04,0x04,'in-focus'])`
+    // — push the label when `($flags & mask) == value`.
+    let mut tags: std::vec::Vec<&'static str> = std::vec::Vec::new();
+    if flags & 0x10 == 0x10 {
+      tags.push("central");
+    }
+    if flags & 0x08 == 0 {
+      tags.push("peripheral");
+    }
+    if flags & 0x04 == 0x04 {
+      tags.push("in-focus");
+    }
+    let s = if tags.is_empty() {
+      std::format!("{x},{y}")
+    } else {
+      std::format!("{x},{y}({})", tags.join(","))
+    };
+    strs.push(TagValue::Str(SmolStr::from(s)));
+    i += 7;
+  }
+  out.push(VendorEmission::new(
+    SmolStr::new_static("AFAreas"),
+    TagValue::List(strs),
+    false,
+  ));
 }
 
 /// `($val & mask) >> bitShift`, `bitShift` = the mask's trailing-zero-bit count

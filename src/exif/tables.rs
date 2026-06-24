@@ -653,6 +653,17 @@ const COMPRESSION: &[(i64, &str)] = &[
   (99, "JPEG"),
   (32773, "PackBits"),
   (34892, "Lossy JPEG"),
+  (34925, "LZMA2"),
+  (34926, "Zstd (old)"),
+  (34927, "WebP (old)"),
+  (34933, "PNG"),
+  (34934, "JPEG XR"),
+  (50000, "Zstd"),
+  (50001, "WebP"),
+  (50002, "JPEG XL (old)"),
+  (52546, "JPEG XL"),
+  (65000, "Kodak DCR Compressed"),
+  (65535, "Pentax PEF Compressed"),
 ];
 
 /// `%photometricInterpretation` PrintConv (`Exif.pm:271-289`).

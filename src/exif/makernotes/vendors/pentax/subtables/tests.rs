@@ -495,62 +495,74 @@ fn lens_info2_truncated_block_no_panic() {
   assert!(find(&em2, "NominalMinAperture").is_none());
 }
 
+/// A crafted OLD-format `%Pentax::LensInfo` record (`Pentax.pm:4218-4237`):
+/// `LensType` `int8u[2]` at offset 0-1, an unused byte at offset 2, then the
+/// nested `LensData` `undef[17]` at offset 3 — here the SAME 17 LensData bytes as
+/// the K10D `LensInfo2` fixture, so the decoded leaves match the K10D path exactly.
+/// (The *ist series / GX-1[LS] use this layout; the K10D-LensData reuse keeps the
+/// expected values identical to the byte-exact `LensInfo2` test.)
+const LENSINFO_OLD: &[u8] = &[
+  0x02, 0x00, // LensType (series 2, model 0)
+  0x00, // offset 2 (unused)
+  // offset 3: the K10D LensData `undef[17]`.
+  0x00, 0x28, 0x94, 0x33, 0x5b, 0x53, 0x86, 0xea, 0x41, 0x40, 0x88, 0x50, 0x38, 0x01, 0x40, 0x6c,
+  0x03,
+];
+
+/// Assert the nine OLD-format LensData leaves (identical to the K10D `LensInfo2`
+/// values) — the old `%LensInfo` decodes `LensData` from offset 3.
+fn assert_old_lens_info_leaves(em: &[VendorEmission]) {
+  assert_eq!(find(em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert_eq!(find(em, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert_eq!(find(em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(find(em, "NominalMinAperture"), Some(&s("23")));
+  assert_eq!(find(em, "AutoAperture"), Some(&s("On")));
+  assert_eq!(find(em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+}
+
 #[test]
-fn lens_info_old_format_ist_emits_nothing() {
+fn lens_info_old_format_ist_decodes_offset3() {
   // ExifTool tests the old `%Pentax::LensInfo` variant FIRST, before the
   // `LensInfo2` `$count` condition (`Pentax.pm:2825-2833`): the *ist series ALWAYS
-  // uses the deferred old format (`/(\*ist|GX-1[LS])/`). Even with an otherwise
-  // valid (K10D) block at an in-gate count (69, not in {90,91,80,128,168}), an
-  // *ist body must emit NOTHING — never misdecode through the offset-4 LensInfo2
-  // `LensData`. (`LENSINFO2_K10D` byte 20 == 0x03, so this is the Model-regex
-  // branch, independent of the byte-20 marker.)
+  // uses the old format (`/(\*ist|GX-1[LS])/`), whose `LensData` lives at offset 3
+  // (`IS_SUBDIR => [3]`). An *ist body decodes the SAME nested LensData leaves as
+  // the K10D — never the offset-4 `LensInfo2` layout.
   let mut em = Vec::new();
-  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX *ist DS"), true, &mut em);
-  assert!(
-    em.is_empty(),
-    "an *ist body uses the deferred old LensInfo ⇒ zero emissions"
-  );
+  emit_lens_info(LENSINFO_OLD, 36, Some("PENTAX *ist DS"), true, &mut em);
+  assert_old_lens_info_leaves(&em);
 }
 
 #[test]
-fn lens_info_old_format_gx1l_emits_nothing() {
+fn lens_info_old_format_gx1l_decodes_offset3() {
   // The Samsung `GX-1[LS]` also always uses the old format (`/GX-1[LS]/`).
   let mut em = Vec::new();
-  emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX GX-1L"), true, &mut em);
-  assert!(
-    em.is_empty(),
-    "a GX-1L body uses the deferred old LensInfo ⇒ zero emissions"
-  );
+  emit_lens_info(LENSINFO_OLD, 36, Some("PENTAX GX-1L"), true, &mut em);
+  assert_old_lens_info_leaves(&em);
 }
 
 #[test]
-fn lens_info_old_format_k100d_byte20_ff_emits_nothing() {
+fn lens_info_old_format_k100d_byte20_ff_decodes_offset3() {
   // The K100D/K110D use the old format only when byte 20 of the record is `0xff`
-  // (`$$valPt=~/^.{20}(\xff|\0\0)/s`). Craft a block whose byte 20 == 0xff: the
-  // old-format marker matches ⇒ zero emissions (the deferred old LensInfo), NOT a
+  // (`$$valPt=~/^.{20}(\xff|\0\0)/s`). Pad `LENSINFO_OLD` to 21 bytes with byte 20
+  // == 0xff: the old-format marker matches ⇒ decode the offset-3 `LensData`, NOT a
   // decode through LensInfo2.
-  let mut block = LENSINFO2_K10D.to_vec();
-  block[20] = 0xff;
+  let mut block = LENSINFO_OLD.to_vec();
+  block.resize(20, 0x00);
+  block.push(0xff); // byte 20
   let mut em = Vec::new();
-  emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
-  assert!(
-    em.is_empty(),
-    "a K100D with byte 20 == 0xff uses the deferred old LensInfo ⇒ zero emissions"
-  );
+  emit_lens_info(&block, 36, Some("PENTAX K100D"), true, &mut em);
+  assert_old_lens_info_leaves(&em);
 }
 
 #[test]
-fn lens_info_old_format_k100d_bytes20_21_zero_emits_nothing() {
+fn lens_info_old_format_k100d_bytes20_21_zero_decodes_offset3() {
   // The other old-format marker: bytes 20..22 == `00 00`.
-  let mut block = LENSINFO2_K10D.to_vec();
-  block[20] = 0x00;
-  block[21] = 0x00;
+  let mut block = LENSINFO_OLD.to_vec();
+  block.resize(22, 0x00); // bytes 20,21 == 00 00
   let mut em = Vec::new();
-  emit_lens_info(&block, 69, Some("PENTAX K100D"), true, &mut em);
-  assert!(
-    em.is_empty(),
-    "a K100D with bytes 20..22 == 00 00 uses the deferred old LensInfo ⇒ zero emissions"
-  );
+  emit_lens_info(&block, 36, Some("PENTAX K100D"), true, &mut em);
+  assert_old_lens_info_leaves(&em);
 }
 
 #[test]
@@ -909,15 +921,76 @@ fn battery_info_kx_does_not_emit_k10d_ad_layout() {
   );
 }
 
+/// The verbatim K-3 Mark III `BatteryInfo` (0x0216) record from the
+/// `PEF_pentax_k3_mark_iii.pef` fixture (`exiftool -v3`: 23 bytes, BigEndian).
+/// Byte 0 = PowerSource/PowerAvailable; byte 2 = BodyBatteryState; byte 3 =
+/// BodyBatteryPercent; bytes 4-7 = BodyBatteryVoltage (int32u); byte 16 =
+/// GripBatteryState; byte 17 = GripBatteryPercent; bytes 18-21 = GripBatteryVoltage.
+const BATTERYINFO_K3III: &[u8] = &[
+  0x11, 0x4c, 0x05, 0x64, 0x0a, 0xbd, 0x0a, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x08, 0x5e, 0x00, 0x2c, 0x00,
+];
+
 #[test]
-fn battery_info_k3iii_suppresses_powersource_variant() {
-  // For the K-3 Mark III the non-K-3III `PowerSource` hash (and the whole K10D
-  // AD layout) must NOT emit — the K-3III re-layout is deferred, so the record
-  // yields none of the ported leaves rather than the wrong-hash PowerSource.
+fn battery_info_k3iii_relayout_byte_exact() {
+  // The K-3 Mark III re-lays the whole `%BatteryInfo` record (#393): PowerSource
+  // (byte 0, mask 0x0f, the K-3III 3-entry hash) + PowerAvailable (byte 0, mask
+  // 0xf0, BITMASK) + BodyBatteryState (byte 2) + BodyBatteryPercent (byte 3) +
+  // BodyBatteryVoltage (int32u BE `$val*4e-8+0.27219`) + GripBatteryState (byte 16)
+  // + GripBatteryPercent (byte 17) + GripBatteryVoltage (int32u BE). Values verified
+  // against `exiftool -G1 -j PEF_pentax_k3_mark_iii.pef`.
   let mut em = Vec::new();
-  emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K-3 Mark III"), true, &mut em);
-  assert!(find(&em, "PowerSource").is_none());
-  assert!(em.is_empty());
+  emit_battery_info(
+    BATTERYINFO_K3III,
+    Some("PENTAX K-3 Mark III"),
+    true,
+    &mut em,
+  );
+  assert_eq!(find(&em, "PowerSource"), Some(&s("Body Battery")));
+  assert_eq!(find(&em, "PowerAvailable"), Some(&s("Body Battery")));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(&s("Full")));
+  assert_eq!(find(&em, "BodyBatteryPercent"), Some(&TagValue::I64(100)));
+  assert_eq!(find(&em, "BodyBatteryVoltage"), Some(&s("7.48 V")));
+  assert_eq!(find(&em, "GripBatteryState"), Some(&s("Empty or Missing")));
+  assert_eq!(find(&em, "GripBatteryPercent"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "GripBatteryVoltage"), Some(&s("5.89 V")));
+  // The non-K-3III K10D AD layout must NOT appear (the K-3III branch is the sole
+  // emitter — never a wrong-hash PowerSource or a K10D byte mis-read).
+  for wrong in [
+    "BodyBatteryADNoLoad",
+    "BodyBatteryADLoad",
+    "GripBatteryADNoLoad",
+    "GripBatteryADLoad",
+  ] {
+    assert!(find(&em, wrong).is_none(), "K-3III must not emit {wrong}");
+  }
+}
+
+#[test]
+fn battery_info_k3iii_n_mode_raw_values() {
+  // `-n`: PowerSource/PowerAvailable masked ints, BodyBatteryState/Percent raw, the
+  // two voltages the post-ValueConv f64. Verified against the `.n.json` golden.
+  let mut em = Vec::new();
+  emit_battery_info(
+    BATTERYINFO_K3III,
+    Some("PENTAX K-3 Mark III"),
+    false,
+    &mut em,
+  );
+  assert_eq!(find(&em, "PowerSource"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "PowerAvailable"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(&TagValue::I64(5)));
+  // The raw ValueConv f64 (`$val*4e-8+0.27219`). The serializer's `format_g`
+  // renders these to the golden's `7.47863424` / `5.88731624` (10-sig-fig); the
+  // stored f64 carries the full IEEE-754 precision.
+  assert_eq!(
+    find(&em, "BodyBatteryVoltage"),
+    Some(&TagValue::F64(f64::from(180161106u32) * 4e-8 + 0.27219))
+  );
+  assert_eq!(
+    find(&em, "GripBatteryVoltage"),
+    Some(&TagValue::F64(f64::from(140378156u32) * 4e-8 + 0.27219))
+  );
 }
 
 #[test]
@@ -1310,4 +1383,437 @@ fn face_info_0x0060_is_unconditional_not_k3iii_gated() {
   // Sanity: a body that WOULD match the LevelInfo K3III gate is still a normal
   // FaceInfo producer at 0x0060 — the gate is unrelated to this table.
   assert!(is_k3_mark_iii(Some("PENTAX K-3 Mark III")));
+}
+
+/// A complete `%AFInfoK3III` (`0x040c`) record for NumAFPoints=1, int16u BigEndian
+/// (28 bytes = elements 0..=13). element 0 AFMode=0 (Phase Detect); element 1
+/// AFSelectionMode=0x1 (Spot); element 2 MaxNumAFPoints=101; element 3
+/// NumAFPoints=1; elements 4..=6 filler; the single AF-area 7-tuple at elements
+/// 7..=13 = (frameW=600, frameH=400, X=300, Y=200, areaW=0, areaH=0, flags=0x14).
+/// areaW/areaH=0 ⇒ bytes 22..26 are all-zero ⇒ AFAreaSize (the contrast-detect
+/// leaf) is correctly suppressed.
+const AFINFO_K3III_COMPLETE: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x01, // 3  NumAFPoints = 1
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, 0x58, // 7  frameW = 600 (AFFrameSize width)
+  0x01, 0x90, // 8  frameH = 400 (AFFrameSize height)
+  0x01, 0x2c, // 9  X = 300
+  0x00, 0xc8, // 10 Y = 200
+  0x00, 0x00, // 11 areaW = 0 (AFAreaSize suppressed)
+  0x00, 0x00, // 12 areaH = 0
+  0x00, 0x14, // 13 flags = 0x14 (central + peripheral + in-focus)
+];
+
+/// `AFINFO_K3III_COMPLETE` truncated to 14 bytes (elements 0..=6 only): the
+/// AFAreas run's first int16u (element 7 = bytes 14..16) is ABSENT. Declared as
+/// its own literal rather than a runtime slice so the test stays index-free.
+const AFINFO_K3III_TRUNCATED_BEFORE_AREA: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x01, // 3  NumAFPoints = 1
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6 (record ends here — element 7 absent)
+];
+
+/// `AFINFO_K3III_COMPLETE` truncated to 20 bytes (elements 0..=9): element 7 IS
+/// present but the 7-value AF-area tuple overruns the record — only 3 whole int16u
+/// (elements 7,8,9 = 600,400,300) fit, element 10's bytes 20..22 are absent.
+const AFINFO_K3III_PARTIAL_AREA: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x01, // 3  NumAFPoints = 1
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, 0x58, // 7  frameW = 600
+  0x01, 0x90, // 8  frameH = 400
+  0x01, 0x2c, // 9  X = 300 (record ends here — element 10 absent)
+];
+
+#[test]
+fn af_info_k3iii_complete_record_emits_areas() {
+  // The full 28-byte record (NumAFPoints=1): the scalars decode and the AFAreas
+  // run is present (element 7 = byte 14 IS within the record), so AFAreas emits
+  // the single `"X,Y(flags)"` tuple. flags 0x14 → 0x10 'central', 0x08-unset
+  // 'peripheral', 0x04 'in-focus'. AFFrameSize = 600x400. areaW/areaH=0 ⇒
+  // AFAreaSize suppressed (phase-detect). This pins the byte-exact K-3III PEF
+  // path the truncation guard must NOT regress.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_COMPLETE, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "AFMode"), Some(&s("Phase Detect")));
+  assert_eq!(find(&em, "AFSelectionMode"), Some(&s("Spot")));
+  assert_eq!(find(&em, "MaxNumAFPoints"), Some(&TagValue::I64(101)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400")));
+  assert_eq!(
+    find(&em, "AFAreas"),
+    Some(&TagValue::List(vec![s(
+      "300,200(central,peripheral,in-focus)"
+    )]))
+  );
+  // areaW/areaH = 0 ⇒ the first 4 bytes of the AFAreaSize leaf (bytes 22..26) are
+  // zero ⇒ the contrast-detect-only AFAreaSize is suppressed.
+  assert!(find(&em, "AFAreaSize").is_none());
+}
+
+#[test]
+fn af_info_k3iii_complete_record_value_conv_run() {
+  // `-n` (print_conv=false): AFAreas is the WHOLE space-joined int16u run (no
+  // PrintConv); AFFrameSize is the space-joined pair. The complete record emits
+  // the full 7-value run for the single point.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_COMPLETE, ByteOrder::Big, false, &mut em);
+  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600 400")));
+  // The single 7-tuple: 600 400 300 200 0 0 20.
+  assert_eq!(find(&em, "AFAreas"), Some(&s("600 400 300 200 0 0 20")));
+}
+
+#[test]
+fn af_info_k3iii_truncated_before_area_skips_afareas() {
+  // ProcessBinaryData skips a row whose start offset is outside the record: the
+  // AFAreas run starts at element 7 = byte 14. A record that carries NumAFPoints
+  // (>0) but stops BEFORE byte 14 (here 14 bytes, indices 0..13, so element 7's
+  // first int16u at bytes 14..16 is absent) reaches `last`/`undef` in ExifTool —
+  // it emits NO AFAreas tag. The port must SKIP AFAreas, not emit the empty-run
+  // `(none)`/`[]`. The scalars (elements 0..=3) still decode.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_TRUNCATED_BEFORE_AREA,
+    ByteOrder::Big,
+    true,
+    &mut em,
+  );
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  // AFFrameSize (element 7..=8) and AFAreas (element 7+) are both absent — NOT an
+  // empty list, NOT `(none)`.
+  assert!(find(&em, "AFFrameSize").is_none());
+  assert!(find(&em, "AFAreas").is_none());
+  assert!(find(&em, "AFAreaSize").is_none());
+}
+
+#[test]
+fn af_info_k3iii_truncated_before_area_value_conv_also_skips() {
+  // Same truncation under `-n`: ExifTool emits no AFAreas value at all, so the
+  // port must NOT fall into the empty-`(none)` branch of the AFAreasK3III
+  // PrintConv — that branch models an empty *value*, not an absent *row*.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_TRUNCATED_BEFORE_AREA,
+    ByteOrder::Big,
+    false,
+    &mut em,
+  );
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert!(find(&em, "AFAreas").is_none());
+}
+
+#[test]
+fn af_info_k3iii_partial_area_tuple_keeps_whole_int16u() {
+  // Element 7 IS present but the full `int16u[7*NumAFPoints]` overruns the record:
+  // ExifTool's ReadValue shortens the count to as many WHOLE int16u as fit. Here
+  // the record stops mid-run (20 bytes ⇒ elements 7,8,9 readable = 3 whole int16u
+  // of the 7-value tuple; element 10's bytes 20..22 are absent). The collect loop
+  // keeps the 3 readable int16u and renders the PrintConv from what is present
+  // (one incomplete tuple < 7 values ⇒ NO `"X,Y(flags)"` string for `-j`; the
+  // space-joined partial run for `-n`).
+  //
+  // `-j`: fewer than 7 area values ⇒ the `while i+7 <= len` loop produces NO
+  // tuple, so AFAreas is the empty LIST (an emitted tag, since element 7 IS
+  // present — the row is NOT skipped, only its single tuple is incomplete).
+  let mut em = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREA, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400"))); // elements 7,8 present
+  assert_eq!(find(&em, "AFAreas"), Some(&TagValue::List(vec![])));
+  // `-n`: the space-joined run of the 3 readable int16u (600 400 300).
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREA, ByteOrder::Big, false, &mut em_n);
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600 400 300")));
+}
+
+#[test]
+fn af_info_k3iii_partial_frame_size_keeps_single_int16u() {
+  // AFFrameSize is a FIXED `int16u[2]` at element 7 (byte 14). When the record ends
+  // mid-pair (element 7 readable, element 8 = bytes 16..18 absent) ExifTool's
+  // ReadValue shortens the count to the one WHOLE int16u that fits and returns it.
+  // The PrintConv `s/ /x/` has no space to rewrite, so the single value passes
+  // through. Oracle (bundled, 16-byte record, NumAFPoints=1): AFFrameSize='600'
+  // (`-n` likewise '600'); AFAreas='600' raw ⇒ empty list for `-j`. The whole-pair
+  // both-present guard would have dropped this — the field must emit the partial.
+  let block = &AFINFO_K3III_COMPLETE[..16]; // elements 0..=7 (element 7 = 600)
+  let mut em = Vec::new();
+  emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600")));
+  assert_eq!(find(&em, "AFAreas"), Some(&TagValue::List(vec![]))); // raw "600" < 7-tuple
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(block, ByteOrder::Big, false, &mut em_n);
+  assert_eq!(find(&em_n, "AFFrameSize"), Some(&s("600")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600")));
+}
+
+/// A 24-byte contrast-detect record (elements 0..=11): NumAFPoints=1, areaW (element
+/// 11, bytes 22..24) = 64 ≠ 0 ⇒ contrast-detect, but element 12 (bytes 24..26, areaH)
+/// is ABSENT — AFAreaSize's `int16u[2]` ends mid-pair.
+const AFINFO_K3III_PARTIAL_AREASIZE: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x01, // 3  NumAFPoints = 1
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, 0x58, // 7  frameW = 600
+  0x01, 0x90, // 8  frameH = 400
+  0x01, 0x2c, // 9  X = 300
+  0x00, 0xc8, // 10 Y = 200
+  0x00, 0x40, // 11 areaW = 64 (contrast-detect; record ends here — element 12 absent)
+];
+
+#[test]
+fn af_info_k3iii_partial_area_size_keeps_single_int16u() {
+  // AFAreaSize is a FIXED `int16u[2]` at element 11 (byte 22), gated on
+  // NumAFPoints>0 AND `$$valPt !~ /^\0\0\0\0/`. `$$valPt` is the AVAILABLE leaf
+  // bytes (here 2: 0x00 0x40), which cannot match the 4-NUL regex ⇒ Condition
+  // passes; ReadValue then shortens the pair to the single readable int16u (64).
+  // Oracle (bundled, 24-byte record): AFAreaSize='64' (`-n` '64'). A 4-byte-fixed
+  // `$$valPt` slice or a both-present guard would have wrongly suppressed it.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREASIZE, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400")));
+  assert_eq!(find(&em, "AFAreaSize"), Some(&s("64")));
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_PARTIAL_AREASIZE,
+    ByteOrder::Big,
+    false,
+    &mut em_n,
+  );
+  assert_eq!(find(&em_n, "AFAreaSize"), Some(&s("64")));
+}
+
+/// A FULL `%AFInfoK3III` record (28 bytes, element 7 = byte 14 readable) with
+/// NumAFPoints=0. Differs from `AFINFO_K3III_COMPLETE` only at element 3.
+const AFINFO_K3III_NUM_ZERO_PRESENT: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x00, // 3  NumAFPoints = 0
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, 0x58, // 7
+  0x01, 0x90, // 8
+  0x01, 0x2c, // 9
+  0x00, 0xc8, // 10
+  0x00, 0x00, // 11
+  0x00, 0x00, // 12
+  0x00, 0x14, // 13
+];
+
+#[test]
+fn af_info_k3iii_num_af_points_zero_present_record_emits_empty_afareas() {
+  // %AFInfoK3III gives AFAreas (7.1) NO Condition — only AFFrameSize (7) and
+  // AFAreaSize (11) gate on `$$self{NumAFPoints} > 0`. For a PRESENT record
+  // (element 7 = byte 14 within the data) with NumAFPoints==0, ExifTool evaluates
+  // AFAreas's `int16u[7 * $val{3}]` = int16u[0]: ReadValue's `unless($count){return ''
+  // if defined $count ...}` returns the DEFINED empty value, so the AFAreas tag IS
+  // handled. Its PrintConv `AFAreasK3III('')` then hits `return '(none)' unless $val`.
+  //
+  // Oracle (bundled ExifTool 13.59, ProcessBinaryData on this record): PrintConv ⇒
+  // `AFAreas = (none)`; `-n` ⇒ `AFAreas = ''` (empty). AFFrameSize/AFAreaSize are
+  // both suppressed by the NumAFPoints>0 Condition. (Contrast the truncated-record
+  // case below, where element 7 is ABSENT and AFAreas is skipped entirely.)
+  let mut em = Vec::new();
+  emit_af_info_k3iii(AFINFO_K3III_NUM_ZERO_PRESENT, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "AFAreas"), Some(&s("(none)")));
+  assert!(find(&em, "AFFrameSize").is_none());
+  assert!(find(&em, "AFAreaSize").is_none());
+
+  // `-n`: AFAreas is the raw empty value (no PrintConv ⇒ not `(none)`).
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_NUM_ZERO_PRESENT,
+    ByteOrder::Big,
+    false,
+    &mut em_n,
+  );
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+  assert!(find(&em_n, "AFFrameSize").is_none());
+  assert!(find(&em_n, "AFAreaSize").is_none());
+}
+
+#[test]
+fn af_info_k3iii_num_af_points_zero_truncated_before_area_skips_afareas() {
+  // The other half of the NumAFPoints==0 case: when the record stops BEFORE element
+  // 7 (byte 14), `$more = $size - 14 <= 0` ⇒ ProcessBinaryData reaches `last` and
+  // emits NO AFAreas tag (the row start is outside the data). This is the row-bound
+  // skip, distinct from the present-zero-count empty value above. The first 7
+  // elements of `AFINFO_K3III_NUM_ZERO_PRESENT` truncated to 14 bytes.
+  let block = &AFINFO_K3III_NUM_ZERO_PRESENT[..14];
+  let mut em = Vec::new();
+  emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
+  assert!(find(&em, "AFAreas").is_none());
+  assert!(find(&em, "AFFrameSize").is_none());
+  assert!(find(&em, "AFAreaSize").is_none());
+}
+
+/// A 15-byte `%AFInfoK3III` record (elements 0..=6 whole, plus the lone byte 14 =
+/// the AFAreas row START) with NumAFPoints=0. Byte 14 is present but byte 15 is
+/// ABSENT — element 7 is NOT a complete int16u. This is the exact one-byte boundary
+/// where the row IS dispatched (`$more = 15 - 14 = 1 > 0`) but no full int16u exists.
+const AFINFO_K3III_ROW_START_ONLY_NUM_ZERO: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x00, // 3  NumAFPoints = 0
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, //       byte 14 = the AFAreas row start (byte 15 absent — element 7 incomplete)
+];
+
+#[test]
+fn af_info_k3iii_row_start_only_num_zero_emits_empty_afareas() {
+  // The one-byte boundary the #393 fix targets: a 15-byte record exposes byte 14
+  // (the AFAreas row start) but NOT byte 15, so `u16_at(7)` would be None — yet
+  // ProcessBinaryData dispatches the row on `$more = $size - 14 = 1 > 0`, and for
+  // NumAFPoints==0 ReadValue's `unless($count){ return '' if defined $count }`
+  // returns the DEFINED empty value BEFORE checking that a full int16u fits. So
+  // AFAreas MUST emit empty here (`(none)` PrintConv / `""` -n), NOT be skipped.
+  // Ground-truthed against bundled ExifTool 13.59: ReadValue(count=0, size=1) ⇒ ''.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_ROW_START_ONLY_NUM_ZERO,
+    ByteOrder::Big,
+    true,
+    &mut em,
+  );
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "AFAreas"), Some(&s("(none)")));
+  // AFFrameSize/AFAreaSize stay suppressed by the NumAFPoints>0 Condition.
+  assert!(find(&em, "AFFrameSize").is_none());
+  assert!(find(&em, "AFAreaSize").is_none());
+
+  // `-n`: AFAreas is the raw empty value (no PrintConv ⇒ not `(none)`).
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_ROW_START_ONLY_NUM_ZERO,
+    ByteOrder::Big,
+    false,
+    &mut em_n,
+  );
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+}
+
+/// Same 15-byte row-start-only record but with NumAFPoints=1 (count = 7*1 = 7).
+const AFINFO_K3III_ROW_START_ONLY_NUM_ONE: &[u8] = &[
+  0x00, 0x00, // 0  AFMode = 0
+  0x00, 0x01, // 1  AFSelectionMode = 0x1
+  0x00, 0x65, // 2  MaxNumAFPoints = 101
+  0x00, 0x01, // 3  NumAFPoints = 1
+  0x00, 0x00, // 4
+  0x00, 0x00, // 5
+  0x00, 0x00, // 6
+  0x02, //       byte 14 = row start only
+];
+
+#[test]
+fn af_info_k3iii_row_start_only_num_one_skips_afareas() {
+  // The complementary half of the byte-14 boundary: with NumAFPoints>0 the count is
+  // 7 (>0), so ReadValue shortens it to `int($more/2) = int(1/2) = 0` whole int16u
+  // and `$count < 1 and return undef` — ProcessBinaryData's `next unless defined
+  // $val` then SKIPS the tag. So byte 14 ALONE with NumAFPoints>0 emits no AFAreas
+  // (distinct from the NumAFPoints==0 defined-empty case above). Ground-truthed:
+  // ReadValue(count=7, size=1) ⇒ undef.
+  let mut em = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_ROW_START_ONLY_NUM_ONE,
+    ByteOrder::Big,
+    true,
+    &mut em,
+  );
+  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert!(find(&em, "AFAreas").is_none());
+  // AFFrameSize (fixed int16u[2] at element 7) also shortens to 0 whole int16u here
+  // (only byte 14) ⇒ ReadValue undef ⇒ skipped.
+  assert!(find(&em, "AFFrameSize").is_none());
+  assert!(find(&em, "AFAreaSize").is_none());
+
+  let mut em_n = Vec::new();
+  emit_af_info_k3iii(
+    AFINFO_K3III_ROW_START_ONLY_NUM_ONE,
+    ByteOrder::Big,
+    false,
+    &mut em_n,
+  );
+  assert!(find(&em_n, "AFAreas").is_none());
+}
+
+#[test]
+fn af_info_k3iii_contrast_detect_emits_afareasize() {
+  // areaW/areaH non-zero (bytes 22..26 not all zero) ⇒ contrast-detect ⇒ the
+  // `$$valPt !~ /^\0\0\0\0/` half of the AFAreaSize Condition passes and
+  // AFAreaSize emits (elements 11,12, `s/ /x/`). Confirms the truncation guard
+  // leaves the contrast-detect path intact. Element 11 (areaW, bytes 22..24) = 64
+  // and element 12 (areaH, bytes 24..26) = 48; the rest matches the complete
+  // record, so bytes 22..26 are no longer all-zero ⇒ contrast-detect.
+  let block: &[u8] = &[
+    0x00, 0x00, // 0  AFMode = 0
+    0x00, 0x01, // 1  AFSelectionMode = 0x1
+    0x00, 0x65, // 2  MaxNumAFPoints = 101
+    0x00, 0x01, // 3  NumAFPoints = 1
+    0x00, 0x00, // 4
+    0x00, 0x00, // 5
+    0x00, 0x00, // 6
+    0x02, 0x58, // 7  frameW = 600
+    0x01, 0x90, // 8  frameH = 400
+    0x01, 0x2c, // 9  X = 300
+    0x00, 0xc8, // 10 Y = 200
+    0x00, 0x40, // 11 areaW = 64
+    0x00, 0x30, // 12 areaH = 48
+    0x00, 0x14, // 13 flags = 0x14
+  ];
+  let mut em = Vec::new();
+  emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
+  assert_eq!(find(&em, "AFAreaSize"), Some(&s("64x48")));
+}
+
+#[test]
+fn push_af_areas_k3iii_empty_value_render() {
+  // The AFAreasK3III PrintConv `return '(none)' unless $val` keys off the RAW value,
+  // and runs ONLY in PrintConv mode. The faithful renderings of a zero-count run:
+  //   PrintConv (`-j`): the empty raw value ⇒ `(none)` SCALAR.
+  //   `-n`:             no PrintConv ⇒ the raw value itself, the empty string `""`.
+  // (Bundled ExifTool on a NumAFPoints==0 record: `AFAreas=(none)` vs `AFAreas=''`.)
+  let mut em_j = Vec::new();
+  push_af_areas_k3iii(&[], true, &mut em_j);
+  assert_eq!(find(&em_j, "AFAreas"), Some(&s("(none)")));
+  let mut em_n = Vec::new();
+  push_af_areas_k3iii(&[], false, &mut em_n);
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+}
+
+#[test]
+fn push_af_areas_k3iii_short_nonempty_run_is_empty_list_not_none() {
+  // A NON-empty raw value shorter than one 7-tuple passes `unless $val` (it is
+  // truthy) and falls through to the loop, which produces no `"X,Y(flags)"` string
+  // ⇒ the empty ARRAYREF `[]` (NOT `(none)`, which is only for an empty value).
+  // Under `-n` it is the space-joined raw run. Pins the `(none)`-vs-`[]` boundary.
+  let mut em_j = Vec::new();
+  push_af_areas_k3iii(&[600, 400, 300], true, &mut em_j);
+  assert_eq!(find(&em_j, "AFAreas"), Some(&TagValue::List(vec![])));
+  let mut em_n = Vec::new();
+  push_af_areas_k3iii(&[600, 400, 300], false, &mut em_n);
+  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600 400 300")));
 }

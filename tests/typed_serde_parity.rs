@@ -227,14 +227,10 @@ const NOT_ACTIVE: &[&str] = &[
   // `-G1` golden is not byte-exact. Accept-deferred to #352 (the SubIFD walk);
   // the CR2 + ARW members of this set ARE active (the IFD0:PreviewImage proof).
   "DNG_preview_image.dng",
-  // The two Pentax PEF (`.pef`) RAW fixtures (#393/#401) ship with paired
-  // `.json`/`.n.json` goldens but their conformance tests are `#[ignore]`d pending
-  // the PEF/Pentax-variant decode port — exifast does not yet emit the full tag
-  // set bundled extracts from these bodies. Accept-deferred here so the auto-
-  // discovered active set stays at `EXPECTED_ACTIVE_FIXTURES`; the in-flight #393
-  // port will move them to active once the variants decode byte-exact.
-  "PEF_pentax_k3_mark_iii.pef",
-  "PEF_pentax_istd.pef",
+  // (The two Pentax PEF fixtures #393/#401 — K-3 Mark III + *ist D — are now
+  // ACTIVE: #393 ported their MakerNote variants byte-exact, so they moved out of
+  // NOT_ACTIVE into the active set with per-fixture FIXTURE_EXCLUDED_KEYS for the
+  // non-MakerNote residuals.)
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
@@ -395,6 +391,42 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Pentax:PixelShiftResolution",
       "Pentax:ShutterType",
       "Pentax:SkinToneCorrection",
+    ],
+  ),
+  // #393 — the K-3 Mark III PEF. The K-3III MakerNote variants are ported
+  // byte-exact; the residuals are the NON-MakerNote container tags (the unported
+  // `ExifIFD:CFAPattern`; the PEF IFD2 JpgFromRaw raw-image chain — bundled
+  // `IFD2:JpgFromRaw*` vs the port's `IFD2:ThumbnailOffset/Length` +
+  // `ExifTool:Warning`, dropped from both; the deferred `Pentax:PreviewImage`/
+  // `PreviewImageStart` IsOffset binary). MIRRORS `conformance.rs::
+  // pef_pentax_k3_mark_iii_conformance`'s `K3III_PEF_DEFERRED`.
+  (
+    "PEF_pentax_k3_mark_iii.pef",
+    &[
+      "ExifIFD:CFAPattern",
+      "IFD2:JpgFromRaw",
+      "IFD2:JpgFromRawStart",
+      "IFD2:JpgFromRawLength",
+      "IFD2:ThumbnailOffset",
+      "IFD2:ThumbnailLength",
+      "ExifTool:Warning",
+      "Pentax:PreviewImage",
+      "Pentax:PreviewImageStart",
+    ],
+  ),
+  // #393 — the *ist D PEF. The OLD-format MakerNote is ported byte-exact; the
+  // residuals are `Composite:LensID` (the camera Composite subsystem, deferred
+  // port-wide), the unported `ExifIFD:CFAPattern`, and the
+  // `Pentax:PreviewImage`/`PreviewImageStart`/`ToneCurve` IsOffset/binary leaves.
+  // MIRRORS `conformance.rs::pef_pentax_istd_conformance`'s `ISTD_PEF_DEFERRED`.
+  (
+    "PEF_pentax_istd.pef",
+    &[
+      "Composite:LensID",
+      "ExifIFD:CFAPattern",
+      "Pentax:PreviewImage",
+      "Pentax:PreviewImageStart",
+      "Pentax:ToneCurve",
     ],
   ),
   // #205 — the PNG raw-profile-XMP diagnostics walk-order fixture. The invalid
@@ -1271,7 +1303,16 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///     `XMP-dc:Format` keeps its EXPLICIT `XMP-dc` family-1 group (NOT `Trailer`,
 ///     the `$grps[1] or …` short-circuit). No dropped keys (a plain golden).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 588;
+///
+/// 588 → 590 (#393) activates the two real-device Pentax PEF raw fixtures whose
+/// `K-3 Mark III` / `*ist D` MakerNote variants are now ported byte-exact (the
+/// `%BatteryInfo`/`%AFInfo` K-3III re-layouts, `%AFInfoK3III` (0x040c),
+/// `%FaceInfoK3III` (0x040b), `%PixelShiftInfo` (0x0243), `%TempInfo` (0x03ff), the
+/// `%LensInfo`-old (*istD) → `%LensData`, `0x003c AFPointsInFocus`, and the
+/// per-body Main scalars). The conformance arms exclude only the non-MakerNote
+/// container residuals (CFAPattern / the PEF IFD2 JpgFromRaw chain / IsOffset
+/// binary previews), see `conformance.rs::pef_pentax_{k3_mark_iii,istd}_conformance`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 590;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

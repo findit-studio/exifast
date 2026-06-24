@@ -12217,25 +12217,90 @@ fn makernotes_samsung_nx1_conformance() {
 }
 
 // #393 — Pentax K-3 Mark III: AFInfoK3III, BatteryInfo re-layout, LevelInfo, FaceInfo
+// #393 — Pentax K-3 Mark III PEF. The MakerNote `K-3 Mark III` variants are now
+// byte-exact: the `%BatteryInfo` re-layout (PowerSource/PowerAvailable +
+// Body/Grip BatteryState/Percent/Voltage, the int32u voltage `$val*4e-8+0.27219`),
+// the `%AFInfo` K-3III leaves (AFPointsSelected via the 101-point grid, LiveView,
+// First/ActionInAFC, AFCHold/PointTracking/Sensitivity, SubjectRecognition), the
+// `%AFInfoK3III` (0x040c — AFMode/AFSelectionMode/MaxNum/NumAFPoints + AFFrameSize/
+// AFAreas/AFAreaSize), the `%FaceInfoK3III` (0x040b — FaceImageSize/CAFArea/
+// FacesDetectedA/B), `%PixelShiftInfo` (0x0243) and `%TempInfo` (0x03ff — ShotNumber
+// `$val+1` + SensorTemperature), plus the K-3III Main scalars (ContrastHighlight-
+// ShadowAdj/ISOAutoMinSpeed/WhiteLevel/ShutterType/SkinToneCorrection).
+//
+// `K3III_PEF_DEFERRED` are the NON-MakerNote residuals (out of #393 scope): the
+// `ExifIFD:CFAPattern` (the `%cfaPattern` PrintConv is unported — also deferred for
+// `NikonD2Hs.jpg`); the PEF IFD2 raw-image chain — bundled resolves the IFD2 0x111/
+// 0x117 pair to `JpgFromRaw*` (the `%Exif::Main` 0x111 JpgFromRaw arm + the PEF
+// raw-IFD `SubfileType` DataMember, a #331-family raw-IFD concern), whereas the
+// port resolves them to `IFD2:ThumbnailOffset/Length` and (because the JpgFromRaw
+// blob lies past the truncated fixture) raises the `runs past the EXIF data`
+// Warning — so the bundled `JpgFromRaw*` AND the port's `ThumbnailOffset/Length` +
+// `ExifTool:Warning` are dropped from both sides; and the `Pentax:PreviewImage`/
+// `PreviewImageStart` IsOffset binary extraction (a deferred #331 P2/P3 item, also
+// excluded for `Pentax.jpg`). The MakerNote camera-identity surface is fully active.
 #[test]
-#[ignore]
 fn pef_pentax_k3_mark_iii_conformance() {
-  check(
+  check_excluding(
     "PEF_pentax_k3_mark_iii.pef",
     "PEF_pentax_k3_mark_iii.pef.json",
     true,
+    K3III_PEF_DEFERRED,
   );
-  check(
+  check_excluding(
     "PEF_pentax_k3_mark_iii.pef",
     "PEF_pentax_k3_mark_iii.pef.n.json",
     false,
+    K3III_PEF_DEFERRED,
   );
 }
 
-// #393 — Pentax *ist D: raw BatteryInfo variant, AFPointSelected variants
+const K3III_PEF_DEFERRED: &[&str] = &[
+  "ExifIFD:CFAPattern",
+  "IFD2:JpgFromRaw",
+  "IFD2:JpgFromRawStart",
+  "IFD2:JpgFromRawLength",
+  "IFD2:ThumbnailOffset",
+  "IFD2:ThumbnailLength",
+  "ExifTool:Warning",
+  "Pentax:PreviewImage",
+  "Pentax:PreviewImageStart",
+];
+
+// #393 — Pentax *ist D PEF. The OLD-format MakerNote is now byte-exact: the
+// `%LensInfo` (0x0207 count-36) → `%LensData` at offset 3 (AutoAperture/MinAperture/
+// LensFStops/MinFocusDistance/FocusRangeIndex/LensFocalLength/NominalMax/MinAperture),
+// the `0x003c AFPointsInFocus` (`$val & 0x7ff` + the 11-point BITMASK), the *istD
+// Main scalars (PentaxImageSize/FrameNumber/SensorSize/ImageAreaOffset/RawImageSize/
+// ColorMatrixA/B), and the `0x001f/0x0020/0x0021` array-PrintConv pair (`Saturation`/
+// `Contrast`/`Sharpness` → `"0 (normal); 0"`). The `Pentax:LensType` ("A Series
+// Lens") and the `ExifTool:Warning` ("Bad IFD2 directory") are both byte-exact.
+//
+// `ISTD_PEF_DEFERRED` are the residuals: `Composite:LensID` (the camera Composite
+// subsystem builds it from `Pentax:LensType`, but `Composite:LensID` stays deferred
+// port-wide — also excluded for `Pentax.jpg`); the `ExifIFD:CFAPattern` (unported
+// `%cfaPattern`, as above); and the `Pentax:PreviewImage`/`PreviewImageStart`/
+// `ToneCurve` IsOffset/binary leaves (the deferred #331 binary-extraction items).
 #[test]
-#[ignore]
 fn pef_pentax_istd_conformance() {
-  check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.json", true);
-  check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.n.json", false);
+  check_excluding(
+    "PEF_pentax_istd.pef",
+    "PEF_pentax_istd.pef.json",
+    true,
+    ISTD_PEF_DEFERRED,
+  );
+  check_excluding(
+    "PEF_pentax_istd.pef",
+    "PEF_pentax_istd.pef.n.json",
+    false,
+    ISTD_PEF_DEFERRED,
+  );
 }
+
+const ISTD_PEF_DEFERRED: &[&str] = &[
+  "Composite:LensID",
+  "ExifIFD:CFAPattern",
+  "Pentax:PreviewImage",
+  "Pentax:PreviewImageStart",
+  "Pentax:ToneCurve",
+];
