@@ -560,6 +560,191 @@ impl SubDirKind {
   }
 }
 
+// ====================================================================// Deferred SubDirectory descent — emission-position record (#176)
+// ====================================================================
+/// Which kind of deferred SubDirectory a [`DeferredSubdir`] record describes —
+/// the two ExifIFD SubDirectories whose leaves emit AFTER the parent IFD's
+/// direct leaves (`ProcessExif`'s deferred `@subdirs` pass) and whose relative
+/// emission order is the parent's on-disk pointer order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredKind {
+  /// The `0x927c` MakerNote — its vendor leaves live in the captured
+  /// [`MakerNote`]'s cached emissions (NOT in [`Walker::entries`]).
+  MakerNote,
+  /// The `0xa005` InteropIFD — its leaves are walked INLINE into
+  /// [`Walker::entries`] (`ifd() == IfdKind::Interop`).
+  Interop,
+  /// A ZERO-WIDTH position marker recorded when the parent's `0x8769` ExifIFD
+  /// SubDirectory pointer is DISPATCHED (NOT a leaf-bearing subdir). It carries
+  /// [`DeferredSubdir::dispatch_index`] — `self.entries.len()` captured at the
+  /// instant `dispatch_subdir` walked that pointer, BEFORE recursing into the
+  /// ExifIFD — i.e. the exact entry-stream position where the ExifIFD's content
+  /// begins, AFTER any earlier same-block subdirectory leaves (a `GPSInfo`
+  /// `0x8825` walked before `0x8769`). [`push_exif_tags`](ExifMeta::push_exif_tags)
+  /// uses it to splice an EMPTY MakerNote parent (an ExifIFD holding only the
+  /// `0x927c` pointer — no direct leaves, no Interop) at the RECORDED ExifIFD
+  /// dispatch position, preserving same-block `GPSInfo`-before-`ExifOffset`
+  /// pointer order instead of approximating it from this block's IFD0 leaves.
+  /// Keyed (like the MakerNote/Interop records) by `(source_block, parent,
+  /// parent_ifd_start)`, with `parent == IfdKind::ExifIfd` and `parent_ifd_start`
+  /// the DESCENDED ExifIFD body offset — i.e. the MakerNote record's own
+  /// `parent_ifd_start`, so the empty-parent lookup matches it directly. NEVER
+  /// emits a tag and is EXCLUDED from the pointer-ordered deferred-subdir pass.
+  ExifIfdAnchor,
+}
+
+/// One deferred SubDirectory descent recorded at walk time so the emission
+/// path ([`ExifMeta::push_exif_tags`]) can reproduce ExifTool's order (#176).
+///
+/// ExifTool's `ProcessExif` descends a directory's SubDirectories in a DEFERRED
+/// pass AFTER emitting that directory's direct leaves, walking the deferred
+/// subdirs in ENTRY (on-disk) order. The `0x927c` MakerNote and the ExifIFD's
+/// `0xa005` InteropIFD are BOTH ExifIFD SubDirectories; `exiftool -G1 -j`
+/// GROUP-SORTs (`Sort => 'Group1'`), so the WHOLE ExifIFD direct-leaf group
+/// precedes the deferred-subdir groups, and the deferred groups themselves
+/// follow in their parent's on-disk pointer order (MakerNote before InteropIFD
+/// when `0x927c < 0xa005`, the reverse when a crafted IFD orders them the other
+/// way). Recording each pointer's `(parent, pointer_index)` lets the emitter
+/// order the deferred groups by their ACTUAL recorded positions rather than a
+/// fixed MakerNote-first bucket.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredSubdir {
+  /// The IFD the SubDirectory POINTER sat in (the `DirName` the `ProcessExif`
+  /// call ran under) — `(parent, parent_ifd_start)` is the parent walk's
+  /// identity. Almost always [`IfdKind::ExifIfd`]. Paired with
+  /// [`parent_ifd_start`](Self::parent_ifd_start) to distinguish duplicate
+  /// same-label parents (the `DataTagPair` `(ifd_start, ifd)` pattern).
+  parent: IfdKind,
+  /// The buffer-relative start offset of the parent IFD body (`ifd_start`) —
+  /// the other half of the parent-walk identity. Two pointers descended from
+  /// the SAME parent walk share this; a crafted file with two distinct ExifIFD
+  /// bodies has two different values.
+  parent_ifd_start: usize,
+  /// The on-disk ENTRY INDEX of the SubDirectory pointer within the parent IFD
+  /// (`$index`, the `$dirStart + 2 + 12*$index` slot, `Exif.pm:6452`) — the
+  /// sort key for the deferred-subdir emission order.
+  pointer_index: usize,
+  /// The buffer-relative start offset of the DESCENDED sub-IFD body — for an
+  /// `Interop` record the InteropIFD body (`$val`, the pointer's target), which
+  /// equals the [`ExifEntry::own_ifd_start`] of every leaf walked INLINE from
+  /// that descent. [`push_exif_tags`](ExifMeta::push_exif_tags) matches the
+  /// region's `0xa005` leaves to THIS specific InteropIFD instance by it, so two
+  /// ExifIFD walks in one block (each with its own InteropIFD) keep their leaves
+  /// apart. For a `MakerNote` record it is the captured blob's value offset
+  /// (the MakerNote leaves live in the [`MakerNote`] cache, NOT in
+  /// [`Walker::entries`], so it is never matched against an entry — recorded for
+  /// symmetry / debugging).
+  subdir_ifd_start: usize,
+  /// The SOURCE-BLOCK ordinal — the index of the independent TIFF block this
+  /// pointer's parent walk ran in when several `APP1` Exif blocks are MERGED
+  /// (a multi-`APP1` JPEG). `0` for a standalone / embedded TIFF and the first
+  /// block; the JPEG front-end ([`jpeg::merge_exif_block`]) re-stamps each kept
+  /// block's records so [`push_exif_tags`](ExifMeta::push_exif_tags) matches the
+  /// record to the [`ExifEntry::source_block`] of the SAME block's entries — the
+  /// concrete source identity tying the deferred-subdir selection and the
+  /// MakerNote splice to ONE block (block-relative `parent_ifd_start` alone is
+  /// ambiguous across blocks with identically-laid-out ExifIFDs).
+  source_block: u32,
+  /// The zero-width ExifIFD-dispatch anchor: `self.entries.len()` captured the
+  /// instant the parent's `0x8769` ExifIFD pointer was DISPATCHED, before the
+  /// ExifIFD walk pushed any of its own leaves. Meaningful ONLY for a
+  /// [`DeferredKind::ExifIfdAnchor`] record — the exact entry-stream index where
+  /// this ExifIFD's content begins (after any earlier same-block subdir leaves,
+  /// e.g. a `GPSInfo` `0x8825` dispatched before `0x8769`). It equals the
+  /// non-empty path's `region_start` when the ExifIFD has direct/Interop leaves
+  /// (the first such leaf lands at exactly this index), and gives the EMPTY-parent
+  /// splice its recorded position. `0` (unused) for `MakerNote`/`Interop` records.
+  dispatch_index: usize,
+  /// Which deferred SubDirectory this records.
+  kind: DeferredKind,
+}
+
+impl DeferredSubdir {
+  /// The IFD the pointer sat in.
+  #[must_use]
+  #[inline(always)]
+  const fn parent(&self) -> IfdKind {
+    self.parent
+  }
+
+  /// The parent IFD body's buffer-relative start offset.
+  #[must_use]
+  #[inline(always)]
+  const fn parent_ifd_start(&self) -> usize {
+    self.parent_ifd_start
+  }
+
+  /// The on-disk entry index of the pointer within the parent (the order key).
+  #[must_use]
+  #[inline(always)]
+  const fn pointer_index(&self) -> usize {
+    self.pointer_index
+  }
+
+  /// The descended sub-IFD body's buffer-relative start offset (the InteropIFD
+  /// body for an `Interop` record — the [`ExifEntry::own_ifd_start`] of its
+  /// inline leaves).
+  #[must_use]
+  #[inline(always)]
+  const fn subdir_ifd_start(&self) -> usize {
+    self.subdir_ifd_start
+  }
+
+  /// The source-block ordinal (the merged `APP1` block whose parent walk
+  /// recorded this pointer — `0` for a standalone TIFF / the first block).
+  #[must_use]
+  #[inline(always)]
+  const fn source_block(&self) -> u32 {
+    self.source_block
+  }
+
+  /// The zero-width ExifIFD-dispatch anchor (the entry-stream index where this
+  /// ExifIFD's content begins) — meaningful only for a
+  /// [`DeferredKind::ExifIfdAnchor`] record.
+  #[must_use]
+  #[inline(always)]
+  const fn dispatch_index(&self) -> usize {
+    self.dispatch_index
+  }
+
+  /// Re-stamp this record's [`source_block`](Self::source_block) ordinal — used
+  /// by the JPEG front-end ([`jpeg::merge_exif_block`]) when it adopts a block's
+  /// MakerNote + its deferred records together (atomically), so the record
+  /// carries the SAME block identity as that block's emitted entries.
+  #[inline(always)]
+  fn set_source_block(&mut self, block: u32) {
+    self.source_block = block;
+  }
+
+  /// Rebase this record's block-LOCAL [`dispatch_index`](Self::dispatch_index)
+  /// onto the MERGED entry stream — used by the JPEG front-end
+  /// ([`jpeg::merge_exif_block`]) when it adopts a later `APP1` block's deferred
+  /// records. [`dispatch_index`](Self::dispatch_index) is captured as
+  /// `self.entries.len()` while parsing ONE block in ISOLATION, so it indexes
+  /// THAT block's local entries vector. The merge appends each block's entries
+  /// AFTER all prior blocks' entries, so the block's ExifIFD content actually
+  /// begins at `base + dispatch_index` in the merged `self.entries` — where
+  /// `base` is the count of all earlier blocks' entries (the merged length at
+  /// the instant this block's entries are about to be appended). Adding `base`
+  /// turns the block-local index into the GLOBAL merged index
+  /// [`push_exif_tags`](ExifMeta::push_exif_tags) uses to splice an EMPTY
+  /// MakerNote parent (#176-B). Only meaningful for a
+  /// [`DeferredKind::ExifIfdAnchor`] record; the other kinds' `dispatch_index`
+  /// is unused (`0`), so the caller applies this only to anchors. A `base` of
+  /// `0` (the first/only block) leaves the index unchanged.
+  #[inline(always)]
+  fn rebase_dispatch_index(&mut self, base: usize) {
+    self.dispatch_index = self.dispatch_index.saturating_add(base);
+  }
+
+  /// Which deferred SubDirectory this records.
+  #[must_use]
+  #[inline(always)]
+  const fn kind(&self) -> DeferredKind {
+    self.kind
+  }
+}
+
 // ====================================================================// Typed value carrier — `ExifValue<'a>`
 // ====================================================================
 /// One decoded Exif/GPS tag value — the post-Format-decode, pre-conversion
@@ -635,6 +820,33 @@ pub struct ExifEntry {
   /// `NikonEntry { value_size: total_size }`. Ignored by every consumer but the
   /// vendor span re-slice.
   value_size: usize,
+  /// The buffer-relative start offset of the IFD body this entry was emitted
+  /// from (`ifd_start`) — its OWN containing directory. Paired with
+  /// [`source_block`](Self::source_block) so [`push_exif_tags`](ExifMeta::push_exif_tags)
+  /// can anchor the MakerNote splice to the EXACT recorded ExifIFD-walk instance
+  /// (the kept `0x927c` record's `(source_block, parent_ifd_start)`): an ExifIFD
+  /// DIRECT leaf carries the ExifIFD body's `ifd_start` (== that record's
+  /// `parent_ifd_start`), while an INLINE-descended `0xa005` InteropIFD leaf
+  /// carries the InteropIFD body's `ifd_start` (== that descent's
+  /// [`DeferredSubdir::subdir_ifd_start`]). So the splice distinguishes TWO
+  /// ExifIFD walks within ONE block — a crafted IFD0 with two `0x8769` pointers
+  /// at DISTINCT offsets — which `IfdKind` alone collapses, and never swallows a
+  /// sibling instance's leaves. The IFD0 body offset (`8` for a normal
+  /// standalone TIFF) for an IFD0 leaf; never serialized (an emission-ordering
+  /// aid only — VALUES stay byte-identical).
+  own_ifd_start: usize,
+  /// The SOURCE-BLOCK ordinal — the index of the independent TIFF block this
+  /// entry was extracted from when several are MERGED into one [`ExifMeta`]
+  /// (a multi-`APP1` JPEG: each independent `APP1` Exif segment is its own
+  /// self-contained TIFF, concatenated in file order). `0` for a standalone /
+  /// embedded TIFF (the single-block case) and for the FIRST merged block; the
+  /// JPEG front-end ([`jpeg::merge_exif_block`]) re-stamps each later block's
+  /// entries with its own ordinal so [`push_exif_tags`](Self::push_exif_tags)
+  /// can scope the MakerNote splice to the entries of the block whose MakerNote
+  /// it actually kept — `IfdKind` + block-relative `ifd_start` ALONE do not
+  /// distinguish two `APP1` blocks' identically-laid-out ExifIFDs. Never
+  /// serialized (an emission-ordering aid only — VALUES stay byte-identical).
+  source_block: u32,
   /// The conversion ExifTool applies to this tag at serialize time.
   conv: ResolvedConv,
 }
@@ -705,6 +917,36 @@ impl ExifEntry {
   #[inline(always)]
   pub const fn value_size(&self) -> usize {
     self.value_size
+  }
+
+  /// The buffer-relative start offset of this entry's OWN containing IFD body —
+  /// the ExifIFD body for an ExifIFD direct leaf, the InteropIFD body for an
+  /// inline-descended `0xa005` leaf. Used by
+  /// [`push_exif_tags`](ExifMeta::push_exif_tags) to anchor the MakerNote splice
+  /// to the exact recorded ExifIFD-walk instance; never serialized.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn own_ifd_start(&self) -> usize {
+    self.own_ifd_start
+  }
+
+  /// The source-block ordinal (the merged `APP1` Exif block this entry came
+  /// from — `0` for a standalone TIFF / the first block). Used by
+  /// [`push_exif_tags`](ExifMeta::push_exif_tags) to scope the MakerNote splice
+  /// to its recorded parent block; never serialized.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn source_block(&self) -> u32 {
+    self.source_block
+  }
+
+  /// Re-stamp this entry's [`source_block`](Self::source_block) ordinal — used
+  /// by the JPEG front-end ([`jpeg::merge_exif_block`]) as it concatenates each
+  /// independent `APP1` Exif block's entries into the merged stream, so the
+  /// emitter can later tie the MakerNote splice to the right block's ExifIFD run.
+  #[inline(always)]
+  pub(crate) fn set_source_block(&mut self, block: u32) {
+    self.source_block = block;
   }
 }
 
@@ -1789,6 +2031,14 @@ pub struct ExifMeta<'a> {
   /// parsing is deferred to the MakerNotes wave. Borrows from the input
   /// TIFF block — the sole reason `ExifMeta` carries a lifetime.
   maker_note: Option<MakerNote<'a>>,
+  /// Each deferred ExifIFD SubDirectory descent (`0x927c` MakerNote / `0xa005`
+  /// InteropIFD) with the on-disk pointer position that orders it (#176). Lets
+  /// [`push_exif_tags`](Self::push_exif_tags) emit the deferred-subdir groups
+  /// in the parent's recorded pointer order — MakerNote-before-InteropIFD for
+  /// the canonical `0x927c < 0xa005` layout, the reverse for a crafted IFD that
+  /// orders them the other way — matching bundled `exiftool -G1 -j`. EMPTY for
+  /// a file with neither a MakerNote nor an InteropIFD.
+  deferred_subdirs: Vec<DeferredSubdir>,
   /// The `PrintIMVersion` strings parsed from each PrintIM (`0xc4a5`)
   /// SubDirectory the IFD walk reached (`PrintIM.pm`'s `ProcessPrintIM`), in walk
   /// order. [`Taggable::tags`](crate::emit::Taggable::tags) emits each as a
@@ -2173,6 +2423,7 @@ impl<'a> ExifMeta<'a> {
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
     printim_versions: Vec<smol_str::SmolStr>,
+    deferred_subdirs: Vec<DeferredSubdir>,
   ) -> Self {
     // JPEG `APP1` Exif blocks come through `ProcessTIFF` with
     // `Parent='APP1'` (`ExifTool.pm:7779-7783`), so `TIFF_TYPE='APP1'` and
@@ -2186,6 +2437,7 @@ impl<'a> ExifMeta<'a> {
       byte_order,
       printim_versions,
       maker_note,
+      deferred_subdirs,
       multi_page_count: None,
       // The SOF dimension tags are attached AFTER construction by the JPEG
       // marker walk via [`set_jpeg_sof`](Self::set_jpeg_sof) once the first SOF
@@ -2418,13 +2670,17 @@ impl<'a> ExifMeta<'a> {
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
     Vec<smol_str::SmolStr>,
+    Vec<DeferredSubdir>,
   ) {
     // `multi_page_count` is dropped — the JPEG-merge path constructs the
     // merged `ExifMeta` via `from_jpeg_parts`, which always sets
     // `multi_page_count = None` (`Parent='APP1'`, not 'TIFF', so bundled
     // suppresses the emit). Restoring it on merge would be incorrect. The
     // PrintIM versions (IFD0 `0xc4a5`) DO thread through — a JPEG carries its
-    // PrintIM in the `APP1` Exif block, so it must survive the merge.
+    // PrintIM in the `APP1` Exif block, so it must survive the merge. The
+    // deferred-subdir records (#176) thread through alongside the MakerNote,
+    // adopted ATOMICALLY with it in [`merge_exif_block`] (same source block) so
+    // they describe the kept MakerNote's ExifIFD region.
     (
       self.entries,
       self.warnings,
@@ -2432,6 +2688,7 @@ impl<'a> ExifMeta<'a> {
       self.byte_order,
       self.maker_note,
       self.printim_versions,
+      self.deferred_subdirs,
     )
   }
 }
@@ -2960,6 +3217,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
@@ -3037,6 +3295,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
     multi_page_count,
     // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
@@ -3157,6 +3416,7 @@ fn parse_bigtiff<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
@@ -3213,6 +3473,7 @@ fn parse_bigtiff<'a>(
     // local `order`.
     byte_order: None,
     maker_note: w.maker_note,
+    deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
     // `File:PageCount` IS emitted for a BigTIFF whose IFD chain tripped `MultiPage`
     // (a `SubfileType == 2` / `OldSubfileType == 3` `RawConv` tap in `Walker::emit`,
@@ -3366,6 +3627,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     captured_model: None,
@@ -3422,6 +3684,7 @@ fn parse_tiff_with_base_shared<'a>(
     warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
@@ -3621,6 +3884,13 @@ struct Walker<'a, 'g> {
   warnings_ignorable: Vec<u8>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
+  /// Each deferred ExifIFD SubDirectory descent (`0x927c` MakerNote / `0xa005`
+  /// InteropIFD) recorded with the on-disk pointer position that orders it at
+  /// emission time (#176). Appended at dispatch time — the MakerNote record at
+  /// `0x927c` capture, the InteropIFD record at the `0xa005` descent — each
+  /// carrying its parent walk's `(parent, parent_ifd_start)` identity and the
+  /// pointer's entry index. Transferred to [`ExifMeta::deferred_subdirs`].
+  deferred_subdirs: Vec<DeferredSubdir>,
   /// The `PrintIMVersion` strings parsed from each PrintIM SubDirectory
   /// (`0xc4a5` in a core IFD, `PrintIM.pm`'s `ProcessPrintIM`) reached during the
   /// walk, in walk order. ExifTool's `%PrintIM::Main` emits `PrintIMVersion`
@@ -5337,7 +5607,20 @@ impl Walker<'_, '_> {
           self.dispatch_classic_subifd(value_offset, read_len, format, count);
         }
       } else {
-        self.dispatch_subdir(sub, value_offset, read_len, format, count);
+        // `kind`/`ifd_start` identify the PARENT IFD walk and `index` the
+        // on-disk pointer entry position — recorded by `dispatch_subdir` for the
+        // deferred `0x927c`/`0xa005` subdirs so the emitter can order them by
+        // their actual recorded positions (#176).
+        self.dispatch_subdir(
+          sub,
+          value_offset,
+          read_len,
+          format,
+          count,
+          kind,
+          ifd_start,
+          index,
+        );
       }
       // The SubDirectory was dispatched (recursed/captured) — a normal entry:
       // [`Step::Keep`].
@@ -6343,6 +6626,9 @@ impl Walker<'_, '_> {
     read_len: usize,
     format: Format,
     count: usize,
+    parent_ifd: IfdKind,
+    parent_ifd_start: usize,
+    pointer_index: usize,
   ) {
     match sub {
       SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop => {
@@ -6382,6 +6668,38 @@ impl Walker<'_, '_> {
         // an offset inside the TIFF header (< 8) or past EOF is degenerate;
         // `walk_one_ifd` bounds-checks and the reprocess guard handles a
         // self-pointer.
+        // Record the ZERO-WIDTH ExifIFD-dispatch anchor BEFORE recursing: the
+        // entry-stream position where THIS ExifIFD's content begins is exactly
+        // `self.entries.len()` at the instant the `0x8769` pointer is walked —
+        // AFTER any earlier same-block subdir leaves (a `GPSInfo` `0x8825`
+        // dispatched before `0x8769` has already pushed its leaves), BEFORE the
+        // ExifIFD walk pushes its own. `push_exif_tags` uses it to splice an
+        // EMPTY MakerNote parent (an ExifIFD holding only the `0x927c` pointer)
+        // at this recorded position rather than approximating from IFD0 leaves
+        // (#176-B). Keyed by `(source_block, ExifIfd, sub_offset)` so it matches
+        // the MakerNote record's own `parent_ifd_start` (the descended ExifIFD
+        // body). Pushed for EVERY ExifIFD descent; consulted only when a kept
+        // MakerNote's empty-parent splice needs it, and the JPEG merge adopts it
+        // only alongside the block whose MakerNote won. `sub_offset` is the
+        // post-`try_from` ExifIFD body offset = the MakerNote record's
+        // `parent_ifd_start`.
+        if matches!(sub, SubDirKind::ExifIfd) {
+          self.deferred_subdirs.push(DeferredSubdir {
+            parent: IfdKind::ExifIfd,
+            parent_ifd_start: sub_offset,
+            // Not pointer-sorted (excluded from the deferred-subdir pass).
+            pointer_index: 0,
+            // Not an Interop body; unused for an anchor.
+            subdir_ifd_start: 0,
+            // The zero-width anchor — captured BEFORE `process_subdir` so it
+            // precedes the ExifIFD's own leaves and trails earlier subdir leaves.
+            dispatch_index: self.entries.len(),
+            // Single walk = the first/only block; the JPEG merge re-stamps a
+            // later kept block's records (`set_source_block`).
+            source_block: 0,
+            kind: DeferredKind::ExifIfdAnchor,
+          });
+        }
         // Sub-IFDs are NOT chained via a next-IFD pointer (`MaxSubdirs => 1`
         // for GPS/Interop, `Exif.pm:2138`; ExifIFD is a single IFD too) —
         // walk exactly one IFD, through THE shared sub-directory entry point.
@@ -6399,6 +6717,32 @@ impl Walker<'_, '_> {
           FixBaseMode::No,
           ProcessProc::Exif,
         );
+        // Record the InteropIFD (`0xa005`) descent's on-disk pointer position so
+        // the emitter can order it against the `0x927c` MakerNote by their actual
+        // recorded positions (#176). Only `Interop` is a DEFERRED subdir whose
+        // leaves the emitter re-groups; ExifIFD/GPS descend at the IFD-walk top
+        // level (ExifIFD IS the parent here; GPS is IFD0's own deferred subdir
+        // that already trails the ExifIFD subtree by IFD-walk order). The record
+        // is keyed to the PARENT walk (`parent_ifd`, `parent_ifd_start`), not the
+        // descended `kind`. A descent that emitted no Interop leaf still records
+        // harmlessly — `push_exif_tags` keys on the presence of `Interop` entries.
+        if matches!(sub, SubDirKind::Interop) {
+          self.deferred_subdirs.push(DeferredSubdir {
+            parent: parent_ifd,
+            parent_ifd_start,
+            pointer_index,
+            // The InteropIFD body offset (`$val`) — the `own_ifd_start` of every
+            // leaf walked inline from this descent, so `push_exif_tags` matches
+            // the region's `0xa005` leaves to THIS InteropIFD instance.
+            subdir_ifd_start: sub_offset,
+            // Unused for an Interop record (only the `ExifIfdAnchor` carries it).
+            dispatch_index: 0,
+            // Single walk = the first/only block; the JPEG merge re-stamps a
+            // later kept block's records (`set_source_block`).
+            source_block: 0,
+            kind: DeferredKind::Interop,
+          });
+        }
       }
       SubDirKind::MakerNote => {
         // **MakerNotes Phase 1: identify vendor + capture `SubDirectory`
@@ -6986,6 +7330,27 @@ impl Walker<'_, '_> {
               cached_emissions_print_conv: cached_pc,
               value_conv_decode,
               emission_group1,
+            });
+            // Record the `0x927c` MakerNote's on-disk pointer position (#176) so
+            // the emitter can order the vendor block against the ExifIFD's
+            // `0xa005` InteropIFD by their actual recorded positions — keyed to
+            // the PARENT walk (`parent_ifd`, `parent_ifd_start`, almost always
+            // the ExifIFD). Recorded inside the first-wins `maker_note.is_none()`
+            // guard so it stays tied to the kept MakerNote.
+            self.deferred_subdirs.push(DeferredSubdir {
+              parent: parent_ifd,
+              parent_ifd_start,
+              pointer_index,
+              // The captured blob's value offset — the MakerNote's vendor leaves
+              // live in the `MakerNote` cache, never in `entries`, so this is
+              // never matched against an entry (recorded for symmetry).
+              subdir_ifd_start: value_offset,
+              // Unused for a MakerNote record (only the `ExifIfdAnchor` carries it).
+              dispatch_index: 0,
+              // Single walk = the first/only block; the JPEG merge re-stamps a
+              // later kept block's records (`set_source_block`).
+              source_block: 0,
+              kind: DeferredKind::MakerNote,
             });
           }
         }
@@ -7760,6 +8125,13 @@ impl Walker<'_, '_> {
       on_disk_format,
       value_offset,
       value_size,
+      // This leaf's OWN containing IFD body (the ExifIFD body for a direct
+      // ExifIFD leaf, the InteropIFD body for an inline `0xa005` leaf) — the
+      // MakerNote splice anchors on it (`push_exif_tags`).
+      own_ifd_start: ifd_start,
+      // Single walk = the first/only source block (`0`); the JPEG merge
+      // re-stamps later `APP1` blocks' entries (`set_source_block`).
+      source_block: 0,
       conv,
     });
   }
@@ -7946,6 +8318,13 @@ impl Walker<'_, '_> {
         on_disk_format: Format::Undef,
         value_offset: 0,
         value_size: 0,
+        // The synthetic DataTag image trails its OWN IFD's leaves (the same
+        // emitted-directory `ifd_start` the pair was collected under).
+        own_ifd_start: pair.ifd_start,
+        // The synthetic DataTag image trails its IFD's leaves in the SAME
+        // source block; `finalize_data_tags` runs per-block before any merge
+        // (re-stamped with the block ordinal in `merge_exif_block`).
+        source_block: 0,
         conv: ResolvedConv::Exif(&SYNTHETIC_DATA_TAG),
       });
     }
@@ -8086,13 +8465,59 @@ impl ExifMeta<'_> {
   ///
   /// Writes DIRECTLY into the caller's `out` buffer (P2 — no per-call temp `Vec`
   /// that [`tags`](crate::emit::Taggable::tags) then has to move). **EXIF
-  /// entries only**: the `File:ExifByteOrder`/`File:PageCount` prefix + the
-  /// MakerNote vendor emissions are pushed by [`tags`](crate::emit::Taggable::tags)
-  /// into the SAME `out`; the `ExifTool:Warning` messages stay a separate channel
+  /// entries + the MakerNote**: the `File:ExifByteOrder`/`File:PageCount` prefix
+  /// is pushed by [`tags`](crate::emit::Taggable::tags) into the SAME `out`
+  /// BEFORE this; the `ExifTool:Warning` messages stay a separate channel
   /// yielded by [`ExifMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics).
+  ///
+  /// ## SubDirectory emission order (#176, Option B)
+  ///
+  /// `exiftool -G1 -j` runs `GetFoundTags(Sort => 'Group1', Sort2 => 'Tag')`
+  /// (`ExifTool.pm:3373-3397`): it orders the GROUPS by each group's EARLIEST-
+  /// extracted (lowest `FILE_ORDER`) tag, then sorts tags by ID within a group.
+  /// `ProcessExif` extracts a directory's entries in on-disk order, recursing a
+  /// SubDirectory INLINE at its entry (so its leaves take their `FILE_ORDER`
+  /// there). The `0x927c` MakerNote and the ExifIFD's `0xa005` InteropIFD are
+  /// BOTH ExifIFD SubDirectories whose pointers, in a well-formed IFD, follow the
+  /// ExifIFD's direct leaves — so the ExifIFD GROUP (earliest direct leaf) is
+  /// positioned first (its high-tag-ID members like `LensMake`/`LensModel` at
+  /// `0xa433`/`0xa434` sort to the END of that group by `Sort2 => 'Tag'`), then
+  /// the deferred subdir groups follow in their parent's ON-DISK pointer order
+  /// (MakerNote before InteropIFD when `0x927c < 0xa005`; the reverse for a
+  /// crafted IFD that orders the pointers the other way).
+  ///
+  /// The shared `Walker` descends sub-IFDs INLINE at their on-disk position, so
+  /// `self.entries` interleaves the Interop leaves AMONG the ExifIFD direct
+  /// leaves, and the MakerNote leaves are absent (they live in the captured
+  /// [`MakerNote`]'s cached emissions). This RE-GROUPS to reproduce bundled's
+  /// order: emit the ExifIFD direct leaves, then walk the recorded
+  /// [`deferred_subdirs`](Self::deferred_subdirs) for the MakerNote's parent IFD
+  /// in their `pointer_index` order — emitting the cached vendor block for the
+  /// MakerNote record and the region's `Interop` leaves for the InteropIFD
+  /// record — with IFD0/GPS/IFD1 untouched around the subtree. With no MakerNote
+  /// the loop is a single uninterrupted pass (the prior behavior, unchanged).
+  ///
+  /// For a multi-`APP1` JPEG `self.entries` MERGES several independent TIFF
+  /// blocks (each `APP1` Exif segment is its own self-contained TIFF), so it can
+  /// hold MORE THAN ONE ExifIFD run. The subtree lookup and the deferred-record
+  /// selection are BOTH keyed on the kept MakerNote's recorded
+  /// [`source_block`](ExifEntry::source_block) ([`jpeg::merge_exif_block`] stamps
+  /// the kept MakerNote's record AND that block's entries with the same ordinal),
+  /// so the splice targets the RECORDED parent block's ExifIFD run — never the
+  /// first ExifIFD it happens to see, and never an Interop-only sibling block's
+  /// records. `source_block` is `0` for a standalone / embedded TIFF, so that
+  /// single-block path is byte-for-byte unchanged.
+  ///
+  /// This is Option B's "parent direct leaves, then deferred subdirs by recorded
+  /// on-disk position" model (#400). It matches bundled for the camera-metadata
+  /// path (direct leaves at low entries precede the subdir pointers); a doubly-
+  /// malformed IFD whose direct leaf sits at a HIGHER entry index than a subdir
+  /// pointer would, under bundled's pure `FILE_ORDER` group sort, place that
+  /// direct leaf's group last — a within-EXIF-block ORDER nuance the multiset
+  /// `-G1 -j` conformance (`src/jsondiff.rs`) is blind to and Option B does not
+  /// chase (values stay byte-identical).
   fn push_exif_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
     out.reserve(self.entries.len());
-    let mut sink = EmittedTagSink::new(out);
     // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
     // 'Unknown' guess — identical to `serialize_tags`'s `entry_order`. `None`
     // only for a JPEG accepted without a parsed Exif block, which then has NO
@@ -8109,20 +8534,298 @@ impl ExifMeta<'_> {
     let file_type = None;
     let (canon_focal_units, canon_lens_type) = (None, None);
     let canon_focal_length_blob: Option<&[u8]> = None;
-    for entry in &self.entries {
-      // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
-      let Ok(()) = emit_entry(
-        entry,
-        entry_order,
-        print_conv,
-        model,
-        file_type,
-        canon_focal_units,
-        canon_lens_type,
-        canon_focal_length_blob,
-        &mut sink,
-      );
+    // Emit a contiguous slice of `self.entries` through a fresh `EmittedTagSink`,
+    // keeping only the entries whose IFD passes `keep`. A closure (not a held
+    // `&mut sink`) so the sink's borrow of `out` is released between segments,
+    // letting `push_maker_note_tags` write to the SAME `out` in between. The
+    // sink appends in order with NO internal dedup (the engine's `TagMap` dedups
+    // centrally), so splitting one IFD's entries across calls is order-preserving.
+    let emit_slice = |out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+                      slice: &[ExifEntry],
+                      keep: &dyn Fn(IfdKind) -> bool| {
+      let mut sink = EmittedTagSink::new(out);
+      for entry in slice {
+        if !keep(entry.ifd()) {
+          continue;
+        }
+        // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
+        let Ok(()) = emit_entry(
+          entry,
+          entry_order,
+          print_conv,
+          model,
+          file_type,
+          canon_focal_units,
+          canon_lens_type,
+          canon_focal_length_blob,
+          &mut sink,
+        );
+      }
+    };
+    // As `emit_slice`, but driven by a pre-resolved list of entry REFERENCES (in
+    // the order given) rather than an `IfdKind` `keep` scan — used to emit the
+    // region's `0xa005` InteropIFD leaves split by their `own_ifd_start` (the
+    // InteropIFD body each leaf was walked from), so each recorded Interop descent
+    // emits ONLY its OWN body's leaves at its recorded pointer position (#176-B
+    // Interop split), not the whole non-parent bucket. The region is bucketed by
+    // `own_ifd_start` ONCE below, so each body emits via an O(1) bucket lookup
+    // instead of an O(region) re-scan per Interop record (#176-B perf — a crafted
+    // ExifIFD with many duplicate `0xa005` pointers would otherwise be O(N²)). The
+    // bucket is built by a single in-order region pass, so each bucket's entries
+    // are already in region order and the sink appends with no dedup ⇒ a bucket
+    // emission is byte-identical to the equivalent region-order predicate scan.
+    let emit_entries = |out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+                        entries: &[&ExifEntry]| {
+      let mut sink = EmittedTagSink::new(out);
+      for entry in entries {
+        let Ok(()) = emit_entry(
+          entry,
+          entry_order,
+          print_conv,
+          model,
+          file_type,
+          canon_focal_units,
+          canon_lens_type,
+          canon_focal_length_blob,
+          &mut sink,
+        );
+      }
+    };
+    let any = |_: IfdKind| true;
+
+    // No MakerNote: the whole stream emits in one uninterrupted pass (the prior
+    // behavior, unchanged). The recorded `deferred_subdirs` (Interop-only, if
+    // any) describe no re-grouping needed — Interop already trails the ExifIFD
+    // direct leaves in IFD-walk order via the inline descent, and a lone Interop
+    // group's relative order is fixed by that walk.
+    if self.maker_note.is_none() {
+      emit_slice(out, &self.entries, &any);
+      return;
     }
+
+    // The MakerNote's parent IFD (`parent`/`parent_ifd_start`) identifies the
+    // ExifIFD subtree whose direct leaves precede the deferred subdirs and whose
+    // recorded deferred subdirs (this MakerNote + any same-parent InteropIFD)
+    // order by `pointer_index`. The MakerNote record is always present (recorded
+    // alongside the `maker_note` capture); fall back to a plain end-splice if it
+    // is somehow absent (no record ⇒ keep the old position-agnostic behavior).
+    let Some(mn_record) = self
+      .deferred_subdirs
+      .iter()
+      .find(|d| matches!(d.kind(), DeferredKind::MakerNote))
+    else {
+      emit_slice(out, &self.entries, &any);
+      self.push_maker_note_tags(print_conv, out);
+      return;
+    };
+    let parent = mn_record.parent();
+    let parent_start = mn_record.parent_ifd_start();
+    // The CONCRETE source identity of the block whose MakerNote was kept — the
+    // tie that pins BOTH the subtree lookup AND the deferred-subdir selection to
+    // ONE `APP1` Exif block. For a multi-`APP1` JPEG the merged `self.entries`
+    // can hold SEVERAL ExifIFD runs (one per block); `IfdKind` + block-relative
+    // `parent_ifd_start` ALONE do not distinguish them (two blocks can lay their
+    // ExifIFD at the same relative offset). The `source_block` ordinal does —
+    // [`jpeg::merge_exif_block`] stamps the kept MakerNote's record and that
+    // block's entries with the SAME ordinal. `0` for a standalone / embedded
+    // TIFF (one block), so the single-block path is unchanged.
+    let mn_block = mn_record.source_block();
+    // The InteropIFD body offset(s) of the kept MakerNote's parent walk — the
+    // `0xa005` descents recorded for THIS exact ExifIFD instance
+    // (`(mn_block, parent, parent_start)`). An inline Interop leaf carries its
+    // InteropIFD body as [`ExifEntry::own_ifd_start`], so matching the region's
+    // Interop leaves by membership here ties them to the RECORDED ExifIFD walk —
+    // not a sibling ExifIFD's Interop in the same block. At most one in the
+    // camera path; a `HashSet` so the `in_subtree` membership probe stays O(1) —
+    // a crafted ExifIFD with thousands of `0xa005` pointers would make a linear
+    // `Vec::contains` over the `position`/`take_while` region scan O(N²) (#176-B
+    // perf — the same CPU-DoS class as the deferred-emission bucket below).
+    let interop_starts: std::collections::HashSet<usize> = self
+      .deferred_subdirs
+      .iter()
+      .filter(|d| {
+        matches!(d.kind(), DeferredKind::Interop)
+          && d.source_block() == mn_block
+          && d.parent() == parent
+          && d.parent_ifd_start() == parent_start
+      })
+      .map(DeferredSubdir::subdir_ifd_start)
+      .collect();
+    // The ExifIFD subtree in `self.entries` is the contiguous run of entries that
+    // — within the MakerNote's OWN block — belong to the EXACT recorded ExifIFD
+    // walk instance: a parent-IFD direct leaf whose `own_ifd_start` is the
+    // recorded `parent_start`, OR an inline-descended `0xa005` leaf whose
+    // `own_ifd_start` is one of THIS instance's `interop_starts`. Anchoring on
+    // `(source_block, parent_ifd_start)` (not `IfdKind` alone) is REQUIRED: a
+    // sibling block's — OR a second `0x8769` pointer's — identically-typed
+    // ExifIFD entries may sit IMMEDIATELY adjacent, and an `IfdKind`-only run
+    // would wrongly swallow them (distinguishing duplicate ExifIFD walks is
+    // exactly what `parent_ifd_start` was recorded for). Every sub-IFD descent is
+    // inline ⇒ instance N's direct + Interop leaves are one contiguous block. The
+    // deferred MakerNote leaves are NOT in `self.entries`; the Interop leaves are.
+    let in_subtree = |e: &ExifEntry| {
+      e.source_block() == mn_block
+        && ((e.ifd() == parent && e.own_ifd_start() == parent_start)
+          || (parent == IfdKind::ExifIfd
+            && e.ifd() == IfdKind::Interop
+            && interop_starts.contains(&e.own_ifd_start())))
+    };
+    let region_start = self.entries.iter().position(in_subtree);
+    let Some(start) = region_start else {
+      // The recorded ExifIFD instance walked NO direct leaves and NO matched
+      // Interop leaves (a degenerate ExifIFD holding ONLY the `0x927c` pointer).
+      // The MakerNote still splices at the EXACT recorded ExifIFD-dispatch
+      // position — `self.entries.len()` captured the instant the parent's
+      // `0x8769` pointer was walked (the [`DeferredKind::ExifIfdAnchor`] record),
+      // which is AFTER any earlier same-block subdir leaves (a `GPSInfo` `0x8825`
+      // dispatched before `0x8769` already pushed its leaves) and BEFORE the
+      // ExifIFD's own. This preserves the recorded pointer order: a crafted IFD0
+      // with `0x8825` before `0x8769` keeps the same-block GPS leaves AHEAD of the
+      // empty MakerNote, where an IFD0-leaves-only count would jump the MakerNote
+      // past them (#176-B). The anchor is matched on the SAME identity as the
+      // MakerNote record (`source_block` + the descended ExifIFD body
+      // `parent_ifd_start`). FALLBACK (no anchor recorded — defensive; the anchor
+      // is pushed for every ExifIFD descent and adopted atomically with the kept
+      // MakerNote's block): the block-ordinal partition — every EARLIER block's
+      // entries plus this block's IFD0 leaves, stopping before any later block —
+      // which lands at the recorded block position when `mn_block` contributes no
+      // matched ExifIFD entries.
+      let insert_at = self
+        .deferred_subdirs
+        .iter()
+        .find(|d| {
+          matches!(d.kind(), DeferredKind::ExifIfdAnchor)
+            && d.source_block() == mn_block
+            && d.parent() == parent
+            && d.parent_ifd_start() == parent_start
+        })
+        .map_or_else(
+          || {
+            self
+              .entries
+              .iter()
+              .take_while(|e| {
+                e.source_block() < mn_block
+                  || (e.source_block() == mn_block && e.ifd() == IfdKind::Ifd0)
+              })
+              .count()
+          },
+          // A `position`-style index into `self.entries`; clamp defensively so a
+          // crafted record can never drive `split_at` out of range.
+          |d| d.dispatch_index().min(self.entries.len()),
+        );
+      let (before, after) = self.entries.split_at(insert_at);
+      emit_slice(out, before, &any);
+      self.push_maker_note_tags(print_conv, out);
+      emit_slice(out, after, &any);
+      return;
+    };
+    // `start <= entries.len()` (a `position` index), so `split_at` is in range —
+    // `before` is the pre-subtree prefix (IFD0 + any earlier block's tags),
+    // `rest` begins at the subtree.
+    let (before, rest) = self.entries.split_at(start);
+    // The contiguous subtree run is `rest`'s leading `in_subtree` entries (stop
+    // at the first that leaves the subtree — GPS/IFD1, or a sibling block's
+    // entries). `region_len <= rest.len()`, so the second `split_at` is in range
+    // too. Every entry in `region` is therefore from `mn_block`, so the
+    // IFD-only `keep` filters below (`k == parent` / `k != parent`) are exact.
+    let region_len = rest.iter().take_while(|e| in_subtree(e)).count();
+    let (region, after) = rest.split_at(region_len);
+
+    emit_slice(out, before, &any);
+    // Parent-IFD direct leaves first — the group-sort puts ALL of the parent
+    // group's direct leaves ahead of the deferred-subdir groups (even leaves
+    // whose tag IDs exceed `0x927c`).
+    emit_slice(out, region, &|k| k == parent);
+    // Then the deferred subdirs in their recorded on-disk pointer order. Collect
+    // the MakerNote's parent's deferred records, sort by `pointer_index`, and
+    // emit each: the cached vendor block for the MakerNote, the region's Interop
+    // leaves for the InteropIFD. (A `[DeferredSubdir; 2]`-bounded sort — at most
+    // one MakerNote + one Interop per ExifIFD — kept general for robustness.)
+    // Matched on the SAME concrete source identity as the subtree above
+    // (`source_block` + the parent walk's `(parent, parent_ifd_start)`): a
+    // multi-`APP1` JPEG records each block's ExifIFD deferred subdirs, and only
+    // the kept MakerNote's block's records describe the `region` emitted here —
+    // a sibling block's Interop record must NOT drive THIS splice.
+    let mut deferred: std::vec::Vec<&DeferredSubdir> = self
+      .deferred_subdirs
+      .iter()
+      .filter(|d| {
+        // The leaf-bearing deferred subdirs only — the zero-width
+        // `ExifIfdAnchor` (which shares this `(source_block, parent,
+        // parent_ifd_start)` identity) emits no tag and must NOT enter the
+        // pointer-ordered pass.
+        !matches!(d.kind(), DeferredKind::ExifIfdAnchor)
+          && d.source_block() == mn_block
+          && d.parent() == parent
+          && d.parent_ifd_start() == parent_start
+      })
+      .collect();
+    // STABLE sort by the on-disk pointer entry index (the order ExifTool's
+    // inline SubDirectory recursion assigns them their `FILE_ORDER`). A
+    // duplicate `pointer_index` (degenerate/crafted) keeps record order.
+    deferred.sort_by_key(|d| d.pointer_index());
+    // Pre-bucket the region's non-parent (InteropIFD-body) leaves by their
+    // `own_ifd_start` in ONE in-order region pass (#176-B perf). Each
+    // InteropIFD descent then emits its OWN body's leaves via an O(1) bucket
+    // lookup below, so a crafted ExifIFD with many `0xa005` pointers (N Interop
+    // records over an N-entry region) costs O(N) total — not the O(N²) a
+    // per-record full-region predicate scan would (a CPU-DoS).
+    // Building by a single in-order pass keeps each bucket's entries in region
+    // order, so a bucket emission is byte-identical to the prior region-order
+    // predicate scan for that body.
+    let mut interop_buckets: std::collections::HashMap<usize, std::vec::Vec<&ExifEntry>> =
+      std::collections::HashMap::new();
+    for entry in region {
+      if entry.ifd() != parent {
+        interop_buckets
+          .entry(entry.own_ifd_start())
+          .or_default()
+          .push(entry);
+      }
+    }
+    // Each Interop record emits ONLY its OWN InteropIFD body's leaves — the
+    // region entries whose `own_ifd_start` equals THAT record's
+    // `subdir_ifd_start` — at its recorded pointer position. For an
+    // Interop#1 → MakerNote → Interop#2 pointer order this yields Interop#1's
+    // body, then the MakerNote, then Interop#2's body (the old whole-`k != parent`
+    // bucket emitted BOTH bodies on the first Interop record, then suppressed the
+    // second — reversing pointer order, #176-B). Track each emitted body offset (a
+    // `HashSet` for O(1) membership) so a duplicate record (two pointers to one
+    // InteropIFD) does not re-emit it and the fallback skips already-emitted
+    // leaves.
+    let mut emitted_interop_starts: std::collections::HashSet<usize> =
+      std::collections::HashSet::new();
+    for d in deferred {
+      match d.kind() {
+        DeferredKind::MakerNote => self.push_maker_note_tags(print_conv, out),
+        DeferredKind::Interop => {
+          let body = d.subdir_ifd_start();
+          if emitted_interop_starts.insert(body) {
+            if let Some(bucket) = interop_buckets.get(&body) {
+              emit_entries(out, bucket);
+            }
+          }
+        }
+        // The zero-width anchor was filtered out above; never reached.
+        DeferredKind::ExifIfdAnchor => {}
+      }
+    }
+    // Any region Interop leaves NOT covered by a recorded InteropIFD descent (a
+    // descent that emitted leaves but whose record was lost) still emit, after
+    // the MakerNote — preserving the old MakerNote-before-Interop fallback and
+    // never dropping a tag. Collect the leftover bodies' entries in region order
+    // (a single region pass with O(1) `HashSet` membership), skipping the bodies
+    // already emitted per-record above.
+    let leftover: std::vec::Vec<&ExifEntry> = region
+      .iter()
+      .filter(|e| e.ifd() != parent && !emitted_interop_starts.contains(&e.own_ifd_start()))
+      .collect();
+    if !leftover.is_empty() {
+      emit_entries(out, &leftover);
+    }
+    // Then everything after the subtree (GPS, IFD1).
+    emit_slice(out, after, &any);
   }
 
   /// Append the captured PrintIM versions as `PrintIM:PrintIMVersion`
@@ -8150,9 +8853,12 @@ impl ExifMeta<'_> {
 
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
-  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Emitted
-  /// AFTER the EXIF/IFD leaves ([`push_exif_tags`]), faithful to ExifTool
-  /// emitting the MakerNote stream after the parent IFD.
+  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Called by
+  /// [`push_exif_tags`](Self::push_exif_tags) at the MakerNote's deferred-
+  /// SubDirectory splice point in the ExifIFD subtree (after the ExifIFD's direct
+  /// leaves, ordered against the `0xa005` InteropIFD by their recorded on-disk
+  /// pointer positions — #176), faithful to ExifTool descending a directory's
+  /// SubDirectories after emitting its leaves.
   ///
   /// Each [`VendorEmission`](makernotes::VendorEmission) becomes an `EmittedTag`
   /// under `Group{family0:"MakerNotes", family1:<vendor group1>}`
@@ -8432,20 +9138,22 @@ impl crate::emit::Taggable for ExifMeta<'_> {
       order.sort_by_key(|(pos, _)| *pos);
       for (_, block) in order {
         match block {
-          Block::Exif => {
-            self.push_exif_tags(print_conv, &mut tags);
-            self.push_maker_note_tags(print_conv, &mut tags);
-          }
+          // `push_exif_tags` emits the WHOLE EXIF block — the IFD-walk entries
+          // with the captured MakerNote vendor leaves SPLICED at the ExifIFD's
+          // deferred-SubDirectory position in the recorded on-disk pointer order
+          // (#176), not appended at the end.
+          Block::Exif => self.push_exif_tags(print_conv, &mut tags),
           Block::Aux(aux) => aux.push_tags(print_conv, &mut tags),
         }
       }
     }
     // Without `quicktime` there are no aux blocks, so the EXIF block is the only
-    // metadata block — emitted in its normal position (unchanged).
+    // metadata block — emitted in its normal position (unchanged). The MakerNote
+    // vendor leaves ride INSIDE the block at the ExifIFD deferred-SubDirectory
+    // splice point (#176).
     #[cfg(not(feature = "quicktime"))]
     {
       self.push_exif_tags(print_conv, &mut tags);
-      self.push_maker_note_tags(print_conv, &mut tags);
     }
     // The PrintIM `PrintIM:PrintIMVersion` (IFD0 `0xc4a5`) — emitted after the
     // EXIF/MakerNote block (the key MULTISET is position-insensitive). EMPTY for
@@ -10379,6 +11087,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     // The parent IFD0 `Make`, threaded from the dispatch — the format-16
     // (`int64u`) Apple carve-out in the per-entry gate requires
@@ -10585,6 +11294,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the four conditional-ARRAY AF tags + the single-HASH
@@ -10879,6 +11589,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` selects the 0x0f AFAreaMode / 0x2c ContrastMode branches; the
@@ -11153,6 +11864,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` gates the AFInfo BigEndian read + the LensData Z telemetry;
@@ -11491,6 +12203,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the FixBase heuristic
     // (`GetMakerNoteOffset`'s `make.starts_with("PENTAX")` absolute-addressing
@@ -12001,6 +12714,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
     // Samsung walk reads no model-conditional structure (no PENTAX-style make
@@ -12304,6 +13018,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
     // leaf reads Make.
@@ -12487,6 +13202,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
     maker_note: None,
+    deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
     captured_make: None,
     // `$$self{Model}` (the conditional `SerialNumber` PrintConv is `-j`-only, but
@@ -16176,6 +16892,7 @@ mod tests {
       warnings: Vec::new(),
       warnings_ignorable: Vec::new(),
       maker_note: None,
+      deferred_subdirs: Vec::new(),
       printim_versions: Vec::new(),
       captured_make: None,
       captured_model: None,
@@ -17477,6 +18194,1823 @@ mod tests {
     assert_eq!(vendor_group1_of(TableRef::Interop), None);
     #[cfg(feature = "gps")]
     assert_eq!(vendor_group1_of(TableRef::Gps), None);
+  }
+
+  // ====================================================================// MakerNote SubDirectory emission position (#176, Option B)
+  //
+  // `exiftool -G1 -j` orders GROUPS by each group's earliest-extracted tag
+  // (`Sort => 'Group1'`, `Sort2 => 'Tag'` within a group — `ExifTool.pm:3373`).
+  // `ProcessExif` recurses a SubDirectory INLINE at its on-disk entry, so the
+  // `0x927c` MakerNote + `0xa005` InteropIFD (both ExifIFD SubDirectories, whose
+  // pointers in a well-formed IFD follow the ExifIFD's direct leaves) emit AFTER
+  // the ExifIFD direct-leaf group, in the parent's ON-DISK pointer order. The
+  // ExifIFD group's high-tag-ID members (`LensMake`/`LensModel`, `0xa433`/
+  // `0xa434`) still sort to the END of that group (`Sort2 => 'Tag'`), so the
+  // whole ExifIFD group precedes the deferred groups. `ExifMeta::tags` (whose
+  // order the engine's first-wins `TagMap` preserves) reproduces this: ExifIFD
+  // direct → MakerNote/InteropIFD ordered by recorded `pointer_index`.
+  //
+  // ORDER-sensitive: the `-G1 -j` conformance (`src/jsondiff.rs`) compares the
+  // key MULTISET, so it is blind to this; only an ordered check catches it.
+  // ====================================================================
+
+  /// The ordered `Group:Name` keys bundled `exiftool -G1 -j` emits for
+  /// `fixture`, restricted to the family-1 groups `ExifMeta::tags` itself
+  /// produces (drops `SourceFile`, `ExifTool:*`, `System:*`, `Composite:*` —
+  /// engine-orchestration / synthesized groups absent from the typed stream).
+  /// `None` ⇒ the bundled tool or `perl` is unavailable (skip).
+  #[cfg(all(unix, feature = "std"))]
+  fn bundled_g1_key_order(fixture: &std::path::Path) -> Option<std::vec::Vec<std::string::String>> {
+    let script = std::env::var("EXIFTOOL").ok()?;
+    if !have_perl() {
+      return None;
+    }
+    let out = std::process::Command::new("perl")
+      .arg(&script)
+      .args(["-G1", "-j"])
+      .arg(fixture)
+      .output()
+      .ok()?;
+    if !out.status.success() {
+      return None;
+    }
+    let text = std::string::String::from_utf8(out.stdout).ok()?;
+    // `-j` is pretty-printed: one `  "Group:Name": value,` per line. Extract the
+    // first quoted token of each line as the key (the value is never the line's
+    // FIRST quoted token). Keep only the groups the typed stream emits.
+    let mut keys = std::vec::Vec::new();
+    for line in text.lines() {
+      let line = line.trim();
+      let Some(rest) = line.strip_prefix('"') else {
+        continue;
+      };
+      let Some(end) = rest.find('"') else {
+        continue;
+      };
+      let key = &rest[..end];
+      if key == "SourceFile" {
+        continue;
+      }
+      let Some((group, _name)) = key.split_once(':') else {
+        continue;
+      };
+      if matches!(group, "ExifTool" | "System" | "Composite") {
+        continue;
+      }
+      keys.push(key.to_string());
+    }
+    (!keys.is_empty()).then_some(keys)
+  }
+
+  /// The ordered `family1:Name` keys `ExifMeta::tags` yields for `-G1 -j`,
+  /// dropping the `Unknown=>1` leaves the engine suppresses from default output
+  /// (so the sequence is comparable to bundled's visible `-G1 -j` keys).
+  #[cfg(feature = "alloc")]
+  fn exifast_g1_key_order(meta: &ExifMeta<'_>) -> std::vec::Vec<std::string::String> {
+    use crate::emit::Taggable;
+    meta
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .filter(|t| !t.unknown())
+      .map(|t| {
+        let g = t.tag().group_ref();
+        std::format!("{}:{}", g.family1(), t.tag().name())
+      })
+      .collect()
+  }
+
+  /// Collapse DUPLICATE `Group:Name` keys last-wins-IN-PLACE — keep the FIRST
+  /// occurrence's POSITION and drop every later duplicate — mirroring the engine's
+  /// [`crate::tagmap::TagMap`] dedup (last value, first slot). The raw
+  /// [`exifast_g1_key_order`] stream is PRE-dedup, so when several merged `APP1`
+  /// Exif blocks share a tag (a multi-`APP1` JPEG with the same ExifIFD leaf in
+  /// two blocks) it carries that key twice; bundled `-G1 -j` shows it once. This
+  /// makes the two sequences comparable for the ordered cross-check (idempotent
+  /// on bundled's already-deduped output).
+  #[cfg(feature = "alloc")]
+  fn dedup_keys_in_place(keys: &[std::string::String]) -> std::vec::Vec<std::string::String> {
+    let mut seen: std::vec::Vec<&str> = std::vec::Vec::new();
+    let mut out: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+    for k in keys {
+      if seen.iter().any(|s| *s == k.as_str()) {
+        continue;
+      }
+      seen.push(k.as_str());
+      out.push(k.clone());
+    }
+    out
+  }
+
+  /// Assert the MakerNote-vendor keys (`{vendor}:*`) sit AFTER the last
+  /// `ExifIFD:*` key and BEFORE the first `{after}:*` key in `keys` — the
+  /// `0x927c` SubDirectory position. Returns the `(last_exif, first_vendor,
+  /// first_after)` indices so callers can cross-check the two streams agree.
+  #[cfg(feature = "alloc")]
+  fn assert_makernote_at_927c(
+    keys: &[std::string::String],
+    vendor: &str,
+    after: &str,
+    label: &str,
+  ) -> (usize, usize, usize) {
+    let exif_prefix = "ExifIFD:";
+    let vendor_prefix = std::format!("{vendor}:");
+    let after_prefix = std::format!("{after}:");
+    let last_exif = keys
+      .iter()
+      .rposition(|k| k.starts_with(exif_prefix))
+      .unwrap_or_else(|| panic!("{label}: no ExifIFD:* key in {keys:?}"));
+    let first_vendor = keys
+      .iter()
+      .position(|k| k.starts_with(vendor_prefix.as_str()))
+      .unwrap_or_else(|| panic!("{label}: no {vendor}:* key in {keys:?}"));
+    let first_after = keys
+      .iter()
+      .position(|k| k.starts_with(after_prefix.as_str()))
+      .unwrap_or_else(|| panic!("{label}: no {after}:* key in {keys:?}"));
+    assert!(
+      last_exif < first_vendor,
+      "{label}: {vendor}:* must follow the LAST ExifIFD:* key \
+       (last ExifIFD at {last_exif} = {:?}, first {vendor} at {first_vendor} = {:?})",
+      keys.get(last_exif),
+      keys.get(first_vendor),
+    );
+    assert!(
+      first_vendor < first_after,
+      "{label}: {vendor}:* must precede the FIRST {after}:* key \
+       (first {vendor} at {first_vendor} = {:?}, first {after} at {first_after} = {:?})",
+      keys.get(first_vendor),
+      keys.get(first_after),
+    );
+    (last_exif, first_vendor, first_after)
+  }
+
+  /// Drive the #176 order check for one fixture: parse it, compare `tags`'s
+  /// emission order to the MakerNote-at-`0x927c` invariant, and (when the
+  /// bundled tool is present) assert the bundled `-G1 -j` key order agrees.
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn check_makernote_position(fixture_rel: &str, vendor: &str, after: &str) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(root).join(fixture_rel);
+    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {fixture_rel}: {e}"));
+    let meta = jpeg::parse_jpeg_exif(&data).unwrap_or_else(|| panic!("{fixture_rel}: APP1 Exif"));
+
+    let ours = exifast_g1_key_order(&meta);
+    assert_makernote_at_927c(&ours, vendor, after, "exifast");
+
+    // Cross-check the live bundled tool: it must place the vendor block in the
+    // SAME ExifIFD→vendor→after relationship (the oracle for the order). Skipped
+    // only when `EXIFTOOL`/`perl` is unavailable.
+    if let Some(bundled) = bundled_g1_key_order(&path) {
+      assert_makernote_at_927c(&bundled, vendor, after, "bundled exiftool");
+    } else {
+      eprintln!("SKIP bundled cross-check for {fixture_rel}: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #176 — the captured Apple MakerNote (`0x927c` in the ExifIFD) emits between
+  /// the last `ExifIFD:*` tag and the first `GPS:*` tag, matching bundled
+  /// `exiftool -G1 -j` on `MakerNotes_Apple.jpg`. The ExifIFD's `LensMake`/
+  /// `LensModel` (`0xa433`/`0xa434`, tag IDs ABOVE `0x927c`) still emit BEFORE
+  /// the Apple block — the group-sort places the whole ExifIFD group first.
+  /// Before the splice fix the vendor leaves were appended at the END (after
+  /// `GPS:*`/`IFD1:*`), so the `Apple:* < GPS:*` assertion FAILED — the RED→GREEN
+  /// guard.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn apple_maker_note_emits_at_927c_before_gps() {
+    check_makernote_position("tests/fixtures/MakerNotes_Apple.jpg", "Apple", "GPS");
+  }
+
+  /// #176 — the captured Canon MakerNote (`0x927c` in the ExifIFD) emits between
+  /// the last `ExifIFD:*` tag and the first `InteropIFD:*` tag, matching bundled
+  /// `exiftool -G1 -j` on `MakerNotes_Canon.jpg`. The ExifIFD here carries BOTH
+  /// the `0x927c` MakerNote (on-disk entry 15) and the `0xa005` InteropIFD (entry
+  /// 21); since the MakerNote pointer precedes the InteropIFD pointer on disk,
+  /// the position-ordered descent emits MakerNote → InteropIFD, so `Canon:*`
+  /// precedes `InteropIFD:*`. Before the splice fix the vendor leaves were
+  /// appended at the END, failing `Canon:* < InteropIFD:*`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn canon_maker_note_emits_at_927c_before_interop() {
+    check_makernote_position("tests/fixtures/MakerNotes_Canon.jpg", "Canon", "InteropIFD");
+  }
+
+  /// A minimal big-endian Apple MakerNote blob bundled ExifTool accepts: the
+  /// `Apple iOS\0\0\x01MM` 14-byte header (the trailing `MM` IS the body byte
+  /// order — `MakerNoteApple`'s `Start => '$valuePtr + 14'`, `ByteOrder =>
+  /// 'Unknown'`, lands the IFD's count word at offset 14, so there is NO extra
+  /// body marker), then a 1-entry IFD: `0x0001 MakerNoteVersion` int32u = 7.
+  ///
+  /// NOTE: this differs from [`crafted_apple_blob`] (which appends a SECOND `MM`
+  /// body marker for the exifast isolated-walk differential). exifast's Apple
+  /// body reader accepts BOTH layouts (`ByteOrder::from_marker` of `\x00\x01`
+  /// fails ⇒ it reads the count at offset 14 directly), but ONLY this no-extra-
+  /// marker layout is what bundled ExifTool parses — so the cross-checked #176
+  /// order fixtures use it.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn bundled_apple_makernote_blob() -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Apple iOS\x00\x00\x01MM"); // 14-byte header (trailing MM = body order)
+    b.extend_from_slice(&1u16.to_be_bytes()); // IFD entry count at offset 14
+    b.extend_from_slice(&entry(0x0001, 4, 1, 7u32.to_be_bytes())); // MakerNoteVersion int32u=7
+    b.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+    b
+  }
+
+  /// Build a STANDALONE big-endian TIFF whose ExifIFD carries TWO direct leaves
+  /// (at LOW entry indices) followed by the `0x927c` MakerNote and `0xa005`
+  /// InteropIFD SubDirectory pointers, laid out in a chosen ON-DISK entry order.
+  /// `interop_before_maker` puts the `0xa005` pointer at a LOWER entry index than
+  /// `0x927c` (the crafted reversed case) when `true`, the canonical `0x927c`-
+  /// first order when `false`.
+  ///
+  /// The two direct leaves precede the SubDirectory pointers (faithful to a
+  /// real ExifIFD, whose direct leaves' lower tag IDs put them at lower on-disk
+  /// entry indices), so the deferred subdirs both trail the ExifIFD direct
+  /// group; ONLY their relative order flips with `interop_before_maker`. This is
+  /// the layout that ground-truths Option B's position-ordered descent (and
+  /// distinguishes it from a fixed MakerNote-first bucket) against bundled.
+  ///
+  /// Layout (all offsets TIFF-block-relative, base 0):
+  ///   IFD0 @ 8: one entry `0x8769 ExifOffset → ExifIFD`.
+  ///   ExifIFD: `0x8822 ExposureProgram` = 1, `0x8827 ISO` = 100 (direct leaves),
+  ///     then the `0x927c` MakerNote + `0xa005` InteropIFD pointers in the
+  ///     requested order.
+  ///   InteropIFD: one leaf `0x0001 InteropIndex = "R98\0"`.
+  ///   MakerNote: [`bundled_apple_makernote_blob`] (`MakerNoteVersion` = 7).
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn crafted_reversible_interop_tiff(interop_before_maker: bool) -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+
+    // [header 8][IFD0][ExifIFD][InteropIFD][values...]. Offsets computed up front.
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4; // count + 1 entry + next-IFD
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 4usize; // 2 direct leaves + 0x927c + 0xa005
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let interop_off = exififd_off + exififd_len;
+    let interop_n = 1usize; // 0x0001 InteropIndex
+    let interop_len = 2 + 12 * interop_n + 4;
+    let values_off = interop_off + interop_len;
+    let mn_off = values_off; // MakerNote blob first in the values region
+
+    let mut t: Vec<u8> = Vec::new();
+    // TIFF header: big-endian, magic 42, IFD0 at offset 8.
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+
+    // ---- IFD0: ExifOffset (0x8769) → ExifIFD --------------------------------
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes()); // IFD0 next-IFD = 0
+    debug_assert_eq!(t.len(), exififd_off);
+
+    // ---- ExifIFD: 2 direct leaves, then the 2 SubDirectory pointers ----------
+    // Direct leaves at the LOW entry indices (their lower tag IDs would sort
+    // them here in a well-formed IFD anyway), so the deferred MakerNote/Interop
+    // both trail the ExifIFD direct group; only their RELATIVE order flips.
+    let exposure_program = entry(0x8822, 3, 1, [0x00, 0x01, 0x00, 0x00]); // int16u = 1
+    let iso = entry(0x8827, 3, 1, [0x00, 0x64, 0x00, 0x00]); // int16u = 100
+    let maker_entry = entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    );
+    let interop_entry = entry(0xa005, 4, 1, (interop_off as u32).to_be_bytes());
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&exposure_program);
+    t.extend_from_slice(&iso);
+    if interop_before_maker {
+      t.extend_from_slice(&interop_entry);
+      t.extend_from_slice(&maker_entry);
+    } else {
+      t.extend_from_slice(&maker_entry);
+      t.extend_from_slice(&interop_entry);
+    }
+    t.extend_from_slice(&0u32.to_be_bytes()); // ExifIFD next-IFD = 0
+    debug_assert_eq!(t.len(), interop_off);
+
+    // ---- InteropIFD: InteropIndex (0x0001) = "R98\0" ------------------------
+    t.extend_from_slice(&(interop_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\x00"));
+    t.extend_from_slice(&0u32.to_be_bytes()); // InteropIFD next-IFD = 0
+    debug_assert_eq!(t.len(), values_off);
+
+    // ---- values region: the MakerNote blob ----------------------------------
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176 Option B — a crafted ExifIFD with the `0xa005` InteropIFD pointer at a
+  /// LOWER on-disk entry index than the `0x927c` MakerNote reverses the deferred
+  /// emission order: bundled emits `InteropIFD:*` BEFORE the `Apple:*` vendor
+  /// block (the deferred subdirs walk in on-disk pointer order). The
+  /// position-ordered descent reproduces that; the prior R2 BUCKETED approach
+  /// (which always emitted the MakerNote before the InteropIFD) would NOT — so
+  /// this is what DISTINGUISHES Option B from the bucketed fix. Ground-truthed
+  /// against the live bundled tool when available.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn reversed_interop_emits_before_maker_note() {
+    let data = crafted_reversible_interop_tiff(/* interop_before_maker */ true);
+    let meta = parse_exif_block(&data).expect("crafted reversed-Interop TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let interop = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD:* key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let last_exif = ours
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    // The two direct ExifIFD leaves precede both deferred subdirs; the reversed
+    // on-disk pointer order then puts InteropIFD BEFORE the Apple block. The
+    // prior R2 BUCKETED approach forced MakerNote-first (`apple < interop`);
+    // Option B's position-ordered descent gives `interop < apple`.
+    assert!(
+      last_exif < interop,
+      "the ExifIFD direct leaves must precede InteropIFD:* (last ExifIFD at \
+       {last_exif}, InteropIFD at {interop}) in {ours:?}"
+    );
+    assert!(
+      interop < apple,
+      "reversed on-disk order ⇒ InteropIFD:* must precede Apple:* (InteropIFD at \
+       {interop}, Apple at {apple}) — Option B position order, NOT the bucketed \
+       MakerNote-first; got {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool: the FULL ExifIFD/InteropIFD/Apple key
+    // sequence must match exactly (the order oracle) — not merely the pairwise
+    // InteropIFD-before-Apple relation. Restrict both streams to those three
+    // groups (the crafted file's only movable groups) and compare in order.
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let keep = |k: &std::string::String| {
+        k.starts_with("ExifIFD:") || k.starts_with("InteropIFD:") || k.starts_with("Apple:")
+      };
+      let ours_seq: std::vec::Vec<_> = ours.iter().filter(|k| keep(k)).cloned().collect();
+      let bundled_seq: std::vec::Vec<_> = bundled.iter().filter(|k| keep(k)).cloned().collect();
+      // Bundled must itself emit InteropIFD before Apple for the reversed layout;
+      // if it somehow omits a group (e.g. an older bundled tool), skip rather
+      // than fail spuriously.
+      let b_has_both = bundled_seq.iter().any(|k| k.starts_with("InteropIFD:"))
+        && bundled_seq.iter().any(|k| k.starts_with("Apple:"));
+      if b_has_both {
+        assert_eq!(
+          ours_seq, bundled_seq,
+          "exifast's ExifIFD/InteropIFD/Apple key order must match bundled \
+           exiftool -G1 -j for the reversed-Interop layout"
+        );
+      } else {
+        eprintln!("SKIP bundled reversed-Interop cross-check: missing group {bundled:?}");
+      }
+    } else {
+      eprintln!("SKIP bundled reversed-Interop cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #176 Option B — the CANONICAL `0x927c`-before-`0xa005` on-disk order (the
+  /// control for [`reversed_interop_emits_before_maker_note`]) emits the Apple
+  /// MakerNote block BEFORE the InteropIFD, the same ordering the real Canon
+  /// fixture exercises. Confirms the position-ordered descent reproduces BOTH
+  /// directions from the SAME crafted builder (only the pointer order flips).
+  /// This is ALSO the RED→GREEN guard against the OLD end-append behavior: with
+  /// the MakerNote appended at the very END, `apple < interop` was FALSE (Apple
+  /// trailed InteropIFD); the splice makes it TRUE.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn forward_interop_emits_after_maker_note() {
+    let data = crafted_reversible_interop_tiff(/* interop_before_maker */ false);
+    let meta = parse_exif_block(&data).expect("crafted forward-Interop TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+    let interop = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD:* key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    assert!(
+      apple < interop,
+      "canonical on-disk order ⇒ Apple:* must precede InteropIFD:* (Apple at \
+       {apple}, InteropIFD at {interop}) in {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool: the FULL ExifIFD/InteropIFD/Apple key
+    // sequence must match (Apple before InteropIFD for the canonical layout).
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let keep = |k: &std::string::String| {
+        k.starts_with("ExifIFD:") || k.starts_with("InteropIFD:") || k.starts_with("Apple:")
+      };
+      let ours_seq: std::vec::Vec<_> = ours.iter().filter(|k| keep(k)).cloned().collect();
+      let bundled_seq: std::vec::Vec<_> = bundled.iter().filter(|k| keep(k)).cloned().collect();
+      let b_has_both = bundled_seq.iter().any(|k| k.starts_with("InteropIFD:"))
+        && bundled_seq.iter().any(|k| k.starts_with("Apple:"));
+      if b_has_both {
+        assert_eq!(
+          ours_seq, bundled_seq,
+          "exifast's ExifIFD/InteropIFD/Apple key order must match bundled \
+           exiftool -G1 -j for the canonical forward-Interop layout"
+        );
+      } else {
+        eprintln!("SKIP bundled forward-Interop cross-check: missing group {bundled:?}");
+      }
+    } else {
+      eprintln!("SKIP bundled forward-Interop cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// The ordered `Group:Name` keys bundled `exiftool -G1 -j` emits for an
+  /// in-memory crafted TIFF, written to a temp file. `None` when the bundled
+  /// tool / `perl` is unavailable. Mirrors [`bundled_g1_key_order`] but for a
+  /// crafted byte buffer rather than a checked-in fixture.
+  ///
+  /// The temp path is UNIQUE per call (`pid` + a process-global atomic counter)
+  /// so the parallel #176 crafted tests — which the default test harness runs on
+  /// separate threads of ONE process — never share a file (a fixed `pid`-only
+  /// name raced: one test's TIFF overwrote the other's, corrupting the
+  /// cross-check).
+  #[cfg(all(unix, feature = "std"))]
+  fn bundled_crafted_g1_order(tiff: &[u8]) -> Option<std::vec::Vec<std::string::String>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("EXIFTOOL").is_err() || !have_perl() {
+      return None;
+    }
+    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let path = dir.join(std::format!(
+      "exifast_emitorder_{}_{}.tif",
+      std::process::id(),
+      nonce
+    ));
+    std::fs::write(&path, tiff).ok()?;
+    let keys = bundled_g1_key_order(&path);
+    let _ = std::fs::remove_file(&path);
+    keys
+  }
+
+  // ====================================================================// Multi-APP1 MakerNote splice — block identity (#400 round 2)
+  //
+  // A multi-`APP1` JPEG MERGES several independent TIFF blocks into one
+  // `ExifMeta`. The MakerNote splice (`push_exif_tags`) must tie BOTH the
+  // deferred-record selection AND the parent-subtree lookup to the SAME concrete
+  // source block — the one whose MakerNote was kept (first-wins). Two regressions
+  // the old code had:
+  //   1. an Interop-only earlier `APP1` seeded the JPEG-level `deferred_subdirs`,
+  //      so the later MakerNote block's record was discarded → the vendor block
+  //      end-appended (the #176 bug back, for multi-`APP1`);
+  //   2. even with the record present, the subtree lookup found the FIRST ExifIFD
+  //      run (an earlier block's) → the MakerNote spliced into the wrong block.
+  // Both are now keyed on the kept MakerNote's `source_block`. Order-sensitive:
+  // the `-G1 -j` multiset conformance is blind to it; only an ordered check + the
+  // live bundled cross-check catch it.
+  // ====================================================================
+
+  /// A STANDALONE big-endian TIFF whose ExifIFD carries one direct leaf
+  /// (`0x8822 ExposureProgram`) plus the `0xa005` InteropIFD pointer — and NO
+  /// `0x927c` MakerNote. The InteropIFD has one leaf `0x0001 InteropIndex`. Used
+  /// as the EARLIER `APP1` block in the Interop-only-then-MakerNote regression:
+  /// it records a deferred Interop descent but no MakerNote, so under the old
+  /// independent first-wins it (wrongly) populated the JPEG-level
+  /// `deferred_subdirs` and starved the later block's MakerNote record.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn interop_only_exif_tiff() -> Vec<u8> {
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4; // count + 1 entry (ExifOffset) + next-IFD
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 2usize; // 1 direct leaf + 0xa005
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let interop_off = exififd_off + exififd_len;
+    let interop_n = 1usize;
+    let interop_len = 2 + 12 * interop_n + 4;
+    debug_assert_eq!(interop_off + interop_len, interop_off + interop_len);
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: ExifOffset (0x8769) → ExifIFD.
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: 1 direct leaf, then the 0xa005 InteropIFD pointer.
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8822, 3, 1, [0x00, 0x02, 0x00, 0x00])); // ExposureProgram int16u = 2
+    t.extend_from_slice(&entry(0xa005, 4, 1, (interop_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), interop_off);
+    // InteropIFD: InteropIndex (0x0001) = "R98\0".
+    t.extend_from_slice(&(interop_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\x00"));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    t
+  }
+
+  /// A STANDALONE big-endian TIFF whose ExifIFD carries one direct leaf
+  /// (`0x8827 ISO`) plus the `0x927c` MakerNote ([`bundled_apple_makernote_blob`])
+  /// — and NO `0xa005` InteropIFD. When `with_gps` the IFD0 also carries a
+  /// `0x8825` GPSInfo pointer → a GPS IFD with one leaf (`0x0000 GPSVersionID`),
+  /// so the merged stream has a `GPS:*` group AFTER the ExifIFD subtree — the
+  /// marker that distinguishes the SPLICED MakerNote position (before GPS) from
+  /// the OLD end-append (after GPS).
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn makernote_exif_tiff(with_gps: bool) -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_n = if with_gps { 2usize } else { 1usize }; // ExifOffset [+ GPSInfo]
+    let ifd0_len = 2 + 12 * ifd0_n + 4;
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 2usize; // 1 direct leaf + 0x927c
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let gps_off = exififd_off + exififd_len;
+    let gps_n = 1usize;
+    let gps_len = 2 + 12 * gps_n + 4;
+    let values_off = if with_gps { gps_off + gps_len } else { gps_off };
+    let mn_off = values_off;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: ExifOffset (0x8769) [+ GPSInfo (0x8825)].
+    t.extend_from_slice(&(ifd0_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    if with_gps {
+      t.extend_from_slice(&entry(0x8825, 4, 1, (gps_off as u32).to_be_bytes()));
+    }
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: 1 direct leaf, then the 0x927c MakerNote pointer.
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8827, 3, 1, [0x00, 0x64, 0x00, 0x00])); // ISO int16u = 100
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    if with_gps {
+      debug_assert_eq!(t.len(), gps_off);
+      // GPS IFD: GPSVersionID (0x0000) = 2.3.0.0 (4 × int8u, inline).
+      t.extend_from_slice(&(gps_n as u16).to_be_bytes());
+      t.extend_from_slice(&entry(0x0000, 1, 4, [2, 3, 0, 0]));
+      t.extend_from_slice(&0u32.to_be_bytes());
+    }
+    debug_assert_eq!(t.len(), values_off);
+    // values region: the MakerNote blob.
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// A STANDALONE big-endian TIFF whose ExifIFD carries ONLY direct leaves
+  /// (`0x8822 ExposureProgram`, `0x8827 ISO`) — no `0x927c` MakerNote, no
+  /// `0xa005` InteropIFD, so it records NO deferred subdir. Used as the EARLIER
+  /// `APP1` block in the ExifIFD-leaves-only-then-MakerNote regression: its
+  /// ExifIFD run is the FIRST in the merged stream, which the old subtree lookup
+  /// (`position(first ExifIFD)`) wrongly spliced the LATER block's MakerNote into.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn exififd_leaves_only_tiff() -> Vec<u8> {
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4;
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 2usize; // 2 direct leaves, no subdir
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8822, 3, 1, [0x00, 0x02, 0x00, 0x00])); // ExposureProgram = 2
+    t.extend_from_slice(&entry(0x8827, 3, 1, [0x00, 0x32, 0x00, 0x00])); // ISO = 50
+    t.extend_from_slice(&0u32.to_be_bytes());
+    t
+  }
+
+  /// Wrap two independent TIFF blocks into ONE JPEG carrying two `APP1` Exif
+  /// segments (`SOI`, `APP1 Exif\0\0 <a>`, `APP1 Exif\0\0 <b>`, `EOI`) — each a
+  /// self-contained TIFF, so the JPEG front-end MERGES them into one `ExifMeta`
+  /// in file order. NOT a multi-segment (extended) EXIF chain: each block begins
+  /// `Exif\0\0` + a TIFF byte-order magic (`MM\0\x2a`), so the chain
+  /// discriminator (`ExifTool.pm:7764`) sees two INDEPENDENT blocks.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn wrap_two_app1_jpeg(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut j: Vec<u8> = std::vec![0xff, 0xd8]; // SOI
+    for block in [a, b] {
+      j.push(0xff);
+      j.push(0xe1); // APP1
+      let mut payload: Vec<u8> = Vec::new();
+      payload.extend_from_slice(b"Exif\0\0");
+      payload.extend_from_slice(block);
+      let len = (payload.len() + 2) as u16;
+      j.extend_from_slice(&len.to_be_bytes());
+      j.extend_from_slice(&payload);
+    }
+    j.extend_from_slice(&[0xff, 0xd9]); // EOI
+    j
+  }
+
+  /// The ordered `Group:Name` keys bundled `exiftool -G1 -j` emits for an
+  /// in-memory crafted JPEG, written to a unique temp `.jpg`. Mirrors
+  /// [`bundled_crafted_g1_order`] (the TIFF variant) for a JPEG buffer.
+  #[cfg(all(unix, feature = "std"))]
+  fn bundled_crafted_jpeg_g1_order(jpeg: &[u8]) -> Option<std::vec::Vec<std::string::String>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("EXIFTOOL").is_err() || !have_perl() {
+      return None;
+    }
+    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(std::format!(
+      "exifast_emitorder_jpeg_{}_{}.jpg",
+      std::process::id(),
+      nonce
+    ));
+    std::fs::write(&path, jpeg).ok()?;
+    let keys = bundled_g1_key_order(&path);
+    let _ = std::fs::remove_file(&path);
+    keys
+  }
+
+  /// #400 round 2, Finding 1 — a multi-`APP1` JPEG whose FIRST `APP1` Exif block
+  /// is InteropIFD-only (`0xa005`, NO MakerNote) and whose SECOND `APP1` carries
+  /// the FIRST (kept) MakerNote + a GPS IFD. The kept MakerNote's deferred record
+  /// must be adopted ATOMICALLY with the MakerNote (from the SAME block), so the
+  /// vendor block SPLICES after the second block's ExifIFD direct leaves and
+  /// BEFORE its `GPS:*` group — NOT end-appended after `GPS:*`.
+  ///
+  /// RED under the OLD independent first-wins selection: the Interop-only first
+  /// block populated the JPEG-level `deferred_subdirs`, the second block's
+  /// MakerNote record was DISCARDED, so `push_exif_tags` found no MakerNote
+  /// record and end-appended the vendor block AFTER `GPS:*` (`Apple:* > GPS:*`).
+  /// GREEN now: `Apple:* < GPS:*`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn multi_app1_interop_only_then_maker_note_splices_before_gps() {
+    let block_a = interop_only_exif_tiff(); // Interop, no MakerNote
+    let block_b = makernote_exif_tiff(/* with_gps */ true); // MakerNote + GPS
+    let jpeg = wrap_two_app1_jpeg(&block_a, &block_b);
+    let meta = jpeg::parse_jpeg_exif(&jpeg).expect("two-APP1 JPEG parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let gps = ours
+      .iter()
+      .position(|k| k.starts_with("GPS:"))
+      .unwrap_or_else(|| panic!("exifast: no GPS:* key in {ours:?}"));
+    // The second block's MakerNote (`Apple:*`) emits between its ExifIFD direct
+    // leaves and its GPS group — the #176 deferred-subdir position. The OLD
+    // cross-block-mismatch end-appended it AFTER GPS.
+    assert!(
+      apple < gps,
+      "the kept MakerNote (2nd APP1) must splice BEFORE its GPS group, not \
+       end-append after it (Apple at {apple}, GPS at {gps}) in {ours:?}"
+    );
+    // The vendor block must also follow the LAST ExifIFD key (its own block's
+    // direct leaves), never precede the ExifIFD group.
+    let last_exif = ours
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    assert!(
+      last_exif < apple,
+      "Apple:* must follow the last ExifIFD:* key (last ExifIFD at {last_exif}, \
+       Apple at {apple}) in {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool on the SAME crafted JPEG: its
+    // ExifIFD/Apple/GPS key order must agree (the order oracle).
+    if let Some(bundled) = bundled_crafted_jpeg_g1_order(&jpeg) {
+      let keep = |k: &std::string::String| {
+        k.starts_with("ExifIFD:") || k.starts_with("Apple:") || k.starts_with("GPS:")
+      };
+      // Collapse last-wins-in-place (pre-dedup `tags` stream) for comparability
+      // with bundled's deduped `-G1 -j`.
+      let ours_kept: std::vec::Vec<_> = ours.iter().filter(|k| keep(k)).cloned().collect();
+      let ours_seq = dedup_keys_in_place(&ours_kept);
+      let bundled_seq: std::vec::Vec<_> = bundled.iter().filter(|k| keep(k)).cloned().collect();
+      let b_has = bundled_seq.iter().any(|k| k.starts_with("Apple:"))
+        && bundled_seq.iter().any(|k| k.starts_with("GPS:"));
+      if b_has {
+        assert_eq!(
+          ours_seq, bundled_seq,
+          "exifast's ExifIFD/Apple/GPS key order must match bundled exiftool \
+           -G1 -j for the Interop-only-then-MakerNote two-APP1 JPEG"
+        );
+      } else {
+        eprintln!("SKIP bundled multi-APP1(a) cross-check: missing group {bundled:?}");
+      }
+    } else {
+      eprintln!("SKIP bundled multi-APP1(a) cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #400 round 2, Finding 2 — a multi-`APP1` JPEG whose FIRST `APP1` Exif block
+  /// has ExifIFD direct leaves AND its OWN `0xa005` InteropIFD descent (an
+  /// earlier block with its own deferred subdir), and whose SECOND `APP1` carries
+  /// the kept MakerNote. The subtree lookup must target the SECOND block's ExifIFD
+  /// run (the kept MakerNote's recorded parent, by `source_block`), leaving the
+  /// FIRST block's Interop leaves at their own file position — BEFORE the second
+  /// block's MakerNote. So `InteropIFD:*` (the first block's) precedes `Apple:*`.
+  ///
+  /// RED under the OLD `position(first ExifIFD)` lookup: it found the FIRST
+  /// block's ExifIFD run, swallowed that block's Interop leaves into the spliced
+  /// `region`, and the no-recorded-Interop fallback re-emitted them AFTER the
+  /// MakerNote → `Apple:*` WRONGLY preceded `InteropIFD:*`. The block-scoped
+  /// lookup keeps the first block's Interop in `before` (emitted in file order),
+  /// so `InteropIFD:* < Apple:*` — matching bundled.
+  ///
+  /// `exififd_leaves_only_tiff` is exercised as a no-regression control: two
+  /// plain ExifIFD blocks then a MakerNote still splice the vendor block after the
+  /// last ExifIFD key.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn multi_app1_earlier_interop_block_then_maker_note_splices_into_recorded_block() {
+    // First block: ExifIFD leaves + its OWN InteropIFD descent, NO MakerNote.
+    let block_a = interop_only_exif_tiff();
+    // Second block: the kept MakerNote (no Interop, no GPS).
+    let block_b = makernote_exif_tiff(/* with_gps */ false);
+    let jpeg = wrap_two_app1_jpeg(&block_a, &block_b);
+    let meta = jpeg::parse_jpeg_exif(&jpeg).expect("two-APP1 JPEG parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let interop = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD:* key in {ours:?}"));
+    // The FIRST block's Interop sits at its own file position (in `before`),
+    // BEFORE the SECOND block's spliced MakerNote. The OLD first-ExifIFD-run
+    // lookup re-emitted the first block's Interop leaves AFTER the MakerNote.
+    assert!(
+      interop < apple,
+      "the earlier block's InteropIFD:* must precede the later block's spliced \
+       Apple:* (InteropIFD at {interop}, Apple at {apple}) — Finding 2's \
+       block-scoped subtree lookup; got {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool on the SAME crafted JPEG: bundled must
+    // ALSO place the earlier block's InteropIFD:* before the later block's
+    // Apple:* — the invariant the block-scoped splice controls. (The fix ties the
+    // splice to the recorded block; it does NOT also impose bundled's GLOBAL
+    // cross-block Group1 sort, which would interleave the two blocks' ExifIFD
+    // tags — a within-file ORDER nuance the multiset `-G1 -j` conformance is
+    // blind to, and which exifast's per-block `tags` stream does not chase. So
+    // cross-check the pairwise InteropIFD-before-Apple relation, not the full
+    // interleaved sequence.)
+    if let Some(bundled) = bundled_crafted_jpeg_g1_order(&jpeg) {
+      let b_interop = bundled.iter().position(|k| k.starts_with("InteropIFD:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      match (b_interop, b_apple) {
+        (Some(bi), Some(ba)) => assert!(
+          bi < ba,
+          "bundled must place the earlier block's InteropIFD:* before the later \
+           block's Apple:* (InteropIFD at {bi}, Apple at {ba}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled multi-APP1(b) cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled multi-APP1(b) cross-check: EXIFTOOL/perl unavailable");
+    }
+
+    // No-regression control: two PLAIN ExifIFD blocks (no subdir on the first)
+    // then a MakerNote still splice the vendor block after the last ExifIFD key.
+    let ctrl = wrap_two_app1_jpeg(&exififd_leaves_only_tiff(), &makernote_exif_tiff(false));
+    let ctrl_meta = jpeg::parse_jpeg_exif(&ctrl).expect("control two-APP1 JPEG parses");
+    let ctrl_keys = exifast_g1_key_order(&ctrl_meta);
+    let ctrl_apple = ctrl_keys
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("control: no Apple:* key in {ctrl_keys:?}"));
+    let ctrl_last_exif = ctrl_keys
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("control: no ExifIFD:* key in {ctrl_keys:?}"));
+    assert!(
+      ctrl_last_exif < ctrl_apple,
+      "control: Apple:* must follow the last ExifIFD:* key (last ExifIFD at \
+       {ctrl_last_exif}, Apple at {ctrl_apple}) in {ctrl_keys:?}"
+    );
+  }
+
+  // ====================================================================// MakerNote splice — recorded-position anchor (#176-B / #400 round 3)
+  //
+  // The splice anchors on the kept MakerNote record's EXACT recorded
+  // ExifIFD-walk instance — `(source_block, parent_ifd_start)` — carried onto the
+  // entries via [`ExifEntry::own_ifd_start`]. Two edges the old `source_block` +
+  // `IfdKind`-only subtree lookup got wrong:
+  //   1. EMPTY-PARENT: an ExifIFD holding ONLY the `0x927c` pointer has NO direct
+  //      leaves, so `region_start` was `None` → the MakerNote front-spliced
+  //      (before EVERY entry). In a multi-`APP1` JPEG that moved the later block's
+  //      vendor tags AHEAD of an earlier block. Now it splices at the RECORDED
+  //      position (after that block's IFD0 leaves), never the front.
+  //   2. DUPLICATE-EXIFIFD: two `0x8769` pointers in ONE IFD0 (distinct offsets)
+  //      lay two ExifIFD runs in `entries`; the `IfdKind`-only lookup found the
+  //      FIRST run. The `parent_ifd_start` anchor targets the run the kept
+  //      MakerNote was actually in.
+  // ORDER-sensitive: the `-G1 -j` multiset conformance is blind to it.
+  // ====================================================================
+
+  /// A STANDALONE big-endian TIFF whose ExifIFD holds ONLY the `0x927c` MakerNote
+  /// ([`bundled_apple_makernote_blob`]) — NO direct ExifIFD leaves, NO `0xa005`
+  /// InteropIFD. IFD0 carries `Make` (an emitted IFD0 leaf the MakerNote must
+  /// follow) + the ExifOffset pointer; when `with_gps` it also carries a `0x8825`
+  /// GPSInfo pointer → a GPS IFD (`0x0000 GPSVersionID`) that trails the ExifIFD
+  /// descent. The empty ExifIFD makes `region_start` `None`, exercising the
+  /// recorded-position empty-parent splice (after IFD0's `Make`, before `GPS:*`).
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn makernote_only_exififd_tiff(with_gps: bool) -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_n = if with_gps { 3usize } else { 2usize }; // Make + ExifOffset [+ GPSInfo]
+    let ifd0_len = 2 + 12 * ifd0_n + 4;
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 1usize; // ONLY the 0x927c pointer
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let gps_off = exififd_off + exififd_len;
+    let gps_n = 1usize;
+    let gps_len = 2 + 12 * gps_n + 4;
+    let make_off = if with_gps { gps_off + gps_len } else { gps_off };
+    let mn_off = make_off + 6; // "Canon\0" is 6 bytes
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: Make (0x010f, out-of-line ASCII) + ExifOffset (0x8769) [+ GPSInfo].
+    t.extend_from_slice(&(ifd0_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x010f, 2, 6, (make_off as u32).to_be_bytes())); // Make = "Canon\0"
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    if with_gps {
+      t.extend_from_slice(&entry(0x8825, 4, 1, (gps_off as u32).to_be_bytes()));
+    }
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: ONLY the 0x927c MakerNote pointer (no direct leaf, no 0xa005).
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    if with_gps {
+      debug_assert_eq!(t.len(), gps_off);
+      t.extend_from_slice(&(gps_n as u16).to_be_bytes());
+      t.extend_from_slice(&entry(0x0000, 1, 4, [2, 3, 0, 0])); // GPSVersionID
+      t.extend_from_slice(&0u32.to_be_bytes());
+    }
+    debug_assert_eq!(t.len(), make_off);
+    t.extend_from_slice(b"Canon\0"); // Make value
+    debug_assert_eq!(t.len(), mn_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B Finding 1 (empty-parent) — a multi-`APP1` JPEG whose FIRST `APP1`
+  /// carries normal ExifIFD tags ([`exififd_leaves_only_tiff`]) and whose SECOND
+  /// `APP1` has a MakerNote-ONLY ExifIFD ([`makernote_only_exififd_tiff`], with a
+  /// trailing GPS). The kept MakerNote's parent ExifIFD has NO direct leaves, so
+  /// the OLD `region_start == None` path front-spliced the vendor block — moving
+  /// the SECOND block's `Apple:*` AHEAD of the FIRST block's `ExifIFD:*`. The
+  /// recorded-position splice keeps it within its own block: after the first
+  /// block's tags AND after the second block's IFD0 `Make`, BEFORE the second
+  /// block's `GPS:*`.
+  ///
+  /// RED under the OLD front-fallback: `Apple:*` at the FRONT ⇒ `Apple < first
+  /// ExifIFD` (and `Apple < Make`). GREEN now: `first-block ExifIFD < Apple` and
+  /// `Apple < GPS`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn multi_app1_maker_note_only_exififd_splices_at_recorded_position_not_front() {
+    let block_a = exififd_leaves_only_tiff(); // normal ExifIFD tags, no MakerNote
+    let block_b = makernote_only_exififd_tiff(/* with_gps */ true); // MakerNote-only ExifIFD + GPS
+    let jpeg = wrap_two_app1_jpeg(&block_a, &block_b);
+    let meta = jpeg::parse_jpeg_exif(&jpeg).expect("two-APP1 JPEG parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let first_exif = ours
+      .iter()
+      .position(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    // The FIRST block's ExifIFD carries TWO direct leaves
+    // ([`exififd_leaves_only_tiff`]: ExposureProgram + ISO). The empty-parent
+    // MakerNote must follow the LAST of them, not just the first — a block-LOCAL
+    // `dispatch_index` (un-rebased by the merged base) would splice the vendor
+    // block between the first block's two ExifIFD leaves (#176-B, the merge-base
+    // rebase). `first_exif < apple` alone could not see that mis-splice.
+    let last_exif = ours
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    let make = ours
+      .iter()
+      .position(|k| k == "IFD0:Make")
+      .unwrap_or_else(|| panic!("exifast: no IFD0:Make key in {ours:?}"));
+    let gps = ours
+      .iter()
+      .position(|k| k.starts_with("GPS:"))
+      .unwrap_or_else(|| panic!("exifast: no GPS:* key in {ours:?}"));
+    // The empty-parent MakerNote must NOT front-splice: the FIRST block's ExifIFD
+    // tags precede it (the OLD bug put Apple:* at index 0, ahead of them).
+    assert!(
+      first_exif < apple,
+      "the MakerNote-only ExifIFD's vendor block must splice at its RECORDED \
+       block position (after the earlier block's ExifIFD:*), NOT the front \
+       (first ExifIFD at {first_exif}, Apple at {apple}) in {ours:?}"
+    );
+    // …and after the FIRST block's LAST ExifIFD leaf — the block-local
+    // `dispatch_index` (e.g. 1, the second block's own IFD0 count at `0x8769`
+    // dispatch) used as a GLOBAL `self.entries` index splices the MakerNote
+    // INSIDE the first block's two-leaf ExifIFD run (after leaf #1, before leaf
+    // #2). RED there; GREEN once the merge re-bases `dispatch_index` by the
+    // prior blocks' merged entry base (#176-B).
+    assert!(
+      last_exif < apple,
+      "the spliced MakerNote must follow the FIRST block's LAST ExifIFD:* leaf, \
+       not splice between its two leaves (last ExifIFD at {last_exif}, Apple at \
+       {apple}) in {ours:?}"
+    );
+    // …and after the SECOND block's own IFD0 `Make` (its block-1 IFD0 prefix) —
+    // the recorded ExifIFD dispatch sits AFTER that block's IFD0 leaves.
+    assert!(
+      make < apple,
+      "the spliced MakerNote must follow its own block's IFD0:Make (Make at \
+       {make}, Apple at {apple}) in {ours:?}"
+    );
+    // …and still BEFORE its own block's GPS group (the recorded ExifIFD descent
+    // sits between this block's IFD0 leaves and its GPS).
+    assert!(
+      apple < gps,
+      "the spliced MakerNote must precede its own block's GPS:* (Apple at \
+       {apple}, GPS at {gps}) in {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool on the SAME crafted JPEG: it must also
+    // place the earlier block's ExifIFD:* before the later block's Apple:*, and
+    // Apple:* before GPS:* — the relations the recorded-position splice controls.
+    if let Some(bundled) = bundled_crafted_jpeg_g1_order(&jpeg) {
+      let b_first_exif = bundled.iter().position(|k| k.starts_with("ExifIFD:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      let b_gps = bundled.iter().position(|k| k.starts_with("GPS:"));
+      match (b_first_exif, b_apple, b_gps) {
+        (Some(be), Some(ba), Some(bg)) => {
+          assert!(
+            be < ba && ba < bg,
+            "bundled must place the earlier ExifIFD:* before Apple:* before GPS:* \
+             (ExifIFD {be}, Apple {ba}, GPS {bg}) in {bundled:?}"
+          );
+        }
+        _ => eprintln!("SKIP bundled empty-parent cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled empty-parent cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// A SINGLE-block control for the empty-parent splice: one standalone TIFF whose
+  /// ExifIFD is MakerNote-only (no direct leaves) with IFD0 `Make` + a trailing
+  /// GPS. The vendor block must splice at the recorded ExifIFD position — after
+  /// IFD0's `Make`, BEFORE `GPS:*` — never the front (which would put `Apple:*`
+  /// ahead of `IFD0:Make`).
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn single_block_maker_note_only_exififd_splices_after_ifd0_before_gps() {
+    let data = makernote_only_exififd_tiff(/* with_gps */ true);
+    let meta = parse_exif_block(&data).expect("MakerNote-only-ExifIFD TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let make = ours
+      .iter()
+      .position(|k| k == "IFD0:Make")
+      .unwrap_or_else(|| panic!("exifast: no IFD0:Make key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let gps = ours
+      .iter()
+      .position(|k| k.starts_with("GPS:"))
+      .unwrap_or_else(|| panic!("exifast: no GPS:* key in {ours:?}"));
+    assert!(
+      make < apple && apple < gps,
+      "the empty-parent MakerNote must splice after IFD0:Make and before GPS:* \
+       (Make at {make}, Apple at {apple}, GPS at {gps}) — recorded position, NOT \
+       the front; got {ours:?}"
+    );
+
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let b_make = bundled.iter().position(|k| k == "IFD0:Make");
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      let b_gps = bundled.iter().position(|k| k.starts_with("GPS:"));
+      match (b_make, b_apple, b_gps) {
+        (Some(bm), Some(ba), Some(bg)) => assert!(
+          bm < ba && ba < bg,
+          "bundled must place IFD0:Make before Apple:* before GPS:* \
+           (Make {bm}, Apple {ba}, GPS {bg}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled single-block empty-parent cross-check: missing {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled single-block empty-parent cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #176-B (the merge-base rebase) — a LATER `APP1` empty-MakerNote-parent block
+  /// must splice the vendor block at its GLOBAL merged-stream position, AFTER ALL
+  /// of the earlier block's emitted entries.
+  ///
+  /// The [`DeferredKind::ExifIfdAnchor`]'s `dispatch_index` is captured as the
+  /// SECOND block's OWN `self.entries.len()` at its `0x8769` dispatch (a small
+  /// block-LOCAL index — here `1`, after that block's IFD0 `Make`). The JPEG merge
+  /// appends each block's entries AFTER all prior blocks', so consuming that index
+  /// DIRECTLY as a merged-`self.entries` `split_at` index would splice the
+  /// MakerNote at global index `1` — INSIDE the FIRST block's two-leaf ExifIFD run
+  /// (`ExposureProgram`, then `Apple:*`, then `ISO`). The fix rebases the anchor by
+  /// the merged entry base (the first block's entry count) so it becomes the
+  /// GLOBAL index where the second block's ExifIFD content begins.
+  ///
+  /// Asserts the MakerNote follows EVERY first-block `ExifIFD:*` leaf AND the
+  /// second block's own `IFD0:Make`, and precedes the second block's `GPS:*` — i.e.
+  /// the vendor block is at the recorded GLOBAL position, never interleaved with a
+  /// prior block's tags. RED under the un-rebased block-local index; GREEN once
+  /// [`merge_exif_block`](jpeg::merge_exif_block) adds the merged base.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn later_app1_empty_parent_maker_note_rebases_dispatch_index_to_global_position() {
+    let block_a = exififd_leaves_only_tiff(); // two ExifIFD direct leaves, ordinal 0
+    let block_b = makernote_only_exififd_tiff(/* with_gps */ true); // empty-parent MN + IFD0 Make + GPS, ordinal 1
+    let jpeg = wrap_two_app1_jpeg(&block_a, &block_b);
+    let meta = jpeg::parse_jpeg_exif(&jpeg).expect("two-APP1 JPEG parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    // The MakerNote must come after the LAST first-block ExifIFD leaf — the index
+    // that goes RED if the anchor stays block-local (the splice lands between the
+    // first block's two ExifIFD leaves, after `ExposureProgram` but before `ISO`).
+    let last_exif = ours
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    // …and after the second block's own IFD0 prefix (`IFD0:Make`).
+    let make = ours
+      .iter()
+      .position(|k| k == "IFD0:Make")
+      .unwrap_or_else(|| panic!("exifast: no IFD0:Make key in {ours:?}"));
+    // …and before the second block's GPS group.
+    let gps = ours
+      .iter()
+      .position(|k| k.starts_with("GPS:"))
+      .unwrap_or_else(|| panic!("exifast: no GPS:* key in {ours:?}"));
+    assert!(
+      last_exif < apple && make < apple && apple < gps,
+      "the later block's empty-parent MakerNote must splice at its GLOBAL recorded \
+       position — after EVERY first-block ExifIFD:* leaf (last at {last_exif}) and \
+       after its own IFD0:Make ({make}), before GPS:* ({gps}); Apple at {apple}. A \
+       block-local dispatch_index would interleave it with the first block's two \
+       ExifIFD leaves. Order: {ours:?}"
+    );
+
+    // The full relative order must match bundled exiftool -G1 -j on the SAME JPEG:
+    // both first-block ExifIFD leaves, then the second block's Make, then Apple:*,
+    // then GPS:*.
+    if let Some(bundled) = bundled_crafted_jpeg_g1_order(&jpeg) {
+      let b_last_exif = bundled.iter().rposition(|k| k.starts_with("ExifIFD:"));
+      let b_make = bundled.iter().position(|k| k == "IFD0:Make");
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      let b_gps = bundled.iter().position(|k| k.starts_with("GPS:"));
+      match (b_last_exif, b_make, b_apple, b_gps) {
+        (Some(be), Some(bm), Some(ba), Some(bg)) => assert!(
+          be < ba && bm < ba && ba < bg,
+          "bundled must place every ExifIFD:* (last {be}) and IFD0:Make ({bm}) \
+           before Apple:* ({ba}), and Apple:* before GPS:* ({bg}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled later-empty-parent cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled later-empty-parent cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// A STANDALONE big-endian TIFF whose IFD0 carries TWO `0x8769` ExifIFD pointers
+  /// at DISTINCT offsets — a crafted DUPLICATE ExifIFD walk. ExifIFD #1 holds one
+  /// direct leaf (`0x8822 ExposureProgram`) PLUS a `0xa005` InteropIFD pointer (so
+  /// it owns its OWN deferred subdir), and NO MakerNote. ExifIFD #2 holds one
+  /// direct leaf (`0x8827 ISO`) PLUS the `0x927c` MakerNote
+  /// ([`bundled_apple_makernote_blob`]), and NO Interop. The kept (first-and-only)
+  /// MakerNote is in instance #2, so its recorded `parent_ifd_start` is ExifIFD
+  /// #2's body — the splice must target #2's run, leaving instance #1's `0xa005`
+  /// leaves at their own file position (in the pre-subtree prefix), NOT swallowed
+  /// into the region and re-emitted after the MakerNote.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn duplicate_exififd_makernote_tiff() -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_n = 2usize; // two 0x8769 ExifOffset pointers
+    let ifd0_len = 2 + 12 * ifd0_n + 4;
+    let exif1_off = ifd0_off + ifd0_len;
+    let exif1_n = 2usize; // 1 direct leaf + 0xa005
+    let exif1_len = 2 + 12 * exif1_n + 4;
+    let interop_off = exif1_off + exif1_len;
+    let interop_n = 1usize; // 0x0001 InteropIndex
+    let interop_len = 2 + 12 * interop_n + 4;
+    let exif2_off = interop_off + interop_len;
+    let exif2_n = 2usize; // 1 direct leaf + 0x927c
+    let exif2_len = 2 + 12 * exif2_n + 4;
+    let mn_off = exif2_off + exif2_len;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: two ExifOffset pointers → two DISTINCT ExifIFD bodies.
+    t.extend_from_slice(&(ifd0_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exif1_off as u32).to_be_bytes()));
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exif2_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exif1_off);
+    // ExifIFD #1: ExposureProgram + its OWN 0xa005 InteropIFD (no MakerNote).
+    t.extend_from_slice(&(exif1_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8822, 3, 1, [0x00, 0x02, 0x00, 0x00])); // ExposureProgram = 2
+    t.extend_from_slice(&entry(0xa005, 4, 1, (interop_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), interop_off);
+    // InteropIFD (instance #1's): InteropIndex (0x0001) = "R98\0".
+    t.extend_from_slice(&(interop_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\x00"));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exif2_off);
+    // ExifIFD #2: ISO + the 0x927c MakerNote.
+    t.extend_from_slice(&(exif2_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8827, 3, 1, [0x00, 0x64, 0x00, 0x00])); // ISO = 100
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), mn_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B Finding 2 (duplicate-ExifIFD) — a crafted IFD0 with TWO `0x8769`
+  /// pointers ([`duplicate_exififd_makernote_tiff`]). The kept MakerNote sits in
+  /// the SECOND ExifIFD instance; the FIRST instance owns a `0xa005` InteropIFD.
+  /// The `(source_block, parent_ifd_start)` anchor targets instance #2's run, so
+  /// the vendor block emits among instance #2's leaves (`ISO` precedes `Apple:*`),
+  /// while instance #1's `InteropIFD:*` stays at its own file position — BEFORE the
+  /// instance #2 MakerNote. So `InteropIFD:* < Apple:*` is the DISTINGUISHING
+  /// relation.
+  ///
+  /// RED under the OLD `IfdKind`-only subtree lookup: it found instance #1's run
+  /// and SWALLOWED both instances' `ExifIFD`/`Interop` leaves into one `region`;
+  /// instance #2's MakerNote record (selected by `parent_ifd_start`) then emitted,
+  /// and the lost-record fallback re-emitted instance #1's `0xa005` leaves AFTER
+  /// it → `Apple:* < InteropIFD:*`. The anchor scopes the region to instance #2,
+  /// leaving instance #1's Interop in the prefix → `InteropIFD:* < Apple:*`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn duplicate_exififd_maker_note_splices_into_recorded_instance() {
+    let data = duplicate_exififd_makernote_tiff();
+    let meta = parse_exif_block(&data).expect("duplicate-ExifIFD TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let exposure = ours
+      .iter()
+      .position(|k| k == "ExifIFD:ExposureProgram")
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:ExposureProgram key in {ours:?}"));
+    let interop = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD:* key in {ours:?}"));
+    let iso = ours
+      .iter()
+      .position(|k| k == "ExifIFD:ISO")
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:ISO key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    // The DISTINGUISHING relation: instance #1's InteropIFD:* stays in the
+    // pre-subtree prefix, BEFORE the instance #2 MakerNote. The OLD IfdKind-only
+    // lookup swallowed instance #1's Interop into the region and re-emitted it
+    // AFTER the MakerNote (`Apple:* < InteropIFD:*`).
+    assert!(
+      interop < apple,
+      "instance #1's InteropIFD:* must precede instance #2's spliced Apple:* \
+       (InteropIFD at {interop}, Apple at {apple}) — the anchor scopes the region \
+       to the RECORDED instance, NOT the first ExifIFD run; got {ours:?}"
+    );
+    // The MakerNote splices among instance #2's leaves: `ISO` (#2) precedes it.
+    assert!(
+      iso < apple,
+      "the MakerNote must splice into its RECORDED ExifIFD instance (#2, with \
+       ISO), so ISO precedes Apple:* (ISO at {iso}, Apple at {apple}); got {ours:?}"
+    );
+    // Instance #1's ExposureProgram + InteropIFD lead the recorded-instance region.
+    assert!(
+      exposure < interop && interop < iso,
+      "instance #1's ExposureProgram + InteropIFD must precede instance #2's ISO \
+       (ExposureProgram at {exposure}, InteropIFD at {interop}, ISO at {iso}) \
+       in {ours:?}"
+    );
+
+    // Best-effort bundled cross-check: if the live tool also walks both ExifIFD
+    // bodies and captures the second's MakerNote, it must agree InteropIFD:* (the
+    // first instance's) precedes Apple:* (the second's).
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let b_interop = bundled.iter().position(|k| k.starts_with("InteropIFD:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      match (b_interop, b_apple) {
+        (Some(bi), Some(ba)) => assert!(
+          bi < ba,
+          "bundled must place InteropIFD:* before Apple:* (InteropIFD {bi}, \
+           Apple {ba}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled duplicate-ExifIFD cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled duplicate-ExifIFD cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// A STANDALONE big-endian TIFF that emits NO `ExifEntry` of its own: IFD0 holds
+  /// ONLY the `0x8769` ExifOffset pointer (no IFD0 leaf, no `0x8825` GPSInfo), and
+  /// the ExifIFD holds ONLY the `0x927c` MakerNote pointer (no direct leaf, no
+  /// `0xa005` InteropIFD). Every entry is a dispatched SubDirectory pointer —
+  /// NONE is emitted as a leaf — so the block contributes a kept MakerNote but
+  /// ZERO entries to the merged stream. Used as the FIRST `APP1` (the MakerNote
+  /// owner, ordinal `0`) in the empty-block splice regression: with no entry at
+  /// `source_block == 0`, the OLD `take_while(source_block != mn_block || Ifd0)`
+  /// had no boundary entry and ran past the SECOND block too (appending the
+  /// MakerNote after later tags). The block-ordinal partition stops at the
+  /// `source_block == 0 / > 0` boundary regardless.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn pointer_only_maker_note_tiff() -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4; // count + ONLY the 0x8769 pointer + next-IFD
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 1usize; // ONLY the 0x927c pointer
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let mn_off = exififd_off + exififd_len;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: ONLY the ExifOffset (0x8769) pointer — no emitted IFD0 leaf.
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: ONLY the 0x927c MakerNote pointer — no direct leaf, no 0xa005.
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), mn_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B (empty-block) — a multi-`APP1` JPEG whose FIRST `APP1` is the
+  /// MakerNote owner but emits ZERO entries ([`pointer_only_maker_note_tiff`]:
+  /// only the IFD0 ExifOffset + the ExifIFD MakerNote pointers), FOLLOWED by a
+  /// SECOND `APP1` with normal emitted ExifIFD tags ([`exififd_leaves_only_tiff`]).
+  /// The kept MakerNote's block (ordinal `0`) contributes NO `ExifEntry`, so no
+  /// entry has `source_block == 0` to bound the empty-parent splice. The MakerNote
+  /// must splice at its RECORDED block position — block `0`, which is FIRST — so
+  /// `Apple:*` precedes the SECOND block's `ExifIFD:*`.
+  ///
+  /// RED under the OLD `take_while(source_block != mn_block || ifd == Ifd0)`:
+  /// block 0 has no entry, so the predicate (`source_block != 0`) stayed TRUE for
+  /// the SECOND block's entries too → `insert_at == entries.len()` → the MakerNote
+  /// APPENDED after the later block (`ExifIFD:* < Apple:*`). GREEN under the
+  /// block-ordinal partition: `insert_at` counts entries with `source_block < 0`
+  /// (none) OR `source_block == 0 && Ifd0` (none) ⇒ `0`, splicing the MakerNote
+  /// at the front of the stream — its block-0 position — so `Apple:* < ExifIFD:*`.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn multi_app1_pointer_only_maker_note_block_splices_at_recorded_block_not_appended() {
+    let block_a = pointer_only_maker_note_tiff(); // MakerNote owner, emits NOTHING
+    let block_b = exififd_leaves_only_tiff(); // normal ExifIFD tags, no MakerNote
+    let jpeg = wrap_two_app1_jpeg(&block_a, &block_b);
+    let meta = jpeg::parse_jpeg_exif(&jpeg).expect("two-APP1 JPEG parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    let last_exif = ours
+      .iter()
+      .rposition(|k| k.starts_with("ExifIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no ExifIFD:* key in {ours:?}"));
+    // The MakerNote owner is the FIRST block (ordinal 0) and emits NO entries; the
+    // splice must land at its recorded block position — the FRONT — so the
+    // MakerNote precedes the SECOND block's ExifIFD tags. The OLD take_while(!=)
+    // found no source_block==0 entry, ran past block 1, and APPENDED the MakerNote
+    // after the SECOND block's ExifIFD:* (last_exif < apple).
+    assert!(
+      apple < last_exif,
+      "the pointer-only MakerNote block (ordinal 0, no entries) must splice at its \
+       RECORDED block position (the front, before the later block's ExifIFD:*), \
+       NOT be appended after it (Apple at {apple}, last ExifIFD at {last_exif}) \
+       in {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool on the SAME crafted JPEG: it must also
+    // place the first block's Apple:* before the second block's ExifIFD:*.
+    if let Some(bundled) = bundled_crafted_jpeg_g1_order(&jpeg) {
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      let b_last_exif = bundled.iter().rposition(|k| k.starts_with("ExifIFD:"));
+      match (b_apple, b_last_exif) {
+        (Some(ba), Some(be)) => assert!(
+          ba < be,
+          "bundled must place the first block's Apple:* before the second block's \
+           ExifIFD:* (Apple {ba}, last ExifIFD {be}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled empty-block cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled empty-block cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// A STANDALONE big-endian TIFF whose ExifIFD carries TWO `0xa005` InteropIFD
+  /// pointers with the `0x927c` MakerNote BETWEEN them on disk — a crafted
+  /// duplicate-Interop layout. The ExifIFD entries in on-disk order are:
+  /// `0xa005` (Interop #1) → `0x927c` (MakerNote) → `0xa005` (Interop #2). Both
+  /// InteropIFD bodies hold one `0x0001 InteropIndex` leaf; the MakerNote is
+  /// [`bundled_apple_makernote_blob`]. The deferred subdirs walk in on-disk
+  /// pointer order, so `InteropIFD:*` (the first descent) emits BEFORE the
+  /// `Apple:*` MakerNote, which emits BEFORE the second Interop descent — the
+  /// MakerNote splices BETWEEN the two Interop pointers, not before/after both.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn maker_note_between_two_interop_tiff() -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4; // count + 1 ExifOffset + next-IFD
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 3usize; // 0xa005 + 0x927c + 0xa005
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let interop1_off = exififd_off + exififd_len;
+    let interop_n = 1usize;
+    let interop_len = 2 + 12 * interop_n + 4;
+    let interop2_off = interop1_off + interop_len;
+    let mn_off = interop2_off + interop_len;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: ExifOffset (0x8769) → ExifIFD.
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: 0xa005 (Interop #1), then 0x927c (MakerNote), then 0xa005 (#2).
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0xa005, 4, 1, (interop1_off as u32).to_be_bytes()));
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&entry(0xa005, 4, 1, (interop2_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), interop1_off);
+    // InteropIFD #1: InteropIndex (0x0001) = "R98\0".
+    t.extend_from_slice(&(interop_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\x00"));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), interop2_off);
+    // InteropIFD #2: InteropIndex (0x0001) = "THM\0".
+    t.extend_from_slice(&(interop_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"THM\x00"));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), mn_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B (duplicate-Interop, same parent) — an ExifIFD with the `0x927c`
+  /// MakerNote BETWEEN two `0xa005` InteropIFD pointers
+  /// ([`maker_note_between_two_interop_tiff`]). This exercises the NON-empty-parent
+  /// `region_start` splice path (the parent walked Interop leaves), and asserts the
+  /// deferred-subdir on-disk pointer order is preserved: the FIRST Interop descent's
+  /// `InteropIFD:*` leaves precede the `Apple:*` MakerNote (their pointer index is
+  /// lower than `0x927c`'s). The block contributes Interop entries, so this is the
+  /// `region_start.is_some()` branch — UNCHANGED by the empty-block fix — confirming
+  /// the fix does not perturb the splice when the MakerNote block has entries.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn maker_note_between_duplicate_interop_pointers_preserves_pointer_order() {
+    let data = maker_note_between_two_interop_tiff();
+    let meta = parse_exif_block(&data).expect("MakerNote-between-two-Interop TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let interop = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD:* key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    // The FIRST 0xa005 pointer precedes the 0x927c MakerNote on disk, so its
+    // InteropIFD descent emits BEFORE the Apple:* vendor block (deferred subdirs
+    // walk in on-disk pointer order — #176 Option B).
+    assert!(
+      interop < apple,
+      "the first InteropIFD descent (pointer before 0x927c) must precede the \
+       MakerNote (InteropIFD at {interop}, Apple at {apple}) in {ours:?}"
+    );
+
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let b_interop = bundled.iter().position(|k| k.starts_with("InteropIFD:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      match (b_interop, b_apple) {
+        (Some(bi), Some(ba)) => assert!(
+          bi < ba,
+          "bundled must place the first InteropIFD:* before Apple:* \
+           (InteropIFD {bi}, Apple {ba}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled duplicate-Interop cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled duplicate-Interop cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  // ====================================================================// #176-B definitive close — recorded-position fixes (round 2)
+  //
+  // Two ORDER-only refinements the multiset `-G1 -j` conformance is blind to —
+  // ground-truthed against the live bundled tool when present:
+  //   1. the EMPTY MakerNote parent (an ExifIFD holding ONLY the `0x927c`
+  //      pointer) must splice at the RECORDED ExifIFD-dispatch position
+  //      ([`DeferredKind::ExifIfdAnchor`] — `entries.len()` at the `0x8769`
+  //      walk), NOT a count of this block's IFD0 leaves. A crafted IFD0 with
+  //      `GPSInfo` (`0x8825`) BEFORE `ExifOffset` (`0x8769`) dispatches the GPS
+  //      leaves first; the empty MakerNote must land AFTER them.
+  //   2. each `0xa005` InteropIFD descent must emit ONLY its OWN body's leaves at
+  //      its recorded pointer position (split by `own_ifd_start ==
+  //      subdir_ifd_start`), so an Interop#1 → MakerNote → Interop#2 layout emits
+  //      Interop#1 < MakerNote < Interop#2 — NOT both Interop bodies then the
+  //      MakerNote (the old whole-`k != parent`-bucket-on-first-record behavior).
+  // ====================================================================
+
+  /// The ordered `family1:Name=<value>` strings `ExifMeta::tags` yields for
+  /// `-G1 -j` (PrintConv), dropping `Unknown=>1` leaves — like
+  /// [`exifast_g1_key_order`] but CARRYING the rendered value so two same-keyed
+  /// leaves (e.g. two `InteropIFD:InteropIndex` from distinct InteropIFD bodies)
+  /// can be told apart by their value. Non-`Str` values render as `"<non-str>"`
+  /// (the order tests only disambiguate string-valued `InteropIndex`).
+  #[cfg(feature = "alloc")]
+  fn exifast_g1_key_value_order(meta: &ExifMeta<'_>) -> std::vec::Vec<std::string::String> {
+    use crate::emit::Taggable;
+    meta
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .filter(|t| !t.unknown())
+      .map(|t| {
+        let g = t.tag().group_ref();
+        let val = match t.tag().value_ref() {
+          crate::value::TagValue::Str(s) => s.to_string(),
+          _ => std::string::String::from("<non-str>"),
+        };
+        std::format!("{}:{}={}", g.family1(), t.tag().name(), val)
+      })
+      .collect()
+  }
+
+  /// A STANDALONE big-endian TIFF whose IFD0 lists the `0x8825` GPSInfo pointer
+  /// BEFORE the `0x8769` ExifOffset pointer, and whose ExifIFD holds ONLY the
+  /// `0x927c` MakerNote ([`bundled_apple_makernote_blob`]) — NO direct leaves,
+  /// NO `0xa005` InteropIFD (the EMPTY-parent splice path). The GPS IFD has one
+  /// leaf (`0x0000 GPSVersionID`).
+  ///
+  /// Because `0x8825` precedes `0x8769` in IFD0, the walk DISPATCHES the GPS IFD
+  /// first (pushing its leaves), THEN the ExifIFD — so the recorded ExifIFD
+  /// dispatch anchor sits AFTER the GPS leaves, and the empty MakerNote must
+  /// splice after `GPS:*`. The OLD empty-parent fallback counted only this
+  /// block's IFD0 leaves (`Ifd0`-typed entries) — STOPPING before the first GPS
+  /// entry (`ifd != Ifd0`, dispatched when the `0x8825` pointer was walked) — so
+  /// it spliced the MakerNote AHEAD of `GPS:*`, reversing the recorded pointer
+  /// order. (Note: IFD0 here has NO own `Ifd0`-typed leaves, only the two subdir
+  /// pointers, so the old count was 0 → MakerNote at the very front.)
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn empty_makernote_exififd_gps_before_exif_tiff() -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_n = 2usize; // GPSInfo (0x8825) + ExifOffset (0x8769), in THAT order
+    let ifd0_len = 2 + 12 * ifd0_n + 4;
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = 1usize; // ONLY the 0x927c MakerNote (empty parent — no leaves)
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let gps_off = exififd_off + exififd_len;
+    let gps_n = 1usize;
+    let gps_len = 2 + 12 * gps_n + 4;
+    let values_off = gps_off + gps_len;
+    let mn_off = values_off;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: GPSInfo (0x8825) BEFORE ExifOffset (0x8769) — the crafted order.
+    t.extend_from_slice(&(ifd0_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8825, 4, 1, (gps_off as u32).to_be_bytes()));
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: ONLY the 0x927c MakerNote pointer (no direct leaves, no Interop).
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), gps_off);
+    // GPS IFD: GPSVersionID (0x0000) = 2.3.0.0 (4 × int8u, inline).
+    t.extend_from_slice(&(gps_n as u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x0000, 1, 4, [2, 3, 0, 0]));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), values_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B (FINDING 1) — an EMPTY MakerNote parent (an ExifIFD holding only the
+  /// `0x927c` pointer) in an IFD0 that lists `GPSInfo` (`0x8825`) BEFORE
+  /// `ExifOffset` (`0x8769`). The GPS IFD is dispatched first, so the recorded
+  /// ExifIFD-dispatch anchor sits AFTER the GPS leaves and the empty MakerNote
+  /// must splice AFTER `GPS:*` (`GPS:* < Apple:*`).
+  ///
+  /// RED under the OLD `Ifd0`-leaves-only predicate: it counted this block's
+  /// `Ifd0`-typed leaves (here ZERO — IFD0 holds only the two subdir pointers),
+  /// stopping before the first GPS entry, and spliced the MakerNote at the FRONT
+  /// (`Apple:* < GPS:*`). GREEN now via [`DeferredKind::ExifIfdAnchor`].
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn empty_makernote_parent_splices_after_earlier_gps() {
+    let data = empty_makernote_exififd_gps_before_exif_tiff();
+    let meta = parse_exif_block(&data).expect("empty-MakerNote GPS-before-Exif TIFF parses");
+    let ours = exifast_g1_key_order(&meta);
+
+    let gps = ours
+      .iter()
+      .position(|k| k.starts_with("GPS:"))
+      .unwrap_or_else(|| panic!("exifast: no GPS:* key in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    // The GPS pointer (0x8825) precedes the ExifIFD pointer (0x8769) on disk, so
+    // the GPS leaves are dispatched BEFORE the (empty) ExifIFD; the MakerNote
+    // splices at the recorded ExifIFD-dispatch anchor, AFTER GPS.
+    assert!(
+      gps < apple,
+      "the empty MakerNote parent must splice AFTER the earlier-dispatched GPS \
+       leaves (GPS at {gps}, Apple at {apple}) — the recorded ExifIFD-dispatch \
+       anchor, NOT the IFD0-leaves approximation; got {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool: the GPS:* group must precede the Apple:*
+    // block for the GPSInfo-before-ExifOffset layout.
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let b_gps = bundled.iter().position(|k| k.starts_with("GPS:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      match (b_gps, b_apple) {
+        (Some(bg), Some(ba)) => assert!(
+          bg < ba,
+          "bundled must place GPS:* before Apple:* for the GPS-before-Exif empty \
+           MakerNote layout (GPS {bg}, Apple {ba}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled empty-parent GPS cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled empty-parent GPS cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// #176-B (FINDING 2) — an Interop#1 → MakerNote → Interop#2 on-disk pointer
+  /// order ([`maker_note_between_two_interop_tiff`], distinct InteropIndex values
+  /// `R98` / `THM`) must emit Interop#1's body, then the `Apple:*` MakerNote,
+  /// then Interop#2's body — each Interop descent emitting ONLY its OWN body's
+  /// leaves at its recorded pointer position. Checks the PRE-dedup `tags()`
+  /// stream (Option B's FILE_ORDER model), where both Interop bodies are visible
+  /// and disambiguated by their distinct `InteropIndex` value.
+  ///
+  /// RED under the OLD single-bucket emission: the FIRST Interop record emitted
+  /// the WHOLE `k != parent` bucket (BOTH InteropIFD bodies) before the MakerNote,
+  /// then `interop_emitted` suppressed the second record — so `THM` (Interop#2)
+  /// emitted BEFORE `Apple:*`, jumping ahead of the MakerNote it sits AFTER on
+  /// disk. GREEN now: the per-record split by `own_ifd_start` yields
+  /// `R98 < Apple < THM`.
+  ///
+  /// The bundled `-G1 -j` cross-check is restricted to the FIRST `InteropIFD:*`
+  /// before `Apple:*` (the stable relation): bundled GROUP-SORTS (`Sort =>
+  /// 'Group1'`), clustering BOTH InteropIFD leaves together rather than
+  /// interleaving them around the MakerNote pointer, AND `%noDups` last-wins
+  /// collapses the duplicate `InteropIndex` to a single value — so bundled's
+  /// display cannot witness the three-way interleave. That interleave is a
+  /// within-EXIF-block FILE_ORDER nuance the order-blind multiset `-G1 -j`
+  /// conformance does not chase (values stay byte-identical); only exifast's
+  /// position-ordered stream expresses it, which is what the fix makes correct.
+  #[test]
+  #[cfg(all(unix, feature = "alloc", feature = "std"))]
+  fn maker_note_between_two_interop_preserves_each_body_position() {
+    let data = maker_note_between_two_interop_tiff();
+    let meta = parse_exif_block(&data).expect("MakerNote-between-two-Interop TIFF parses");
+    let ours = exifast_g1_key_value_order(&meta);
+
+    // Disambiguate the two InteropIFD bodies by their distinct InteropIndex value
+    // (R98 = Interop#1, the lower pointer index; THM = Interop#2, above 0x927c).
+    let interop1 = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:") && k.contains("R98"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD R98 (Interop#1) in {ours:?}"));
+    let interop2 = ours
+      .iter()
+      .position(|k| k.starts_with("InteropIFD:") && k.contains("THM"))
+      .unwrap_or_else(|| panic!("exifast: no InteropIFD THM (Interop#2) in {ours:?}"));
+    let apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .unwrap_or_else(|| panic!("exifast: no Apple:* key in {ours:?}"));
+    assert!(
+      interop1 < apple && apple < interop2,
+      "the per-body Interop split must give Interop#1 (R98) < Apple < Interop#2 \
+       (THM) (R98 at {interop1}, Apple at {apple}, THM at {interop2}) — NOT both \
+       Interop bodies then the MakerNote; got {ours:?}"
+    );
+
+    // Ground-truth the live bundled tool on the stable relation only: the FIRST
+    // InteropIFD descent (pointer before 0x927c) precedes Apple. (Bundled
+    // group-sorts + dedups, so it cannot witness the three-way interleave above.)
+    if let Some(bundled) = bundled_crafted_g1_order(&data) {
+      let b_interop = bundled.iter().position(|k| k.starts_with("InteropIFD:"));
+      let b_apple = bundled.iter().position(|k| k.starts_with("Apple:"));
+      match (b_interop, b_apple) {
+        (Some(bi), Some(ba)) => assert!(
+          bi < ba,
+          "bundled must place the first InteropIFD:* before Apple:* \
+           (InteropIFD {bi}, Apple {ba}) in {bundled:?}"
+        ),
+        _ => eprintln!("SKIP bundled two-Interop split cross-check: missing group {bundled:?}"),
+      }
+    } else {
+      eprintln!("SKIP bundled two-Interop split cross-check: EXIFTOOL/perl unavailable");
+    }
+  }
+
+  /// A standalone big-endian TIFF whose ExifIFD lists `n` DISTINCT `0xa005`
+  /// InteropIFD pointers (each → its own one-leaf InteropIFD body) AHEAD of one
+  /// `0x927c` MakerNote ([`bundled_apple_makernote_blob`]) — the #176-B perf
+  /// stress fixture. Each InteropIFD descent walks one `0x0001 InteropIndex`
+  /// leaf, so `self.entries` carries `n` `Interop` leaves and
+  /// `self.deferred_subdirs` carries `n` `Interop` records: the exact `N` records
+  /// × `N` region-entries shape that the OLD per-record full-region
+  /// `emit_slice_entry` scan + linear `Vec::contains` made O(N²) (a CPU-DoS at a
+  /// crafted `n` near the 65535 IFD-entry ceiling). All pointers/bodies are valid
+  /// (no per-entry warnings), so the ExifIFD walk completes all `n` entries (it
+  /// never hits the 10-warning abort), and every InteropIFD offset is distinct so
+  /// none is suppressed by the reprocess chain-guard.
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn maker_note_with_many_interop_tiff(n: usize) -> Vec<u8> {
+    let mn_blob = bundled_apple_makernote_blob();
+    let ifd0_off = 8usize;
+    let ifd0_len = 2 + 12 + 4; // count + 1 ExifOffset + next-IFD
+    let exififd_off = ifd0_off + ifd0_len;
+    let exif_n = n + 1; // n × 0xa005, then 0x927c
+    let exififd_len = 2 + 12 * exif_n + 4;
+    let interop_off = exififd_off + exififd_len;
+    let interop_len = 2 + 12 + 4; // count + 1 InteropIndex + next-IFD
+    let mn_off = interop_off + n * interop_len;
+
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'M', b'M', 0x00, 0x2a]);
+    t.extend_from_slice(&(ifd0_off as u32).to_be_bytes());
+    // IFD0: ExifOffset (0x8769) → ExifIFD.
+    t.extend_from_slice(&(1u16).to_be_bytes());
+    t.extend_from_slice(&entry(0x8769, 4, 1, (exififd_off as u32).to_be_bytes()));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), exififd_off);
+    // ExifIFD: n × 0xa005 (each → its own InteropIFD body), then 0x927c.
+    t.extend_from_slice(&(exif_n as u16).to_be_bytes());
+    for i in 0..n {
+      let body_off = interop_off + i * interop_len;
+      t.extend_from_slice(&entry(0xa005, 4, 1, (body_off as u32).to_be_bytes()));
+    }
+    t.extend_from_slice(&entry(
+      0x927c,
+      7, /* undef */
+      mn_blob.len() as u32,
+      (mn_off as u32).to_be_bytes(),
+    ));
+    t.extend_from_slice(&0u32.to_be_bytes());
+    debug_assert_eq!(t.len(), interop_off);
+    // n InteropIFD bodies, each one InteropIndex (0x0001) = "R98\0".
+    for _ in 0..n {
+      t.extend_from_slice(&(1u16).to_be_bytes());
+      t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\x00"));
+      t.extend_from_slice(&0u32.to_be_bytes());
+    }
+    debug_assert_eq!(t.len(), mn_off);
+    t.extend_from_slice(&mn_blob);
+    t
+  }
+
+  /// #176-B PERF — a crafted ExifIFD with THOUSANDS of distinct `0xa005`
+  /// InteropIFD pointers must emit in BOUNDED (near-linear) time, not the O(N²)
+  /// the prior per-record full-region [scan] + linear `Vec::contains` cost. The
+  /// deferred Interop emission now pre-buckets the region by `own_ifd_start`
+  /// ONCE (single region pass) and looks each body up O(1), with a `HashSet`
+  /// emitted-tracker — so `N` records over an `N`-leaf region is O(N), not the
+  /// `N × N` scans + `N` growing-`Vec` `contains` that, at a crafted `n` near the
+  /// 65535 IFD-entry ceiling, would be BILLIONS of comparisons (a CPU-DoS during
+  /// serialization, BEFORE the value/conformance tests would notice). With
+  /// `n = 30000` an O(N²) emission is multiple SECONDS of pure integer
+  /// comparisons; the bucketed O(N) emission completes in well under the bound.
+  /// Also asserts ORDER is preserved: every `InteropIFD:*` leaf precedes the
+  /// `Apple:*` MakerNote (all `0xa005` pointers sit before `0x927c` on disk), and
+  /// EVERY one of the `n` InteropIFD bodies emits its leaf exactly once.
+  #[test]
+  #[cfg(all(feature = "alloc", feature = "std"))]
+  fn many_interop_pointers_emit_in_bounded_time() {
+    let n = 30_000usize;
+    let data = maker_note_with_many_interop_tiff(n);
+    // Parse ONCE, outside the timed region — the O(N²) the fix removes lived in
+    // the EMISSION (`push_exif_tags`'s deferred Interop loop), not the parse.
+    let meta = parse_exif_block(&data).expect("many-Interop stress TIFF parses");
+
+    let start = std::time::Instant::now();
+    let ours = exifast_g1_key_order(&meta);
+    let elapsed = start.elapsed();
+
+    // BOUNDED: the bucketed O(N) emission is sub-millisecond-to-low-millisecond
+    // at n = 30000; an O(N²) regression is multiple seconds. A generous 5s bound
+    // gives the O(N) path a >100x margin while still tripping a true O(N²)
+    // reintroduction (CI-load tolerant).
+    assert!(
+      elapsed < std::time::Duration::from_secs(5),
+      "the deferred Interop emission for {n} pointers took {elapsed:?} — expected \
+       bounded (near-linear) time; an O(N²) per-record region scan regressed (#176-B)"
+    );
+
+    // ORDER + COMPLETENESS preserved: every InteropIFD leaf (all pointers precede
+    // 0x927c) emits BEFORE the Apple MakerNote, and all n bodies emit (one leaf
+    // each — same name/group, so count by prefix).
+    let interop_count = ours.iter().filter(|k| k.starts_with("InteropIFD:")).count();
+    assert_eq!(
+      interop_count, n,
+      "expected {n} InteropIFD:* leaves (one per body), got {interop_count}"
+    );
+    let last_interop = ours
+      .iter()
+      .rposition(|k| k.starts_with("InteropIFD:"))
+      .expect("at least one InteropIFD:* leaf");
+    let first_apple = ours
+      .iter()
+      .position(|k| k.starts_with("Apple:"))
+      .expect("an Apple:* MakerNote leaf");
+    assert!(
+      last_interop < first_apple,
+      "every InteropIFD:* leaf (pointers before 0x927c) must precede the Apple:* \
+       MakerNote (last InteropIFD at {last_interop}, first Apple at {first_apple})"
+    );
   }
 
   // ====================================================================// Apple engine migration — differential test (#243 phase 3)

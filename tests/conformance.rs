@@ -12342,8 +12342,16 @@ fn mpeg2_ts_misb_klv_conformance() {
 #[test]
 #[ignore]
 fn mpeg2_ts_mpeg2video_conformance() {
-    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.json", true);
-    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.n.json", false);
+  check(
+    "MPEG2_TS_mpeg2video.ts",
+    "MPEG2_TS_mpeg2video.ts.json",
+    true,
+  );
+  check(
+    "MPEG2_TS_mpeg2video.ts",
+    "MPEG2_TS_mpeg2video.ts.n.json",
+    false,
+  );
 }
 // #211 — Real GoPro HERO6 Black with a live `gpmd` GPS/sensor track (from
 // gopro/gpmf-parser). The DEFAULT (no-`ee`) `.json`/`.n.json` are byte-exact:
