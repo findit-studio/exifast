@@ -1356,7 +1356,12 @@ fn stage_common(body: &[u8]) -> Option<Common> {
           compressor_name = Some(s.to_string());
         }
       }
-      _ => {}
+      // `process_binary_data` only ever pushes the `def.name()` of an
+      // `AIFF_COMMON_KEYS` entry resolved through `AIFF_COMMON` (a closed set:
+      // the 6 `%AIFF::Common` fields matched above). Any other name means the
+      // keys, the table, and this lift loop have drifted — a programming bug.
+      // Debug-only signal; release behavior unchanged (silent no-op).
+      other => debug_assert!(false, "aiff COMM lift: unknown staged tag {other:?}"),
     }
   }
 

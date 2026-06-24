@@ -844,7 +844,12 @@ fn extract_sv7_header(hdr: &[u8]) -> Sv7Header {
       "FastSeek" => h.fast_seek = n as u8,
       "Gapless" => h.gapless = n as u8,
       "EncoderVersion" => h.encoder_version = n as u8,
-      _ => {}
+      // `process_bit_stream` only ever pushes the `def.name()` of an
+      // `MPC_BIT_KEYS` entry resolved through `mpc_get` (a closed set: the 11
+      // `%MPC::Main` SV7 fields matched above). Any other name means the keys,
+      // the table, and this lift loop have drifted — a programming bug.
+      // Debug-only signal; release behavior unchanged (silent no-op).
+      other => debug_assert!(false, "mpc lift: unknown staged tag {other:?}"),
     }
   }
   h
