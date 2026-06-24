@@ -11244,3 +11244,12 @@ fn mpeg2_ts_mpeg2video_conformance() {
     check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.json", true);
     check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.n.json", false);
 }
+
+// Real Sony FX3 footage — ILME-FX3, 4K 4:2:2 10-bit, S-Log3, 23.98fps
+// Used to instrument real error variants in the RTMD parser (#TBD)
+#[test]
+#[ignore]
+fn quicktime_sony_fx3_real_conformance() {
+    check("QuickTime_sony_fx3_real.mp4", "QuickTime_sony_fx3_real.mp4.json", true);
+    check("QuickTime_sony_fx3_real.mp4", "QuickTime_sony_fx3_real.mp4.n.json", false);
+}
