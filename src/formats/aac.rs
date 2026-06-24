@@ -310,7 +310,12 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
           channels = (*n as u64) as u8;
         }
       }
-      _ => {}
+      // `process_bit_stream` only ever pushes the `def.name()` of an
+      // `AAC_BIT_KEYS` entry resolved through `aac_get` (a closed set:
+      // ProfileType/SampleRate/Channels). Any other name means the keys,
+      // the table, and this lift loop have drifted — a programming bug.
+      // Debug-only signal; release behavior unchanged (silent no-op).
+      other => debug_assert!(false, "aac lift: unknown staged tag {other:?}"),
     }
   }
 
