@@ -3191,9 +3191,11 @@ fn process_moov_gps_box(
 /// `ProcessMOV` `for(;;)` loop (QuickTime.pm:10032) reaches them:
 ///
 ///   - `trak` — the timed-metadata samples (a `gpmd` GoPro track dispatches
-///     into [`crate::formats::gopro::process_gopro`]). ExifTool runs
-///     `ProcessSamples` when the track's `stbl` box EXITS (QuickTime.pm:10369-
-///     10371), i.e. at that `trak`'s position in the walk.
+///     into [`crate::formats::gopro::process_gopro`], each `DEVC` sample landing
+///     as a per-`Doc<N>` [`crate::metadata::GoProDocSample`] in `gopro_timed_out`
+///     stamped with the `trak`'s `Track<N>` index — NOT the flat `gopro_out`;
+///     #189). ExifTool runs `ProcessSamples` when the track's `stbl` box EXITS
+///     (QuickTime.pm:10369-10371), i.e. at that `trak`'s position in the walk.
 ///   - `udta/GPMF` — the GoPro GPMF atom (QuickTime.pm:2132-2135). ExifTool
 ///     dispatches it via `$et->ProcessDirectory` (QuickTime.pm:10359) the
 ///     instant the walk descends the `udta` child, i.e. at that `udta`'s
@@ -3208,24 +3210,26 @@ fn process_moov_gps_box(
 ///     own child position (its freeGPS rows land in the SEPARATE `out`
 ///     accumulator, so they never interleave with GoPro's `gopro_out`).
 ///
-/// Processing each source AT its atom position (rather than draining all
-/// `gpmd` samples then all `udta/GPMF` in a fixed post-pass) makes the
-/// accumulation into the single flat `gopro_out` follow ExifTool's `for(;;)`
-/// walk ORDER — so GoPro scalar tags (last-wins `set_*`) and GPS rows (append
-/// `push_*`) land in walk order. This holds across EVERY top-level `moov`
-/// (the caller invokes `walk_moov` per `moov` in file order, R7 multi-moov).
+/// Processing each `udta/GPMF` atom AT its atom position (rather than in a fixed
+/// post-pass) makes the accumulation into the flat `gopro_out` follow ExifTool's
+/// `for(;;)` walk ORDER — so the moov-level GoPro scalar tags (last-wins `set_*`)
+/// and GPS rows (append `push_*`) land in walk order. This holds across EVERY
+/// top-level `moov` (the caller invokes `walk_moov` per `moov` in file order, R7
+/// multi-moov).
 ///
-/// NOTE (oracle-verified, ExifTool 13.59): a file carrying BOTH a `gpmd` trak
-/// AND a `udta/GPMF` is NOT a clean last-wins collision in ExifTool — the
-/// `gpmd` GoPro tags inherit the track's `SET_GROUP1 = Track<N>` group
-/// (GoPro.pm:826 leaves `SET_GROUP0` alone when `SET_GROUP1` is set) while the
-/// `udta/GPMF` tags emit at the moov level (`GoPro:`/`QuickTime:`), so the two
-/// sources occupy DIFFERENT groups and BOTH survive regardless of sibling
-/// order. exifast's flat [`crate::metadata::GoProMeta`] cannot represent that
-/// per-track grouping, so it collapses both into one `GoPro:` namespace; this
-/// ordered walk only controls WHICH source wins that single flat slot. The
-/// group-faithful behaviour (per-track GoPro tags) is a separate, larger
-/// change tracked outside this walk — see the module-level note.
+/// #189 (oracle-verified, ExifTool 13.59): a file carrying BOTH a `gpmd` trak
+/// AND a `udta/GPMF` is NOT a last-wins collision — the `gpmd` GoPro tags inherit
+/// the track's `SET_GROUP1 = Track<N>` group (GoPro.pm:826 leaves `SET_GROUP0`
+/// alone when `SET_GROUP1` is set) while the `udta/GPMF` tags emit at the moov
+/// level (`GoPro:`/`QuickTime:`), so the two sources occupy DIFFERENT family-1
+/// groups and BOTH survive regardless of sibling order. exifast mirrors that by
+/// SOURCE, not by collapsing: the `udta/GPMF` atom fills the flat
+/// [`crate::metadata::GoProMeta`] (`gopro_out` → `GoPro:`), while each `gpmd`
+/// `DEVC` sample is a per-`Doc<N>` [`crate::metadata::GoProDocSample`] in
+/// `gopro_timed_out` stamped with the `trak`'s `Track<N>` index (→ `Track<N>:`,
+/// `-ee` only — [`crate::formats::quicktime::emit_gopro_doc`]). So the two
+/// sources never share a slot, and a duplicate scalar name (e.g. `DeviceName`)
+/// survives in BOTH groups.
 ///
 /// Returns `true` iff ANY GoPro source was DISPATCHED — a `gpmd` GoPro sample
 /// in a `trak` OR a `udta/GPMF` atom — mirroring ExifTool's
@@ -3328,10 +3332,12 @@ fn walk_moov(
       // (processed at the `trak` position) and the `gps ` box above. Running
       // it here (rather than in a fixed post-pass after every `trak`) makes
       // the accumulation into the flat `gopro_out` follow ExifTool's walk
-      // ORDER. (See the fn doc: in ExifTool the two sources land in different
-      // GROUPS — `Track<N>:` vs `GoPro:` — so this ordering only decides which
-      // wins exifast's single flat slot; full group fidelity is a separate
-      // change.)
+      // ORDER. (See the fn doc: the two sources land in DIFFERENT family-1
+      // groups — `Track<N>:` for `gpmd` vs `GoPro:` for `udta/GPMF` — and
+      // exifast keeps them separate by source, #189: `gpmd` → the per-`Doc<N>`
+      // `gopro_timed_out`, this `udta/GPMF` → the flat `gopro_out`. So this
+      // ordering only sequences the moov-level `udta/GPMF` and `gps ` sources;
+      // it never collides with the `Track<N>:` `gpmd` stream.)
       //
       // `GPMF` lives ONLY in the `udta`/UserData table, so it is reached as a
       // DIRECT child of `udta`; a direct `moov/GPMF` child is NOT an ExifTool

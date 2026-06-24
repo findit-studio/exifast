@@ -7594,14 +7594,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // reaches a `udta/GPMF` when it descends that `udta` child
   // (`ProcessDirectory`, QuickTime.pm:10359) and a `trak`'s `gpmd` samples when
   // that `trak`'s `stbl` box exits (QuickTime.pm:10369-10371) — so they
-  // interleave by atom layout, and the flat `gopro_meta` accumulates in walk
-  // order instead of the prior fixed "all `gpmd` then all `udta/GPMF`" post-
-  // pass. NOTE (oracle-verified, ExifTool 13.59): when a `moov` carries BOTH
-  // sources ExifTool keeps them in DIFFERENT groups (`Track<N>:` for `gpmd`
-  // vs `GoPro:` for `udta/GPMF`), so there is no single cross-source last-wins
-  // to match — the flat `GoProMeta` collapses both, a divergence this ordered
-  // walk does not by itself resolve (see `walk_moov` doc). The walk completes
-  // BEFORE the `mdat` scan, and a visited `udta/GPMF` (like a
+  // interleave by atom layout. #189 (oracle-verified, ExifTool 13.59): a `moov`
+  // carrying BOTH sources keeps them in DIFFERENT family-1 groups (`Track<N>:`
+  // for `gpmd` — the `trak`'s `SET_GROUP1`, GoPro.pm:826 — vs `GoPro:` for
+  // `udta/GPMF`), so both survive with no cross-source collision. exifast mirrors
+  // that by source: the `udta/GPMF` atom fills this flat `gopro_meta` (→ `GoPro:`,
+  // no-`ee`), while each `gpmd` `DEVC` sample is a per-`Doc<N>` entry in the
+  // SEPARATE `gopro_timed_meta` ([`GoProTimedMeta`]) stamped with its `Track<N>`
+  // index (→ `Track<N>:`, `-ee` only — see `walk_moov` + `emit_gopro_doc`). The
+  // walk completes BEFORE the `mdat` scan, and a visited `udta/GPMF` (like a
   // `gpmd` sample) folds into `found_embedded`, so the `mdat` scan is still
   // suppressed by the mere PRESENCE of any dispatched GoPro source
   // (`return if $$et{FoundEmbedded}`, QuickTimeStream.pl:3689). A direct
