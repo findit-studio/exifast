@@ -79,6 +79,7 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod body;
+pub mod dji_info;
 pub mod printconv;
 pub mod tags;
 
@@ -88,6 +89,7 @@ use smol_str::SmolStr;
 use std::vec::Vec;
 
 pub use body::{DjiEntry, walk_dji_body, walk_dji_in_tiff};
+pub use dji_info::{is_dji_info, parse_dji_info};
 pub use printconv::DjiPrintConv;
 pub use tags::{DJI_TAGS, DjiTag, lookup};
 
@@ -292,6 +294,16 @@ pub fn parse_with_print_conv(
 /// `tiff_data` is the parent TIFF block; `mn_offset` is the MakerNote
 /// blob's start within `tiff_data`; `mn_len` is the blob length;
 /// `parent_order` is the parent IFD's byte order.
+///
+/// `MakerNotes.pm:93-106` routes a 0x927C MakerNote two ways under
+/// `Vendor::Dji`: a value matching `^\[ae_dbg_info:/` (`NotIFD => 1`) goes to
+/// `%DJI::Info`/[`dji_info::parse_dji_info`] (a flat `[key:val]` bracket run),
+/// everything else to the `%DJI::Main` headerless IFD walked here. This split
+/// is reproduced by sniffing the blob's leading signature: a DJIInfo body has
+/// no IFD, and the IFD walker would misread its leading `[a` (`0x615b`) as a
+/// 24929-entry count and yield garbage. The DJIInfo path populates no typed
+/// `MakerNotesDji` fields (it carries debug blobs, not the camera-pose / speed
+/// data the struct models), so the typed slot stays empty there.
 #[must_use]
 pub fn parse_in_tiff(
   tiff_data: &[u8],
@@ -302,6 +314,16 @@ pub fn parse_in_tiff(
 ) -> (MakerNotesDji, Vec<VendorEmission>) {
   let mut typed = MakerNotesDji::new();
   let mut emissions: Vec<VendorEmission> = Vec::new();
+  // DJIInfo (`MakerNoteDJIInfo`, `NotIFD => 1`): the whole 0x927C value is the
+  // bracketed-string body (`DirStart = 0`). `%DJI::Info` has no Conv, so the
+  // emissions are `print_conv`-independent.
+  let blob_end = mn_offset.saturating_add(mn_len);
+  if let Some(blob) = tiff_data.get(mn_offset..blob_end) {
+    if dji_info::is_dji_info(blob) {
+      emissions.extend(dji_info::parse_dji_info(blob));
+      return (typed, emissions);
+    }
+  }
   let entries = body::walk_dji_in_tiff(tiff_data, mn_offset, mn_len, parent_order);
   for entry in &entries {
     let Some(def) = tags::lookup(entry.tag_id) else {
