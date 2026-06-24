@@ -140,7 +140,7 @@ id3        = []
 # `GetTagTable('Image::ExifTool::QuickTime::Stream')` — exifast's `LigoGPS`
 # walker (`process_ligogps`) and the shared `QuickTime::Stream` emitter
 # (`emit_ligogps`) both live behind the `quicktime` gate.
-m2ts       = ["h264", "quicktime"]
+m2ts       = ["h264", "quicktime", "mpeg-audio"]
 # `matroska` — engine-only per FORMATS.md row 23. Leaf format (no
 # cross-format chains); ports the entire EBML walker + tag table.
 matroska   = []

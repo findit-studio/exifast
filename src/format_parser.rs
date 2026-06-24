@@ -805,7 +805,8 @@ impl AnyMeta<'_> {
           .iter()
           .map(|t| (t.group_ref().family1(), t.name(), t.value_ref())),
       );
-      let ctx = crate::composite::CompositeContext::new(mdat_total, rotation);
+      let ctx = crate::composite::CompositeContext::new(mdat_total, rotation)
+        .with_file_size(self.composite_file_size());
       crate::composite::build_composites_into_tags(
         &mut out,
         Some(&mut other_view),
@@ -985,6 +986,7 @@ impl AnyMeta<'_> {
           crate::emit::ConvMode::PrintConv => &other_view,
         };
         crate::composite::make_context(mdat_total, value_view)
+          .with_file_size(self.composite_file_size())
       };
       crate::composite::build_composites(out, Some(&mut other_view), mode, doc_count, &ctx);
     }
@@ -1008,6 +1010,22 @@ impl AnyMeta<'_> {
     match self {
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => m.quicktime().media_data_total(),
+      _ => None,
+    }
+  }
+
+  /// `$$self{VALUE}{FileSize}` — the input byte length the `%MPEG::Composite`
+  /// `Duration` derive divides by (MPEG.pm:412-413, `Require => FileSize`). Only
+  /// the `M2ts` Meta supplies it (the sole exifast path emitting the `%MPEG::
+  /// Video` bitrate tags); every other Meta returns `None` (their composites
+  /// never read FileSize). exifast does not emit `File:FileSize` as a tag, so
+  /// this is threaded into the Composite engine via
+  /// [`CompositeContext::with_file_size`] rather than resolved from the stream.
+  #[cfg(feature = "alloc")]
+  fn composite_file_size(&self) -> Option<u64> {
+    match self {
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(m) => Some(m.file_size()),
       _ => None,
     }
   }

@@ -432,6 +432,17 @@ pub struct Meta<'a> {
   /// Stored as the RAW index byte; PrintConv lookup at emit. Bundled `-n`
   /// emits the raw index (a fixture shows `0` for 48000).
   ac3_audio_sample_rate: Option<u8>,
+  /// `MPEG:ImageWidth/Height/AspectRatio/FrameRate/VideoBitrate` — the
+  /// `%MPEG::Video` sequence-header decode of a stream-type-0x01/0x02 PES
+  /// (M2TS.pm:300-307 → `MPEG::ParseMPEGAudioVideo`). `None` for an MPEG-2-
+  /// video-free stream (the canonical H.264 `M2TS.mts`).
+  mpeg_video: Option<crate::formats::mpeg::VideoMeta>,
+  /// `$$self{VALUE}{FileSize}` (ExifTool.pm `SetFileType`) — the input byte
+  /// length, threaded into the Composite engine for the `%MPEG::Composite`
+  /// `Duration` def (MPEG.pm:386-415 `Require => FileSize`). Not emitted as a
+  /// tag (the goldens exclude `File:FileSize`); carried only for the Composite
+  /// `Duration = 8 * FileSize / (Audio+VideoBitrate)` derive.
+  file_size: u64,
   /// Nested H.264 Meta when an H.264 PES payload was forwarded to the
   /// H.264 decoder. The H.264 Meta is fully owned (`'a` is a phantom in
   /// `H264Meta<'a>`), but is stored at the Meta's own `'a` for GAT
@@ -548,6 +559,23 @@ impl<'a> Meta<'a> {
   #[inline(always)]
   pub const fn ac3_audio_sample_rate(&self) -> Option<u8> {
     self.ac3_audio_sample_rate
+  }
+
+  /// The MPEG-1/2 video sequence-header decode (`%MPEG::Video`,
+  /// M2TS.pm:300-307). `None` when no MPEG-2-video PES was decoded.
+  #[must_use]
+  #[inline(always)]
+  pub const fn mpeg_video(&self) -> Option<&crate::formats::mpeg::VideoMeta> {
+    self.mpeg_video.as_ref()
+  }
+
+  /// The input byte length (`$$self{VALUE}{FileSize}`), used by the Composite
+  /// `%MPEG::Composite` `Duration` derive (MPEG.pm:386-415). `0` only for an
+  /// empty input (never produced — `probe` rejects sub-`MIN_INITIAL_BYTES`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_size(&self) -> u64 {
+    self.file_size
   }
 
   /// The H.264 sub-Meta when an H.264 PES payload was forwarded. Borrowed
@@ -777,6 +805,13 @@ struct Walker<'a> {
   ac3_audio_channels: Option<u8>,
   /// AC-3 PES payload decode (M2TS.pm:253-261).
   ac3_audio_sample_rate: Option<u8>,
+  /// MPEG-1/2 video sequence-header decode (M2TS.pm:300-307 →
+  /// `MPEG::ParseMPEGAudioVideo`). The `%MPEG::Video` tags
+  /// (`ImageWidth`/`Height`/`AspectRatio`/`FrameRate`/`VideoBitrate`) extracted
+  /// from the FIRST stream-type-0x01/0x02 PES whose payload carries a valid
+  /// `\0\0\x01\xb3` sequence header. `HandleTag`s are last-wins, so the LAST
+  /// successfully-decoded video PES survives (the inner `if let Some`).
+  mpeg_video: Option<crate::formats::mpeg::VideoMeta>,
   /// Nested H.264 Meta when an H.264 PES payload was forwarded.
   h264: Option<crate::formats::h264::H264Meta<'a>>,
   /// `$$et{ParsedH264}` (H264.pm:1102-1103) — set once the first H.264 frame
@@ -903,6 +938,7 @@ impl<'a> Walker<'a> {
       ac3_surround_mode: None,
       ac3_audio_channels: None,
       ac3_audio_sample_rate: None,
+      mpeg_video: None,
       h264: None,
       parsed_h264: false,
       h264_frame_state: crate::formats::h264::H264FrameState::new(),
@@ -1656,10 +1692,25 @@ impl<'a> Walker<'a> {
       return ParseOutcome::Unknown;
     };
     match t {
-      // M2TS.pm:300-307 — MPEG-1/2 Video / Audio. Routed to `MPEG::*` —
-      // deferred; the canonical fixture exercises 0x1b H.264 only. Bundled
-      // `$more` stays 0 (these `ParseMPEG*` helpers don't set it).
-      0x01..=0x04 => ParseOutcome::Done,
+      // M2TS.pm:300-303 — MPEG-1/2 Video. `ParseMPEGAudioVideo` scans the
+      // ≤256-byte PES payload for the `\0\0\x01\xb3` sequence-header start code
+      // and bit-extracts the `%MPEG::Video` tags (`ImageWidth`/`Height`/
+      // `AspectRatio`/`FrameRate`/`VideoBitrate`, MPEG.pm:258-313) into the
+      // typed [`crate::formats::mpeg::VideoMeta`]. `HandleTag` is last-wins, so a
+      // later valid sequence header overwrites (the inner `if let Some`); a PES
+      // with no valid header leaves the prior decode intact. Bundled `$more`
+      // stays 0 (`ParseMPEGAudioVideo` never sets it).
+      0x01 | 0x02 => {
+        if let Some(v) = crate::formats::mpeg::parse_mpeg_audio_video(payload) {
+          self.mpeg_video = Some(v);
+        }
+        ParseOutcome::Done
+      }
+      // M2TS.pm:304-307 — MPEG-1/2 Audio (`MPEG::ParseMPEGAudio`). Deferred:
+      // the embedded MPEG-audio-in-PES decode produces no tags for the camera/
+      // dashcam M2TS references (which carry AC-3 / AAC audio on 0x81/0x0f, not
+      // MPEG-1/2 audio on 0x03/0x04). Filed as the MPEG-audio-in-PES follow-up.
+      0x03 | 0x04 => ParseOutcome::Done,
       // M2TS.pm:342-351 — H.264.
       0x1b => {
         let prev = self.h264.take();
@@ -1970,6 +2021,11 @@ impl<'a> Walker<'a> {
       ac3_surround_mode: self.ac3_surround_mode,
       ac3_audio_channels: self.ac3_audio_channels,
       ac3_audio_sample_rate: self.ac3_audio_sample_rate,
+      mpeg_video: self.mpeg_video,
+      // `$$self{VALUE}{FileSize}` — the input length (ExifTool sets FileSize at
+      // SetFileType). The Composite `%MPEG::Composite` `Duration` derive divides
+      // by it (MPEG.pm:413); not emitted as a tag.
+      file_size: self.data.len() as u64,
       h264: self.h264,
       warnings: self.warnings,
       ligogps: self.ligogps,
@@ -2245,6 +2301,75 @@ impl crate::emit::Taggable for Meta<'_> {
         ac3(),
         "AudioSampleRate".into(),
         value,
+        false,
+      ));
+    }
+
+    // MPEG-1/2 video (`%MPEG::Video`, M2TS.pm:300-307 → MPEG.pm:258-313) — emit
+    // in `%MPEG::Video` `ProcessFrameHeader` sort order (the `BitNN` keys sort
+    // ImageWidth, ImageHeight, AspectRatio, FrameRate, VideoBitrate). Family-0 =
+    // family-1 = `"MPEG"` (MPEG.pm:259 `GROUPS{2} => 'Video'` ⇒ family-0
+    // defaults to the table name `"MPEG"`; the `-G1` key is `"MPEG"`).
+    if let Some(v) = &self.mpeg_video {
+      let mpeg = || Group::new("MPEG", "MPEG");
+      // MPEG.pm:260/261 — ImageWidth / ImageHeight: no ValueConv/PrintConv,
+      // raw integer in both modes.
+      tags.push(EmittedTag::new(
+        mpeg(),
+        "ImageWidth".into(),
+        TagValue::U64(u64::from(v.image_width())),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        mpeg(),
+        "ImageHeight".into(),
+        TagValue::U64(u64::from(v.image_height())),
+        false,
+      ));
+      // MPEG.pm:262-295 — AspectRatio: ValueConv hash (raw idx → float) then
+      // PrintConv hash (float → name). `-n` emits the ValueConv float; `-j` the
+      // named string.
+      let aspect = if print_conv {
+        TagValue::Str(v.aspect_ratio_print().into())
+      } else {
+        TagValue::F64(v.aspect_ratio_value())
+      };
+      tags.push(EmittedTag::new(mpeg(), "AspectRatio".into(), aspect, false));
+      // MPEG.pm:296-308 — FrameRate: ValueConv hash (raw idx → fps) then
+      // `PrintConv => '"$val fps"'` (the ValueConv float interpolated, %.15g
+      // NV stringification, e.g. `59.94 fps`).
+      let frame_rate = if print_conv {
+        TagValue::Str(format!("{} fps", crate::value::format_g(v.frame_rate_value(), 15)).into())
+      } else {
+        TagValue::F64(v.frame_rate_value())
+      };
+      tags.push(EmittedTag::new(
+        mpeg(),
+        "FrameRate".into(),
+        frame_rate,
+        false,
+      ));
+      // MPEG.pm:309-313 — VideoBitrate: `ValueConv => '$val eq 0x3ffff ?
+      // "Variable" : $val * 400'`, `PrintConv => 'ConvertBitrate($val)'`. `-n`
+      // emits the post-ValueConv integer (or the "Variable" string); `-j` the
+      // ConvertBitrate text (or "Variable" passed through unchanged — it is not
+      // `IsFloat`, so `ConvertBitrate` returns it verbatim).
+      let bitrate = match v.video_bitrate() {
+        crate::formats::mpeg::VideoBitrate::Variable => TagValue::Str("Variable".into()),
+        crate::formats::mpeg::VideoBitrate::Bps(bps) => {
+          if print_conv {
+            let mut s = String::new();
+            let _ = crate::formats::mpeg::write_convert_bitrate(&mut s, f64::from(bps));
+            TagValue::Str(s.into())
+          } else {
+            TagValue::U64(u64::from(bps))
+          }
+        }
+      };
+      tags.push(EmittedTag::new(
+        mpeg(),
+        "VideoBitrate".into(),
+        bitrate,
         false,
       ));
     }

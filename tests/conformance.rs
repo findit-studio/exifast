@@ -12337,10 +12337,9 @@ fn mpeg2_ts_misb_klv_conformance() {
 // teammate fixture (#408) re-added the (now-active, see below) Pentax PEF test
 // stubs from a pre-#393 base; those duplicates are dropped here — #393's
 // `check_excluding` versions remain the canonical ones. The MPEG2 video PES
-// decode (`MPEG:ImageWidth/Height/FrameRate/VideoBitrate`) is deferred (#128),
-// so this fixture stays `#[ignore]`d + NOT_ACTIVE until the decoder lands.
+// decode (`MPEG:ImageWidth/Height/AspectRatio/FrameRate/VideoBitrate`) +
+// `%MPEG::Composite` `Duration` landed (#128), so the fixture is active.
 #[test]
-#[ignore]
 fn mpeg2_ts_mpeg2video_conformance() {
   check(
     "MPEG2_TS_mpeg2video.ts",

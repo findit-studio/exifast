@@ -73,6 +73,11 @@ pub(crate) struct CompositeContext {
   /// `vide`-track rotation angle in degrees, or `None` when there is no video
   /// track / matrix (then `Composite:Rotation`'s ValueConv is `undef`).
   pub(crate) rotation: Option<f64>,
+  /// `$$self{VALUE}{FileSize}` — the input byte length, threaded for the
+  /// `%MPEG::Composite` `Duration` derive (MPEG.pm:386-415, `Require =>
+  /// FileSize`). `None` for every format that does not supply it (only M2TS
+  /// does, via [`crate::format_parser::AnyMeta::composite_file_size`]).
+  pub(crate) file_size: Option<u64>,
 }
 
 impl CompositeContext {
@@ -80,13 +85,25 @@ impl CompositeContext {
   /// total for `AvgBitrate`, and the pre-computed `CalcRotation` angle). The
   /// non-QuickTime / no-`mdat` / no-video cases pass `None`s. (`AvgBitrate` does
   /// NOT divide by `$$self{TimeScale}` — see [`avg_bitrate`] — so the TimeScale
-  /// is not threaded.)
+  /// is not threaded.) `file_size` defaults to `None`; set it with
+  /// [`Self::with_file_size`] on the MPEG/M2TS path.
   #[cfg(feature = "alloc")]
   pub(crate) const fn new(media_data_total: Option<u64>, rotation: Option<f64>) -> Self {
     Self {
       media_data_total,
       rotation,
+      file_size: None,
     }
+  }
+
+  /// Set `$$self{VALUE}{FileSize}` for the `%MPEG::Composite` `Duration` derive
+  /// (MPEG.pm:413). A builder so the 22 non-MPEG `new(…, …)` call sites stay
+  /// unchanged.
+  #[cfg(feature = "alloc")]
+  #[must_use]
+  pub(crate) const fn with_file_size(mut self, file_size: Option<u64>) -> Self {
+    self.file_size = file_size;
+    self
   }
 }
 
@@ -286,6 +303,16 @@ pub(crate) enum CompositePrintConv {
   /// the bare raw scalar under `-n`, the quoted Perl string for a non-finite
   /// value in both modes ([`crate::composite::convs::duration_value`]).
   ConvertDuration,
+  /// `%MPEG::Composite` `Duration` PrintConv (`ConvertDuration($val) . " (approx)"`,
+  /// MPEG.pm:414) — identical to [`ConvertDuration`](Self::ConvertDuration) under
+  /// `-j` but with the literal `" (approx)"` suffix appended (e.g. `"1.68 s
+  /// (approx)"`); the bare numeric `$val` (the `8 * FileSize / TotalBitrate`
+  /// seconds) under `-n` (the suffix is a PrintConv-only string concatenation,
+  /// so `-n` carries no `(approx)`). A non-finite `$val` would stringify via
+  /// `ConvertDuration` (titlecase `Inf`/`NaN`) and STILL gain the suffix —
+  /// faithful to the Perl `.` string concat (unreachable for the M2TS path,
+  /// whose `FileSize`/bitrate are always finite-positive).
+  MpegDuration,
   /// `PrintConv => 'Image::ExifTool::GPS::ToDMS($self, $val, 1, $ref)'` — the
   /// `Composite:GPSLatitude`/`GPSLongitude` PrintConv. Under `-j` the DMS string
   /// (`48 deg 51' 29.34" N`); under `-n` the bare signed decimal `$val`. The
@@ -408,6 +435,21 @@ impl CompositePrintConv {
         // finite/non-finite-aware renderer.
         let n = raw.as_num().unwrap_or(f64::NAN);
         crate::composite::convs::duration_value(n, mode)
+      }
+      CompositePrintConv::MpegDuration => {
+        // `%MPEG::Composite` Duration (MPEG.pm:414): `ConvertDuration($val) .
+        // " (approx)"`. `$val` is the numeric `8 * FileSize / TotalBitrate`
+        // seconds. Under `-n` the bare ValueConv number (no suffix — the suffix
+        // is a PrintConv string concat). Under `-j` the `ConvertDuration`
+        // rendering (a finite value via the shared renderer, a non-finite value
+        // its titlecase Perl string) with the literal ` (approx)` appended.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => crate::composite::convs::duration_value(n, mode),
+          ConvMode::PrintConv => TagValue::Str(
+            std::format!("{} (approx)", crate::composite::convs::convert_duration(n)).into(),
+          ),
+        }
       }
       CompositePrintConv::GpsCoordinate(ref_pos) => {
         let n = raw.as_num().unwrap_or(f64::NAN);
@@ -981,6 +1023,107 @@ fn aiff_duration(
   }
   Some(CompositeRaw::Num(
     frames_raw.coerce_numeric()? / sr_raw.coerce_numeric()?,
+  ))
+}
+
+/// `$val[i] =~ /^\d+$/` — the `%MPEG::Composite` Duration ValueConv bitrate
+/// guard (MPEG.pm:410-411). A PRESENT bitrate input ([`MPEG:AudioBitrate`] /
+/// [`MPEG:VideoBitrate`]) is admissible only if its ValueConv value stringifies
+/// to a run of ASCII digits — an `Variable`-sentinel `Str` (the all-ones VBR
+/// VideoBitrate) does NOT match, so the whole Duration aborts (`return undef`).
+/// An ABSENT input vacuously passes (the Perl `$val[i] and …` short-circuits on
+/// the undef), mirrored by [`CompositeValue::is_present`] short-circuiting here.
+#[cfg(feature = "m2ts")]
+fn mpeg_bitrate_is_decimal(input: &CompositeValue) -> bool {
+  match input.as_text() {
+    Some(s) => !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
+    None => true, // absent ⇒ the `$val[i] and ...` guard is vacuously satisfied
+  }
+}
+
+/// `%MPEG::Composite` `Duration` ValueConv (MPEG.pm:400-413). Inputs (index =
+/// ExifTool hash position): `0`=FileSize (Require), `1`=ID3Size, `2`=MPEG:
+/// AudioBitrate, `3`=MPEG:VideoBitrate, `4`=MPEG:VBRFrames, `5`=MPEG:SampleRate,
+/// `6`=MPEG:MPEGAudioVersion (all Desire). Two branches:
+///
+/// * VBR (`$val[4] and defined $val[5] and defined $val[6]`): compute from the
+///   VBR audio-frame count — `$mfs = $prt[5] / ($val[6] == 3 ? 144 : 72)` (the
+///   PrintConv SampleRate over the MPEG-version frame-size divisor), then
+///   `8 * $val[4] / $mfs`. `$prt[5]` is the SampleRate PrintConv value (its
+///   numeric coercion equals the raw rate at exifast's option set).
+/// * Total-bitrate (`return undef unless $val[2] or $val[3]`): the file size in
+///   bits divided by the summed audio+video bitrate — `8 * (FileSize - (ID3Size
+///   ||0)) / ((AudioBitrate||0) + (VideoBitrate||0))`, guarded by the two
+///   `/^\d+$/` bitrate checks (a `Variable` VideoBitrate ⇒ undef). This is the
+///   `(approx)` path the M2TS MPEG-2-video fixture takes (no VBR audio):
+///   `8 * 3989924 / 19000000 = 1.679968`.
+#[cfg(feature = "m2ts")]
+fn mpeg_duration(
+  v: &[CompositeValue],
+  prts: &[Option<TagValue>],
+  ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$val[0]` — ExifTool's `Require => FileSize` resolves `$$self{VALUE}{FileSize}`
+  // (the pseudo-tag ExifTool always carries). exifast does not EMIT `File:FileSize`
+  // (the goldens exclude it), so the input byte length is THREADED via
+  // [`CompositeContext::file_size`] instead (set by the M2TS path's
+  // `with_file_size`); absent ⇒ no composite (only M2TS supplies it).
+  let file_size = ctx.file_size? as f64;
+  let id3_size = v.get(1).and_then(CompositeValue::coerce_numeric);
+  let audio = v.get(2);
+  let video = v.get(3);
+  let vbr_frames = v.get(4);
+  let sample_rate = v.get(5);
+  let mpeg_version = v.get(6);
+
+  // VBR branch: `$val[4] and defined $val[5] and defined $val[6]`. `$val[4]`
+  // (VBRFrames) is a Perl-truthy test on the RAW value; the other two are
+  // `defined` (presence).
+  let vbr_frames_truthy = vbr_frames.is_some_and(CompositeValue::is_truthy);
+  let sr_present = sample_rate.is_some_and(CompositeValue::is_present);
+  let ver_present = mpeg_version.is_some_and(CompositeValue::is_present);
+  if vbr_frames_truthy && sr_present && ver_present {
+    // `$mfs = $prt[5] / ($val[6] == 3 ? 144 : 72)`; `8 * $val[4] / $mfs`.
+    let prt_sr = prts
+      .get(5)
+      .and_then(Option::as_ref)
+      .map(crate::composite::value_text)
+      .map(|s| crate::convert::perl_str_to_f64(&s))?;
+    let ver = mpeg_version?.coerce_numeric()?;
+    let divisor = if ver == 3.0 { 144.0 } else { 72.0 };
+    let mfs = prt_sr / divisor;
+    let frames = vbr_frames?.coerce_numeric()?;
+    return Some(CompositeRaw::Num(8.0 * frames / mfs));
+  }
+
+  // Total-bitrate branch. `return undef unless $val[2] or $val[3]` — at least
+  // one bitrate must be Perl-truthy.
+  let audio_truthy = audio.is_some_and(CompositeValue::is_truthy);
+  let video_truthy = video.is_some_and(CompositeValue::is_truthy);
+  if !audio_truthy && !video_truthy {
+    return None;
+  }
+  // `return undef if $val[2] and not $val[2] =~ /^\d+$/` (and likewise $val[3]).
+  // The guard fires only for a PRESENT non-decimal bitrate (e.g. a `Variable`
+  // VideoBitrate); an absent input passes.
+  if audio.is_some_and(CompositeValue::is_present) && !mpeg_bitrate_is_decimal(audio?) {
+    return None;
+  }
+  if video.is_some_and(CompositeValue::is_present) && !mpeg_bitrate_is_decimal(video?) {
+    return None;
+  }
+  // `(8 * ($val[0] - ($val[1]||0))) / (($val[2]||0) + ($val[3]||0))`.
+  let total_bitrate = audio
+    .and_then(CompositeValue::coerce_numeric)
+    .unwrap_or(0.0)
+    + video
+      .and_then(CompositeValue::coerce_numeric)
+      .unwrap_or(0.0);
+  if total_bitrate == 0.0 {
+    return None; // a present-but-zero bitrate would divide by zero (Perl dies; we abort)
+  }
+  Some(CompositeRaw::Num(
+    8.0 * (file_size - id3_size.unwrap_or(0.0)) / total_bitrate,
   ))
 }
 
@@ -2119,6 +2262,44 @@ const AIFF_DURATION: CompositeDef = CompositeDef {
   sort_key: "AIFF-Duration",
 };
 
+/// `%MPEG::Composite` `Duration` (MPEG.pm:386-415) — Group2 `Video`,
+/// `Priority => -1`. Registered only when `m2ts` is on (the sole exifast path
+/// that emits the `%MPEG::Video` bitrate tags AND threads the input byte length
+/// via [`CompositeContext::file_size`]).
+///
+/// **Index alignment.** ExifTool's `Require => { 0 => FileSize }` resolves the
+/// `$$self{VALUE}{FileSize}` pseudo-tag, which exifast does not emit; the derive
+/// reads it from `ctx.file_size` instead. Index 0 stays a (never-resolving,
+/// `Desire`-kind) `FileSize` placeholder so the remaining `$val[1..6]` line up
+/// 1:1 with `mpeg_duration`'s transliterated arithmetic. Making the placeholder
+/// `Desire` (not `Require`) keeps the engine from aborting on the always-Missing
+/// stream FileSize — observationally identical to ExifTool, whose `Require`d
+/// FileSize is always satisfied. The bitrate/VBR inputs carry the `MPEG:` group
+/// (family-1 `MPEG`); `ID3Size`/`FileSize` are bare-name (any group).
+///
+/// `Priority => -1` ("don't replace any other Duration tag") is moot here:
+/// `Composite:Duration` is keyed under family-1 `Composite` and never collides
+/// with the format `M2TS:Duration` / `MPEG:Duration` (distinct family-1), so the
+/// duplicate-override rule is never exercised — stored as the default `1`.
+#[cfg(feature = "m2ts")]
+const MPEG_DURATION: CompositeDef = CompositeDef {
+  name: "Duration",
+  inputs: &[
+    des(&[], "FileSize"), // index 0 — supplied via ctx.file_size (placeholder)
+    des(&[], "ID3Size"),
+    des(&["MPEG"], "AudioBitrate"),
+    des(&["MPEG"], "VideoBitrate"),
+    des(&["MPEG"], "VBRFrames"),
+    des(&["MPEG"], "SampleRate"),
+    des(&["MPEG"], "MPEGAudioVersion"),
+  ],
+  derive: mpeg_duration,
+  print_conv: CompositePrintConv::MpegDuration,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "MPEG-Duration",
+};
+
 /// `Composite:GPSLatitude` (GPS.pm:368). Group2 `Location`. The composite name
 /// matches the GPS-main `GPSLatitude`, but resolves from `GPS:GPSLatitude` (the
 /// decimal-degrees ValueConv) — the family-1 `GPS` group keeps them distinct.
@@ -2662,6 +2843,8 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   FLAC_DURATION,
   #[cfg(feature = "aiff")]
   AIFF_DURATION,
+  #[cfg(feature = "m2ts")]
+  MPEG_DURATION,
   #[cfg(feature = "exif")]
   GPS_LATITUDE,
   #[cfg(feature = "exif")]

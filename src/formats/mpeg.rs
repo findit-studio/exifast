@@ -2071,6 +2071,294 @@ pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
 }
 
 // ===========================================================================
+// MPEG video — `%MPEG::Video` / `ProcessMPEGVideo` / `ParseMPEGAudioVideo`
+// (MPEG.pm:258-321 + 583-681)
+// ===========================================================================
+
+/// `%MPEG::Video` AspectRatio ValueConv hash (MPEG.pm:262-279) — the 4-bit
+/// `aspect_ratio_information` index (1-14) → the decimal aspect value. Index 0
+/// and 15 are rejected by [`process_mpeg_video`] (forbidden / reserved), so the
+/// table is keyed 1..=14. `-n` emits the float; `-j` runs [`ASPECT_PRINT`].
+const ASPECT_VALUE: [(u8, f64); 14] = [
+  (1, 1.0),
+  (2, 0.6735),
+  (3, 0.7031),
+  (4, 0.7615),
+  (5, 0.8055),
+  (6, 0.8437),
+  (7, 0.8935),
+  (8, 0.9157),
+  (9, 0.9815),
+  (10, 1.0255),
+  (11, 1.0695),
+  (12, 1.0950),
+  (13, 1.1575),
+  (14, 1.2015),
+];
+
+/// `%MPEG::Video` AspectRatio PrintConv hash (MPEG.pm:280-295) — keyed by the
+/// ValueConv'd float (matching ExifTool's `PrintConv` lookup against `$val`).
+/// A value with no named hit prints the bare float string (ExifTool's
+/// `PrintInverseLookup` passthrough — every numeric float in the table has an
+/// explicit PrintConv entry, so the named hits below are exhaustive).
+const ASPECT_PRINT: [(u8, &str); 14] = [
+  (1, "1:1"),
+  (2, "0.6735"),
+  (3, "16:9, 625 line, PAL"),
+  (4, "0.7615"),
+  (5, "0.8055"),
+  (6, "16:9, 525 line, NTSC"),
+  (7, "0.8935"),
+  (8, "4:3, 625 line, PAL, CCIR601"),
+  (9, "0.9815"),
+  (10, "1.0255"),
+  (11, "1.0695"),
+  (12, "4:3, 525 line, NTSC, CCIR601"),
+  (13, "1.1575"),
+  (14, "1.2015"),
+];
+
+/// `%MPEG::Video` FrameRate ValueConv hash (MPEG.pm:298-307) — the 4-bit
+/// `frame_rate_code` index (1-8) → fps. Index 0 and >8 are rejected by
+/// [`process_mpeg_video`]. `-n` emits the float; `-j` appends `" fps"`
+/// (MPEG.pm:308 `PrintConv => '"$val fps"'`).
+const FRAME_RATE_VALUE: [(u8, f64); 8] = [
+  (1, 23.976),
+  (2, 24.0),
+  (3, 25.0),
+  (4, 29.97),
+  (5, 30.0),
+  (6, 50.0),
+  (7, 59.94),
+  (8, 60.0),
+];
+
+/// `0x3ffff` — `%MPEG::Video` VideoBitrate "Variable" sentinel (MPEG.pm:312
+/// `$val eq 0x3ffff ? "Variable" : $val * 400`). The raw 18-bit `bit_rate_value`
+/// all-ones means VBR.
+const VIDEO_BITRATE_VBR: u32 = 0x3_ffff;
+
+/// The post-ValueConv `MPEG:VideoBitrate` (MPEG.pm:312). `Variable` (the
+/// all-ones VBR sentinel) or `bit_rate_value * 400` bits/s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoBitrate {
+  /// `0x3ffff` ⇒ `"Variable"` (`-n` AND `-j`).
+  Variable,
+  /// `bit_rate_value * 400` bits/s (`-n` raw integer; `-j` ConvertBitrate).
+  Bps(u32),
+}
+
+/// Typed MPEG-2 video sequence-header metadata — the output of
+/// [`parse_mpeg_audio_video`] (the video side of `ParseMPEGAudioVideo`,
+/// MPEG.pm:627-666, which dispatches a `\0\0\x01\xb3` sequence-header start
+/// code to `ProcessMPEGVideo`, MPEG.pm:587-606). Carries the five
+/// fixture-visible `%MPEG::Video` tags.
+///
+/// **D8 — no public fields, accessors only.** Construct only via
+/// [`parse_mpeg_audio_video`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoMeta {
+  /// `MPEG:ImageWidth` — Bit00-11 of `$w1` = the 12-bit `horizontal_size`
+  /// (MPEG.pm:260).
+  image_width: u16,
+  /// `MPEG:ImageHeight` — Bit12-23 of `$w1` = the 12-bit `vertical_size`
+  /// (MPEG.pm:261).
+  image_height: u16,
+  /// `MPEG:AspectRatio` — the raw 4-bit `aspect_ratio_information` index
+  /// (Bit24-27 of `$w1`, MPEG.pm:262); 1..=14 (0/15 rejected). ValueConv/
+  /// PrintConv applied at emit via [`ASPECT_VALUE`] / [`ASPECT_PRINT`].
+  aspect_ratio_idx: u8,
+  /// `MPEG:FrameRate` — the raw 4-bit `frame_rate_code` index (Bit28-31 of
+  /// `$w1`, MPEG.pm:296); 1..=8. ValueConv/PrintConv via [`FRAME_RATE_VALUE`].
+  frame_rate_idx: u8,
+  /// `MPEG:VideoBitrate` — the post-ValueConv form (Bit32-49 of `$w2`,
+  /// MPEG.pm:309-313): the 18-bit `bit_rate_value * 400`, or `Variable`.
+  video_bitrate: VideoBitrate,
+}
+
+impl VideoMeta {
+  /// `MPEG:ImageWidth` (MPEG.pm:260).
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_width(&self) -> u16 {
+    self.image_width
+  }
+
+  /// `MPEG:ImageHeight` (MPEG.pm:261).
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_height(&self) -> u16 {
+    self.image_height
+  }
+
+  /// `MPEG:AspectRatio` ValueConv float (MPEG.pm:262-279) — the decimal aspect
+  /// value for the raw 4-bit index, used by `-n` and as the PrintConv key.
+  #[must_use]
+  #[inline(always)]
+  pub fn aspect_ratio_value(&self) -> f64 {
+    ASPECT_VALUE
+      .iter()
+      .find(|(k, _)| *k == self.aspect_ratio_idx)
+      .map_or(f64::from(self.aspect_ratio_idx), |(_, v)| *v)
+  }
+
+  /// `MPEG:AspectRatio` PrintConv string (MPEG.pm:280-295) — the named ratio
+  /// (e.g. `"16:9, 625 line, PAL"`) for the raw 4-bit index.
+  #[must_use]
+  #[inline(always)]
+  pub fn aspect_ratio_print(&self) -> &'static str {
+    ASPECT_PRINT
+      .iter()
+      .find(|(k, _)| *k == self.aspect_ratio_idx)
+      .map_or("", |(_, s)| *s)
+  }
+
+  /// `MPEG:FrameRate` ValueConv fps (MPEG.pm:298-307) — the fps for the raw
+  /// 4-bit code. `-j` appends `" fps"`.
+  #[must_use]
+  #[inline(always)]
+  pub fn frame_rate_value(&self) -> f64 {
+    FRAME_RATE_VALUE
+      .iter()
+      .find(|(k, _)| *k == self.frame_rate_idx)
+      .map_or(f64::from(self.frame_rate_idx), |(_, v)| *v)
+  }
+
+  /// `MPEG:VideoBitrate` post-ValueConv form (MPEG.pm:309-313).
+  #[must_use]
+  #[inline(always)]
+  pub const fn video_bitrate(&self) -> VideoBitrate {
+    self.video_bitrate
+  }
+}
+
+/// `ProcessMPEGVideo` (MPEG.pm:587-606) — read the two big-endian header words
+/// `$w1`/`$w2` that FOLLOW a `\0\0\x01\xb3` sequence-header start code, validate
+/// the aspect-ratio + frame-rate nibbles, and bit-extract the `%MPEG::Video`
+/// fields via the `ProcessFrameHeader` masks (MPEG.pm:441-457).
+///
+/// `buff` begins at the byte AFTER the `\xb3` start code (the position Perl's
+/// `substr($$buffPt, pos(...))` slices from). Returns `None` when fewer than 4
+/// bytes are available (MPEG.pm:591 `return 0 unless length $$buffPt >= 4`) or
+/// the aspect/frame-rate validation fails (MPEG.pm:593-598 `return 0`) — exactly
+/// the cases Perl rejects.
+///
+/// **Per-field gating (4-7 byte tail).** MPEG.pm:592 `my ($w1, $w2) =
+/// unpack('N2', $$buffPt)` — Perl's `unpack` silently drops an INCOMPLETE second
+/// 4-byte group, so a 4-7 byte tail leaves `$w2` **undef**. `ProcessFrameHeader`
+/// then reads `$word = $data[1] = undef` for `Bit32-49 VideoBitrate` and
+/// computes `(undef >> 14) & 0x3FFFF` = `0` (Perl warns to STDERR but emits the
+/// tag). So bundled extracts the FIRST-word tags (ImageWidth/ImageHeight/
+/// AspectRatio/FrameRate) at >=4 bytes and emits `VideoBitrate => 0` (PrintConv
+/// `"0 bps"`) when the second word is absent — it is NOT omitted. We mirror this
+/// by defaulting the missing second word to `0`. The downstream
+/// `%MPEG::Composite` `Duration` derive (`mpeg_duration`) then suppresses itself
+/// via its `$val[3]` truthiness guard (a `0` VideoBitrate is Perl-falsy), so no
+/// `Composite:Duration` appears for a partial header — byte-identical to bundled
+/// ExifTool 13.59.
+#[must_use]
+fn process_mpeg_video(buff: &[u8]) -> Option<VideoMeta> {
+  // MPEG.pm:591 `return 0 unless length $$buffPt >= 4` — the FIRST word ($w1)
+  // alone carries ImageWidth/Height/AspectRatio/FrameRate, so the gate is >=4.
+  let w1_bytes: [u8; 4] = buff.get(..4)?.try_into().ok()?;
+  let w1 = u32::from_be_bytes(w1_bytes);
+  // MPEG.pm:592 `unpack('N2', ...)` — the SECOND word ($w2 = VideoBitrate) is
+  // present only at >=8 bytes; an incomplete group leaves `$w2` undef, which
+  // `ProcessFrameHeader` treats as 0 (`undef >> 14 & mask`). Default to 0.
+  let w2 = buff
+    .get(4..8)
+    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+    .map_or(0, u32::from_be_bytes);
+  // MPEG.pm:592-599 — validate as much as possible:
+  //   ($w1 & 0xf0) == 0x00 → 0000 forbidden aspect ratio
+  //   ($w1 & 0xf0) == 0xf0 → 1111 reserved aspect ratio
+  //   ($w1 & 0x0f) == 0    → frame rate must be 1-8
+  //   ($w1 & 0x0f) > 8
+  let aspect_nibble = ((w1 >> 4) & 0x0f) as u8;
+  let frame_rate_idx = (w1 & 0x0f) as u8;
+  if aspect_nibble == 0x00 || aspect_nibble == 0x0f || frame_rate_idx == 0 || frame_rate_idx > 8 {
+    return None;
+  }
+  // `ProcessFrameHeader` masks (MPEG.pm:441-457) for `%MPEG::Video`:
+  //   Bit00-11 ImageWidth  = ($w1 >> (31 - 11)) & 0xFFF = ($w1 >> 20) & 0xFFF
+  //   Bit12-23 ImageHeight = ($w1 >> (31 - 23)) & 0xFFF = ($w1 >> 8)  & 0xFFF
+  //   Bit24-27 AspectRatio = ($w1 >> (31 - 27)) & 0x0F  = ($w1 >> 4)  & 0x0F
+  //   Bit28-31 FrameRate   = ($w1 >> (31 - 31)) & 0x0F  =  $w1        & 0x0F
+  //   Bit32-49 VideoBitrate= ($w2 >> (31 + 32 - 49)) & 0x3FFFF = ($w2 >> 14) & 0x3FFFF
+  let image_width = ((w1 >> 20) & 0x0fff) as u16;
+  let image_height = ((w1 >> 8) & 0x0fff) as u16;
+  let aspect_ratio_idx = aspect_nibble;
+  let bit_rate_value = (w2 >> 14) & 0x3_ffff;
+  let video_bitrate = if bit_rate_value == VIDEO_BITRATE_VBR {
+    VideoBitrate::Variable
+  } else {
+    VideoBitrate::Bps(bit_rate_value.saturating_mul(400))
+  };
+  Some(VideoMeta {
+    image_width,
+    image_height,
+    aspect_ratio_idx,
+    frame_rate_idx,
+    video_bitrate,
+  })
+}
+
+/// `ParseMPEGAudioVideo` (MPEG.pm:627-666) — the video side. Scan `buff` for the
+/// MPEG-2 sequence-header start code `\0\0\x01\xb3` and, on the first match,
+/// hand the ≤256-byte tail (starting AFTER the `\xb3`) to [`process_mpeg_video`].
+///
+/// Returns the decoded [`VideoMeta`] for the first valid sequence header, or
+/// `None` when no `\xb3` header is present / validates. Faithful scope: the
+/// MPEG-1/2 **audio** side of `ParseMPEGAudioVideo` (the `\xc0` audio start code
+/// + the leading-frame `ParseMPEGAudio` MP3-sync probe, MPEG.pm:639-645/650) is
+/// the [`AudioMeta`] domain and produces no tags for an MPEG-2 video elementary
+/// stream (M2TS routes MPEG audio via stream types 0x03/0x04, not 0x02) — it is
+/// the deferred MPEG-audio-in-PES item, not exercised by the video fixture.
+#[must_use]
+pub fn parse_mpeg_audio_video(buff: &[u8]) -> Option<VideoMeta> {
+  // MPEG.pm:636 `while ($$buffPt =~ /\0\0\x01(\xb3|\xc0)/g)`. We only dispatch
+  // the `\xb3` (video) branch; iterate every sequence-start candidate so a
+  // leading non-`\xb3` (`\xc0`) match does not abort the scan.
+  let mut pos = 0usize;
+  while let Some(rel) = find_subslice(buff.get(pos..)?, &[0x00, 0x00, 0x01]) {
+    let sc_pos = pos + rel; // start of `00 00 01`
+    let marker = buff.get(sc_pos + 3).copied();
+    // Advance past this `00 00 01` for the next iteration regardless.
+    pos = sc_pos + 3;
+    if marker == Some(0xb3) {
+      // MPEG.pm:642-647 — `substr($$buffPt, pos(...), $len)` with `$len`
+      // clamped to 256; `pos(...)` is one past the matched `\xb3`.
+      let after = sc_pos + 4;
+      let tail = buff.get(after..)?;
+      let bounded = tail.get(..256.min(tail.len()))?;
+      if let Some(meta) = process_mpeg_video(bounded) {
+        return Some(meta);
+      }
+      // MPEG.pm:648-649 `$len = length - pos; last if $len < 4` — a tail of
+      // fewer than 4 bytes after the `\xb3` cannot hold the first word, so
+      // `process_mpeg_video` returns `None` (its >=4 gate). A 4-7 byte tail now
+      // DECODES the first-word tags (`$w2` defaults to 0 ⇒ `VideoBitrate => 0`),
+      // matching bundled. On an invalid header (bad aspect/frame-rate) keep
+      // scanning for a later sequence header (faithful: the Perl loop continues
+      // to the next `/g` match while `found{video}` is unset).
+    }
+  }
+  None
+}
+
+/// Find the first occurrence of `needle` in `haystack` (a small two/three-byte
+/// start-code search; `memchr`-free to keep the dependency surface minimal and
+/// the `#![deny(clippy::indexing_slicing)]` contract checked).
+#[inline]
+#[must_use]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+  if needle.is_empty() || haystack.len() < needle.len() {
+    return None;
+  }
+  haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2696,5 +2984,117 @@ mod tests {
     assert!(ChannelMode::Stereo.is_stereo());
     assert!(ChannelMode::SingleChannel.is_single_channel());
     assert!(Emphasis::None.is_none() && Emphasis::Reserved.is_reserved());
+  }
+
+  // ──────────────────── MPEG-2 video per-field gating ────────────────────
+  //
+  // Oracle: bundled ExifTool 13.59 (`exiftool -G1 -j`) on a raw `.mpg` whose
+  // bytes are `00 00 01 b3` + the tail under test. The first word
+  // `w1 = 0x2D01E034` decodes to ImageWidth=720 (0x2D0), ImageHeight=480
+  // (0x1E0), AspectRatio idx 3 ("16:9, 625 line, PAL"), FrameRate idx 4
+  // (29.97 fps); the second word `w2 = 0x00190000` yields VideoBitrate
+  // `(0x19_0000 >> 14) & 0x3FFFF = 100`, ValueConv `100 * 400 = 40000` bps.
+  //
+  // Bundled per-length behavior (`MPEG.pm:591` gate `>= 4`; `unpack('N2')`
+  // drops the incomplete 2nd group ⇒ `$w2` undef ⇒ `VideoBitrate => 0`):
+  //   4-byte tail: ImageWidth/Height/AspectRatio/FrameRate + `VideoBitrate 0`
+  //   7-byte tail: identical to the 4-byte tail (still no full 2nd word)
+  //   8-byte tail: + the real `VideoBitrate 40000`
+  const VID_W1: [u8; 4] = [0x2D, 0x01, 0xE0, 0x34];
+  const VID_W2: [u8; 4] = [0x00, 0x19, 0x00, 0x00];
+
+  fn mpeg2_video_buf(tail: &[u8]) -> std::vec::Vec<u8> {
+    let mut b = std::vec![0x00u8, 0x00, 0x01, 0xb3];
+    b.extend_from_slice(tail);
+    b
+  }
+
+  #[test]
+  fn mpeg2_video_first_word_only_4_byte_tail() {
+    // MPEG.pm:591 gate is `>= 4`: the first word alone decodes. Bundled emits
+    // the first-word tags + `VideoBitrate => 0` (NOT omitted).
+    let buf = mpeg2_video_buf(&VID_W1);
+    let v = parse_mpeg_audio_video(&buf).expect("4-byte tail decodes the first word");
+    assert_eq!(v.image_width(), 720);
+    assert_eq!(v.image_height(), 480);
+    assert_eq!(v.aspect_ratio_print(), "16:9, 625 line, PAL");
+    assert_eq!(format_g(v.frame_rate_value(), 15), "29.97");
+    // `$w2` undef ⇒ `(undef >> 14) & 0x3FFFF` = 0 ⇒ Bps(0) (= bundled "0 bps").
+    assert_eq!(v.video_bitrate(), VideoBitrate::Bps(0));
+  }
+
+  #[test]
+  fn mpeg2_video_partial_second_word_7_byte_tail() {
+    // 7 bytes = first word + 3 of the 4 second-word bytes. `unpack('N2')` drops
+    // the incomplete group, so this is byte-for-byte identical to the 4-byte
+    // tail: first-word tags + `VideoBitrate => 0`.
+    let mut tail = VID_W1.to_vec();
+    tail.extend_from_slice(&VID_W2[..3]);
+    let buf = mpeg2_video_buf(&tail);
+    let v = parse_mpeg_audio_video(&buf).expect("7-byte tail decodes the first word");
+    assert_eq!(v.image_width(), 720);
+    assert_eq!(v.image_height(), 480);
+    assert_eq!(v.aspect_ratio_print(), "16:9, 625 line, PAL");
+    assert_eq!(format_g(v.frame_rate_value(), 15), "29.97");
+    assert_eq!(v.video_bitrate(), VideoBitrate::Bps(0));
+  }
+
+  #[test]
+  fn mpeg2_video_full_8_byte_tail_emits_bitrate() {
+    // 8 bytes = both words. Bundled emits the real VideoBitrate (40000 bps).
+    let mut tail = VID_W1.to_vec();
+    tail.extend_from_slice(&VID_W2);
+    let buf = mpeg2_video_buf(&tail);
+    let v = parse_mpeg_audio_video(&buf).expect("8-byte tail decodes both words");
+    assert_eq!(v.image_width(), 720);
+    assert_eq!(v.image_height(), 480);
+    assert_eq!(v.video_bitrate(), VideoBitrate::Bps(40_000));
+  }
+
+  #[test]
+  fn mpeg2_video_zero_vs_full_bitrate_differ() {
+    // Guard the regression directly: the 4-byte (partial) decode must NOT equal
+    // the 8-byte (full) decode — the partial one carries Bps(0), the full one
+    // Bps(40000). Both still emit the SAME first-word tags.
+    let four = parse_mpeg_audio_video(&mpeg2_video_buf(&VID_W1)).expect("4-byte decodes");
+    let mut full_tail = VID_W1.to_vec();
+    full_tail.extend_from_slice(&VID_W2);
+    let eight = parse_mpeg_audio_video(&mpeg2_video_buf(&full_tail)).expect("8-byte decodes");
+    assert_eq!(four.image_width(), eight.image_width());
+    assert_eq!(four.image_height(), eight.image_height());
+    assert_ne!(four.video_bitrate(), eight.video_bitrate());
+    assert_eq!(four.video_bitrate(), VideoBitrate::Bps(0));
+    assert_eq!(eight.video_bitrate(), VideoBitrate::Bps(40_000));
+  }
+
+  #[test]
+  fn mpeg2_video_start_code_near_end_of_window() {
+    // The `\xb3` lands within <4 bytes of the buffer end: the tail cannot hold
+    // even the first word, so `process_mpeg_video`'s >=4 gate rejects (None),
+    // matching MPEG.pm:649 `last if $len < 4`. (1, 2, and 3 trailing bytes.)
+    for partial in 1..4usize {
+      let buf = mpeg2_video_buf(&VID_W1[..partial]);
+      assert!(
+        parse_mpeg_audio_video(&buf).is_none(),
+        "a {partial}-byte tail after \\xb3 is below the >=4 first-word gate"
+      );
+    }
+  }
+
+  #[test]
+  fn mpeg2_video_invalid_header_keeps_scanning() {
+    // A first `\xb3` with a forbidden aspect-ratio nibble (0) is rejected, but a
+    // later VALID sequence header in the same buffer is still found (the loop
+    // continues to the next `/g` match, MPEG.pm:637).
+    let mut bad_w1 = VID_W1;
+    bad_w1[3] = 0x04; // aspect nibble (high) -> 0 (forbidden), frame rate 4
+    let mut buf = mpeg2_video_buf(&bad_w1);
+    // Append a second, valid full header.
+    buf.extend_from_slice(&[0x00, 0x00, 0x01, 0xb3]);
+    buf.extend_from_slice(&VID_W1);
+    buf.extend_from_slice(&VID_W2);
+    let v = parse_mpeg_audio_video(&buf).expect("the second valid header is found");
+    assert_eq!(v.image_width(), 720);
+    assert_eq!(v.video_bitrate(), VideoBitrate::Bps(40_000));
   }
 }
