@@ -12333,6 +12333,29 @@ fn mpeg2_ts_misb_klv_conformance() {
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
 }
 
+// #393 — Pentax K-3 Mark III: AFInfoK3III, BatteryInfo re-layout, LevelInfo, FaceInfo
+#[test]
+#[ignore]
+fn pef_pentax_k3_mark_iii_conformance() {
+    check("PEF_pentax_k3_mark_iii.pef", "PEF_pentax_k3_mark_iii.pef.json", true);
+    check("PEF_pentax_k3_mark_iii.pef", "PEF_pentax_k3_mark_iii.pef.n.json", false);
+}
+
+// #393 — Pentax *ist D: raw BatteryInfo variant, AFPointSelected variants
+#[test]
+#[ignore]
+fn pef_pentax_istd_conformance() {
+    check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.json", true);
+    check("PEF_pentax_istd.pef", "PEF_pentax_istd.pef.n.json", false);
+}
+
+// #128 — MPEG-2 video + AC3 audio in MPEG-TS (stream types 0x02, 0x81)
+#[test]
+#[ignore]
+fn mpeg2_ts_mpeg2video_conformance() {
+    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.json", true);
+    check("MPEG2_TS_mpeg2video.ts", "MPEG2_TS_mpeg2video.ts.n.json", false);
+}
 // #211 — Real GoPro HERO6 Black with a live `gpmd` GPS/sensor track (from
 // gopro/gpmf-parser). The DEFAULT (no-`ee`) `.json`/`.n.json` are byte-exact:
 // the `gpmd`/`fdsc` traks are `meta`-handler ⇒ fully `-ee` gated, so the base
