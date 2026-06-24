@@ -701,10 +701,14 @@ pub(crate) fn print_hyperfocal(val: f64) -> String {
   if val.is_finite() {
     format!("{val:.2} m")
   } else {
-    format!(
-      "{} m",
-      crate::value::perl_nonfinite_str(val).unwrap_or("NaN")
-    )
+    // The `else` arm is reached ONLY for a non-finite `val`, so
+    // `perl_nonfinite_str` returns `Some` by construction (it is `None` ONLY
+    // for finite inputs). `expect` the invariant rather than silently degrade
+    // to a wrong "NaN" token — a `None` here would be a programming-logic bug,
+    // never a data edge (#53/FU-12).
+    let non_finite = crate::value::perl_nonfinite_str(val)
+      .expect("perl_nonfinite_str is Some for every non-finite f64 (is_finite-guarded)");
+    format!("{non_finite} m")
   }
 }
 

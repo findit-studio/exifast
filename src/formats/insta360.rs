@@ -503,20 +503,55 @@ fn decode_identity(buff: &[u8]) -> Insta360Identity {
       break;
     };
     // QuickTimeStream.pl:3434 `$et->HandleTag($tagTablePtr, $t, $val)`.
+    // These INSV maker-note values are raw byte substrings (QuickTimeStream.pl
+    // :3433 `substr` + HandleTag — no Format/charset/RawConv), so bundled emits
+    // them through the FULL JSON `EscapeJSON` order: it first CLASSIFIES the
+    // ORIGINAL value (NULs and all) against the boolean/number gate
+    // (exiftool:3805/3810) and, ONLY for a non-match, DELETES every NUL
+    // (`tr/\0//d`, exiftool:3820) and THEN runs `FixUTF8` (exiftool:3824). The
+    // classify PRECEDES the NUL-strip, so a NUL-bearing original always fails
+    // the anchored gate → it is a QUOTED string, NOT a bare token: a NUL-split
+    // numeric `31 00 32 00` → `"12"` (NOT bare `12`) and `74 00 72 00 75 00
+    // 65 00` → `"true"` (NOT bare `true`). The NUL-strip-before-`FixUTF8` order
+    // also rejoins a NUL-SPLIT UTF-8 sequence (`C2 00 A9` → `©`, not `??`). A
+    // NUL-free clean-number/boolean original DOES pass the gate → BARE.
+    //
+    // `escape_json_raw_bytes_classified` returns that verdict
+    // ([`EscapedJson::Bare`]/[`EscapedJson::Quoted`]); we store it via the
+    // `*_json` setters so the emit can map `Bare`→`TagValue::Str` (the
+    // serializer renders it bare) and `Quoted`→`TagValue::JsonStr` (forced
+    // quoted, bypassing the serializer's re-run of the gate on the
+    // ALREADY-NUL-stripped text). For the real all-ASCII device strings (no
+    // NUL, valid UTF-8) the verdict is `Quoted` and the content is identity —
+    // byte-identical to bundled's quoted output (#53/FU-12).
+    use crate::convert::escape_json_raw_bytes_classified;
     match t {
       TAG_SERIAL_NUMBER => {
-        out.set_serial_number(Some(SmolStr::new(core::str::from_utf8(val).unwrap_or(""))));
+        out.set_serial_number_json(Some(escape_json_raw_bytes_classified(val, false)));
       }
       TAG_MODEL => {
-        out.set_model(Some(SmolStr::new(core::str::from_utf8(val).unwrap_or(""))));
+        out.set_model_json(Some(escape_json_raw_bytes_classified(val, false)));
       }
       TAG_FIRMWARE => {
-        out.set_firmware(Some(SmolStr::new(core::str::from_utf8(val).unwrap_or(""))));
+        out.set_firmware_json(Some(escape_json_raw_bytes_classified(val, false)));
       }
       TAG_PARAMETERS => {
-        // QuickTimeStream.pl:705 `ValueConv => '$val =~ tr/_/ /; $val'`.
-        let s = core::str::from_utf8(val).unwrap_or("");
-        out.set_parameters(Some(SmolStr::new(s.replace('_', " "))));
+        // QuickTimeStream.pl:705 `ValueConv => '$val =~ tr/_/ /; $val'`. The
+        // `tr/_/ /` runs on the RAW `$val` BEFORE the `EscapeJSON` classify, so
+        // map `_`→` ` on the raw bytes first, then classify the result — a
+        // value that becomes number-shaped only after the `tr` is judged on the
+        // post-`tr` lexeme exactly as ExifTool does (the `_`→` ` is ASCII and
+        // commutes with the later NUL-strip + `FixUTF8`). No `_` ⇒ classify the
+        // value in place (no allocation).
+        if val.contains(&b'_') {
+          let mapped: std::vec::Vec<u8> = val
+            .iter()
+            .map(|&b| if b == b'_' { b' ' } else { b })
+            .collect();
+          out.set_parameters_json(Some(escape_json_raw_bytes_classified(&mapped, false)));
+        } else {
+          out.set_parameters_json(Some(escape_json_raw_bytes_classified(val, false)));
+        }
       }
       _ => {} // Unknown tag; bundled HandleTag with no-table-entry is a no-op.
     }
@@ -1856,6 +1891,152 @@ mod tests {
     assert_eq!(id.serial_number(), Some("S"));
     assert_eq!(id.parameters(), Some("P"));
     // The 5th tag (0xff) was outside the cap; nothing extra to verify.
+  }
+
+  #[test]
+  fn decode_identity_nul_split_utf8_reassembles_via_escapejson_order() {
+    // A crafted identity value whose UTF-8 sequence is SPLIT by an embedded NUL:
+    // `C2 00 A9` is `©` (`C2 A9`) with a NUL between the leader and continuation.
+    // Bundled's `EscapeJSON` deletes NULs FIRST (`tr/\0//d`, exiftool:3820) then
+    // runs `FixUTF8` (exiftool:3824), so the NUL-strip rejoins `C2 A9` → `©`.
+    // A `FixUTF8`-first order would instead flag the `C2`/`A9` halves separately
+    // (the NUL breaks the sequence) → `??`, and the trailing NUL of the
+    // round-tripped `Str` would then be stripped → still `??`. The fix routes
+    // through `escape_json_raw_bytes` (NUL-strip → `FixUTF8`), so each field is
+    // the faithful `©`.
+    let split = b"\xc2\x00\xa9"; // © split by a NUL
+    let id = decode_identity(&identity_body(&[
+      (TAG_SERIAL_NUMBER, split),
+      (TAG_MODEL, split),
+      (TAG_FIRMWARE, split),
+      // Parameters additionally runs `tr/_/ /`; `_` is absent here, so the
+      // EscapeJSON repair alone applies (still `©`).
+      (TAG_PARAMETERS, split),
+    ]));
+    assert_eq!(id.serial_number(), Some("©"));
+    assert_eq!(id.model(), Some("©"));
+    assert_eq!(id.firmware(), Some("©"));
+    assert_eq!(id.parameters(), Some("©"));
+  }
+
+  #[test]
+  fn decode_identity_real_ascii_is_byte_identical_under_escapejson() {
+    // Real all-ASCII device strings carry no NUL and are valid UTF-8, so
+    // `escape_json_raw_bytes` is identity on them — byte-identical to the prior
+    // `fix_utf8` path (no golden change). Underscores in Parameters still map to
+    // spaces (QuickTimeStream.pl:705 `tr/_/ /`).
+    let id = decode_identity(&identity_body(&[
+      (TAG_SERIAL_NUMBER, b"IXX00123"),
+      (TAG_MODEL, b"Insta360 X3"),
+      (TAG_FIRMWARE, b"1.0.07"),
+      (TAG_PARAMETERS, b"2_6_4032_3024"),
+    ]));
+    assert_eq!(id.serial_number(), Some("IXX00123"));
+    assert_eq!(id.model(), Some("Insta360 X3"));
+    assert_eq!(id.firmware(), Some("1.0.07"));
+    assert_eq!(id.parameters(), Some("2 6 4032 3024"));
+    // Every real device string fails the number/boolean gate (letters, dots,
+    // spaces) → QUOTED. Emit renders each as `TagValue::JsonStr` ⇒ the SAME
+    // quoted token the prior `TagValue::Str` produced (byte-identical golden).
+    use crate::convert::EscapedJson;
+    assert!(matches!(id.serial_number_json(), Some(EscapedJson::Quoted(s)) if s == "IXX00123"));
+    assert!(matches!(id.model_json(), Some(EscapedJson::Quoted(s)) if s == "Insta360 X3"));
+    assert!(matches!(id.firmware_json(), Some(EscapedJson::Quoted(s)) if s == "1.0.07"));
+    assert!(matches!(id.parameters_json(), Some(EscapedJson::Quoted(s)) if s == "2 6 4032 3024"));
+  }
+
+  #[test]
+  fn decode_identity_nul_split_numeric_is_quoted_not_bare() {
+    // The #53 finding: a NUL-SPLIT numeric `31 00 32 00` (`"1\02\0"`). ExifTool's
+    // `EscapeJSON` CLASSIFIES the ORIGINAL (NULs and all) FIRST — the anchored
+    // number regex rejects the embedded NUL — so it is a QUOTED string, and the
+    // `tr/\0//d` that follows yields the lexeme `"12"`: bundled emits `"12"`, NOT
+    // a bare `12`. Classifying AFTER the NUL-strip (the bug) would see `12` and
+    // wrongly emit it bare. The fix carries the `Quoted` verdict so emit forces
+    // `TagValue::JsonStr` ⇒ `"12"`.
+    let nul_split_num = b"1\x002\x00";
+    let id = decode_identity(&identity_body(&[
+      (TAG_SERIAL_NUMBER, nul_split_num),
+      (TAG_MODEL, nul_split_num),
+      (TAG_FIRMWARE, nul_split_num),
+      (TAG_PARAMETERS, nul_split_num),
+    ]));
+    use crate::convert::EscapedJson;
+    // Content (NUL-stripped) is `12`, but the verdict is QUOTED (the original
+    // failed the gate), so it must NOT be coerced to a bare number.
+    for v in [
+      id.serial_number_json(),
+      id.model_json(),
+      id.firmware_json(),
+      id.parameters_json(),
+    ] {
+      assert!(
+        matches!(v, Some(EscapedJson::Quoted(s)) if s == "12"),
+        "NUL-split numeric must be Quoted(\"12\"), got {v:?}"
+      );
+    }
+    assert_eq!(id.serial_number(), Some("12")); // content accessor sees `12`
+  }
+
+  #[test]
+  fn decode_identity_nul_split_boolean_is_quoted_not_bare() {
+    // The boolean half of #53: `74 00 72 00 75 00 65 00` (`"t\0r\0u\0e\0"`). The
+    // NUL-bearing original fails `/^(true|false)$/i` (anchored, no NUL), so it is
+    // a QUOTED string; `tr/\0//d` then yields `"true"`. Bundled emits `"true"`,
+    // NOT a bare `true`. The `Quoted` verdict ⇒ `TagValue::JsonStr` ⇒ `"true"`.
+    let nul_split_bool = b"t\x00r\x00u\x00e\x00";
+    let id = decode_identity(&identity_body(&[
+      (TAG_SERIAL_NUMBER, nul_split_bool),
+      (TAG_MODEL, nul_split_bool),
+    ]));
+    use crate::convert::EscapedJson;
+    assert!(matches!(id.serial_number_json(), Some(EscapedJson::Quoted(s)) if s == "true"));
+    assert!(matches!(id.model_json(), Some(EscapedJson::Quoted(s)) if s == "true"));
+    assert_eq!(id.serial_number(), Some("true"));
+  }
+
+  #[test]
+  fn decode_identity_clean_numeric_no_nul_is_bare() {
+    // The complement: a CLEAN number original (no NUL) `31 32 33 34` (`"1234"`)
+    // DOES pass the gate, so `EscapeJSON` returns it VERBATIM as a BARE token —
+    // `escape_json_raw_bytes` is identity on it. The `Bare` verdict ⇒
+    // `TagValue::Str` ⇒ the serializer's own gate renders it bare `1234`.
+    let id = decode_identity(&identity_body(&[(TAG_SERIAL_NUMBER, b"1234")]));
+    use crate::convert::EscapedJson;
+    assert!(matches!(id.serial_number_json(), Some(EscapedJson::Bare(s)) if s == "1234"));
+    assert_eq!(id.serial_number(), Some("1234"));
+  }
+
+  #[test]
+  fn decode_identity_nul_split_utf8_is_quoted() {
+    // The R2 NUL-split UTF-8 `C2 00 A9` → `©` now flows via the verdict path:
+    // the NUL-bearing original fails the number/boolean gate → QUOTED, and the
+    // NUL-strip-then-`FixUTF8` order reassembles `C2 A9` → `©`. Emit forces
+    // `TagValue::JsonStr` ⇒ the quoted `"©"` (byte-identical to the prior
+    // `TagValue::Str("©")` rendering — `©` is non-numeric either way).
+    let split = b"\xc2\x00\xa9";
+    let id = decode_identity(&identity_body(&[
+      (TAG_SERIAL_NUMBER, split),
+      (TAG_PARAMETERS, split),
+    ]));
+    use crate::convert::EscapedJson;
+    assert!(matches!(id.serial_number_json(), Some(EscapedJson::Quoted(s)) if s == "©"));
+    assert!(matches!(id.parameters_json(), Some(EscapedJson::Quoted(s)) if s == "©"));
+    assert_eq!(id.serial_number(), Some("©"));
+  }
+
+  #[test]
+  fn decode_identity_parameters_tr_underscore_before_classify() {
+    // Parameters runs `tr/_/ /` (QuickTimeStream.pl:705) on the RAW `$val`
+    // BEFORE `EscapeJSON` classifies. A value that is number-shaped ONLY before
+    // the `tr` (`"1_2"`) becomes `"1 2"` (a space → fails the number gate) →
+    // QUOTED `"1 2"`, matching ExifTool's `tr`-then-classify order. A value that
+    // stays a clean number after the (absent) `tr` (`"12"`, no `_`/NUL) is BARE.
+    let id_underscore = decode_identity(&identity_body(&[(TAG_PARAMETERS, b"1_2")]));
+    use crate::convert::EscapedJson;
+    assert!(matches!(id_underscore.parameters_json(), Some(EscapedJson::Quoted(s)) if s == "1 2"));
+    let id_clean = decode_identity(&identity_body(&[(TAG_PARAMETERS, b"12")]));
+    assert!(matches!(id_clean.parameters_json(), Some(EscapedJson::Bare(s)) if s == "12"));
   }
 
   #[test]

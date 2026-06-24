@@ -1151,7 +1151,18 @@ impl<'a> Walker<'a> {
           if let Some(sty) = stype
             && let Some(stream) = self.streams.get_mut(stream_idx)
           {
-            let sty_str = SmolStr::new(core::str::from_utf8(&sty).unwrap_or(""));
+            // `strh` StreamType is a raw 4-byte FourCC (`auds`/`vids`/…),
+            // captured here UNTRIMMED (the raw `fourcc_at` bytes). Decode via
+            // the `EscapeJSON` tail order — DELETE NULs (`tr/\0//d`,
+            // exiftool:3820) THEN run `FixUTF8` (exiftool:3824) — rather than the
+            // prior bare `fix_utf8` (which repaired before the NUL deletion) or
+            // silently dropping a non-UTF-8 FourCC to "". The NUL-strip precedes
+            // the repair, so a trailing-NUL / NUL-split non-UTF-8 FourCC
+            // reassembles faithfully (`C2 00 A9` → `©`, not `??`), and a trailing
+            // NUL is removed before the `TrackKind` match. For the real all-ASCII
+            // 4-byte FourCCs (no NUL, valid UTF-8) `escape_json_raw_bytes` is
+            // identity → byte-identical (#53/FU-12).
+            let sty_str = SmolStr::new(crate::convert::escape_json_raw_bytes(&sty));
             stream.stream_type = Some(sty_str);
           }
           // The codec FourCC at offset 4 is captured by `emit_stream_header`
@@ -4293,6 +4304,82 @@ mod tests {
       RiffValue::Str(s) => assert_eq!(s.as_str(), "2003:03:10 15:04:43"),
       v => panic!("{v:?}"),
     }
+  }
+
+  #[test]
+  fn strl_stream_type_nul_bearing_fourcc_reassembles_via_escapejson_order() {
+    // A crafted `strh` StreamType FourCC whose UTF-8 is SPLIT by an embedded NUL
+    // and trailed by a NUL: `C2 00 A9 00`. The raw `strh` StreamType is captured
+    // UNTRIMMED (`fourcc_at`, the 4 raw bytes) into `RiffStream::stream_type`.
+    // Bundled emits raw on-disk strings through `EscapeJSON`, which DELETES NULs
+    // FIRST (`tr/\0//d`, exiftool:3820) then runs `FixUTF8` (exiftool:3824): the
+    // NUL-strip rejoins `C2 A9` → `©`. The prior bare `fix_utf8(b"\xc2\x00\xa9\x00")`
+    // ran the repair BEFORE the NUL deletion → it flagged the `C2`/`A9` halves
+    // separately (the NULs break the sequence) → `"?\0?\0"`. The fix routes
+    // through `escape_json_raw_bytes` (NUL-strip → `FixUTF8`) → the faithful `©`.
+    //
+    // Drive `process_chunks_strl` directly (the `body` it expects begins at the
+    // first sub-chunk header, AFTER the `strl` LIST type).
+    let mut body = Vec::new();
+    body.extend_from_slice(b"strh");
+    body.extend_from_slice(&48u32.to_le_bytes());
+    body.extend_from_slice(b"\xc2\x00\xa9\x00"); // 0: StreamType (© split + trailed by NUL)
+    body.extend_from_slice(&[0u8; 44]); // remaining 44 bytes of the 48-byte strh
+    let mut walker = Walker {
+      data: &body,
+      pos: 0,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+      pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
+    };
+    walker.process_chunks_strl(&body);
+    assert_eq!(walker.streams.len(), 1, "one strl → one stream record");
+    assert_eq!(
+      walker.streams[0].stream_type(),
+      Some("©"),
+      "NUL-split StreamType is repaired in EscapeJSON order (NUL-strip then FixUTF8)"
+    );
+  }
+
+  #[test]
+  fn strl_stream_type_real_fourcc_is_byte_identical_under_escapejson() {
+    // The real all-ASCII 4-byte FourCCs (`vids`/`auds`/…) carry no NUL and are
+    // valid UTF-8, so `escape_json_raw_bytes` is identity on them — the captured
+    // `stream_type` is byte-identical to the prior `fix_utf8` path (no behavior
+    // change for real data), keeping the downstream `TrackKind` match intact.
+    let mut body = Vec::new();
+    body.extend_from_slice(b"strh");
+    body.extend_from_slice(&48u32.to_le_bytes());
+    body.extend_from_slice(b"vids"); // 0: StreamType
+    body.extend_from_slice(&[0u8; 44]);
+    let mut walker = Walker {
+      data: &body,
+      pos: 0,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+      pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
+    };
+    walker.process_chunks_strl(&body);
+    assert_eq!(walker.streams.len(), 1);
+    assert_eq!(walker.streams[0].stream_type(), Some("vids"));
   }
 
   #[test]

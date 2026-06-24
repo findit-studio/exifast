@@ -79,6 +79,8 @@
 
 use smol_str::SmolStr;
 
+use crate::convert::EscapedJson;
+
 use crate::metadata::{CameraInfo, CaptureSettings, GpsLocation, MediaMetadata};
 
 // ===========================================================================
@@ -92,20 +94,25 @@ use crate::metadata::{CameraInfo, CaptureSettings, GpsLocation, MediaMetadata};
 /// Every field is optional; a real-world INSV trailer always carries at
 /// least Model + Firmware. SerialNumber is missing on some firmware
 /// (GO 2 early builds).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Insta360Identity {
-  /// `0x0a SerialNumber` (QuickTimeStream.pl:698).
-  serial_number: Option<SmolStr>,
+  /// `0x0a SerialNumber` (QuickTimeStream.pl:698). Stored as the FULL
+  /// `EscapeJSON` verdict ([`EscapedJson`]): the content plus whether the
+  /// ORIGINAL raw-byte value classified as a BARE JSON token or a QUOTED
+  /// string. A plainly-set value (the `set_*` API) is a quoted string; the
+  /// decode path (`*_json` setters) carries the classify decision so a
+  /// NUL-split numeric/boolean serial renders quoted, not bare (#53).
+  serial_number: Option<EscapedJson>,
   /// `0x12 Model` (QuickTimeStream.pl:699) — e.g. `"Insta360 X3"`,
   /// `"Insta360 ONE RS"`, `"Insta360 Ace Pro"`.
-  model: Option<SmolStr>,
+  model: Option<EscapedJson>,
   /// `0x1a Firmware` (QuickTimeStream.pl:700).
-  firmware: Option<SmolStr>,
+  firmware: Option<EscapedJson>,
   /// `0x2a Parameters` (QuickTimeStream.pl:701-706) after the bundled
   /// `$val =~ tr/_/ /` substitution. The string encodes the
   /// "number of lenses, 6-axis orientation of each lens, raw resolution"
   /// (bundled note).
-  parameters: Option<SmolStr>,
+  parameters: Option<EscapedJson>,
   /// The STICKY `DOC_NUM` the `0x101` record inherits. `ProcessInsta360`
   /// walks the identity record LAST (it is first in file, walked last) and
   /// does NOT `++$$et{DOC_NUM}` for it — so its tags ride whatever the last
@@ -129,32 +136,65 @@ impl Insta360Identity {
     }
   }
 
-  /// `SerialNumber` (QuickTimeStream.pl:698).
+  /// `SerialNumber` (QuickTimeStream.pl:698) — the rendered text content.
   #[inline(always)]
   #[must_use]
   pub fn serial_number(&self) -> Option<&str> {
-    self.serial_number.as_deref()
+    self.serial_number.as_ref().map(EscapedJson::as_str)
   }
 
-  /// `Model` (QuickTimeStream.pl:699).
+  /// `Model` (QuickTimeStream.pl:699) — the rendered text content.
   #[inline(always)]
   #[must_use]
   pub fn model(&self) -> Option<&str> {
-    self.model.as_deref()
+    self.model.as_ref().map(EscapedJson::as_str)
   }
 
-  /// `Firmware` (QuickTimeStream.pl:700).
+  /// `Firmware` (QuickTimeStream.pl:700) — the rendered text content.
   #[inline(always)]
   #[must_use]
   pub fn firmware(&self) -> Option<&str> {
-    self.firmware.as_deref()
+    self.firmware.as_ref().map(EscapedJson::as_str)
   }
 
-  /// `Parameters` (QuickTimeStream.pl:701-706).
+  /// `Parameters` (QuickTimeStream.pl:701-706) — the rendered text content.
   #[inline(always)]
   #[must_use]
   pub fn parameters(&self) -> Option<&str> {
-    self.parameters.as_deref()
+    self.parameters.as_ref().map(EscapedJson::as_str)
+  }
+
+  /// `SerialNumber` with its [`EscapedJson`] classify verdict — the emit path
+  /// maps `Bare`→[`crate::value::TagValue::Str`] (gate renders it bare) and
+  /// `Quoted`→[`crate::value::TagValue::JsonStr`] (forced-quoted, #53).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn serial_number_json(&self) -> Option<&EscapedJson> {
+    self.serial_number.as_ref()
+  }
+
+  /// `Model` with its [`EscapedJson`] classify verdict (see
+  /// [`Self::serial_number_json`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn model_json(&self) -> Option<&EscapedJson> {
+    self.model.as_ref()
+  }
+
+  /// `Firmware` with its [`EscapedJson`] classify verdict (see
+  /// [`Self::serial_number_json`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn firmware_json(&self) -> Option<&EscapedJson> {
+    self.firmware.as_ref()
+  }
+
+  /// `Parameters` with its [`EscapedJson`] classify verdict (see
+  /// [`Self::serial_number_json`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn parameters_json(&self) -> Option<&EscapedJson> {
+    self.parameters.as_ref()
   }
 
   /// The sticky `DOC_NUM` this identity record inherits (see field doc).
@@ -175,30 +215,63 @@ impl Insta360Identity {
       && self.parameters.is_none()
   }
 
-  /// Assign `SerialNumber`.
+  /// Assign `SerialNumber` from plain text. A plainly-set value is a QUOTED
+  /// JSON string (`EscapeJSON` would never coerce a typed-in value to a bare
+  /// token without re-running its gate); the decode path uses
+  /// [`Self::set_serial_number_json`] to carry the classify verdict instead.
   #[inline(always)]
   pub fn set_serial_number(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.serial_number = v.map(EscapedJson::Quoted);
+    self
+  }
+
+  /// Assign `Model` from plain text (QUOTED; see [`Self::set_serial_number`]).
+  #[inline(always)]
+  pub fn set_model(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.model = v.map(EscapedJson::Quoted);
+    self
+  }
+
+  /// Assign `Firmware` from plain text (QUOTED; see [`Self::set_serial_number`]).
+  #[inline(always)]
+  pub fn set_firmware(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.firmware = v.map(EscapedJson::Quoted);
+    self
+  }
+
+  /// Assign `Parameters` from plain text (QUOTED; see
+  /// [`Self::set_serial_number`]).
+  #[inline(always)]
+  pub fn set_parameters(&mut self, v: Option<SmolStr>) -> &mut Self {
+    self.parameters = v.map(EscapedJson::Quoted);
+    self
+  }
+
+  /// Assign `SerialNumber` with its [`EscapedJson`] classify verdict (the
+  /// decode path — `escape_json_raw_bytes_classified`).
+  #[inline(always)]
+  pub(crate) fn set_serial_number_json(&mut self, v: Option<EscapedJson>) -> &mut Self {
     self.serial_number = v;
     self
   }
 
-  /// Assign `Model`.
+  /// Assign `Model` with its [`EscapedJson`] classify verdict.
   #[inline(always)]
-  pub fn set_model(&mut self, v: Option<SmolStr>) -> &mut Self {
+  pub(crate) fn set_model_json(&mut self, v: Option<EscapedJson>) -> &mut Self {
     self.model = v;
     self
   }
 
-  /// Assign `Firmware`.
+  /// Assign `Firmware` with its [`EscapedJson`] classify verdict.
   #[inline(always)]
-  pub fn set_firmware(&mut self, v: Option<SmolStr>) -> &mut Self {
+  pub(crate) fn set_firmware_json(&mut self, v: Option<EscapedJson>) -> &mut Self {
     self.firmware = v;
     self
   }
 
-  /// Assign `Parameters`.
+  /// Assign `Parameters` with its [`EscapedJson`] classify verdict.
   #[inline(always)]
-  pub fn set_parameters(&mut self, v: Option<SmolStr>) -> &mut Self {
+  pub(crate) fn set_parameters_json(&mut self, v: Option<EscapedJson>) -> &mut Self {
     self.parameters = v;
     self
   }
@@ -215,6 +288,41 @@ impl Default for Insta360Identity {
   #[inline(always)]
   fn default() -> Self {
     Self::new()
+  }
+}
+
+/// Value equality on each field's OBSERVABLE/CANONICAL form, never its raw
+/// private representation. Every field of [`Insta360Identity`] is compared this
+/// way, so no construction-path bookkeeping can leak into equality (#53):
+///
+///  - the four identity fields (`serial_number` / `model` / `firmware` /
+///    `parameters`, each [`EscapedJson`]) carry a private `Bare`/`Quoted`
+///    JSON-rendering verdict that is serialization bookkeeping, NOT identity — a
+///    clean numeric serial the decode path stores as `Bare("1234")` is the SAME
+///    identity as one a `set_serial_number(Some("1234"))` caller stores as
+///    `Quoted("1234")` (external callers cannot construct `Bare`). Each is
+///    compared via its `*()` accessor (the inner `&str`), so the derived
+///    [`EscapedJson`] `PartialEq` (which also discriminates the variant) is
+///    deliberately NOT used.
+///  - [`Self::doc`] is the sticky `DOC_NUM` walk stamp, compared via its emit
+///    canonical form `doc.unwrap_or(0)`: `None` and `Some(0)` both denote the
+///    flat (Main) document — emit collapses them with `id.doc().unwrap_or(0)`
+///    (`quicktime.rs` `Group::with_doc(.., id.doc().unwrap_or(0))`), so a record
+///    the decode path stamps `Some(0)` and the same content left `None` by
+///    public construction are observably identical. `Some(nonzero)` stays a
+///    distinct `Doc<N>`.
+///
+/// With all five fields observable-compared, the equality-leak class is closed:
+/// no field carries a raw representation into `eq`. `Eq`/`Hash` are not derived,
+/// so there is no consistency obligation to uphold.
+impl PartialEq for Insta360Identity {
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    self.serial_number() == other.serial_number()
+      && self.model() == other.model()
+      && self.firmware() == other.firmware()
+      && self.parameters() == other.parameters()
+      && self.doc.unwrap_or(0) == other.doc.unwrap_or(0)
   }
 }
 
@@ -1039,6 +1147,63 @@ mod tests {
     assert_eq!(id.serial_number(), Some("IXX00123"));
     assert_eq!(id.parameters(), Some("2 6 4032 3024"));
     assert!(!id.is_empty());
+  }
+
+  #[test]
+  fn identity_eq_compares_content_not_json_verdict() {
+    // #53: the decode path can store a clean numeric ORIGINAL as the bare JSON
+    // verdict (`escape_json_raw_bytes_classified("1234")` → `Bare("1234")`),
+    // while the public `set_*` API stores the SAME visible text as `Quoted`.
+    // The classify verdict is JSON-rendering bookkeeping, not identity, so the
+    // two must compare EQUAL on their public content.
+    let mut decoded = Insta360Identity::new();
+    decoded.set_serial_number_json(Some(EscapedJson::Bare(SmolStr::new("1234"))));
+    assert_eq!(decoded.serial_number(), Some("1234"));
+
+    let mut via_setter = Insta360Identity::new();
+    via_setter.set_serial_number(Some(SmolStr::new("1234")));
+    // Confirm the setter took the quoted verdict (the private leak the bug is
+    // about) — yet equality ignores it.
+    assert!(matches!(
+      via_setter.serial_number_json(),
+      Some(EscapedJson::Quoted(_))
+    ));
+
+    assert_eq!(
+      decoded, via_setter,
+      "Bare(\"1234\") and Quoted(\"1234\") must be equal (same content)"
+    );
+
+    // Sanity: genuinely different content is still NOT equal.
+    let mut other = Insta360Identity::new();
+    other.set_serial_number(Some(SmolStr::new("5678")));
+    assert_ne!(decoded, other);
+
+    // #53 R5: the `doc` walk stamp is compared by its emit canonical form
+    // `doc.unwrap_or(0)`. `None` and `Some(0)` both denote the flat (Main)
+    // document (emit collapses them via `id.doc().unwrap_or(0)`), so identical
+    // content under either must compare EQUAL — the construction path must not
+    // leak through `doc`.
+    let mut doc_none = Insta360Identity::new();
+    doc_none.set_serial_number(Some(SmolStr::new("1234")));
+    assert_eq!(doc_none.doc(), None);
+    let mut doc_zero = doc_none.clone();
+    doc_zero.set_doc(Some(0));
+    assert_eq!(doc_zero.doc(), Some(0));
+    assert_eq!(
+      doc_none, doc_zero,
+      "doc None and Some(0) are the SAME Main-doc state (unwrap_or(0))"
+    );
+
+    // A nonzero `Doc<N>` stays distinct from the Main document (and from a
+    // different nonzero doc): same content, different sticky doc ⇒ NOT equal.
+    let mut doc_one = doc_none.clone();
+    doc_one.set_doc(Some(1));
+    assert_ne!(
+      doc_zero, doc_one,
+      "Some(0) (Main) and Some(1) (Doc1) are distinct documents"
+    );
+    assert_ne!(doc_none, doc_one);
   }
 
   #[test]
