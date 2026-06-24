@@ -107,11 +107,30 @@
 //!   missing-sub-port deferral, NOT a zlib deferral.
 //! - **APNG animation frames** (`fcTL` / `fdAT`, `PNG.pm:766-825`) — not
 //!   in camera-metadata scope.
-//! - **Private/vendor chunks** (the lowercase-second-char convention, the
-//!   `iDOT` / `cpIp` / `meTa` / `caBX` private chunks `PNG.pm:331-373`) —
-//!   defer all body parsing; chunk-walk continues past them. The SEAL /
-//!   JUMBF / Photoshop / IPTC chunks similarly require their own large
-//!   sub-ports (Phase-2+).
+//! - **Private/vendor chunks** (the lowercase-second-char convention,
+//!   `PNG.pm:331-382`). The two `Binary => 1` chunks with NO SubDirectory ARE
+//!   ported, each emitted as the `(Binary data N bytes, …)` placeholder
+//!   (rendered from the payload LENGTH alone — the bytes are never retained):
+//!   - **`iDOT`** (Apple `AppleDataOffsets`, `PNG.pm:331-342`) — `decode_idot`.
+//!   - **`gdAT`** (`GainMapImage`, `Groups => { 2 => 'Preview' }`,
+//!     `PNG.pm:374-378`) — `decode_gdat`.
+//!   The four genuinely-subsystem chunks all dispatch into large SubDirectory
+//!   subsystems exifast does not have, so they are still deferred (chunk-walk
+//!   continues past them):
+//!   - **`caBX`** (`JUMBF`, `PNG.pm:343-346`) → `Jpeg2000::Main` — the whole
+//!     JUMBF / C2PA box subsystem (`Jpeg2000.pm`, ~1700 lines).
+//!   - **`cpIp`** (`OLEInfo`, `PNG.pm:354-365`) → `FlashPix::Main` via
+//!     `ProcessFPX` (~1200 lines, the OLE compound-document parser). Its
+//!     `Condition` also mutates `FileType PNG → "PNG Plus"`.
+//!   - **`meTa`** (`PNG.pm:368-372`) → `XMP::XML` (`ProcessXMP` bare-XML path,
+//!     UTF-16 BOM XML). exifast's XMP port accepts only XMP-rooted input.
+//!   - **`seAl`** (`SEAL`, `PNG.pm:380-382`) → `XMP::SEAL` via `ProcessSEAL`
+//!     (SEAL content-authentication, delegates to `ProcessXMP` + `FoundSEAL`).
+//!   For a chunk whose SubDirectory extracts NOTHING, bundled falls back to
+//!   emitting the chunk as a `Binary` tag under its Name (`PNG.pm:1107`/`1116`-
+//!   `1146`, `$compressed = 1` at `:1028`); but for any real sample the
+//!   subsystem extracts tags, so a binary-fallback-only port would diverge —
+//!   each needs its full sub-port. (#142)
 //! - **MNG / JNG** sibling containers (`PNG.pm:63-64`) — same chunk-walk
 //!   but different signature + small chunk-table additions; not in
 //!   camera-metadata scope.
@@ -464,6 +483,10 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"IHDR" => decode_ihdr(meta, data),
     // ----- pHYs (PNG.pm:216-222, sub-table :441-468) ---------------------
     b"pHYs" => decode_phys(meta, data),
+    // ----- iDOT (PNG.pm:331-342) -----------------------------------------
+    b"iDOT" => decode_idot(meta, data),
+    // ----- gdAT (PNG.pm:374-378) -----------------------------------------
+    b"gdAT" => decode_gdat(meta, data),
     // ----- iCCP (PNG.pm:171-181) -----------------------------------------
     b"iCCP" => decode_iccp(meta, data),
     // ----- tEXt / zTXt / iTXt --------------------------------------------
@@ -544,6 +567,64 @@ fn decode_phys(meta: &mut PngMeta<'_>, data: &[u8]) {
   let ppu_x = u32::from_be_bytes([d0, d1, d2, d3]);
   let ppu_y = u32::from_be_bytes([d4, d5, d6, d7]);
   meta.set_phys(ppu_x, ppu_y, units);
+}
+
+// ===========================================================================
+// iDOT decoder — PNG.pm:331-342
+// ===========================================================================
+
+/// `iDOT` decoder (`PNG.pm:331-342`, ref NealKrawetz). Apple's private
+/// "data offsets" chunk:
+///
+/// ```text
+/// iDOT => {
+///     Name => 'AppleDataOffsets',
+///     Binary => 1,
+///     # int32u Divisor, Unknown, TotalDividedHeight, Size,
+///     #        DividedHeight1, DividedHeight2, IDAT_Offset2
+/// },
+/// ```
+///
+/// The table has `Name => 'AppleDataOffsets', Binary => 1` and NO
+/// `SubDirectory` — so `FoundPNG` (`PNG.pm:970-1148`) resolves the tagInfo,
+/// finds no SubDirectory, and stores the WHOLE raw chunk value under
+/// `PNG:AppleDataOffsets`. Because the tag is `Binary => 1` it renders as the
+/// universal `(Binary data N bytes, use -b option to extract)` placeholder at
+/// any size (oracle-verified vs bundled 13.59); `-b` extracts the raw bytes,
+/// but the JSON path consults only the byte LENGTH. We retain the length, not
+/// the payload — a crafted large-but-present `iDOT` chunk passes the chunk
+/// bounds but never forces a payload-sized clone. The chunk's internal int32u
+/// layout documented above is informational only (bundled never decodes the
+/// sub-fields — there is no sub-table).
+fn decode_idot(meta: &mut PngMeta<'_>, data: &[u8]) {
+  meta.set_apple_data_offsets(data.len());
+}
+
+// ===========================================================================
+// gdAT decoder — PNG.pm:374-378
+// ===========================================================================
+
+/// `gdAT` decoder (`PNG.pm:374-378`). The gain-map preview image chunk:
+///
+/// ```text
+/// gdAT => {
+///     Name => 'GainMapImage',
+///     Groups => { 2 => 'Preview' },
+///     Binary => 1,
+/// },
+/// ```
+///
+/// Identical shape to `iDOT`: `Name => 'GainMapImage', Binary => 1` with NO
+/// `SubDirectory`, so `FoundPNG` stores the WHOLE chunk value under
+/// `PNG:GainMapImage` and renders the universal `(Binary data N bytes, use -b
+/// option to extract)` placeholder (`-j`); `-b` extracts the raw embedded
+/// image. The only extra is the family-2 `Preview` group (`Groups => { 2 =>
+/// 'Preview' }`), which does not affect the `-G1` family-1 group (`PNG`). As
+/// with `iDOT` we retain only the byte LENGTH — the embedded gain-map image
+/// (a full PNG/HEIC payload) is never cloned. Oracle-verified vs bundled
+/// 13.59.
+fn decode_gdat(meta: &mut PngMeta<'_>, data: &[u8]) {
+  meta.set_gain_map_image(data.len());
 }
 
 // ===========================================================================
@@ -1989,7 +2070,7 @@ impl crate::emit::Taggable for PngMeta<'_> {
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
     let mode = opts.mode;
     use crate::emit::EmittedTag;
-    use crate::value::{Group, TagValue};
+    use crate::value::{Group, TagValue, binary_placeholder};
 
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     // family-0 == family-1 == "PNG" (Main table); the pHYs sub-table keeps
@@ -2128,6 +2209,58 @@ impl crate::emit::Taggable for PngMeta<'_> {
           false,
         ));
       }
+    }
+
+    // ---- iDOT (PNG.pm:331-342) -------------------------------------
+    // Apple's `AppleDataOffsets` — `Binary => 1`, NO SubDirectory. Emitted
+    // (in chunk-walk order, right after the IHDR sub-table tags) as the
+    // universal `(Binary data N bytes, …)` placeholder, rendered from the
+    // stored LENGTH alone (the payload was never retained) via
+    // [`binary_placeholder`]. A PNG may carry `iDOT` BOTH before `IEND`
+    // (→ `PNG:AppleDataOffsets`) AND after it (→ `Trailer:AppleDataOffsets`,
+    // `SET_GROUP1 = 'Trailer'`, `PNG.pm:1484`); bundled emits BOTH under their
+    // distinct family-1 groups, so each occurrence is emitted from its own
+    // per-group slot. Oracle-verified vs bundled 13.59.
+    if let Some(len) = self.apple_data_offsets_main_len() {
+      tags.push(EmittedTag::new(
+        png_group(false),
+        "AppleDataOffsets".into(),
+        TagValue::Str(binary_placeholder(len as u64)),
+        false,
+      ));
+    }
+    if let Some(len) = self.apple_data_offsets_trailer_len() {
+      tags.push(EmittedTag::new(
+        png_group(true),
+        "AppleDataOffsets".into(),
+        TagValue::Str(binary_placeholder(len as u64)),
+        false,
+      ));
+    }
+
+    // ---- gdAT (PNG.pm:374-378) -------------------------------------
+    // `GainMapImage` — `Binary => 1`, `Groups => { 2 => 'Preview' }`, NO
+    // SubDirectory (the same shape as `iDOT`). Emitted (in chunk-walk order)
+    // as the `(Binary data N bytes, …)` placeholder, rendered from the stored
+    // LENGTH alone. The family-2 `Preview` group does not surface at `-G1`.
+    // Like `iDOT` a pre-`IEND` `gdAT` (→ `PNG:GainMapImage`) and a post-`IEND`
+    // trailer `gdAT` (→ `Trailer:GainMapImage`, `PNG.pm:1484`) BOTH emit under
+    // their distinct family-1 groups. Oracle-verified vs bundled 13.59.
+    if let Some(len) = self.gain_map_image_main_len() {
+      tags.push(EmittedTag::new(
+        png_group(false),
+        "GainMapImage".into(),
+        TagValue::Str(binary_placeholder(len as u64)),
+        false,
+      ));
+    }
+    if let Some(len) = self.gain_map_image_trailer_len() {
+      tags.push(EmittedTag::new(
+        png_group(true),
+        "GainMapImage".into(),
+        TagValue::Str(binary_placeholder(len as u64)),
+        false,
+      ));
     }
 
     // ---- bKGD (PNG.pm:128-131) -------------------------------------
@@ -3651,6 +3784,236 @@ mod tests {
     let (dx, dy) = meta.dpi().expect("dpi");
     assert!((dx - 71.9836).abs() < 1e-9);
     assert!((dy - 71.9836).abs() < 1e-9);
+  }
+
+  #[test]
+  fn idot_apple_data_offsets_captured_as_binary() {
+    // iDOT: Apple data offsets — 7 int32u (28 bytes), the layout documented at
+    // PNG.pm:331-342. Only the LENGTH is retained; it emits as the binary
+    // `(Binary data 28 bytes, …)` placeholder under `PNG:AppleDataOffsets`.
+    let mut idot = Vec::new();
+    for v in [2u32, 0, 1, 0x28, 1, 1, 0x100] {
+      idot.extend_from_slice(&v.to_be_bytes());
+    }
+    assert_eq!(idot.len(), 28);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&2u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&2u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"iDOT", &idot));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert_eq!(meta.apple_data_offsets_main_len(), Some(28));
+    assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
+    // The emitted tag renders the binary placeholder (matches bundled).
+    let emitted: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let idot_tag = emitted
+      .iter()
+      .find(|t| t.tag().name() == "AppleDataOffsets")
+      .expect("AppleDataOffsets emitted");
+    assert_eq!(idot_tag.tag().group_ref().family1(), "PNG");
+    assert_eq!(
+      idot_tag.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(28))
+    );
+  }
+
+  #[test]
+  fn gdat_gain_map_image_captured_as_binary() {
+    // gdAT (PNG.pm:374-378): `GainMapImage`, `Binary => 1`, NO SubDirectory —
+    // the same shape as iDOT. Only the LENGTH is retained; it emits as the
+    // `(Binary data N bytes, …)` placeholder under `PNG:GainMapImage`. The
+    // payload here stands in for an embedded gain-map image.
+    let gdat = vec![0xABu8; 20];
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"gdAT", &gdat));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert_eq!(meta.gain_map_image_main_len(), Some(20));
+    assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
+    let emitted: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let gdat_tag = emitted
+      .iter()
+      .find(|t| t.tag().name() == "GainMapImage")
+      .expect("GainMapImage emitted");
+    assert_eq!(gdat_tag.tag().group_ref().family1(), "PNG");
+    assert_eq!(
+      gdat_tag.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(20))
+    );
+  }
+
+  #[test]
+  fn large_idot_chunk_stores_length_not_payload() {
+    // Regression (#142 Codex F1): a large-but-present iDOT chunk must NOT be
+    // cloned. The chunk passes the PNG length/CRC bounds, but the parser
+    // retains only the byte LENGTH — `PngMeta` has no payload buffer for it —
+    // so the stored representation is length-only and the normal `-j` output
+    // renders the placeholder from that count alone (no payload-sized alloc in
+    // either decode OR tags()).
+    const BIG: usize = 8 * 1024 * 1024; // 8 MiB, well under MAX_CHUNK_LENGTH.
+    let idot = vec![0u8; BIG];
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"iDOT", &idot));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    // Stored representation is the LENGTH, not the 8 MiB payload.
+    assert_eq!(meta.apple_data_offsets_main_len(), Some(BIG));
+    // The emitted placeholder is derived from the length alone.
+    let emitted: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let idot_tag = emitted
+      .iter()
+      .find(|t| t.tag().name() == "AppleDataOffsets")
+      .expect("AppleDataOffsets emitted");
+    assert_eq!(
+      idot_tag.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(BIG as u64))
+    );
+  }
+
+  #[test]
+  fn idot_before_and_after_iend_emit_under_both_groups() {
+    // #142 (Codex [medium]): a PNG carrying `iDOT` BOTH pre-`IEND` (28 bytes)
+    // and as a post-`IEND` TRAILER chunk (4 bytes) emits BOTH placeholders —
+    // `PNG:AppleDataOffsets` AND `Trailer:AppleDataOffsets` — under their
+    // DISTINCT family-1 groups (oracle-verified vs bundled 13.59). The
+    // singleton model lost the main; the per-group slots keep both, still
+    // length-only.
+    let main_idot = {
+      let mut v = Vec::new();
+      for x in [2u32, 0, 1, 0x28, 1, 1, 0x100] {
+        v.extend_from_slice(&x.to_be_bytes());
+      }
+      v
+    };
+    assert_eq!(main_idot.len(), 28);
+    let trailer_idot = 0xDEAD_BEEFu32.to_be_bytes().to_vec(); // 4 bytes
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"iDOT", &main_idot));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    bytes.extend_from_slice(&chunk(b"iDOT", &trailer_idot));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    // Both per-group LENGTHS survive (length-only — no payload retained).
+    assert_eq!(meta.apple_data_offsets_main_len(), Some(28));
+    assert_eq!(meta.apple_data_offsets_trailer_len(), Some(4));
+    // The post-`IEND` entry warning is document-level (raised before
+    // `SET_GROUP1`), so the PNG-level `warnings()` list carries it.
+    assert_eq!(
+      meta.warnings(),
+      &["Trailer data after PNG IEND chunk".to_string()]
+    );
+    let emitted: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    // Exactly two `AppleDataOffsets` tags, one per family-1 group.
+    let offsets: Vec<_> = emitted
+      .iter()
+      .filter(|t| t.tag().name() == "AppleDataOffsets")
+      .collect();
+    assert_eq!(
+      offsets.len(),
+      2,
+      "expected PNG: + Trailer: AppleDataOffsets"
+    );
+    let main = offsets
+      .iter()
+      .find(|t| t.tag().group_ref().family1() == "PNG")
+      .expect("PNG:AppleDataOffsets emitted");
+    let trailer = offsets
+      .iter()
+      .find(|t| t.tag().group_ref().family1() == "Trailer")
+      .expect("Trailer:AppleDataOffsets emitted");
+    assert_eq!(
+      main.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(28))
+    );
+    assert_eq!(
+      trailer.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(4))
+    );
+  }
+
+  #[test]
+  fn gdat_before_and_after_iend_emit_under_both_groups() {
+    // #142 (Codex [medium]): the same per-group split for `gdAT`. A pre-`IEND`
+    // `gdAT` (20 bytes → `PNG:GainMapImage`) and a post-`IEND` trailer `gdAT`
+    // (8 bytes → `Trailer:GainMapImage`) BOTH emit. Length-only.
+    let main_gdat = vec![0xABu8; 20];
+    let trailer_gdat = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"gdAT", &main_gdat));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    bytes.extend_from_slice(&chunk(b"gdAT", &trailer_gdat));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert_eq!(meta.gain_map_image_main_len(), Some(20));
+    assert_eq!(meta.gain_map_image_trailer_len(), Some(8));
+    let emitted: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let images: Vec<_> = emitted
+      .iter()
+      .filter(|t| t.tag().name() == "GainMapImage")
+      .collect();
+    assert_eq!(images.len(), 2, "expected PNG: + Trailer: GainMapImage");
+    let main = images
+      .iter()
+      .find(|t| t.tag().group_ref().family1() == "PNG")
+      .expect("PNG:GainMapImage emitted");
+    let trailer = images
+      .iter()
+      .find(|t| t.tag().group_ref().family1() == "Trailer")
+      .expect("Trailer:GainMapImage emitted");
+    assert_eq!(
+      main.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(20))
+    );
+    assert_eq!(
+      trailer.tag().value_ref(),
+      &crate::value::TagValue::Str(crate::value::binary_placeholder(8))
+    );
   }
 
   #[test]

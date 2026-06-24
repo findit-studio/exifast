@@ -11777,6 +11777,85 @@ fn png_trailer_xmp_warn_conformance() {
   );
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_idot_conformance() {
+  // #142 — the Apple `iDOT` private vendor chunk (`AppleDataOffsets`,
+  // `PNG.pm:331-342`, ref NealKrawetz). The chunk table is `Name =>
+  // 'AppleDataOffsets', Binary => 1` with NO SubDirectory, so `FoundPNG`
+  // (`PNG.pm:970-1148`) resolves the tagInfo, finds no subdir, and stores the
+  // WHOLE 28-byte chunk value under `PNG:AppleDataOffsets`; because it is
+  // `Binary => 1` the value renders as the universal `(Binary data 28 bytes,
+  // use -b option to extract)` placeholder at any size. Crafted minimal 1x1 RGB
+  // fixture (`tools/gen_png_idot_fixture.py`) whose only vendor chunk is `iDOT`,
+  // placed directly after IHDR (the real Apple-PNG layout). PNG is in the
+  // Composite allow-list, so the ported `Composite:ImageSize`/`Megapixels` are
+  // kept and compared too (no exclusion — a PLAIN `check`). The OTHER four PNG
+  // private chunks (`caBX`-JUMBF / `cpIp`-FlashPix / `meTa`-XML / `seAl`-SEAL,
+  // `PNG.pm:343-382`) dispatch into large SubDirectory subsystems exifast does
+  // not have and remain deferred (#142). Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("PNG_idot.png", "PNG_idot.png.json", true);
+  check("PNG_idot.png", "PNG_idot.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_gdat_conformance() {
+  // #142 (Codex F2) — the `gdAT` gain-map chunk (`GainMapImage`, `PNG.pm:374-
+  // 378`). The chunk table is `Name => 'GainMapImage', Groups => { 2 =>
+  // 'Preview' }, Binary => 1` with NO SubDirectory — the SAME simple shape as
+  // `iDOT` — so `FoundPNG` stores the WHOLE chunk value under
+  // `PNG:GainMapImage` and renders the universal `(Binary data 20 bytes, use
+  // -b option to extract)` placeholder (`-j`); exifast retains only the
+  // payload LENGTH and renders the placeholder from it. The family-2 `Preview`
+  // group does not surface under `-G1` (family-1 stays `PNG`). Crafted minimal
+  // 1x1 RGB fixture (`tools/gen_png_idot_fixture.py`) whose only vendor chunk
+  // is `gdAT`. PNG is in the Composite allow-list, so the ported
+  // `Composite:ImageSize`/`Megapixels` are compared too (a PLAIN `check`).
+  // Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_gdat.png", "PNG_gdat.png.json", true);
+  check("PNG_gdat.png", "PNG_gdat.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_idot_main_trailer_conformance() {
+  // #142 (Codex [medium]) — the per-group `iDOT` fix. A PNG can carry the
+  // `Binary => 1` `iDOT` chunk BOTH before `IEND` (stored under the `PNG`
+  // family-1 group) AND as a post-`IEND` TRAILER chunk (stored under the
+  // `Trailer` group, `PNG.pm:1479-1484` `SET_GROUP1 = 'Trailer'`). Bundled
+  // emits BOTH placeholders — `PNG:AppleDataOffsets` (28 bytes, the pre-`IEND`
+  // main) AND `Trailer:AppleDataOffsets` (4 bytes, the post-`IEND` trailer) —
+  // under their DISTINCT family-1 groups. The previous singleton
+  // `Option<usize>` model lost the main (the trailer setter overwrote it); the
+  // per-group [`BinaryChunkLengths`] keeps both, STILL length-only (no payload
+  // bytes). The trailer-ENTRY warning `Trailer data after PNG IEND chunk`
+  // (`PNG.pm:1481`, raised BEFORE `SET_GROUP1`) stays the document `[minor]
+  // ExifTool:Warning`. Crafted main+trailer fixture
+  // (`tools/gen_png_idot_fixture.py`). PNG is in the Composite allow-list, so
+  // the ported `Composite:ImageSize`/`Megapixels` are compared too (a PLAIN
+  // `check` — no deferred keys to drop). Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("PNG_idot_trailer.png", "PNG_idot_trailer.png.json", true);
+  check("PNG_idot_trailer.png", "PNG_idot_trailer.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_gdat_main_trailer_conformance() {
+  // #142 (Codex [medium]) — the same per-group fix for `gdAT` (GainMapImage).
+  // A pre-`IEND` `gdAT` (→ `PNG:GainMapImage`, 20 bytes) and a post-`IEND`
+  // trailer `gdAT` (→ `Trailer:GainMapImage`, 8 bytes) BOTH emit under their
+  // distinct family-1 groups (the family-2 `Preview` group does not surface at
+  // `-G1`). STILL length-only. The document `[minor] ExifTool:Warning` (the
+  // trailer-entry warning) is emitted too. Crafted main+trailer fixture
+  // (`tools/gen_png_idot_fixture.py`); a PLAIN `check`. Oracle: bundled `perl
+  // exiftool -j -G1 -struct` 13.59.
+  check("PNG_gdat_trailer.png", "PNG_gdat_trailer.png.json", true);
+  check("PNG_gdat_trailer.png", "PNG_gdat_trailer.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

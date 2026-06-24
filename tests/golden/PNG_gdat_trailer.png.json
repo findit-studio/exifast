@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "PNG_gdat_trailer.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Trailer data after PNG IEND chunk",
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG:GainMapImage": "(Binary data 20 bytes, use -b option to extract)",
+  "Trailer:GainMapImage": "(Binary data 8 bytes, use -b option to extract)",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

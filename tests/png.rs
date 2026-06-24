@@ -453,6 +453,64 @@ fn raw_profile_body(profile_type: &str, raw: &[u8], declared_len: usize) -> Vec<
 }
 
 #[test]
+fn engine_extract_info_emits_apple_data_offsets_binary() {
+  // #142 — the Apple `iDOT` private chunk (`AppleDataOffsets`, `Binary => 1`,
+  // NO SubDirectory, PNG.pm:331-342). A 1x1 RGB PNG with a single 28-byte `iDOT`
+  // chunk directly after IHDR. Bundled stores the whole chunk under
+  // `PNG:AppleDataOffsets` and renders the binary placeholder. Oracle
+  // (`perl exiftool -j -G1` 13.59):
+  //   "PNG:AppleDataOffsets": "(Binary data 28 bytes, use -b option to extract)"
+  // 7x int32u (28 bytes), the layout documented at PNG.pm:334-341.
+  let mut idot = Vec::new();
+  for v in [2u32, 0, 1, 0x28, 1, 1, 0x100] {
+    idot.extend_from_slice(&v.to_be_bytes());
+  }
+  let bytes = assemble(&[ihdr_rgb_1x1(), chunk(b"iDOT", &idot)]);
+  let json = extract_info("idot.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains("\"PNG:AppleDataOffsets\":\"(Binary data 28 bytes, use -b option to extract)\""),
+    "expected the AppleDataOffsets binary placeholder, got {json}",
+  );
+  // The structural tags are unaffected; no warning.
+  assert!(json.contains("\"PNG:ImageWidth\":1"), "got {json}");
+  assert!(!json.contains("Error inflating"), "got {json}");
+}
+
+#[test]
+fn engine_extract_info_emits_idot_under_both_png_and_trailer_groups() {
+  // #142 (Codex [medium]) — a PNG carrying `iDOT` BOTH before `IEND` and as a
+  // post-`IEND` TRAILER chunk emits BOTH placeholders under their distinct
+  // family-1 groups. Oracle (`perl exiftool -j -G1` 13.59):
+  //   "PNG:AppleDataOffsets":     "(Binary data 28 bytes, …)"
+  //   "Trailer:AppleDataOffsets": "(Binary data 4 bytes, …)"
+  //   "ExifTool:Warning":         "[minor] Trailer data after PNG IEND chunk"
+  let mut main_idot = Vec::new();
+  for v in [2u32, 0, 1, 0x28, 1, 1, 0x100] {
+    main_idot.extend_from_slice(&v.to_be_bytes());
+  }
+  let trailer_idot = 0xDEAD_BEEFu32.to_be_bytes(); // 4-byte post-IEND iDOT
+  let bytes = assemble_with_trailer(
+    &[ihdr_gray_1x1(), chunk(b"iDOT", &main_idot)],
+    &chunk(b"iDOT", &trailer_idot),
+  );
+  let json = extract_info("idot_trailer.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains("\"PNG:AppleDataOffsets\":\"(Binary data 28 bytes, use -b option to extract)\""),
+    "expected the pre-IEND PNG:AppleDataOffsets placeholder, got {json}",
+  );
+  assert!(
+    json
+      .contains("\"Trailer:AppleDataOffsets\":\"(Binary data 4 bytes, use -b option to extract)\""),
+    "expected the post-IEND Trailer:AppleDataOffsets placeholder, got {json}",
+  );
+  // The trailer-entry warning is document-level (raised before SET_GROUP1).
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"[minor] Trailer data after PNG IEND chunk\""),
+    "got {json}",
+  );
+}
+
+#[test]
 fn engine_ztxt_inflates_comment() {
   // Oracle (`perl exiftool -j -G1`) on a zTXt "Comment" chunk:
   //   "PNG:Comment": "decompressed comment value"
