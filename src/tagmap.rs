@@ -522,7 +522,7 @@ impl TagMap {
   pub(crate) fn get_str(&self, group: &str, name: &str) -> Option<String> {
     use core::fmt::Write as _;
     self.get(group, name).map(|v| match v {
-      TagValue::Str(s) => s.to_string(),
+      TagValue::Str(s) | TagValue::JsonStr(s) => s.to_string(),
       TagValue::U64(n) => n.to_string(),
       TagValue::I64(n) => n.to_string(),
       TagValue::F64(x) => {

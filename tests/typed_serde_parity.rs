@@ -1312,7 +1312,46 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// per-body Main scalars). The conformance arms exclude only the non-MakerNote
 /// container residuals (CFAPattern / the PEF IFD2 JpgFromRaw chain / IsOffset
 /// binary previews), see `conformance.rs::pef_pentax_{k3_mark_iii,istd}_conformance`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 590;
+///
+/// 590 → 592 (#399) adds two crafted wrong-format EXIF byte-conv fixtures, each a
+/// plain golden (no dropped keys):
+///   * `Exif_gps_versionid_undef.tif` — `GPSVersionID` (0x0000) as `undef[4]`
+///     `02 03 00 00`. ExifTool reads the on-disk format (GPSVersionID has no
+///     `Format =>` override), so the value is the NUL-stripped raw bytes
+///     ("\u0002\u0003"), NOT re-read as int8u and NOT the binary placeholder.
+///   * `Exif_filesource_sigma.tif` — `FileSource` (0xa300) as the literal Sigma
+///     `undef[4]` `03 00 00 00`, hitting the dedicated PrintConv string key
+///     `"\3\0\0\0" => 'Sigma Digital Camera'` (`Exif.pm:2820`).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 592 → 594 (#399 follow-up, Codex [medium]) adds two crafted NUL-split-UTF-8
+/// fixtures pinning ExifTool's `EscapeJSON` ORDER (NUL-delete `exiftool:3820`
+/// BEFORE `FixUTF8` `exiftool:3824`) on the raw-byte render paths, each a plain
+/// golden:
+///   * `Exif_gps_versionid_nulsplit.tif` — `GPSVersionID` (0x0000) `undef[4]`
+///     `C2 00 A9 00`: the NUL between `C2` and `A9` SPLITS a 2-byte sequence;
+///     NUL-strip-THEN-FixUTF8 reassembles `C2 A9` → "©" (bundled 13.59, both
+///     `-j`/`-n`), where the pre-fix FixUTF8-first order emitted "??".
+///   * `Exif_filesource_nulsplit.tif` — the same `C2 00 A9 00` on the non-Sigma
+///     multi-byte `FileSource` HASH-miss path → "Unknown (©)" / "©".
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 594 → 597 (#399 follow-up R2, Codex [medium]) adds three crafted NUL-split
+/// fixtures pinning the FULL `EscapeJSON` CLASSIFY order — the value is classified
+/// against the boolean/number gate AS-IS (the ORIGINAL, WITH NULs) BEFORE
+/// `tr/\0//d` (`exiftool:3805-3810` precede `:3820`), so a value whose NUL strip
+/// PRODUCES a number/boolean lexeme is still a QUOTED string. Each a plain golden:
+///   * `Exif_gps_versionid_nulnum.tif` — `GPSVersionID` (0x0000) `undef[4]`
+///     `31 00 32 00` (`"1\02\0"`): NUL-strip → `12`, but the NUL-bearing original
+///     fails the number gate ⇒ quoted `"12"` (NOT bare `12`), both `-j`/`-n`.
+///   * `Exif_gps_versionid_nulbool.tif` — `GPSVersionID` (0x0000) `undef[8]`
+///     `74 00 72 00 75 00 65 00` (`"t\0r\0u\0e\0"`): NUL-strip → `true`, but the
+///     NUL-bearing original fails the boolean gate ⇒ quoted `"true"` (NOT bare
+///     `true`), both `-j`/`-n`.
+///   * `Exif_filesource_nulnum.tif` — the same `31 00 32 00` on the `FileSource`
+///     HASH-miss path → "Unknown (12)" / quoted "12".
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 597;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

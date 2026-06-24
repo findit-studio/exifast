@@ -401,6 +401,27 @@ pub enum TagValue {
   F64(f64),
   /// UTF-8 text.
   Str(SmolStr),
+  /// UTF-8 text that ExifTool's `EscapeJSON` has ALREADY classified as a JSON
+  /// STRING (it failed the boolean/number gate at the classify point) — so it is
+  /// rendered as a QUOTED string VERBATIM, bypassing the [`TagValue::Str`]
+  /// serializer's own re-run of that gate.
+  ///
+  /// `EscapeJSON` (`exiftool:3804-3824`) coerces a value to a bare JSON
+  /// boolean/number ONLY when the ORIGINAL string (NULs and all) matches
+  /// `/^(true|false)$/i` or the conservative number regex, and ONLY THEN, for a
+  /// value that did NOT match, deletes NULs (`tr/\0//d`) and runs `FixUTF8`. A
+  /// raw on-disk byte string whose NUL deletion / UTF-8 repair happens to PRODUCE
+  /// a number- or boolean-shaped lexeme (e.g. a `GPSVersionID`/`FileSource`
+  /// `undef[4]` `31 00 32 00` → `"12"`, or `74 00 72 00 75 00 65 00` → `"true"`)
+  /// is therefore a QUOTED string — the NUL-bearing ORIGINAL failed the gate, so
+  /// the post-strip lexeme must NOT be re-coerced to a bare token. This variant
+  /// carries that already-decided "it is a string" verdict so neither the generic
+  /// serializer NOR the [`JsonTagValue`] renderer re-classifies it. The escaped,
+  /// NUL-stripped, `FixUTF8`'d content is stored directly; the serializer only
+  /// quotes it (`serialize_str`). A clean-number/boolean ORIGINAL (no NUL) is
+  /// instead emitted as a [`TagValue::Str`], which the gate correctly renders
+  /// BARE (`escape_json_raw_bytes` is identity on NUL-free ASCII).
+  JsonStr(SmolStr),
   /// Boolean.
   Bool(bool),
   /// Raw bytes (binary tag).
@@ -1166,6 +1187,14 @@ const _: () = {
             s.serialize_str(text)
           }
         }
+        // `EscapeJSON` ALREADY classified this content as a JSON string (the
+        // NUL-bearing original failed the boolean/number gate), so emit it as a
+        // QUOTED string VERBATIM — NO bool/number re-gate. The content is the
+        // post-`tr/\0//d` post-`FixUTF8` text (NUL-free valid UTF-8), so it is
+        // written directly; this is what keeps a NUL-split numeric/boolean
+        // (`31 00 32 00` → `"12"`, `74 00 72 00 75 00 65 00` → `"true"`) a quoted
+        // string, byte-identical to bundled, instead of a bare token.
+        TagValue::JsonStr(text) => s.serialize_str(text),
         TagValue::Bool(b) => s.serialize_bool(*b),
         // ExifTool universal no-`-b` placeholder (a plain string, never
         // numeric). N = byte length. Shares `binary_placeholder` with the
@@ -1666,6 +1695,40 @@ mod tests {
     // The `true`/`false` boolean coercion still precedes the number gate.
     assert_eq!(j(&TagValue::Str("True".into())), "true");
     assert_eq!(j(&TagValue::Str("false".into())), "false");
+  }
+
+  /// #399 — `TagValue::JsonStr` carries `EscapeJSON`'s ALREADY-DECIDED "it is a
+  /// string" verdict, so it is ALWAYS a QUOTED JSON string VERBATIM — the
+  /// boolean/number gate is NOT re-run on it. This is what keeps a NUL-split
+  /// numeric/boolean value (whose `tr/\0//d`+`FixUTF8` content is number- or
+  /// boolean-SHAPED) a quoted string rather than a bare token. Pinned through
+  /// BOTH the generic serializer AND the `JsonTagValue` renderer (the two output
+  /// paths must agree).
+  #[cfg(feature = "json")]
+  #[test]
+  fn json_str_always_serializes_as_quoted_string() {
+    let generic = |v: &TagValue| serde_json::to_string(v).unwrap();
+    let wrapped = |v: &TagValue| serde_json::to_string(&JsonTagValue(v)).unwrap();
+    // A number-SHAPED content — bare as `Str`, but QUOTED as `JsonStr`.
+    assert_eq!(generic(&TagValue::Str("12".into())), "12");
+    assert_eq!(generic(&TagValue::JsonStr("12".into())), "\"12\"");
+    assert_eq!(wrapped(&TagValue::JsonStr("12".into())), "\"12\"");
+    // A boolean-SHAPED content — bare boolean as `Str`, QUOTED as `JsonStr`.
+    assert_eq!(generic(&TagValue::Str("true".into())), "true");
+    assert_eq!(generic(&TagValue::JsonStr("true".into())), "\"true\"");
+    assert_eq!(wrapped(&TagValue::JsonStr("true".into())), "\"true\"");
+    // A fractional/exponent numeric content — quoted as `JsonStr`.
+    assert_eq!(generic(&TagValue::JsonStr("-12.5".into())), "\"-12.5\"");
+    assert_eq!(wrapped(&TagValue::JsonStr("1.4e2".into())), "\"1.4e2\"");
+    // A genuinely non-numeric content quotes identically either way.
+    assert_eq!(generic(&TagValue::JsonStr("©".into())), "\"©\"");
+    assert_eq!(wrapped(&TagValue::JsonStr("©".into())), "\"©\"");
+    // The content is emitted VERBATIM (no further NUL handling needed — the
+    // caller already ran `tr/\0//d`+`FixUTF8`); a control char escapes as `\u`.
+    assert_eq!(
+      generic(&TagValue::JsonStr("\u{2}\u{3}".into())),
+      "\"\\u0002\\u0003\""
+    );
   }
 
   /// #321 — a `TagValue::Str` that passes the `EscapeJSON` number gate is emitted
