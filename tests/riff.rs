@@ -629,3 +629,494 @@ fn wav_adtl_repeated_labl_first_wins() {
     "the second labl must be dropped (first-wins):\n{got_diff}"
   );
 }
+
+/// Build a minimal AVI (`RIFF`/`AVI ` + `LIST_hdrl`/`avih` + one `JUNK` chunk)
+/// carrying `junk` as the JUNK payload. The `avih` is a 56-byte int32u header
+/// (320x240, 10 frames, 1 stream) — enough for the walker to set the AVI file
+/// type and reach the top-level `JUNK` chunk.
+fn riff_avi_with_junk(junk: &[u8]) -> Vec<u8> {
+  let mut avih = Vec::new();
+  for v in [41666u32, 0, 0, 0x10, 10, 0, 1, 0, 320, 240, 0, 0, 0, 0] {
+    avih.extend_from_slice(&v.to_le_bytes());
+  }
+  let mut hdrl = Vec::from(*b"hdrl");
+  hdrl.extend_from_slice(&wav_chunk(b"avih", &avih));
+  let lst = wav_chunk(b"LIST", &hdrl);
+  let junk_chunk = wav_chunk(b"JUNK", junk);
+  let mut body = Vec::from(*b"AVI ");
+  body.extend_from_slice(&lst);
+  body.extend_from_slice(&junk_chunk);
+  let mut out = Vec::from(*b"RIFF");
+  out.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+  out.extend_from_slice(&body);
+  out
+}
+
+#[test]
+fn junk_textjunk_ascii_fallback_emits() {
+  // RIFF.pm:488-491 `TextJunk`: a printable run + trailing NULs → `RIFF:TextJunk`.
+  let data = riff_avi_with_junk(b"Hello RIFF Junk Text\0\0\0\0");
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    got.contains("\"RIFF:TextJunk\":\"Hello RIFF Junk Text\""),
+    "TextJunk fallback should emit the printable run:\n{got}"
+  );
+}
+
+#[test]
+fn junk_textjunk_rejects_embedded_control_byte() {
+  // The RawConv is end-anchored (`\0*$`): a control byte AFTER the printable run
+  // (not a trailing NUL) fails the whole match ⇒ no `TextJunk`.
+  let data = riff_avi_with_junk(b"Hello\x01World\0");
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "an embedded control byte must reject TextJunk:\n{got}"
+  );
+}
+
+#[test]
+fn junk_textjunk_rejects_high_byte() {
+  // A high byte (0x7f-0xff) is excluded from the printable class ⇒ no match.
+  let data = riff_avi_with_junk(b"Caf\xe9\0\0");
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "a high byte must reject TextJunk:\n{got}"
+  );
+}
+
+#[test]
+fn junk_textjunk_rejects_empty_or_all_nul() {
+  // `+` requires a NON-EMPTY printable run; an all-NUL payload has none ⇒ undef.
+  let data = riff_avi_with_junk(b"\0\0\0\0");
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "an all-NUL JUNK must not emit TextJunk:\n{got}"
+  );
+}
+
+#[test]
+fn junk_pentax_junk_emits_model_under_makernotes() {
+  // RIFF.pm:469-473 `PentaxJunk` (`^IIII\x01\0` → `%Pentax::Junk`): Model @ 0x0c.
+  let mut junk = vec![0u8; 0x2c];
+  junk[0..4].copy_from_slice(b"IIII");
+  junk[4..6].copy_from_slice(b"\x01\x00");
+  junk[0x0c..0x0c + 12].copy_from_slice(b"Optio RS1000");
+  let data = riff_avi_with_junk(&junk);
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    got.contains("\"Pentax:Model\":\"Optio RS1000\""),
+    "PentaxJunk Model should emit under MakerNotes:Pentax:\n{got}"
+  );
+  // It must NOT also leak as a RIFF:TextJunk (the Pentax condition wins first).
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "a Pentax-signature JUNK must not fall through to TextJunk:\n{got}"
+  );
+}
+
+#[test]
+fn junk_deferred_vendor_signature_not_emitted_as_textjunk() {
+  // RIFF.pm:445 `OlympusJunk` (`^OLYMDigital Camera`) routes to a deferred
+  // subsystem — the printable signature must NOT be mis-emitted as `TextJunk`
+  // (the ordered conditions match Olympus FIRST).
+  let mut junk = Vec::from(*b"OLYMDigital Camera");
+  junk.extend_from_slice(&[0u8; 8]);
+  let data = riff_avi_with_junk(&junk);
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "an OlympusJunk-signature JUNK must not emit TextJunk:\n{got}"
+  );
+}
+
+#[test]
+fn junq_oldxmp_not_routed_through_junk_dispatch() {
+  // `JUNQ` is the `%Main` `OldXMP` tag (RIFF.pm:498-502), NOT a `JUNK` variant.
+  // A `JUNQ` chunk whose bytes would match the TextJunk RawConv must still NOT
+  // emit `RIFF:TextJunk` (it never reaches the JUNK dispatch).
+  let mut avih = Vec::new();
+  for v in [41666u32, 0, 0, 0x10, 10, 0, 1, 0, 320, 240, 0, 0, 0, 0] {
+    avih.extend_from_slice(&v.to_le_bytes());
+  }
+  let mut hdrl = Vec::from(*b"hdrl");
+  hdrl.extend_from_slice(&wav_chunk(b"avih", &avih));
+  let lst = wav_chunk(b"LIST", &hdrl);
+  let junq = wav_chunk(b"JUNQ", b"PrintableOldXMP\0");
+  let mut body = Vec::from(*b"AVI ");
+  body.extend_from_slice(&lst);
+  body.extend_from_slice(&junq);
+  let mut data = Vec::from(*b"RIFF");
+  data.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+  data.extend_from_slice(&body);
+  let got = extract_info("t.avi", &data, true);
+  assert!(
+    !got.contains("RIFF:TextJunk"),
+    "JUNQ must not be routed through the JUNK TextJunk dispatch:\n{got}"
+  );
+}
+
+// ===========================================================================
+// `%Pentax::Junk2` FNumber PrintConv (`sprintf("%.1f",$val)`, Pentax.pm:6633) —
+// faithful `%.1f` half-even + the `-j`/`-n` rendering + the zero-denominator
+// `inf`/`undef` path + the derived `Composite:Aperture` (#154 Codex [high]).
+// Each expected value below was captured from bundled ExifTool 13.59 (`-j`/`-n`
+// `-G1` on the crafted FNumber).
+// ===========================================================================
+
+/// Build a minimal `PentaxJunk2` AVI (`^PENTDigital Camera` → `%Pentax::Junk2`,
+/// RIFF.pm:474-478) whose `FNumber` `rational64u` (@ payload 0x5e) is
+/// `num`/`denom`. `Make` (@0x12) and `Model` (@0x2c) carry fixed strings so the
+/// derived `Composite:Aperture` (which selects the raw FNumber operand) is the
+/// only aperture surface under test.
+fn pentaxjunk2_avi_fnumber(num: u32, denom: u32) -> Vec<u8> {
+  let mut payload = vec![0u8; 0x66];
+  payload[0..18].copy_from_slice(b"PENTDigital Camera");
+  payload[0x12..0x12 + 6].copy_from_slice(b"PENTAX");
+  payload[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+  payload[0x5e..0x5e + 4].copy_from_slice(&num.to_le_bytes());
+  payload[0x5e + 4..0x5e + 8].copy_from_slice(&denom.to_le_bytes());
+  riff_avi_with_junk(&payload)
+}
+
+#[test]
+fn pentaxjunk2_fnumber_whole_renders_dot_zero() {
+  // 4/1: bundled `-j` `FNumber`/`Aperture` = `4.0` (the `%.1f` string `"4.0"`
+  // passes EscapeJSON's number gate → a BARE JSON number WITH the `.0`); `-n` =
+  // `4` (the raw `%g` quotient). NOT a bare `4` at `-j` (the pre-fix bug).
+  let data = pentaxjunk2_avi_fnumber(4, 1);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":4.0,"),
+    "4/1 -j FNumber must render the bare JSON number 4.0 (not 4):\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":4.0,"),
+    "4/1 -j Composite:Aperture must follow FNumber as 4.0:\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":4,"),
+    "4/1 -n FNumber must render the raw quotient 4:\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":4,"),
+    "4/1 -n Composite:Aperture must follow FNumber as 4:\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_is_round_half_even_not_half_away() {
+  // The crux of the finding: Perl `sprintf("%.1f",$val)` is round-HALF-EVEN, so
+  // `225/100` (= 2.25, a tie) rounds DOWN to `2.2` (the nearest EVEN last digit),
+  // NOT `.round()`'s half-away `2.3`. Rust's `format!("{:.1}")` is also
+  // half-even, so the two agree byte-for-byte. `-n` keeps the raw `2.25`.
+  let data = pentaxjunk2_avi_fnumber(225, 100);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":2.2,"),
+    "225/100 -j FNumber must be the half-even 2.2 (NOT the half-away 2.3):\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":2.2,"),
+    "225/100 -j Composite:Aperture must follow FNumber as 2.2:\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":2.25,"),
+    "225/100 -n FNumber must keep the raw quotient 2.25:\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":2.25,"),
+    "225/100 -n Composite:Aperture must keep the raw 2.25:\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_half_even_ties_round_to_even() {
+  // Two more half-even ties confirm the rounding rule against bundled: `235/100`
+  // (= 2.35) → `2.4` (round UP to even), `245/100` (= 2.45) → `2.5` (round UP to
+  // even). A naive half-away `.round()` would give the same `2.4`/`2.5` here, but
+  // `225/100`→`2.2` (above) is where half-even and half-away diverge; these pin
+  // the whole tie class against bundled.
+  for (num, fj, fn_) in [(235u32, "2.4", "2.35"), (245u32, "2.5", "2.45")] {
+    let data = pentaxjunk2_avi_fnumber(num, 100);
+    let j = extract_info("pj2.avi", &data, true);
+    assert!(
+      j.contains(&format!("\"Pentax:FNumber\":{fj},")),
+      "{num}/100 -j FNumber must be the half-even {fj}:\n{j}"
+    );
+    let n = extract_info("pj2.avi", &data, false);
+    assert!(
+      n.contains(&format!("\"Pentax:FNumber\":{fn_},")),
+      "{num}/100 -n FNumber must keep the raw {fn_}:\n{n}"
+    );
+  }
+}
+
+#[test]
+fn pentaxjunk2_fnumber_zero_denom_nonzero_num_is_inf() {
+  // A degenerate `1/0` rational: ExifTool `ReadValue` yields the bare word
+  // `"inf"` (numerator != 0). bundled `-n` `FNumber`/`Aperture` = `"inf"`
+  // (lowercase, QUOTED); `-j` `FNumber` = `"Inf"` (Perl `sprintf("%.1f",Inf)` is
+  // TITLECASE) while `Composite:Aperture` = `"inf"` (the raw operand passes
+  // through `PrintFNumber` unchanged). The tag is EMITTED, not suppressed.
+  let data = pentaxjunk2_avi_fnumber(1, 0);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":\"Inf\","),
+    "1/0 -j FNumber must be the titlecase quoted \"Inf\":\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":\"inf\","),
+    "1/0 -j Composite:Aperture must be the lowercase quoted \"inf\":\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":\"inf\","),
+    "1/0 -n FNumber must be the lowercase quoted \"inf\":\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":\"inf\","),
+    "1/0 -n Composite:Aperture must be the lowercase quoted \"inf\":\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_zero_over_zero_is_undef() {
+  // A `0/0` rational: ExifTool `ReadValue` yields the bare word `"undef"`.
+  // bundled `-n` `FNumber`/`Aperture` = `"undef"` (QUOTED). At `-j` the asymmetry
+  // is exact: `FNumber` = `0.0` (Perl numifies the STRING `"undef"` to `0`, so
+  // `sprintf("%.1f","undef")` = `"0.0"` → a bare JSON `0.0`), while
+  // `Composite:Aperture` = `"undef"` (its operand is the raw word `"undef"`,
+  // which `PrintFNumber` leaves verbatim). Both EMITTED, not suppressed.
+  let data = pentaxjunk2_avi_fnumber(0, 0);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":0.0,"),
+    "0/0 -j FNumber must be the bare JSON number 0.0 (sprintf of numified undef):\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":\"undef\","),
+    "0/0 -j Composite:Aperture must be the quoted \"undef\":\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":\"undef\","),
+    "0/0 -n FNumber must be the quoted \"undef\":\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":\"undef\","),
+    "0/0 -n Composite:Aperture must be the quoted \"undef\":\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_typical_decimal_is_unchanged() {
+  // The real-device value (`28/10` = 2.8) keeps rendering `2.8` at `-j`
+  // (`sprintf("%.1f",2.8)` = `"2.8"` → bare `2.8`) and `2.8` at `-n` — so the
+  // bundled `AVI_pentaxjunk2.avi` golden is byte-identical after the fix.
+  let data = pentaxjunk2_avi_fnumber(28, 10);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":2.8,") && j.contains("\"Composite:Aperture\":2.8,"),
+    "28/10 must render 2.8 in -j (FNumber + Aperture):\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":2.8,") && n.contains("\"Composite:Aperture\":2.8,"),
+    "28/10 must render 2.8 in -n (FNumber + Aperture):\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_roundfloat10_drops_excess_precision_whole() {
+  // ExifTool `ReadValue` of a `rational64u` is `RoundFloat(num/denom, 10)` — 10
+  // significant figures — applied BEFORE both the `%.1f` PrintConv AND the
+  // `-n`/Composite ValueConv. `4000000001/4` = raw `1000000000.25`, but
+  // `RoundFloat(_, 10)` = `1000000000` (the `.25` is beyond 10 sig figs). bundled
+  // 13.59: `-j` `FNumber`/`Aperture` = `1000000000.0` (`%.1f` of the rounded
+  // WHOLE value); `-n` `FNumber`/`Aperture` = `1000000000` (a bare INTEGER, NOT
+  // `1000000000.25`). The pre-fix code formatted the RAW quotient → `-j`
+  // `1000000000.2`, `-n` `1000000000.25` (both DIVERGE).
+  let data = pentaxjunk2_avi_fnumber(4_000_000_001, 4);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":1000000000.0,"),
+    "4000000001/4 -j FNumber must be %.1f of RoundFloat(_,10)=1000000000.0 (not the raw 1000000000.2):\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":1000000000.0,"),
+    "4000000001/4 -j Composite:Aperture must follow the rounded FNumber as 1000000000.0:\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":1000000000,"),
+    "4000000001/4 -n FNumber must be the whole RoundFloat(_,10)=1000000000 (not the raw 1000000000.25):\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":1000000000,"),
+    "4000000001/4 -n Composite:Aperture must follow the rounded FNumber as 1000000000:\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_roundfloat10_caps_repeating_fraction() {
+  // `1/3` = a 15-significant-figure repeating fraction raw, but `RoundFloat(_, 10)`
+  // = `0.3333333333` (exactly 10 sig figs). bundled 13.59: `-n` `FNumber` =
+  // `0.3333333333` (NOT the 15-digit `0.333333333333333`) and `Composite:Aperture`
+  // = `0.3333333333` (its operand is that same rounded value); `-j` `FNumber` =
+  // `0.3` (`%.1f` of the rounded value) while `Composite:Aperture` = `0.33`
+  // (`PrintFNumber` of the operand `0.3333333333` → `sprintf("%.2g",...)`-style
+  // `0.33`). The pre-fix code carried the raw 15-digit quotient (`-n` DIVERGES).
+  let data = pentaxjunk2_avi_fnumber(1, 3);
+  let j = extract_info("pj2.avi", &data, true);
+  assert!(
+    j.contains("\"Pentax:FNumber\":0.3,"),
+    "1/3 -j FNumber must be %.1f of RoundFloat(_,10)=0.3:\n{j}"
+  );
+  assert!(
+    j.contains("\"Composite:Aperture\":0.33,"),
+    "1/3 -j Composite:Aperture must be PrintFNumber of the rounded operand = 0.33:\n{j}"
+  );
+  let n = extract_info("pj2.avi", &data, false);
+  assert!(
+    n.contains("\"Pentax:FNumber\":0.3333333333,"),
+    "1/3 -n FNumber must be RoundFloat(_,10)=0.3333333333 (NOT the 15-digit raw quotient):\n{n}"
+  );
+  assert!(
+    n.contains("\"Composite:Aperture\":0.3333333333,"),
+    "1/3 -n Composite:Aperture must follow the rounded FNumber as 0.3333333333:\n{n}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_fnumber_roundfloat10_exponent_token_is_emitted_verbatim() {
+  // The TERMINAL precision case (#154 Codex [medium]): a `RoundFloat(num/denom, 10)`
+  // whose magnitude is below 1e-4 renders in SCIENTIFIC notation — ExifTool's `%g`
+  // emits a 2-digit signed exponent (`format_g(_, 10)`), so a tiny `1/100000` has
+  // `$val` `1e-05` and `1/30000` has `0.00003333333333` rounded to `3.333333333e-05`.
+  // The `-n`/Composite ValueConv view must emit that exact `$val` LEXEME — emitting
+  // the float instead, then re-rendering it, DIVERGES (serde_json/Ryū renders the
+  // f64 as `0.00001` for `1e-05`, and `1e-6` for `1/1000000` whose `$val` is
+  // `1e-06`). All tokens below were captured from bundled ExifTool 13.59
+  // (`-G1 -j`/`-n` on the crafted FNumber).
+  for (num, denom, n_token, j_fnumber, j_aperture) in [
+    // 1/100000 = 1e-5: $val "1e-05"; %.1f of 1e-05 = "0.0"; PrintFNumber = "0.00".
+    (1u32, 100_000u32, "1e-05", "0.0", "0.00"),
+    // 1/1000000 = 1e-6: $val "1e-06" (NOT Ryū's "1e-6").
+    (1, 1_000_000, "1e-06", "0.0", "0.00"),
+    // 1/30000 = RoundFloat(_,10) "3.333333333e-05" (NOT Ryū's "0.00003333333333").
+    (1, 30_000, "3.333333333e-05", "0.0", "0.00"),
+  ] {
+    let data = pentaxjunk2_avi_fnumber(num, denom);
+    let n = extract_info("pj2.avi", &data, false);
+    assert!(
+      n.contains(&format!("\"Pentax:FNumber\":{n_token},")),
+      "{num}/{denom} -n FNumber must be the verbatim RoundFloat(_,10) exponent token {n_token} (NOT a float re-render):\n{n}"
+    );
+    assert!(
+      n.contains(&format!("\"Composite:Aperture\":{n_token},")),
+      "{num}/{denom} -n Composite:Aperture must follow the FNumber lexeme as {n_token}:\n{n}"
+    );
+    let j = extract_info("pj2.avi", &data, true);
+    assert!(
+      j.contains(&format!("\"Pentax:FNumber\":{j_fnumber},")),
+      "{num}/{denom} -j FNumber must be %.1f of the value = {j_fnumber}:\n{j}"
+    );
+    assert!(
+      j.contains(&format!("\"Composite:Aperture\":{j_aperture},")),
+      "{num}/{denom} -j Composite:Aperture must be PrintFNumber of the operand = {j_aperture}:\n{j}"
+    );
+  }
+}
+
+/// Build a minimal `PentaxJunk2` AVI whose `Make` (`string[24]` @ 0x12) carries
+/// the raw bytes `make_bytes` (caller supplies any embedded NUL); `FNumber` is a
+/// benign `28/10`. Used to pin ExifTool's `string`-format first-NUL truncation.
+fn pentaxjunk2_avi_make_bytes(make_bytes: &[u8]) -> Vec<u8> {
+  let mut payload = vec![0u8; 0x66];
+  payload[0..18].copy_from_slice(b"PENTDigital Camera");
+  let n = make_bytes.len().min(24);
+  payload[0x12..0x12 + n].copy_from_slice(&make_bytes[..n]);
+  payload[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+  payload[0x5e..0x5e + 4].copy_from_slice(&28u32.to_le_bytes());
+  payload[0x5e + 4..0x5e + 8].copy_from_slice(&10u32.to_le_bytes());
+  riff_avi_with_junk(&payload)
+}
+
+#[test]
+fn pentaxjunk2_string_field_truncates_at_embedded_nul() {
+  // ExifTool's `string` format truncates at the FIRST NUL (`$val =~ s/\0.*//s`,
+  // ExifTool.pm:6311) — a `string[24]` `Make` of `PEN\0TRAILING!` reads `"PEN"`,
+  // the post-NUL bytes DROPPED (NOT retained, and NOT just trailing-NUL trimmed).
+  // bundled `-j` `Pentax:Make` = `"PEN"`.
+  let data = pentaxjunk2_avi_make_bytes(b"PEN\x00TRAILING!");
+  let got = extract_info("pj2.avi", &data, true);
+  assert!(
+    got.contains("\"Pentax:Make\":\"PEN\","),
+    "a string[24] Make must truncate at the embedded NUL to \"PEN\":\n{got}"
+  );
+  // The post-NUL text must NOT leak into the value.
+  assert!(
+    !got.contains("TRAILING"),
+    "bytes after the embedded NUL must be dropped:\n{got}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_repeated_junk_is_first_wins_in_exifast() {
+  // DIVERGENCE NOTE (separate from the #154 FNumber finding): with TWO
+  // `PentaxJunk2` chunks, bundled ExifTool is LAST-wins (the later chunk's
+  // `Make`/`FNumber`/… override via the TagMap), whereas exifast's JUNK dispatch
+  // captures the FIRST matching Pentax `JUNK` (`pentax_junk.is_none()`,
+  // riff.rs:1353) and IGNORES the rest. This test pins exifast's CURRENT
+  // first-wins behavior (the first chunk's `FNumber 2.8` survives); reconciling
+  // the JUNK-dispatch ordering with bundled's last-wins is a distinct change to
+  // the capture path, tracked outside this FNumber fix.
+  let first = {
+    let mut p = vec![0u8; 0x66];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    p[0x12..0x12 + 6].copy_from_slice(b"PENTAX");
+    p[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+    p[0x5e..0x5e + 4].copy_from_slice(&28u32.to_le_bytes());
+    p[0x5e + 4..0x5e + 8].copy_from_slice(&10u32.to_le_bytes());
+    p
+  };
+  let second = {
+    let mut p = vec![0u8; 0x66];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    p[0x12..0x12 + 6].copy_from_slice(b"RICOH ");
+    p[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+    p[0x5e..0x5e + 4].copy_from_slice(&50u32.to_le_bytes());
+    p[0x5e + 4..0x5e + 8].copy_from_slice(&10u32.to_le_bytes());
+    p
+  };
+  // Two JUNK chunks back to back inside the AVI body.
+  let mut avih = Vec::new();
+  for v in [41666u32, 0, 0, 0x10, 10, 0, 1, 0, 320, 240, 0, 0, 0, 0] {
+    avih.extend_from_slice(&v.to_le_bytes());
+  }
+  let mut hdrl = Vec::from(*b"hdrl");
+  hdrl.extend_from_slice(&wav_chunk(b"avih", &avih));
+  let lst = wav_chunk(b"LIST", &hdrl);
+  let mut body = Vec::from(*b"AVI ");
+  body.extend_from_slice(&lst);
+  body.extend_from_slice(&wav_chunk(b"JUNK", &first));
+  body.extend_from_slice(&wav_chunk(b"JUNK", &second));
+  let mut data = Vec::from(*b"RIFF");
+  data.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+  data.extend_from_slice(&body);
+  let got = extract_info("pj2dup.avi", &data, true);
+  // exifast first-wins: the FIRST chunk's 2.8 / PENTAX survive.
+  assert!(
+    got.contains("\"Pentax:FNumber\":2.8,"),
+    "exifast captures the first PentaxJunk2 (FNumber 2.8):\n{got}"
+  );
+  assert!(
+    got.contains("\"Pentax:Make\":\"PENTAX\","),
+    "exifast captures the first PentaxJunk2 (Make PENTAX):\n{got}"
+  );
+}

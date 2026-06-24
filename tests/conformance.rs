@@ -343,6 +343,41 @@ fn riff_avi_conformance() {
 }
 
 #[test]
+fn riff_junk_conformance() {
+  // The ported `%Main` `JUNK` Condition subset (RIFF.pm:442-492, #154), each on
+  // a HAND-CRAFTED minimal AVI (a `RIFF`/`AVI ` + `LIST_hdrl`/`avih` + a single
+  // `JUNK` chunk) — every fixture's bundled `-G1 -j` output is oracle-confirmed
+  // to carry ONLY File:/RIFF:/Pentax: + the ported Composites
+  // (ImageSize/Megapixels/Duration, which exifast emits byte-exact).
+  //
+  // `AVI_textjunk.avi` — `TextJunk` (RIFF.pm:488-491). The JUNK payload
+  // "Hello RIFF Junk Text\0\0\0\0" matches the ASCII-only RawConv
+  // `/^([^\0-\x1f\x7f-\xff]+)\0*$/`, so `$1` ("Hello RIFF Junk Text") emits as
+  // `RIFF:TextJunk`.
+  check("AVI_textjunk.avi", "AVI_textjunk.avi.json", true);
+  check("AVI_textjunk.avi", "AVI_textjunk.avi.n.json", false);
+
+  // `AVI_pentaxjunk.avi` — `PentaxJunk` (Optio RS1000, RIFF.pm:469-473 →
+  // `%Pentax::Junk`, `Pentax.pm:6409-6418`). The `^IIII\x01\0`-tagged JUNK emits
+  // its single `Model` `string[32]` @ 0x0c ("Optio RS1000") under
+  // `MakerNotes:Pentax:Model`.
+  check("AVI_pentaxjunk.avi", "AVI_pentaxjunk.avi.json", true);
+  check("AVI_pentaxjunk.avi", "AVI_pentaxjunk.avi.n.json", false);
+
+  // `AVI_pentaxjunk2.avi` — `PentaxJunk2` (Optio RZ18, RIFF.pm:474-478 →
+  // `%Pentax::Junk2`, `Pentax.pm:6610-6658`). The `^PENTDigital Camera`-tagged
+  // JUNK emits `Pentax:Make`/`Model`/`FNumber` (rational64u 28/10 → 2.8, the
+  // `%.1f` PrintConv)/`DateTime1`/`DateTime2` (the 0x12b+ thumbnail leaves are
+  // out of range for this minimal chunk). The engine's EXIF Composite post-pass
+  // resolves `FNumber` from the `MakerNotes:Pentax:FNumber` ingredient and
+  // builds `Composite:Aperture` = 2.8 byte-exact vs bundled — so it is KEPT
+  // (plain `check`, no exclusion), alongside the ported
+  // ImageSize/Megapixels/Duration.
+  check("AVI_pentaxjunk2.avi", "AVI_pentaxjunk2.avi.json", true);
+  check("AVI_pentaxjunk2.avi", "AVI_pentaxjunk2.avi.n.json", false);
+}
+
+#[test]
 fn riff_wav_extensible_encoding_conformance() {
   // Finding 1 (full `%audioEncoding`, RIFF.pm:90-335). A crafted WAV whose
   // `fmt ` Encoding is `0xfffe` = `WAVE_FORMAT_EXTENSIBLE` (RIFF.pm:333) —
