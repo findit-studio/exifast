@@ -74,7 +74,9 @@
 use std::{string::String, vec::Vec};
 
 use super::ifd::{ByteOrder, get_u16};
-use super::{ExifEntry, ExifMeta, MakerNote, SofInfo, parse_exif_block_with_base};
+use super::{
+  DeferredKind, DeferredSubdir, ExifEntry, ExifMeta, MakerNote, SofInfo, parse_exif_block_with_base,
+};
 
 /// The 6-byte Exif `APP1` header — bundled `$exifAPP1hdr = "Exif\0\0"`
 /// (`ExifTool.pm:1239`). Stripped before the TIFF block (`DirStart(…,
@@ -226,6 +228,17 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // the MakerNote for JPEGs exactly as for a standalone TIFF (the seam #75+
   // consume). First-wins matches bundled keeping the PRIMARY MakerNote.
   let mut maker_note: Option<MakerNote<'_>> = None;
+  // The deferred ExifIFD SubDirectory position records (#176) of the block whose
+  // MakerNote was kept (first-wins) — adopted ATOMICALLY with that MakerNote in
+  // `merge_exif_block` so they describe the SAME block's emitted ExifIFD region.
+  let mut deferred_subdirs: Vec<DeferredSubdir> = Vec::new();
+  // The source-block ordinal handed to `merge_exif_block` — the index of each
+  // independent `APP1` Exif block that PARSES (0 for the first, 1 for the next,
+  // …), used to re-stamp that block's entries + deferred records so the
+  // MakerNote splice ties to the correct block. Bumped per successful merge; a
+  // malformed / skipped `APP1` does NOT consume an ordinal (it contributes no
+  // entries). The common single-`APP1` JPEG never advances past 0.
+  let mut next_exif_block: u32 = 0;
   // The PrintIM versions (IFD0 `0xc4a5`) accumulated across the merged `APP1`
   // Exif blocks — a JPEG carries its PrintIM in the `APP1` Exif block's IFD0, so
   // the merge must preserve it (the engine emits `PrintIM:PrintIMVersion`).
@@ -502,8 +515,14 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
             &mut byte_order,
             &mut maker_note,
             &mut printim_versions,
+            &mut deferred_subdirs,
+            next_exif_block,
             exif,
           );
+          // This `APP1` Exif block parsed and merged — advance the source-block
+          // ordinal so the NEXT parsed block (a multi-`APP1` JPEG) re-stamps its
+          // entries/records distinctly.
+          next_exif_block += 1;
         }
         // `parse_exif_block_with_base` also returns `None` for a BigTIFF (0x2b)
         // header — a clean, deliberate no-Exif skip (bundled SUPPORTS BigTIFF, so
@@ -549,6 +568,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     byte_order,
     maker_note,
     printim_versions,
+    deferred_subdirs,
   );
   // The JPEG auxiliary `APP`-segment tags: JFIF (`APP0`), MPF (`APP2`) and the
   // DJI thermal arms (`APP3`/`APP4`/`APP5`/`APP7`). Decoded for BOTH print-conv
@@ -1167,6 +1187,24 @@ fn is_multisegment_chain(data: &[u8], segments: &[Segment], i: usize) -> bool {
 /// JPEG carrier). The `'a` lifetime flows from the block (which borrows the
 /// JPEG input) through to the accumulator, so the merged `MakerNote` is the
 /// borrow of the original input bytes.
+///
+/// `block_ordinal` is this block's source index in the merge (0 for the first
+/// `APP1` Exif block, 1 for the next, …). Every one of the block's entries is
+/// re-stamped with it ([`ExifEntry::set_source_block`]) so a later
+/// [`ExifMeta::push_exif_tags`] can scope the MakerNote splice to the entries of
+/// the block whose MakerNote it kept — `IfdKind` + block-relative `ifd_start`
+/// alone cannot tell two `APP1` blocks' identically-laid-out ExifIFDs apart.
+///
+/// The deferred-subdir records (#176) and the MakerNote are adopted TOGETHER,
+/// ATOMICALLY: the block that wins the first-wins MakerNote ALSO contributes its
+/// deferred records (re-stamped with `block_ordinal`), so the records the
+/// emitter uses for the splice describe the SAME block's ExifIFD region. A block
+/// with only a `0xa005` InteropIFD and NO MakerNote does NOT seed the
+/// JPEG-level `deferred_subdirs` (those records would describe a region whose
+/// MakerNote was never kept — the cross-block mismatch that fell back to an
+/// end-append / spliced into the wrong ExifIFD run). Records are consumed by
+/// `push_exif_tags` ONLY when a MakerNote was kept, so a no-MakerNote JPEG needs
+/// none.
 fn merge_exif_block<'a>(
   entries: &mut Vec<ExifEntry>,
   warnings: &mut Vec<String>,
@@ -1174,23 +1212,64 @@ fn merge_exif_block<'a>(
   byte_order: &mut Option<ByteOrder>,
   maker_note: &mut Option<MakerNote<'a>>,
   printim_versions: &mut Vec<smol_str::SmolStr>,
+  deferred_subdirs: &mut Vec<DeferredSubdir>,
+  block_ordinal: u32,
   block: ExifMeta<'a>,
 ) {
   let (
-    block_entries,
+    mut block_entries,
     block_warnings,
     block_warnings_ignorable,
     block_order,
     block_maker_note,
     block_printim_versions,
+    mut block_deferred_subdirs,
   ) = block.into_jpeg_parts();
   if byte_order.is_none() {
     *byte_order = block_order;
   }
+  // Tie this block's entries to its source ordinal so `push_exif_tags` can scope
+  // the MakerNote splice to the right block (the first block keeps the walker's
+  // `0`; later blocks are re-stamped here).
+  if block_ordinal != 0 {
+    for e in &mut block_entries {
+      e.set_source_block(block_ordinal);
+    }
+  }
   // First captured MakerNote wins (the primary — faithful to ExifTool keeping
-  // the first/primary MakerNote across the merged segments).
-  if maker_note.is_none() {
+  // the first/primary MakerNote across the merged segments). Adopt the block's
+  // deferred-subdir records ATOMICALLY with its MakerNote: the records must
+  // describe the SAME ExifIFD region as the kept MakerNote, so they are taken
+  // from — and only from — the block that wins the MakerNote, re-stamped with
+  // its ordinal. (A block whose MakerNote loses, or an Interop-only block with
+  // no MakerNote, contributes no JPEG-level deferred records: those would
+  // mis-describe the spliced region. `push_exif_tags` reads the records only
+  // when a MakerNote is present, so the no-MakerNote case needs none.)
+  if maker_note.is_none() && block_maker_note.is_some() {
     *maker_note = block_maker_note;
+    // The MERGED entry base: the count of all PRIOR blocks' entries already in
+    // `entries` (this block's entries are appended just below, AFTER it). The
+    // block's `ExifIfdAnchor.dispatch_index` is a block-LOCAL `self.entries.len()`
+    // captured while parsing this block in isolation, so the block's ExifIFD
+    // content begins at `base + dispatch_index` in the merged `entries` —
+    // rebase the anchor to that GLOBAL index so `push_exif_tags`'s empty-parent
+    // splice lands in the right block (#176-B). The block-relative
+    // `parent_ifd_start` / `subdir_ifd_start` are BYTE OFFSETS into the block's
+    // TIFF (matched only within the same `source_block`), NOT entry indices, so
+    // they are NOT rebased — only `dispatch_index` (an `entries` index) is. The
+    // first/only block has `base == 0` (a no-op). Done together with the
+    // `source_block` re-stamp so the adopted records carry BOTH this block's
+    // identity AND its merged-stream anchor.
+    let merged_base = entries.len();
+    for d in &mut block_deferred_subdirs {
+      if block_ordinal != 0 {
+        d.set_source_block(block_ordinal);
+      }
+      if matches!(d.kind(), DeferredKind::ExifIfdAnchor) {
+        d.rebase_dispatch_index(merged_base);
+      }
+    }
+    *deferred_subdirs = block_deferred_subdirs;
   }
   entries.extend(block_entries);
   warnings.extend(block_warnings);
