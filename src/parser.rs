@@ -104,7 +104,13 @@ struct FileTypeTriplet {
 /// value — e.g. a `.crw`-named TIFF resolves to `"TIFF"` here (CRW's base module
 /// is `CanonRaw`, not TIFF, and `"CRW"` has no `RAW` substring — see
 /// [`finalized_tiff_file_type`]), never `"CRW"`.
-fn resolved_file_type_name<'a>(
+///
+/// `pub(crate)` so the PNG walker ([`crate::formats::png`]) can apply the SAME
+/// extension-derived `SetFileType` resolution to the firing-point `$$et{FileType}`
+/// of its `Text/EXIF chunk(s) found after <FileType> IDAT` warning — a `.apng`
+/// PNG-signature file is promoted `PNG → APNG` by this exact rule BEFORE the
+/// chunk walk (ExifTool.pm:9686-9692), independently of any `acTL` override.
+pub(crate) fn resolved_file_type_name<'a>(
   base_type: &'a str,
   file_type: Option<&'a str>,
   ext: Option<&'a str>,
@@ -898,6 +904,68 @@ fn extract_info_typed(
               &mut obj,
               "File:MIMEType".into(),
               Value::String(payload.mime().to_string()),
+            );
+          }
+        }
+        FileTypeFinalize::DetectedThenOverrideWithExt(payload) => {
+          // SetFileType() (detected) then OverrideFileType($file_type, undef,
+          // $ext) — an EXPLICIT `$normExt` but a TABLE-derived MIME (animated
+          // PNG: `OverrideFileType("APNG", undef, "PNG")`, PNG.pm:776).
+          //
+          // `OverrideFileType` is GUARDED by `$fileType ne $$self{VALUE}{FileType}`
+          // (ExifTool.pm:9726): it fires ONLY when the override type DIFFERS from
+          // the type `SetFileType` already produced. For a PNG-signature file
+          // `SetFileType` resolves `PNG` (the detected candidate), so `APNG ne
+          // PNG` ⇒ the override fires: FileType → `APNG`, FileTypeExtension →
+          // `uc $ext` (the EXPLICIT `"PNG"` arg, `png`/`PNG`, since `APNG` has no
+          // `%fileTypeExt` entry — a table lookup would wrongly yield `apng`),
+          // and the MIME → `%mimeType{APNG}` (`image/apng`; the 2nd
+          // `OverrideFileType` arg is `undef`, so the table IS consulted,
+          // ExifTool.pm:9734). When the detected type already equals the override
+          // (a hypothetical `.apng`-resolved input), the guard is FALSE ⇒ no-op,
+          // and the base triplet stands.
+          let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+          if base.file_type == payload.file_type() {
+            // `$fileType ne $$self{VALUE}{FileType}` FALSE ⇒ no override.
+            insert(
+              &mut obj,
+              "File:FileType".into(),
+              Value::String(base.file_type),
+            );
+            insert(
+              &mut obj,
+              "File:FileTypeExtension".into(),
+              serde_json::to_value(&base.file_type_extension).unwrap_or(Value::Null),
+            );
+            insert(
+              &mut obj,
+              "File:MIMEType".into(),
+              Value::String(base.mime_type),
+            );
+          } else {
+            // Override fires: FileType from the override type; FileTypeExtension
+            // from the EXPLICIT `$ext` arg (`uc`, then `lc` under PrintConv);
+            // MIME from the `%mimeType` table lookup of the override type
+            // (`undef` 2nd arg ⇒ table consulted). Fall back to the base MIME
+            // when the override type has no table entry (defensive — `APNG` does
+            // have `image/apng`).
+            let (ov_ft, _ov_ext, ov_mime) =
+              resolve_override_file_type(payload.file_type(), print_conv_enabled);
+            let ov_ext = apply(
+              &FILE_TYPE_EXT,
+              &TagValue::Str(payload.ext().to_uppercase().into()),
+              print_conv_enabled,
+            );
+            insert(&mut obj, "File:FileType".into(), Value::String(ov_ft));
+            insert(
+              &mut obj,
+              "File:FileTypeExtension".into(),
+              serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
+            );
+            insert(
+              &mut obj,
+              "File:MIMEType".into(),
+              Value::String(ov_mime.unwrap_or(base.mime_type)),
             );
           }
         }

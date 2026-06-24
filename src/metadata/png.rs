@@ -609,6 +609,27 @@ pub struct PngMeta<'a> {
   filter: Option<u8>,
   /// `IHDR.Interlace` (`PNG.pm:419-422`). `0` = Noninterlaced, `1` = Adam7.
   interlace: Option<u8>,
+  // ----- acTL (animated PNG, PNG.pm:302-307 + sub-table PNG.pm:766-782) --
+  /// `acTL.AnimationFrames` (`AnimationControl` tag 0, `int32u`,
+  /// `PNG.pm:774-777`) — the APNG `num_frames`. Its RawConv
+  /// (`$self->OverrideFileType("APNG", undef, "PNG"); $val`) emits the value
+  /// UNCHANGED but, as a side effect, promotes `File:FileType` to `APNG`
+  /// (driven by [`Self::is_apng`]). PER-GROUP ([`ActlValues`]): a pre-`IEND`
+  /// `acTL` (→ `PNG:AnimationFrames`) and a post-`IEND` trailer `acTL`
+  /// (→ `Trailer:AnimationFrames`, `PNG.pm:1484`) are kept SEPARATELY so a
+  /// trailer-only frame count does not re-group the main one (and vice-versa);
+  /// each occurrence emits under its OWN family-1 group (oracle-verified vs
+  /// 13.59). All-`None` when no `acTL` chunk was seen.
+  animation_frames: ActlValues,
+  /// `acTL.AnimationPlays` (`AnimationControl` tag 1, `int32u`,
+  /// `PNG.pm:778-781`) — the APNG `num_plays`. The raw value is stored; the
+  /// PrintConv `$val || "inf"` (`0` ⇒ `"inf"`) is applied at emission. PER-GROUP
+  /// ([`ActlValues`]): kept SEPARATELY from `AnimationFrames`'s provenance — a
+  /// 4-to-7-byte trailer `acTL` carries only `AnimationFrames` (bytes `4..8`
+  /// absent), so its `trailer` slot stays `None` and the main
+  /// `PNG:AnimationPlays` is NOT re-grouped to `Trailer`. All-`None` when no
+  /// `acTL` chunk supplied bytes `4..8`.
+  animation_plays: ActlValues,
   // ----- iDOT (PNG.pm:331-342) -----------------------------------------
   /// `iDOT.AppleDataOffsets` — Apple's private "data offsets" chunk
   /// (`Name => 'AppleDataOffsets', Binary => 1`, NO SubDirectory). Only the
@@ -857,6 +878,70 @@ impl BinaryChunkLengths {
   }
 }
 
+/// One `acTL` sub-table field's value (`AnimationFrames` OR `AnimationPlays`)
+/// split BY FAMILY-1 GROUP — a pre-`IEND` occurrence (`main`, emitted under the
+/// `PNG` group) and a post-`IEND` TRAILER occurrence (`trailer`, emitted under
+/// the `Trailer` group, `PNG.pm:1484`). The SAME per-field-provenance shape as
+/// [`BinaryChunkLengths`] (iDOT/gdAT), applied PER acTL FIELD because the two
+/// fields are extracted INDEPENDENTLY by `ProcessBinaryData` (each iff its
+/// `offset+size` is within the chunk length): a 4-to-7-byte trailer `acTL`
+/// supplies `AnimationFrames` (bytes `0..4`) but NOT `AnimationPlays` (bytes
+/// `4..8`), so `AnimationFrames.trailer` is `Some` while `AnimationPlays.trailer`
+/// stays `None`. A single shared trailing flag would have re-grouped the main
+/// `AnimationPlays` to `Trailer` and fabricated a `Trailer:AnimationPlays` that
+/// did not exist in the trailer chunk; separate slots keep each field's group
+/// faithful (oracle-verified vs ExifTool 13.59). Each slot is last-wins (a
+/// repeated `acTL` within the same region overwrites, matching the singleton
+/// TagMap key). `main == trailer == None` when the field was never extracted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ActlValues {
+  /// Value of the pre-`IEND` occurrence — emitted under the `PNG` family-1
+  /// group. Last-wins on a repeated pre-`IEND` `acTL`.
+  main: Option<u32>,
+  /// Value of the post-`IEND` TRAILER occurrence — emitted under the `Trailer`
+  /// family-1 group (`PNG.pm:1484`). Last-wins on a repeated post-`IEND` `acTL`.
+  trailer: Option<u32>,
+}
+
+impl ActlValues {
+  /// An empty pair — neither a pre- nor a post-`IEND` occurrence of this acTL
+  /// field seen.
+  #[inline(always)]
+  #[must_use]
+  const fn new() -> Self {
+    Self {
+      main: None,
+      trailer: None,
+    }
+  }
+
+  /// Record one occurrence's `value`, routed to the `trailer` slot when the
+  /// `acTL` chunk was parsed in post-`IEND` TRAILER mode (`trailing == true`,
+  /// `PNG.pm:1484`) and the `main` slot otherwise. Last-wins within the slot.
+  #[inline(always)]
+  fn set(&mut self, value: u32, trailing: bool) {
+    if trailing {
+      self.trailer = Some(value);
+    } else {
+      self.main = Some(value);
+    }
+  }
+
+  /// The pre-`IEND` (`PNG:`-group) occurrence value, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn main(&self) -> Option<u32> {
+    self.main
+  }
+
+  /// The post-`IEND` (`Trailer:`-group) occurrence value, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn trailer(&self) -> Option<u32> {
+    self.trailer
+  }
+}
+
 /// Which structural single-value PNG chunks (the [`PngMeta`] singleton fields)
 /// were last set from a post-`IEND` TRAILER chunk and so carry the `Trailer`
 /// family-1 group override. All-`false` for a standard (IEND-last) PNG.
@@ -896,6 +981,8 @@ impl PngMeta<'_> {
       compression: None,
       filter: None,
       interlace: None,
+      animation_frames: ActlValues::new(),
+      animation_plays: ActlValues::new(),
       apple_data_offsets: BinaryChunkLengths::new(),
       gain_map_image: BinaryChunkLengths::new(),
       pixels_per_unit_x: None,
@@ -990,6 +1077,61 @@ impl PngMeta<'_> {
   #[must_use]
   pub const fn interlace(&self) -> Option<u8> {
     self.interlace
+  }
+
+  // ===== acTL accessors =================================================
+
+  /// `acTL.AnimationFrames` from the MAIN (pre-`IEND`) `acTL` chunk
+  /// (`PNG:AnimationFrames`, `AnimationControl` tag 0, `PNG.pm:774-777`).
+  /// `None` when no pre-`IEND` `acTL` supplied bytes `0..4`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn animation_frames_main(&self) -> Option<u32> {
+    self.animation_frames.main()
+  }
+
+  /// `acTL.AnimationFrames` from the post-`IEND` TRAILER `acTL` chunk
+  /// (`Trailer:AnimationFrames`, parsed while `SET_GROUP1 = 'Trailer'`,
+  /// `PNG.pm:1484`). `None` when no post-`IEND` `acTL` supplied bytes `0..4`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn animation_frames_trailer(&self) -> Option<u32> {
+    self.animation_frames.trailer()
+  }
+
+  /// `acTL.AnimationPlays` from the MAIN (pre-`IEND`) `acTL` chunk
+  /// (`PNG:AnimationPlays`, `AnimationControl` tag 1, `PNG.pm:778-781`), the
+  /// RAW value (`0` ⇒ infinite). The `$val || "inf"` PrintConv is applied at
+  /// emission. `None` when no pre-`IEND` `acTL` supplied bytes `4..8`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn animation_plays_main(&self) -> Option<u32> {
+    self.animation_plays.main()
+  }
+
+  /// `acTL.AnimationPlays` from the post-`IEND` TRAILER `acTL` chunk
+  /// (`Trailer:AnimationPlays`, parsed while `SET_GROUP1 = 'Trailer'`,
+  /// `PNG.pm:1484`), the RAW value. `None` when no post-`IEND` `acTL` supplied
+  /// bytes `4..8` — e.g. a runt 4-to-7-byte trailer `acTL` leaves this `None`
+  /// so the main `PNG:AnimationPlays` is NOT re-grouped to `Trailer`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn animation_plays_trailer(&self) -> Option<u32> {
+    self.animation_plays.trailer()
+  }
+
+  /// Whether this PNG is an ANIMATED PNG — i.e. carried an `acTL` chunk (so
+  /// `AnimationFrames` was decoded in EITHER region). Drives the `File:FileType`
+  /// promotion to `APNG`: bundled's `AnimationFrames` RawConv calls
+  /// `$self->OverrideFileType("APNG", undef, "PNG")` (`PNG.pm:776`), so the
+  /// override fires whenever the `acTL` chunk is present, regardless of the
+  /// frame count's value. Keyed on `AnimationFrames` (tag 0) because that is
+  /// the tag whose RawConv runs the override; either a pre-`IEND` or a
+  /// post-`IEND` `acTL` arms it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_apng(&self) -> bool {
+    self.animation_frames.main().is_some() || self.animation_frames.trailer().is_some()
   }
 
   // ===== pHYs accessors =================================================
@@ -1194,6 +1336,31 @@ impl PngMeta<'_> {
     self.pixels_per_unit_y = Some(ppu_y);
     self.pixel_units = Some(units);
     self.structural_trailing.phys = self.in_trailer;
+  }
+
+  /// Set the acTL `AnimationFrames` value — `AnimationControl` tag 0
+  /// (`int32u` at offset 0, `PNG.pm:774-777`). `ProcessBinaryData` extracts
+  /// this independently of `AnimationPlays` (each field emits IFF its
+  /// `offset+size` is within the chunk length), so a runt 4-to-7-byte acTL
+  /// still produces `AnimationFrames`. It triggers the `File:FileType` → `APNG`
+  /// promotion ([`Self::is_apng`]) via its RawConv side effect. Routed to the
+  /// pre-`IEND` (`PNG:`) or post-`IEND` (`Trailer:`) slot per the current
+  /// [`Self::begin_trailer`] state (`PNG.pm:1484`) — kept SEPARATELY from
+  /// `AnimationPlays` so a trailer-only `acTL` does not re-group the main play
+  /// count; last-wins WITHIN each region.
+  pub(crate) fn set_animation_frames(&mut self, num_frames: u32) {
+    self.animation_frames.set(num_frames, self.in_trailer);
+  }
+
+  /// Set the acTL `AnimationPlays` value — `AnimationControl` tag 1 (`int32u`
+  /// at offset 4, `PNG.pm:778-781`), extracted by `ProcessBinaryData` only when
+  /// the chunk holds the full bytes `4..8`. Stored raw; the PrintConv
+  /// `$val || "inf"` (`0` ⇒ `"inf"`) is applied at emission. Routed to the
+  /// pre-`IEND` (`PNG:`) or post-`IEND` (`Trailer:`) slot per the current
+  /// [`Self::begin_trailer`] state (`PNG.pm:1484`), independently of
+  /// `AnimationFrames`'s provenance; last-wins WITHIN each region.
+  pub(crate) fn set_animation_plays(&mut self, num_plays: u32) {
+    self.animation_plays.set(num_plays, self.in_trailer);
   }
 
   /// Record the Apple `iDOT` chunk's payload LENGTH (`AppleDataOffsets`,

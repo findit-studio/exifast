@@ -11891,6 +11891,30 @@ fn png_gdat_main_trailer_conformance() {
   check("PNG_gdat_trailer.png", "PNG_gdat_trailer.png.n.json", false);
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_apng_conformance() {
+  // #141 — the animated-PNG `acTL` Animation Control chunk (`PNG.pm:302-307`),
+  // whose SubDirectory is the `AnimationControl` `ProcessBinaryData` table
+  // (`PNG.pm:766-782`, `FORMAT => 'int32u'`): `AnimationFrames` (tag 0,
+  // `num_frames`) + `AnimationPlays` (tag 1, `num_plays`, `PrintConv => '$val
+  // || "inf"'` so a `0` play count renders as `"inf"` under `-j` and the raw
+  // `0` under `-n`). `AnimationFrames`'s RawConv calls `OverrideFileType("APNG",
+  // undef, "PNG")` (`PNG.pm:776`), promoting `File:FileType` → `APNG`,
+  // `MIMEType` → `image/apng` (the `%mimeType{APNG}` lookup), and
+  // `FileTypeExtension` → the EXPLICIT `"PNG"` arg (`png`/`PNG`) since `APNG`
+  // has no `%fileTypeExt` entry. The `fcTL`/`fdAT` per-frame chunks have NO
+  // bundled table (`PNG.pm:329-330` is comment-only), so the APNG metadata is
+  // the `acTL` summary alone — verified vs bundled 13.59 (the crafted fixture
+  // carries TWO `fcTL` + one `fdAT` frame, none of which emit any tag). Crafted
+  // minimal 1x1 RGB APNG (`tools/make_apng.py`, valid CRC32 throughout;
+  // `-validate` = OK). PNG is in the Composite allow-list, so the ported
+  // `Composite:ImageSize`/`Megapixels` are compared too (a PLAIN `check`).
+  // Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_apng.png", "PNG_apng.png.json", true);
+  check("PNG_apng.png", "PNG_apng.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

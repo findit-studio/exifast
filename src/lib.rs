@@ -216,7 +216,8 @@ pub use diagnostics::{Diagnose, Diagnostic, Severity};
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use format_parser::Rendered;
 pub use format_parser::{
-  AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, OverrideWithMime, SharedFlags,
+  AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, OverrideWithExt, OverrideWithMime,
+  SharedFlags,
 };
 
 // Per-format parser-handle re-exports. The `ProcessXxx` unit-struct is the

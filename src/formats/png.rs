@@ -256,31 +256,82 @@ impl FormatParser for ProcessPng {
   type Context<'a> = &'a [u8];
 
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    parse_inner(data)
+    // The leaf `FormatParser::parse` Context is the byte slice alone — no
+    // extension channel. The engine dispatch uses the extension-aware
+    // [`parse_with_ext`] instead (see the `AnyParser::Png` arm), so the
+    // `.apng`-extension `PNG → APNG` promotion of the after-IDAT warning's
+    // FileType reaches that path; here it stays `acTL`-driven only.
+    parse_inner(data, None)
   }
 }
 
 /// Lib-first direct entry — parse a whole PNG file buffer into a typed
 /// [`PngMeta`]. Returns `None` ONLY for a non-PNG (signature mismatch).
 ///
+/// The filename/extension is unknown on this direct path, so the firing-point
+/// `$$et{FileType}` of the after-IDAT warning is driven solely by the in-stream
+/// `acTL` override (no extension-derived `PNG → APNG` promotion). Callers that
+/// know the file extension (the engine dispatch) use [`parse_with_ext`].
+///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved).
 pub fn parse_borrowed(data: &[u8]) -> Option<PngMeta<'_>> {
-  parse_inner(data)
+  parse_inner(data, None)
+}
+
+/// Extension-aware entry — parse a whole PNG file buffer, threading the
+/// uppercased dotless file extension (`$$self{FILE_EXT}`) so the after-IDAT
+/// `Text/EXIF chunk(s) found after <FileType> IDAT` warning can reflect the
+/// extension-derived `SetFileType` promotion.
+///
+/// ExifTool runs `SetFileType` BEFORE the chunk walk (ExifTool.pm:9677-9706):
+/// a PNG-signature file named with a PNG-rooted extension takes that sub-type
+/// as `$$et{FileType}` via the `%fileTypeLookup` sub-type-by-extension rule
+/// (`APNG`/`MNG`/`JNG` all map to base module `PNG`, [`crate::filetype_data`])
+/// the instant the type is set, with NO `acTL` required — `.apng`→`APNG`,
+/// `.mng`→`MNG`, `.jng`→`JNG`, else `PNG`. The `acTL` chunk's
+/// `OverrideFileType("APNG", …)` (PNG.pm:776) is a SECOND, in-stream source
+/// that SUPERSEDES the extension with `APNG`. So at the firing point the
+/// warning's FileType is `APNG` iff an `acTL` has already been dispatched,
+/// otherwise the extension-resolved sub-type — exactly what [`parse_inner`]
+/// threads here. `ext` borrows on an independent (elided) lifetime; only
+/// `data` drives the returned Meta.
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved).
+pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
+  parse_inner(data, ext)
 }
 
 /// The chunk walker proper. `PNG.pm:1424` `return 0 unless $raf->Read($sig,8)
 /// == 8 and $pngLookup{$sig}` ⇒ signature mismatch / short read returns
 /// `None`. Otherwise this ALWAYS returns `Some(meta)` (truncations and CRC
 /// failures land as warnings in the [`PngMeta`]).
-fn parse_inner(data: &[u8]) -> Option<PngMeta<'_>> {
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
   // `PNG.pm:1424` signature gate. Checked `.get()`: a too-short buffer makes
   // `.get(..N)` `None` (≠ `Some(sig)`) ⇒ same early-return as the old
   // `data.len() < N` guard ⇒ byte-identical.
   if data.get(..PNG_SIGNATURE.len()) != Some(PNG_SIGNATURE.as_slice()) {
     return None;
   }
+
+  // Extension-derived FileType (ExifTool's `SetFileType` BEFORE the walk,
+  // ExifTool.pm:9677-9706). A PNG-signature file is detected as base type
+  // `PNG`; the sub-type-by-extension rule (ExifTool.pm:9686-9692) then
+  // promotes it to whatever PNG-rooted sub-type the file's extension names —
+  // `.apng`→`APNG`, `.mng`→`MNG`, `.jng`→`JNG` (each row roots to `PNG` in
+  // [`crate::filetype_data`]), or stays `PNG` for `.png`/no ext. `ext` arrives
+  // already uppercased + dotless (`$$self{FILE_EXT}`). This resolved STRING is
+  // the firing-point `$$et{FileType}` the after-IDAT warning interpolates, the
+  // single source of truth (the OTHER source being the `acTL` `OverrideFileType`,
+  // which supersedes it once seen). Storing the full string — not just an
+  // `== "APNG"` bool — closes the warning-FileType-source class for ALL
+  // PNG-rooted extensions at once (oracle-verified vs bundled 13.59: `.png`→
+  // `after PNG IDAT`, `.apng`→`APNG`, `.mng`→`MNG`, `.jng`→`JNG`; an `acTL`
+  // before IDAT overrides any of them → `APNG`).
+  let ext_file_type = crate::parser::resolved_file_type_name("PNG", None, ext);
 
   let mut meta = PngMeta::new();
   // Cursor sits just past the 8-byte signature (`PNG.pm:1424` consumed it).
@@ -428,9 +479,44 @@ fn parse_inner(data: &[u8]) -> Option<PngMeta<'_>> {
     if is_text_chunk(&chunk_type)
       && let Some(was) = was_dat
     {
+      // `$$et{FileType}` interpolates the CURRENT resolved FileType at the
+      // point the warning fires (`PNG.pm:1604`), NOT a fixed `PNG`. That value
+      // has TWO sources:
+      //
+      //   (a) the EXTENSION-derived `SetFileType`, run BEFORE the walk: a
+      //       PNG-signature file named with a PNG-rooted extension takes that
+      //       sub-type as `$$et{FileType}` from the start (ExifTool.pm:9686-9692),
+      //       with NO `acTL` required — `.apng`→`APNG`, `.mng`→`MNG`,
+      //       `.jng`→`JNG`, else `PNG`. `ext_file_type` is that full resolved
+      //       string (computed once at the top via the same
+      //       `resolved_file_type_name` resolution as finalization);
+      //   (b) the `acTL` `AnimationFrames` RawConv (`PNG.pm:776`
+      //       `OverrideFileType("APNG", …)`), which promotes the FileType to
+      //       `APNG` the instant its `acTL` chunk is dispatched (`FoundPNG`,
+      //       `PNG.pm:1653`) — superseding the extension type. An `acTL` SEEN
+      //       EARLIER in the walk (before this IDAT) makes it say `APNG`, while
+      //       an `acTL` that comes AFTER (or is absent) does not. `meta.is_apng()`
+      //       reads that exact walk-time state: `set_animation_frames` ran only
+      //       for an already-dispatched `acTL` (an earlier loop iteration), so a
+      //       post-IDAT `acTL` is not yet reflected — preserving ExifTool's
+      //       firing-point semantics.
+      //
+      // The firing-point FileType is therefore `APNG` when the `acTL` override
+      // has already fired, otherwise the extension-resolved string. Using the
+      // full string — not an `== "APNG"` collapse — closes the
+      // warning-FileType-source class for ALL PNG-rooted extensions
+      // (oracle-verified vs bundled 13.59: `.png`→`PNG`, `.apng`→`APNG`,
+      // `.mng`→`MNG`, `.jng`→`JNG`; `acTL`-before any of them → `APNG`;
+      // `.mng` `acTL`-AFTER → `MNG` at the firing point, even though the final
+      // FileType becomes `APNG`).
+      let file_type = if meta.is_apng() {
+        "APNG"
+      } else {
+        ext_file_type
+      };
       let was_str = was.iter().map(|&b| b as char).collect::<String>();
       let msg = std::format!(
-        "Text/EXIF chunk(s) found after PNG {was_str} (may be ignored by some readers)",
+        "Text/EXIF chunk(s) found after {file_type} {was_str} (may be ignored by some readers)",
       );
       meta.push_warning(msg);
     }
@@ -487,6 +573,8 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"iDOT" => decode_idot(meta, data),
     // ----- gdAT (PNG.pm:374-378) -----------------------------------------
     b"gdAT" => decode_gdat(meta, data),
+    // ----- acTL (PNG.pm:302-307, sub-table :766-782) ---------------------
+    b"acTL" => decode_actl(meta, data),
     // ----- iCCP (PNG.pm:171-181) -----------------------------------------
     b"iCCP" => decode_iccp(meta, data),
     // ----- tEXt / zTXt / iTXt --------------------------------------------
@@ -502,11 +590,13 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"bKGD" => decode_bkgd(meta, data),
     // ----- tIME (PNG.pm:262-275) ----------------------------------------
     b"tIME" => decode_time(meta, data),
-    // Every other chunk is in bundled's table (`acTL`, `cHRM`, `dSIG`, …)
-    // but we DO NOT extract their tags in this Phase-2 port — they are
-    // valid PNG chunks the walker skips silently (`PNG.pm:1657` table
-    // miss). The chunk walker continues to the next chunk; this matches
-    // bundled when the chunk is recognized but has no extractor.
+    // Every other chunk is in bundled's table (`cHRM`, `dSIG`, …) but we DO
+    // NOT extract their tags in this Phase-2 port — they are valid PNG chunks
+    // the walker skips silently (`PNG.pm:1657` table miss). The chunk walker
+    // continues to the next chunk; this matches bundled when the chunk is
+    // recognized but has no extractor. (`fcTL`/`fdAT` are likewise skipped —
+    // bundled has NO table for them, `PNG.pm:329-330` is comment-only — so the
+    // APNG metadata is the `acTL` summary alone, oracle-verified vs 13.59.)
     _ => {}
   }
 }
@@ -625,6 +715,56 @@ fn decode_idot(meta: &mut PngMeta<'_>, data: &[u8]) {
 /// 13.59.
 fn decode_gdat(meta: &mut PngMeta<'_>, data: &[u8]) {
   meta.set_gain_map_image(data.len());
+}
+
+// ===========================================================================
+// acTL decoder — PNG.pm:302-307 + sub-table :766-782
+// ===========================================================================
+
+/// `acTL` decoder — the animated-PNG Animation Control chunk
+/// (`PNG.pm:302-307`), whose SubDirectory is the `AnimationControl`
+/// `ProcessBinaryData` table (`PNG.pm:766-782`, `FORMAT => 'int32u'`):
+///
+/// ```text
+/// 0 => { Name => 'AnimationFrames',
+///        RawConv => '$self->OverrideFileType("APNG", undef, "PNG"); $val' },
+/// 1 => { Name => 'AnimationPlays', PrintConv => '$val || "inf"' },
+/// ```
+///
+/// The chunk payload is two big-endian `int32u`: `num_frames` then
+/// `num_plays` (the APNG spec's acTL layout). `ProcessBinaryData` reads each
+/// field at its `int32u` offset and emits it IFF `offset + size` is within the
+/// chunk length (`ExifTool.pm`: `my $more = $size - $entry; last if $more <=
+/// 0`). So each field is INDEPENDENTLY available:
+///
+/// * bytes `0..4` present (len ≥ 4) ⇒ `AnimationFrames`,
+/// * bytes `4..8` present (len ≥ 8) ⇒ `AnimationPlays`.
+///
+/// A runt 4-to-7-byte acTL therefore emits `AnimationFrames` (and fires the
+/// `APNG` FileType override) but NOT `AnimationPlays`; a `< 4`-byte acTL emits
+/// neither and leaves `File:FileType` as `PNG`. We mirror this per-field with
+/// safe slicing rather than gating both tags on the full 8 bytes (the latter
+/// would wrongly drop the frame count + the `APNG` promotion for a 4-to-7-byte
+/// acTL). Oracle-verified vs bundled 13.59 at 4/7/8-byte (and `< 4`) lengths.
+///
+/// `AnimationFrames`'s RawConv emits the raw `num_frames` value UNCHANGED; its
+/// only side effect is `OverrideFileType("APNG", undef, "PNG")` (`PNG.pm:776`),
+/// modelled by [`PngMeta::is_apng`] driving the `File:FileType` promotion in
+/// the parser — so the override is gated on `AnimationFrames` (len ≥ 4), NOT on
+/// `AnimationPlays`. `AnimationPlays`'s `$val || "inf"` PrintConv (`0` ⇒
+/// `"inf"`) is applied at emission.
+fn decode_actl(meta: &mut PngMeta<'_>, data: &[u8]) {
+  // Per-field `ProcessBinaryData` availability (the #128 MPEG / #149 av1C
+  // class). `AnimationFrames` (offset 0) needs bytes `0..4`; setting it also
+  // arms the `APNG` FileType override ([`PngMeta::is_apng`]). `AnimationPlays`
+  // (offset 4) needs bytes `4..8` and is independent of the frame count — a
+  // 4-to-7-byte acTL omits it.
+  if let Some(&frames) = data.first_chunk::<4>() {
+    meta.set_animation_frames(u32::from_be_bytes(frames));
+  }
+  if let Some(plays) = data.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) {
+    meta.set_animation_plays(u32::from_be_bytes(plays));
+  }
 }
 
 // ===========================================================================
@@ -2211,6 +2351,69 @@ impl crate::emit::Taggable for PngMeta<'_> {
       }
     }
 
+    // ---- acTL sub-table (animated PNG, PNG.pm:766-782) ----------------
+    // `AnimationControl` (`ProcessBinaryData`, `FORMAT => 'int32u'`) emits in
+    // offset order: AnimationFrames (tag 0), AnimationPlays (tag 1). Present
+    // only for an APNG (an `acTL` chunk was seen). `AnimationFrames` is the
+    // raw `num_frames` (its RawConv emits `$val` unchanged; the
+    // `OverrideFileType("APNG", …)` side effect promotes `File:FileType` via
+    // [`PngMeta::is_apng`], applied in the parser). `AnimationPlays` is
+    // `$val || "inf"` (`0` ⇒ `"inf"` under PrintConv; the raw int under `-n`).
+    //
+    // PER-FIELD PROVENANCE (the iDOT/gdAT pattern): each field carries its own
+    // pre-`IEND` (`PNG:`) and post-`IEND` trailer (`Trailer:`, `PNG.pm:1484`)
+    // occurrence. A PNG may carry `acTL` in BOTH regions; bundled emits each
+    // occurrence's fields under its OWN family-1 group. The two fields are
+    // INDEPENDENT — a 4-to-7-byte trailer `acTL` supplies only
+    // `AnimationFrames` (bytes `0..4`), so `Trailer:AnimationFrames` is emitted
+    // while the main `PNG:AnimationPlays` stays under `PNG` (NOT re-grouped to
+    // `Trailer`). Emitted in chunk-walk order: the main pair (Frames, Plays)
+    // then the trailer pair (Frames, Plays). Oracle-verified vs bundled 13.59.
+    //
+    // PNG.pm:780 `PrintConv => '$val || "inf"'` for AnimationPlays — a `0` play
+    // count (the APNG "infinite loop" sentinel) renders as the string `"inf"`
+    // under PrintConv; any non-zero count stays the bare number; `-n` always
+    // emits the raw int.
+    let push_plays = |group: Group, plays: u32, tags: &mut Vec<EmittedTag>| {
+      if print_conv && plays == 0 {
+        tags.push(EmittedTag::new(
+          group,
+          "AnimationPlays".into(),
+          TagValue::Str("inf".into()),
+          false,
+        ));
+      } else {
+        tags.push(EmittedTag::new(
+          group,
+          "AnimationPlays".into(),
+          TagValue::U64(u64::from(plays)),
+          false,
+        ));
+      }
+    };
+    if let Some(frames) = self.animation_frames_main() {
+      tags.push(EmittedTag::new(
+        png_group(false),
+        "AnimationFrames".into(),
+        TagValue::U64(u64::from(frames)),
+        false,
+      ));
+    }
+    if let Some(plays) = self.animation_plays_main() {
+      push_plays(png_group(false), plays, &mut tags);
+    }
+    if let Some(frames) = self.animation_frames_trailer() {
+      tags.push(EmittedTag::new(
+        png_group(true),
+        "AnimationFrames".into(),
+        TagValue::U64(u64::from(frames)),
+        false,
+      ));
+    }
+    if let Some(plays) = self.animation_plays_trailer() {
+      push_plays(png_group(true), plays, &mut tags);
+    }
+
     // ---- iDOT (PNG.pm:331-342) -------------------------------------
     // Apple's `AppleDataOffsets` — `Binary => 1`, NO SubDirectory. Emitted
     // (in chunk-walk order, right after the IHDR sub-table tags) as the
@@ -2552,8 +2755,8 @@ impl crate::emit::Taggable for PngMeta<'_> {
 /// warnings carry the minor flag in `PNG.pm`:
 ///
 /// - `Trailer data after PNG IEND chunk` (`PNG.pm:1481` `$et->Warn(..., 1)`).
-/// - `Text/EXIF chunk(s) found after PNG <chunk> (…)` (`PNG.pm:1604`
-///   `$et->Warn(..., 1)`).
+/// - `Text/EXIF chunk(s) found after <FileType> <chunk> (…)` (`PNG.pm:1604`
+///   `$et->Warn(..., 1)`; `<FileType>` is `PNG` or `APNG`, see the emission).
 /// - `<chunk> chunk should be <std>` (the `%stdCase` case-fix, `PNG.pm:1650`
 ///   `$et->Warn(..., 1)`).
 ///
@@ -2564,7 +2767,13 @@ impl crate::emit::Taggable for PngMeta<'_> {
 /// (no minor flag) ⇒ no prefix. Oracle-confirmed against `perl exiftool` 13.59.
 fn png_warning_is_minor(msg: &str) -> bool {
   msg == "Trailer data after PNG IEND chunk"
-    || (msg.starts_with("Text/EXIF chunk(s) found after PNG ")
+    // `Text/EXIF chunk(s) found after <FileType> <chunk> (…)` (`PNG.pm:1604`).
+    // The `<FileType>` is interpolated from `$$et{FileType}` — `PNG`, or `APNG`
+    // once an `acTL` chunk fired the `AnimationFrames` RawConv override
+    // (`PNG.pm:776`). The minor flag attaches to the whole `Text/EXIF chunk(s)
+    // found after …` warning regardless of which FileType word it carries, so
+    // match the FileType-independent prefix + suffix.
+    || (msg.starts_with("Text/EXIF chunk(s) found after ")
       && msg.ends_with("(may be ignored by some readers)"))
     || msg.ends_with(" chunk should be eXIf")
     || msg.ends_with(" chunk should be zxIf")
@@ -4470,6 +4679,350 @@ mod tests {
         .warnings()
         .iter()
         .any(|w| w.contains("Text/EXIF chunk(s) found after PNG IDAT")),
+    );
+  }
+
+  #[test]
+  fn text_after_idat_with_prior_actl_warns_apng() {
+    // #141: IHDR + acTL(≥4 bytes, sets APNG) + IDAT + tEXt + IEND. The acTL is
+    // dispatched (set_animation_frames → is_apng) BEFORE the post-IDAT tEXt
+    // warning fires, so the warning interpolates the APNG FileType (PNG.pm:1604
+    // `$$et{FileType}`). Oracle-verified vs 13.59 (`found after APNG IDAT`).
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    let mut actl = 2u32.to_be_bytes().to_vec();
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&chunk(b"acTL", &actl));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert!(meta.is_apng(), "acTL should mark APNG");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after APNG IDAT")),
+      "expected APNG-form warning, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after PNG IDAT")),
+      "must not emit the PNG-form warning, got {:?}",
+      meta.warnings(),
+    );
+    // The minor classifier still recognizes the APNG form.
+    let warn = meta
+      .warnings()
+      .iter()
+      .find(|w| w.contains("found after APNG IDAT"))
+      .expect("APNG warning present");
+    assert!(png_warning_is_minor(warn), "APNG form must be minor");
+  }
+
+  #[test]
+  fn text_after_idat_with_actl_after_warns_png_firing_point() {
+    // #141 firing-point: IHDR + IDAT + tEXt + acTL + IEND. The acTL comes AFTER
+    // the post-IDAT tEXt, so set_animation_frames has NOT run when the warning
+    // fires — is_apng() is still false there → the warning says PNG, even though
+    // the final PngMeta IS an APNG. Oracle-verified vs 13.59.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    let mut actl = 2u32.to_be_bytes().to_vec();
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&chunk(b"acTL", &actl));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert!(meta.is_apng(), "the final meta is still an APNG");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after PNG IDAT")),
+      "expected the PNG-form warning at firing point, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after APNG IDAT")),
+      "must not say APNG when acTL fires after the warning, got {:?}",
+      meta.warnings(),
+    );
+  }
+
+  /// IHDR + IDAT + tEXt + IEND named `.apng`, with NO `acTL`. ExifTool's
+  /// `SetFileType` runs BEFORE the chunk walk and promotes the PNG-signature
+  /// file to `$$et{FileType} = APNG` from the `.apng` extension alone
+  /// (ExifTool.pm:9686-9692), so the after-IDAT warning interpolates `APNG`
+  /// even though no `acTL` was ever seen (`is_apng()` stays false). This is the
+  /// EXTENSION-derived source of the firing-point FileType — the path the
+  /// `.png`-named R3 tests never exercised. Oracle-verified vs bundled 13.59
+  /// (`-warning` on a `.apng` with IDAT+tEXt → `found after APNG IDAT`).
+  #[test]
+  fn text_after_idat_apng_extension_no_actl_warns_apng() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    // `$$self{FILE_EXT}` is uppercased + dotless.
+    let meta = parse_with_ext(&bytes, Some("APNG")).expect("png parses");
+    assert!(!meta.is_apng(), "no acTL ⇒ not APNG by the acTL source");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after APNG IDAT")),
+      "extension-derived APNG must reach the warning, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after PNG IDAT")),
+      "must not emit the PNG-form warning for a .apng file, got {:?}",
+      meta.warnings(),
+    );
+    let warn = meta
+      .warnings()
+      .iter()
+      .find(|w| w.contains("found after APNG IDAT"))
+      .expect("APNG warning present");
+    assert!(png_warning_is_minor(warn), "APNG form must be minor");
+  }
+
+  /// IHDR + IDAT + tEXt + acTL + IEND named `.apng`. The `acTL` comes AFTER the
+  /// warning fires (so `is_apng()` is still false at the firing point), yet the
+  /// warning still says `APNG` — because the EXTENSION already resolved the
+  /// FileType to `APNG` before the walk. Confirms the two sources compose: even
+  /// when the `acTL`-derived source has not yet fired, the extension-derived one
+  /// carries the firing-point FileType. Oracle-verified vs bundled 13.59.
+  #[test]
+  fn text_after_idat_apng_extension_actl_after_warns_apng() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    let mut actl = 2u32.to_be_bytes().to_vec();
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&chunk(b"acTL", &actl));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_with_ext(&bytes, Some("APNG")).expect("png parses");
+    assert!(meta.is_apng(), "the final meta is an APNG (acTL seen)");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after APNG IDAT")),
+      "the .apng extension carries APNG even before the late acTL, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after PNG IDAT")),
+      "must not emit the PNG-form warning for a .apng file, got {:?}",
+      meta.warnings(),
+    );
+  }
+
+  /// The negative control via the extension-aware entry: the SAME IDAT+tEXt
+  /// bytes named `.png` (a non-promoting extension) keep the PNG-form warning —
+  /// no `acTL`, no `.apng` ⇒ `$$et{FileType} = PNG`. Guards that threading the
+  /// extension does NOT spuriously upgrade an ordinary PNG. Oracle-verified vs
+  /// bundled 13.59 (`.png` with IDAT+tEXt → `found after PNG IDAT`).
+  #[test]
+  fn text_after_idat_png_extension_no_actl_warns_png() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_with_ext(&bytes, Some("PNG")).expect("png parses");
+    assert!(!meta.is_apng());
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after PNG IDAT")),
+      "a .png extension must keep the PNG-form warning, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after APNG IDAT")),
+      "must not upgrade an ordinary .png to APNG, got {:?}",
+      meta.warnings(),
+    );
+  }
+
+  /// #141 structural close: a PNG-signature file named with a PNG-ROOTED
+  /// extension OTHER than `.apng` (`.mng`/`.jng`, which `%fileTypeLookup` roots
+  /// to base module `PNG`, [`crate::filetype_data`]) makes ExifTool's
+  /// pre-walk `SetFileType` resolve `$$et{FileType}` to that sub-type, so the
+  /// after-IDAT warning interpolates `MNG`/`JNG` — NOT `PNG`. Storing the full
+  /// resolved FileType string (not an `== "APNG"` bool) is what makes the
+  /// warning track the extension for every PNG-rooted type. Oracle-verified vs
+  /// bundled 13.59: a PNG-signature `.mng` with IDAT+tEXt → `found after MNG
+  /// IDAT`; the same bytes `.jng` → `found after JNG IDAT`.
+  #[test]
+  fn text_after_idat_png_rooted_extension_warns_resolved_file_type() {
+    for (ext, expect) in [("MNG", "MNG"), ("JNG", "JNG")] {
+      let mut bytes = Vec::new();
+      bytes.extend_from_slice(PNG_SIGNATURE);
+      let mut ihdr_data = Vec::new();
+      ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+      ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+      ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+      bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+      bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+      bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+      bytes.extend_from_slice(&chunk(b"IEND", &[]));
+      // `$$self{FILE_EXT}` is uppercased + dotless.
+      let meta = parse_with_ext(&bytes, Some(ext)).expect("png parses");
+      assert!(!meta.is_apng(), "{ext}: no acTL ⇒ not APNG");
+      let needle = std::format!("Text/EXIF chunk(s) found after {expect} IDAT");
+      assert!(
+        meta.warnings().iter().any(|w| w.contains(&needle)),
+        "{ext}: expected {needle:?}, got {:?}",
+        meta.warnings(),
+      );
+      // The PNG-collapse bug emitted `after PNG IDAT` for these extensions.
+      assert!(
+        !meta
+          .warnings()
+          .iter()
+          .any(|w| w.contains("found after PNG IDAT")),
+        "{ext}: must not collapse to the PNG-form warning, got {:?}",
+        meta.warnings(),
+      );
+      let warn = meta
+        .warnings()
+        .iter()
+        .find(|w| w.contains(&needle))
+        .expect("warning present");
+      assert!(png_warning_is_minor(warn), "{ext}: form must be minor");
+    }
+  }
+
+  /// #141 acTL override supersedes a non-APNG PNG-rooted extension: a
+  /// PNG-signature file named `.mng` with an `acTL` BEFORE the IDAT. The `acTL`
+  /// `OverrideFileType("APNG", …)` (`PNG.pm:776`) fires first, so the
+  /// firing-point `$$et{FileType}` is `APNG`, not the extension's `MNG`.
+  /// Oracle-verified vs bundled 13.59 (`.mng` + acTL-before → `found after APNG
+  /// IDAT`).
+  #[test]
+  fn text_after_idat_mng_extension_actl_before_warns_apng() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    let mut actl = 2u32.to_be_bytes().to_vec();
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&chunk(b"acTL", &actl));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_with_ext(&bytes, Some("MNG")).expect("png parses");
+    assert!(meta.is_apng(), "acTL should mark APNG");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after APNG IDAT")),
+      "acTL must supersede the .mng extension, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after MNG IDAT")),
+      "must not say MNG once acTL has overridden, got {:?}",
+      meta.warnings(),
+    );
+  }
+
+  /// #141 firing-point with a non-APNG PNG-rooted extension: a PNG-signature
+  /// `.mng` whose `acTL` comes AFTER the post-IDAT tEXt. At the warning's firing
+  /// point the `acTL` override has not yet fired (`is_apng()` false), so the
+  /// warning uses the extension-resolved `MNG` — even though the FINAL FileType
+  /// becomes `APNG` once the late `acTL` is dispatched. This is the case that
+  /// proves storing the extension STRING (not an APNG bool) is required:
+  /// is_apng-false must fall back to `MNG`, not `PNG`. Oracle-verified vs
+  /// bundled 13.59 (`.mng` + acTL-after → File:FileType=APNG, warning `found
+  /// after MNG IDAT`).
+  #[test]
+  fn text_after_idat_mng_extension_actl_after_warns_mng_firing_point() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(b"IDAT", b"\x00"));
+    bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
+    let mut actl = 2u32.to_be_bytes().to_vec();
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&chunk(b"acTL", &actl));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    let meta = parse_with_ext(&bytes, Some("MNG")).expect("png parses");
+    assert!(meta.is_apng(), "the final meta is an APNG (late acTL seen)");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("Text/EXIF chunk(s) found after MNG IDAT")),
+      "firing point predates the late acTL ⇒ MNG, got {:?}",
+      meta.warnings(),
+    );
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("found after APNG IDAT") || w.contains("found after PNG IDAT")),
+      "must be neither APNG (acTL not yet fired) nor PNG (collapse bug), got {:?}",
+      meta.warnings(),
     );
   }
 
