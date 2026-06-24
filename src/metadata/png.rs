@@ -609,6 +609,34 @@ pub struct PngMeta<'a> {
   filter: Option<u8>,
   /// `IHDR.Interlace` (`PNG.pm:419-422`). `0` = Noninterlaced, `1` = Adam7.
   interlace: Option<u8>,
+  // ----- iDOT (PNG.pm:331-342) -----------------------------------------
+  /// `iDOT.AppleDataOffsets` — Apple's private "data offsets" chunk
+  /// (`Name => 'AppleDataOffsets', Binary => 1`, NO SubDirectory). Only the
+  /// payload LENGTH is retained: the tag is `Binary => 1` and renders as the
+  /// universal `(Binary data N bytes, …)` placeholder (`-j`), which derives
+  /// from the byte count alone — bundled `-b` extracts the raw bytes, but the
+  /// JSON path never touches them. Storing the length (not the payload) keeps
+  /// a crafted large-but-present `iDOT` chunk from forcing a payload-sized
+  /// allocation. PER-GROUP ([`BinaryChunkLengths`]): a PNG can carry `iDOT`
+  /// BOTH before `IEND` (→ `PNG:AppleDataOffsets`) AND after it
+  /// (→ `Trailer:AppleDataOffsets`); bundled emits BOTH under their distinct
+  /// family-1 groups (oracle-verified vs 13.59), so the main and the
+  /// post-`IEND` trailer lengths are kept SEPARATELY (each region last-wins).
+  /// All-`None` when no `iDOT` chunk was seen.
+  apple_data_offsets: BinaryChunkLengths,
+  // ----- gdAT (PNG.pm:374-378) -----------------------------------------
+  /// `gdAT.GainMapImage` — the gain-map preview image chunk (`Name =>
+  /// 'GainMapImage', Groups => { 2 => 'Preview' }, Binary => 1`, NO
+  /// SubDirectory — the same shape as `iDOT`). Only the payload LENGTH is
+  /// retained: like `iDOT` it renders as the `(Binary data N bytes, …)`
+  /// placeholder (`-j`) from the byte count alone (`-b` extracts the raw
+  /// bytes), so the embedded image is never cloned. PER-GROUP
+  /// ([`BinaryChunkLengths`]): a pre-`IEND` `gdAT` (→ `PNG:GainMapImage`) and a
+  /// post-`IEND` trailer `gdAT` (→ `Trailer:GainMapImage`) BOTH emit under
+  /// their distinct family-1 groups (oracle-verified vs 13.59), so their
+  /// lengths are kept separately (each region last-wins). All-`None` when no
+  /// `gdAT` chunk was seen.
+  gain_map_image: BinaryChunkLengths,
   // ----- pHYs (PNG.pm:216-222, sub-table PNG.pm:441-468) ----------------
   /// `pHYs.PixelsPerUnitX` (`PNG.pm:453-457`).
   pixels_per_unit_x: Option<u32>,
@@ -769,6 +797,66 @@ pub(crate) enum PngDiagStep {
   Xmp,
 }
 
+/// The payload LENGTHS of a `Binary => 1` PNG vendor chunk (`iDOT` /
+/// `gdAT`) split BY FAMILY-1 GROUP — a pre-`IEND` occurrence (`main`, emitted
+/// under the `PNG` group) and a post-`IEND` TRAILER occurrence (`trailer`,
+/// emitted under the `Trailer` group, `PNG.pm:1484`). A single PNG can carry
+/// the chunk in BOTH regions and bundled emits BOTH placeholders under their
+/// distinct groups (oracle-verified vs ExifTool 13.59), so a single
+/// `Option<usize>` would lose one; this pair preserves both. STILL
+/// length-only — never the payload bytes (the `Binary => 1` placeholder is
+/// rendered from the byte count alone). Each slot is last-wins (a repeated
+/// chunk within the same region overwrites, matching the singleton TagMap
+/// key). `main == trailer == None` when the chunk was absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BinaryChunkLengths {
+  /// Length of the pre-`IEND` occurrence — emitted under the `PNG` family-1
+  /// group. Last-wins on a repeated pre-`IEND` chunk.
+  main: Option<usize>,
+  /// Length of the post-`IEND` TRAILER occurrence — emitted under the
+  /// `Trailer` family-1 group (`PNG.pm:1484`). Last-wins on a repeated
+  /// post-`IEND` chunk.
+  trailer: Option<usize>,
+}
+
+impl BinaryChunkLengths {
+  /// An empty pair — neither a pre- nor a post-`IEND` occurrence seen.
+  #[inline(always)]
+  #[must_use]
+  const fn new() -> Self {
+    Self {
+      main: None,
+      trailer: None,
+    }
+  }
+
+  /// Record one occurrence's `len`, routed to the `trailer` slot when the
+  /// chunk was parsed in post-`IEND` TRAILER mode (`trailing == true`,
+  /// `PNG.pm:1484`) and the `main` slot otherwise. Last-wins within the slot.
+  #[inline(always)]
+  fn set(&mut self, len: usize, trailing: bool) {
+    if trailing {
+      self.trailer = Some(len);
+    } else {
+      self.main = Some(len);
+    }
+  }
+
+  /// The pre-`IEND` (`PNG:`-group) occurrence length, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn main(&self) -> Option<usize> {
+    self.main
+  }
+
+  /// The post-`IEND` (`Trailer:`-group) occurrence length, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn trailer(&self) -> Option<usize> {
+    self.trailer
+  }
+}
+
 /// Which structural single-value PNG chunks (the [`PngMeta`] singleton fields)
 /// were last set from a post-`IEND` TRAILER chunk and so carry the `Trailer`
 /// family-1 group override. All-`false` for a standard (IEND-last) PNG.
@@ -808,6 +896,8 @@ impl PngMeta<'_> {
       compression: None,
       filter: None,
       interlace: None,
+      apple_data_offsets: BinaryChunkLengths::new(),
+      gain_map_image: BinaryChunkLengths::new(),
       pixels_per_unit_x: None,
       pixels_per_unit_y: None,
       pixel_units: None,
@@ -942,6 +1032,50 @@ impl PngMeta<'_> {
     Some((f64::from(x) * 0.0254, f64::from(y) * 0.0254))
   }
 
+  // ===== iDOT accessors =================================================
+
+  /// The payload LENGTH of the MAIN (pre-`IEND`) Apple `iDOT` chunk
+  /// (`PNG:AppleDataOffsets`, `PNG.pm:331-342`), used to render the
+  /// `(Binary data N bytes, …)` placeholder. The raw bytes are never retained.
+  /// `None` when no pre-`IEND` `iDOT` chunk was seen.
+  #[inline(always)]
+  #[must_use]
+  pub const fn apple_data_offsets_main_len(&self) -> Option<usize> {
+    self.apple_data_offsets.main()
+  }
+
+  /// The payload LENGTH of the post-`IEND` TRAILER Apple `iDOT` chunk
+  /// (`Trailer:AppleDataOffsets`, `PNG.pm:331-342` parsed while
+  /// `SET_GROUP1 = 'Trailer'`, `PNG.pm:1484`). `None` when no post-`IEND`
+  /// `iDOT` chunk was seen.
+  #[inline(always)]
+  #[must_use]
+  pub const fn apple_data_offsets_trailer_len(&self) -> Option<usize> {
+    self.apple_data_offsets.trailer()
+  }
+
+  // ===== gdAT accessors =================================================
+
+  /// The payload LENGTH of the MAIN (pre-`IEND`) `gdAT` chunk
+  /// (`PNG:GainMapImage`, `PNG.pm:374-378`), used to render the
+  /// `(Binary data N bytes, …)` placeholder. The raw bytes are never retained.
+  /// `None` when no pre-`IEND` `gdAT` chunk was seen.
+  #[inline(always)]
+  #[must_use]
+  pub const fn gain_map_image_main_len(&self) -> Option<usize> {
+    self.gain_map_image.main()
+  }
+
+  /// The payload LENGTH of the post-`IEND` TRAILER `gdAT` chunk
+  /// (`Trailer:GainMapImage`, `PNG.pm:374-378` parsed while
+  /// `SET_GROUP1 = 'Trailer'`, `PNG.pm:1484`). `None` when no post-`IEND`
+  /// `gdAT` chunk was seen.
+  #[inline(always)]
+  #[must_use]
+  pub const fn gain_map_image_trailer_len(&self) -> Option<usize> {
+    self.gain_map_image.trailer()
+  }
+
   // ===== iCCP accessors =================================================
 
   /// The `iCCP-name` — the ICC profile NAME (`PNG.pm:182-190`). The
@@ -1060,6 +1194,25 @@ impl PngMeta<'_> {
     self.pixels_per_unit_y = Some(ppu_y);
     self.pixel_units = Some(units);
     self.structural_trailing.phys = self.in_trailer;
+  }
+
+  /// Record the Apple `iDOT` chunk's payload LENGTH (`AppleDataOffsets`,
+  /// `PNG.pm:331-342`). The bytes themselves are never retained — the
+  /// `Binary => 1` placeholder is rendered from the length. Routed to the
+  /// pre-`IEND` (`PNG:`) or post-`IEND` (`Trailer:`) slot per the current
+  /// [`Self::begin_trailer`] state, so a PNG carrying `iDOT` in BOTH regions
+  /// keeps both lengths; last-wins WITHIN each region.
+  pub(crate) fn set_apple_data_offsets(&mut self, len: usize) {
+    self.apple_data_offsets.set(len, self.in_trailer);
+  }
+
+  /// Record the `gdAT` chunk's payload LENGTH (`GainMapImage`,
+  /// `PNG.pm:374-378`). Like `iDOT` the bytes are never retained — the
+  /// `Binary => 1` placeholder is rendered from the length. Routed to the
+  /// pre-`IEND` (`PNG:`) or post-`IEND` (`Trailer:`) slot per the current
+  /// [`Self::begin_trailer`] state; last-wins WITHIN each region.
+  pub(crate) fn set_gain_map_image(&mut self, len: usize) {
+    self.gain_map_image.set(len, self.in_trailer);
   }
 
   /// Set the iCCP profile NAME.

@@ -134,6 +134,22 @@ case "$FIX" in
   # eXIf/zxIf binary-block placeholder the port suppresses) for the nested-zXIf
   # fixture — stay in the golden; the conformance `check_excluding` drops them.
   PNG_trailer_*|PNG_nested_*) : ;;
+  # The PNG Apple `iDOT` vendor-chunk fixture (#142): a minimal 1x1 RGB PNG whose
+  # only vendor chunk is `iDOT` (`AppleDataOffsets`, `Binary => 1`, NO
+  # SubDirectory, PNG.pm:331-342). PNG is in the Composite allow-list, so the
+  # ported `Composite:ImageSize`/`Megapixels` are kept; `PNG:AppleDataOffsets`
+  # renders the `(Binary data 28 bytes …)` placeholder on both sides. No
+  # exclusion needed (default path) — listed for documentation.
+  PNG_idot.png) : ;;
+  # The PNG per-group iDOT/gdAT main+trailer fixtures (#142 Codex [medium]):
+  # a minimal 1x1 RGB PNG carrying the vendor chunk BOTH pre-`IEND`
+  # (→ `PNG:AppleDataOffsets`/`PNG:GainMapImage`) AND as a post-`IEND` trailer
+  # chunk (→ `Trailer:AppleDataOffsets`/`Trailer:GainMapImage`, PNG.pm:1484).
+  # Bundled emits BOTH placeholders + the document-level minor
+  # `Trailer data after PNG IEND chunk` warning; exifast now emits all of them,
+  # so no exclusion is needed (the ported `Composite:ImageSize`/`Megapixels`
+  # are kept). Listed for documentation.
+  PNG_idot_trailer.png|PNG_gdat_trailer.png) : ;;
   # ── #133 PR 5 video/container Composite arms ─────────────────────────────────
   # The full-video-activation fixtures keep their ported Composites
   # (ImageSize/Megapixels/AvgBitrate/Rotation/Duration + the GPS-group SubDoc

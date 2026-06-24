@@ -1350,8 +1350,28 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///     `true`), both `-j`/`-n`.
 ///   * `Exif_filesource_nulnum.tif` — the same `31 00 32 00` on the `FileSource`
 ///     HASH-miss path → "Unknown (12)" / quoted "12".
-/// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 598;
+/// 598 → 599 (#142, the Apple `iDOT` private PNG vendor chunk) adds
+/// `PNG_idot.png` — a crafted minimal 1x1 RGB PNG whose only vendor chunk is
+/// `iDOT` (`AppleDataOffsets`, `Binary => 1`, NO SubDirectory, `PNG.pm:331-342`),
+/// emitting the `PNG:AppleDataOffsets` `(Binary data 28 bytes …)` placeholder
+/// (plus the ported `Composite:ImageSize`/`Megapixels`).
+/// 599 → 600 (#142 Codex F2, the `gdAT` gain-map chunk) adds `PNG_gdat.png` —
+/// the same minimal shape with `gdAT` (`GainMapImage`, `Binary => 1`,
+/// `Groups => { 2 => 'Preview' }`, NO SubDirectory, `PNG.pm:374-378`), emitting
+/// the `PNG:GainMapImage` `(Binary data 20 bytes …)` placeholder. The remaining
+/// four PNG private chunks (`caBX`-JUMBF / `cpIp`-FlashPix / `meTa`-XML /
+/// `seAl`-SEAL) dispatch into large SubDirectory subsystems exifast lacks and
+/// stay deferred. Additive — every PRE-EXISTING golden stays byte-identical.
+/// 600 → 602 (#142 Codex [medium], the per-group `iDOT`/`gdAT` fix) adds
+/// `PNG_idot_trailer.png` + `PNG_gdat_trailer.png` — each a minimal 1x1 RGB PNG
+/// carrying the vendor chunk BOTH pre-`IEND` (→ `PNG:AppleDataOffsets` /
+/// `PNG:GainMapImage`) AND as a post-`IEND` TRAILER chunk
+/// (→ `Trailer:AppleDataOffsets` / `Trailer:GainMapImage`, `PNG.pm:1484`).
+/// Bundled emits BOTH placeholders + the document `[minor] Trailer data after
+/// PNG IEND chunk` warning; exifast now emits all of them, so a PLAIN compare
+/// (no `FIXTURE_EXCLUDED_KEYS`). Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 602;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
