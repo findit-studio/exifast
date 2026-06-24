@@ -379,12 +379,6 @@ pub enum AnyParser {
 /// [`AnyMeta::_Phantom`] variant — present ONLY in a no-format build —
 /// anchors `'a`. Under the `all-formats` default the phantom is `cfg`'d
 /// OUT (Codex CF3).
-// `AnyMeta::QuickTime` carries the QuickTime [`crate::formats::quicktime::Meta`]
-// which accumulates sub-Metas across the SP3 timed-metadata chain (camm,
-// sony_rtmd, canon_ctmd, insta360, gopro, parrot, …) and has grown past
-// 1024 bytes. The architectural fix — boxing the variants — is tracked
-// at issue #106; allow locally so the size-diff doesn't bite each new port.
-#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
@@ -484,7 +478,7 @@ pub enum AnyMeta<'a> {
   Matroska(crate::formats::matroska::Meta<'a>),
   /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — SP1 core structural atoms).
   #[cfg(feature = "quicktime")]
-  QuickTime(crate::formats::quicktime::Meta<'a>),
+  QuickTime(Box<crate::formats::quicktime::Meta<'a>>),
   /// JPEG 2000 (JP2/JPX/JPM/JPH/JXL). [`Jp2Meta`](crate::metadata::Jp2Meta)
   /// owns its data (it records only offsets/sub-type, no input borrow), so
   /// the enum `'a` is unused by this variant.
@@ -502,7 +496,7 @@ pub enum AnyMeta<'a> {
   /// chain's tags + the captured-but-deferred MakerNote blob). GPS sub-IFD
   /// tags (row 14) are inside this same Meta.
   #[cfg(feature = "exif")]
-  Exif(crate::exif::ExifMeta<'a>),
+  Exif(Box<crate::exif::ExifMeta<'a>>),
   /// RIFF / AVI (FORMATS.md row 26). `RiffMeta` owns most of its data
   /// (FourCCs are transformed to SmolStr, dates run through `ConvertRIFFDate`),
   /// but BORROWS the raw Pentax AVI MakerNote payload as a `&'a [u8]` sub-slice
@@ -1156,7 +1150,7 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(&**m),
       #[cfg(feature = "quicktime")]
       AnyMeta::Jp2(m) => crate::diagnostics::Diagnose::diagnostics(m),
       // MXF runs entirely under `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared
@@ -1171,7 +1165,7 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       #[cfg(feature = "plist")]
       AnyMeta::Plist(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      AnyMeta::Exif(m) => crate::diagnostics::Diagnose::diagnostics(&**m),
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => crate::diagnostics::Diagnose::diagnostics(m),
       // XMP: the lone reachable `$et->Warn` sites (`XMP is double UTF-encoded`
@@ -1228,7 +1222,7 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
     match self {
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => {
-        crate::diagnostics::Diagnose::diagnostics_with_options(m, extract_embedded)
+        crate::diagnostics::Diagnose::diagnostics_with_options(&**m, extract_embedded)
       }
       _ => crate::diagnostics::Diagnose::diagnostics(self),
     }
@@ -1521,7 +1515,7 @@ impl AnyMeta<'_> {
       // vendor MakerNote merge) via the `Project` trait. Phase 2 switches the
       // arms below from the empty default to their own `m.project()`.
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => crate::metadata::Project::project(m),
+      AnyMeta::Exif(m) => crate::metadata::Project::project(&**m),
       #[cfg(feature = "moi")]
       AnyMeta::Moi(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "aac")]
@@ -1572,7 +1566,7 @@ impl AnyMeta<'_> {
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => crate::metadata::Project::project(m),
+      AnyMeta::QuickTime(m) => crate::metadata::Project::project(&**m),
       #[cfg(feature = "quicktime")]
       AnyMeta::Jp2(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "mxf")]
@@ -2404,7 +2398,8 @@ impl AnyParser {
         // The leaf `FormatParser::parse` has no extension channel, so the
         // dispatch uses the extension-aware `parse_with_ext` entry instead.
         let _ = (p, shared);
-        crate::formats::quicktime::parse_with_ext(bytes, ext).map(AnyMeta::QuickTime)
+        crate::formats::quicktime::parse_with_ext(bytes, ext)
+          .map(|m| AnyMeta::QuickTime(Box::new(m)))
       }
       #[cfg(feature = "quicktime")]
       AnyParser::Jp2(p) => {
@@ -2482,7 +2477,7 @@ impl AnyParser {
         let body = bytes.get(header_skip..).unwrap_or(&[]);
         if body.len() >= 2 && body[0] == 0xff && body[1] == 0xd8 {
           return crate::exif::jpeg::parse_jpeg_exif_with_base(body, header_skip)
-            .map(AnyMeta::Exif);
+            .map(|m| AnyMeta::Exif(Box::new(m)));
         }
         // A standalone TIFF — at byte 0 normally, or at `bytes[header_skip..]`
         // for the detector's terminal TIFF-after-unknown-header candidate.
@@ -2548,7 +2543,7 @@ impl AnyParser {
           /* base_file_type */
           Some("TIFF"),
         )
-        .map(AnyMeta::Exif)
+        .map(|m| AnyMeta::Exif(Box::new(m)))
       }
       #[cfg(feature = "riff")]
       AnyParser::Riff(p) => {
