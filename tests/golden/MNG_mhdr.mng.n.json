@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "MNG_mhdr.mng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "MNG",
+  "File:FileTypeExtension": "MNG",
+  "File:MIMEType": "video/mng",
+  "MNG:ImageWidth": 160,
+  "MNG:ImageHeight": 120,
+  "MNG:TicksPerSecond": 30,
+  "MNG:NominalLayerCount": 5,
+  "MNG:NominalFrameCount": 10,
+  "MNG:NominalPlayTime": 0,
+  "MNG:SimplicityProfile": 73,
+  "Composite:ImageSize": "160 120",
+  "Composite:Megapixels": 0.0192
+}]

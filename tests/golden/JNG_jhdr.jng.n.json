@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "JNG_jhdr.jng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "JNG",
+  "File:FileTypeExtension": "JNG",
+  "File:MIMEType": "image/jng",
+  "MNG:ImageWidth": 320,
+  "MNG:ImageHeight": 240,
+  "MNG:ColorType": 10,
+  "MNG:BitDepth": 8,
+  "MNG:Compression": 8,
+  "MNG:Interlace": 0,
+  "MNG:AlphaBitDepth": 8,
+  "MNG:AlphaCompression": 8,
+  "MNG:AlphaFilter": 0,
+  "MNG:AlphaInterlace": 0,
+  "Composite:ImageSize": "320 240",
+  "Composite:Megapixels": 0.0768
+}]

@@ -1493,7 +1493,34 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// pre-fix whole-payload OVERWRITE dropped, now fixed by the ordered-Vec +
 /// replay-all dispatch. Additive — every PRE-EXISTING golden stays
 /// byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 625;
+/// 625 → 628 (#143 MNG/JNG sub-table port) adds the three crafted PNG-sibling
+/// fixtures `MNG_mhdr.mng` (the `MHDR` MNGHeader sub-table incl. the
+/// SimplicityProfile `0x%.8x` hand-port), `JNG_jhdr.jng` (the `JHDR` JNGHeader
+/// sub-table + its int->label PrintConvs), and `MNG_chunks.mng` (a kitchen-sink
+/// covering all 17 `%MNG::*` `ProcessBinaryData` sub-tables, the DISC/DROP/SEEK
+/// inline ValueConvs, the 6 `Binary => 1` placeholders, and `pHYg` → the shared
+/// `PNG-pHYs` decoder). The `\x8aMNG`/`\x8bJNG` signature gate (`PNG.pm:63-64`)
+/// drives the `%MNG::Main` chunk-table fallback (`PNG.pm:1655`); a plain PNG is
+/// unaffected (the fallback is reached only for an MNG/JNG container), so every
+/// PRE-EXISTING PNG golden stays byte-identical.
+/// 628 → 629 (#143 Codex Finding 2 — post-`MEND` MNG trailer group) adds
+/// `MNG_trailer.mng`: an MNG (`MHDR`+`MEND`) with one trailing `BACK` chunk
+/// after the `MEND` end chunk. The walker's trailer mode (`PNG.pm:1484`
+/// `SET_GROUP1 = 'Trailer'`) emits that leaf under family-1 `Trailer`
+/// (`Trailer:BackgroundColor`), distinct from the main `MNG:*` (the
+/// `(doc, family1, name)` dedup key). Additive — every PRE-EXISTING golden
+/// (incl. the three R1 MNG/JNG fixtures + all PNG goldens) stays byte-identical.
+/// 629 → 630 (#143 — realistic mixed-MNG composite regression guard) adds
+/// `MNG_embedded_ihdr.mng`: an MNG whose header `MHDR` (160x120) is followed by
+/// an embedded PNG `IHDR` chunk (320x240). `ProcessPNG` resolves a chunk
+/// against `%PNG::Main` before the `%MNG::Main` fallback (`PNG.pm:1653-1656`),
+/// so `MHDR`→`MNG:ImageWidth=160` and `IHDR`→`PNG:ImageWidth=320` are BOTH
+/// emitted; the equal-priority `Composite:ImageSize` keeps the LAST-walked
+/// `IHDR` ⇒ `320x240`, byte-for-byte matching bundled. Additive — every
+/// PRE-EXISTING golden (the four R1/R2 MNG/JNG fixtures + all PNG goldens) stays
+/// byte-identical (no code change). The crafted three-equal-producer Case-A
+/// composite-priority divergence is tracked separately as #436.
+const EXPECTED_ACTIVE_FIXTURES: usize = 630;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

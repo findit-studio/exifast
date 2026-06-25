@@ -1736,21 +1736,38 @@ impl AnyMeta<'_> {
         None => FileTypeFinalize::Detected,
       },
       // PNG: `ProcessPNG` calls `$et->SetFileType($fileType)` with
-      // `$fileType` from `%pngLookup` (PNG.pm:1439-1440). For the PNG
-      // signature this is `"PNG"` — the detected candidate. An animated PNG
-      // (an `acTL` chunk was seen) then promotes to `APNG`: the
-      // `AnimationFrames` RawConv calls `OverrideFileType("APNG", undef, "PNG")`
-      // (PNG.pm:776), so `File:FileType` → `APNG`, `MIMEType` →
-      // `image/apng` (the `%mimeType{APNG}` lookup), and `FileTypeExtension`
-      // → the EXPLICIT `"PNG"` arg (`png`/`PNG`), since `APNG` has no
-      // `%fileTypeExt` entry. Bundled applies no other post-walk override for
-      // PNG/MNG/JNG.
+      // `$fileType` from `%pngLookup` (PNG.pm:1439-1440) — the SIGNATURE-resolved
+      // container `PNG`/`MNG`/`JNG`, INDEPENDENT of the filename extension. The
+      // detector's candidate type is `PNG` for ALL THREE signatures (they share
+      // the `\x{89/8a/8b}…NG\r\n\x1a\n` family), so the engine's `Detected`
+      // arm — which keys off that candidate — would wrongly finalize an
+      // MNG/JNG-signature file (e.g. one named `.png`, or extension-less) as
+      // `PNG`/`image/png`. Make the finalize CONTAINER-AWARE: a non-APNG PNG
+      // emits `Explicit(container.as_file_type())` so the SIGNATURE drives
+      // `File:FileType` + MIME (`PngContainer::as_file_type` → `PNG`/`MNG`/`JNG`;
+      // `resolve_file_type`'s `%mimeType` lookup → `image/png`/`video/mng`/
+      // `image/jng`). For a plain PNG container `Explicit("PNG")` is identical to
+      // `Detected` (the `ext == ft` short-circuit + `$mimeType{PNG}` ⇒ the same
+      // triplet), and an MNG/JNG-signature file finalizes signature-first —
+      // oracle-verified vs bundled 13.59 (an MNG-signature `.png` → FileType
+      // `MNG`, `video/mng`; extension-less likewise; a JNG-signature `.png` →
+      // `JNG`, `image/jng`).
+      //
+      // An animated PNG (an `acTL` chunk was seen) takes precedence and promotes
+      // to `APNG`: the `AnimationFrames` RawConv calls `OverrideFileType("APNG",
+      // undef, "PNG")` (PNG.pm:776), so `File:FileType` → `APNG`, `MIMEType` →
+      // `image/apng` (the `%mimeType{APNG}` lookup), and `FileTypeExtension` →
+      // the EXPLICIT `"PNG"` arg (`png`/`PNG`), since `APNG` has no `%fileTypeExt`
+      // entry. `acTL` only arises on the PNG signature (container `Png`, base
+      // `PNG`), so the override's pre-`OverrideFileType` base type stays `PNG` —
+      // UNCHANGED from before this container-aware split. Bundled applies no
+      // other post-walk override for PNG/MNG/JNG.
       #[cfg(feature = "png")]
       AnyMeta::Png(m) => {
         if m.is_apng() {
           FileTypeFinalize::DetectedThenOverrideWithExt(OverrideWithExt::new("APNG", "PNG"))
         } else {
-          FileTypeFinalize::Detected
+          FileTypeFinalize::Explicit(m.container().as_file_type())
         }
       }
       // Real: SetFileType($type) where $type = 'RM' / 'RA' / 'RAM' / 'RPM'

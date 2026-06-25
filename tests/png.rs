@@ -2841,3 +2841,157 @@ fn engine_trailing_exif_cycle_guard_diagnostic_is_trailer_scoped() {
     "the cycle-guard warning must not leak as a document-level diagnostic, got {diags:?}",
   );
 }
+
+// ===========================================================================
+// Finding 1 — container-aware FileType finalize (signature-authoritative).
+//
+// The detector's candidate is `PNG` for ALL THREE NG signatures, so before the
+// container-aware finalize an MNG/JNG-signature file whose extension did NOT
+// promote it (named `.png`, or extension-less) finalized as `PNG`/`image/png`.
+// Now the SIGNATURE-resolved container (`PngContainer`) drives File:FileType +
+// MIME. Oracle-verified vs bundled 13.59 (see the per-test comments).
+// ===========================================================================
+
+/// An MHDR chunk body (MNG.pm MHDR, FORMAT int32u): FrameWidth, FrameHeight,
+/// TicksPerSecond, NominalLayerCount, NominalFrameCount, NominalPlayTime,
+/// SimplicityProfile.
+fn mhdr_chunk(simplicity: u32) -> Vec<u8> {
+  let mut d = Vec::new();
+  for v in [100u32, 200, 30, 0, 0, 0, simplicity] {
+    d.extend_from_slice(&v.to_be_bytes());
+  }
+  chunk(b"MHDR", &d)
+}
+
+/// A minimal MNG file: `\x8aMNG…` signature + MHDR + MEND (the MNG end chunk is
+/// `MEND`, NOT `IEND`).
+fn minimal_mng(simplicity: u32) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  bytes.extend_from_slice(exifast::formats::png::MNG_SIGNATURE);
+  bytes.extend_from_slice(&mhdr_chunk(simplicity));
+  bytes.extend_from_slice(&chunk(b"MEND", &[]));
+  bytes
+}
+
+/// A minimal JNG file: `\x8bJNG…` signature + JHDR + IEND (JNG's end is `IEND`).
+fn minimal_jng() -> Vec<u8> {
+  let mut jhdr = Vec::new();
+  jhdr.extend_from_slice(&640u32.to_be_bytes()); // ImageWidth
+  jhdr.extend_from_slice(&480u32.to_be_bytes()); // ImageHeight
+  jhdr.extend_from_slice(&[8, 0, 0, 8, 0, 0]); // ColorType etc.
+  let mut bytes = Vec::new();
+  bytes.extend_from_slice(exifast::formats::png::JNG_SIGNATURE);
+  bytes.extend_from_slice(&chunk(b"JHDR", &jhdr));
+  bytes.extend_from_slice(&chunk(b"IEND", &[]));
+  bytes
+}
+
+/// An MNG-signature file NAMED `.png` finalizes signature-first: File:FileType
+/// `MNG`, MIME `video/mng`, extension `mng` — the extension does NOT win.
+/// Oracle (bundled 13.59, `mng_as_png.png`): FileType=MNG, MIMEType=video/mng,
+/// FileTypeExtension=mng, plus MNG:* tags.
+#[test]
+fn engine_mng_signature_named_png_finalizes_as_mng() {
+  let bytes = minimal_mng(0x0000_000b);
+  let json = extract_info("mislabeled.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"MNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"video/mng\""),
+    "got {json}"
+  );
+  assert!(
+    json.contains("\"File:FileTypeExtension\":\"mng\""),
+    "got {json}"
+  );
+  // The signature-selected MNG container engaged the %MNG::Main fallback.
+  assert!(json.contains("\"MNG:ImageWidth\":100"), "got {json}");
+  assert!(
+    json.contains("\"MNG:SimplicityProfile\":\"0x0000000b\""),
+    "got {json}"
+  );
+}
+
+/// An MNG-signature file with NO extension also finalizes as MNG (the
+/// container, not the absent extension, is authoritative). Oracle (bundled
+/// 13.59, `mng_noext`): FileType=MNG, MIMEType=video/mng.
+#[test]
+fn engine_mng_signature_no_extension_finalizes_as_mng() {
+  let bytes = minimal_mng(0x0000_0001);
+  let json = extract_info("mng_noext", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"MNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"video/mng\""),
+    "got {json}"
+  );
+}
+
+/// The SAME MNG bytes NAMED `.mng` still finalize as MNG (the container-aware
+/// finalize is consistent with the extension-promoted path — no regression to
+/// the `.mng`/`.jng` goldens). Oracle (bundled 13.59, `real.mng`): MNG.
+#[test]
+fn engine_mng_signature_named_mng_finalizes_as_mng() {
+  let bytes = minimal_mng(0x0000_0001);
+  let json = extract_info("real.mng", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"MNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"video/mng\""),
+    "got {json}"
+  );
+}
+
+/// A JNG-signature file NAMED `.png` finalizes as JNG, `image/jng`, ext `jng`.
+/// Oracle (bundled 13.59, `jng_as_png.png`): FileType=JNG, MIMEType=image/jng,
+/// FileTypeExtension=jng.
+#[test]
+fn engine_jng_signature_named_png_finalizes_as_jng() {
+  let bytes = minimal_jng();
+  let json = extract_info("mislabeled.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"JNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/jng\""),
+    "got {json}"
+  );
+  assert!(
+    json.contains("\"File:FileTypeExtension\":\"jng\""),
+    "got {json}"
+  );
+}
+
+/// Guard: a PLAIN PNG-signature file still finalizes as PNG/image/png — the
+/// container-aware finalize is a byte-identical no-op for the PNG container
+/// (`Explicit("PNG")` == the old `Detected`). Oracle (bundled 13.59): PNG.
+#[test]
+fn engine_plain_png_signature_still_finalizes_as_png() {
+  let bytes = assemble(&[ihdr_rgb_1x1(), chunk(b"IDAT", &zlib_store(&[0, 0]))]);
+  let json = extract_info("plain.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"PNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/png\""),
+    "got {json}"
+  );
+}
+
+/// Guard: a PNG-signature APNG (an `acTL` chunk) still overrides to
+/// APNG/image/apng with extension `png` — the `is_apng()` arm is UNCHANGED by
+/// the container-aware split. Oracle (bundled 13.59): FileType=APNG,
+/// MIMEType=image/apng, FileTypeExtension=png.
+#[test]
+fn engine_apng_actl_still_overrides_to_apng() {
+  let mut actl = 2u32.to_be_bytes().to_vec(); // num_frames
+  actl.extend_from_slice(&0u32.to_be_bytes()); // num_plays
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"acTL", &actl),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+  ]);
+  let json = extract_info("anim.png", &bytes, /* print_conv */ true);
+  assert!(json.contains("\"File:FileType\":\"APNG\""), "got {json}");
+  assert!(
+    json.contains("\"File:MIMEType\":\"image/apng\""),
+    "got {json}"
+  );
+  assert!(
+    json.contains("\"File:FileTypeExtension\":\"png\""),
+    "got {json}"
+  );
+}

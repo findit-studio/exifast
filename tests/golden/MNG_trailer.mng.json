@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "MNG_trailer.mng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Trailer data after MNG MEND chunk",
+  "File:FileType": "MNG",
+  "File:FileTypeExtension": "mng",
+  "File:MIMEType": "video/mng",
+  "MNG:ImageWidth": 100,
+  "MNG:ImageHeight": 200,
+  "MNG:TicksPerSecond": 30,
+  "MNG:NominalLayerCount": 0,
+  "MNG:NominalFrameCount": 0,
+  "MNG:NominalPlayTime": 0,
+  "MNG:SimplicityProfile": "0x00000001",
+  "Trailer:BackgroundColor": "1 2 3",
+  "Composite:ImageSize": "100x200",
+  "Composite:Megapixels": 0.020
+}]
