@@ -35,12 +35,13 @@ pub(crate) enum BoxKind {
   /// `c2sh` (`Jpeg2000.pm:441`) — `C2PASaltHash`: a hex salt. A FORMAT box,
   /// group `Jpeg2000`, `JUMBF_Suffix => 'Salt'`.
   C2sh,
-  /// `json` (`Jpeg2000.pm:409`) — `JSONData`: a JSON content box whose decoder
-  /// (`JSON::Main`) is DEFERRED to Phase 2. Recursed-but-opaque: the box is
-  /// traversed (its bounds validated) but emits no tags in Phase 1.
+  /// `json` (`Jpeg2000.pm:409`) — `JSONData`: a JSON content box decoded by
+  /// `JSON::Main` / `ProcessJSON` ([`super::json`], Phase 2 #142) into flattened
+  /// `JSON:*` tags.
   Json,
   /// `cbor` (`Jpeg2000.pm:420`) — `CBORData`: a CBOR content box whose decoder
-  /// (`CBOR::Main`) is DEFERRED to Phase 3. Recursed-but-opaque (see [`Self::Json`]).
+  /// (`CBOR::Main`) is DEFERRED to Phase 3. Recursed-but-opaque: the box is
+  /// traversed (its bounds validated) but emits no tags yet.
   Cbor,
 }
 

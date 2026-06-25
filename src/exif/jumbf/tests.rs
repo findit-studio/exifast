@@ -662,3 +662,531 @@ fn box_len_zero_runs_to_end() {
   let pj = render(&meta, true);
   assert!(has(&pj, "JUMDLabel"));
 }
+
+// ── Phase 2: the `json` content decoder (`JSON::Main` / `ProcessJSON`) ────────
+
+/// Build a `jumb -> jumd(label) + json{doc}` caBX box stream and decode it.
+fn json_box_meta(doc: &[u8]) -> JumbfMeta {
+  let jumd = jumd_content(&json_uuid(), 0x03, Some("c2pa.test"), None);
+  let inner = [box_bytes(b"jumd", &jumd), box_bytes(b"json", doc)].concat();
+  process(&box_bytes(b"jumb", &inner))
+}
+
+#[test]
+fn json_flattens_top_level_object_keys() {
+  // Each top-level key becomes one JSON:<legalized-key> tag; group is JSON.
+  let meta = json_box_meta(br#"{"claim_generator":"exifast/1.0","format":"image/png"}"#);
+  let pj = render(&meta, true);
+  let (g, _, v) = find(&pj, "Claim_generator");
+  assert_eq!(g, GROUP_JSON);
+  assert_eq!(v, &TagValue::Str("exifast/1.0".into()));
+  let (g2, _, v2) = find(&pj, "Format");
+  assert_eq!(g2, GROUP_JSON);
+  assert_eq!(v2, &TagValue::Str("image/png".into()));
+}
+
+#[test]
+fn json_scalar_types_render_through_the_gate() {
+  // number -> raw lexeme Str (gate renders bare); true/false -> Bool; null ->
+  // the "null" Str (MissingTagValue default, gate quotes it); a >15-digit
+  // integer stays a Str (gate quotes it).
+  let meta = json_box_meta(
+    br#"{"version":2,"score":0.95,"validated":true,"revoked":false,"signature":null,"serial":1234567890123456789}"#,
+  );
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "Version").2, TagValue::Str("2".into()));
+  assert_eq!(find(&pj, "Score").2, TagValue::Str("0.95".into()));
+  assert_eq!(find(&pj, "Validated").2, TagValue::Bool(true));
+  assert_eq!(find(&pj, "Revoked").2, TagValue::Bool(false));
+  assert_eq!(find(&pj, "Signature").2, TagValue::Str("null".into()));
+  assert_eq!(
+    find(&pj, "Serial").2,
+    TagValue::Str("1234567890123456789".into())
+  );
+}
+
+#[test]
+fn json_nested_object_is_a_struct_map_with_raw_inner_keys() {
+  // Under -struct, a nested object emits as ONE tag whose value is a Map with
+  // the RAW inner keys (NOT legalized).
+  let meta = json_box_meta(br#"{"thumbnail":{"format":"image/jpeg","2key":7}}"#);
+  let pj = render(&meta, true);
+  let (g, _, v) = find(&pj, "Thumbnail");
+  assert_eq!(g, GROUP_JSON);
+  assert_eq!(
+    v,
+    &TagValue::Map(vec![
+      ("format".into(), TagValue::Str("image/jpeg".into())),
+      ("2key".into(), TagValue::Str("7".into())),
+    ])
+  );
+}
+
+#[test]
+fn json_arrays_of_scalars_and_objects() {
+  // An array stays a List; an array of objects is a List of Maps.
+  let meta = json_box_meta(br#"{"ingredients":["a","b"],"assertions":[{"label":"x"}]}"#);
+  let pj = render(&meta, true);
+  assert_eq!(
+    find(&pj, "Ingredients").2,
+    TagValue::List(vec![TagValue::Str("a".into()), TagValue::Str("b".into())])
+  );
+  assert_eq!(
+    find(&pj, "Assertions").2,
+    TagValue::List(vec![TagValue::Map(vec![(
+      "label".into(),
+      TagValue::Str("x".into())
+    )])])
+  );
+}
+
+#[test]
+fn json_empty_array_emits_no_tag_but_empty_object_does() {
+  // A top-level EMPTY array emits nothing (ProcessTag iterates @$val = []);
+  // an empty object emits one tag (FoundTag(Struct=>1) -> {}).
+  let meta = json_box_meta(br#"{"empty_arr":[],"empty_obj":{},"kept":1}"#);
+  let pj = render(&meta, true);
+  assert!(!has(&pj, "Empty_arr"), "empty array must emit no tag");
+  assert_eq!(find(&pj, "Empty_obj").2, TagValue::Map(vec![]));
+  assert_eq!(find(&pj, "Kept").2, TagValue::Str("1".into()));
+}
+
+#[test]
+fn json_top_level_key_legalization() {
+  // tr/:/_/, the ^c2pa->C2PA hack, MakeTagName (delete-illegal/ucfirst/Tag-
+  // prefix), and AddTagToTable's leading-letter Tag prefix.
+  let meta =
+    json_box_meta(br#"{"hello world":1,"with.dot":2,"123num":3,"c2pa.manifest":4,"_x":5,"a":6}"#);
+  let pj = render(&meta, true);
+  assert!(has(&pj, "Helloworld"));
+  assert!(has(&pj, "Withdot"));
+  assert!(has(&pj, "Tag123num"));
+  assert!(has(&pj, "C2PAmanifest"));
+  assert!(has(&pj, "Tag_x"));
+  assert!(has(&pj, "TagA"));
+}
+
+#[test]
+fn json_string_escapes_are_unescaped() {
+  // \uHHHH -> the code point; \t\n\r\b\f -> the control char; \" \\ -> the
+  // literal char; and a raw multi-byte UTF-8 sequence (é = 0xC3 0xA9) passes
+  // through repaired.
+  let mut doc = br#"{"esc":"a\tb\n\"q\"\\"#.to_vec();
+  doc.extend_from_slice(&[0xC3, 0xA9]); // a literal U+00E9 in the source bytes
+  doc.extend_from_slice(br#""}"#);
+  let meta = json_box_meta(&doc);
+  let pj = render(&meta, true);
+  assert_eq!(
+    find(&pj, "Esc").2,
+    TagValue::Str("a\tb\n\"q\"\\\u{00e9}".into())
+  );
+}
+
+#[test]
+fn json_tags_ride_the_doc_axis() {
+  // The JSON tags carry this box's Doc<N> (Doc1 here — first top-level jumb).
+  let meta = json_box_meta(br#"{"key":1}"#);
+  let doc = render_doc(&meta, true);
+  let k = doc
+    .iter()
+    .find(|(_, n, ..)| n == "Key")
+    .expect("JSON:Key present");
+  assert_eq!(k.0, GROUP_JSON);
+  assert_eq!(k.3, 1, "JSON tag must ride Doc1");
+  assert_eq!(k.4, "", "top-level jumb is a plain Doc1 (no sub-path)");
+}
+
+#[test]
+fn json_non_object_document_is_unrecognized_box() {
+  // A bare-scalar document -> ProcessJSON returns 0 -> the JUMBF walker raises
+  // `Unrecognized <Name> box` (the renamed JUMBFLabel — c2pa.test -> C2PATest).
+  let meta = json_box_meta(br#"42"#);
+  assert!(
+    render(&meta, true).iter().all(|(g, ..)| g != GROUP_JSON),
+    "a non-object json doc emits no JSON tags"
+  );
+  assert!(
+    meta
+      .warnings()
+      .iter()
+      .any(|w| w.message() == "Unrecognized C2PATest box"),
+    "expected the Unrecognized box warning, got {:?}",
+    meta.warnings()
+  );
+}
+
+#[test]
+fn json_deeply_nested_is_depth_bounded_not_a_panic() {
+  // A pathologically deep document must not overflow the stack: it parses to a
+  // failure at the budget and surfaces the Unrecognized-box warning (no panic).
+  let depth = super::json::tests_max_depth() + 50;
+  let mut doc = Vec::new();
+  for _ in 0..depth {
+    doc.extend_from_slice(br#"{"a":"#);
+  }
+  doc.extend_from_slice(b"1");
+  doc.extend(std::iter::repeat_n(b'}', depth));
+  let meta = json_box_meta(&doc);
+  // Must not panic; either no JSON tags or a warning — the point is termination.
+  assert!(render(&meta, true).iter().all(|(g, ..)| g != GROUP_JSON) || !meta.warnings().is_empty());
+}
+
+#[test]
+fn json_truncated_document_does_not_panic() {
+  // A truncated object (no closing brace / value) must fail gracefully.
+  for doc in [
+    &b"{"[..],
+    &b"{\"k\":"[..],
+    &b"{\"k\":\"unterminated"[..],
+    &b"[1,2"[..],
+    &b"{\"k\":1,"[..],
+  ] {
+    let meta = json_box_meta(doc);
+    // No panic; a malformed doc yields the Unrecognized-box warning.
+    let _ = render(&meta, true);
+    assert!(
+      !meta.warnings().is_empty(),
+      "truncated json {doc:?} should warn"
+    );
+  }
+}
+
+// ── Phase 2: the `Import::ReadJSON` SourceFile-keyed array database ───────────
+// (Import.pm:285-303 + the ProcessJSON sorted-key flatten loop, JSON.pm:161-168.
+//  Each top-level array OBJECT is keyed by its `SourceFile`; a later same-key
+//  object overwrites; the surviving objects flatten in SORTED key order, the
+//  auto-default `'*'` SourceFile skipped. All oracle-verified vs bundled 13.59.)
+
+#[test]
+fn json_array_distinct_sourcefiles_keep_both_objects() {
+  // [{SourceFile:a,x:1},{SourceFile:b,y:2}] -> two DISTINCT database keys, so
+  // BOTH objects survive: JSON:TagX (from a.jpg) and JSON:TagY (from b.jpg).
+  // NO data loss — the pre-fix `last_object` collapse dropped TagX entirely.
+  let meta = json_box_meta(br#"[{"SourceFile":"a.jpg","x":1},{"SourceFile":"b.jpg","y":2}]"#);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagX").2, TagValue::Str("1".into()));
+  assert_eq!(find(&pj, "TagY").2, TagValue::Str("2".into()));
+  // Both objects carry an explicit SourceFile (≠ '*'), so each flattens to a
+  // JSON:SourceFile entry, emitted in sorted-key order [a.jpg, b.jpg]. The
+  // unit `tags()` stream is pre-dedup; the downstream TagMap last-wins keeps the
+  // LAST value (b.jpg), matching bundled. Assert the emitted SEQUENCE so both
+  // the sorted order and the last-wins value are pinned.
+  let sources: Vec<&TagValue> = pj
+    .iter()
+    .filter(|(g, n, _)| g == GROUP_JSON && n == "SourceFile")
+    .map(|(_, _, v)| v)
+    .collect();
+  assert_eq!(
+    sources,
+    vec![
+      &TagValue::Str("a.jpg".into()),
+      &TagValue::Str("b.jpg".into())
+    ],
+    "explicit SourceFiles flatten in sorted-key order; TagMap then last-wins b.jpg"
+  );
+}
+
+#[test]
+fn json_array_no_sourcefile_collapses_to_last() {
+  // [{x:1},{y:2}] -> neither has a SourceFile, so both default to '*' and
+  // collide; the LAST object overwrites -> only JSON:TagY survives (TagX gone).
+  // The auto-default '*' SourceFile is skipped, so no JSON:SourceFile.
+  let meta = json_box_meta(br#"[{"x":1},{"y":2}]"#);
+  let pj = render(&meta, true);
+  assert!(
+    !has(&pj, "TagX"),
+    "the '*'-keyed first object is overwritten"
+  );
+  assert_eq!(find(&pj, "TagY").2, TagValue::Str("2".into()));
+  assert!(
+    !has(&pj, "SourceFile"),
+    "the auto-default '*' SourceFile is skipped (JSON.pm:165)"
+  );
+}
+
+#[test]
+fn json_array_sourcefile_keys_iterate_sorted() {
+  // [{SourceFile:b,y:2},{SourceFile:a,x:1}] -> sorted key order visits a.jpg
+  // BEFORE b.jpg regardless of document order, so TagX (a.jpg) flattens first.
+  // (Verifies `sort keys %database`, JSON.pm:161.)
+  let meta = json_box_meta(br#"[{"SourceFile":"b.jpg","y":2},{"SourceFile":"a.jpg","x":1}]"#);
+  let pj = render(&meta, true);
+  let names: Vec<&str> = pj
+    .iter()
+    .filter(|(g, ..)| g == GROUP_JSON)
+    .map(|(_, n, _)| n.as_str())
+    .collect();
+  let x = names.iter().position(|n| *n == "TagX");
+  let y = names.iter().position(|n| *n == "TagY");
+  assert!(
+    x.is_some() && y.is_some(),
+    "both objects survive: {names:?}"
+  );
+  assert!(
+    x < y,
+    "a.jpg sorts before b.jpg, so TagX precedes TagY: {names:?}"
+  );
+}
+
+#[test]
+fn json_array_same_sourcefile_overwrites() {
+  // [{SourceFile:a,x:1},{SourceFile:a,y:2}] -> same database key 'a.jpg', so
+  // the second object OVERWRITES the first: TagX gone, only TagY (+ the
+  // explicit SourceFile a.jpg, which is ≠ '*' so it flattens).
+  let meta = json_box_meta(br#"[{"SourceFile":"a.jpg","x":1},{"SourceFile":"a.jpg","y":2}]"#);
+  let pj = render(&meta, true);
+  assert!(!has(&pj, "TagX"), "same-key object is overwritten");
+  assert_eq!(find(&pj, "TagY").2, TagValue::Str("2".into()));
+  assert_eq!(find(&pj, "SourceFile").2, TagValue::Str("a.jpg".into()));
+}
+
+#[test]
+fn json_array_of_scalars_is_unrecognized() {
+  // [1,2,3] -> no HASH element -> $found stays false -> ReadJSON errors ->
+  // ProcessJSON returns 0 -> the Unrecognized-box warning, no JSON tags.
+  let meta = json_box_meta(br#"[1,2,3]"#);
+  assert!(
+    render(&meta, true).iter().all(|(g, ..)| g != GROUP_JSON),
+    "a scalar-only array emits no JSON tags"
+  );
+  assert!(
+    meta
+      .warnings()
+      .iter()
+      .any(|w| w.message() == "Unrecognized C2PATest box"),
+    "expected the Unrecognized-box warning, got {:?}",
+    meta.warnings()
+  );
+}
+
+#[test]
+fn json_array_mixed_scalar_and_object_keeps_the_object() {
+  // [1,{x:5}] -> the scalar 1 is skipped (next unless ref eq HASH); the object
+  // defaults to '*' -> JSON:TagX=5.
+  let meta = json_box_meta(br#"[1,{"x":5}]"#);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagX").2, TagValue::Str("5".into()));
+}
+
+#[test]
+fn json_single_object_explicit_sourcefile_flattens_it() {
+  // A single (non-array) object with an EXPLICIT SourceFile (≠ '*') flattens it
+  // to JSON:SourceFile (ReadJSON wraps {…} as [{…}]; the value is not '*').
+  let meta = json_box_meta(br#"{"SourceFile":"z.jpg","x":1}"#);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "SourceFile").2, TagValue::Str("z.jpg".into()));
+  assert_eq!(find(&pj, "TagX").2, TagValue::Str("1".into()));
+}
+
+#[test]
+fn json_single_object_star_and_case_insensitive_sourcefile_are_dropped() {
+  // An explicit '*' SourceFile is skipped (JSON.pm:165).
+  let star = json_box_meta(br#"{"SourceFile":"*","x":1}"#);
+  let star_pj = render(&star, true);
+  assert!(!has(&star_pj, "SourceFile"), "explicit '*' is skipped");
+  assert_eq!(find(&star_pj, "TagX").2, TagValue::Str("1".into()));
+  // A case-insensitive `sourcefile` key (no exact SourceFile) is RENAMED to
+  // SourceFile and its original key REMOVED, so it does NOT flatten at all.
+  let ci = json_box_meta(br#"{"sourcefile":"q.jpg","x":1}"#);
+  let ci_pj = render(&ci, true);
+  assert!(
+    !has(&ci_pj, "SourceFile") && !has(&ci_pj, "Sourcefile"),
+    "a renamed case-insensitive sourcefile key flattens to nothing: {ci_pj:?}"
+  );
+  assert_eq!(find(&ci_pj, "TagX").2, TagValue::Str("1".into()));
+}
+
+// ── Phase 2: `Import::ReadJSON` base64 string decoding (Import.pm:227-229) ────
+
+#[test]
+fn json_base64_text_value_is_decoded() {
+  // 'base64:SGk=' (len 11, %4==3) decodes to "Hi" (oracle: JSON:TagV "Hi").
+  let meta = json_box_meta(br#"{"v":"base64:SGk="}"#);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagV").2, TagValue::Str("Hi".into()));
+  // A longer body: 'base64:SGVsbG8=' (len 15, %4==3) -> "Hello".
+  let meta2 = json_box_meta(br#"{"v":"base64:SGVsbG8="}"#);
+  assert_eq!(
+    find(&render(&meta2, true), "TagV").2,
+    TagValue::Str("Hello".into())
+  );
+}
+
+#[test]
+fn json_base64_binary_value_renders_as_question_marks() {
+  // 'base64:/v0=' (len 11, %4==3) decodes to the bytes FE FD (invalid UTF-8);
+  // bundled's JSON FixUTF8 renders them as "??" (0x3F 0x3F), top-level AND in a
+  // nested struct (oracle-verified both paths).
+  let meta = json_box_meta(br#"{"v":"base64:/v0="}"#);
+  assert_eq!(
+    find(&render(&meta, true), "TagV").2,
+    TagValue::Str("??".into())
+  );
+  let nested = json_box_meta(br#"{"outer":{"v":"base64:/v0="}}"#);
+  assert_eq!(
+    find(&render(&nested, true), "Outer").2,
+    TagValue::Map(vec![("v".into(), TagValue::Str("??".into()))])
+  );
+}
+
+#[test]
+fn json_base64_non_matching_length_stays_literal() {
+  // The length rule `% 4 == 3` is on the WHOLE string. 'base64:QQ=' has length
+  // 10 (%4==2) -> does NOT decode -> the literal string passes through.
+  let meta = json_box_meta(br#"{"v":"base64:QQ="}"#);
+  assert_eq!(
+    find(&render(&meta, true), "TagV").2,
+    TagValue::Str("base64:QQ=".into())
+  );
+  // The length rule passes (`base64:a@bc` = 11, %4==3) but the '@' breaks the
+  // `[A-Za-z0-9+/]*={0,2}` body form -> NOT decoded, the literal passes through.
+  let meta2 = json_box_meta(br#"{"v":"base64:a@bc"}"#);
+  assert_eq!(
+    find(&render(&meta2, true), "TagV").2,
+    TagValue::Str("base64:a@bc".into())
+  );
+}
+
+// ── Phase 2: the SourceFile database key is the RAW (pre-FixUTF8) bytes ───────
+// (Import.pm:301 keys %database on the raw decoded SourceFile scalar — base64-
+//  decoded, but BEFORE FixUTF8, which is an OUTPUT concern). Early normalization
+//  would collapse two DISTINCT raw keys that share a FixUTF8 rendering and drop
+//  an object. All oracle-verified vs bundled ExifTool 13.59.
+
+#[test]
+fn json_array_sourcefile_raw_byte_keys_do_not_collide() {
+  // [{SourceFile:'base64:/v0=',x:1},{SourceFile:'??',y:2}]: the first object's
+  // SourceFile base64-decodes to the RAW bytes FE FD; the second's is the
+  // literal ASCII '??' = 3F 3F. These are DISTINCT raw database keys, so BOTH
+  // objects survive (the pre-fix early-FixUTF8 turned FE FD into '??' too, so
+  // the keys collided and TagX was LOST). Ground-truthed vs bundled 13.59
+  // (`-G1 -j -struct` ⇒ both JSON:TagX=1 AND JSON:TagY=2).
+  let meta = json_box_meta(br#"[{"SourceFile":"base64:/v0=","x":1},{"SourceFile":"??","y":2}]"#);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagX").2, TagValue::Str("1".into()));
+  assert_eq!(find(&pj, "TagY").2, TagValue::Str("2".into()));
+  // Sorted RAW-key order: 3F 3F (the '??' object, with TagY) sorts BEFORE FE FD
+  // (the FE-FD object, with TagX) — 0x3F < 0xFE. Both SourceFile values render
+  // '??' at output (FE FD and 3F 3F both FixUTF8 to '??'). Assert the emitted
+  // JSON sequence pins the raw-byte sort order (TagY before TagX).
+  let names: Vec<&str> = pj
+    .iter()
+    .filter(|(g, ..)| g == GROUP_JSON)
+    .map(|(_, n, _)| n.as_str())
+    .collect();
+  let y = names.iter().position(|n| *n == "TagY");
+  let x = names.iter().position(|n| *n == "TagX");
+  assert!(
+    y < x,
+    "raw key 3F 3F (TagY) sorts before FE FD (TagX): {names:?}"
+  );
+  // Each surviving object flattens its explicit SourceFile, both rendering '??'
+  // (the FE-FD object's via FixUTF8 at flatten, the literal object's verbatim).
+  let sources: Vec<&TagValue> = pj
+    .iter()
+    .filter(|(g, n, _)| g == GROUP_JSON && n == "SourceFile")
+    .map(|(_, _, v)| v)
+    .collect();
+  assert_eq!(
+    sources,
+    vec![&TagValue::Str("??".into()), &TagValue::Str("??".into())],
+    "both objects' SourceFile values render '??' after FixUTF8"
+  );
+}
+
+#[test]
+fn json_array_base64_and_literal_decoding_to_same_bytes_collide() {
+  // The KEY is the base64-DECODED bytes, so a base64 value that decodes to the
+  // SAME bytes as a literal value DOES collide. 'base64:Pz8=' decodes to 3F 3F
+  // = the literal '??', so both objects key on 3F 3F -> the LAST (y) overwrites
+  // the first (x). Ground-truthed vs bundled 13.59 (`-G1 -j` ⇒ only JSON:TagY=2
+  // + JSON:SourceFile '??'; TagX gone). Proves the key is the DECODED raw bytes,
+  // not the `base64:` lexeme.
+  let meta = json_box_meta(br#"[{"SourceFile":"base64:Pz8=","x":1},{"SourceFile":"??","y":2}]"#);
+  let pj = render(&meta, true);
+  assert!(
+    !has(&pj, "TagX"),
+    "base64:Pz8= decodes to 3F 3F = '??', colliding with the literal -> TagX overwritten"
+  );
+  assert_eq!(find(&pj, "TagY").2, TagValue::Str("2".into()));
+  assert_eq!(find(&pj, "SourceFile").2, TagValue::Str("??".into()));
+}
+
+#[test]
+fn json_array_duplicate_tag_across_sorted_raw_keys_last_wins() {
+  // Two objects with DISTINCT raw SourceFile keys (FE FD via base64, vs the
+  // literal 'a.jpg') BOTH emit a `dup` tag. They flatten in sorted raw-key
+  // order — 'a.jpg' (61 2E...) sorts BEFORE FE FD — so `dup`=first then `dup`=
+  // second in the stream; the downstream TagMap last-wins keeps the LAST (the
+  // FE-FD object's value). Pins both the raw-byte sort order AND the last-wins
+  // across sorted raw keys (oracle: bundled 13.59 prints the FE-FD object's
+  // `dup` last, so `-j` last-wins keeps "fromfefd").
+  let meta = json_box_meta(
+    br#"[{"SourceFile":"base64:/v0=","dup":"fromfefd"},{"SourceFile":"a.jpg","dup":"froma"}]"#,
+  );
+  let pj = render(&meta, true);
+  let dups: Vec<&TagValue> = pj
+    .iter()
+    .filter(|(g, n, _)| g == GROUP_JSON && n == "Dup")
+    .map(|(_, _, v)| v)
+    .collect();
+  // 'a.jpg' (0x61...) sorts before FE FD, so the sequence is [froma, fromfefd].
+  assert_eq!(
+    dups,
+    vec![
+      &TagValue::Str("froma".into()),
+      &TagValue::Str("fromfefd".into())
+    ],
+    "duplicate `dup` flattens in sorted raw-key order [a.jpg, FE FD]; TagMap then last-wins fromfefd"
+  );
+}
+
+// ── Phase 2: `\uHHHH` surrogate / BMP escape decoding (Import.pm:224) ─────────
+
+/// Wrap a `\u`-escape body (the bytes BETWEEN the value quotes) into a json doc
+/// `{"v":"<body>"}`. Built byte-wise so a literal backslash-u stays a JSON
+/// escape (not a Rust one).
+fn json_uesc_doc(body: &[u8]) -> Vec<u8> {
+  [br#"{"v":""#.as_slice(), body, br#""}"#.as_slice()].concat()
+}
+
+#[test]
+fn json_unicode_escapes_match_to_utf8_then_fixutf8() {
+  // The `\uHHHH` escape bodies are spelled as explicit ASCII bytes so they
+  // stay JSON escapes (a Rust `\u` literal would be interpreted at compile).
+  // `é` = the 6 bytes below.
+  let bmp = json_box_meta(&json_uesc_doc(b"\\u00e9"));
+  // A BMP escape é -> the proper UTF-8 for é (C3 A9).
+  assert_eq!(
+    find(&render(&bmp, true), "TagV").2,
+    TagValue::Str("\u{00e9}".into())
+  );
+  // `😀` (what a JSON encoder emits for 😀) is NOT combined into
+  // U+1F600: ExifTool encodes each surrogate half independently (ToUTF8 -> two
+  // 3-byte WTF-8 sequences = 6 invalid bytes), then FixUTF8 renders them as six
+  // '?' (oracle-verified vs bundled 13.59).
+  let pair = json_box_meta(&json_uesc_doc(b"\\uD83D\\uDE00"));
+  assert_eq!(
+    find(&render(&pair, true), "TagV").2,
+    TagValue::Str("??????".into())
+  );
+  // A LONE surrogate `\uD83D` -> one 3-byte WTF-8 sequence -> three '?'.
+  let lone = json_box_meta(&json_uesc_doc(b"\\uD83D"));
+  assert_eq!(
+    find(&render(&lone, true), "TagV").2,
+    TagValue::Str("???".into())
+  );
+}
+
+#[test]
+fn json_unicode_escape_then_single_char_escape_ordering() {
+  // ExifTool runs the \uHHHH substitution BEFORE the \(.) one, both global:
+  // `\` becomes a literal backslash in pass 1, which pass 2 then pairs
+  // with the following 'n' -> a NEWLINE (0x0A). (Import.pm:224 then :225;
+  // oracle-verified vs bundled 13.59: `\n` -> the single byte 0x0A.)
+  let meta = json_box_meta(&json_uesc_doc(b"\\u005cn"));
+  assert_eq!(
+    find(&render(&meta, true), "TagV").2,
+    TagValue::Str("\n".into())
+  );
+}
