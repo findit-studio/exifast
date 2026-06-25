@@ -1190,3 +1190,714 @@ fn json_unicode_escape_then_single_char_escape_ordering() {
     TagValue::Str("\n".into())
   );
 }
+
+// ── Phase 3: the `cbor` content decoder (`CBOR::Main` / `ProcessCBOR`) ────────
+// All oracle-verified vs bundled ExifTool 13.59 (see the
+// `png_cabx_cbor_conformance` golden + the `tools/gen_jumbf_fixtures.py`
+// `PNG_cabx_cbor.png` fixture).
+
+/// The CBOR content type-UUID: ASCII `cbor` then the fixed JUMBF tail.
+fn cbor_uuid() -> Vec<u8> {
+  let mut v = b"cbor".to_vec();
+  v.extend_from_slice(&[
+    0x00, 0x11, 0x00, 0x10, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+  ]);
+  v
+}
+
+/// Build a `jumb -> jumd(label) + cbor{doc}` caBX box stream and decode it.
+fn cbor_box_meta(doc: &[u8]) -> JumbfMeta {
+  let jumd = jumd_content(&cbor_uuid(), 0x03, Some("c2pa.test"), None);
+  let inner = [box_bytes(b"jumd", &jumd), box_bytes(b"cbor", doc)].concat();
+  process(&box_bytes(b"jumb", &inner))
+}
+
+/// CBOR initial byte + minimal big-endian argument for a non-negative count.
+fn cbor_head(major: u8, n: u64) -> Vec<u8> {
+  if n < 24 {
+    vec![(major << 5) | n as u8]
+  } else if n < 0x100 {
+    vec![(major << 5) | 24, n as u8]
+  } else if n < 0x10000 {
+    let mut v = vec![(major << 5) | 25];
+    v.extend_from_slice(&(n as u16).to_be_bytes());
+    v
+  } else if n < 0x1_0000_0000 {
+    let mut v = vec![(major << 5) | 26];
+    v.extend_from_slice(&(n as u32).to_be_bytes());
+    v
+  } else {
+    let mut v = vec![(major << 5) | 27];
+    v.extend_from_slice(&n.to_be_bytes());
+    v
+  }
+}
+
+/// A CBOR text string (major 3).
+fn cbor_text(s: &str) -> Vec<u8> {
+  let mut v = cbor_head(3, s.len() as u64);
+  v.extend_from_slice(s.as_bytes());
+  v
+}
+
+/// A one-key CBOR map `{ key: value }` (major 5).
+fn cbor_map1(key: &str, value: &[u8]) -> Vec<u8> {
+  let mut v = cbor_head(5, 1);
+  v.extend_from_slice(&cbor_text(key));
+  v.extend_from_slice(value);
+  v
+}
+
+#[test]
+fn cbor_group_is_jumbf_family0_cbor_family1() {
+  // `CBOR::Main` GROUPS => { 0 => 'JUMBF', 1 => 'CBOR' } (CBOR.pm:64): the tags
+  // emit family-0 JUMBF, family-1 CBOR (the -G1 prefix).
+  let meta = cbor_box_meta(&cbor_map1("count", &cbor_head(0, 42)));
+  let mode = ConvMode::from_print_conv(true);
+  let tag = meta
+    .tags(EmitOptions::g1(mode, false))
+    .find(|t| t.tag().name() == "Count")
+    .expect("Count tag present");
+  assert_eq!(tag.tag().group_ref().family0(), GROUP_CBOR_FAMILY0);
+  assert_eq!(tag.tag().group_ref().family1(), GROUP_CBOR);
+  assert_eq!(tag.tag().value_ref(), &TagValue::U64(42));
+}
+
+#[test]
+fn cbor_negative_int_minus_one_times_num_quirk() {
+  // The faithful ExifTool quirk (CBOR.pm:121): wire -7 (major-1 arg 6) decodes
+  // to -1 * 6 = -6, NOT the RFC -7. And -1 (arg 0) -> 0, -2 (arg 1) -> -1.
+  let neg7 = cbor_box_meta(&cbor_map1("neg", &cbor_head(1, 6)));
+  assert_eq!(find(&render(&neg7, true), "Neg").2, TagValue::I64(-6));
+  // arg 0 -> -1 * 0 = 0, which at TOP level inside a map is still emitted (not
+  // the padding-stop, which only applies to a BARE top-level 0 value).
+  let negm1 = cbor_box_meta(&cbor_map1("neg", &cbor_head(1, 0)));
+  assert_eq!(find(&render(&negm1, true), "Neg").2, TagValue::I64(0));
+}
+
+#[test]
+fn cbor_predefined_names_override_legalization() {
+  // `dc:title` -> Title, `dc:format` -> Format, `thumbnailUrl` -> ThumbnailURL,
+  // `instanceID` -> InstanceID (CBOR.pm:72-82). An UNKNOWN key legalizes via the
+  // shared JSON path (colon -> underscore, ucfirst).
+  let meta = cbor_box_meta(
+    &[
+      cbor_head(5, 3),
+      cbor_text("dc:title"),
+      cbor_text("A Title"),
+      cbor_text("thumbnailUrl"),
+      cbor_text("http://x"),
+      cbor_text("xyz:foo"),
+      cbor_text("v"),
+    ]
+    .concat(),
+  );
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "Title").2, TagValue::Str("A Title".into()));
+  assert!(has(&pj, "ThumbnailURL"));
+  // The unknown colon key -> Xyz_foo (the JSON-shared legalizer).
+  assert!(has(&pj, "Xyz_foo"));
+}
+
+#[test]
+fn cbor_byte_string_renders_as_binary_placeholder() {
+  // A major-2 byte string -> a scalar reference -> the `(Binary data N bytes …)`
+  // placeholder, in BOTH modes (no PrintConv).
+  let mut bytes = cbor_head(2, 4);
+  bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+  let meta = cbor_box_meta(&cbor_map1("raw", &bytes));
+  for pc in [true, false] {
+    assert_eq!(
+      find(&render(&meta, pc), "Raw").2,
+      TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+      "byte string is the placeholder in mode pc={pc}"
+    );
+  }
+}
+
+#[test]
+fn cbor_half_float_reproduces_the_buggy_formula() {
+  // Wire half 0x3c00 (true IEEE 1.0) -> ($mant+1024) ** ($exp-25) = 1024**-10 ≈
+  // 7.8886e-31 (CBOR.pm:237-248). Build major-7 ai-25 + the 2 BE bits.
+  let mut half = vec![0xf9u8];
+  half.extend_from_slice(&0x3c00u16.to_be_bytes());
+  let meta = cbor_box_meta(&cbor_map1("half", &half));
+  let v = find(&render(&meta, true), "Half").2.clone();
+  match v {
+    TagValue::F64(f) => assert!(
+      (f - 1024f64.powi(-10)).abs() < 1e-40,
+      "half-float buggy decode mismatch: {f}"
+    ),
+    other => panic!("expected F64, got {other:?}"),
+  }
+  // The subnormal 0x0000 (exp=0, mant=0) -> 0 ** -24 = +Inf. (A single-char key
+  // would get the `Tag` prefix, so use a >=2-char key to test the value path.)
+  let mut zero = vec![0xf9u8];
+  zero.extend_from_slice(&0u16.to_be_bytes());
+  let meta0 = cbor_box_meta(&cbor_map1("hzero", &zero));
+  match find(&render(&meta0, true), "Hzero").2 {
+    TagValue::F64(f) => assert!(f.is_infinite() && f > 0.0, "0x0000 half -> +Inf, got {f}"),
+    ref other => panic!("expected F64 Inf, got {other:?}"),
+  }
+}
+
+#[test]
+fn cbor_simple_values_false_true_null() {
+  // major-7 args 20/21/22 -> false / true / the literal "null" string.
+  let meta = cbor_box_meta(
+    &[
+      cbor_head(5, 3),
+      cbor_text("a"),
+      vec![0xf4], // false
+      cbor_text("b"),
+      vec![0xf5], // true
+      cbor_text("c"),
+      vec![0xf6], // null
+    ]
+    .concat(),
+  );
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagA").2, TagValue::Bool(false));
+  assert_eq!(find(&pj, "TagB").2, TagValue::Bool(true));
+  assert_eq!(find(&pj, "TagC").2, TagValue::Str("null".into()));
+}
+
+#[test]
+fn cbor_top_level_array_emits_item_tags() {
+  // A top-level array -> Item0, Item1, … (CBOR.pm:294-297). A nested map element
+  // is a -struct Map.
+  let arr = [
+    cbor_head(4, 3),
+    cbor_head(0, 10),
+    cbor_text("hello"),
+    cbor_map1("k", &cbor_text("v")),
+  ]
+  .concat();
+  let meta = cbor_box_meta(&arr);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "Item0").2, TagValue::U64(10));
+  assert_eq!(find(&pj, "Item1").2, TagValue::Str("hello".into()));
+  assert_eq!(
+    find(&pj, "Item2").2,
+    TagValue::Map(vec![("k".into(), TagValue::Str("v".into()))])
+  );
+}
+
+#[test]
+fn cbor_bare_zero_stops_the_loop_other_scalar_ignored() {
+  // A bare top-level 0 (0x00) is padding -> stop, no tag (CBOR.pm:298-300). A
+  // map AFTER it is NOT reached. A bare non-zero scalar is ignored (no tag) but
+  // the loop CONTINUES to a following map.
+  let after_zero = [vec![0x00], cbor_map1("a", &cbor_head(0, 1))].concat();
+  let m1 = cbor_box_meta(&after_zero);
+  assert!(
+    render(&m1, true).iter().all(|(g, ..)| g != GROUP_CBOR),
+    "a bare 0 stops the loop, the trailing map is not read"
+  );
+  // A bare scalar 5 then a map: the scalar is ignored, the map IS read.
+  let after_scalar = [cbor_head(0, 5), cbor_map1("a", &cbor_head(0, 1))].concat();
+  let m2 = cbor_box_meta(&after_scalar);
+  assert_eq!(find(&render(&m2, true), "TagA").2, TagValue::U64(1));
+}
+
+#[test]
+fn cbor_two_top_level_maps_both_flatten() {
+  // ProcessCBOR loops over top-level values (CBOR.pm:287); two concatenated maps
+  // both flatten.
+  let two = [
+    cbor_map1("a", &cbor_head(0, 1)),
+    cbor_map1("b", &cbor_head(0, 2)),
+  ]
+  .concat();
+  let meta = cbor_box_meta(&two);
+  let pj = render(&meta, true);
+  assert_eq!(find(&pj, "TagA").2, TagValue::U64(1));
+  assert_eq!(find(&pj, "TagB").2, TagValue::U64(2));
+}
+
+#[test]
+fn cbor_nested_empty_array_preserved_top_level_empty_array_skipped() {
+  // A nested empty array inside a struct value is preserved as `[]`; a TOP-LEVEL
+  // key whose value is an empty array emits NO tag (CBOR.pm via JSON.pm:105-108).
+  let nested = cbor_map1(
+    "outer",
+    &[cbor_head(5, 1), cbor_text("tags"), cbor_head(4, 0)].concat(),
+  );
+  let m1 = cbor_box_meta(&nested);
+  assert_eq!(
+    find(&render(&m1, true), "Outer").2,
+    TagValue::Map(vec![("tags".into(), TagValue::List(vec![]))])
+  );
+  // Top-level empty-array value -> skipped.
+  let top_empty = cbor_map1("tags", &cbor_head(4, 0));
+  let m2 = cbor_box_meta(&top_empty);
+  assert!(
+    !has(&render(&m2, true), "Tags"),
+    "a top-level empty-array value emits no tag"
+  );
+}
+
+#[test]
+fn cbor_tag0_date_string_through_convert_xmp_date() {
+  // tag 0 + a text date -> ConvertXMPDate (CBOR.pm:213-215), a locale-independent
+  // string reformat: ISO `2021-06-15T12:30:45Z` -> `2021:06:15 12:30:45Z`.
+  let tagged = [cbor_head(6, 0), cbor_text("2021-06-15T12:30:45Z")].concat();
+  let meta = cbor_box_meta(&cbor_map1("created", &tagged));
+  assert_eq!(
+    find(&render(&meta, true), "Created").2,
+    TagValue::Str("2021:06:15 12:30:45Z".into())
+  );
+}
+
+#[test]
+fn cbor_cose_sign1_tag_stays_opaque_placeholder() {
+  // A COSE_Sign1 tag(18) wrapping a byte string: the tag is TRANSPARENT (no
+  // conversion), the wrapped bytes render as the placeholder — OPAQUE, no crypto.
+  let mut blob = cbor_head(2, 4);
+  blob.extend_from_slice(&[0x84, 0xa0, 0xa0, 0xf6]);
+  let tagged = [cbor_head(6, 18), blob].concat();
+  let meta = cbor_box_meta(&cbor_map1("signature", &tagged));
+  assert_eq!(
+    find(&render(&meta, true), "Signature").2,
+    TagValue::Bytes(vec![0x84, 0xa0, 0xa0, 0xf6])
+  );
+}
+
+#[test]
+fn cbor_c2pa_case_hack_top_level_key() {
+  // `c2pa.manifest` -> C2PAmanifest (the s/^c2pa/C2PA/i hack via the shared
+  // JSON legalizer, CBOR uses the same FoundTag path).
+  let meta = cbor_box_meta(&cbor_map1("c2pa.manifest", &cbor_text("urn:c2pa:abc")));
+  assert!(has(&render(&meta, true), "C2PAmanifest"));
+}
+
+#[test]
+fn cbor_integer_map_key_stringified() {
+  // A COSE-style integer map key: top-level int key 1 -> Tag1 (MakeTagName
+  // prefixes a digit-leading name); a NESTED int key -> the raw stringified key.
+  let int_key = [cbor_head(5, 1), cbor_head(0, 1), cbor_text("alg")].concat();
+  let m1 = cbor_box_meta(&int_key);
+  assert_eq!(
+    find(&render(&m1, true), "Tag1").2,
+    TagValue::Str("alg".into())
+  );
+  // Nested int key inside a kept map.
+  let nested = cbor_map1(
+    "headers",
+    &[cbor_head(5, 1), cbor_head(0, 1), cbor_text("inner")].concat(),
+  );
+  let m2 = cbor_box_meta(&nested);
+  assert_eq!(
+    find(&render(&m2, true), "Headers").2,
+    TagValue::Map(vec![("1".into(), TagValue::Str("inner".into()))])
+  );
+}
+
+#[test]
+fn cbor_indefinite_length_array_map_string() {
+  // Indefinite-length array (0x9f…0xff), map (0xbf…0xff), and text string
+  // (0x7f<chunks>0xff) all decode (CBOR.pm:101-103/:127-136/:175-177).
+  let ind_arr = [vec![0x9f], cbor_head(0, 1), cbor_head(0, 2), vec![0xff]].concat();
+  let ind_str = [vec![0x7f], cbor_text("Hel"), cbor_text("lo"), vec![0xff]].concat();
+  let meta = cbor_box_meta(
+    &[
+      cbor_head(5, 2),
+      cbor_text("arr"),
+      ind_arr,
+      cbor_text("str"),
+      ind_str,
+    ]
+    .concat(),
+  );
+  let pj = render(&meta, true);
+  assert_eq!(
+    find(&pj, "Arr").2,
+    TagValue::List(vec![TagValue::U64(1), TagValue::U64(2)])
+  );
+  assert_eq!(find(&pj, "Str").2, TagValue::Str("Hello".into()));
+}
+
+#[test]
+fn cbor_truncated_item_warns_not_panics() {
+  // A truncated string / integer / an invalid type must surface the bundled
+  // CBOR error string as a warning, never a panic (CBOR.pm:289 $et->Warn).
+  let cases: &[(&[u8], &str)] = &[
+    // text(3) declared but only 2 bytes present.
+    (
+      &[0xa1, 0x63, b'b', b'a', b'd', 0x63, 0x41, 0x42],
+      "Truncated CBOR string value",
+    ),
+    // int32 (0x1a) follow-on bytes truncated.
+    (
+      &[0xa1, 0x61, b'x', 0x1a, 0x00],
+      "Truncated CBOR integer value",
+    ),
+    // invalid integer type 28 (0x1c).
+    (&[0xa1, 0x61, b'x', 0x1c], "Invalid CBOR integer type 28"),
+  ];
+  for (doc, want) in cases {
+    let meta = cbor_box_meta(doc);
+    let _ = render(&meta, true); // must not panic
+    assert!(
+      meta.warnings().iter().any(|w| w.message() == *want),
+      "doc {doc:?} should warn {want:?}, got {:?}",
+      meta.warnings()
+    );
+  }
+}
+
+#[test]
+fn cbor_deeply_nested_is_depth_bounded_not_a_panic() {
+  // A pathologically deep array must not overflow the recursive reader's stack:
+  // it fails at the budget with the depth-guard warning (no panic).
+  let depth = super::cbor::tests_max_depth() + 50;
+  let doc: Vec<u8> = std::iter::repeat_n(0x81u8, depth) // array(1) repeated
+    .chain(std::iter::once(0x00u8)) // an innermost 0
+    .collect();
+  let meta = cbor_box_meta(&doc);
+  let _ = render(&meta, true); // must not panic
+  assert!(
+    !meta.warnings().is_empty(),
+    "a depth-exceeding CBOR document should warn"
+  );
+}
+
+#[test]
+fn cbor_truncated_top_level_data_is_empty() {
+  // An EMPTY cbor box (no data) -> the while loop never runs -> no tags, no
+  // warning (pos == end immediately). A 1-byte truncated header at top level
+  // warns Truncated CBOR data only if it tries to read a follow-on.
+  let empty = cbor_box_meta(&[]);
+  assert!(render(&empty, true).iter().all(|(g, ..)| g != GROUP_CBOR));
+  assert!(empty.warnings().is_empty(), "empty cbor box is silent");
+}
+
+/// A CBOR byte string (major 2) carrying `bytes`.
+fn cbor_bytes(bytes: &[u8]) -> Vec<u8> {
+  let mut v = cbor_head(2, bytes.len() as u64);
+  v.extend_from_slice(bytes);
+  v
+}
+
+#[test]
+fn cbor_nested_indefinite_string_is_depth_bounded_not_a_panic() {
+  // FINDING 1: an indefinite-length string (`0x7f`/`0x5f`) reads each chunk via
+  // a GENERIC recursion (CBOR.pm:129); a crafted payload of NESTED indefinite
+  // strings recurses one frame per level. The beyond-faithful MAX_CBOR_DEPTH
+  // guard (the same the array/map/tag branches apply) must bound it so the bomb
+  // fails at the cap with a warning instead of overflowing the stack.
+  let depth = super::cbor::tests_max_depth() + 50;
+  // `depth` nested indefinite TEXT strings (0x7f), an innermost definite text,
+  // then `depth` break bytes (0xff). Past the cap the reader stops with a warn.
+  let mut ind = std::iter::repeat_n(0x7fu8, depth).collect::<Vec<u8>>();
+  ind.extend_from_slice(&cbor_text("Z"));
+  ind.extend(std::iter::repeat_n(0xffu8, depth));
+  let meta = cbor_box_meta(&cbor_map1("deep", &ind));
+  let _ = render(&meta, true); // must NOT stack-overflow / panic
+  assert!(
+    !meta.warnings().is_empty(),
+    "a nested-indefinite-string bomb must be depth-bounded (warn, no overflow)"
+  );
+  // And a VALID indefinite string of definite chunks (one level deep) still
+  // decodes byte-identically (no false positive from the new guard).
+  let ind_ok = [vec![0x7f], cbor_text("Hel"), cbor_text("lo"), vec![0xff]].concat();
+  let ok = cbor_box_meta(&cbor_map1("str", &ind_ok));
+  assert_eq!(
+    find(&render(&ok, true), "Str").2,
+    TagValue::Str("Hello".into())
+  );
+  assert!(
+    ok.warnings().is_empty(),
+    "a valid indefinite string is silent"
+  );
+  // A definite-chunk indefinite BYTE string (0x5f) likewise decodes without a
+  // depth warning (the chunks are flat, one level deep).
+  let ind_b = [
+    vec![0x5f],
+    cbor_bytes(&[0xde, 0xad]),
+    cbor_bytes(&[0xbe, 0xef]),
+    vec![0xff],
+  ]
+  .concat();
+  let okb = cbor_box_meta(&cbor_map1("raw", &ind_b));
+  assert_eq!(
+    find(&render(&okb, true), "Raw").2,
+    TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+  );
+  assert!(
+    okb.warnings().is_empty(),
+    "a valid indefinite byte string is silent"
+  );
+}
+
+#[test]
+fn cbor_indefinite_string_nonstring_chunk_appends_and_consumes_through_break() {
+  // The indefinite-string loop (CBOR.pm:128-134) does `$string .= $val` for EACH
+  // chunk and `last` ONLY on the break — it does NOT verify a chunk was a string
+  // (the CBOR.pm:132 comment), so a non-string chunk is APPENDED (its
+  // stringification) and the loop CONSUMES THROUGH the break. Breaking early
+  // instead would (a) truncate the string AND (b) leave the remaining chunks +
+  // the 0xff break to be misread as TOP-LEVEL data, silently dropping a following
+  // top-level map (a desync). Crafted: an indefinite TEXT string
+  // [0x7f, uint(1), text('x'), break] under key "v" (legalized -> TagV), then a
+  // SECOND top-level map {follow: 99}. Oracle (bundled 13.59, `-G1 -j -struct`):
+  // CBOR:TagV = "1x" AND CBOR:Follow = 99 (the following map IS still read — no
+  // desync, no warning).
+  let indef = [vec![0x7f], cbor_head(0, 1), cbor_text("x"), vec![0xff]].concat();
+  let doc = [
+    cbor_map1("v", &indef),
+    cbor_map1("follow", &cbor_head(0, 99)),
+  ]
+  .concat();
+  let meta = cbor_box_meta(&doc);
+  let pj = render(&meta, true);
+  // (a) the uint(1) chunk stringifies to "1", concatenated with "x" -> "1x".
+  assert_eq!(
+    find(&pj, "TagV").2,
+    TagValue::Str("1x".into()),
+    "a non-string (uint 1) chunk is appended as its decimal, not truncated"
+  );
+  // (b) THE FOLLOWING TOP-LEVEL MAP IS STILL EMITTED — proves the loop consumed
+  // through the break (no desync / silent data loss).
+  assert_eq!(
+    find(&pj, "Follow").2,
+    TagValue::U64(99),
+    "the map after the indefinite string must still be read (no top-level desync)"
+  );
+  assert!(
+    meta.warnings().is_empty(),
+    "ExifTool appends-and-continues here without a warning"
+  );
+  // A NEGATIVE-int chunk takes the `-1*num` quirk: wire nint arg 6 -> -6, so
+  // [0x7f, nint(6), text('y'), break] -> "-6y" (oracle: bundled 13.59 => "-6y").
+  let indn = [vec![0x7f], cbor_head(1, 6), cbor_text("y"), vec![0xff]].concat();
+  let dn = [
+    cbor_map1("v", &indn),
+    cbor_map1("follow", &cbor_head(0, 99)),
+  ]
+  .concat();
+  let pn = render(&cbor_box_meta(&dn), true);
+  assert_eq!(find(&pn, "TagV").2, TagValue::Str("-6y".into()));
+  assert_eq!(find(&pn, "Follow").2, TagValue::U64(99));
+}
+
+#[test]
+fn cbor_indefinite_string_missing_break_is_bounded_and_warns() {
+  // A truncated indefinite string with NO break ([0x7f, text('Hel')] running to
+  // the box end) must be BOUNDED — the next `read_value` hits EOF and returns
+  // `Err("Truncated CBOR data")` (no infinite loop), which the top-level loop
+  // surfaces as the outcome warning. Oracle (bundled 13.59): ExifTool:Warning =
+  // "Truncated CBOR data".
+  let indef = [vec![0x7f], cbor_text("Hel")].concat();
+  let meta = cbor_box_meta(&cbor_map1("trunc", &indef));
+  let _ = render(&meta, true); // must terminate (no hang) and not panic
+  assert!(
+    meta
+      .warnings()
+      .iter()
+      .any(|w| w.message() == "Truncated CBOR data"),
+    "a missing-break indefinite string is bounded and warns: {:?}",
+    meta.warnings()
+  );
+}
+
+#[test]
+fn cbor_tag1_fractional_epoch_uses_six_fixed_digits() {
+  // FINDING 2: tag-1 (epoch date) with a FRACTIONAL float uses ConvertUnixTime(
+  // $val, 1, 6) = SIX fixed fractional digits (CBOR.pm:218-219). The localtime
+  // TZ suffix is OS-dependent, so assert the byte-exact `.500000` fraction +
+  // the `±HH:MM` shape (oracle: TZ=UTC bundled 13.59 => `…:30.500000+00:00`).
+  let mut val = vec![0xfbu8]; // major-7 ai-27 (double)
+  val.extend_from_slice(&1_234_567_890.5f64.to_be_bytes());
+  let frac = cbor_box_meta(&cbor_map1("created", &[cbor_head(6, 1), val].concat()));
+  let v = find(&render(&frac, true), "Created").2.clone();
+  match v {
+    TagValue::Str(s) => {
+      assert!(
+        s.contains(":31:30.500000"),
+        "fractional tag-1 epoch must keep the fixed 6-digit `.500000`: {s}"
+      );
+      let b = s.as_bytes();
+      assert!(
+        b.last() == Some(&b'0') || s.ends_with(|c: char| c.is_ascii_digit()),
+        "tag-1 local render ends with the tz digits: {s}"
+      );
+      assert!(s.contains('+') || s.contains('-'), "missing tz sign: {s}");
+    }
+    other => panic!("expected a date string, got {other:?}"),
+  }
+  // A WHOLE-second float epoch takes the no-`$dec` path (`$val == int($val)` =>
+  // $dec undef) — NO fractional part (regression guard).
+  let mut whole = vec![0xfbu8];
+  whole.extend_from_slice(&1_234_567_890.0f64.to_be_bytes());
+  let w = cbor_box_meta(&cbor_map1("created", &[cbor_head(6, 1), whole].concat()));
+  match find(&render(&w, true), "Created").2.clone() {
+    TagValue::Str(s) => {
+      assert!(s.contains(":31:30"), "whole-second epoch render: {s}");
+      assert!(
+        !s.contains('.'),
+        "a whole-second tag-1 epoch must have NO fraction: {s}"
+      );
+    }
+    other => panic!("expected a date string, got {other:?}"),
+  }
+  // An INTEGER-typed tag-1 epoch is also numeric (Perl IsFloat matches an int
+  // string) but is always whole => no fraction.
+  let int_ts = cbor_box_meta(&cbor_map1(
+    "created",
+    &[cbor_head(6, 1), cbor_head(0, 1_234_567_890)].concat(),
+  ));
+  match find(&render(&int_ts, true), "Created").2.clone() {
+    TagValue::Str(s) => assert!(
+      !s.contains('.'),
+      "an integer tag-1 epoch has no fraction: {s}"
+    ),
+    other => panic!("expected a date string, got {other:?}"),
+  }
+}
+
+#[test]
+fn cbor_tag1_non_finite_float_passes_through_not_a_date() {
+  // `CBOR.pm:217` gates the tag-1 epoch conversion on `IsFloat($val)` — a regex
+  // (`ExifTool.pm:5947`) on the STRINGIFIED scalar. A non-finite double FAILS
+  // it (Perl stringifies them as `Inf`/`-Inf`/`NaN`, none matching the regex),
+  // so bundled 13.59 leaves them UNCONVERTED — the bare major-7 double, rendered
+  // as `TagValue::F64` (the canonical `Inf`/`-Inf`/`NaN` strings). Oracle
+  // (`perl -Ilib`): `IsFloat(9**9**9)` / `IsFloat(-9**9**9)` / `IsFloat(NaN)`
+  // are all FALSE => pass-through. WITHOUT the `is_finite` guard, `NaN` would
+  // reach `convert_unix_time_local_frac_f64` and fabricate a bogus `aN`-suffixed
+  // date; `±Inf` would saturate through the helper. Build a tag(1) wrapping each
+  // double via major-7 ai-27 (`0xfb`).
+  for (label, bits) in [
+    ("NaN", f64::NAN),
+    ("Inf", f64::INFINITY),
+    ("-Inf", f64::NEG_INFINITY),
+  ] {
+    let mut val = vec![0xfbu8]; // major-7 ai-27 (double)
+    val.extend_from_slice(&bits.to_be_bytes());
+    let meta = cbor_box_meta(&cbor_map1("created", &[cbor_head(6, 1), val].concat()));
+    for pc in [true, false] {
+      match find(&render(&meta, pc), "Created").2.clone() {
+        // Passes through as the bare double — the SAME `node_to_value` →
+        // `TagValue::F64` path a non-tag-1 major-7 float gets. Its serialized
+        // form is the canonical `Inf`/`-Inf`/`NaN` string (value.rs renders a
+        // non-finite F64 to exactly these, byte-identical to Perl), so it is
+        // NOT a fabricated date.
+        TagValue::F64(f) => {
+          assert!(
+            !f.is_finite(),
+            "tag-1 {label} must stay the non-finite double (pc={pc}), got {f}"
+          );
+          if label == "NaN" {
+            assert!(f.is_nan(), "tag-1 NaN stays NaN (pc={pc}), got {f}");
+          } else if label == "Inf" {
+            assert!(
+              f.is_infinite() && f > 0.0,
+              "tag-1 +Inf stays +Inf (pc={pc})"
+            );
+          } else {
+            assert!(
+              f.is_infinite() && f < 0.0,
+              "tag-1 -Inf stays -Inf (pc={pc})"
+            );
+          }
+        }
+        TagValue::Str(s) => panic!(
+          "tag-1 {label} must NOT be date-converted (CBOR.pm:217 IsFloat gate); \
+           got a string {s:?} (pc={pc})"
+        ),
+        other => panic!("tag-1 {label} must stay the bare double, got {other:?} (pc={pc})"),
+      }
+    }
+  }
+}
+
+#[test]
+fn cbor_bignum_above_u64_renders_as_double_not_a_wrapped_int() {
+  // FINDING 3: a tag-2/3 bignum is `$big = 256*$big + byte` (CBOR.pm:222-223).
+  // Perl keeps an exact integer (UV) up to u64::MAX, then PROMOTES to a double
+  // (NV) — so an oversized bignum renders as a `%.15g` float, NOT a decimal
+  // string and NOT a silently-wrapped integer. Oracle-verified vs bundled 13.59.
+
+  // A 20-byte (160-bit) positive bignum (`0x01` * 20) => 5.73137896992511e+45.
+  let raw20 = [0x01u8; 20];
+  let mut expect_f: f64 = 0.0;
+  for &b in &raw20 {
+    expect_f = 256.0 * expect_f + f64::from(b);
+  }
+  let big = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 2), cbor_bytes(&raw20)].concat(),
+  ));
+  assert_eq!(
+    find(&render(&big, true), "Bignum").2,
+    TagValue::F64(expect_f),
+    "a >128-bit positive bignum is the promoted double (no wrap, no string)"
+  );
+  // tag-3 negates the promoted double.
+  let nbig = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 3), cbor_bytes(&raw20)].concat(),
+  ));
+  assert_eq!(
+    find(&render(&nbig, true), "Bignum").2,
+    TagValue::F64(-expect_f)
+  );
+
+  // A magnitude in the u64..u128 range (9 bytes, 2^72-1) is ALSO a double in
+  // bundled (Perl overflows UV at 2^64) — the old u128 path wrongly kept it an
+  // exact decimal string; assert it is the float now.
+  let nine_ff = [0xffu8; 9];
+  let mut expect9: f64 = 0.0;
+  for &b in &nine_ff {
+    expect9 = 256.0 * expect9 + f64::from(b);
+  }
+  let m9 = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 2), cbor_bytes(&nine_ff)].concat(),
+  ));
+  assert_eq!(find(&render(&m9, true), "Bignum").2, TagValue::F64(expect9));
+
+  // A bignum that FITS u64 stays an EXACT integer (u64::MAX => Uint, the number
+  // gate quotes the >=16-digit decimal — no float).
+  let u64max = [0xffu8; 8];
+  let fits = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 2), cbor_bytes(&u64max)].concat(),
+  ));
+  assert_eq!(
+    find(&render(&fits, true), "Bignum").2,
+    TagValue::U64(u64::MAX)
+  );
+
+  // tag-3 negation boundary: a magnitude of exactly 2^63 maps to i64::MIN
+  // (exact Nint); 2^63 + 1 exceeds i64 => the promoted double.
+  let two63 = (1u64 << 63).to_be_bytes(); // 8 bytes = 2^63
+  let at_min = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 3), cbor_bytes(&two63)].concat(),
+  ));
+  assert_eq!(
+    find(&render(&at_min, true), "Bignum").2,
+    TagValue::I64(i64::MIN)
+  );
+  // 2^63 + 1 (9 bytes) negated => below i64::MIN => double.
+  let two63p1 = ((1u128 << 63) + 1).to_be_bytes(); // 16 bytes, leading zeros
+  let over = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 3), cbor_bytes(&two63p1)].concat(),
+  ));
+  match find(&render(&over, true), "Bignum").2 {
+    TagValue::F64(f) => assert!(
+      f < 0.0 && f.is_finite(),
+      "tag-3 below i64::MIN is a negative double: {f}"
+    ),
+    ref other => panic!("expected F64, got {other:?}"),
+  }
+  // A small positive bignum (2 bytes => 258) stays an exact integer.
+  let small = cbor_box_meta(&cbor_map1(
+    "bignum",
+    &[cbor_head(6, 2), cbor_bytes(&[0x01, 0x02])].concat(),
+  ));
+  assert_eq!(find(&render(&small, true), "Bignum").2, TagValue::U64(258));
+}
