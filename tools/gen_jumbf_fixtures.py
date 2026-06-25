@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Generate the JUMBF / C2PA conformance fixtures for the PNG caBX box-structure
-# port (#142, Phase 1: structure + the jumd description layer + the bfdb/bidb/
-# c2sh binary content).
+# port (#142). Phase 1: structure + the jumd description layer + the bfdb/bidb/
+# c2sh binary content. Phase 2: the `json` content box (PNG_cabx_json.png).
 #
 # A PNG `caBX` chunk (`PNG.pm:343-346`: caBX -> Jpeg2000::Main) carries a JUMBF
 # box stream (ISO-BMFF: 4-byte BE length INCLUDING the 8-byte header, 4-byte
@@ -26,6 +26,17 @@
 #   * PNG_cabx_label_rename.png — jumb -> jumd(label "c2pa.assertions") + bfdb +
 #     c2sh. Exercises the JUMBFLabel rename: bfdb -> C2PAAssertionsType, c2sh ->
 #     C2PAAssertionsSalt (both keeping the Jpeg2000 group).
+#   * PNG_cabx_json.png (Phase 2) — jumb -> jumd(label "c2pa.test", JSON uuid) +
+#     json{...}. A representative C2PA-ish JSON document exercising the JSON::Main
+#     flattening: top-level keys -> JSON:<legalized-key> (ucfirst, the C2PA-case
+#     hack, the `Tag` prefix), a nested object emitted as a -struct Map (raw
+#     inner keys), arrays (of scalars + of objects), string/number(int+float)/
+#     bool/null scalars, and a >15-digit number (quoted by the EscapeJSON gate).
+#     The json box keeps group JSON (the JUMBFLabel rename does NOT touch the
+#     flattened tag names). NOTE: the three Phase-1 fixtures above carry NO `json`
+#     CONTENT box (only a `jumd` whose type-UUID happens to be the (json) UUID),
+#     so their goldens are UNCHANGED by Phase 2 — only this new fixture emits
+#     JSON:* tags.
 #
 # Usage: python3 tools/gen_jumbf_fixtures.py [OUTDIR]  (default: <repo>/tests/fixtures)
 #
@@ -33,6 +44,7 @@
 #   EXIFTOOL=../exiftool/exiftool tools/gen_golden.sh PNG_cabx_jumbf.png
 #   EXIFTOOL=../exiftool/exiftool tools/gen_golden.sh PNG_cabx_binary.png
 #   EXIFTOOL=../exiftool/exiftool tools/gen_golden.sh PNG_cabx_label_rename.png
+#   EXIFTOOL=../exiftool/exiftool tools/gen_golden.sh PNG_cabx_json.png
 import os
 import struct
 import sys
@@ -111,7 +123,42 @@ def main(outdir: str) -> None:
     f3 = cabx_png(box(b"jumb", inner3))
     open(os.path.join(outdir, "PNG_cabx_label_rename.png"), "wb").write(f3)
 
-    print(f"wrote 3 JUMBF fixtures to {outdir}")
+    # 4) JSON content (Phase 2): jumb -> jumd(label "c2pa.test", JSON uuid) +
+    #    json{...}. A representative C2PA-ish document. The byte-exact key order
+    #    is preserved (ExifTool emits in document-key order); the JSON.pm
+    #    flattening + EscapeJSON gate are exercised across every value type.
+    #    Authored as a compact (no-whitespace) UTF-8 byte string so the on-disk
+    #    box is deterministic.
+    json_doc = (
+        b'{'
+        b'"claim_generator":"exifast/1.0",'      # string -> JSON:Claim_generator
+        b'"format":"image/png",'                 # string -> JSON:Format
+        b'"title":"A Title",'                    # spaced string value (quoted)
+        b'"instanceID":"xmp:iid:1234",'          # ucfirst -> JSON:InstanceID
+        b'"thumbnail":{'                         # nested object -> -struct Map
+        b'"format":"image/jpeg",'                #   (raw inner keys, recursive)
+        b'"identifier":"self#jumbf=c2pa.thumb",'
+        b'"width":256,'                          #   nested int  -> bare 256
+        b'"verified":true,'                      #   nested bool -> bare true
+        b'"caption":null'                        #   nested null -> quoted "null"
+        b'},'
+        b'"assertions":[{"label":"c2pa.hash"},{"label":"stds.exif"}],'  # array of objects
+        b'"ingredients":["a","b","c"],'          # array of scalar strings
+        b'"version":2,'                          # integer  -> bare 2
+        b'"score":0.95,'                          # float    -> bare 0.95
+        b'"validated":true,'                      # boolean  -> bare true
+        b'"revoked":false,'                       # boolean  -> bare false
+        b'"signature":null,'                      # null     -> quoted "null"
+        b'"serial":1234567890123456789,'          # >15-digit -> quoted (EscapeJSON gate)
+        b'"c2pa.manifest":"urn:c2pa:abc-123"'     # C2PA-case hack -> JSON:C2PAmanifest
+        b'}'
+    )
+    j4 = jumd_content(JSON_UUID, 0x03, label=b"c2pa.test")
+    inner4 = box(b"jumd", j4) + box(b"json", json_doc)
+    f4 = cabx_png(box(b"jumb", inner4))
+    open(os.path.join(outdir, "PNG_cabx_json.png"), "wb").write(f4)
+
+    print(f"wrote 4 JUMBF fixtures to {outdir}")
 
 
 if __name__ == "__main__":

@@ -1542,7 +1542,16 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// matches bundled byte-exact. Additive — every PRE-EXISTING golden (all PNG +
 /// the five MNG/JNG fixtures) stays byte-identical (`caBX` only fires for a
 /// `caBX` chunk).
-const EXPECTED_ACTIVE_FIXTURES: usize = 634;
+/// 634 → 635 (#142 JUMBF / C2PA, Phase 2: the `json` content decoder,
+/// `JSON::Main` / `ProcessJSON`) adds one crafted caBX-PNG fixture
+/// `PNG_cabx_json.png` (`jumb`->`jumd`(label "c2pa.test") + `json{...}` — a
+/// representative C2PA-ish document flattened to `JSON:*` tags: the top-level
+/// keys legalized + the C2PA-case hack, a nested object as a `-struct` Map,
+/// arrays of scalars/objects, and the bare-number / bare-boolean / quoted-`null`
+/// / quoted-19-digit `EscapeJSON` gate). The three Phase-1 caBX fixtures carry a
+/// `jumd` whose type-UUID is the `(json)` UUID but NO `json` CONTENT box, so
+/// their goldens are UNCHANGED by Phase 2 (only the new fixture emits `JSON:*`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 635;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

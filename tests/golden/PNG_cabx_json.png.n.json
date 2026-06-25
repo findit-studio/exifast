@@ -1,0 +1,42 @@
+[{
+  "SourceFile": "PNG_cabx_json.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "PNG",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 0,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "JUMBF:JUMDType": "6a736f6e00110010800000aa00389b71",
+  "JUMBF:JUMDLabel": "c2pa.test",
+  "JSON:Claim_generator": "exifast/1.0",
+  "JSON:Format": "image/png",
+  "JSON:Title": "A Title",
+  "JSON:InstanceID": "xmp:iid:1234",
+  "JSON:Thumbnail": {
+    "format": "image/jpeg",
+    "identifier": "self#jumbf=c2pa.thumb",
+    "width": 256,
+    "verified": true,
+    "caption": "null"
+  },
+  "JSON:Assertions": [{
+    "label": "c2pa.hash"
+  },{
+    "label": "stds.exif"
+  }],
+  "JSON:Ingredients": ["a","b","c"],
+  "JSON:Version": 2,
+  "JSON:Score": 0.95,
+  "JSON:Validated": true,
+  "JSON:Revoked": false,
+  "JSON:Signature": "null",
+  "JSON:Serial": "1234567890123456789",
+  "JSON:C2PAmanifest": "urn:c2pa:abc-123",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

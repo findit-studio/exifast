@@ -16,12 +16,14 @@
 //!
 //! ## Phase boundary
 //!
-//! Phase 1 ports the box TREE walk + the `jumd` description layer + the binary
-//! content boxes (`bfdb`/`bidb`/`c2sh`). The JSON (`json`) and CBOR (`cbor`)
-//! CONTENT decoders (`JSON::Main` / `CBOR::Main`) are Phases 2-3: a `json`/`cbor`
-//! box is recognized and its bounds validated, but it emits NO tags here. So a
-//! Phase-1 fixture must carry only structure + binary boxes (no `json`/`cbor`
-//! CONTENT) to stay byte-exact vs bundled (which WOULD decode that content).
+//! Phase 1 ported the box TREE walk + the `jumd` description layer + the binary
+//! content boxes (`bfdb`/`bidb`/`c2sh`). **Phase 2 (#142)** adds the JSON
+//! content decoder ([`json`], `JSON::Main` / `ProcessJSON`): a `json` box now
+//! decodes its document into flattened `JSON:*` tags. The CBOR (`cbor`) content
+//! decoder (`CBOR::Main`) is the remaining Phase 3: a `cbor` box is recognized
+//! and its bounds validated, but it still emits NO tags. So a fixture that must
+//! stay byte-exact vs bundled without the CBOR decoder may carry structure +
+//! binary + `json` content, but NOT `cbor` CONTENT (which bundled WOULD decode).
 //!
 //! ## Part A — the box-tree walker ([`JumbfWalker::walk`])
 //!
@@ -91,6 +93,7 @@
 //! accessors only); per-field availability (a tag is emitted iff its bytes are
 //! in range).
 
+mod json;
 mod tables;
 #[cfg(test)]
 mod tests;
@@ -112,6 +115,12 @@ const GROUP_JUMBF: &str = "JUMBF";
 /// under `Jpeg2000:*` even when nested in a `jumb` superbox (oracle-verified vs
 /// bundled 13.59).
 const GROUP_JPEG2000: &str = "Jpeg2000";
+
+/// Family-0 / family-1 group of the flattened `json` content-box tags
+/// (`JSON::Main`'s `GROUPS => { 0 => 'JSON', 1 => 'JSON' }`, `JSON.pm:23`). The
+/// JSON tags emit under `JSON:*` (on the box's `Doc<N>` axis) regardless of any
+/// active JUMBFLabel (oracle-verified vs bundled 13.59).
+const GROUP_JSON: &str = "JSON";
 
 /// Beyond-faithful recursion cap on `jumb`/`asoc` box nesting (the QuickTime
 /// [`MAX_ATOM_DEPTH`](crate::formats::quicktime) pattern). `ProcessJpeg2000Box`
@@ -163,20 +172,32 @@ pub(crate) enum JumbfWarning {
   /// `Missing JUMD signature` (`Jpeg2000.pm:840`) — the signature toggle was set
   /// but fewer than 32 bytes remain.
   MissingSignature,
+  /// `Unrecognized <Name> box` (`Jpeg2000.pm:1330-1332`) — a `json` content box
+  /// whose `JSON::Main` SubDirectory processor (`ProcessJSON`) returned 0: the
+  /// document did not parse to a hash / array-of-hashes (a bare scalar, an
+  /// array with no object, or a syntax error). `<Name>` is the content tag's
+  /// name — `JSONData` by default, or the active JUMBFLabel (the renamed
+  /// `JSONData`, since `json` carries `BlockExtract`) — so the message is
+  /// carried as an owned [`SmolStr`].
+  UnrecognizedJsonBox(SmolStr),
 }
 
 impl JumbfWarning {
-  /// The exact bundled warning text (`$et->Warn(...)`).
-  pub(crate) const fn message(&self) -> &'static str {
+  /// The exact bundled warning text (`$et->Warn(...)`). Most are fixed
+  /// `&'static str`; [`Self::UnrecognizedJsonBox`] interpolates the content
+  /// tag's name (`Unrecognized <Name> box`), so the result is a [`SmolStr`].
+  pub(crate) fn message(&self) -> SmolStr {
     match self {
-      Self::TooDeep => "JUMBF box nesting too deep",
-      Self::BoxTruncated => "Truncated JPEG 2000 box",
-      Self::InvalidBoxLength => "Invalid JPEG 2000 box length",
-      Self::Over4Gb => "Can't currently handle JPEG 2000 boxes > 4 GB",
-      Self::TruncatedJumd => "Truncated JUMD directory",
-      Self::MissingLabelTerminator => "Missing JUMD label terminator",
-      Self::MissingId => "Missing JUMD ID",
-      Self::MissingSignature => "Missing JUMD signature",
+      Self::TooDeep => SmolStr::new_static("JUMBF box nesting too deep"),
+      Self::BoxTruncated => SmolStr::new_static("Truncated JPEG 2000 box"),
+      Self::InvalidBoxLength => SmolStr::new_static("Invalid JPEG 2000 box length"),
+      Self::Over4Gb => SmolStr::new_static("Can't currently handle JPEG 2000 boxes > 4 GB"),
+      Self::TruncatedJumd => SmolStr::new_static("Truncated JUMD directory"),
+      Self::MissingLabelTerminator => SmolStr::new_static("Missing JUMD label terminator"),
+      Self::MissingId => SmolStr::new_static("Missing JUMD ID"),
+      Self::MissingSignature => SmolStr::new_static("Missing JUMD signature"),
+      // `$et->Warn("Unrecognized $$tagInfo{Name} box")` (`Jpeg2000.pm:1332`).
+      Self::UnrecognizedJsonBox(name) => SmolStr::from(std::format!("Unrecognized {name} box")),
     }
   }
 }
@@ -207,6 +228,11 @@ enum JumbfValue {
   /// `bidb`/`<Label>Data` — the binary payload LENGTH (the `(Binary data N
   /// bytes …)` placeholder; the bytes are never retained).
   BinaryLen(u64),
+  /// A flattened `json` content-box value (`JSON::Main`, Phase 2,
+  /// [`json::decode`]): a top-level JSON key's already-converted [`TagValue`]
+  /// — a scalar, a [`TagValue::List`] (array), or a [`TagValue::Map`] (object),
+  /// identical in both `-n` and `-j` modes (JSON values have no PrintConv).
+  Json(crate::value::TagValue),
 }
 
 /// One decoded JUMBF tag: its family-0/1 group, name, value, the full `Doc<N>`
@@ -459,11 +485,13 @@ impl JumbfWalker {
       BoxKind::Bfdb => self.process_bfdb(content),
       BoxKind::Bidb => self.process_bidb(content),
       BoxKind::C2sh => self.process_c2sh(content),
-      // Phase 2/3: a `json`/`cbor` content box is RECOGNIZED and traversed (its
-      // bounds were validated in `walk`) but its decoder is deferred — it emits
-      // NO tags here. (A Phase-1 fixture avoids carrying such content so exifast
-      // stays byte-exact vs bundled, which WOULD decode it.)
-      BoxKind::Json | BoxKind::Cbor => {}
+      // Phase 2 (#142): a `json` content box decodes through `JSON::Main`
+      // ([`process_json`]) into flattened `JSON:*` tags.
+      BoxKind::Json => self.process_json(content),
+      // Phase 3: a `cbor` content box is RECOGNIZED and traversed (its bounds
+      // were validated in `walk`) but its decoder (`CBOR::Main`) is deferred —
+      // it emits NO tags here.
+      BoxKind::Cbor => {}
     }
   }
 
@@ -762,6 +790,45 @@ impl JumbfWalker {
     });
   }
 
+  /// `json` → `JSON::Main` (`Jpeg2000.pm:409-418`, Phase 2 #142): decode the
+  /// JSON document ([`json::decode`]) and emit the flattened `JSON:<key>` tags
+  /// (group `JSON`, `JSON.pm:23`) on THIS box's `Doc<N>` axis. A document that
+  /// does not parse to an object / array-of-objects yields the bundled
+  /// `Unrecognized <Name> box` warning (`Jpeg2000.pm:1330-1332`), where
+  /// `<Name>` is the renamed JUMBFLabel (the `json` box carries `BlockExtract`,
+  /// so the rename applies, with the empty `JUMBF_Suffix` — `JSONData` is
+  /// renamed to just the label) or the default `JSONData`. The flattened tags
+  /// keep group `JSON` regardless of the label (the rename only affects the
+  /// block-extract name, oracle-verified vs bundled 13.59).
+  fn process_json(&mut self, content: &[u8]) {
+    let (doc, doc_subpath) = self.current_docpath();
+    match json::decode(content) {
+      json::JsonOutcome::Tags(pairs) => {
+        for (name, value) in pairs {
+          self.push_tag(JumbfTag {
+            family0: GROUP_JSON,
+            family1: GROUP_JSON,
+            name,
+            value: JumbfValue::Json(value),
+            doc,
+            doc_subpath: doc_subpath.clone(),
+            unknown: false,
+          });
+        }
+      }
+      json::JsonOutcome::Unrecognized => {
+        // `$$tagInfo{Name}` in the warning is the renamed JUMBFLabel when one is
+        // active (`Jpeg2000.pm:1206-1212`; `json` has `BlockExtract`, so the
+        // rename fires with the empty suffix → the bare label), else `JSONData`.
+        let name = match self.cur_label.as_ref() {
+          Some(label) => SmolStr::from(tables::make_renamed_tag_name(label, "")),
+          None => SmolStr::new("JSONData"),
+        };
+        self.warn(JumbfWarning::UnrecognizedJsonBox(name));
+      }
+    }
+  }
+
   /// The content tag's NAME: the renamed `<Label><Suffix>` when a JUMBFLabel is
   /// active (`Jpeg2000.pm:1205-1212`), else the default `default_name`. The
   /// rename joins the sanitized label + the box's [`tables::jumbf_suffix`] then
@@ -893,6 +960,9 @@ impl crate::emit::Taggable for JumbfMeta {
         JumbfValue::BinaryLen(len) => {
           crate::value::TagValue::Str(crate::value::binary_placeholder(*len))
         }
+        // A flattened `json` value is already a fully-formed `TagValue`
+        // (scalar / `List` / `Map`), identical in both modes — clone it through.
+        JumbfValue::Json(v) => v.clone(),
       };
       let group =
         crate::value::Group::with_subpath(t.family0, t.family1, t.doc, t.doc_subpath.clone());

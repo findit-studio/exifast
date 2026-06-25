@@ -12358,6 +12358,37 @@ fn png_cabx_label_rename_conformance() {
   );
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_cabx_json_conformance() {
+  // #142 (JUMBF / C2PA, Phase 2: the `json` content decoder) — a PNG `caBX`
+  // chunk whose `jumb -> jumd(label "c2pa.test", JSON type-UUID) + json{...}`
+  // carries a representative C2PA-ish JSON document. The `json` box
+  // (`Jpeg2000.pm:409-418`: `JSONData`, `SubDirectory => JSON::Main`) is decoded
+  // by `ProcessJSON` (`JSON.pm:118`) over `Import::ReadJSONObject`
+  // (`Import.pm:138`), emitting FLATTENED `JSON:<key>` tags (group `JSON`,
+  // `JSON.pm:23`) on this box's `Doc1` axis. Under the golden's `-struct` regime
+  // (`Options('Struct') == 1`), each TOP-LEVEL key becomes ONE tag
+  // (`JSON.pm:96-98` emits the struct then `return unless Struct > 1`): a nested
+  // object is a `-struct` Map with RAW inner keys (`JSON:Thumbnail`), an array
+  // stays a list (`JSON:Assertions` of objects, `JSON:Ingredients` of scalars),
+  // and scalars render through the `EscapeJSON` number/boolean gate
+  // (`XMPStruct.pl:166-176`) — `JSON:Version`/`Score` BARE numbers,
+  // `JSON:Validated`/`Revoked` BARE booleans, `JSON:Signature` the quoted
+  // `"null"` (the `MissingTagValue` default, `JSON.pm:6`), and `JSON:Serial` the
+  // QUOTED 19-digit number (the gate caps the integer part at 15 digits). The
+  // top-level NAMES are legalized (`FoundTag` + `AddTagToTable`): `ucfirst`
+  // (`claim_generator -> Claim_generator`, `instanceID -> InstanceID`) and the
+  // C2PA-case hack (`c2pa.manifest -> C2PAmanifest`). The `JSON:*` tags keep
+  // group `JSON` regardless of the active JUMBFLabel (the rename only affects
+  // the block-extract name, not the SubDirectory's flattened tags). `-j` and
+  // `-n` agree on every JSON value (no PrintConv). Crafted via
+  // `tools/gen_jumbf_fixtures.py`. Oracle: bundled `perl exiftool -j -G1 -struct`
+  // 13.59.
+  check("PNG_cabx_json.png", "PNG_cabx_json.png.json", true);
+  check("PNG_cabx_json.png", "PNG_cabx_json.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
