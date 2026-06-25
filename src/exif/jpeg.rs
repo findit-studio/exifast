@@ -243,6 +243,10 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // Exif blocks — a JPEG carries its PrintIM in the `APP1` Exif block's IFD0, so
   // the merge must preserve it (the engine emits `PrintIM:PrintIMVersion`).
   let mut printim_versions: Vec<smol_str::SmolStr> = Vec::new();
+  // The GeoTiff GeoKeys decoded from the FIRST `APP1` Exif block carrying a
+  // GeoKey directory (`GeoTiff.pm`'s `ProcessGeoTiff`). A GeoTiff-in-JPEG is
+  // exotic, so this is `None` for every realistic camera JPEG.
+  let mut geotiff: Option<crate::exif::geotiff::GeoTiffMeta> = None;
   // The embedded XMP packet decoded from a JPEG `APP1` "XMP" segment
   // (`ExifTool.pm:7794`, the `$$valPt =~ /^$xmpAPP1hdr/` → `ProcessXMP` arm). A
   // JPEG normally carries exactly one; a file with more than one is handled by
@@ -516,6 +520,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
             &mut maker_note,
             &mut printim_versions,
             &mut deferred_subdirs,
+            &mut geotiff,
             next_exif_block,
             exif,
           );
@@ -569,6 +574,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     maker_note,
     printim_versions,
     deferred_subdirs,
+    geotiff,
   );
   // The JPEG auxiliary `APP`-segment tags: JFIF (`APP0`), MPF (`APP2`) and the
   // DJI thermal arms (`APP3`/`APP4`/`APP5`/`APP7`). Decoded for BOTH print-conv
@@ -1213,6 +1219,7 @@ fn merge_exif_block<'a>(
   maker_note: &mut Option<MakerNote<'a>>,
   printim_versions: &mut Vec<smol_str::SmolStr>,
   deferred_subdirs: &mut Vec<DeferredSubdir>,
+  geotiff: &mut Option<crate::exif::geotiff::GeoTiffMeta>,
   block_ordinal: u32,
   block: ExifMeta<'a>,
 ) {
@@ -1224,6 +1231,7 @@ fn merge_exif_block<'a>(
     block_maker_note,
     block_printim_versions,
     mut block_deferred_subdirs,
+    block_geotiff,
   ) = block.into_jpeg_parts();
   if byte_order.is_none() {
     *byte_order = block_order;
@@ -1278,6 +1286,13 @@ fn merge_exif_block<'a>(
   // The PrintIM versions accumulate across blocks (in block order), faithful to
   // ExifTool emitting each PrintIM's `PrintIMVersion` as the IFD walk reaches it.
   printim_versions.extend(block_printim_versions);
+  // The GeoTiff GeoKeys: FIRST block with a GeoKey directory wins (like the
+  // MakerNote). ExifTool's `ProcessGeoTiff` has a `$$self{DidGeoTiff}` re-process
+  // guard (`GeoTiff.pm:2139`), so a later `APP1` Exif block's identical directory
+  // is skipped; first-wins reproduces that for the common (single-GeoTiff) case.
+  if geotiff.is_none() {
+    *geotiff = block_geotiff;
+  }
 }
 
 /// `true` when `block` begins with a BigTIFF header — a valid TIFF byte-order

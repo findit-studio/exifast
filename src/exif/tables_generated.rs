@@ -206,6 +206,26 @@ static EXIF_FNUMBER: ExifTag = ExifTag {
   name: "FNumber",
   conv: Conv::FNumber,
 };
+static EXIF_PIXELSCALE: ExifTag = ExifTag {
+  id: 0x830e,
+  name: "PixelScale",
+  conv: Conv::None,
+};
+static EXIF_INTERGRAPHMATRIX: ExifTag = ExifTag {
+  id: 0x8480,
+  name: "IntergraphMatrix",
+  conv: Conv::None,
+};
+static EXIF_MODELTIEPOINT: ExifTag = ExifTag {
+  id: 0x8482,
+  name: "ModelTiePoint",
+  conv: Conv::None,
+};
+static EXIF_MODELTRANSFORM: ExifTag = ExifTag {
+  id: 0x85d8,
+  name: "ModelTransform",
+  conv: Conv::None,
+};
 static EXIF_EXPOSUREPROGRAM: ExifTag = ExifTag {
   id: 0x8822,
   name: "ExposureProgram",
@@ -664,7 +684,7 @@ static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
   conv: Conv::CompositeImageExposureTimes,
 };
 
-/// `Exif::Main` — the generated shadow (118 ids: the ported hand subset + the
+/// `Exif::Main` — the generated shadow (122 ids: the ported hand subset + the
 /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
 /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
 /// in the hand table) is the only one this fallback actually returns.
@@ -707,6 +727,10 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x8298 => Some(&EXIF_COPYRIGHT),
     0x829a => Some(&EXIF_EXPOSURETIME),
     0x829d => Some(&EXIF_FNUMBER),
+    0x830e => Some(&EXIF_PIXELSCALE),
+    0x8480 => Some(&EXIF_INTERGRAPHMATRIX),
+    0x8482 => Some(&EXIF_MODELTIEPOINT),
+    0x85d8 => Some(&EXIF_MODELTRANSFORM),
     0x8822 => Some(&EXIF_EXPOSUREPROGRAM),
     0x8824 => Some(&EXIF_SPECTRALSENSITIVITY),
     0x8827 => Some(&EXIF_ISO),

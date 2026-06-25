@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "GeoTiff_bigtiff.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "BTF",
+  "File:FileTypeExtension": "BTF",
+  "File:MIMEType": "image/x-tiff-big",
+  "IFD0:ImageWidth": 1,
+  "IFD0:ImageHeight": 1,
+  "IFD0:BitsPerSample": 8,
+  "IFD0:Compression": 1,
+  "IFD0:PhotometricInterpretation": 1,
+  "IFD0:StripOffsets": 416,
+  "IFD0:SamplesPerPixel": 1,
+  "IFD0:RowsPerStrip": 1,
+  "IFD0:StripByteCounts": 1,
+  "IFD0:PixelScale": "10 10 0",
+  "IFD0:ModelTiePoint": "0 0 0 100 200 0",
+  "IFD0:GeoTiffDirectory": "(Binary data 50 bytes, use -b option to extract)",
+  "IFD0:GeoTiffDoubleParams": "(Binary data 9 bytes, use -b option to extract)",
+  "IFD0:GeoTiffAsciiParams": "(Binary data 7 bytes, use -b option to extract)",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "GeoTiff_projcs.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:ImageWidth": 1,
+  "IFD0:ImageHeight": 1,
+  "IFD0:BitsPerSample": 8,
+  "IFD0:Compression": "Uncompressed",
+  "IFD0:PhotometricInterpretation": "BlackIsZero",
+  "IFD0:StripOffsets": 166,
+  "IFD0:SamplesPerPixel": 1,
+  "IFD0:RowsPerStrip": 1,
+  "IFD0:StripByteCounts": 1,
+  "GeoTiff:GeoTiffVersion": "1.1.0",
+  "GeoTiff:GTModelType": "Projected",
+  "GeoTiff:GTRasterType": "Pixel Is Area",
+  "GeoTiff:ProjectedCSType": "WGS84 UTM zone 17N",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

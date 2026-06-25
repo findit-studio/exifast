@@ -129,6 +129,23 @@ pub const TAG_OLD_SUBFILE_TYPE: u16 = 0x00ff;
 /// (the port emits no `IFD0:DNGVersion` tag).
 pub const TAG_DNG_VERSION: u16 = 0xc612;
 
+/// `GeoTiffDirectory` (0x87af, `Exif.pm:2059-2079`) — the GeoKey directory
+/// (`int16u` array), `Format => 'undef'`, `Binary => 1`. ExifTool's `RawConv`
+/// saves the raw block for `ProcessGeoTiff` (`GeoTiff.pm:2136`) and the tag is
+/// deleted from default output. The walker captures the raw bytes
+/// ([`crate::exif`] [`Walker`]) WITHOUT emitting the leaf.
+pub const TAG_GEOTIFF_DIRECTORY: u16 = 0x87af;
+
+/// `GeoTiffDoubleParams` (0x87b0, `Exif.pm:2081-2097`) — the `double` parameter
+/// block a GeoKey with `loc == 0x87b0` indexes (`GeoTiff.pm:2177`). `Binary => 1`,
+/// captured raw, never emitted.
+pub const TAG_GEOTIFF_DOUBLE_PARAMS: u16 = 0x87b0;
+
+/// `GeoTiffAsciiParams` (0x87b1, `Exif.pm:2099-2105`) — the `string` parameter
+/// block a GeoKey with `loc == 0x87b1` slices (`GeoTiff.pm:2179`). `Binary => 1`,
+/// captured raw, never emitted.
+pub const TAG_GEOTIFF_ASCII_PARAMS: u16 = 0x87b1;
+
 // ===========================================================================
 // Conversion descriptor — `Conv`
 // ===========================================================================
@@ -1067,6 +1084,40 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0x8298,
     name: "Copyright",
+    conv: Conv::None,
+  },
+  // ---- GeoTiff IFD0 leaf tags (Exif.pm:1870-1982) -------------------------
+  // The four `double` GeoTiff geometry tags carried directly in IFD0 (the
+  // GeoKey directory itself rides the three `Binary => 1` block tags 0x87af/
+  // 0x87b0/0x87b1, which are captured + decoded by `crate::exif::geotiff`, not
+  // emitted as leaves). Each is `Conv::None` — `-listx` shows no `<values>`
+  // map, so the generated shadow resolves them to `P::Identity` too. The
+  // family-2 `Location` group on ModelTiePoint/ModelTransform never reaches the
+  // `-G1 -j` output, so the leaf table need not model it.
+  ExifTag {
+    // `PixelScale` (0x830e, `Exif.pm:1870-1875`) — `double[3]`.
+    id: 0x830e,
+    name: "PixelScale",
+    conv: Conv::None,
+  },
+  ExifTag {
+    // `IntergraphMatrix` (0x8480, `Exif.pm:1902-1907`) — `double[-1]`.
+    id: 0x8480,
+    name: "IntergraphMatrix",
+    conv: Conv::None,
+  },
+  ExifTag {
+    // `ModelTiePoint` (0x8482, `Exif.pm:1909-1915`) — `double[-1]`,
+    // `Groups => { 2 => 'Location' }`.
+    id: 0x8482,
+    name: "ModelTiePoint",
+    conv: Conv::None,
+  },
+  ExifTag {
+    // `ModelTransform` (0x85d8, `Exif.pm:1977-1983`) — `double[16]`,
+    // `Groups => { 2 => 'Location' }`.
+    id: 0x85d8,
+    name: "ModelTransform",
     conv: Conv::None,
   },
   // ---- ExifIFD tags (Exif.pm:1848-3050) -----------------------------------
