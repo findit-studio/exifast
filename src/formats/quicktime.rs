@@ -2297,29 +2297,39 @@ fn decode_stsd_meta_type(payload: &[u8]) -> StsdMetaType {
   result
 }
 
-/// Capture the first `application[^\0]+` run in `bytes` (QuickTime.pm:7773
+/// Capture the leftmost `application[^\0]+` run in `bytes` (QuickTime.pm:7773
 /// `RawConv` regex), or `None` when absent. The `+` requires AT LEAST ONE
-/// non-NUL byte after the literal `application`: the run extends from the
+/// non-NUL byte after the literal `application`: a candidate run extends from an
 /// `application` literal up to (not including) the first NUL byte (or end of
-/// buffer), and a bare `application` or `application\0` (no following non-NUL
-/// byte) FAILS the match → `None` (the RawConv's `undef` clear). Mirrors
+/// buffer). The regex is UNANCHORED, so a failed start (a bare `application` or
+/// `application\0` with no following non-NUL byte) does NOT end matching —
+/// Perl's engine advances and retries from later positions; e.g.
+/// `application\0application/arcore-accel\0` captures `application/arcore-accel`.
+/// We therefore iterate over EVERY `application` candidate position
+/// (leftmost-first) and return the first one carrying ≥1 non-NUL byte; `None`
+/// only after no candidate qualifies (the RawConv's `undef` clear). Mirrors
 /// `crate::formats::quicktime_stream::scan_application_string`.
 fn scan_stsd_application_string(bytes: &[u8]) -> Option<String> {
   const NEEDLE: &[u8] = b"application";
-  let i = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
-  let mut end = i + NEEDLE.len();
-  while bytes.get(end).is_some_and(|&b| b != 0) {
-    end += 1;
+  // Leftmost-first over all literal `application` occurrences. The `[^\0]+`
+  // quantifier requires ≥1 non-NUL byte, so a candidate whose needle is
+  // immediately followed by NUL or buffer-end (`end` never advanced past it)
+  // fails; the unanchored regex continues to the next candidate.
+  for (i, window) in bytes.windows(NEEDLE.len()).enumerate() {
+    if window != NEEDLE {
+      continue;
+    }
+    let mut end = i + NEEDLE.len();
+    while bytes.get(end).is_some_and(|&b| b != 0) {
+      end += 1;
+    }
+    if end > i + NEEDLE.len() {
+      return bytes
+        .get(i..end)
+        .map(|m| String::from_utf8_lossy(m).into_owned());
+    }
   }
-  // The `[^\0]+` quantifier requires ≥1 non-NUL byte; if the needle is
-  // immediately followed by NUL or buffer-end (`end` never advanced past it),
-  // the regex does not match → `undef`.
-  if end == i + NEEDLE.len() {
-    return None;
-  }
-  bytes
-    .get(i..end)
-    .map(|m| String::from_utf8_lossy(m).into_owned())
+  None
 }
 
 /// Faithful `Image::ExifTool::QuickTime::CalcSampleRate` (QuickTime.pm:8856-8868)
@@ -27142,6 +27152,32 @@ mod tests {
     assert_eq!(scan_stsd_application_string(b"application\0"), None);
     // No `application` substring at all → `None`.
     assert_eq!(scan_stsd_application_string(b"random opaque bytes"), None);
+    // The regex is UNANCHORED (#426): a failed start at a bare `application\0`
+    // does NOT end matching — Perl advances and captures a LATER valid run.
+    // Bundled 13.59 / standalone perl `/(application[^\0]+)/` on
+    // `application\0application/arcore-accel\0` ⇒ `application/arcore-accel`.
+    assert_eq!(
+      scan_stsd_application_string(b"application\0application/arcore-accel\0"),
+      Some("application/arcore-accel".to_string()),
+    );
+    // No candidate has a non-NUL run (every `application` is NUL-terminated) ⇒
+    // `None` (perl: `application\0application\0` → undef).
+    assert_eq!(
+      scan_stsd_application_string(b"application\0application\0"),
+      None
+    );
+    // Leftmost valid run wins even when a later `application/...` also qualifies
+    // (perl: `application/arcore-accel\0application/x` → `application/arcore-accel`).
+    assert_eq!(
+      scan_stsd_application_string(b"application/arcore-accel\0application/x"),
+      Some("application/arcore-accel".to_string()),
+    );
+    // A partial `app` prefix then a real `application/...` matches at the real
+    // occurrence (perl: `appapplication/foo\0` → `application/foo`).
+    assert_eq!(
+      scan_stsd_application_string(b"appapplication/foo\0"),
+      Some("application/foo".to_string()),
+    );
   }
 
   #[test]
@@ -27152,6 +27188,26 @@ mod tests {
     assert_eq!(
       decode_stsd_meta_type(&body),
       StsdMetaType::EntryProcessed(Some("application/arcore-accel".to_string())),
+    );
+  }
+
+  #[test]
+  fn decode_stsd_meta_type_unanchored_skips_failed_start_end_to_end() {
+    // #426 end-to-end: a lone `mett` entry whose offset-8 tail begins with a
+    // bare `application\0` (a FAILED `(application[^\0]+)` start) followed by a
+    // valid `application/arcore-accel\0` run. The unanchored RawConv regex
+    // skips the dead start and captures the later run (bundled 13.59 / perl).
+    let body = meta_stsd_body(&[(b"mett", b"application\0application/arcore-accel\0")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(Some("application/arcore-accel".to_string())),
+    );
+    // Same shape with NO later valid run (every `application` NUL-terminated) ⇒
+    // the RawConv `undef` arm ⇒ a clear, not a spurious `application` capture.
+    let body = meta_stsd_body(&[(b"mett", b"application\0application\0")]);
+    assert_eq!(
+      decode_stsd_meta_type(&body),
+      StsdMetaType::EntryProcessed(None)
     );
   }
 
