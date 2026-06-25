@@ -256,7 +256,7 @@ pub(crate) fn run_emission<T: Taggable>(
     // family-0-qualified ingredient (`Sony:GPSLatitude`). Behavior-preserving.
     let _ = out.write_value_doc(
       group.doc(),
-      group.doc_sub(),
+      group.doc_subpath(),
       group.family1(),
       name.as_str(),
       priority,

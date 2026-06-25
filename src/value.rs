@@ -584,16 +584,24 @@ pub struct Group {
   family0: SmolStr,
   family1: SmolStr,
   /// ExifTool family-3 sub-document: `0` = Main, `N` = `Doc<N>` (the per-sample
-  /// document index for `-ee` timed metadata). Almost every group is `0`.
+  /// document index for `-ee` timed metadata). Almost every group is `0`. This
+  /// is the FIRST component of ExifTool's `DOC_NUM` (`join '-', @doc_levels`);
+  /// the remaining components (if any) are carried pre-rendered in
+  /// [`Self::doc_subpath`].
   doc: u32,
-  /// The SECOND-level sub-document index for the GoPro GPMF `ProcessString`
-  /// shape only (`0` = none → render `Doc<N>`; `M > 0` → render `Doc<N>-<M>`,
-  /// GoPro.pm:759-774). ExifTool's `ProcessString` keeps the parent `DOC_NUM`
-  /// and splits each subsequent row of a multi-row `GPS5`/`GPS9` record into
-  /// `"$docNum-$subDoc"`; this is the only source in the port that emits the
-  /// two-level form. Every other group is `0` here (rendered as the ordinary
-  /// `Doc<N>`), so this is purely additive — no existing golden carries it.
-  doc_sub: u32,
+  /// The pre-rendered DASH-joined TAIL of ExifTool's `DOC_NUM` beyond the first
+  /// `doc` component — `""` for a plain `Doc<N>` (or Main), `"-<M>"` for the
+  /// two-level GoPro GPMF `ProcessString` per-row split (`Doc<N>-<M>`,
+  /// GoPro.pm:759-774), and `"-<M>-<P>…"` for the N-level JUMBF / C2PA
+  /// sub-document path (`DOC_NUM = join '-', @{$$et{jumd_level}}`,
+  /// Jpeg2000.pm:786 — real C2PA nests `jumb`→`jumb`→`jumb`→content, so a leaf
+  /// is `Doc1-1-1`). Carrying the WHOLE tail (not a single second index) is what
+  /// distinguishes `Doc1-1` from `Doc1-1-1` in both the `-G3` render and the
+  /// dedup key, so two distinct nested superbox contents never collide. Empty
+  /// for every non-JUMBF, non-GoPro group (a `SmolStr` empty string is INLINE —
+  /// no heap), so this is purely additive: a 1- or 2-level path renders exactly
+  /// as before.
+  doc_subpath: SmolStr,
 }
 
 impl Group {
@@ -605,7 +613,7 @@ impl Group {
       family0: family0.into(),
       family1: family1.into(),
       doc: 0,
-      doc_sub: 0,
+      doc_subpath: SmolStr::default(),
     }
   }
 
@@ -617,7 +625,7 @@ impl Group {
       family0: family0.into(),
       family1: family1.into(),
       doc,
-      doc_sub: 0,
+      doc_subpath: SmolStr::default(),
     }
   }
 
@@ -625,7 +633,9 @@ impl Group {
   /// `ProcessString` per-row split (GoPro.pm:759-774). `sub == 0` is the parent
   /// `Doc<N>` (identical to [`Self::with_doc`]); `sub > 0` renders `Doc<N>-<M>`.
   /// Used ONLY by the GoPro `gpmd` timed-metadata emitter for the subsequent
-  /// rows of a multi-row `GPS5`/`GPS9` record.
+  /// rows of a multi-row `GPS5`/`GPS9` record. Builds the `"-<M>"` sub-path tail
+  /// internally, so its render + dedup key are byte-identical to before the
+  /// [`Self::doc_subpath`] generalization.
   #[must_use]
   #[inline(always)]
   pub fn with_subdoc(
@@ -634,11 +644,39 @@ impl Group {
     doc: u32,
     sub: u32,
   ) -> Self {
+    let doc_subpath = if sub == 0 {
+      SmolStr::default()
+    } else {
+      SmolStr::from(std::format!("-{sub}"))
+    };
     Self {
       family0: family0.into(),
       family1: family1.into(),
       doc,
-      doc_sub: sub,
+      doc_subpath,
+    }
+  }
+
+  /// An N-level sub-document group from a PRE-RENDERED dash-joined sub-path tail
+  /// (the part of `DOC_NUM` after the first `doc` component — `""`, `"-1"`,
+  /// `"-1-1"`, …). The JUMBF / C2PA producer builds it from the full
+  /// `@{$$et{jumd_level}}` stack (`DOC_NUM = join '-', @jumd_level`,
+  /// Jpeg2000.pm:786) so a deep `jumb`→`jumb`→`jumb` nest renders + dedups as a
+  /// distinct `Doc1-1-1` (never collapsed onto `Doc1-1`). `doc == 0` is Main and
+  /// the tail is ignored (no `Doc` prefix is rendered).
+  #[must_use]
+  #[inline(always)]
+  pub fn with_subpath(
+    family0: impl Into<SmolStr>,
+    family1: impl Into<SmolStr>,
+    doc: u32,
+    doc_subpath: impl Into<SmolStr>,
+  ) -> Self {
+    Self {
+      family0: family0.into(),
+      family1: family1.into(),
+      doc,
+      doc_subpath: doc_subpath.into(),
     }
   }
 
@@ -663,13 +701,16 @@ impl Group {
     self.doc
   }
 
-  /// The SECOND-level sub-document index (`0` = none → `Doc<N>`; `M > 0` →
-  /// `Doc<N>-<M>`). Non-zero only for the GoPro GPMF `ProcessString` per-row
-  /// split (GoPro.pm:759-774).
+  /// The pre-rendered dash-joined sub-document tail beyond the first `doc`
+  /// component (`""` for a plain `Doc<N>` / Main; `"-<M>"` for the GoPro GPMF
+  /// per-row split; `"-<M>-<P>…"` for the N-level JUMBF / C2PA path). Non-empty
+  /// only for those two producers; carried in both the `-G3` render and the
+  /// dedup key so a deep nest (`Doc1-1-1`) never collides with a shallower one
+  /// (`Doc1-1`).
   #[must_use]
   #[inline(always)]
-  pub const fn doc_sub(&self) -> u32 {
-    self.doc_sub
+  pub fn doc_subpath(&self) -> &str {
+    self.doc_subpath.as_str()
   }
 }
 

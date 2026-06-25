@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "PNG_cabx_binary.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "Grayscale",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "JUMBF:JUMDType": "6579d6fb-dba2-446b-b2ac1b82feeb89d1",
+  "Jpeg2000:BinaryDataType": "image/jpeg",
+  "Jpeg2000:BinaryData": "(Binary data 16 bytes, use -b option to extract)",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

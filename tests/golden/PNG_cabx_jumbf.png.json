@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "PNG_cabx_jumbf.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "Grayscale",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "JUMBF:JUMDType": "(json)-0011-0010-800000aa00389b71",
+  "JUMBF:JUMDLabel": "c2pa.test",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

@@ -3614,7 +3614,7 @@ mod tests {
       // the old raw; ValueConv ⇒ the old raw verbatim. old ≡ new on BOTH axes.
       let mut w = TagMap::new();
       for t in &main_tags {
-        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
+        let _ = w.write_value_doc(0, "", "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
       crate::composite::build_composites(
         &mut w,
@@ -3633,7 +3633,7 @@ mod tests {
 
       let mut wn = TagMap::new();
       for t in &main_tags {
-        let _ = wn.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
+        let _ = wn.write_value_doc(0, "", "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
       crate::composite::build_composites(
         &mut wn,
@@ -3676,7 +3676,7 @@ mod tests {
 
       let mut w = TagMap::new();
       for t in &main_tags {
-        let _ = w.write_value_doc(0, 0, "APE", t.name(), 1, t.value_ref().clone(), "APE");
+        let _ = w.write_value_doc(0, "", "APE", t.name(), 1, t.value_ref().clone(), "APE");
       }
       crate::composite::build_composites(
         &mut w,

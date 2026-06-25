@@ -1530,7 +1530,19 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `Priority => 0` (now threaded through the MakerNote replay). Additive —
 /// every PRE-EXISTING golden (`Pentax.avi`, the `AVI_pentaxjunk*` set) stays
 /// byte-identical (the realistic/JUNK-only/hydt-only cases keep their order).
-const EXPECTED_ACTIVE_FIXTURES: usize = 631;
+/// 631 → 634 (#142 JUMBF / C2PA, Phase 1: the PNG `caBX` box-structure
+/// subsystem) adds three crafted caBX-PNG fixtures: `PNG_cabx_jumbf.png`
+/// (`jumb`->`jumd` with the JSON type-UUID + label "c2pa.test" — the `JUMDType`
+/// `(json)` PrintConv split + `JUMDLabel`), `PNG_cabx_binary.png` (`jumb`->`jumd`
+/// raw-UUID + `bfdb`/`bidb` — the raw `JUMDType`, `Jpeg2000:BinaryDataType`, and
+/// the `bidb` byte-count placeholder), and `PNG_cabx_label_rename.png`
+/// (`jumb`->`jumd`(label) + `bfdb`/`c2sh` — the JUMBFLabel rename to
+/// `Jpeg2000:C2PAAssertions{Type,Salt}`). Each carries ONLY structure + binary
+/// boxes (no `json`/`cbor` CONTENT, whose decoders are Phases 2-3), so exifast
+/// matches bundled byte-exact. Additive — every PRE-EXISTING golden (all PNG +
+/// the five MNG/JNG fixtures) stays byte-identical (`caBX` only fires for a
+/// `caBX` chunk).
+const EXPECTED_ACTIVE_FIXTURES: usize = 634;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

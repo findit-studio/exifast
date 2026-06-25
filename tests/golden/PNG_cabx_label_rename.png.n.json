@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "PNG_cabx_label_rename.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "PNG",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 0,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "JUMBF:JUMDType": "6a736f6e00110010800000aa00389b71",
+  "JUMBF:JUMDLabel": "c2pa.assertions",
+  "Jpeg2000:C2PAAssertionsType": "application/octet-stream",
+  "Jpeg2000:C2PAAssertionsSalt": "deadbeefcafe",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

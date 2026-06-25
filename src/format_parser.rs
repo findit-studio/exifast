@@ -2120,11 +2120,19 @@ const _: () = {
       let mut map = s.serialize_map(Some(entries.len() + extra))?;
       // Build the JSON key ONCE per surviving entry via the shared `group_key`
       // join (P1+P4: the `TagMap` no longer carries a per-insert combined key) —
-      // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
+      // `-G1` collapses the leading `(doc, doc_subpath)`, `-G3` prefixes
+      // `Doc<N>…:`.
       let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (doc, doc_sub, group, name, _priority, value, _family0) in entries {
-        crate::serialize_key::group_key_into(&mut key, *doc, *doc_sub, group, name, group_mode);
+      for (doc, doc_subpath, group, name, _priority, value, _family0) in entries {
+        crate::serialize_key::group_key_into(
+          &mut key,
+          *doc,
+          doc_subpath.as_str(),
+          group,
+          name,
+          group_mode,
+        );
         // `Rendered` is a PUBLIC, generic `Serialize` (re-exported as
         // [`crate::Rendered`]) reachable by ANY `Serializer`, so it serializes
         // the plain `TagValue` through that value's OWN serializer-agnostic

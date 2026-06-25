@@ -2995,3 +2995,175 @@ fn engine_apng_actl_still_overrides_to_apng() {
     "got {json}"
   );
 }
+
+// ===========================================================================
+// #142 (JUMBF / C2PA, Codex [medium]) — the `caBX` walker's `Jpeg2000.pm`
+// warnings surface at the `caBX` CHUNK-WALK POSITION (the `PngDiagStep::Jumbf`
+// step in `diag_order`), not after the whole PNG walk. `Warning` is priority-0
+// FIRST-WINS ([[exifast-warning-priority0-firstwins]]), so a malformed `caBX`
+// BEFORE a later PNG walker warning must win the document-level
+// `ExifTool:Warning` slot, and a `caBX` AFTER must lose to the earlier PNG one
+// — matching ExifTool's walk-position emission. Oracle: bundled `perl exiftool
+// -j -G1` 13.59 emits the FIRST `$et->Warn` raised in chunk-walk order.
+// ===========================================================================
+
+/// A JUMBF box: 4-byte BE length (INCLUDING the 8-byte header) + 4-byte type +
+/// payload (mirrors `src/exif/jumbf/tests.rs::box_bytes`).
+fn jumbf_box(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+  let mut v = Vec::with_capacity(8 + payload.len());
+  v.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+  v.extend_from_slice(typ);
+  v.extend_from_slice(payload);
+  v
+}
+
+/// A `caBX` chunk whose JUMBF box stream is a `jumb` → `jumd` where the `jumd`
+/// is shorter than the 17-byte minimum — the walker raises `Truncated JUMD
+/// directory` (`Jpeg2000.pm:811`), a NON-minor document-level `$et->Warn`. This
+/// gives a `caBX` chunk that contributes exactly one JUMBF warning (and no
+/// content tags) so the ordering vs a later PNG warning is unambiguous.
+fn cabx_truncated_jumd() -> Vec<u8> {
+  let jumd = jumbf_box(b"jumd", &[0u8; 10]); // 10-byte jumd content < 17 ⇒ Truncated
+  let jumb = jumbf_box(b"jumb", &jumd);
+  chunk(b"caBX", &jumb)
+}
+
+#[test]
+fn engine_cabx_warning_before_post_idat_text_wins_first_slot() {
+  // caBX(malformed jumd) BEFORE IDAT + a post-IDAT tEXt: the JUMBF
+  // `Truncated JUMD directory` warning is raised at the `caBX` walk position
+  // (before IDAT), the `Text/EXIF chunk(s) found after PNG IDAT` warning later
+  // — so the JUMBF warning WINS the priority-0 first-wins `ExifTool:Warning`.
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    cabx_truncated_jumd(),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"tEXt", b"Comment\0Hi"),
+  ]);
+  let json = extract_info("cabx_first.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains("\"ExifTool:Warning\":\"Truncated JUMD directory\""),
+    "the caBX warning precedes the post-IDAT text warning ⇒ it must win the \
+     first-wins ExifTool:Warning slot, got {json}",
+  );
+  // The later PNG text warning must NOT have taken the slot.
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"[minor] Text/EXIF chunk(s) found after"),
+    "the post-IDAT text warning must lose to the earlier caBX warning, got {json}",
+  );
+}
+
+#[test]
+fn engine_post_idat_text_before_cabx_warning_wins_first_slot() {
+  // The reverse: a post-IDAT tEXt (the `Text/EXIF chunk(s) found after PNG
+  // IDAT` warning) BEFORE the malformed caBX. `caBX` is not a text chunk, so it
+  // raises no post-IDAT warning of its own; its `Truncated JUMD directory`
+  // warning is raised LATER (at the caBX walk position) ⇒ the EARLIER PNG text
+  // warning WINS the first-wins `ExifTool:Warning` slot, and the caBX warning
+  // loses. Oracle-aligned with the walk-position emission.
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"tEXt", b"Comment\0Hi"),
+    cabx_truncated_jumd(),
+  ]);
+  let json = extract_info("cabx_second.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains(
+      "\"ExifTool:Warning\":\"[minor] Text/EXIF chunk(s) found after PNG IDAT \
+       (may be ignored by some readers)\""
+    ),
+    "the post-IDAT text warning precedes the caBX warning ⇒ it must win the \
+     first-wins ExifTool:Warning slot, got {json}",
+  );
+  // The later caBX warning must NOT have taken the slot.
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"Truncated JUMD directory\""),
+    "the caBX warning must lose to the earlier post-IDAT text warning, got {json}",
+  );
+}
+
+/// A `caBX` chunk whose JUMBF box stream is a WELL-FORMED `jumb` → `jumd`
+/// (JSON type-UUID, toggles `0x02` = Label, NUL-terminated `label`) — ≥ the
+/// 17-byte minimum, so the walker emits `JUMDType` + `JUMDToggles` + `JUMDLabel`
+/// and raises NO warning. Used to give a VALID first `caBX` (tags, no warning)
+/// preceding a later malformed one in the repeated-`caBX` ordering regression.
+fn cabx_valid_label(label: &str) -> Vec<u8> {
+  // 16-byte JSON type-UUID + 1-byte toggles (0x02 = Label) + NUL-terminated label.
+  let mut jumd = Vec::new();
+  jumd.extend_from_slice(b"json");
+  jumd.extend_from_slice(&[
+    0x00, 0x11, 0x00, 0x10, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+  ]);
+  jumd.push(0x02); // toggles: Label only
+  jumd.extend_from_slice(label.as_bytes());
+  jumd.push(0); // label NUL terminator
+  let jumb = jumbf_box(b"jumb", &jumbf_box(b"jumd", &jumd));
+  chunk(b"caBX", &jumb)
+}
+
+#[test]
+fn engine_repeated_cabx_diags_drain_per_occurrence_first_warning_wins() {
+  // #142 (Codex [medium], R3 follow-up): the per-OCCURRENCE JUMBF diagnostic
+  // axis. A PNG with [valid caBX A: tags, NO warning] [post-IDAT tEXt: the
+  // `Text/EXIF chunk(s) found after PNG IDAT` PNG warning] [malformed caBX B:
+  // `Truncated JUMD directory`]. `Warning` is priority-0 FIRST-wins
+  // ([[exifast-warning-priority0-firstwins]]), so the EARLIER-walked tEXt
+  // warning must win the document-level `ExifTool:Warning` slot and the LATER
+  // malformed caBX B's warning must lose — at ITS walk position.
+  //
+  // The R3 bug stored a SINGLE `Jumbf` diag marker (at caBX A's position) but
+  // last-wins-replaced `self.jumbf` with caBX B's meta, so B's `Truncated JUMD
+  // directory` drained at A's EARLIER position and incorrectly STOLE the
+  // first-wins slot from the intervening tEXt warning. Per-occurrence storage
+  // drains each caBX's warnings at its OWN position, so B loses.
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    cabx_valid_label("c2pa.first"),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+    chunk(b"tEXt", b"Comment\0Hi"),
+    cabx_truncated_jumd(),
+  ]);
+  let json = extract_info("cabx_repeat_order.png", &bytes, /* print_conv */ true);
+  // The intervening post-IDAT tEXt warning (walked BEFORE caBX B) wins.
+  assert!(
+    json.contains(
+      "\"ExifTool:Warning\":\"[minor] Text/EXIF chunk(s) found after PNG IDAT \
+       (may be ignored by some readers)\""
+    ),
+    "the intervening post-IDAT text warning precedes the later malformed caBX \
+     ⇒ it must win the first-wins ExifTool:Warning slot, got {json}",
+  );
+  // The LATER malformed caBX B's warning must NOT have taken the slot (the R3
+  // bug: it drained at caBX A's earlier position and stole it).
+  assert!(
+    !json.contains("\"ExifTool:Warning\":\"Truncated JUMD directory\""),
+    "the later malformed caBX warning must lose to the earlier text warning \
+     (per-occurrence drain), got {json}",
+  );
+}
+
+#[test]
+fn engine_repeated_cabx_tags_are_last_wins() {
+  // The TAG axis stays last-wins (`%PNG::Main` `caBX` singleton key), UNCHANGED
+  // by the per-occurrence diagnostic decoupling: a 2nd non-empty `caBX`'s tags
+  // overwrite the 1st's. Two valid `caBX` with DIFFERENT labels ⇒ the emitted
+  // `JUMBF:JUMDLabel` is the SECOND-walked label.
+  let bytes = assemble(&[
+    ihdr_rgb_1x1(),
+    cabx_valid_label("c2pa.first"),
+    cabx_valid_label("c2pa.second"),
+    chunk(b"IDAT", &zlib_store(&[0, 0])),
+  ]);
+  let json = extract_info("cabx_repeat_tags.png", &bytes, /* print_conv */ true);
+  assert!(
+    json.contains("\"JUMBF:JUMDLabel\":\"c2pa.second\""),
+    "the 2nd caBX's tags must last-wins-replace the 1st's (unchanged tag \
+     behavior), got {json}",
+  );
+  assert!(
+    !json.contains("\"JUMBF:JUMDLabel\":\"c2pa.first\""),
+    "the 1st caBX's label must have been overwritten by the 2nd (last-wins), \
+     got {json}",
+  );
+}

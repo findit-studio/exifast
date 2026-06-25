@@ -152,7 +152,7 @@ impl CompositeSink for crate::tagmap::TagMap {
     name: &str,
     doc: DocScope,
   ) -> CompositeValue {
-    // A TagMap entry is `(doc, doc_sub, family1, name, priority, value, family0)`.
+    // A TagMap entry is `(doc, doc_subpath, family1, name, priority, value, family0)`.
     // An input matches when its family-1 group set contains the entry's family-1
     // (or the set is empty ⇒ any), AND — for a family-0-qualified input
     // (`Sony:GPSLatitude`, Sony.pm:10929) — the entry's family-0 (index 6)
@@ -160,7 +160,7 @@ impl CompositeSink for crate::tagmap::TagMap {
     // (every pre-existing input), so this is behavior-preserving.
     let group_ok = |entry: &(
       u32,
-      u32,
+      smol_str::SmolStr,
       smol_str::SmolStr,
       smol_str::SmolStr,
       u8,
@@ -174,7 +174,7 @@ impl CompositeSink for crate::tagmap::TagMap {
     let pred_in = |d: u32| {
       move |entry: &&(
         u32,
-        u32,
+        smol_str::SmolStr,
         smol_str::SmolStr,
         smol_str::SmolStr,
         u8,
@@ -209,7 +209,7 @@ impl CompositeSink for crate::tagmap::TagMap {
       DocScope::Main => find_in(0).or_else(|| {
         let cross = |entry: &&(
           u32,
-          u32,
+          smol_str::SmolStr,
           smol_str::SmolStr,
           smol_str::SmolStr,
           u8,
@@ -238,7 +238,7 @@ impl CompositeSink for crate::tagmap::TagMap {
     // A composite carries family-0 == family-1 == "Composite" (matching the
     // `iter_tags` path's `Group::with_doc("Composite", "Composite", doc)`), so a
     // composite-on-composite input (`Composite:GPSLatitude`) resolves it.
-    let _ = self.write_value_doc(doc, 0, "Composite", name, priority, value, "Composite");
+    let _ = self.write_value_doc(doc, "", "Composite", name, priority, value, "Composite");
   }
 }
 
