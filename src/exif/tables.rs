@@ -146,6 +146,15 @@ pub const TAG_GEOTIFF_DOUBLE_PARAMS: u16 = 0x87b0;
 /// captured raw, never emitted.
 pub const TAG_GEOTIFF_ASCII_PARAMS: u16 = 0x87b1;
 
+/// `ColorMap` (0x0140, `Exif.pm:961-965`) — the `int16u[3*2^BitsPerSample]` RGB
+/// palette, `Format => 'binary'`, `Binary => 1`. Classic `ProcessExif` applies
+/// the `'binary'` (= `undef`) [`format_override`] so it decodes as raw bytes (the
+/// `(Binary data N bytes …)` placeholder reports the on-disk byte count). The
+/// BigTIFF walker does NOT apply that override (`ProcessBigIFD` `ReadValue`s with
+/// the on-disk `int16u`), so its placeholder reports `length(join(' ', @vals))`
+/// instead — handled in the BigTIFF Binary-placeholder path, keyed by this id.
+pub const TAG_COLOR_MAP: u16 = 0x0140;
+
 // ===========================================================================
 // Conversion descriptor — `Conv`
 // ===========================================================================
@@ -1056,6 +1065,17 @@ pub const EXIF_TAGS: &[ExifTag] = &[
     name: "PrimaryChromaticities",
     conv: Conv::None,
   },
+  // 0x0140 `ColorMap` — `Format => 'binary'`, `Binary => 1` (`Exif.pm:961-965`).
+  // The SHORT[3*2^BitsPerSample] palette: the `Format => 'binary'` override
+  // (format code 7, "same as undef", `ExifTool.pm:104`) re-reads the on-disk
+  // value as raw `undef` bytes — `int(size/1)` of them — and `Binary => 1`
+  // renders it as the `(Binary data N bytes, …)` placeholder (`N` = the byte
+  // length). See [`format_override`] for the `undef` reshape.
+  ExifTag {
+    id: 0x0140,
+    name: "ColorMap",
+    conv: Conv::BinaryData,
+  },
   ExifTag {
     id: 0x0211,
     name: "YCbCrCoefficients",
@@ -1564,6 +1584,14 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
 #[must_use]
 pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
   match id {
+    // `ColorMap` (0x0140) — `Format => 'binary'` (`Exif.pm:963`). `'binary'` is
+    // format code 7, "(same as undef)" (`ExifTool.pm:104`), so the on-disk
+    // SHORT[3*2^BitsPerSample] value is re-read as `int(size/1)` raw `undef`
+    // bytes (verbose: "int16u[768] read as undef[1536]"); `length($val)` is then
+    // the byte size the `Conv::BinaryData` `(Binary data N bytes, …)` placeholder
+    // reports (GeoTiff.tif: 1536). Without this the value would decode per its
+    // on-disk `int16u[768]` and the placeholder count would be wrong.
+    0x0140 => Some(crate::exif::ifd::Format::Undef),
     0x9286 => Some(crate::exif::ifd::Format::Undef),
     // `ComponentsConfiguration` (0x9101) — `Format => 'int8u'` (`Exif.pm:2298`).
     // The on-disk value is re-read as `int(size/1)` int8u elements regardless of

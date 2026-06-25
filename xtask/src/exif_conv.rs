@@ -164,6 +164,10 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   // bytes so the conv sees the raw LE 2-byte units).
   hp(0x9c9c, "Conv::WindowsXp"),
   hp(0x9c9e, "Conv::WindowsXp"),
+  // `ColorMap` (0x0140) — `Format => 'binary'`, `Binary => 1` (Exif.pm:961-965);
+  // pin the binary-placeholder conv. `-listx` carries no `<values>`, and its
+  // `Format => 'binary'` (read as `undef`) is handled by `tables::format_override`.
+  hp(0x0140, "Conv::BinaryData"),
   // `DeviceSettingDescription` (0xa40b) — `Binary => 1` (Exif.pm:2957-2961);
   // pin the binary-placeholder conv (`(Binary data N bytes …)`).
   hp(0xa40b, "Conv::BinaryData"),

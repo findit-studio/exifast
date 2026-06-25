@@ -453,15 +453,6 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // the prior `Invalid zxIf chunk`) is what this fixture pins. Mirrors
   // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
   ("PNG_nested_zxif.png", &["PNG:zxIf"]),
-  // The real `GeoTiff.tif` carries an `IFD0:ColorMap` (0x0140, the RGB palette)
-  // that is NOT yet in the port's EXIF leaf table (a deferred `%Exif::Main`
-  // Binary tag, orthogonal to the GeoTiff port), so bundled's
-  // `"(Binary data 1536 bytes, …)"` has no exifast counterpart. Dropped from
-  // BOTH sides; every GeoTiff GeoKey + the `IFD0:ModelTransform` leaf are
-  // byte-exact. Mirrors `conformance.rs::geotiff_real_conformance`'s
-  // `check_excluding`. (The crafted `GeoTiff_mini.tif`/`GeoTiff_projcs.tif`
-  // carry no ColorMap, so they need no exclusion.)
-  ("GeoTiff.tif", &["IFD0:ColorMap"]),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1475,7 +1466,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// keys; the three `Binary => 1` block tags survive as `IFD0:GeoTiffDirectory`/
 /// `DoubleParams`/`AsciiParams` `(Binary data N bytes …)` placeholders (50/9/7).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 622;
+/// 622 → 623 (#428 Codex round, the BigTIFF ColorMap path) adds
+/// `BigTIFF_colormap.tif` — a crafted minimal little-endian BigTIFF (`0x002B`,
+/// 8-byte offsets) carrying an IFD0 `ColorMap` (0x0140) `int16u[12]` palette.
+/// A BigTIFF does NOT apply the classic `'binary'`/`undef` `Format` override, so
+/// `ProcessBigIFD` reads the on-disk `int16u` and the `Binary => 1` placeholder
+/// reports `length(join(' ', @vals))` (43 bytes) — NOT the classic undef-reshape
+/// byte count (the 1536 of `GeoTiff.tif`, which stays unchanged). Additive —
+/// every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 623;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

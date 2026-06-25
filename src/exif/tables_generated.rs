@@ -166,6 +166,11 @@ static EXIF_PRIMARYCHROMATICITIES: ExifTag = ExifTag {
   name: "PrimaryChromaticities",
   conv: Conv::None,
 };
+static EXIF_COLORMAP: ExifTag = ExifTag {
+  id: 0x0140,
+  name: "ColorMap",
+  conv: Conv::BinaryData,
+};
 static EXIF_THUMBNAILOFFSET: ExifTag = ExifTag {
   id: 0x0201,
   name: "ThumbnailOffset",
@@ -684,7 +689,7 @@ static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
   conv: Conv::CompositeImageExposureTimes,
 };
 
-/// `Exif::Main` — the generated shadow (122 ids: the ported hand subset + the
+/// `Exif::Main` — the generated shadow (123 ids: the ported hand subset + the
 /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
 /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
 /// in the hand table) is the only one this fallback actually returns.
@@ -719,6 +724,7 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x013d => Some(&EXIF_PREDICTOR),
     0x013e => Some(&EXIF_WHITEPOINT),
     0x013f => Some(&EXIF_PRIMARYCHROMATICITIES),
+    0x0140 => Some(&EXIF_COLORMAP),
     0x0201 => Some(&EXIF_THUMBNAILOFFSET),
     0x0202 => Some(&EXIF_THUMBNAILLENGTH),
     0x0211 => Some(&EXIF_YCBCRCOEFFICIENTS),
