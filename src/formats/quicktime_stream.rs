@@ -2872,39 +2872,48 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
   track.meta_keys = merged_keys;
 }
 
-/// QuickTime.pm:7773 — extract the first `application[^\0]+` substring
+/// QuickTime.pm:7773 — extract the leftmost `application[^\0]+` substring
 /// from a `stsd` sample-description entry body, terminated by NUL or
 /// end-of-buffer. Returns an empty string (the RawConv `undef` clear)
 /// when no match is found. Faithful: the bundled regex `(application[^\0]+)`
-/// matches greedily from the first occurrence of `"application"` up to (but
-/// not including) the first `\0` byte after that point. The `+` requires AT
-/// LEAST ONE non-NUL byte after `application`, so a bare `application` or
-/// `application\0` (no following non-NUL byte) FAILS the match → empty.
+/// matches greedily from an occurrence of `"application"` up to (but not
+/// including) the first `\0` byte after that point. The `+` requires AT LEAST
+/// ONE non-NUL byte after `application`, so a bare `application` or
+/// `application\0` (no following non-NUL byte) FAILS at that position. The
+/// regex is UNANCHORED, so a failed start does NOT terminate matching — Perl
+/// advances and retries from later positions (e.g.
+/// `application\0application/arcore-accel\0` captures `application/arcore-accel`).
+/// We therefore iterate over EVERY `application` candidate (leftmost-first) and
+/// return the first carrying ≥1 non-NUL byte; empty only after none qualifies.
+/// Mirrors `crate::formats::quicktime::scan_stsd_application_string`.
 fn scan_application_string(bytes: &[u8]) -> alloc::string::String {
   const NEEDLE: &[u8] = b"application";
-  // Sliding window over `bytes` looking for `NEEDLE` (checked via
-  // `windows` so a too-short buffer simply yields no match).
-  let Some(i) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) else {
-    return alloc::string::String::new();
-  };
-  // Run forward from the match start until NUL or end.
-  let mut end = i + NEEDLE.len();
-  while bytes.get(end).is_some_and(|&b| b != 0) {
-    end += 1;
+  // Sliding window over `bytes` looking for `NEEDLE` (checked via `windows` so
+  // a too-short buffer simply yields no match). Leftmost-first over all literal
+  // `application` occurrences: the `[^\0]+` quantifier requires ≥1 non-NUL byte,
+  // so a candidate whose needle is immediately followed by NUL or buffer-end
+  // (`end` never advanced past it) fails; the unanchored regex continues to the
+  // next candidate.
+  for (i, window) in bytes.windows(NEEDLE.len()).enumerate() {
+    if window != NEEDLE {
+      continue;
+    }
+    // Run forward from the match start until NUL or end.
+    let mut end = i + NEEDLE.len();
+    while bytes.get(end).is_some_and(|&b| b != 0) {
+      end += 1;
+    }
+    if end > i + NEEDLE.len() {
+      // Faithful to Perl: the regex matches the entire `application[^\0]+`
+      // run as one capture. Stay UTF-8-lossy-tolerant (the typed layer
+      // matches against the byte content via `is_arcore_meta_type`).
+      return bytes
+        .get(i..end)
+        .map(|m| alloc::string::String::from_utf8_lossy(m).into_owned())
+        .unwrap_or_default();
+    }
   }
-  // The `[^\0]+` quantifier requires ≥1 non-NUL byte; if the needle is
-  // immediately followed by NUL or buffer-end (`end` never advanced past it),
-  // the regex does not match → `undef` (empty).
-  if end == i + NEEDLE.len() {
-    return alloc::string::String::new();
-  }
-  // Faithful to Perl: the regex matches the entire `application[^\0]+`
-  // run as one capture. Stay UTF-8-lossy-tolerant (the typed layer
-  // matches against the byte content via `is_arcore_meta_type`).
-  bytes
-    .get(i..end)
-    .map(|m| alloc::string::String::from_utf8_lossy(m).into_owned())
-    .unwrap_or_default()
+  alloc::string::String::new()
 }
 
 /// Walk one `trak`, collecting its `HandlerType`, `MediaTimeScale` and (when
@@ -5296,6 +5305,29 @@ mod tests {
     assert!(scan_application_string(b"application").is_empty());
     // `application\0` (needle immediately followed by NUL) also fails ⇒ empty.
     assert!(scan_application_string(b"application\0").is_empty());
+    // The regex is UNANCHORED (#426): a failed start at a bare `application\0`
+    // does NOT end matching — Perl advances and captures a LATER valid run.
+    // Bundled 13.59 / standalone perl `/(application[^\0]+)/` on
+    // `application\0application/arcore-accel\0` ⇒ `application/arcore-accel`.
+    assert_eq!(
+      scan_application_string(b"application\0application/arcore-accel\0"),
+      "application/arcore-accel",
+    );
+    // No candidate has a non-NUL run (every `application` is NUL-terminated) ⇒
+    // empty (perl: `application\0application\0` → undef).
+    assert!(scan_application_string(b"application\0application\0").is_empty());
+    // Leftmost valid run wins even when a later `application/...` also qualifies
+    // (perl: `application/arcore-accel\0application/x` → `application/arcore-accel`).
+    assert_eq!(
+      scan_application_string(b"application/arcore-accel\0application/x"),
+      "application/arcore-accel",
+    );
+    // A partial `app` prefix then a real `application/...` matches at the real
+    // occurrence (perl: `appapplication/foo\0` → `application/foo`).
+    assert_eq!(
+      scan_application_string(b"appapplication/foo\0"),
+      "application/foo"
+    );
   }
 
   /// `walk_stsd` must assign `MetaType` on EVERY
