@@ -431,8 +431,9 @@ enum WebpMetaChunk<'a> {
 /// Which Pentax `%Main` JUNK SubDirectory matched the `JUNK` chunk's leading
 /// signature (RIFF.pm:469-478). Both are `ProcessBinaryData` camera tables
 /// emitting under family-0 `MakerNotes`, family-1 `Pentax`
-/// (`Pentax.pm:6409-6418` / `:6610-6658`). The matched payload is captured for
-/// the emit-time decode (`tags()`), mirroring the `pentax_makernote` re-dispatch
+/// (`Pentax.pm:6409-6418` / `:6610-6658`). The matched payload is captured into
+/// [`PentaxEvent::Junk`] for the emit-time decode (`tags()`), alongside the
+/// `LIST_hydt`/`LIST_pntx` MakerNote re-dispatch in one walk-ordered list
 /// — the field offsets/formats are tiny fixed binary-data leaves, so the
 /// variant alone selects the right offset map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,12 +448,49 @@ enum PentaxJunkVariant {
   Junk2,
 }
 
+/// One captured Pentax re-dispatch, recorded in RIFF WALK ORDER. ExifTool walks
+/// the RIFF chunks once in file order and dispatches each Pentax source as it
+/// reaches it — the `LIST_hydt`/`LIST_pntx` MakerNote (`Pentax.pm:6373-6395`)
+/// and EACH Pentax-signature `JUNK` (`PentaxJunk`/`PentaxJunk2`,
+/// RIFF.pm:469-478) — into the SAME tag store, where `FoundTag` resolves a
+/// per-tag duplicate by `Priority` then file order (`ExifTool.pm:9544-9589`).
+/// Holding both kinds in ONE ordered list (instead of a MakerNote slot + a
+/// separate JUNK Vec replayed MakerNote-first) lets the emit-time replay visit
+/// them in true walk order, so the central `TagMap` resolves the lone
+/// overlapping leaf (`Pentax:FNumber`) exactly as bundled does (#434).
+///
+/// The only `Pentax:FNumber` overlap between the two sources is priority-
+/// asymmetric — the `%Pentax::Main` hymn `FNumber` is `Priority => 0`
+/// (`Pentax.pm:1484`) while the `%Pentax::Junk2` `FNumber` is the default
+/// `Priority => 1` — so a `JUNK` `FNumber` wins regardless of order and the
+/// hymn `FNumber` never overrides it (the `MakerNote` replay threads the
+/// emission's `Priority => N` through `new_with_priority`, mirroring the static
+/// MakerNote path at `src/exif/mod.rs:9194`). A real Pentax AVI carries its
+/// MakerNote in ONE place (a `LIST_hydt`/`LIST_pntx` OR a `JUNK`), so a file
+/// with both is crafted-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PentaxEvent<'a> {
+  /// The Pentax AVI MakerNote payload — the `hymn`/`mknt` sub-chunk of
+  /// `LIST_hydt`/`LIST_pntx` (`Pentax.pm:6373-6395`). A sub-slice BORROWED from
+  /// the input (zero-copy); decoded at emit time through the shared
+  /// `%Pentax::Main` walker
+  /// ([`crate::exif::makernotes::vendors::pentax::redispatch_avi_makernote`]).
+  MakerNote(&'a [u8]),
+  /// A matched Pentax vendor `JUNK` SubDirectory and its borrowed payload
+  /// (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478) — decoded at emit time
+  /// through the variant's tiny `ProcessBinaryData` offset map
+  /// ([`emit_pentax_junk`]). Only a chunk with at least one in-range leaf is
+  /// recorded (a signature-only chunk emits nothing, so it is dropped to bound
+  /// the Vec against a crafted tiny-chunk repeat — #422).
+  Junk(PentaxJunkVariant, &'a [u8]),
+}
+
 /// Which `%RIFF::StreamData` row the `strd` chunk's leading 4-byte tag ID
 /// matched (`RIFF.pm:1250-1276`, `ProcessStreamData` at `RIFF.pm:1699-1748`).
 /// `ProcessStreamData` keys the table by the first 4 bytes of the chunk
 /// (`my $tag = substr($$dataPt, $start, 4)`, `RIFF.pm:1709`); the matched
 /// payload is captured for the emit-time decode (`tags()`), mirroring the
-/// `pentax_junk_records` re-dispatch. The leaf renderings are tiny fixed string
+/// Pentax [`PentaxEvent`] re-dispatch. The leaf renderings are tiny fixed string
 /// conversions, so the variant alone selects the right one.
 ///
 /// The Canon `AVIF` row (`RIFF.pm:1257-1265` → `Exif::Main` IFD0 with
@@ -531,13 +569,19 @@ pub struct RiffMeta<'a> {
   /// [`RiffMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics) as an
   /// `ExifTool:Warning`.
   unsupported_charset: Option<u16>,
-  /// The raw Pentax AVI MakerNote payload (`hymn`/`mknt` sub-chunk of
-  /// `LIST_hydt`/`LIST_pntx`, `Pentax.pm:6373-6395`) — a sub-slice BORROWED
-  /// from the input (no second allocation; the `'a` input lifetime carries it),
-  /// decoded at emit time (when the `-j`/`-n` mode is known) through the shared
-  /// `%Pentax::Main` walker, mirroring the Canon CTMD re-dispatch. `None` for a
-  /// non-Pentax AVI (#157).
-  pentax_makernote: Option<&'a [u8]>,
+  /// The Pentax re-dispatches — the `LIST_hydt`/`LIST_pntx` MakerNote
+  /// (`hymn`/`mknt`, `Pentax.pm:6373-6395`) AND the Pentax-signature `JUNK`
+  /// records (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478) — in a SINGLE list
+  /// in RIFF WALK ORDER (#434). Each payload is a sub-slice BORROWED from the
+  /// input (no second allocation; the `'a` input lifetime carries it), decoded
+  /// at emit time (when the `-j`/`-n` mode is known): the MakerNote through the
+  /// shared `%Pentax::Main` walker (mirroring the Canon CTMD re-dispatch), each
+  /// `JUNK` through the variant's tiny `ProcessBinaryData` offset map. Replaying
+  /// the list IN ORDER (rather than the MakerNote unconditionally before the
+  /// JUNK) lets the central `TagMap` resolve a per-tag duplicate in true walk
+  /// order — see [`PentaxEvent`]. Empty for an AVI with no Pentax MakerNote or
+  /// matched `JUNK` (#157, #422).
+  pentax_events: Vec<PentaxEvent<'a>>,
   /// The embedded WEBP metadata chunks (`EXIF`/`Exif` TIFF blocks and
   /// `XMP `/`XMP\0` packets) in WALK ORDER (RIFF.pm:557-587). ExifTool
   /// dispatches EVERY such chunk occurrence as it walks (each EXIF block to
@@ -556,21 +600,6 @@ pub struct RiffMeta<'a> {
   /// WEBP gets its `webp` extension from the `%fileTypeExt` default, not this
   /// flag.
   webp_ext_override: bool,
-  /// The matched Pentax vendor `JUNK` SubDirectories (`PentaxJunk`/`PentaxJunk2`,
-  /// RIFF.pm:469-478) and their borrowed payloads, in WALK ORDER. ExifTool
-  /// re-runs the matched SubDirectory on EVERY `JUNK` chunk it walks, so a
-  /// repeated/mixed `JUNK` retains a record per matched chunk that has at least
-  /// one in-range leaf; each payload is a sub-slice BORROWED from the input
-  /// (zero-copy), decoded at emit time through the variant's tiny
-  /// `ProcessBinaryData` offset map and emitted under family-0 `MakerNotes`,
-  /// family-1 `Pentax`. The central `TagMap` resolves duplicates PER LEAF
-  /// (last-wins per tag name), so a full `PentaxJunk2` followed by a SHORTER
-  /// same-signature one keeps the earlier chunk's `Model`/`FNumber`/`DateTime`
-  /// while the later `Make` wins. A signature-only chunk with no in-range leaf is
-  /// dropped (it would emit nothing — byte-identical to the full replay, but
-  /// bounds the Vec against a crafted tiny-chunk repeat). Empty for a `JUNK` that
-  /// matched no vendor signature or the `TextJunk` fallback (#154, #422).
-  pentax_junk_records: Vec<(PentaxJunkVariant, &'a [u8])>,
   /// The matched `strd` (StreamData) chunks whose leading 4-byte tag ID hit a
   /// `%RIFF::StreamData` row (`Zora`/`CASI`/the `unknown` fallback —
   /// `RIFF.pm:1250-1276`), in WALK ORDER. ExifTool runs `ProcessStreamData` on
@@ -595,10 +624,9 @@ impl Default for RiffMeta<'_> {
       rf64: false,
       corrupted: false,
       unsupported_charset: None,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
       webp_meta: Vec::new(),
       webp_ext_override: false,
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     }
   }
@@ -768,13 +796,13 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     charset: Charset::Latin,
     unsupported_charset: None,
     err: false,
-    pentax_makernote: None,
+    pentax_events: Vec::new(),
+    pentax_makernote_seen: false,
     base_file_type,
     form_is_webp,
     webp_file_type_override: None,
     webp_ext_override: false,
     webp_meta: Vec::new(),
-    pentax_junk_records: Vec::new(),
     strd_records: Vec::new(),
   };
 
@@ -803,10 +831,9 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     rf64,
     corrupted: walker.err,
     unsupported_charset: walker.unsupported_charset,
-    pentax_makernote: walker.pentax_makernote,
+    pentax_events: walker.pentax_events,
     webp_meta: walker.webp_meta,
     webp_ext_override,
-    pentax_junk_records: walker.pentax_junk_records,
     strd_records: walker.strd_records,
   })
 }
@@ -841,12 +868,28 @@ struct Walker<'a> {
   /// not be fully read (truncated). Drives the terminal
   /// `Error reading RIFF file (corrupted?)` warning.
   err: bool,
-  /// The Pentax AVI MakerNote payload — the `hymn` (or Q-S1 `mknt`) sub-chunk
-  /// of `LIST_hydt`/`LIST_pntx` (`Pentax.pm:6373-6395`). A sub-slice BORROWED
-  /// from `data` (zero-copy — no owned duplicate of the payload); decoded at
-  /// emit time (when the `-j`/`-n` mode is known) through the shared
-  /// `%Pentax::Main` walker. `None` for a non-Pentax AVI (#157).
-  pentax_makernote: Option<&'a [u8]>,
+  /// The Pentax re-dispatches — the `LIST_hydt`/`LIST_pntx` MakerNote
+  /// (`hymn`/`mknt`, `Pentax.pm:6373-6395`) AND the Pentax-signature `JUNK`
+  /// records (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478) — appended in a
+  /// SINGLE list as the top-level chunk walk reaches each (true RIFF WALK
+  /// ORDER, #434). Each payload is a sub-slice BORROWED from `data` (zero-copy
+  /// — no owned duplicate); decoded at emit time (when the `-j`/`-n` mode is
+  /// known): the MakerNote through the shared `%Pentax::Main` walker, each
+  /// `JUNK` through the variant's `ProcessBinaryData` offset map. See
+  /// [`PentaxEvent`]. Empty until a Pentax MakerNote or a matched `JUNK` is seen
+  /// (#157, #422).
+  pentax_events: Vec<PentaxEvent<'a>>,
+  /// `true` once the FIRST `LIST_hydt`/`LIST_pntx` `hymn`/`mknt` MakerNote has
+  /// been captured into [`Self::pentax_events`] — the O(1) once-guard for
+  /// [`Self::process_chunks_hydt`]. A real Pentax AVI carries a single MakerNote,
+  /// and bundled's `%Pentax::AVI` has one `hymn`/`mknt` row each, so only the
+  /// FIRST is kept (a later sub-chunk — same or a later LIST — is ignored). This
+  /// is a flag rather than scanning `pentax_events` for a `MakerNote` variant per
+  /// sub-chunk: `dispatch_junk` appends a `JUNK` event per retained Pentax `JUNK`,
+  /// so a per-sub-chunk full-vec scan would be O(junk_events × hydt_sub_chunks) on
+  /// a crafted input (many tiny Pentax `JUNK` before a large `hydt` LIST) — see
+  /// #434.
+  pentax_makernote_seen: bool,
   /// The ORIGINAL form-type's `SetFileType` value (`%riffType` lookup of the
   /// 4cc after `RIFF`/`RF64`, RIFF.pm:2041/2053) — `WAV` / `AVI` / `WEBP` / …
   /// / `RIFF`. The `VP8L` RawConv appends ` (lossless)` to the CURRENT FileType
@@ -875,20 +918,6 @@ struct Walker<'a> {
   /// through [`crate::exif::parse_exif_block`] / [`crate::formats::xmp::parse_borrowed`].
   /// Empty until a metadata chunk is seen.
   webp_meta: Vec<WebpMetaChunk<'a>>,
-  /// The matched Pentax vendor `JUNK` SubDirectories (`PentaxJunk`/`PentaxJunk2`,
-  /// RIFF.pm:469-478) and their borrowed payloads, in WALK ORDER — ExifTool
-  /// re-runs the matched SubDirectory on EVERY `JUNK` chunk it walks (`HandleTag`
-  /// at each walk position), so a repeated/mixed `JUNK` retains one record per
-  /// matched chunk that has at least one in-range leaf, NOT a single slot. Each
-  /// chunk's in-range leaves are replayed at emit time through the variant's
-  /// `ProcessBinaryData` offset map, and the central `TagMap` resolves duplicates
-  /// PER LEAF (last-wins per tag) — so a full `PentaxJunk2` followed by a SHORTER
-  /// same-signature one keeps the first chunk's `Model`/`FNumber`/`DateTime` (the
-  /// short one lacks them) while the later `Make` wins. A signature-only chunk
-  /// that can emit no leaf is not retained (no output either way; bounds the Vec
-  /// against a crafted tiny-chunk repeat). Each payload is borrowed from `data`
-  /// (zero-copy). Empty until such a `JUNK` is seen (#154, #422).
-  pentax_junk_records: Vec<(PentaxJunkVariant, &'a [u8])>,
   /// The matched `%RIFF::StreamData` rows (`Zora`/`CASI`/`unknown`,
   /// `RIFF.pm:1250-1276`) and their borrowed `strd` payloads, in WALK ORDER —
   /// ExifTool's `ProcessStreamData` runs on EVERY `strd` chunk it walks (one per
@@ -1380,7 +1409,9 @@ impl<'a> Walker<'a> {
   /// first sub-chunk header). Sub-chunk framing is the standard
   /// `[FourCC][int32u len][payload][pad]`. The FIRST `hymn`/`mknt` wins (a
   /// single MakerNote per file in practice; bundled's `%Pentax::AVI` has one row
-  /// each and last would overwrite, but there is never more than one).
+  /// each and last would overwrite, but there is never more than one) — the
+  /// once-guard reads the O(1) [`Self::pentax_makernote_seen`] flag (set at the
+  /// capture below), NOT a per-sub-chunk scan of `pentax_events` (#434).
   fn process_chunks_hydt(&mut self, body: &'a [u8]) {
     let mut p = 0usize;
     while p + 8 <= body.len() {
@@ -1392,12 +1423,16 @@ impl<'a> Walker<'a> {
         // (bundled's read fails and aborts the sub-walk).
         return;
       };
-      if (&tag == b"hymn" || &tag == b"mknt") && self.pentax_makernote.is_none() {
+      if (&tag == b"hymn" || &tag == b"mknt") && !self.pentax_makernote_seen {
         // Borrow the sub-slice of the input (it already carries `'a`) — NO
         // owned copy, so a crafted multi-MB hymn payload cannot double resident
-        // memory during parse (#157 Codex R1). The emit-time re-dispatch in
-        // `RiffMeta::tags` operates over this borrow.
-        self.pentax_makernote = Some(payload);
+        // memory during parse (#157 Codex R1). Appended at the walk position so
+        // the emit-time re-dispatch in `RiffMeta::tags` replays it in true RIFF
+        // walk order relative to the Pentax `JUNK` records (#434). The flag makes
+        // the first-wins guard O(1) per sub-chunk regardless of how many `JUNK`
+        // events `dispatch_junk` has appended ahead of this LIST (#434).
+        self.pentax_events.push(PentaxEvent::MakerNote(payload));
+        self.pentax_makernote_seen = true;
       }
       p += len + (len & 1);
     }
@@ -1458,8 +1493,8 @@ impl<'a> Walker<'a> {
     if body.starts_with(b"IIII\x01\x00") {
       if pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk, body.len()) {
         self
-          .pentax_junk_records
-          .push((PentaxJunkVariant::Junk, body));
+          .pentax_events
+          .push(PentaxEvent::Junk(PentaxJunkVariant::Junk, body));
       }
       return;
     }
@@ -1473,8 +1508,8 @@ impl<'a> Walker<'a> {
     if body.starts_with(b"PENTDigital Camera") {
       if pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk2, body.len()) {
         self
-          .pentax_junk_records
-          .push((PentaxJunkVariant::Junk2, body));
+          .pentax_events
+          .push(PentaxEvent::Junk(PentaxJunkVariant::Junk2, body));
       }
       return;
     }
@@ -3587,44 +3622,43 @@ impl crate::emit::Taggable for RiffMeta<'_> {
     for entry in &self.entries {
       tags.push(emit_one(entry, print_conv));
     }
-    // Pentax AVI MakerNote (`hymn`/`mknt`, `%Pentax::AVI` → `%Pentax::Main`,
-    // `Pentax.pm:6373-6395`): decode the captured payload through the shared
-    // `%Pentax::Main` walker at the now-known mode, and emit each leaf under
-    // family-0 `MakerNotes`, family-1 `Pentax` (the `%Pentax::Main` `GROUPS`
-    // — `exiftool -G1 -j` emits `Pentax:LensType` etc.), mirroring the
-    // QuickTime Canon CTMD re-dispatch. ExifTool walks the `LIST_hydt` after
-    // the AVI header/stream chunks, so these append AFTER the `RIFF:`/`File:`
-    // stream (the conformance gate is object-key-order-insensitive regardless).
-    // The engine's central Unknown-suppression drops any `Unknown=>1` leaf, so
-    // the flag is carried through verbatim.
+    // Pentax re-dispatches — the `LIST_hydt`/`LIST_pntx` MakerNote (`hymn`/`mknt`,
+    // `%Pentax::AVI` → `%Pentax::Main`, `Pentax.pm:6373-6395`) AND each
+    // Pentax-signature `JUNK` (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478) —
+    // replayed from the SINGLE [`Self::pentax_events`] list IN RIFF WALK ORDER
+    // (#434). All emit under family-0 `MakerNotes`, family-1 `Pentax` (the table
+    // `GROUPS` — `exiftool -G1 -j` emits `Pentax:LensType`/`Pentax:Model` etc.).
+    // ExifTool walks the RIFF once in file order and feeds every Pentax source
+    // into the same store; `FoundTag` resolves a per-tag duplicate by `Priority`
+    // then file order (`ExifTool.pm:9544-9589`). Visiting the events in walk
+    // order lets the central `TagMap` reproduce that exactly: the MakerNote leaves
+    // carry the emission's `Priority => N` (so the `%Pentax::Main` `Priority => 0`
+    // `FNumber` never overrides a `JUNK` `FNumber`, mirroring the static MakerNote
+    // path at `src/exif/mod.rs:9194`), and the `JUNK` leaves use the default
+    // `Priority => 1` last-wins. The engine's central Unknown-suppression drops
+    // any `Unknown => 1` leaf, so the flag is carried through verbatim. Mode-aware
+    // so the `FNumber` `%.1f` PrintConv applies only under `-j`.
     #[cfg(feature = "alloc")]
-    if let Some(payload) = self.pentax_makernote.as_deref() {
-      let group = crate::value::Group::new("MakerNotes", "Pentax");
-      let emissions =
-        crate::exif::makernotes::vendors::pentax::redispatch_avi_makernote(payload, print_conv);
-      for e in emissions {
-        tags.push(crate::emit::EmittedTag::new(
-          group.clone(),
-          smol_str::SmolStr::new(e.name()),
-          e.value().clone(),
-          e.unknown(),
-        ));
+    for event in &self.pentax_events {
+      match *event {
+        PentaxEvent::MakerNote(payload) => {
+          let group = crate::value::Group::new("MakerNotes", "Pentax");
+          let emissions =
+            crate::exif::makernotes::vendors::pentax::redispatch_avi_makernote(payload, print_conv);
+          for e in emissions {
+            tags.push(crate::emit::EmittedTag::new_with_priority(
+              group.clone(),
+              smol_str::SmolStr::new(e.name()),
+              e.value().clone(),
+              e.unknown(),
+              e.priority(),
+            ));
+          }
+        }
+        PentaxEvent::Junk(variant, payload) => {
+          emit_pentax_junk(variant, payload, print_conv, &mut tags);
+        }
       }
-    }
-    // Pentax vendor `JUNK` (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478): replay
-    // EACH captured chunk in WALK ORDER, decoding it through the variant's tiny
-    // `ProcessBinaryData` offset map (`%Pentax::Junk` / `%Pentax::Junk2`,
-    // `Pentax.pm:6409` / `:6610`) and emitting each in-range leaf under family-0
-    // `MakerNotes`, family-1 `Pentax` (the table `GROUPS` — `exiftool -G1 -j`
-    // emits `Pentax:Model` etc.). ExifTool re-runs the SubDirectory on every
-    // `JUNK` chunk, so the central `TagMap` resolves a per-tag collision to the
-    // LAST-walked chunk (`Priority => 1`); replaying all records keeps the union
-    // (a later SHORTER chunk's missing leaves fall back to the earlier chunk's),
-    // matching bundled 13.59 (#422). Mode-aware so the `FNumber` `%.1f` PrintConv
-    // applies only under `-j`.
-    #[cfg(feature = "alloc")]
-    for &(variant, payload) in &self.pentax_junk_records {
-      emit_pentax_junk(variant, payload, print_conv, &mut tags);
     }
     // `strd` StreamData (`Zora`/`CASI`/`unknown`, `%RIFF::StreamData`,
     // `RIFF.pm:1250-1276`): decode EACH captured payload in WALK ORDER through
@@ -5043,13 +5077,13 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
@@ -5081,13 +5115,13 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
@@ -5483,19 +5517,20 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_hydt(&body);
-    let captured = walker
-      .pentax_makernote
-      .expect("the hymn payload is captured");
+    let captured = match walker.pentax_events.as_slice() {
+      [PentaxEvent::MakerNote(p)] => *p,
+      other => panic!("expected one captured MakerNote event, got {other:?}"),
+    };
     assert_eq!(
       captured.len(),
       HYMN_LEN,
@@ -5564,13 +5599,13 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.walk_top();
@@ -5990,7 +6025,7 @@ mod tests {
     // out of range). The dispatch must NOT retain such no-output records, else a
     // large Vec accumulates with no contribution to the output (memory/CPU
     // amplification). Drive `dispatch_junk` directly with 1000 of each and assert
-    // `pentax_junk_records` stays EMPTY.
+    // `pentax_events` stays EMPTY.
     let empty: &[u8] = &[];
     let mut walker = Walker {
       data: empty,
@@ -6001,13 +6036,13 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     let junk_sig = b"IIII\x01\x00"; // 6 bytes ≤ `Junk` Model offset 0x0c ⇒ 0 bytes at the leaf.
@@ -6017,10 +6052,10 @@ mod tests {
       walker.dispatch_junk(junk2_sig);
     }
     assert!(
-      walker.pentax_junk_records.is_empty(),
+      walker.pentax_events.is_empty(),
       "signature-only Pentax JUNK chunks (no in-range leaf) must NOT be retained \
-       (bounded allocation, no amplification): got {} records",
-      walker.pentax_junk_records.len()
+       (bounded allocation, no amplification): got {} events",
+      walker.pentax_events.len()
     );
   }
 
@@ -6050,24 +6085,30 @@ mod tests {
       charset: Charset::Latin,
       unsupported_charset: None,
       err: false,
-      pentax_makernote: None,
+      pentax_events: Vec::new(),
+      pentax_makernote_seen: false,
       base_file_type: "RIFF",
       form_is_webp: false,
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.dispatch_junk(&owned);
     walker.dispatch_junk(&owned2);
+    let variants: Vec<PentaxJunkVariant> = walker
+      .pentax_events
+      .iter()
+      .map(|e| match *e {
+        PentaxEvent::Junk(v, _) => v,
+        PentaxEvent::MakerNote(_) => panic!("dispatch_junk must not push a MakerNote event"),
+      })
+      .collect();
     assert_eq!(
-      walker.pentax_junk_records.len(),
-      2,
-      "a chunk with at least one in-range leaf must be retained"
+      variants,
+      vec![PentaxJunkVariant::Junk, PentaxJunkVariant::Junk2],
+      "a chunk with at least one in-range leaf must be retained, in walk order"
     );
-    assert_eq!(walker.pentax_junk_records[0].0, PentaxJunkVariant::Junk);
-    assert_eq!(walker.pentax_junk_records[1].0, PentaxJunkVariant::Junk2);
   }
 
   #[test]
@@ -6085,9 +6126,9 @@ mod tests {
     let bytes = riff_with(b"AVI ", &chunks);
     let meta = parse_borrowed(&bytes).expect("AVI parses");
     assert!(
-      meta.pentax_junk_records.is_empty(),
-      "no signature-only chunk is retained: got {} records",
-      meta.pentax_junk_records.len()
+      meta.pentax_events.is_empty(),
+      "no signature-only chunk is retained: got {} events",
+      meta.pentax_events.len()
     );
     let emitted: Vec<_> = meta
       .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
@@ -6111,7 +6152,7 @@ mod tests {
     let bytes2 = riff_with(b"AVI ", &chunks2);
     let meta2 = parse_borrowed(&bytes2).expect("AVI parses");
     assert_eq!(
-      meta2.pentax_junk_records.len(),
+      meta2.pentax_events.len(),
       1,
       "only the full chunk (with an in-range leaf) is retained; the tiny ones are dropped"
     );
@@ -6123,6 +6164,197 @@ mod tests {
         .iter()
         .any(|t| t.tag().name() == "Make" && t.tag().group_ref().family1() == "Pentax"),
       "the full chunk's Make must still emit"
+    );
+  }
+
+  #[test]
+  fn pentax_events_capture_junk_then_makernote_in_walk_order() {
+    // #434: the unified `pentax_events` list must record BOTH Pentax sources in
+    // true RIFF walk order. Build an AVI with a full `PentaxJunk2` `JUNK` (emits
+    // `Make` @ 0x12, so it is retained) at the top level BEFORE a `LIST_hydt`
+    // carrying a `hymn` MakerNote sub-chunk. The walk visits the `JUNK` first,
+    // then the `LIST_hydt`, so the events are `[Junk, MakerNote]` — the order the
+    // pre-#434 fixed MakerNote-before-JUNK replay would have INVERTED.
+    let mut junk2 = vec![0u8; 0x18];
+    junk2[0..18].copy_from_slice(b"PENTDigital Camera");
+    junk2[0x12..0x18].copy_from_slice(b"PENTAX");
+    let hymn = chunk(b"hymn", &[0u8; 16]);
+    let mut hydt_payload = b"hydt".to_vec();
+    hydt_payload.extend_from_slice(&hymn);
+    let mut chunks = chunk(b"JUNK", &junk2);
+    chunks.extend_from_slice(&chunk(b"LIST", &hydt_payload));
+    let bytes = riff_with(b"AVI ", &chunks);
+
+    let meta = parse_borrowed(&bytes).expect("AVI parses");
+    let kinds: Vec<&'static str> = meta
+      .pentax_events
+      .iter()
+      .map(|e| match e {
+        PentaxEvent::Junk(..) => "junk",
+        PentaxEvent::MakerNote(_) => "makernote",
+      })
+      .collect();
+    assert_eq!(
+      kinds,
+      vec!["junk", "makernote"],
+      "the JUNK (walked first) precedes the LIST_hydt MakerNote in pentax_events"
+    );
+  }
+
+  #[test]
+  fn hydt_makernote_guard_is_first_wins_after_many_retained_junk() {
+    // #434 [high] (correctness half): the once-guard keeps the FIRST `hymn`/`mknt`
+    // and ignores a later one — same semantics as the pre-#434 whole-vec
+    // `any(MakerNote)` scan, now via the O(1) `pentax_makernote_seen` flag. Build a
+    // worst-case AVI: many FULL `PentaxJunk2` `JUNK` chunks (each retained — `Make`
+    // @ 0x12 is in range) BEFORE a `LIST_hydt` whose body holds many non-MakerNote
+    // sub-chunks and TWO `hymn` sub-chunks. Assert the events are exactly the N
+    // junk records (walk order) then a SINGLE MakerNote (the first `hymn`; the
+    // second is dropped by the guard).
+    const JUNK_COUNT: usize = 500;
+    const FILLER_SUBCHUNKS: usize = 2000;
+
+    let mut full_junk2 = vec![0u8; 0x18];
+    full_junk2[0..18].copy_from_slice(b"PENTDigital Camera");
+    full_junk2[0x12..0x18].copy_from_slice(b"PENTAX");
+
+    let mut chunks = Vec::new();
+    for _ in 0..JUNK_COUNT {
+      chunks.extend_from_slice(&chunk(b"JUNK", &full_junk2));
+    }
+    // The `hydt` LIST body: FILLER non-MakerNote sub-chunks, then two `hymn`s. The
+    // guard runs on EVERY sub-chunk; the first `hymn` captures, the second is the
+    // first-wins drop.
+    let mut hydt_payload = b"hydt".to_vec();
+    for _ in 0..FILLER_SUBCHUNKS {
+      hydt_payload.extend_from_slice(&chunk(b"junk", &[0u8; 4]));
+    }
+    hydt_payload.extend_from_slice(&chunk(b"hymn", &[0xaa; 16]));
+    hydt_payload.extend_from_slice(&chunk(b"hymn", &[0xbb; 16]));
+    chunks.extend_from_slice(&chunk(b"LIST", &hydt_payload));
+    let bytes = riff_with(b"AVI ", &chunks);
+
+    let meta = parse_borrowed(&bytes).expect("AVI parses");
+    let junk_events = meta
+      .pentax_events
+      .iter()
+      .filter(|e| matches!(e, PentaxEvent::Junk(..)))
+      .count();
+    assert_eq!(
+      junk_events, JUNK_COUNT,
+      "every full JUNK is retained in walk order"
+    );
+    let makernotes: Vec<&[u8]> = meta
+      .pentax_events
+      .iter()
+      .filter_map(|e| match e {
+        PentaxEvent::MakerNote(p) => Some(*p),
+        PentaxEvent::Junk(..) => None,
+      })
+      .collect();
+    assert_eq!(
+      makernotes.len(),
+      1,
+      "first-wins: only the FIRST hymn is captured, the second is dropped"
+    );
+    assert_eq!(
+      makernotes[0], &[0xaa; 16],
+      "the captured MakerNote is the FIRST hymn"
+    );
+    // Walk order: all JUNK precede the MakerNote (the LIST follows them).
+    assert!(
+      matches!(meta.pentax_events.last(), Some(PentaxEvent::MakerNote(_))),
+      "the LIST_hydt MakerNote is appended after the JUNK records"
+    );
+  }
+
+  #[test]
+  fn hydt_makernote_guard_cost_is_independent_of_pentax_events_len() {
+    use std::time::Instant;
+    // #434 [high] (O(1) half): the per-sub-chunk once-guard must NOT scan
+    // `pentax_events`. `dispatch_junk` appends one event per retained Pentax
+    // `JUNK`, so the pre-fix `pentax_events.iter().any(MakerNote)` scan made
+    // `process_chunks_hydt` O(retained_junk × hydt_sub_chunks) — a crafted RIFF
+    // with many tiny retained Pentax `JUNK` before a large `hydt` LIST forced
+    // quadratic parse work. The O(1) `pentax_makernote_seen` flag makes each
+    // sub-chunk's guard cost independent of how many events precede it.
+    //
+    // Prove the algorithmic CLASS, not a wall-clock absolute (robust to machine
+    // speed / CI load): drive `process_chunks_hydt` over a FIXED hydt body (many
+    // non-MakerNote sub-chunks, no `hymn` — so the guard never short-circuits and
+    // runs the full check on every sub-chunk) with the walker's `pentax_events`
+    // PRE-LOADED to a SMALL vs a LARGE length. Under O(1) the two timings match;
+    // under the old O(n×m) scan the large-preload run would scale with the
+    // preload length. Assert the large/small ratio stays well under the linear
+    // blow-up the regression would show.
+    const FILLER_SUBCHUNKS: usize = 4000;
+    const SMALL_PRELOAD: usize = 4;
+    const LARGE_PRELOAD: usize = 4000; // 1000× the small preload
+    const RUNS: u32 = 5;
+
+    // A `hydt` body of FILLER non-MakerNote sub-chunks (NO `hymn`: the guard is
+    // exercised on every sub-chunk and never finds a MakerNote, the exact pattern
+    // that maximized the old scan).
+    let mut hydt_body = Vec::new();
+    for _ in 0..FILLER_SUBCHUNKS {
+      hydt_body.extend_from_slice(&chunk(b"junk", &[0u8; 4]));
+    }
+    // A retained Pentax JUNK payload to pre-load `pentax_events` with (simulating
+    // the events `dispatch_junk` would have appended ahead of the LIST).
+    let mut full_junk2 = vec![0u8; 0x18];
+    full_junk2[0..18].copy_from_slice(b"PENTDigital Camera");
+    full_junk2[0x12..0x18].copy_from_slice(b"PENTAX");
+
+    // Measure the min wall-time of `process_chunks_hydt` over `RUNS` repeats for a
+    // given preload length (min denoises scheduler/warmup jitter).
+    let measure = |preload: usize| -> std::time::Duration {
+      let mut best = std::time::Duration::MAX;
+      for _ in 0..RUNS {
+        let mut walker = Walker {
+          data: &hydt_body,
+          pos: 0,
+          entries: Vec::new(),
+          streams: Vec::new(),
+          current_stream_type: None,
+          charset: Charset::Latin,
+          unsupported_charset: None,
+          err: false,
+          pentax_events: (0..preload)
+            .map(|_| PentaxEvent::Junk(PentaxJunkVariant::Junk2, full_junk2.as_slice()))
+            .collect(),
+          pentax_makernote_seen: false,
+          base_file_type: "RIFF",
+          form_is_webp: false,
+          webp_file_type_override: None,
+          webp_ext_override: false,
+          webp_meta: Vec::new(),
+          strd_records: Vec::new(),
+        };
+        let t = Instant::now();
+        walker.process_chunks_hydt(&hydt_body);
+        best = best.min(t.elapsed());
+        // No `hymn` ⇒ no MakerNote captured ⇒ the preload events are unchanged.
+        assert_eq!(walker.pentax_events.len(), preload);
+      }
+      best
+    };
+
+    let small = measure(SMALL_PRELOAD);
+    let large = measure(LARGE_PRELOAD);
+
+    // O(1): the large-preload run costs essentially the same as the small one. The
+    // old O(n×m) scan would cost ~ (LARGE/SMALL) = 1000× more. Allow a generous
+    // headroom (timer granularity, allocation noise) — even 50× is two orders of
+    // magnitude below the 1000× linear blow-up the regression would exhibit.
+    let small_ns = small.as_nanos().max(1);
+    let large_ns = large.as_nanos().max(1);
+    assert!(
+      large_ns <= small_ns.saturating_mul(50),
+      "process_chunks_hydt must be O(1) per sub-chunk in pentax_events.len(): a \
+       {LARGE_PRELOAD}-event preload took {large:?} vs {small:?} for {SMALL_PRELOAD} \
+       events ({}× — a per-sub-chunk full-vec scan would be ~{}×)",
+      large_ns / small_ns,
+      LARGE_PRELOAD / SMALL_PRELOAD,
     );
   }
 }

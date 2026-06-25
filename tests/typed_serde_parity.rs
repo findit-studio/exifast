@@ -1520,7 +1520,17 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// PRE-EXISTING golden (the four R1/R2 MNG/JNG fixtures + all PNG goldens) stays
 /// byte-identical (no code change). The crafted three-equal-producer Case-A
 /// composite-priority divergence is tracked separately as #436.
-const EXPECTED_ACTIVE_FIXTURES: usize = 630;
+/// 630 → 631 (#434 — Pentax RIFF cross-source walk-order replay) adds
+/// `AVI_pentaxjunk2_before_hydt.avi`: a full `PentaxJunk2` `JUNK` (`FNumber`
+/// 2.8) placed BEFORE the real `Pentax.avi` `LIST_hydt` MakerNote (hymn
+/// `FNumber` 0.0). `RiffMeta::tags` now replays a SINGLE walk-ordered
+/// `pentax_events` list (the MakerNote + the `JUNK` records together) so the
+/// `TagMap` resolves the lone overlapping leaf (`Pentax:FNumber`) in true RIFF
+/// walk order; bundled keeps `2.8` here because the hymn `FNumber` is
+/// `Priority => 0` (now threaded through the MakerNote replay). Additive —
+/// every PRE-EXISTING golden (`Pentax.avi`, the `AVI_pentaxjunk*` set) stays
+/// byte-identical (the realistic/JUNK-only/hydt-only cases keep their order).
+const EXPECTED_ACTIVE_FIXTURES: usize = 631;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

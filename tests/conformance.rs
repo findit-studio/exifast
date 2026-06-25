@@ -419,6 +419,38 @@ fn riff_junk_conformance() {
     "AVI_pentaxjunk2_partial.avi.n.json",
     false,
   );
+
+  // `AVI_pentaxjunk2_before_hydt.avi` (#434) — a CRAFTED AVI placing a FULL
+  // `PentaxJunk2` `JUNK` chunk (the real `AVI_pentaxjunk2.avi` body: `FNumber`
+  // 28/10 → 2.8) at the top level BEFORE the real `Pentax.avi` `LIST_hydt`
+  // MakerNote (whose `%Pentax::Main` hymn IFD also carries an `FNumber`, here
+  // 0.0). This is the cross-source ordering deferred at #422 R5: the pre-#434
+  // `tags()` replayed the MakerNote unconditionally BEFORE the `JUNK`, so a
+  // crafted JUNK-before-hydt file would have resolved the lone overlapping leaf
+  // (`Pentax:FNumber`) wrong. The fix replays a SINGLE walk-ordered
+  // `pentax_events` list so the central `TagMap` resolves in true RIFF walk
+  // order. Bundled 13.59 keeps `Pentax:FNumber = 2.8` here REGARDLESS of order:
+  // the `%Pentax::Main` hymn `FNumber` is `Priority => 0` (`Pentax.pm:1484`)
+  // while the `%Pentax::Junk2` `FNumber` is the default `Priority => 1`, so the
+  // `JUNK` value wins and the later hymn `FNumber` never overrides it
+  // (`ExifTool.pm:9544-9589`). exifast threads the emission's `Priority => N`
+  // into the MakerNote replay, so it matches byte-exact (the hymn `Pentax:*`
+  // leaves + the `JUNK` `Make`/`Model`/`DateTime`, `Composite:Aperture` = 2.8).
+  // The golden is generated with the SAME `EXCLUDE` as `Pentax.avi` (the shared
+  // hymn IFD): the three still-deferred size-24 AEInfo leaves
+  // `AEWhiteBalance`/`AEMeteringMode2`/`LevelIndicator` are dropped — a
+  // pre-existing `%Pentax::Main` port gap, NOT a #434 regression (the diff
+  // carries no tag exifast emits that bundled does not).
+  check(
+    "AVI_pentaxjunk2_before_hydt.avi",
+    "AVI_pentaxjunk2_before_hydt.avi.json",
+    true,
+  );
+  check(
+    "AVI_pentaxjunk2_before_hydt.avi",
+    "AVI_pentaxjunk2_before_hydt.avi.n.json",
+    false,
+  );
 }
 
 #[test]
