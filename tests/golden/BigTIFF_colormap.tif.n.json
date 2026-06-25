@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "BigTIFF_colormap.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "BTF",
+  "File:FileTypeExtension": "BTF",
+  "File:MIMEType": "image/x-tiff-big",
+  "IFD0:ImageWidth": 1,
+  "IFD0:ImageHeight": 1,
+  "IFD0:BitsPerSample": 2,
+  "IFD0:Compression": 1,
+  "IFD0:PhotometricInterpretation": 3,
+  "IFD0:StripOffsets": 256,
+  "IFD0:SamplesPerPixel": 1,
+  "IFD0:RowsPerStrip": 1,
+  "IFD0:StripByteCounts": 1,
+  "IFD0:ColorMap": "(Binary data 43 bytes, use -b option to extract)",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

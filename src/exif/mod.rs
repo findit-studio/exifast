@@ -5029,6 +5029,35 @@ impl Walker<'_, '_> {
       return Step::Keep;
     }
 
+    // ---- ColorMap (0x0140) — the BigTIFF Binary-placeholder leaf --------
+    // `ColorMap` is `Format => 'binary'`, `Binary => 1` (`Exif.pm:961-965`):
+    // the `int16u[3*2^BitsPerSample]` RGB palette. On the CLASSIC path
+    // `ProcessExif` applies the `'binary'` (= `undef`) tag-table `Format`
+    // override (`tables::format_override(0x0140)`), so the value re-reads as
+    // `int(size/1)` raw `undef` BYTES and the `(Binary data N bytes …)`
+    // placeholder reports the ON-DISK byte length (`GeoTiff.tif`: int16u[768]
+    // → 1536). `ProcessBigIFD` does NOT apply that override: it `ReadValue`s
+    // with the on-disk `$formatStr` (`BigTIFF.pm:122`, no `$$tagInfo{Format}`)
+    // and `HandleTag`s the resulting `$val` (`:200-209`), so a count>1 `int16u`
+    // ColorMap becomes the space-joined `join(' ', @vals)` STRING and `Binary
+    // => 1` reports `length($val)` of THAT — NOT 2*N, NOT the classic undef
+    // reshape. [`read_value_byte_len`] computes that `length(join(' ', @vals))`
+    // allocation-free (it never materializes the attacker-controlled, in-bounds-
+    // but-huge `int16u` array into a `Vec`+joined `String` just to measure it,
+    // the same OOM/DoS the GeoTiff-block path avoids). ColorMap carries NO
+    // `RawConv` (unlike GeoTiffDirectory/DoubleParams), so no order-tag append.
+    // Route it through the placeholder HERE rather than the shared
+    // [`emit`](Self::emit) → `Conv::BinaryData` path, whose non-`Bytes` fallback
+    // is `RawValue::count()` (the ELEMENT count N, wrong for a BigTIFF where no
+    // override reshaped the value to `Bytes`). Oracle (bundled ExifTool 13.59,
+    // `BigTIFF_colormap.tif`): BitsPerSample=2 → int16u[12] palette
+    // `"0 0 0 21845 0 0 0 21845 0 65535 65535 65535"` → `length` 43 bytes.
+    if matches!(self.active_table, TableRef::Exif) && tag_id == tables::TAG_COLOR_MAP {
+      let len = read_value_byte_len(data, value_offset, format, count, read_len, order);
+      self.push_binary_placeholder(kind, tag_id, "ColorMap", len);
+      return Step::Keep;
+    }
+
     // ---- SubIFD pointer tags (ExifOffset/GPSInfo/InteropOffset) ---------
     // `if ($tagInfo and $$tagInfo{SubIFD}) { … process all SubIFD's as BigTIFF }`
     // (`BigTIFF.pm:171-198`). All three pointer tags carry the `SubIFD` flag

@@ -10435,18 +10435,13 @@ fn geotiff_real_conformance() {
   // never emitted (no `RequestAll`). Verified byte-exact vs bundled `perl
   // exiftool 13.59 -j -G1` (`-j` PrintConv labels; `-n` the raw GeoKey ints).
   //
-  // `IFD0:ColorMap` (0x0140, the RGB palette this image carries) is dropped from
-  // BOTH sides: it is a `Binary => 1` palette tag NOT yet in the port's EXIF
-  // leaf table (a deferred `%Exif::Main` item, orthogonal to GeoTiff), so
-  // bundled's `"(Binary data 1536 bytes, …)"` has no exifast counterpart. Every
-  // GeoTiff tag (and the `IFD0:ModelTransform` leaf) IS compared byte-exactly.
-  check_excluding("GeoTiff.tif", "GeoTiff.tif.json", true, &["IFD0:ColorMap"]);
-  check_excluding(
-    "GeoTiff.tif",
-    "GeoTiff.tif.n.json",
-    false,
-    &["IFD0:ColorMap"],
-  );
+  // `IFD0:ColorMap` (0x0140, the RGB palette this image carries) is now PORTED
+  // (a `Format => 'binary'`, `Binary => 1` tag in `%Exif::Main`, `Exif.pm:961`)
+  // and emits bundled's `"(Binary data 1536 bytes, use -b option to extract)"`
+  // placeholder under IFD0 — so it is compared byte-exactly like every other
+  // GeoTiff tag (and the `IFD0:ModelTransform` leaf), no exclusion (#428).
+  check("GeoTiff.tif", "GeoTiff.tif.json", true);
+  check("GeoTiff.tif", "GeoTiff.tif.n.json", false);
 }
 #[test]
 fn geotiff_mini_conformance() {
@@ -10495,6 +10490,25 @@ fn geotiff_bigtiff_conformance() {
   // Byte-exact vs bundled ExifTool 13.59 (`-j` and `-n`).
   check("GeoTiff_bigtiff.tif", "GeoTiff_bigtiff.tif.json", true);
   check("GeoTiff_bigtiff.tif", "GeoTiff_bigtiff.tif.n.json", false);
+}
+#[test]
+fn bigtiff_colormap_conformance() {
+  // A CRAFTED minimal little-endian BigTIFF (`0x002B`, 8-byte offsets/counts)
+  // carrying an IFD0 `ColorMap` (0x0140) `int16u[3*2^BitsPerSample]` RGB palette
+  // (BitsPerSample=2 → int16u[12]). It pins the BigTIFF-specific ColorMap
+  // Binary-placeholder byte count (#428 Codex [medium]): `ColorMap` is `Format
+  // => 'binary'`, `Binary => 1` (`Exif.pm:961-965`). On the CLASSIC path
+  // `ProcessExif` applies the `'binary'` (= `undef`) `Format` override so the
+  // value re-reads as raw bytes and the `(Binary data N bytes …)` placeholder
+  // reports the ON-DISK byte length (GeoTiff.tif: int16u[768] → 1536). A BigTIFF
+  // does NOT apply that override: `ProcessBigIFD` `ReadValue`s with the on-disk
+  // `int16u` (`BigTIFF.pm:122`) and `HandleTag`s the resulting space-joined
+  // `$val`, so `Binary => 1` reports `length(join(' ', @vals))` — NOT 2*N, NOT
+  // the classic undef reshape. For the `0 0 0 21845 0 0 0 21845 0 65535 65535
+  // 65535` palette that is 43 bytes. Byte-exact vs bundled ExifTool 13.59
+  // (`-j` and `-n`); the classic `GeoTiff.tif` (1536) stays unchanged.
+  check("BigTIFF_colormap.tif", "BigTIFF_colormap.tif.json", true);
+  check("BigTIFF_colormap.tif", "BigTIFF_colormap.tif.n.json", false);
 }
 #[test]
 fn gps_conformance() {
