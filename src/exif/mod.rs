@@ -113,6 +113,14 @@ mod geotiff;
 // [`crate::metadata::png::PngMeta`] and emits `MNG:*` tags.
 #[cfg(feature = "png")]
 pub(crate) mod mng;
+// JUMBF / C2PA — the PNG `caBX` box-structure reader (`Jpeg2000.pm`'s
+// `ProcessJpeg2000Box` / `ProcessJUMB` / `ProcessJUMD` read subset, Phase 1:
+// box structure + the `jumd` description layer + the `bfdb`/`bidb`/`c2sh` binary
+// content). Built by the PNG chunk walker (`PNG.pm:343` `caBX` →
+// `Jpeg2000::Main`); hangs off [`crate::metadata::png::PngMeta`] and emits
+// `JUMBF:*` + `Jpeg2000:*` tags on the `Doc<N>` axis.
+#[cfg(feature = "png")]
+pub(crate) mod jumbf;
 
 use std::{string::String, vec::Vec};
 

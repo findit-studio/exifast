@@ -12288,6 +12288,76 @@ fn mng_embedded_ihdr_conformance() {
   );
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_cabx_jumbf_conformance() {
+  // #142 (JUMBF / C2PA, Phase 1: box structure) — a PNG `caBX` chunk
+  // (`PNG.pm:343-346`: `caBX` -> `Jpeg2000::Main` SubDirectory) carries a JUMBF
+  // box stream. `jumb` (the superbox, `ProcessJUMB`, `Jpeg2000.pm:777`) opens a
+  // `Doc<N>` sub-document and recurses; `jumd` (the description box,
+  // `ProcessJUMD`, `Jpeg2000.pm:803`) carries a 16-byte type-UUID + a toggle
+  // byte + a NUL-terminated label. This structure-only fixture is
+  // `jumb -> jumd(JSON type-UUID, toggles Requestable+Label, label "c2pa.test")`
+  // with NO content box (the json/cbor CONTENT decoders are Phases 2-3, so a
+  // Phase-1 golden must avoid them to stay byte-exact). `JUMBF:JUMDType` renders
+  // the `Jpeg2000.pm:746-752` PrintConv split + ASCII-detect under `-j`
+  // (`(json)-0011-0010-800000aa00389b71`) and the raw `unpack "H*"` hex under
+  // `-n` (`6a736f6e…`); `JUMBF:JUMDLabel` is the raw label. `JUMDToggles` is
+  // `Unknown => 1` (`Jpeg2000.pm:761`) so it is SUPPRESSED from the default
+  // output. `File:FileType` stays PNG (`caBX` is just a chunk); the ported PNG
+  // `Composite:ImageSize`/`Megapixels` are kept (PNG is Composite-allow-listed).
+  // Crafted via `tools/gen_jumbf_fixtures.py`. Oracle: bundled `perl exiftool
+  // -j -G1 -struct` 13.59.
+  check("PNG_cabx_jumbf.png", "PNG_cabx_jumbf.png.json", true);
+  check("PNG_cabx_jumbf.png", "PNG_cabx_jumbf.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_cabx_binary_conformance() {
+  // #142 (JUMBF Phase 1) — the binary content boxes. `jumb -> jumd(raw JPEG
+  // type-UUID `6579d6fb…`, NO label) + bfdb + bidb`. The raw type-UUID's first
+  // 4 bytes are NOT printable ASCII, so `JUMBF:JUMDType` renders the raw
+  // `6579d6fb-dba2-446b-b2ac1b82feeb89d1` (no `(text)` substitution,
+  // `Jpeg2000.pm:750`). `bfdb` (`BinaryDataType`, `Jpeg2000.pm:425`) carries a
+  // toggle byte + a NUL-padded MIME type — its ValueConv drops the toggle byte
+  // and trims NULs -> `Jpeg2000:BinaryDataType = image/jpeg`. `bidb`
+  // (`BinaryData`, `Binary => 1`, `Groups => { 2 => Preview }`,
+  // `Jpeg2000.pm:433`) emits the `(Binary data 16 bytes …)` placeholder from the
+  // payload LENGTH. Both content tags emit under the `Jpeg2000` group (they live
+  // in `%Jpeg2000::Main`, default group `Jpeg2000`, NOT `JUMBF`) since this
+  // jumd carries no label to rename them. Crafted via
+  // `tools/gen_jumbf_fixtures.py`. Oracle: bundled `perl exiftool` 13.59.
+  check("PNG_cabx_binary.png", "PNG_cabx_binary.png.json", true);
+  check("PNG_cabx_binary.png", "PNG_cabx_binary.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_cabx_label_rename_conformance() {
+  // #142 (JUMBF Phase 1) — the JUMBFLabel rename (`Jpeg2000.pm:1205-1212`).
+  // `jumb -> jumd(label "c2pa.assertions") + bfdb + c2sh`. The label is
+  // sanitized (`Jpeg2000.pm:824-831`: capitalize-after-illegal + strip-illegal +
+  // `C2pa`->`C2PA`) to the `JUMBFLabel` `C2PAAssertions`, which RENAMES the
+  // following content tags by joining the label + each box's `JUMBF_Suffix`
+  // (`bfdb`->`Type`, `c2sh`->`Salt`) and applying `AddTagToTable`'s name
+  // legalization (`ExifTool.pm:6488`): `Jpeg2000:C2PAAssertionsType =
+  // application/octet-stream` and `Jpeg2000:C2PAAssertionsSalt = deadbeefcafe`
+  // (the `c2sh` `unpack "H*"` hex). The renamed tags keep the `Jpeg2000` group.
+  // Crafted via `tools/gen_jumbf_fixtures.py`. Oracle: bundled `perl exiftool`
+  // 13.59.
+  check(
+    "PNG_cabx_label_rename.png",
+    "PNG_cabx_label_rename.png.json",
+    true,
+  );
+  check(
+    "PNG_cabx_label_rename.png",
+    "PNG_cabx_label_rename.png.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

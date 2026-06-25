@@ -637,6 +637,14 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"bKGD" => decode_bkgd(meta, data),
     // ----- tIME (PNG.pm:262-275) ----------------------------------------
     b"tIME" => decode_time(meta, data),
+    // ----- caBX (PNG.pm:343-346) → JUMBF / C2PA box subsystem -----------
+    // The `caBX` chunk carries a JUMBF box stream (`PNG.pm:343` `caBX` →
+    // `Jpeg2000::Main` SubDirectory). Hand the whole payload to the JUMBF
+    // box-tree walker (Phase 1: structure + the `jumd` description layer + the
+    // `bfdb`/`bidb`/`c2sh` binary content; the `json`/`cbor` content decoders
+    // are Phases 2-3). A `caBX` with no recognized boxes decodes to an empty
+    // `JumbfMeta` and is dropped (byte-identical PNG output).
+    b"caBX" => meta.set_jumbf(crate::exif::jumbf::process(data)),
     // Every other chunk MISSED the `%PNG::Main` table. `PNG.pm:1655-1657`: for
     // an MNG/JNG container (`$fileType ne 'PNG'`) the walker then tries the
     // `%MNG::Main` FALLBACK table; for a plain PNG there is no fallback and the
@@ -2832,6 +2840,17 @@ impl crate::emit::Taggable for PngMeta<'_> {
       tags.extend(mng_meta.tags(opts));
     }
 
+    // ---- JUMBF / C2PA caBX tags — chain the JUMBF sub-Meta's tag stream ----
+    // A `caBX` chunk (`PNG.pm:343-346`) fed its JUMBF box stream to
+    // [`crate::exif::jumbf::process`] during the walk. Splice its `Taggable`
+    // stream (the `JUMBF:*` description tags + the `Jpeg2000:*` content tags) on
+    // the `Doc<N>` axis here, AFTER the PNG-level tags (the walk-order position
+    // bundled emits them, oracle-verified vs 13.59). `None` for a PNG with no
+    // `caBX` ⇒ byte-identical PNG output.
+    if let Some(jumbf_meta) = self.jumbf() {
+      tags.extend(jumbf_meta.tags(opts));
+    }
+
     tags.into_iter()
   }
 }
@@ -3013,6 +3032,28 @@ impl crate::diagnostics::Diagnose for PngMeta<'_> {
         }
         #[cfg(not(feature = "exif"))]
         PngDiagStep::ExifEvent => {}
+        // A `caBX` chunk's JUMBF / C2PA sub-Meta (`Jpeg2000.pm`). Its walker
+        // warnings (`Truncated JUMD directory` / `Missing JUMD label
+        // terminator|ID|signature`, `Jpeg2000.pm:811`/`:819`/`:835`/`:840`, plus
+        // the beyond-faithful `JUMBF box nesting too deep` depth-budget guard)
+        // surface HERE — at the `caBX` chunk-walk position recorded in
+        // `diag_order` — so a malformed `caBX` before a later PNG walker warning
+        // wins the document-level priority-0 first-wins `ExifTool:Warning`
+        // ([[exifast-warning-priority0-firstwins]]), matching ExifTool's
+        // walk-position emission. Each non-empty `caBX` recorded its OWN step
+        // carrying the index of THAT occurrence's warnings (`jumbf_diags`), so a
+        // repeated `caBX` drains PER occurrence at its position — a malformed
+        // LATER `caBX` does NOT steal the first-wins slot from an intervening
+        // earlier-walked warning (the TAG output stays last-wins separately).
+        PngDiagStep::Jumbf(idx) => {
+          if let Some(warnings) = self.jumbf_diag(*idx) {
+            out.extend(
+              warnings
+                .iter()
+                .map(|w| crate::diagnostics::Diagnostic::warn(w.message())),
+            );
+          }
+        }
         #[cfg(feature = "xmp")]
         PngDiagStep::Xmp => {
           if let Some((xi, packet)) = xmp_cursor.next()
@@ -3056,6 +3097,10 @@ impl crate::diagnostics::Diagnose for PngMeta<'_> {
           .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
       );
     }
+    // (JUMBF / C2PA `caBX` walker warnings are NOT drained here — they surface
+    // at the `caBX` chunk-walk position via the `PngDiagStep::Jumbf` step above,
+    // so a malformed `caBX` before a later PNG warning wins the priority-0
+    // first-wins `ExifTool:Warning`, matching ExifTool's walk-position emission.)
     out
   }
 }

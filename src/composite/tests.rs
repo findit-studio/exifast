@@ -73,7 +73,7 @@ fn sum_inputs(
 fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
   let mut m = TagMap::new();
   for (g, n, v) in entries {
-    let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
+    let _ = m.write_value_doc(0, "", g, n, 1, v.clone(), g);
   }
   m
 }
@@ -2148,7 +2148,7 @@ mod subdoc {
   fn map_with_docs(entries: &[(u32, &str, &str, TagValue)]) -> TagMap {
     let mut m = TagMap::new();
     for (doc, g, n, v) in entries {
-      let _ = m.write_value_doc(*doc, 0, g, n, 1, v.clone(), g);
+      let _ = m.write_value_doc(*doc, "", g, n, 1, v.clone(), g);
     }
     m
   }
@@ -2288,7 +2288,7 @@ mod subdoc {
   fn map_with_docs_g0(entries: &[(u32, &str, &str, &str, TagValue)]) -> TagMap {
     let mut m = TagMap::new();
     for (doc, g0, g1, n, v) in entries {
-      let _ = m.write_value_doc(*doc, 0, g1, n, 1, v.clone(), g0);
+      let _ = m.write_value_doc(*doc, "", g1, n, 1, v.clone(), g0);
     }
     m
   }
@@ -2304,7 +2304,7 @@ mod subdoc {
   fn map_with_docs_g0_p(entries: &[(u32, &str, &str, &str, u8, TagValue)]) -> TagMap {
     let mut m = TagMap::new();
     for (doc, g0, g1, n, p, v) in entries {
-      let _ = m.write_value_doc(*doc, 0, g1, n, *p, v.clone(), g0);
+      let _ = m.write_value_doc(*doc, "", g1, n, *p, v.clone(), g0);
     }
     m
   }
@@ -2788,7 +2788,7 @@ mod video_defs {
   fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
     let mut m = TagMap::new();
     for (g, n, v) in entries {
-      let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
+      let _ = m.write_value_doc(0, "", g, n, 1, v.clone(), g);
     }
     m
   }
@@ -2962,7 +2962,7 @@ mod riff_duration {
   fn map_with(entries: &[(&str, &str, TagValue)]) -> TagMap {
     let mut m = TagMap::new();
     for (g, n, v) in entries {
-      let _ = m.write_value_doc(0, 0, g, n, 1, v.clone(), g);
+      let _ = m.write_value_doc(0, "", g, n, 1, v.clone(), g);
     }
     m
   }

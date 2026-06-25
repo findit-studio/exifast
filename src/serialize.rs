@@ -128,7 +128,7 @@ mod serde_doc {
       for t in doc.tags {
         let token = crate::serialize_key::group_key(
           t.group_ref().doc(),
-          t.group_ref().doc_sub(),
+          t.group_ref().doc_subpath(),
           t.group_ref().family1(),
           t.name(),
           crate::serialize_key::GroupMode::G1,

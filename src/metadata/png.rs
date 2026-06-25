@@ -863,6 +863,30 @@ pub struct PngMeta<'a> {
   /// diagnostics drain alongside the PNG warnings. The same "sub-Meta hangs off
   /// the parent Meta" shape as `GeoTiffMeta` on `ExifMeta`.
   mng: Option<crate::exif::mng::MngMeta>,
+  // ----- JUMBF / C2PA caBX box subsystem (Jpeg2000.pm) -------------------
+  /// The decoded JUMBF / C2PA metadata of a PNG `caBX` chunk
+  /// (`PNG.pm:343-346` → `Jpeg2000::Main`), produced by
+  /// [`crate::exif::jumbf::process`] when the chunk walker reaches a `caBX`
+  /// chunk. `None` for a PNG with no `caBX` (and for a `caBX` whose box stream
+  /// recognized nothing). Emitted via its
+  /// [`Taggable`](crate::emit::Taggable) impl under groups `JUMBF` (the `jumd`
+  /// description tags) + `Jpeg2000` (the `bfdb`/`bidb`/`c2sh` content tags) on
+  /// the `Doc<N>` axis, appended AFTER the PNG-level tags; its diagnostics drain
+  /// alongside the PNG warnings. The same "sub-Meta hangs off the parent Meta"
+  /// shape as `GeoTiffMeta`/`MngMeta`.
+  jumbf: Option<crate::exif::jumbf::JumbfMeta>,
+  /// The JUMBF walker warnings of EACH dispatched `caBX` chunk, one inner `Vec`
+  /// per `caBX` (in chunk-walk order). [`PngDiagStep::Jumbf`] carries the index
+  /// into this list, so each `caBX`'s warnings drain at ITS walk position — the
+  /// per-OCCURRENCE diagnostic axis, decoupled from the last-wins [`Self::jumbf`]
+  /// TAG meta. A PNG legally carries one `caBX` (so this holds one entry), but a
+  /// crafted PNG can carry several; the `caBX` TAGS last-wins-replace into
+  /// [`Self::jumbf`] while the DIAGNOSTICS stay per-occurrence, so a malformed
+  /// LATER `caBX`'s warning does not steal the priority-0 first-wins
+  /// `ExifTool:Warning` slot from an intervening earlier-walked warning
+  /// ([[exifast-warning-priority0-firstwins]]). Only a NON-empty decode pushes an
+  /// entry (an empty `caBX` is dropped whole, see [`Self::set_jumbf`]).
+  jumbf_diags: Vec<Vec<crate::exif::jumbf::JumbfWarning>>,
   /// Phantom carry of `'a` for future zero-alloc evolution / sub-Meta
   /// embedding.
   _lifetime: core::marker::PhantomData<&'a ()>,
@@ -885,6 +909,18 @@ pub(crate) enum PngDiagStep {
   /// `ProcessXMP` decode yields at most one first-occurrence warning.
   #[cfg(feature = "xmp")]
   Xmp,
+  /// A `caBX` chunk's JUMBF sub-Meta — its `Jpeg2000.pm` walker warnings
+  /// (`Truncated JUMD directory`, the depth-budget `JUMBF box nesting too deep`,
+  /// …) drain at the `caBX` chunk-walk position. Carries the index into
+  /// [`PngMeta::jumbf_diags`] of THAT `caBX`'s warnings: each non-empty `caBX`
+  /// pushes its OWN step (a PNG legally carries one, but a crafted PNG can carry
+  /// several), so the warnings stay PER occurrence and drain at the right walk
+  /// position. Decoupled from the last-wins [`PngMeta::jumbf`] TAG meta —
+  /// recorded so a malformed `caBX` BEFORE a later PNG warning wins the
+  /// document-level priority-0 first-wins `ExifTool:Warning` slot, while a
+  /// malformed LATER `caBX` does NOT steal that slot from an earlier-walked
+  /// warning, matching ExifTool's walk-position emission.
+  Jumbf(usize),
 }
 
 /// The payload LENGTHS of a `Binary => 1` PNG vendor chunk (`iDOT` /
@@ -1084,6 +1120,8 @@ impl PngMeta<'_> {
       zxif_inflated_total: 0,
       container: PngContainer::Png,
       mng: None,
+      jumbf: None,
+      jumbf_diags: Vec::new(),
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -1557,6 +1595,52 @@ impl PngMeta<'_> {
   #[inline]
   pub(crate) fn mng_mut(&mut self) -> &mut crate::exif::mng::MngMeta {
     self.mng.get_or_insert_with(crate::exif::mng::MngMeta::new)
+  }
+
+  /// The decoded JUMBF / C2PA metadata of a `caBX` chunk, if any. `None` for a
+  /// PNG with no `caBX` (and for a `caBX` whose box stream recognized nothing).
+  #[inline]
+  #[must_use]
+  pub(crate) fn jumbf(&self) -> Option<&crate::exif::jumbf::JumbfMeta> {
+    self.jumbf.as_ref()
+  }
+
+  /// Record the decoded JUMBF metadata of a `caBX` chunk — the chunk-walker hook
+  /// called once per `caBX` chunk (`PNG.pm:343-346`). A non-empty decode REPLACES
+  /// any prior for the TAG output (a PNG may legally carry a single `caBX`;
+  /// last-wins matches the `%PNG::Main` `caBX` non-List default); an empty decode
+  /// (`JumbfMeta::is_empty`) is dropped whole so the PNG output stays
+  /// byte-identical.
+  ///
+  /// EACH non-empty `caBX` appends one [`PngDiagStep::Jumbf`] to
+  /// [`Self::diag_order`] at ITS chunk-walk position, carrying the index of THAT
+  /// `caBX`'s warnings stored in [`Self::jumbf_diags`] — so the JUMBF walker's
+  /// warnings drain at the `caBX` chunk position rather than after the whole walk,
+  /// PER occurrence. Load-bearing for the document-level priority-0 first-wins
+  /// `ExifTool:Warning` (a malformed `caBX` before a later PNG warning must win):
+  /// the diagnostics are decoupled from the last-wins TAG meta, so a malformed
+  /// LATER `caBX` does NOT steal the slot from an earlier-walked warning. The TAG
+  /// output ([`Self::jumbf`]) still last-wins-replaces (a 2nd `caBX`'s tags
+  /// overwrite), matching the `%PNG::Main` singleton key.
+  #[inline]
+  pub(crate) fn set_jumbf(&mut self, jumbf: crate::exif::jumbf::JumbfMeta) {
+    if !jumbf.is_empty() {
+      self
+        .diag_order
+        .push(PngDiagStep::Jumbf(self.jumbf_diags.len()));
+      self.jumbf_diags.push(jumbf.warnings().to_vec());
+      self.jumbf = Some(jumbf);
+    }
+  }
+
+  /// The JUMBF walker warnings recorded for the `caBX` occurrence at `index` (the
+  /// index a [`PngDiagStep::Jumbf`] carries) — the per-occurrence diagnostic
+  /// drain reads them at the `caBX` walk position. `None` for an out-of-range
+  /// index (defensive; the drain only replays recorded steps).
+  #[inline]
+  #[must_use]
+  pub(crate) fn jumbf_diag(&self, index: usize) -> Option<&[crate::exif::jumbf::JumbfWarning]> {
+    self.jumbf_diags.get(index).map(Vec::as_slice)
   }
 
   /// The WALK-ORDER interleaving of the three document-diagnostic sources (one
