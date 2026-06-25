@@ -1,0 +1,22 @@
+[{
+  "SourceFile": "AVI_pentaxjunk2_dup.avi",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "AVI",
+  "File:FileTypeExtension": "AVI",
+  "File:MIMEType": "video/x-msvideo",
+  "RIFF:FrameRate": 24.0003840061441,
+  "RIFF:MaxDataRate": 0,
+  "RIFF:FrameCount": 10,
+  "RIFF:StreamCount": 1,
+  "RIFF:ImageWidth": 320,
+  "RIFF:ImageHeight": 240,
+  "Pentax:Make": "PENTAX",
+  "Pentax:Model": "Optio RZ99",
+  "Pentax:FNumber": 2.8,
+  "Pentax:DateTime1": "2099:12:31 23:59:58",
+  "Pentax:DateTime2": "2099:12:31 23:59:59",
+  "Composite:Aperture": 2.8,
+  "Composite:ImageSize": "320 240",
+  "Composite:Megapixels": 0.0768,
+  "Composite:Duration": 0.41666
+}]

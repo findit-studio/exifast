@@ -1067,15 +1067,16 @@ fn pentaxjunk2_string_field_truncates_at_embedded_nul() {
 }
 
 #[test]
-fn pentaxjunk2_repeated_junk_is_first_wins_in_exifast() {
-  // DIVERGENCE NOTE (separate from the #154 FNumber finding): with TWO
-  // `PentaxJunk2` chunks, bundled ExifTool is LAST-wins (the later chunk's
-  // `Make`/`FNumber`/… override via the TagMap), whereas exifast's JUNK dispatch
-  // captures the FIRST matching Pentax `JUNK` (`pentax_junk.is_none()`,
-  // riff.rs:1353) and IGNORES the rest. This test pins exifast's CURRENT
-  // first-wins behavior (the first chunk's `FNumber 2.8` survives); reconciling
-  // the JUNK-dispatch ordering with bundled's last-wins is a distinct change to
-  // the capture path, tracked outside this FNumber fix.
+fn pentaxjunk2_repeated_junk_is_last_wins_matching_bundled() {
+  // #422 RESOLVED: with TWO FULL-length `PentaxJunk2` chunks, bundled ExifTool
+  // is LAST-wins (the later chunk's `Make`/`FNumber`/… override via the TagMap).
+  // exifast's JUNK dispatch now matches — each matched chunk is appended in walk
+  // order and replayed at emit, so the central `TagMap` resolves each leaf to the
+  // last-walked: the SECOND chunk's `RICOH ` / `FNumber 5.0` survive. (Previously
+  // this pinned the deferred first-wins divergence noted in #154; the byte-exact
+  // `AVI_pentaxjunk2_dup.avi` golden is the bundled-13.59 oracle for this path.
+  // The PARTIAL-repeat per-leaf union — where a later SHORTER chunk does NOT
+  // override the earlier chunk's out-of-range leaves — is pinned just below.)
   let first = {
     let mut p = vec![0u8; 0x66];
     p[0..18].copy_from_slice(b"PENTDigital Camera");
@@ -1110,13 +1111,241 @@ fn pentaxjunk2_repeated_junk_is_first_wins_in_exifast() {
   data.extend_from_slice(&((body.len()) as u32).to_le_bytes());
   data.extend_from_slice(&body);
   let got = extract_info("pj2dup.avi", &data, true);
-  // exifast first-wins: the FIRST chunk's 2.8 / PENTAX survive.
+  // exifast last-wins (#422): the SECOND chunk's 5.0 / RICOH survive.
   assert!(
-    got.contains("\"Pentax:FNumber\":2.8,"),
-    "exifast captures the first PentaxJunk2 (FNumber 2.8):\n{got}"
+    got.contains("\"Pentax:FNumber\":5.0,"),
+    "exifast captures the last PentaxJunk2 (FNumber 5.0):\n{got}"
   );
   assert!(
-    got.contains("\"Pentax:Make\":\"PENTAX\","),
-    "exifast captures the first PentaxJunk2 (Make PENTAX):\n{got}"
+    got.contains("\"Pentax:Make\":\"RICOH \","),
+    "exifast captures the last PentaxJunk2 (Make RICOH):\n{got}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_partial_repeat_keeps_earlier_leaves_per_tag() {
+  // #422 Codex [high]: the repeated-`JUNK` dispatch is PER-EMITTED-LEAF, NOT a
+  // whole-payload last-wins. A FULL `PentaxJunk2` (Make/Model/FNumber/DateTime)
+  // followed by a SHORTER same-signature `PentaxJunk2` carrying ONLY `Make` (the
+  // rest of the leaves past the chunk end) must keep the FIRST chunk's
+  // `Model`/`FNumber`/`DateTime1`/`DateTime2` while the later `Make` wins — the
+  // central `TagMap` resolves each tag independently. The pre-fix whole-payload
+  // OVERWRITE dropped Model/FNumber/DateTime (it kept only the short chunk's
+  // subset); the ordered-Vec + replay-all dispatch preserves the union. Bundled
+  // 13.59 oracle: `AVI_pentaxjunk2_partial.avi` (the byte-exact golden).
+  let first = {
+    let mut p = vec![0u8; 0xc0];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    p[0x12..0x12 + 6].copy_from_slice(b"PENTAX");
+    p[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+    p[0x5e..0x5e + 4].copy_from_slice(&28u32.to_le_bytes());
+    p[0x5e + 4..0x5e + 8].copy_from_slice(&10u32.to_le_bytes());
+    p[0x83..0x83 + 19].copy_from_slice(b"2014:01:02 03:04:05");
+    p[0x9d..0x9d + 19].copy_from_slice(b"2014:01:02 03:04:06");
+    p
+  };
+  // SHORTER second chunk: 0x2c bytes — only `Make` @ 0x12 (string[24], ends
+  // 0x2a) is in range; `Model` @ 0x2c, `FNumber` @ 0x5e, `DateTime` @ 0x83/0x9d
+  // are all PAST the chunk end, so this chunk emits NO Model/FNumber/DateTime.
+  let second = {
+    let mut p = vec![0u8; 0x2c];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    p[0x12..0x12 + 6].copy_from_slice(b"RICOH ");
+    p
+  };
+  let mut avih = Vec::new();
+  for v in [41666u32, 0, 0, 0x10, 10, 0, 1, 0, 320, 240, 0, 0, 0, 0] {
+    avih.extend_from_slice(&v.to_le_bytes());
+  }
+  let mut hdrl = Vec::from(*b"hdrl");
+  hdrl.extend_from_slice(&wav_chunk(b"avih", &avih));
+  let lst = wav_chunk(b"LIST", &hdrl);
+  let mut body = Vec::from(*b"AVI ");
+  body.extend_from_slice(&lst);
+  body.extend_from_slice(&wav_chunk(b"JUNK", &first));
+  body.extend_from_slice(&wav_chunk(b"JUNK", &second));
+  let mut data = Vec::from(*b"RIFF");
+  data.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+  data.extend_from_slice(&body);
+  let got = extract_info("pj2partial.avi", &data, true);
+  // The FIRST (full) chunk's leaves the short chunk lacks SURVIVE.
+  assert!(
+    got.contains("\"Pentax:Model\":\"Optio RZ18\","),
+    "the earlier chunk's Model must survive a shorter repeat:\n{got}"
+  );
+  assert!(
+    got.contains("\"Pentax:FNumber\":2.8,"),
+    "the earlier chunk's FNumber must survive a shorter repeat:\n{got}"
+  );
+  assert!(
+    got.contains("\"Pentax:DateTime1\":\"2014:01:02 03:04:05\","),
+    "the earlier chunk's DateTime1 must survive a shorter repeat:\n{got}"
+  );
+  assert!(
+    got.contains("\"Pentax:DateTime2\":\"2014:01:02 03:04:06\","),
+    "the earlier chunk's DateTime2 must survive a shorter repeat:\n{got}"
+  );
+  // The LATER (short) chunk's `Make` wins per-leaf.
+  assert!(
+    got.contains("\"Pentax:Make\":\"RICOH \","),
+    "the later (shorter) chunk's Make must win per-leaf:\n{got}"
+  );
+}
+
+/// Build a single-`JUNK` AVI whose `PentaxJunk2` payload is `len` bytes total:
+/// the `PENTDigital Camera` signature (18 bytes) then `make_fill` written across
+/// the `Make` region (0x12), padded with NUL to `len`. For `len > 0x12` the
+/// `Make` leaf has `len - 0x12` bytes available.
+fn pentaxjunk2_avi_truncated(len: usize, make_fill: &[u8]) -> Vec<u8> {
+  let mut p = vec![0u8; len];
+  let sig = b"PENTDigital Camera";
+  let s = sig.len().min(len);
+  p[..s].copy_from_slice(&sig[..s]);
+  if len > 0x12 {
+    let avail = len - 0x12;
+    let n = make_fill.len().min(avail);
+    p[0x12..0x12 + n].copy_from_slice(&make_fill[..n]);
+  }
+  riff_avi_with_junk(&p)
+}
+
+/// Build a single-`JUNK` AVI whose `PentaxJunk` payload is `len` bytes total: the
+/// `IIII\x01\0` signature (6 bytes) then `model_fill` written across the `Model`
+/// region (0x0c), padded with NUL to `len`.
+fn pentaxjunk_avi_truncated(len: usize, model_fill: &[u8]) -> Vec<u8> {
+  let mut p = vec![0u8; len];
+  let sig = b"IIII\x01\x00";
+  let s = sig.len().min(len);
+  p[..s].copy_from_slice(&sig[..s]);
+  if len > 0x0c {
+    let avail = len - 0x0c;
+    let n = model_fill.len().min(avail);
+    p[0x0c..0x0c + n].copy_from_slice(&model_fill[..n]);
+  }
+  riff_avi_with_junk(&p)
+}
+
+#[test]
+fn pentaxjunk2_make_string_clamps_to_available_bytes() {
+  // #422 Codex [medium]: ExifTool's `ReadValue` for a fixed `string[N]` CLAMPS to
+  // the available bytes (`ExifTool.pm:6301-6303` shortens the count) and drops
+  // ONLY at ZERO bytes — so a `Make` `string[24]` @ 0x12 with FEWER than 24 bytes
+  // emits a PARTIAL string (not nothing). The R3 all-or-nothing read
+  // (`payload.get(off..off+24)`) wrongly dropped these. bundled 13.59 oracle
+  // (`PENTDigital Camera` + the 24-char fill `ABCDEFGHIJKLMNOPQRSTUVWX`):
+  //   len 18 → no Make (offset 0x12 == len, 0 bytes);
+  //   len 19 → "A" (1 byte); len 30 → "ABCDEFGHIJKL" (12); len 41 → 23 bytes;
+  //   len 42 → "ABCDEFGHIJKLMNOPQRSTUVWX" (the full 24).
+  let fill = b"ABCDEFGHIJKLMNOPQRSTUVWX"; // 24 distinct chars
+  for (len, expected) in [
+    (19usize, Some("A")),
+    (30, Some("ABCDEFGHIJKL")),
+    (41, Some("ABCDEFGHIJKLMNOPQRSTUVW")),
+    (42, Some("ABCDEFGHIJKLMNOPQRSTUVWX")),
+  ] {
+    let data = pentaxjunk2_avi_truncated(len, fill);
+    let got = extract_info("pj2trunc.avi", &data, true);
+    let needle = format!("\"Pentax:Make\":\"{}\",", expected.unwrap());
+    assert!(
+      got.contains(&needle),
+      "Junk2 len {len}: Make must clamp to the available bytes ({needle}):\n{got}"
+    );
+  }
+  // len 18 (== the Make offset 0x12): ZERO bytes at the leaf ⇒ NO Make at all
+  // (the whole chunk is signature-only and dropped). Matches bundled.
+  let data18 = pentaxjunk2_avi_truncated(18, fill);
+  let got18 = extract_info("pj2trunc.avi", &data18, true);
+  assert!(
+    !got18.contains("Pentax:Make"),
+    "Junk2 len 18 (offset == len, 0 bytes) must emit no Make:\n{got18}"
+  );
+}
+
+#[test]
+fn pentaxjunk_model_string_clamps_to_available_bytes() {
+  // The `PentaxJunk` (variant 1) `Model` `string[32]` @ 0x0c clamps the same way.
+  // bundled 13.59 oracle (`IIII\x01\0` + the 32-char fill):
+  //   len 12 → no Model (offset 0x0c == len); len 13 → "A" (1 byte);
+  //   len 20 → "ABCDEFGH" (8); len 44 → the full 32 bytes.
+  let fill = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"; // 32 distinct chars
+  for (len, expected) in [
+    (13usize, "A"),
+    (20, "ABCDEFGH"),
+    (44, "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),
+  ] {
+    let data = pentaxjunk_avi_truncated(len, fill);
+    let got = extract_info("pj1trunc.avi", &data, true);
+    let needle = format!("\"Pentax:Model\":\"{expected}\",");
+    assert!(
+      got.contains(&needle),
+      "Junk len {len}: Model must clamp to the available bytes ({needle}):\n{got}"
+    );
+  }
+  let data12 = pentaxjunk_avi_truncated(12, fill);
+  let got12 = extract_info("pj1trunc.avi", &data12, true);
+  assert!(
+    !got12.contains("Pentax:Model"),
+    "Junk len 12 (offset == len, 0 bytes) must emit no Model:\n{got12}"
+  );
+}
+
+#[test]
+fn pentaxjunk2_below_threshold_short_repeat_wins_partial_make_per_leaf() {
+  // #422 Codex [medium], the per-leaf union below the full Make width: a FULL
+  // `PentaxJunk2` followed by a SHORT (30-byte) same-signature chunk whose `Make`
+  // is PARTIAL (12 of 24 bytes). Because the short chunk now emits its clamped
+  // Make, the per-leaf last-wins resolves `Make` to the SHORT's partial value,
+  // while `Model`/`FNumber` (which the short chunk lacks — past its end) stay the
+  // FULL chunk's. The R3 code dropped the 30-byte chunk entirely (threshold 42),
+  // so its partial Make never won. bundled 13.59 oracle: full(Make=PENTAX,
+  // FNumber=2.8, Model="Optio RZ18") THEN short30(partial Make="RICOHRICOHRI") →
+  // Make "RICOHRICOHRI", Model "Optio RZ18", FNumber 2.8.
+  let first = {
+    let mut p = vec![0u8; 0x66];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    p[0x12..0x12 + 6].copy_from_slice(b"PENTAX");
+    p[0x2c..0x2c + 10].copy_from_slice(b"Optio RZ18");
+    p[0x5e..0x5e + 4].copy_from_slice(&28u32.to_le_bytes());
+    p[0x5e + 4..0x5e + 8].copy_from_slice(&10u32.to_le_bytes());
+    p
+  };
+  // 30-byte short: Make @ 0x12 has 30-18 = 12 bytes ⇒ partial "RICOHRICOHRI".
+  let second = {
+    let mut p = vec![0u8; 30];
+    p[0..18].copy_from_slice(b"PENTDigital Camera");
+    let fill = b"RICOHRICOHRICOH";
+    let avail = 30 - 0x12; // 12
+    let n = fill.len().min(avail);
+    p[0x12..0x12 + n].copy_from_slice(&fill[..n]);
+    p
+  };
+  let mut avih = Vec::new();
+  for v in [41666u32, 0, 0, 0x10, 10, 0, 1, 0, 320, 240, 0, 0, 0, 0] {
+    avih.extend_from_slice(&v.to_le_bytes());
+  }
+  let mut hdrl = Vec::from(*b"hdrl");
+  hdrl.extend_from_slice(&wav_chunk(b"avih", &avih));
+  let lst = wav_chunk(b"LIST", &hdrl);
+  let mut body = Vec::from(*b"AVI ");
+  body.extend_from_slice(&lst);
+  body.extend_from_slice(&wav_chunk(b"JUNK", &first));
+  body.extend_from_slice(&wav_chunk(b"JUNK", &second));
+  let mut data = Vec::from(*b"RIFF");
+  data.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+  data.extend_from_slice(&body);
+  let got = extract_info("pj2shortwin.avi", &data, true);
+  // The SHORT chunk's PARTIAL Make wins per-leaf.
+  assert!(
+    got.contains("\"Pentax:Make\":\"RICOHRICOHRI\","),
+    "the shorter repeat's clamped (partial) Make must win per-leaf:\n{got}"
+  );
+  // The FULL chunk's leaves the short chunk lacks SURVIVE.
+  assert!(
+    got.contains("\"Pentax:Model\":\"Optio RZ18\","),
+    "the full chunk's Model must survive the shorter repeat:\n{got}"
+  );
+  assert!(
+    got.contains("\"Pentax:FNumber\":2.8,"),
+    "the full chunk's FNumber must survive the shorter repeat:\n{got}"
   );
 }

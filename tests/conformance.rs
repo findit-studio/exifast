@@ -375,6 +375,50 @@ fn riff_junk_conformance() {
   // ImageSize/Megapixels/Duration.
   check("AVI_pentaxjunk2.avi", "AVI_pentaxjunk2.avi.json", true);
   check("AVI_pentaxjunk2.avi", "AVI_pentaxjunk2.avi.n.json", false);
+
+  // `AVI_pentaxjunk2_dup.avi` (#422) — the `AVI_pentaxjunk2.avi` base with a
+  // SECOND, FULL-LENGTH `PentaxJunk2` `JUNK` chunk (a different `Model`
+  // "Optio RZ99" + `DateTime` 2099) appended at the top level. ExifTool re-runs
+  // the matched `%Pentax::Junk2` SubDirectory on EVERY `JUNK` chunk it walks, so
+  // the later chunk's `Pentax:*` leaves last-wins over the earlier one's via the
+  // normal `Priority => 1` tag-overwrite — bundled 13.59 keeps
+  // `Model = Optio RZ99` / `DateTime1 = 2099:12:31 23:59:58` (the SECOND chunk),
+  // NOT the first "Optio RZ18"/2014. The pre-#422 first-match-wins capture (the
+  // `pentax_junk.is_none()` guard) wrongly froze the FIRST chunk; the now
+  // ordered-Vec + replay-all dispatch emits both chunks' leaves and the central
+  // `TagMap` resolves each tag to the last-walked.
+  check(
+    "AVI_pentaxjunk2_dup.avi",
+    "AVI_pentaxjunk2_dup.avi.json",
+    true,
+  );
+  check(
+    "AVI_pentaxjunk2_dup.avi",
+    "AVI_pentaxjunk2_dup.avi.n.json",
+    false,
+  );
+
+  // `AVI_pentaxjunk2_partial.avi` (#422 Codex [high]) — a FULL `PentaxJunk2`
+  // chunk (Make=PENTAX, Model="Optio RZ18", FNumber 28/10, DateTime 2014)
+  // followed by a SHORTER same-signature `PentaxJunk2` chunk (44 bytes: only the
+  // `Make`="RICOH " leaf @ 0x12 is in range; `Model`/`FNumber`/`DateTime` @
+  // 0x2c/0x5e/0x83/0x9d are PAST the chunk end). ExifTool replays the
+  // SubDirectory per chunk and the `TagMap` dedups PER LEAF, so bundled 13.59
+  // keeps the first chunk's `Model`/`FNumber`/`DateTime1`/`DateTime2` (the short
+  // chunk emits none of them) while the later `Make = "RICOH "` wins. The
+  // pre-fix whole-payload OVERWRITE would have dropped Model/FNumber/DateTime
+  // (keeping only the short chunk's Make subset); the ordered-Vec + replay-all
+  // fix preserves the union, matching bundled byte-exact.
+  check(
+    "AVI_pentaxjunk2_partial.avi",
+    "AVI_pentaxjunk2_partial.avi.json",
+    true,
+  );
+  check(
+    "AVI_pentaxjunk2_partial.avi",
+    "AVI_pentaxjunk2_partial.avi.n.json",
+    false,
+  );
 }
 
 #[test]
