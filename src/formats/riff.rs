@@ -452,7 +452,7 @@ enum PentaxJunkVariant {
 /// `ProcessStreamData` keys the table by the first 4 bytes of the chunk
 /// (`my $tag = substr($$dataPt, $start, 4)`, `RIFF.pm:1709`); the matched
 /// payload is captured for the emit-time decode (`tags()`), mirroring the
-/// `pentax_junk` re-dispatch. The leaf renderings are tiny fixed string
+/// `pentax_junk_records` re-dispatch. The leaf renderings are tiny fixed string
 /// conversions, so the variant alone selects the right one.
 ///
 /// The Canon `AVIF` row (`RIFF.pm:1257-1265` → `Exif::Main` IFD0 with
@@ -556,15 +556,21 @@ pub struct RiffMeta<'a> {
   /// WEBP gets its `webp` extension from the `%fileTypeExt` default, not this
   /// flag.
   webp_ext_override: bool,
-  /// `Some((variant, payload))` when a `JUNK` chunk matched a Pentax vendor
-  /// SubDirectory signature (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478). The
-  /// payload is a sub-slice BORROWED from the input (zero-copy); decoded at
-  /// emit time through the variant's tiny `ProcessBinaryData` offset map and
-  /// emitted under family-0 `MakerNotes`, family-1 `Pentax`. The FIRST matching
-  /// `JUNK` wins (a single vendor JUNK per file in practice). `None` for a
-  /// `JUNK` chunk that matched no vendor signature or the `TextJunk` fallback
-  /// (#154).
-  pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
+  /// The matched Pentax vendor `JUNK` SubDirectories (`PentaxJunk`/`PentaxJunk2`,
+  /// RIFF.pm:469-478) and their borrowed payloads, in WALK ORDER. ExifTool
+  /// re-runs the matched SubDirectory on EVERY `JUNK` chunk it walks, so a
+  /// repeated/mixed `JUNK` retains a record per matched chunk that has at least
+  /// one in-range leaf; each payload is a sub-slice BORROWED from the input
+  /// (zero-copy), decoded at emit time through the variant's tiny
+  /// `ProcessBinaryData` offset map and emitted under family-0 `MakerNotes`,
+  /// family-1 `Pentax`. The central `TagMap` resolves duplicates PER LEAF
+  /// (last-wins per tag name), so a full `PentaxJunk2` followed by a SHORTER
+  /// same-signature one keeps the earlier chunk's `Model`/`FNumber`/`DateTime`
+  /// while the later `Make` wins. A signature-only chunk with no in-range leaf is
+  /// dropped (it would emit nothing — byte-identical to the full replay, but
+  /// bounds the Vec against a crafted tiny-chunk repeat). Empty for a `JUNK` that
+  /// matched no vendor signature or the `TextJunk` fallback (#154, #422).
+  pentax_junk_records: Vec<(PentaxJunkVariant, &'a [u8])>,
   /// The matched `strd` (StreamData) chunks whose leading 4-byte tag ID hit a
   /// `%RIFF::StreamData` row (`Zora`/`CASI`/the `unknown` fallback —
   /// `RIFF.pm:1250-1276`), in WALK ORDER. ExifTool runs `ProcessStreamData` on
@@ -592,7 +598,7 @@ impl Default for RiffMeta<'_> {
       pentax_makernote: None,
       webp_meta: Vec::new(),
       webp_ext_override: false,
-      pentax_junk: None,
+      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     }
   }
@@ -768,7 +774,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     webp_file_type_override: None,
     webp_ext_override: false,
     webp_meta: Vec::new(),
-    pentax_junk: None,
+    pentax_junk_records: Vec::new(),
     strd_records: Vec::new(),
   };
 
@@ -800,7 +806,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     pentax_makernote: walker.pentax_makernote,
     webp_meta: walker.webp_meta,
     webp_ext_override,
-    pentax_junk: walker.pentax_junk,
+    pentax_junk_records: walker.pentax_junk_records,
     strd_records: walker.strd_records,
   })
 }
@@ -869,11 +875,20 @@ struct Walker<'a> {
   /// through [`crate::exif::parse_exif_block`] / [`crate::formats::xmp::parse_borrowed`].
   /// Empty until a metadata chunk is seen.
   webp_meta: Vec<WebpMetaChunk<'a>>,
-  /// The matched Pentax vendor `JUNK` SubDirectory (`PentaxJunk`/`PentaxJunk2`,
-  /// RIFF.pm:469-478) and its borrowed payload. The FIRST matching `JUNK` wins
-  /// (the conditions are mutually exclusive on the leading signature anyway).
-  /// `None` until such a `JUNK` is seen (#154).
-  pentax_junk: Option<(PentaxJunkVariant, &'a [u8])>,
+  /// The matched Pentax vendor `JUNK` SubDirectories (`PentaxJunk`/`PentaxJunk2`,
+  /// RIFF.pm:469-478) and their borrowed payloads, in WALK ORDER — ExifTool
+  /// re-runs the matched SubDirectory on EVERY `JUNK` chunk it walks (`HandleTag`
+  /// at each walk position), so a repeated/mixed `JUNK` retains one record per
+  /// matched chunk that has at least one in-range leaf, NOT a single slot. Each
+  /// chunk's in-range leaves are replayed at emit time through the variant's
+  /// `ProcessBinaryData` offset map, and the central `TagMap` resolves duplicates
+  /// PER LEAF (last-wins per tag) — so a full `PentaxJunk2` followed by a SHORTER
+  /// same-signature one keeps the first chunk's `Model`/`FNumber`/`DateTime` (the
+  /// short one lacks them) while the later `Make` wins. A signature-only chunk
+  /// that can emit no leaf is not retained (no output either way; bounds the Vec
+  /// against a crafted tiny-chunk repeat). Each payload is borrowed from `data`
+  /// (zero-copy). Empty until such a `JUNK` is seen (#154, #422).
+  pentax_junk_records: Vec<(PentaxJunkVariant, &'a [u8])>,
   /// The matched `%RIFF::StreamData` rows (`Zora`/`CASI`/`unknown`,
   /// `RIFF.pm:1250-1276`) and their borrowed `strd` payloads, in WALK ORDER —
   /// ExifTool's `ProcessStreamData` runs on EVERY `strd` chunk it walks (one per
@@ -1410,8 +1425,13 @@ impl<'a> Walker<'a> {
   ///   `ProcessLucas` (a timed-metadata subsystem).
   ///
   /// `body` is the full `JUNK` chunk payload (already bounds-checked by the
-  /// caller). The first matching Pentax `JUNK` is captured (zero-copy borrow);
-  /// the `TextJunk` value is decoded + pushed immediately.
+  /// caller). EACH matched Pentax `JUNK` is captured in WALK ORDER (zero-copy
+  /// borrow, appended — never overwritten), mirroring `strd_records`: ExifTool
+  /// re-runs the matched SubDirectory on every `JUNK` chunk, so emit-time replay
+  /// of each chunk's in-range leaves + the central `TagMap` per-leaf dedup keeps
+  /// the union (last-wins per tag) — see the per-signature notes below. The
+  /// `TextJunk` value is decoded + pushed immediately (a single tag, so its
+  /// repeat last-wins via the same `TagMap` dedup).
   fn dispatch_junk(&mut self, body: &'a [u8]) {
     // RIFF.pm:445 `OlympusJunk` `^OLYMDigital Camera` — deferred (subsystem).
     if body.starts_with(b"OLYMDigital Camera") {
@@ -1425,17 +1445,36 @@ impl<'a> Walker<'a> {
     if body.starts_with(b"ucmt") {
       return;
     }
-    // RIFF.pm:471 `PentaxJunk` `^IIII\x01\0` — Optio RS1000.
+    // RIFF.pm:471 `PentaxJunk` `^IIII\x01\0` — Optio RS1000. EACH matched chunk
+    // that CAN emit a leaf is appended in walk order (no overwrite): ExifTool
+    // re-runs the matched SubDirectory on EVERY `JUNK` chunk it walks (`HandleTag`
+    // at each walk position), emitting that chunk's in-range leaves, then the
+    // central `TagMap` resolves duplicates PER LEAF via the normal `Priority => 1`
+    // tag-overwrite (last-walked wins per tag). Replaying every record preserves
+    // the earlier leaves a later SHORTER chunk lacks (verified vs bundled 13.59).
+    // A signature-only chunk with NO in-range leaf is NOT retained — it would
+    // emit nothing, so dropping it is byte-identical to the full replay while
+    // bounding the record Vec against a crafted tiny-chunk repeat (#422).
     if body.starts_with(b"IIII\x01\x00") {
-      if self.pentax_junk.is_none() {
-        self.pentax_junk = Some((PentaxJunkVariant::Junk, body));
+      if pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk, body.len()) {
+        self
+          .pentax_junk_records
+          .push((PentaxJunkVariant::Junk, body));
       }
       return;
     }
-    // RIFF.pm:476 `PentaxJunk2` `^PENTDigital Camera` — Optio RZ18.
+    // RIFF.pm:476 `PentaxJunk2` `^PENTDigital Camera` — Optio RZ18. Same
+    // retain-each-that-emits in walk order as `PentaxJunk` above; the per-leaf
+    // `TagMap` dedup at emit keeps the union (last-wins per tag), so a full
+    // `PentaxJunk2` followed by a shorter same-signature one keeps the first
+    // chunk's `Model`/`FNumber`/`DateTime` while the later `Make` wins (bundled
+    // 13.59). A signature-only chunk shorter than the first leaf (`Make` @ 0x12)
+    // emits nothing and is NOT retained (#422).
     if body.starts_with(b"PENTDigital Camera") {
-      if self.pentax_junk.is_none() {
-        self.pentax_junk = Some((PentaxJunkVariant::Junk2, body));
+      if pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk2, body.len()) {
+        self
+          .pentax_junk_records
+          .push((PentaxJunkVariant::Junk2, body));
       }
       return;
     }
@@ -1925,30 +1964,48 @@ fn emit_audio_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
 }
 
 /// Read a fixed-width `string[N]` field at byte `off` (faithful to ExifTool's
-/// `ReadValue($_, 'string', N)` — exactly `N` bytes). ExifTool's `string` format
-/// TRUNCATES at the first NUL (`$val =~ s/\0.*//s if $format eq 'string'`,
-/// `ExifTool.pm:6311`, `:10038`), so an EMBEDDED NUL ends the value — the bytes
-/// after it are dropped, NOT retained. Invalid UTF-8 is rendered as `?` per the
-/// JSON FixUTF8 step. Returns `None` when the window runs past the chunk (a short
-/// read ⇒ no emission, matching `ProcessBinaryData`'s skip of an out-of-range
-/// entry).
+/// `ReadValue($_, 'string', N)`). ExifTool CLAMPS a fixed `string` to the bytes
+/// actually available from the offset — `ReadValue` shortens the count when
+/// `$len * $count > $size` (`ExifTool.pm:6301-6303`: `$count = int($size/$len)`),
+/// so a short read returns the AVAILABLE bytes (a PARTIAL string), and returns
+/// `undef` ONLY when ZERO bytes remain (`$count < 1`). `ProcessBinaryData` reaches
+/// the field whenever its offset is in range (`$more = $size - $entry`,
+/// `last if $more <= 0`, `:9963-9964`), i.e. iff `off < payload.len()` — so the
+/// field emits a string of `min(N, payload.len() - off)` bytes and emits NOTHING
+/// only when `off >= payload.len()`. The `string` format then TRUNCATES at the
+/// first NUL (`$val =~ s/\0.*//s if $format eq 'string'`, `:6311`, `:10038`), so
+/// an EMBEDDED NUL ends the value — the bytes after it are dropped, NOT retained.
+/// Invalid UTF-8 is rendered as `?` per the JSON FixUTF8 step.
 ///
 /// Every caller is a genuine ExifTool `string[N]` field (bext `Description`/
 /// `Originator`/`OriginatorReference`/`DateTimeOriginal`/`CodingHistory`,
-/// `%Pentax::Junk*` `Make`/`Model`/`DateTime1`/`DateTime2`), so the first-NUL
-/// truncation is correct for all of them. The `undef[N]` fields (`BWF_UMID`)
+/// `%Pentax::Junk*` `Make`/`Model`/`DateTime1`/`DateTime2`), so both the
+/// clamp-to-available read and the first-NUL truncation are correct for all of
+/// them. A fully-available field reads exactly `N` bytes (the clamp is a no-op),
+/// so every full-width golden is unchanged. The `undef[N]` fields (`BWF_UMID`)
 /// take their own ValueConv path, NOT this helper.
 #[cfg(feature = "alloc")]
 fn string_field(payload: &[u8], off: usize, len: usize) -> Option<String> {
-  payload.get(off..off.saturating_add(len)).map(|window| {
-    // `string` format: end the value at the first NUL (the C-string terminator),
-    // then FixUTF8 (`string_trim_nulls`'s trailing-NUL trim is then a no-op). The
-    // `..end` index is `position`-bounded (`< window.len()`) or the full length,
-    // so `get` always succeeds; the panic-free `get` keeps `indexing_slicing`
-    // clean.
-    let end = window.iter().position(|&b| b == 0).unwrap_or(window.len());
-    string_trim_nulls(window.get(..end).unwrap_or(window))
-  })
+  // `ReadValue` clamps a fixed string to the available byte count: read
+  // `min(len, payload.len() - off)` bytes, dropping ONLY when zero bytes remain
+  // at the offset. ExifTool drops at `off >= payload.len()` (`$more <= 0` ⇒
+  // `last`, `:9964`; or `$count < 1` ⇒ `undef`, `:6303`) — i.e. the field needs
+  // at LEAST one byte past `off`. `payload.get(off..)` alone returns `Some(&[])`
+  // for `off == payload.len()`, so filter the zero-length tail to `None`.
+  payload
+    .get(off..)
+    .filter(|tail| !tail.is_empty())
+    .map(|tail| {
+      let take = len.min(tail.len());
+      let window = tail.get(..take).unwrap_or(tail);
+      // `string` format: end the value at the first NUL (the C-string
+      // terminator), then FixUTF8 (`string_trim_nulls`'s trailing-NUL trim is
+      // then a no-op). The `..end` index is `position`-bounded (`< window.len()`)
+      // or the full length, so `get` always succeeds; the panic-free `get` keeps
+      // `indexing_slicing` clean.
+      let end = window.iter().position(|&b| b == 0).unwrap_or(window.len());
+      string_trim_nulls(window.get(..end).unwrap_or(window))
+    })
 }
 
 /// `bext` BroadcastExtension (RIFF.pm:712-759) — the Broadcast Audio Extension
@@ -3554,14 +3611,19 @@ impl crate::emit::Taggable for RiffMeta<'_> {
         ));
       }
     }
-    // Pentax vendor `JUNK` (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478): decode
-    // the captured payload through the variant's tiny `ProcessBinaryData` offset
-    // map (`%Pentax::Junk` / `%Pentax::Junk2`, `Pentax.pm:6409` / `:6610`) and
-    // emit each leaf under family-0 `MakerNotes`, family-1 `Pentax` (the table
-    // `GROUPS` — `exiftool -G1 -j` emits `Pentax:Model` etc.). Mode-aware so the
-    // `FNumber` `%.1f` PrintConv applies only under `-j`.
+    // Pentax vendor `JUNK` (`PentaxJunk`/`PentaxJunk2`, RIFF.pm:469-478): replay
+    // EACH captured chunk in WALK ORDER, decoding it through the variant's tiny
+    // `ProcessBinaryData` offset map (`%Pentax::Junk` / `%Pentax::Junk2`,
+    // `Pentax.pm:6409` / `:6610`) and emitting each in-range leaf under family-0
+    // `MakerNotes`, family-1 `Pentax` (the table `GROUPS` — `exiftool -G1 -j`
+    // emits `Pentax:Model` etc.). ExifTool re-runs the SubDirectory on every
+    // `JUNK` chunk, so the central `TagMap` resolves a per-tag collision to the
+    // LAST-walked chunk (`Priority => 1`); replaying all records keeps the union
+    // (a later SHORTER chunk's missing leaves fall back to the earlier chunk's),
+    // matching bundled 13.59 (#422). Mode-aware so the `FNumber` `%.1f` PrintConv
+    // applies only under `-j`.
     #[cfg(feature = "alloc")]
-    if let Some((variant, payload)) = self.pentax_junk {
+    for &(variant, payload) in &self.pentax_junk_records {
       emit_pentax_junk(variant, payload, print_conv, &mut tags);
     }
     // `strd` StreamData (`Zora`/`CASI`/`unknown`, `%RIFF::StreamData`,
@@ -3689,11 +3751,53 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
   EmittedTag::new_with_priority(g(), name.into(), value, false, entry.priority())
 }
 
+/// `true` iff a `PentaxJunk`/`PentaxJunk2` `JUNK` payload of `payload_len` bytes
+/// has AT LEAST ONE in-range fixed-offset leaf — i.e. [`emit_pentax_junk`] would
+/// emit something for it. The earliest leaf of each table is a `string[N]`, and
+/// `ProcessBinaryData` reaches a leaf whenever its OFFSET is in range
+/// (`$more = $size - $entry`, `last if $more <= 0`, `ExifTool.pm:9963-9964`),
+/// while a fixed `string` CLAMPS to the available bytes (`ReadValue`,
+/// `:6301-6311`) — so the string leaf emits (a partial value) as soon as ONE byte
+/// lies past its offset. "Has a leaf" therefore reduces to clearing the SMALLEST
+/// leaf's OFFSET (`payload_len > off`), NOT `off + len`:
+/// - `Junk`  (`Pentax.pm:6409-6418`): the lone `Model` `string[32]` @ 0x0c ⇒
+///   `payload_len > 0x0c` (`>= 13`).
+/// - `Junk2` (`Pentax.pm:6610-6658`): the first leaf `Make` `string[24]` @ 0x12 ⇒
+///   `payload_len > 0x12` (`>= 19`); every other leaf (`Model` @ 0x2c, `FNumber`
+///   @ 0x5e, the `DateTime`s, the thumbnail dims) lies further out, so `Make` is
+///   the threshold.
+///
+/// Used by [`Walker::dispatch_junk`] to drop a signature-only chunk (a 6-byte
+/// `IIII\x01\0` or 18-byte `PENTDigital Camera` — both with `payload_len == the
+/// leaf offset`, ZERO bytes at the leaf) that matches the condition but emits
+/// nothing: replaying it would push a no-output record (memory/CPU amplification
+/// on a crafted repeat) yet contribute ZERO leaves, so skipping it is
+/// byte-identical to the full replay. A chunk with ≥1 byte at the smallest leaf
+/// offset IS retained — it emits a partial (clamped) string, which must
+/// participate in the per-leaf last-wins union (#422).
+fn pentax_junk_has_in_range_leaf(variant: PentaxJunkVariant, payload_len: usize) -> bool {
+  let smallest_leaf_off = match variant {
+    // `%Pentax::Junk` (`Pentax.pm:6409-6418`): `Model` `string[32]` @ 0x0c.
+    PentaxJunkVariant::Junk => 0x0c,
+    // `%Pentax::Junk2` (`Pentax.pm:6610-6658`): `Make` `string[24]` @ 0x12 is the
+    // earliest leaf; ≥1 byte past it means at least one leaf is in range.
+    PentaxJunkVariant::Junk2 => 0x12,
+  };
+  // `string` clamps to the available bytes (drops only at ZERO bytes), so the
+  // leaf needs `payload_len > off`, i.e. ≥1 byte at the offset.
+  payload_len > smallest_leaf_off
+}
+
 /// Decode + emit a Pentax vendor `JUNK` payload (`PentaxJunk`/`PentaxJunk2`,
 /// RIFF.pm:469-478 → `%Pentax::Junk` / `%Pentax::Junk2`, `Pentax.pm:6409-6418` /
 /// `:6610-6658`). Both are `ProcessBinaryData` tables under family-0
 /// `MakerNotes`, family-1 `Pentax`; each fixed-offset leaf emits independently
-/// iff its window is in range (`ProcessBinaryData` skips an out-of-range entry).
+/// iff its offset is in range. A `string[N]` leaf ([`string_field`]) CLAMPS to
+/// the available bytes — it emits a PARTIAL value when ≥1 byte lies at its offset,
+/// dropping only at ZERO bytes (faithful to `ReadValue`); a numeric leaf
+/// (`FNumber` rational, the thumbnail ints) needs its FULL fixed window
+/// (`payload.get(off..off+size)`) since `ReadValue` returns `undef` for a partial
+/// fixed-width number.
 ///
 /// `FNumber` is a `rational64u` (two LE `int32u`: numerator, denominator) decoded
 /// by [`pentax_fnumber_value`] — the `sprintf("%.1f",$val)` PrintConv under `-j`
@@ -4945,7 +5049,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk: None,
+      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
@@ -4983,7 +5087,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk: None,
+      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_strl(&body);
@@ -5385,7 +5489,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk: None,
+      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.process_chunks_hydt(&body);
@@ -5466,7 +5570,7 @@ mod tests {
       webp_file_type_override: None,
       webp_ext_override: false,
       webp_meta: Vec::new(),
-      pentax_junk: None,
+      pentax_junk_records: Vec::new(),
       strd_records: Vec::new(),
     };
     walker.walk_top();
@@ -5844,5 +5948,181 @@ mod tests {
     assert_eq!(make.tag().group_ref().family1(), "IFD0");
     // The captured-chunk list holds both EXIF chunks, in walk order.
     assert_eq!(meta.webp_meta.len(), 2);
+  }
+
+  #[test]
+  fn pentax_junk_in_range_leaf_threshold_matches_smallest_leaf_offset() {
+    // The predicate clears the SMALLEST leaf's OFFSET (not `off + len`), because
+    // a `string[N]` leaf CLAMPS to the available bytes and emits a PARTIAL value
+    // as soon as ≥1 byte lies at its offset (ExifTool `ReadValue`,
+    // `ExifTool.pm:6301-6311`). `Junk` `Model` @ 0x0c ⇒ `len > 0x0c` (≥13);
+    // `Junk2` `Make` @ 0x12 ⇒ `len > 0x12` (≥19). `len == off` (zero bytes at the
+    // leaf) has NO leaf; `len == off + 1` (one byte) DOES (a 1-char partial).
+    assert!(!pentax_junk_has_in_range_leaf(
+      PentaxJunkVariant::Junk,
+      0x0c
+    )); // 12: off, 0 bytes
+    assert!(pentax_junk_has_in_range_leaf(
+      PentaxJunkVariant::Junk,
+      0x0c + 1
+    )); // 13: 1 byte
+    assert!(!pentax_junk_has_in_range_leaf(
+      PentaxJunkVariant::Junk2,
+      0x12
+    )); // 18: off, 0 bytes
+    assert!(pentax_junk_has_in_range_leaf(
+      PentaxJunkVariant::Junk2,
+      0x12 + 1
+    )); // 19: 1 byte
+    // The signature-only crafted payloads (6-byte `IIII\x01\0`, 18-byte
+    // `PENTDigital Camera`) are both AT/below the leaf offset (6 ≤ 0x0c, 18 ==
+    // 0x12) ⇒ zero bytes at the leaf ⇒ no leaf. (The 18-byte `Junk2` sig is the
+    // exact boundary: `18 > 0x12` is FALSE, so it still drops.)
+    assert!(!pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk, 6));
+    assert!(!pentax_junk_has_in_range_leaf(PentaxJunkVariant::Junk2, 18));
+  }
+
+  #[test]
+  fn dispatch_junk_drops_signature_only_chunks_bounding_the_record_vec() {
+    // #422 [medium]: a crafted RIFF repeating tiny signature-only Pentax JUNK
+    // chunks (6-byte `IIII\x01\0`, 18-byte `PENTDigital Camera`) matches the
+    // condition but `emit_pentax_junk` emits NOTHING (every fixed-offset leaf is
+    // out of range). The dispatch must NOT retain such no-output records, else a
+    // large Vec accumulates with no contribution to the output (memory/CPU
+    // amplification). Drive `dispatch_junk` directly with 1000 of each and assert
+    // `pentax_junk_records` stays EMPTY.
+    let empty: &[u8] = &[];
+    let mut walker = Walker {
+      data: empty,
+      pos: 0,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+      pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
+      pentax_junk_records: Vec::new(),
+      strd_records: Vec::new(),
+    };
+    let junk_sig = b"IIII\x01\x00"; // 6 bytes ≤ `Junk` Model offset 0x0c ⇒ 0 bytes at the leaf.
+    let junk2_sig = b"PENTDigital Camera"; // 18 bytes == `Junk2` Make offset 0x12 ⇒ 0 bytes at the leaf.
+    for _ in 0..1000 {
+      walker.dispatch_junk(junk_sig);
+      walker.dispatch_junk(junk2_sig);
+    }
+    assert!(
+      walker.pentax_junk_records.is_empty(),
+      "signature-only Pentax JUNK chunks (no in-range leaf) must NOT be retained \
+       (bounded allocation, no amplification): got {} records",
+      walker.pentax_junk_records.len()
+    );
+  }
+
+  #[test]
+  fn dispatch_junk_retains_a_chunk_with_an_in_range_leaf() {
+    // The positive control: a chunk with ≥1 byte at the smallest leaf's OFFSET IS
+    // retained and replayed (the guard only drops the no-output chunks). The
+    // boundary is exactly `len > off`: a 13-byte `Junk` (Model @ 0x0c, 1 byte) and
+    // a 19-byte `Junk2` (Make @ 0x12, 1 byte) each produce one record — they emit
+    // a 1-char PARTIAL string, so they must participate in the per-leaf last-wins.
+    let mut junk = vec![0u8; 0x0c + 1]; // 13 bytes: Model @ 0x0c has exactly 1 byte
+    junk[0..4].copy_from_slice(b"IIII");
+    junk[4..6].copy_from_slice(b"\x01\x00");
+    junk[0x0c] = b'Z';
+    let mut junk2 = vec![0u8; 0x12 + 1]; // 19 bytes: Make @ 0x12 has exactly 1 byte
+    junk2[0..18].copy_from_slice(b"PENTDigital Camera");
+    junk2[0x12] = b'Z';
+
+    let owned = junk.clone();
+    let owned2 = junk2.clone();
+    let mut walker = Walker {
+      data: &owned,
+      pos: 0,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+      pentax_makernote: None,
+      base_file_type: "RIFF",
+      form_is_webp: false,
+      webp_file_type_override: None,
+      webp_ext_override: false,
+      webp_meta: Vec::new(),
+      pentax_junk_records: Vec::new(),
+      strd_records: Vec::new(),
+    };
+    walker.dispatch_junk(&owned);
+    walker.dispatch_junk(&owned2);
+    assert_eq!(
+      walker.pentax_junk_records.len(),
+      2,
+      "a chunk with at least one in-range leaf must be retained"
+    );
+    assert_eq!(walker.pentax_junk_records[0].0, PentaxJunkVariant::Junk);
+    assert_eq!(walker.pentax_junk_records[1].0, PentaxJunkVariant::Junk2);
+  }
+
+  #[test]
+  fn pentax_junk_signature_only_flood_emits_nothing_and_is_bounded_end_to_end() {
+    use crate::emit::{ConvMode, Taggable};
+    // The full-walk view of #422: an AVI carrying 1000 tiny signature-only
+    // Pentax JUNK chunks parses to ZERO retained records and emits NO Pentax
+    // leaf — byte-identical to the same AVI with none of those chunks, while the
+    // record Vec is bounded (not 1000).
+    let mut chunks = Vec::new();
+    for _ in 0..1000 {
+      chunks.extend_from_slice(&chunk(b"JUNK", b"IIII\x01\x00"));
+      chunks.extend_from_slice(&chunk(b"JUNK", b"PENTDigital Camera"));
+    }
+    let bytes = riff_with(b"AVI ", &chunks);
+    let meta = parse_borrowed(&bytes).expect("AVI parses");
+    assert!(
+      meta.pentax_junk_records.is_empty(),
+      "no signature-only chunk is retained: got {} records",
+      meta.pentax_junk_records.len()
+    );
+    let emitted: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
+    assert!(
+      !emitted
+        .iter()
+        .any(|t| t.tag().group_ref().family1() == "Pentax"),
+      "a signature-only JUNK flood must emit no Pentax leaf"
+    );
+
+    // The control: one FULL `Junk2` followed by 1000 tiny ones. The full chunk's
+    // `Make` is retained + emitted; the tiny chunks add no record (still 1).
+    let mut full = vec![0u8; 0x66];
+    full[0..18].copy_from_slice(b"PENTDigital Camera");
+    full[0x12..0x12 + 6].copy_from_slice(b"PENTAX");
+    let mut chunks2 = chunk(b"JUNK", &full);
+    for _ in 0..1000 {
+      chunks2.extend_from_slice(&chunk(b"JUNK", b"PENTDigital Camera"));
+    }
+    let bytes2 = riff_with(b"AVI ", &chunks2);
+    let meta2 = parse_borrowed(&bytes2).expect("AVI parses");
+    assert_eq!(
+      meta2.pentax_junk_records.len(),
+      1,
+      "only the full chunk (with an in-range leaf) is retained; the tiny ones are dropped"
+    );
+    let emitted2: Vec<_> = meta2
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
+    assert!(
+      emitted2
+        .iter()
+        .any(|t| t.tag().name() == "Make" && t.tag().group_ref().family1() == "Pentax"),
+      "the full chunk's Make must still emit"
+    );
   }
 }

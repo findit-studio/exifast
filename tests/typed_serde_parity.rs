@@ -1474,7 +1474,26 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// reports `length(join(' ', @vals))` (43 bytes) — NOT the classic undef-reshape
 /// byte count (the 1536 of `GeoTiff.tif`, which stays unchanged). Additive —
 /// every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 623;
+/// 623 → 624 (#422 RIFF repeated-`JUNK` last-wins) adds
+/// `AVI_pentaxjunk2_dup.avi` — the `AVI_pentaxjunk2.avi` base with a SECOND
+/// `PentaxJunk2` `JUNK` chunk (a different `Model`/`DateTime`) appended at the
+/// top level. ExifTool re-runs the matched SubDirectory on EVERY `JUNK` chunk,
+/// so the later chunk's `Pentax:*` leaves last-wins via the normal
+/// `Priority => 1` tag-overwrite — bundled 13.59 keeps `Model = Optio RZ99`
+/// (the second chunk). Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+/// 624 → 625 (#422 Codex [high], the PARTIAL repeated-`JUNK` per-leaf union)
+/// adds `AVI_pentaxjunk2_partial.avi` — a FULL `PentaxJunk2` chunk (Make=PENTAX,
+/// Model="Optio RZ18", FNumber 28/10, DateTime 2014) followed by a SHORTER
+/// same-signature `PentaxJunk2` (44 bytes — only the `Make`="RICOH " leaf @ 0x12
+/// is in range; Model/FNumber/DateTime @ 0x2c/0x5e/0x83/0x9d are past the chunk
+/// end). ExifTool replays the SubDirectory per chunk and the `TagMap` dedups PER
+/// LEAF, so bundled 13.59 keeps the first chunk's Model/FNumber/DateTime1/2 (the
+/// short chunk emits none) while the later `Make` wins — the case the
+/// pre-fix whole-payload OVERWRITE dropped, now fixed by the ordered-Vec +
+/// replay-all dispatch. Additive — every PRE-EXISTING golden stays
+/// byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 625;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
