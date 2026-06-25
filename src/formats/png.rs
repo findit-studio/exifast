@@ -149,7 +149,7 @@
 
 use crate::format_parser::{FormatParser, parser_sealed};
 use crate::metadata::PngExifEvent;
-use crate::metadata::png::IhdrFields;
+use crate::metadata::png::{IhdrFields, PngContainer};
 use crate::metadata::{PngDynamicProfileTag, PngMeta, PngTextRecord};
 
 use smol_str::SmolStr;
@@ -160,10 +160,34 @@ use std::{string::String, vec::Vec};
 // ===========================================================================
 
 /// The PNG signature — `PNG.pm:62`: `\x89PNG\r\n\x1a\n` (8 bytes).
-///
-/// The MNG (`\x8aMNG\r\n\x1a\n`) and JNG (`\x8bJNG\r\n\x1a\n`) sibling
-/// signatures (`PNG.pm:63-64`) are deferred (not in camera-metadata scope).
 pub const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// The MNG sibling signature (`PNG.pm:63`): `\x8aMNG\r\n\x1a\n` (8 bytes). MNG
+/// is a PNG-superset container (`MNG.pm`); its header chunk is `MHDR` and its
+/// END chunk is `MEND` (NOT `IEND`).
+pub const MNG_SIGNATURE: &[u8; 8] = b"\x8aMNG\r\n\x1a\n";
+
+/// The JNG sibling signature (`PNG.pm:64`): `\x8bJNG\r\n\x1a\n` (8 bytes). JNG
+/// is a JPEG-in-PNG-framing container; its header chunk is `JHDR` and its END
+/// chunk is `IEND` (the SAME as PNG).
+pub const JNG_SIGNATURE: &[u8; 8] = b"\x8bJNG\r\n\x1a\n";
+
+/// `%pngLookup` (`PNG.pm:61-65`) — resolve the 8-byte file signature to its
+/// `(container, hdr_chunk, end_chunk)`. `None` for a non-PNG/MNG/JNG buffer
+/// (the `return 0 unless … $pngLookup{$sig}` gate, `PNG.pm:1424`). The header
+/// chunk (`IHDR`/`MHDR`/`JHDR`) is checked as the first chunk; the END chunk
+/// (`IEND`/`MEND`/`IEND`) terminates the walk + drives the trailer logic.
+fn png_lookup(sig: &[u8]) -> Option<(PngContainer, [u8; 4], [u8; 4])> {
+  if sig == PNG_SIGNATURE.as_slice() {
+    Some((PngContainer::Png, *b"IHDR", *b"IEND"))
+  } else if sig == MNG_SIGNATURE.as_slice() {
+    Some((PngContainer::Mng, *b"MHDR", *b"MEND"))
+  } else if sig == JNG_SIGNATURE.as_slice() {
+    Some((PngContainer::Jng, *b"JHDR", *b"IEND"))
+  } else {
+    None
+  }
+}
 
 /// Threshold above which a chunk's declared `length` is treated as
 /// corrupt (`PNG.pm:1490`: `if ($len > 0x7fffffff)`).
@@ -310,30 +334,41 @@ pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'
 /// `None`. Otherwise this ALWAYS returns `Some(meta)` (truncations and CRC
 /// failures land as warnings in the [`PngMeta`]).
 fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
-  // `PNG.pm:1424` signature gate. Checked `.get()`: a too-short buffer makes
-  // `.get(..N)` `None` (≠ `Some(sig)`) ⇒ same early-return as the old
-  // `data.len() < N` guard ⇒ byte-identical.
-  if data.get(..PNG_SIGNATURE.len()) != Some(PNG_SIGNATURE.as_slice()) {
+  // `PNG.pm:1424` signature gate: `return 0 unless … $pngLookup{$sig}`.
+  // [`png_lookup`] resolves the 8-byte signature to its
+  // `(container, hdr_chunk, end_chunk)` — PNG (`IHDR`/`IEND`), MNG
+  // (`MHDR`/`MEND` — END is `MEND`, NOT `IEND`), or JNG (`JHDR`/`IEND`). A
+  // too-short / non-matching buffer is `None` ⇒ the same early-return as before
+  // for a non-PNG (byte-identical for the PNG path).
+  let Some((container, hdr_chunk, end_chunk)) = data.get(..8).and_then(png_lookup) else {
     return None;
-  }
+  };
 
-  // Extension-derived FileType (ExifTool's `SetFileType` BEFORE the walk,
-  // ExifTool.pm:9677-9706). A PNG-signature file is detected as base type
-  // `PNG`; the sub-type-by-extension rule (ExifTool.pm:9686-9692) then
-  // promotes it to whatever PNG-rooted sub-type the file's extension names —
-  // `.apng`→`APNG`, `.mng`→`MNG`, `.jng`→`JNG` (each row roots to `PNG` in
-  // [`crate::filetype_data`]), or stays `PNG` for `.png`/no ext. `ext` arrives
-  // already uppercased + dotless (`$$self{FILE_EXT}`). This resolved STRING is
-  // the firing-point `$$et{FileType}` the after-IDAT warning interpolates, the
-  // single source of truth (the OTHER source being the `acTL` `OverrideFileType`,
-  // which supersedes it once seen). Storing the full string — not just an
-  // `== "APNG"` bool — closes the warning-FileType-source class for ALL
-  // PNG-rooted extensions at once (oracle-verified vs bundled 13.59: `.png`→
-  // `after PNG IDAT`, `.apng`→`APNG`, `.mng`→`MNG`, `.jng`→`JNG`; an `acTL`
-  // before IDAT overrides any of them → `APNG`).
-  let ext_file_type = crate::parser::resolved_file_type_name("PNG", None, ext);
+  // ExifTool's `SetFileType($fileType)` BEFORE the walk (`PNG.pm:1439`), where
+  // `$fileType` is the SIGNATURE-resolved container (`PNG`/`MNG`/`JNG`,
+  // `%pngLookup`). The sub-type-by-extension rule (ExifTool.pm:9686-9692) then
+  // promotes a PNG-signature file per its extension — `.apng`→`APNG`,
+  // `.mng`→`MNG`, `.jng`→`JNG` (each row roots to `PNG`), else `PNG`. For an
+  // MNG/JNG SIGNATURE the container is already `MNG`/`JNG` (the signature is
+  // authoritative), so we resolve the extension subtype against the
+  // container's own base name. This resolved STRING is the firing-point
+  // `$$et{FileType}` the after-IDAT warning interpolates (the OTHER source
+  // being the `acTL` `OverrideFileType`, which supersedes it once seen).
+  // Oracle-verified vs bundled 13.59: `.png`→`PNG`, `.apng`→`APNG`,
+  // `.mng`→`MNG`, `.jng`→`JNG`; an `acTL` before IDAT → `APNG`.
+  let ext_file_type = crate::parser::resolved_file_type_name(container.as_file_type(), None, ext);
+  // `$fileType` interpolated into the structural walker warnings
+  // (`Truncated $fileType image`, `Trailer data after $fileType $endChunk
+  // chunk`, …, `PNG.pm:1481`/`:1486`/…). This is the CONTAINER base name
+  // (`PNG`/`MNG`/`JNG`) — NOT the extension-promoted `APNG` (the walker
+  // warnings interpolate `$fileType`, the signature container, not
+  // `$$et{FileType}`; oracle-confirmed: these stay `PNG`/`MNG`/`JNG`).
+  let ft = container.as_file_type();
+  // `$endChunk` interpolated into the end-chunk warnings + the trailer message.
+  let end_str: String = end_chunk.iter().map(|&b| b as char).collect();
 
   let mut meta = PngMeta::new();
+  meta.set_container(container);
   // Cursor sits just past the 8-byte signature (`PNG.pm:1424` consumed it).
   let mut pos = PNG_SIGNATURE.len();
   // `$wasHdr` / `$wasDat` / `$wasEnd` (`PNG.pm:1421`). `wasHdr` flags the
@@ -369,25 +404,28 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
       let _ = was_hdr;
       if was_end {
         if data.get(pos..pos + 1).is_some() {
-          // 1..8 trailer bytes after IEND: warn (minor) then stop.
-          meta.push_warning(String::from("Trailer data after PNG IEND chunk"));
+          // 1..8 trailer bytes after the end chunk: warn (minor) then stop.
+          // `Trailer data after $fileType $endChunk chunk` (`PNG.pm:1481`) —
+          // `MNG MEND` / `JNG IEND` / `PNG IEND`.
+          meta.push_warning(std::format!("Trailer data after {ft} {end_str} chunk"));
           meta.begin_trailer();
         }
-        // else: clean end of PNG (0 trailer bytes) — no warning.
+        // else: clean end (0 trailer bytes) — no warning.
       } else {
-        meta.push_warning(String::from("Truncated PNG image"));
+        meta.push_warning(std::format!("Truncated {ft} image"));
       }
       return Some(meta);
     };
 
-    // `PNG.pm:1479-1484`: a full (>=8-byte) header read AFTER `IEND` is the
-    // start of a TRAILER chunk. Fire the minor `Trailer data after PNG IEND
-    // chunk` warning (bundled re-`Warn`s it on EVERY trailing chunk; the
-    // document layer dedups to `[x2]…`, first-wins for `ExifTool:Warning`) and
-    // switch the walk into trailer mode so each trailing chunk's PNG-level tags
-    // carry the `Trailer` family-1 override (`SET_GROUP1 = 'Trailer'`).
+    // `PNG.pm:1479-1484`: a full (>=8-byte) header read AFTER the end chunk is
+    // the start of a TRAILER chunk. Fire the minor `Trailer data after
+    // $fileType $endChunk chunk` warning (bundled re-`Warn`s it on EVERY
+    // trailing chunk; the document layer dedups to `[x2]…`, first-wins for
+    // `ExifTool:Warning`) and switch the walk into trailer mode so each trailing
+    // chunk's PNG-level tags carry the `Trailer` family-1 override
+    // (`SET_GROUP1 = 'Trailer'`).
     if was_end {
-      meta.push_warning(String::from("Trailer data after PNG IEND chunk"));
+      meta.push_warning(std::format!("Trailer data after {ft} {end_str} chunk"));
       meta.begin_trailer();
     }
 
@@ -407,37 +445,46 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
     // warning.
     if len > MAX_CHUNK_LENGTH {
       if !was_end {
-        meta.push_warning(String::from("Invalid PNG chunk size"));
+        meta.push_warning(std::format!("Invalid {ft} chunk size"));
       }
       return Some(meta);
     }
 
-    // `PNG.pm:1504-1512`: first chunk must be `IHDR` (the PNG header).
+    // `PNG.pm:1504-1512`: first chunk must be the header chunk
+    // (`IHDR`/`MHDR`/`JHDR`). The Apple `CgBI` exception applies only when the
+    // header chunk is `IHDR` (`PNG.pm:1507` `$hdrChunk eq 'IHDR'`), i.e. only for
+    // a real PNG — an MNG/JNG that does not start with `MHDR`/`JHDR` warns
+    // `<FT> image did not start with <hdrChunk>`.
     if !was_hdr {
-      if &chunk_type == b"IHDR" {
+      if chunk_type == hdr_chunk {
         was_hdr = true;
-      } else if &chunk_type == b"CgBI" {
-        // `PNG.pm:1507`: Apple iPhone non-standard prefix chunk.
+      } else if hdr_chunk == *b"IHDR" && &chunk_type == b"CgBI" {
+        // `PNG.pm:1507`: Apple iPhone non-standard prefix chunk (PNG only).
         meta.push_warning(String::from("Non-standard PNG image (Apple iPhone format)"));
       } else {
-        meta.push_warning(String::from("PNG image did not start with IHDR"));
+        let hdr_str: String = hdr_chunk.iter().map(|&b| b as char).collect();
+        meta.push_warning(std::format!("{ft} image did not start with {hdr_str}"));
       }
     }
 
     // Advance past the 8-byte header to the chunk payload start.
     pos += 8;
 
-    // `PNG.pm:1546-1574`: the `IEND` end chunk — read its 4-byte CRC, set
-    // `$wasEnd`, then `next` (`PNG.pm:1574`). `IEND` carries an empty payload
-    // (`len == 0` always). It does NOT stop the walk: bundled keeps reading,
-    // and any bytes AFTER the IEND CRC are processed as a TRAILER (handled at
-    // the loop top, `PNG.pm:1479-1484`).
-    if &chunk_type == b"IEND" {
+    // `PNG.pm:1546-1574`: the END chunk (`$endChunk` = `IEND`/`MEND`/`IEND`) —
+    // read its 4-byte CRC, set `$wasEnd`, then `next` (`PNG.pm:1574`). The end
+    // chunk carries an empty payload (`len == 0` always). It does NOT stop the
+    // walk: bundled keeps reading, and any bytes AFTER its CRC are processed as a
+    // TRAILER (handled at the loop top, `PNG.pm:1479-1484`). The end chunk is
+    // CONTAINER-resolved (`$chunk eq $endChunk`, `PNG.pm:1546`) — `MEND` for MNG
+    // — NOT a hardcoded `IEND`, else an MNG's `MEND` would be unrecognized and
+    // the walk would warn `Truncated MNG image` at EOF.
+    if chunk_type == end_chunk {
       // `PNG.pm:1548-1551`: `$raf->Read($cbuf, 4)`; a truncated CRC warns
-      // (`unless $wasEnd`, so only on the FIRST IEND) and stops the walk.
+      // `Truncated $fileType $endChunk chunk` (`unless $wasEnd`, so only on the
+      // FIRST end chunk) and stops the walk.
       if data.get(pos..pos + 4).is_none() {
         if !was_end {
-          meta.push_warning(String::from("Truncated PNG IEND chunk"));
+          meta.push_warning(std::format!("Truncated {ft} {end_str} chunk"));
         }
         return Some(meta);
       }
@@ -453,7 +500,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
     // gated `unless $wasEnd` — suppressed in a trailer) and stops.
     let Some(chunk_data) = data.get(pos..pos + len) else {
       if !was_end {
-        meta.push_warning(String::from("Corrupted PNG image"));
+        meta.push_warning(std::format!("Corrupted {ft} image"));
       }
       return Some(meta);
     };
@@ -468,7 +515,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<PngMeta<'a>> {
     // `chunk_data` slices, never a concatenated buffer.
     if data.get(pos + len..pos + len + 4).is_none() {
       if !was_end {
-        meta.push_warning(String::from("Corrupted PNG image"));
+        meta.push_warning(std::format!("Corrupted {ft} image"));
       }
       return Some(meta);
     }
@@ -590,15 +637,42 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"bKGD" => decode_bkgd(meta, data),
     // ----- tIME (PNG.pm:262-275) ----------------------------------------
     b"tIME" => decode_time(meta, data),
-    // Every other chunk is in bundled's table (`cHRM`, `dSIG`, …) but we DO
-    // NOT extract their tags in this Phase-2 port — they are valid PNG chunks
-    // the walker skips silently (`PNG.pm:1657` table miss). The chunk walker
-    // continues to the next chunk; this matches bundled when the chunk is
-    // recognized but has no extractor. (`fcTL`/`fdAT` are likewise skipped —
-    // bundled has NO table for them, `PNG.pm:329-330` is comment-only — so the
-    // APNG metadata is the `acTL` summary alone, oracle-verified vs 13.59.)
-    _ => {}
+    // Every other chunk MISSED the `%PNG::Main` table. `PNG.pm:1655-1657`: for
+    // an MNG/JNG container (`$fileType ne 'PNG'`) the walker then tries the
+    // `%MNG::Main` FALLBACK table; for a plain PNG there is no fallback and the
+    // chunk is skipped (`cHRM`/`dSIG`/… are valid PNG chunks with no extractor
+    // in this Phase-2 port; `fcTL`/`fdAT` have NO bundled table either,
+    // `PNG.pm:329-330` is comment-only — so APNG metadata is the `acTL` summary
+    // alone, oracle-verified vs 13.59).
+    _ => {
+      if meta.container().is_mng_family() {
+        dispatch_mng_chunk(meta, chunk, data);
+      }
+    }
   }
+}
+
+/// The `%MNG::Main` FALLBACK dispatch (`PNG.pm:1655-1657`, the `elsif
+/// $mngTablePtr and $$mngTablePtr{$chunk}` arm) — reached only for an MNG/JNG
+/// container and only for a chunk NOT in `%PNG::Main`. `pHYg` (`GlobalPixelSize`)
+/// has a `SubDirectory` onto `PNG::PhysicalPixel` (the SAME table the PNG `pHYs`
+/// chunk uses, `MNG.pm:115-118`), so it routes to the shared [`decode_phys`] —
+/// emitting `PixelsPerUnitX/Y` + `PixelUnits` under family-1 `PNG-pHYs`
+/// (`PNG.pm:446`), NOT under `MNG`. Every other recognized MNG chunk
+/// (the 17 `ProcessBinaryData` sub-tables, the DISC/DROP/SEEK inline ValueConvs,
+/// and the `Binary => 1` chunks) is decoded by the MNG sub-Meta
+/// ([`crate::exif::mng::MngMeta::process_chunk`]). An unrecognized chunk falls
+/// through silently (both tables missed).
+fn dispatch_mng_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
+  if chunk == b"pHYg" {
+    decode_phys(meta, data);
+    return;
+  }
+  // Stamp each MNG leaf with the walker's post-`MEND`/`IEND` trailer state so a
+  // crafted post-end MHDR/BACK emits under family-1 `Trailer`, not `MNG`
+  // (`PNG.pm:1484` `SET_GROUP1 = 'Trailer'`) — read BEFORE the `&mut` borrow.
+  let in_trailer = meta.in_trailer();
+  meta.mng_mut().process_chunk(chunk, data, in_trailer);
 }
 
 // ===========================================================================
@@ -2743,6 +2817,21 @@ impl crate::emit::Taggable for PngMeta<'_> {
       }
     }
 
+    // ---- MNG/JNG sub-table tags — chain the MNG sub-Meta's tag stream ------
+    // For an MNG/JNG container, the `%MNG::Main` fallback (`PNG.pm:1655`) fed
+    // each MNG-specific chunk to [`crate::exif::mng::MngMeta`] during the walk.
+    // Splice its `Taggable` stream (the `MNG:*` tags, family-0/1 `MNG`) here.
+    // A crafted post-`MEND`/`IEND` MNG chunk (`MHDR`/`BACK`/…) is a TRAILER
+    // chunk: the walker's trailer state was stamped onto each leaf at decode
+    // time, so [`MngMeta::tags`] already emits those under family-1 `Trailer`
+    // (`PNG.pm:1484` `SET_GROUP1 = 'Trailer'`) — they coexist with, and do NOT
+    // overwrite, the main `MNG:*` (the `(doc, family1, name)` dedup key). `None`
+    // for a plain PNG (and for an MNG/JNG that carried no MNG-specific chunk) ⇒
+    // byte-identical PNG output.
+    if let Some(mng_meta) = self.mng() {
+      tags.extend(mng_meta.tags(opts));
+    }
+
     tags.into_iter()
   }
 }
@@ -2766,7 +2855,10 @@ impl crate::emit::Taggable for PngMeta<'_> {
 /// did not start with IHDR`, `Invalid PNG chunk size`) is a plain `$et->Warn`
 /// (no minor flag) ⇒ no prefix. Oracle-confirmed against `perl exiftool` 13.59.
 fn png_warning_is_minor(msg: &str) -> bool {
-  msg == "Trailer data after PNG IEND chunk"
+  // `Trailer data after $fileType $endChunk chunk` (`PNG.pm:1481`,
+  // `$et->Warn(..., 1)`) — minor for EVERY container: `PNG IEND`, `MNG MEND`,
+  // `JNG IEND`. Match the FileType/endChunk-independent prefix + suffix.
+  (msg.starts_with("Trailer data after ") && msg.ends_with(" chunk"))
     // `Text/EXIF chunk(s) found after <FileType> <chunk> (…)` (`PNG.pm:1604`).
     // The `<FileType>` is interpolated from `$$et{FileType}` — `PNG`, or `APNG`
     // once an `acTL` chunk fired the `AnimationFrames` RawConv override
@@ -2947,6 +3039,22 @@ impl crate::diagnostics::Diagnose for PngMeta<'_> {
           }
         }
       }
+    }
+    // MNG/JNG sub-table diagnostics (`MNG.pm`). The 17 `ProcessBinaryData`
+    // sub-tables + inline ValueConvs raise NO `$et->Warn` for a well-formed or
+    // truncated chunk (per-field availability silently omits an out-of-range
+    // leaf), so this corpus is empty in practice; it is drained last for parity
+    // with the GeoTiff precedent + future hostile-input hardening. An MNG/JNG
+    // file's structural-walker warnings (`Truncated MNG image`, `Trailer data
+    // after MNG MEND chunk`, …) already flow through the `PngDiagStep::Warning`
+    // cursor above, at their true walk position.
+    if let Some(mng_meta) = self.mng() {
+      out.extend(
+        mng_meta
+          .warnings()
+          .iter()
+          .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+      );
     }
     out
   }

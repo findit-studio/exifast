@@ -12133,6 +12133,129 @@ fn png_apng_conformance() {
   check("PNG_apng.png", "PNG_apng.png.n.json", false);
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn mng_mhdr_conformance() {
+  // #143 — the MNG (Multi-image Network Graphics) sibling container. A
+  // `\x8aMNG\r\n\x1a\n` signature (`PNG.pm:63`) selects the `MNG` container, so
+  // `ProcessPNG` dispatches the header `MHDR` chunk through the `%MNG::Main`
+  // FALLBACK table (`PNG.pm:1655`) onto the `MNGHeader` `ProcessBinaryData`
+  // sub-table (`MNG.pm:146-160`, `FORMAT => 'int32u'`): ImageWidth/ImageHeight/
+  // TicksPerSecond/NominalLayerCount/NominalFrameCount/NominalPlayTime (7x
+  // int32u) + SimplicityProfile, whose `sprintf("0x%.8x", $val)` PrintConv
+  // hand-port (`MNG.pm:158`) renders `0x00000049` under `-j` and the raw `73`
+  // under `-n`. `File:FileType` = `MNG` (signature-authoritative), MIMEType
+  // `video/mng`. The MNG container is in the Composite allow-list, so the ported
+  // `Composite:ImageSize`/`Megapixels` (from ImageWidth/ImageHeight) are kept
+  // and compared (a PLAIN `check`). Crafted minimal `MHDR`+`MEND` fixture
+  // (`tools/gen_mng_fixtures.py`). Oracle: bundled `perl exiftool -j -G1 -struct`
+  // 13.59.
+  check("MNG_mhdr.mng", "MNG_mhdr.mng.json", true);
+  check("MNG_mhdr.mng", "MNG_mhdr.mng.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn jng_jhdr_conformance() {
+  // #143 — the JNG (JPEG Network Graphics) sibling container. A
+  // `\x8bJNG\r\n\x1a\n` signature (`PNG.pm:64`) selects the `JNG` container
+  // (whose END chunk is `IEND`, the same as PNG); the header `JHDR` chunk routes
+  // through the `%MNG::Main` fallback onto the `JNGHeader` sub-table
+  // (`MNG.pm:598-643`): ImageWidth/ImageHeight (int32u) then the int8u
+  // ColorType/BitDepth/Compression/Interlace/AlphaBitDepth/AlphaCompression/
+  // AlphaFilter/AlphaInterlace, with their int->label PrintConvs (`ColorType` 10
+  // → "Color", `Compression` 8 → "Huffman-coded baseline JPEG", `Interlace` 0 →
+  // "Sequential", `AlphaCompression` 8 → "JNG 8-bit Grayscale JDAA",
+  // `AlphaFilter` 0 → "Adaptive MNG (N/A for JPEG)", `AlphaInterlace` 0 →
+  // "Noninterlaced") under `-j`, raw ints under `-n`. `File:FileType` = `JNG`,
+  // MIMEType `image/jng`. A PLAIN `check` (Composite allow-list). Crafted
+  // minimal `JHDR`+`IEND` fixture. Oracle: bundled `perl exiftool` 13.59.
+  check("JNG_jhdr.jng", "JNG_jhdr.jng.json", true);
+  check("JNG_jhdr.jng", "JNG_jhdr.jng.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn mng_chunks_conformance() {
+  // #143 — the MNG sub-table KITCHEN-SINK: one MNG-specific chunk per remaining
+  // `%MNG::Main` entry, covering all 17 `ProcessBinaryData` sub-tables (BACK/
+  // BASI/CLIP/CLON/DEFI/DHDR/eXPi/fPRI/JHDR-via-the-minimal-JNG/LOOP/MAGN/MHDR/
+  // MOVE/PAST/PROM/SHOW/TERM), the 3 inline `ValueConv` chunks (DISC
+  // `join(" ",unpack("n*"))` → "1 2 3"; DROP `$val=~/..../g` 4-char split →
+  // "BACK MHDR"; SEEK `$val=~s/\0.*//s` NUL-strip → "point1"), the 6 `Binary =>
+  // 1` chunks (DBYK/FRAM/nEED/ORDR/PPLT/SAVE — each the universal `(Binary data
+  // N bytes …)` placeholder from the chunk LENGTH, incl. a 0-byte SAVE), and the
+  // `pHYg` (`GlobalPixelSize`) chunk whose SubDirectory onto `PNG::PhysicalPixel`
+  // routes to the SHARED PNG `pHYs` decoder, emitting `PixelsPerUnitX`/`…Y`/
+  // `PixelUnits` under family-1 `PNG-pHYs` (NOT `MNG`). Exercises every
+  // hand-ported conv (the BASI ColorType "RGB with Alpha"; the preserved-as-is
+  // ExifTool typos "Parital"/"Desination"→"Target Origin") and the last-wins
+  // `TagMap` dedup (BASI's ImageWidth=64 overrides MHDR's 160; CLIP/MOVE/fPRI
+  // share `DeltaType`), so `Composite:ImageSize` resolves to 64x48 (BASI's
+  // dimensions). A PLAIN `check` (Composite allow-list). Crafted multi-chunk
+  // fixture (`tools/gen_mng_fixtures.py`). Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("MNG_chunks.mng", "MNG_chunks.mng.json", true);
+  check("MNG_chunks.mng", "MNG_chunks.mng.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn mng_trailer_conformance() {
+  // #143 Codex Finding 2 — a post-`MEND` MNG TRAILER chunk. The fixture is a
+  // MNG (`MHDR` + `MEND`) followed by a single trailing `BACK` chunk
+  // (BackgroundColor "1 2 3"). After the `MEND` end chunk the walker enters
+  // trailer mode (`PNG.pm:1479-1484` `SET_GROUP1 = 'Trailer'`), so the `BACK`
+  // chunk's MNG leaf emits under family-1 `Trailer`, NOT `MNG` —
+  // `Trailer:BackgroundColor`, distinct from the main `MNG:*` (the
+  // `(doc, family1, name)` dedup key). The document carries the minor
+  // `Trailer data after MNG MEND chunk` warning. The MHDR ImageWidth/Height
+  // feed the ported `Composite:ImageSize`/`Megapixels` (kept, PNG Composite
+  // allow-list). The same-named main-vs-trailer COEXISTENCE (a trailer chunk
+  // does NOT overwrite the main `MNG:*`) is covered by the MngMeta unit test
+  // `post_end_chunk_emits_under_trailer_group` (a single trailing chunk here
+  // sidesteps the unrelated multi-chunk `[x2]` trailer-warning aggregation).
+  // Crafted (PNG-CRC chunk builder). Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("MNG_trailer.mng", "MNG_trailer.mng.json", true);
+  check("MNG_trailer.mng", "MNG_trailer.mng.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn mng_embedded_ihdr_conformance() {
+  // #143 — a realistic MIXED MNG: the header `MHDR` (ImageWidth=160) FOLLOWED
+  // by an embedded PNG `IHDR` chunk (ImageWidth=320), then `MEND`. `ProcessPNG`
+  // resolves a chunk against `%PNG::Main` BEFORE the `%MNG::Main` fallback
+  // (`PNG.pm:1653-1656`), so the `MHDR` emits the MNGHeader leaves
+  // (`MNG:ImageWidth=160`) while the embedded `IHDR` emits the PNG ImageHeader
+  // leaves (`PNG:ImageWidth=320`) — BOTH dimension pairs are present.
+  //
+  // `Composite:ImageSize` `Require`s the BARE `ImageWidth`/`ImageHeight`. Both
+  // the MNG (MHDR) and the PNG-IHDR producers are equal priority 1, and
+  // ExifTool keeps the LAST-walked of an equal-priority duplicate
+  // (`ExifTool.pm:9544-9560`), so the `IHDR` — walked AFTER the `MHDR` — wins ⇒
+  // bundled `Composite:ImageSize = 320x240` (NOT the MHDR 160x120). exifast's
+  // category-grouped emission lists the PNG-IHDR singleton's `ImageWidth` and
+  // its first-match composite resolution likewise yields `320x240`, so the
+  // realistic mixed case is byte-for-byte identical to bundled.
+  //
+  // This guards that the realistic MHDR→IHDR mixed-MNG composite matches
+  // bundled. (The CRAFTED three-equal-producer Case-A — MHDR→IHDR→BASI — that
+  // needs the port-wide composite-engine priority+recency fix is DEFERRED to
+  // #436; the Codex R3 finding's "MHDR wins" premise was ground-truth-disputed
+  // — bundled keeps the LAST-walked IHDR here.) Crafted via
+  // `tools/gen_mng_fixtures.py`. Oracle: bundled `perl exiftool -j -G1 -struct`
+  // 13.59 (`MNG:ImageWidth=160` + `PNG:ImageWidth=320` + `Composite:ImageSize=
+  // 320x240`). NO code change — a pure fixture addition.
+  check("MNG_embedded_ihdr.mng", "MNG_embedded_ihdr.mng.json", true);
+  check(
+    "MNG_embedded_ihdr.mng",
+    "MNG_embedded_ihdr.mng.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

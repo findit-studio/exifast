@@ -106,6 +106,13 @@ mod printim;
 // `GeoTiffDoubleParams` 0x87b0 / `GeoTiffAsciiParams` 0x87b1) are captured raw
 // during the IFD0 walk and decoded post-walk into `GeoTiff:*` GeoKey tags.
 mod geotiff;
+// MNG/JNG — the PNG-sibling chunk sub-table reader (`MNG.pm`'s 17
+// `ProcessBinaryData` sub-tables + the inline-`ValueConv` / `Binary => 1`
+// chunks `%MNG::Main` dispatches). Built by the PNG chunk walker (`PNG.pm`
+// walks MNG/JNG too) when the resolved file type is MNG/JNG; hangs off
+// [`crate::metadata::png::PngMeta`] and emits `MNG:*` tags.
+#[cfg(feature = "png")]
+pub(crate) mod mng;
 
 use std::{string::String, vec::Vec};
 

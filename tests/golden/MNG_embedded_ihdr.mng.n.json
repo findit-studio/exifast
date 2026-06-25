@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "MNG_embedded_ihdr.mng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "MNG",
+  "File:FileTypeExtension": "MNG",
+  "File:MIMEType": "video/mng",
+  "MNG:ImageWidth": 160,
+  "MNG:ImageHeight": 120,
+  "MNG:TicksPerSecond": 30,
+  "MNG:NominalLayerCount": 5,
+  "MNG:NominalFrameCount": 10,
+  "MNG:NominalPlayTime": 0,
+  "MNG:SimplicityProfile": 73,
+  "PNG:ImageWidth": 320,
+  "PNG:ImageHeight": 240,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 6,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "Composite:ImageSize": "320 240",
+  "Composite:Megapixels": 0.0768
+}]

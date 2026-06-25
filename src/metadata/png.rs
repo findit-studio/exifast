@@ -572,6 +572,58 @@ impl PngExifEvent {
 }
 
 // ===========================================================================
+// PngContainer — which PNG-sibling container the signature selected
+// ===========================================================================
+
+/// Which of the three PNG-sibling containers the 8-byte signature selected
+/// (`%pngLookup`, `PNG.pm:61-65`). Drives the resolved `File:FileType` (via
+/// [`crate::formats::png::ProcessPng`]'s finalize arm) and — for MNG/JNG — the
+/// `%MNG::Main` chunk-table FALLBACK (`PNG.pm:1444-1446`). The signature is
+/// authoritative (`SetFileType($fileType)`, `PNG.pm:1439`), independent of the
+/// filename extension.
+///
+/// D8: enum unit-variant only; predicates + `as_file_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PngContainer {
+  /// `\x89PNG\r\n\x1a\n` → PNG (hdr `IHDR`, end `IEND`).
+  #[default]
+  Png,
+  /// `\x8aMNG\r\n\x1a\n` → MNG (hdr `MHDR`, end `MEND`).
+  Mng,
+  /// `\x8bJNG\r\n\x1a\n` → JNG (hdr `JHDR`, end `IEND`).
+  Jng,
+}
+
+impl PngContainer {
+  /// The base `File:FileType` NAME this container finalizes to (`PNG.pm:61-65`'s
+  /// first column). An animated PNG further overrides `PNG` → `APNG` later.
+  #[inline]
+  #[must_use]
+  pub const fn as_file_type(self) -> &'static str {
+    match self {
+      Self::Png => "PNG",
+      Self::Mng => "MNG",
+      Self::Jng => "JNG",
+    }
+  }
+
+  /// `true` for an MNG or JNG container — the two that engage the `%MNG::Main`
+  /// chunk-table fallback (`PNG.pm:1444` `$fileType ne 'PNG'`).
+  #[inline]
+  #[must_use]
+  pub const fn is_mng_family(self) -> bool {
+    matches!(self, Self::Mng | Self::Jng)
+  }
+
+  /// `true` for the plain PNG container.
+  #[inline]
+  #[must_use]
+  pub const fn is_png(self) -> bool {
+    matches!(self, Self::Png)
+  }
+}
+
+// ===========================================================================
 // PngMeta — the faithful PNG parse layer
 // ===========================================================================
 
@@ -794,6 +846,23 @@ pub struct PngMeta<'a> {
   /// chunk length), so a real PNG (≤ 1 small uncompressed `eXIf`) never charges
   /// it and is byte-identical.
   zxif_inflated_total: usize,
+  // ----- container (signature-derived, PNG.pm:61-65) ---------------------
+  /// Which PNG-sibling container the 8-byte signature selected (`PNG`/`MNG`/
+  /// `JNG`, `%pngLookup`). Drives the resolved `File:FileType` and the
+  /// `%MNG::Main` fallback. Defaults to [`PngContainer::Png`].
+  container: PngContainer,
+  // ----- MNG/JNG chunk sub-tables (MNG.pm) -------------------------------
+  /// The decoded MNG/JNG-specific chunk metadata (`MNG.pm`'s 17
+  /// `ProcessBinaryData` sub-tables + inline-`ValueConv` / `Binary => 1`
+  /// chunks), produced as the chunk walker reaches each MNG-specific chunk when
+  /// the resolved file type is MNG/JNG (`PNG.pm:1444-1446`/`:1653-1657`'s
+  /// `%MNG::Main` fallback). `None` for an ordinary PNG (and for an MNG/JNG that
+  /// carried no MNG-specific chunk). Emitted via its
+  /// [`Taggable`](crate::emit::Taggable) impl under group `MNG`, appended AFTER
+  /// the PNG-level tags in [`crate::formats::png::ProcessPng`]'s `tags()`; its
+  /// diagnostics drain alongside the PNG warnings. The same "sub-Meta hangs off
+  /// the parent Meta" shape as `GeoTiffMeta` on `ExifMeta`.
+  mng: Option<crate::exif::mng::MngMeta>,
   /// Phantom carry of `'a` for future zero-alloc evolution / sub-Meta
   /// embedding.
   _lifetime: core::marker::PhantomData<&'a ()>,
@@ -1013,6 +1082,8 @@ impl PngMeta<'_> {
       warnings: Vec::new(),
       diag_order: Vec::new(),
       zxif_inflated_total: 0,
+      container: PngContainer::Png,
+      mng: None,
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -1453,6 +1524,41 @@ impl PngMeta<'_> {
     self.warnings.push(warning);
   }
 
+  // ===== container =====================================================
+
+  /// Which PNG-sibling container the signature selected (`PNG`/`MNG`/`JNG`).
+  #[inline]
+  #[must_use]
+  pub const fn container(&self) -> PngContainer {
+    self.container
+  }
+
+  /// Record the signature-derived container — the chunk-walker hook called once
+  /// right after the signature gate (`PNG.pm:1438`).
+  #[inline]
+  pub(crate) fn set_container(&mut self, container: PngContainer) {
+    self.container = container;
+  }
+
+  // ===== MNG/JNG sub-Meta ===============================================
+
+  /// The decoded MNG/JNG-specific chunk metadata, if any was captured (an
+  /// MNG/JNG file that carried at least one MNG-specific chunk). `None` for an
+  /// ordinary PNG.
+  #[inline]
+  #[must_use]
+  pub(crate) fn mng(&self) -> Option<&crate::exif::mng::MngMeta> {
+    self.mng.as_ref()
+  }
+
+  /// Get the MNG sub-Meta, lazily creating an empty one — the chunk-walker hook
+  /// called for each MNG-specific chunk when the resolved file type is MNG/JNG.
+  /// The walker appends the decoded leaves via the returned `&mut MngMeta`.
+  #[inline]
+  pub(crate) fn mng_mut(&mut self) -> &mut crate::exif::mng::MngMeta {
+    self.mng.get_or_insert_with(crate::exif::mng::MngMeta::new)
+  }
+
   /// The WALK-ORDER interleaving of the three document-diagnostic sources (one
   /// [`PngDiagStep`] per push to [`Self::warnings`] / [`Self::exif_events`] /
   /// [`Self::xmp_profiles`]). The warning drain
@@ -1491,6 +1597,18 @@ impl PngMeta<'_> {
       // surfaces as `Trailer:Warning` (`SET_GROUP1 = 'Trailer'`).
       self.trailer_warning_start = self.warnings.len();
     }
+  }
+
+  /// The current post-`MEND`/`IEND` trailer state (`PNG.pm:1484`
+  /// `$$et{SET_GROUP1} = 'Trailer'`). The MNG-specific chunk dispatch
+  /// ([`crate::formats::png::ProcessPng`]) reads it to stamp each MNG leaf's
+  /// trailer provenance at decode time (the per-leaf analogue of the watermark
+  /// indices the list-stored PNG tags use, since the MNG leaves live in a
+  /// sub-Meta the watermark-by-index scheme cannot reach).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn in_trailer(&self) -> bool {
+    self.in_trailer
   }
 
   /// Whether the text record at index `i` was parsed from a post-`IEND`

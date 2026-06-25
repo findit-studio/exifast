@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "JNG_jhdr.jng",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "JNG",
+  "File:FileTypeExtension": "jng",
+  "File:MIMEType": "image/jng",
+  "MNG:ImageWidth": 320,
+  "MNG:ImageHeight": 240,
+  "MNG:ColorType": "Color",
+  "MNG:BitDepth": 8,
+  "MNG:Compression": "Huffman-coded baseline JPEG",
+  "MNG:Interlace": "Sequential",
+  "MNG:AlphaBitDepth": 8,
+  "MNG:AlphaCompression": "JNG 8-bit Grayscale JDAA",
+  "MNG:AlphaFilter": "Adaptive MNG (N/A for JPEG)",
+  "MNG:AlphaInterlace": "Noninterlaced",
+  "Composite:ImageSize": "320x240",
+  "Composite:Megapixels": 0.077
+}]
