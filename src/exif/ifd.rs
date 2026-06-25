@@ -1084,6 +1084,176 @@ pub fn read_value(
   })
 }
 
+/// The BYTE LENGTH of the post-[`ReadValue`](read_value) `$val` — `length($val)`
+/// in Perl byte semantics — computed WITHOUT materializing the value.
+///
+/// [`read_value`] decodes the entire (attacker-controlled) `count` into a
+/// `Vec`/joined `String` purely so a caller can take its length; for a BigTIFF
+/// `Binary => 1` block tag (`GeoTiffDirectory`/`DoubleParams`/`AsciiParams`),
+/// the only thing the caller needs is that length (the `(Binary data N bytes …)`
+/// placeholder `N`). An in-bounds-but-huge `int16u`/`double` block under the
+/// `0x7fffffff` BigTIFF size gate would drive `read_value` to allocate hundreds
+/// of MB / GB (Vecs + the joined `String`) just to be measured — an OOM/DoS. This
+/// computes the same `N` in O(count) time and O(1) PEAK allocation: it walks the
+/// SAME clamped element window [`read_value`] would, but sums each element's
+/// rendered byte length (an arithmetic decimal-digit count for the integer
+/// shapes; a single throwaway per-element `String` — dropped before the next —
+/// for the float/rational shapes) instead of collecting them.
+///
+/// For a WELL-FORMED block this returns EXACTLY `read_value(..).map(|v|
+/// v.val_bytes().len())` — byte-identical to the materialized count (the numeric
+/// shapes render only ASCII, so the join `String`'s byte length equals its char
+/// length, computed here per element). For the non-numeric shapes it returns the
+/// FAITHFUL RAW byte length of `$val` — the NUL-trimmed `string`/`utf8` byte
+/// count, and (the bug this replaces) the `undef`/`binary` RAW byte count, NOT a
+/// UTF-8-lossy re-encoding (a malformed `0xff` counts as 1 raw post-`ReadValue`
+/// byte, matching Perl `length`, not the 3 bytes of `from_utf8_lossy`'s U+FFFD).
+///
+/// The caller adds the `RawConv` suffix (the 2-byte `GetByteOrder` tag for
+/// `0x87af`/`0x87b0`) on top; this is the `$val`-only length.
+#[must_use]
+pub fn read_value_byte_len(
+  data: &[u8],
+  offset: usize,
+  format: Format,
+  count: usize,
+  size: usize,
+  order: ByteOrder,
+) -> usize {
+  let len = format.byte_size();
+  if len == 0 {
+    return 0; // Unknown format — `read_value` returns `None` → length 0.
+  }
+  let count = match read_value_count(data, offset, format, count, size) {
+    // Mirror `read_value`'s count dispatch exactly: `None` → `read_value` is
+    // `None` (length 0); `Some(0)` → the empty `$val` (`''`/empty list — length
+    // 0 for every shape); `Some(n>=1)` → the clamped element count.
+    None => return 0,
+    Some(0) => return 0,
+    Some(n) => n,
+  };
+  // The SAME byte window `read_value` reads from, with the SAME `count`-already-
+  // clamped invariant (`count * len <= window.len()`); `read_value_count`
+  // shortened `count` to the bytes present from `offset`.
+  let window_end = offset.saturating_add(len.saturating_mul(count));
+  let Some(window) = data.get(offset..window_end.min(data.len())) else {
+    return 0;
+  };
+
+  match format {
+    // ---- string types — the NUL-trimmed RAW byte count (`s/\0.*//s`) ---------
+    // `read_value` keeps the bytes up to the FIRST NUL (or all `count` bytes);
+    // `$val`'s length is that trimmed byte count, NOT the FixUTF8 display string's
+    // (the `Binary => 1` value is never FixUTF8'd — that runs only on the JSON
+    // display string of a NON-binary tag), so a non-UTF-8 `string` byte still
+    // counts as its raw self.
+    Format::Ascii | Format::Utf8 => {
+      let Some(raw) = window.get(..count) else {
+        return 0;
+      };
+      match raw.iter().position(|&b| b == 0) {
+        Some(nul) => nul,
+        None => raw.len(),
+      }
+    }
+    // ---- undef/binary — the RAW byte count (NOT UTF-8 lossy) ------------------
+    // `read_value` returns the raw `count * len` bytes un-trimmed; `length($val)`
+    // is that raw byte count. (The faithful fix: `from_utf8_lossy(..).len()`
+    // over-counts any non-UTF-8 byte.)
+    Format::Undef | Format::Unicode | Format::Complex => count.saturating_mul(len),
+    // ---- integer types — the space-joined decimal byte length ----------------
+    // `join(' ', @vals)`: each element's decimal length (an exact arithmetic
+    // digit count, matching `write!("{v}")`) summed, plus one separator between
+    // elements. Iterates one element at a time — no `Vec`, no joined `String`.
+    Format::Int8u => sum_joined_len(count, |i| {
+      u64_decimal_len(u64::from(window.get(i).copied().unwrap_or(0)))
+    }),
+    Format::Int8s => sum_joined_len(count, |i| {
+      i64_decimal_len(i64::from(window.get(i).copied().unwrap_or(0) as i8))
+    }),
+    Format::Int16u => sum_joined_len(count, |i| {
+      u64_decimal_len(u64::from(get_u16(window, i * 2, order).unwrap_or(0)))
+    }),
+    Format::Int16s => sum_joined_len(count, |i| {
+      i64_decimal_len(i64::from(get_i16(window, i * 2, order).unwrap_or(0)))
+    }),
+    Format::Int32u | Format::Ifd => sum_joined_len(count, |i| {
+      u64_decimal_len(u64::from(get_u32(window, i * 4, order).unwrap_or(0)))
+    }),
+    Format::Int32s => sum_joined_len(count, |i| {
+      i64_decimal_len(i64::from(get_i32(window, i * 4, order).unwrap_or(0)))
+    }),
+    Format::Int64u | Format::Ifd64 => sum_joined_len(count, |i| {
+      u64_decimal_len(get_u64(window, i * 8, order).unwrap_or(0))
+    }),
+    Format::Int64s => sum_joined_len(count, |i| {
+      i64_decimal_len(get_i64(window, i * 8, order).unwrap_or(0))
+    }),
+    // ---- float types — the space-joined `%.15g` byte length ------------------
+    // Each element's `%.15g` byte length is measured ONE AT A TIME by writing it
+    // (the SAME per-element form `numeric_val_string` joins) into a `LenSink` —
+    // a byte-counting `fmt::Write` sink that allocates NOTHING. No per-element
+    // `String` is ever built (and dropped), so a large in-bounds block does ZERO
+    // heap allocation regardless of `count`.
+    Format::Float => sum_joined_len(count, |i| {
+      let mut sink = crate::value::LenSink::default();
+      let _ = crate::value::format_g_into(
+        &mut sink,
+        f64::from(get_f32(window, i * 4, order).unwrap_or(0.0)),
+        15,
+      );
+      sink.0
+    }),
+    Format::Double => sum_joined_len(count, |i| {
+      let mut sink = crate::value::LenSink::default();
+      let _ =
+        crate::value::format_g_into(&mut sink, get_f64(window, i * 8, order).unwrap_or(0.0), 15);
+      sink.0
+    }),
+    // ---- rational types — the space-joined `exiftool_val_str` byte length -----
+    // Same zero-heap probe: write each rational's `$val` into a `LenSink`.
+    Format::Rational64u => sum_joined_len(count, |i| {
+      let n = get_u32(window, i * 8, order).unwrap_or(0);
+      let d = get_u32(window, i * 8 + 4, order).unwrap_or(0);
+      let mut sink = crate::value::LenSink::default();
+      let _ = Rational::rational64(i64::from(n), i64::from(d)).exiftool_val_str_into(&mut sink);
+      sink.0
+    }),
+    Format::Rational64s => sum_joined_len(count, |i| {
+      let n = get_i32(window, i * 8, order).unwrap_or(0);
+      let d = get_i32(window, i * 8 + 4, order).unwrap_or(0);
+      let mut sink = crate::value::LenSink::default();
+      let _ = Rational::rational64(i64::from(n), i64::from(d)).exiftool_val_str_into(&mut sink);
+      sink.0
+    }),
+    Format::Unknown(_) => 0,
+  }
+}
+
+/// Sum `per_elem(i)` for `i in 0..count` plus `count - 1` space separators — the
+/// byte length of `join(' ', …)` without building the joined string. `count` is
+/// `>= 1` here (the count-0 cases returned early), so the separator total is
+/// `count - 1` and never underflows.
+fn sum_joined_len(count: usize, per_elem: impl FnMut(usize) -> usize) -> usize {
+  let total: usize = (0..count).map(per_elem).sum();
+  total.saturating_add(count.saturating_sub(1))
+}
+
+/// Decimal byte length of a `u64` as `write!("{v}")` would render it — `1` for
+/// `0`, else `floor(log10(v)) + 1`. (`v.ilog10()` panics on `0`, hence the
+/// special case.)
+const fn u64_decimal_len(v: u64) -> usize {
+  if v == 0 { 1 } else { v.ilog10() as usize + 1 }
+}
+
+/// Decimal byte length of an `i64` as `write!("{v}")` would render it — one
+/// leading `-` for a negative value plus the digit count of its magnitude.
+/// `unsigned_abs` handles `i64::MIN` without overflow.
+const fn i64_decimal_len(v: i64) -> usize {
+  let sign = if v < 0 { 1 } else { 0 };
+  sign + u64_decimal_len(v.unsigned_abs())
+}
+
 /// The "empty value" `ReadValue` returns when `defined $count` and the data
 /// is too short (`ExifTool.pm:6286` `return ''`). For a string format that
 /// is the empty string; for the others an empty list.
@@ -1545,5 +1715,137 @@ mod tests {
         "read_value_count != read_value element count for {format:?} count={count} size={size}"
       );
     }
+  }
+
+  /// The allocation-free [`read_value_byte_len`] must return EXACTLY the byte
+  /// length of the materialized post-`ReadValue` `$val` (`val_bytes().len()`)
+  /// across every shape — incl. a HUGE in-bounds count (the DoS shape the
+  /// placeholder path must measure WITHOUT collecting). This is the oracle: the
+  /// new calculator is byte-identical to the old materialize-then-`.len()` for
+  /// every well-formed value, only it never allocates the array.
+  #[test]
+  fn read_value_byte_len_matches_materialized_val_bytes() {
+    // A buffer with varied bytes so the decimal/`%g` token lengths differ per
+    // element (0x00, 0xff, 0x80, ascending …) — exercises multi-digit decimals,
+    // negative signed values, NUL-trim, and non-UTF-8 bytes.
+    let mut data = [0u8; 8192];
+    for (i, b) in data.iter_mut().enumerate() {
+      *b = (i as u8).wrapping_mul(37).wrapping_add(i as u8 / 7);
+    }
+    let order = ByteOrder::Little;
+    // (format, count, size): every shape, plus a HUGE in-bounds count per
+    // numeric width (the OOM/DoS case — clamped to the buffer, measured without
+    // a Vec/String), the count==0 derive, the re-clamp, and the nothing-fits 0.
+    let cases: &[(Format, usize, usize)] = &[
+      (Format::Int8u, 50, 50),
+      (Format::Int8s, 50, 50),
+      (Format::Int16u, 25, 50),
+      (Format::Int16s, 25, 50),
+      (Format::Int32u, 12, 48),
+      (Format::Int32s, 12, 48),
+      (Format::Int64u, 6, 48),
+      (Format::Int64s, 6, 48),
+      (Format::Float, 12, 48),
+      (Format::Double, 6, 48),
+      (Format::Rational64u, 6, 48),
+      (Format::Rational64s, 6, 48),
+      (Format::Ascii, 40, 40),
+      (Format::Utf8, 40, 40),
+      (Format::Undef, 40, 40),
+      // HUGE in-bounds counts — the placeholder-DoS shapes. The requested count
+      // dwarfs the buffer; `read_value_count` clamps it, and the calculator sums
+      // ~thousands of tokens in O(count)/O(1)-alloc — no GB Vec/String.
+      (Format::Int8u, 8192, 8192),
+      (Format::Int16u, 4096, 8192),
+      (Format::Int32u, 2048, 8192),
+      (Format::Double, 1024, 8192),
+      (Format::Undef, 8192, 8192),
+      (Format::Ascii, 8192, 8192),
+      // Boundary / degenerate shapes.
+      (Format::Int16u, 0, 50),   // count==0 ⇒ derive 25.
+      (Format::Int8u, 0, 0),     // empty `$val` ⇒ 0.
+      (Format::Int32u, 100, 12), // re-clamp to 3.
+      (Format::Int32u, 1, 2),    // nothing fits ⇒ 0.
+    ];
+    for &(format, count, size) in cases {
+      let probed = read_value_byte_len(&data, 0, format, count, size, order);
+      let materialized =
+        read_value(&data, 0, format, count, size, order).map_or(0, |v| v.val_bytes().len());
+      assert_eq!(
+        probed, materialized,
+        "read_value_byte_len != val_bytes().len() for {format:?} count={count} size={size}"
+      );
+    }
+  }
+
+  /// A LARGE in-bounds element count computes a correct, BOUNDED placeholder
+  /// length without materializing the array — the OOM/DoS fix. A 0x87af/0x87b0
+  /// `int16u`/`double` block under the `0x7fffffff` BigTIFF size gate would drive
+  /// the old `read_value(..).raw_conv_val_string().len()` to allocate the whole
+  /// array (Vecs + joined String) just to be measured; this proves the count is
+  /// produced from the byte window alone, in O(count) and a single reused
+  /// scratch buffer.
+  #[test]
+  fn read_value_byte_len_large_count_no_oom() {
+    // A few-KB buffer of zeros: an `int16u` count of `0x3fff_ffff` (well under
+    // the `0x7fffffff` gate, ~1.07e9 elements → the materialized join would be
+    // ~2 GB) clamps to `buf.len() / 2` and is summed without a Vec/String.
+    let data = [0u8; 2048];
+    let order = ByteOrder::Little;
+    let huge = 0x3fff_ffffusize; // in-bounds under the BigTIFF 0x7fffffff gate.
+
+    // int16u: all-zero elements render "0" (1 byte) joined by spaces. The window
+    // clamps to 2048/2 = 1024 elements ⇒ 1024 tokens + 1023 separators = 2047.
+    let n16 = read_value_byte_len(&data, 0, Format::Int16u, huge, 0x7fff_fffe, order);
+    assert_eq!(
+      n16,
+      1024 + 1023,
+      "int16u huge count must clamp + measure, not OOM"
+    );
+
+    // double: 8-byte all-zero elements render "0" too; 2048/8 = 256 elements ⇒
+    // 256 tokens + 255 separators = 511.
+    let ndbl = read_value_byte_len(&data, 0, Format::Double, huge, 0x7fff_fff8, order);
+    assert_eq!(
+      ndbl,
+      256 + 255,
+      "double huge count must clamp + measure, not OOM"
+    );
+
+    // The materialized oracle agrees (the buffer is small post-clamp, so this is
+    // cheap) — same count, no divergence.
+    assert_eq!(
+      n16,
+      read_value(&data, 0, Format::Int16u, huge, 0x7fff_fffe, order)
+        .map_or(0, |v| v.val_bytes().len())
+    );
+  }
+
+  /// A wrong-format `undef`/`binary` block with invalid (non-UTF-8) bytes counts
+  /// its RAW post-`ReadValue` byte length (1 per `0xff`), NOT the UTF-8-lossy
+  /// stringification the old path used (a `0xff` → the 3-byte U+FFFD). This is
+  /// the faithful `length($val)` for a Perl binary string.
+  #[test]
+  fn read_value_byte_len_undef_counts_raw_bytes_not_lossy() {
+    let order = ByteOrder::Little;
+    // Three lone `0xff` bytes (each invalid UTF-8) as an `undef` block.
+    let data = [0xffu8, 0xff, 0xff];
+    let n = read_value_byte_len(&data, 0, Format::Undef, 3, 3, order);
+    assert_eq!(n, 3, "undef 0xff×3 must count 3 RAW bytes");
+
+    // Prove the divergence the fix closes: the OLD path measured the UTF-8-lossy
+    // string, where each `0xff` becomes U+FFFD (3 bytes) ⇒ 9, NOT 3.
+    let raw = read_value(&data, 0, Format::Undef, 3, 3, order).expect("undef decodes");
+    assert_eq!(raw.val_bytes().len(), 3, "val_bytes is the raw byte count");
+    assert_eq!(
+      raw.raw_conv_val_string().len(),
+      9,
+      "the OLD lossy path over-counted 0xff×3 as 9 (3× U+FFFD) — the bug"
+    );
+    assert_ne!(
+      n,
+      raw.raw_conv_val_string().len(),
+      "read_value_byte_len must NOT use the lossy stringification"
+    );
   }
 }

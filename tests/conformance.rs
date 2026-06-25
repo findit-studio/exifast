@@ -10421,6 +10421,82 @@ fn exif_usercomment_unicode_conformance() {
   );
 }
 #[test]
+fn geotiff_real_conformance() {
+  // The REAL ExifTool `t/images/GeoTiff.tif` — a big-endian (MM) TIFF carrying
+  // the GeoKey directory (`Image::ExifTool::GeoTiff`'s `ProcessGeoTiff`). It
+  // exercises the IFD0 `ModelTransform` double[16] leaf AND the GeoKeys decoded
+  // from all three blocks: inline int16u (`GTModelType` 1024 → "Projected",
+  // `GeographicType` 2048 → "User Defined"), `GeoTiffAsciiParams` strings
+  // (`GeogCitation`/`PCSCitation` → "Hough UTM zone 17N"),
+  // `GeoTiffDoubleParams` doubles (`GeogSemiMajorAxis` 6378270 /
+  // `GeogSemiMinorAxis` 6356794.343479), the synthetic `GeoTiffVersion` "1.1.0",
+  // AND the GIANT `Projection` table (16017 → "UTM zone 17N"). The three
+  // `Binary => 1` block tags (0x87af/0x87b0/0x87b1) are CAPTURED + decoded but
+  // never emitted (no `RequestAll`). Verified byte-exact vs bundled `perl
+  // exiftool 13.59 -j -G1` (`-j` PrintConv labels; `-n` the raw GeoKey ints).
+  //
+  // `IFD0:ColorMap` (0x0140, the RGB palette this image carries) is dropped from
+  // BOTH sides: it is a `Binary => 1` palette tag NOT yet in the port's EXIF
+  // leaf table (a deferred `%Exif::Main` item, orthogonal to GeoTiff), so
+  // bundled's `"(Binary data 1536 bytes, …)"` has no exifast counterpart. Every
+  // GeoTiff tag (and the `IFD0:ModelTransform` leaf) IS compared byte-exactly.
+  check_excluding("GeoTiff.tif", "GeoTiff.tif.json", true, &["IFD0:ColorMap"]);
+  check_excluding(
+    "GeoTiff.tif",
+    "GeoTiff.tif.n.json",
+    false,
+    &["IFD0:ColorMap"],
+  );
+}
+#[test]
+fn geotiff_mini_conformance() {
+  // A CRAFTED minimal little-endian TIFF exercising all three GeoKey `loc`
+  // source paths in one directory (`GeoTiff.pm:2176-2185`):
+  //   * `GTModelType` (1024) — loc=0, an inline int16u → "Projected" PrintConv;
+  //   * `GeogCitation` (2049) — loc=0x87b1, a `GeoTiffAsciiParams` string
+  //     ("WGS 84|", the trailing `|` terminator stripped → "WGS 84");
+  //   * `GeogSemiMajorAxis` (2057) — loc=0x87b0, a `GeoTiffDoubleParams` double
+  //     (6378137).
+  // Plus the IFD0 `PixelScale` (double[3] "10 10 0") and `ModelTiePoint`
+  // (double[6] "0 0 0 100 200 0") leaf tags and the synthetic `GeoTiffVersion`
+  // "1.1.0". Proves the inline/double/string dispatch + the `|`-terminator
+  // strip. Byte-exact vs bundled 13.59.
+  check("GeoTiff_mini.tif", "GeoTiff_mini.tif.json", true);
+  check("GeoTiff_mini.tif", "GeoTiff_mini.tif.n.json", false);
+}
+#[test]
+fn geotiff_projcs_conformance() {
+  // A CRAFTED minimal LE TIFF whose GeoKeyDirectory carries
+  // `ProjectedCSType` = 32617 (an inline int16u GeoKey) — PROVING the GIANT
+  // ~993-row `ProjectedCSType` table resolves 32617 → "WGS84 UTM zone 17N"
+  // (`-j`) and the raw 32617 (`-n`), alongside `GTModelType` 1 → "Projected"
+  // and `GTRasterType` 1 → "Pixel Is Area". Byte-exact vs bundled 13.59.
+  check("GeoTiff_projcs.tif", "GeoTiff_projcs.tif.json", true);
+  check("GeoTiff_projcs.tif", "GeoTiff_projcs.tif.n.json", false);
+}
+#[test]
+fn geotiff_bigtiff_conformance() {
+  // A CRAFTED minimal little-endian BigTIFF (`0x002B`, 8-byte offsets/counts)
+  // carrying the SAME GeoKey blocks as `GeoTiff_mini.tif` (GeoKeyDirectory +
+  // GeoDoubleParams + GeoAsciiParams + PixelScale + ModelTiePoint). It pins the
+  // BigTIFF-specific GeoTiff handling: `ProcessGeoTiff` is UNREACHABLE for a
+  // BigTIFF (`DoProcessTIFF`'s `$identifier == 0x2b` arm `return 1`s at
+  // `ExifTool.pm:8668`, BEFORE the `:8740` `ProcessGeoTiff` call; `BigTIFF.pm`
+  // has no GeoTiff reference), so a BigTIFF GeoTIFF emits NO `GeoTiff:*` GeoKeys.
+  // Instead the three `Binary => 1` block tags survive as `(Binary data N bytes
+  // …)` placeholders under IFD0 (the `ProcessGeoTiff` `DeleteTag` cleanup that
+  // removes them on the classic path never runs). The byte count is the
+  // post-`ReadValue` `$val` length — `ProcessBigIFD` joins the int16u/double
+  // array with the ON-DISK format (no `Format => 'undef'` override) and 0x87af/
+  // 0x87b0's `RawConv => '$val . GetByteOrder()'` appends the 2-byte order tag:
+  //   * GeoTiffDirectory  = len("1 1 0 3 …")+2 = 50,
+  //   * GeoTiffDoubleParams = len("6378137")+2 = 9,
+  //   * GeoTiffAsciiParams  = len("WGS 84|")   = 7.
+  // Byte-exact vs bundled ExifTool 13.59 (`-j` and `-n`).
+  check("GeoTiff_bigtiff.tif", "GeoTiff_bigtiff.tif.json", true);
+  check("GeoTiff_bigtiff.tif", "GeoTiff_bigtiff.tif.n.json", false);
+}
+#[test]
 fn gps_conformance() {
   // FORMATS.md row 14: Image::ExifTool::GPS. The GPS IFD is a standard Exif
   // sub-IFD reached through the IFD0 `GPSInfo` tag (0x8825, Exif.pm:2130-

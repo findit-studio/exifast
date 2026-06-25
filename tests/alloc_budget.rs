@@ -187,6 +187,111 @@ fn alloc_budget() {
       "{name}: extract_info -n allocated {n_allocs} > budget {nb} (Golden-v2 C4 regression)"
     );
   }
+
+  read_value_byte_len_float_rational_is_zero_heap();
+}
+
+/// The placeholder-length path ([`exifast::exif::ifd::read_value_byte_len`]) for
+/// a LARGE in-bounds `Double`/`Rational` block must allocate O(1) heap, NOT
+/// O(count): each element's `%.15g` / rational `$val` byte length is measured by
+/// writing into a `LenSink` (a byte-counting `fmt::Write` sink) and a stack
+/// buffer, never by building + dropping a per-element `String`. Before the fix
+/// the `Double` arm called `format_g(..).len()` and the `Rational` arm
+/// `.exiftool_val_str().len()`, each forcing ONE heap `String` per element — so
+/// a count-N block (near the `0x7fffffff` BigTIFF gate) drove N short heap
+/// allocations (an allocator/CPU-churn DoS). This measures the alloc delta and
+/// asserts it is a tiny CONSTANT, independent of `count`.
+///
+/// Called INLINE from the single `alloc_budget` test (not a second `#[test]`):
+/// the allocation counter is a process-global `AtomicUsize`, so a parallel
+/// second measuring test would cross-contaminate this window (see the module
+/// doc). Running it as a sequential section keeps the counts deterministic.
+fn read_value_byte_len_float_rational_is_zero_heap() {
+  use exifast::exif::ifd::{ByteOrder, Format, read_value_byte_len};
+
+  // A 16 KiB buffer of varied (non-zero, multi-token) bytes so each element's
+  // `%.15g` / rational token is a realistic multi-byte string — the case the OLD
+  // per-element `String` allocated. Built OUTSIDE the measured region.
+  let mut data = vec![0u8; 16 * 1024];
+  for (i, b) in data.iter_mut().enumerate() {
+    *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+  }
+  let order = ByteOrder::Little;
+
+  // SMALL and LARGE element counts for the same format. If the path allocated
+  // per element, the LARGE count's delta would dwarf the SMALL's; the fix makes
+  // BOTH a tiny constant.
+  let small = 4usize;
+  let large = 2048usize; // Double: 2048 * 8 = 16384 = the whole buffer.
+
+  // Warm-up: any first-call lazy init happens OUTSIDE the measured deltas.
+  let _ = read_value_byte_len(&data, 0, Format::Double, small, data.len(), order);
+  let _ = read_value_byte_len(&data, 0, Format::Rational64s, small, data.len(), order);
+
+  // `Double` — the headline DoS shape (`GeoTiffDoubleParams`, code 12).
+  let (len_small_d, allocs_small_d) =
+    count_allocs(|| read_value_byte_len(&data, 0, Format::Double, small, data.len(), order));
+  let (len_large_d, allocs_large_d) =
+    count_allocs(|| read_value_byte_len(&data, 0, Format::Double, large, data.len(), order));
+
+  // `Rational64s` — the other heap-`String`-per-element arm (`exiftool_val_str`).
+  let large_r = 2048usize; // 2048 * 8 = 16384 = the whole buffer.
+  let (len_small_r, allocs_small_r) =
+    count_allocs(|| read_value_byte_len(&data, 0, Format::Rational64s, small, data.len(), order));
+  let (len_large_r, allocs_large_r) =
+    count_allocs(|| read_value_byte_len(&data, 0, Format::Rational64s, large_r, data.len(), order));
+
+  println!("\n=== alloc_budget: read_value_byte_len zero-heap (float/rational) ===");
+  println!(
+    "  Double      small({small})={allocs_small_d} large({large})={allocs_large_d}  (len {len_small_d}/{len_large_d})"
+  );
+  println!(
+    "  Rational64s small({small})={allocs_small_r} large({large_r})={allocs_large_r}  (len {len_small_r}/{len_large_r})"
+  );
+
+  // The lengths are non-trivial (a multi-token join), proving the measured call
+  // actually formatted every element — not a short-circuit to 0.
+  assert!(
+    len_large_d > len_small_d && len_large_d > 1000,
+    "Double large-count length must reflect every formatted element (got {len_large_d})"
+  );
+  assert!(
+    len_large_r > len_small_r && len_large_r > 1000,
+    "Rational large-count length must reflect every formatted element (got {len_large_r})"
+  );
+
+  // THE REGRESSION: the LARGE-count probe (2048 elements) must allocate a tiny
+  // CONSTANT, NOT ~2048 (one heap `String` per element, the pre-fix behavior).
+  // The fix's per-element path (`LenSink` + a stack `StackBuf`) touches the heap
+  // ZERO times; the small ceiling absorbs any incidental harness allocation
+  // while remaining FAR below O(count). If `format_g_into`/`exiftool_val_str_into`
+  // regressed to building a per-element `String`, `allocs_large_*` would be
+  // ~2048 and this trips.
+  const ZERO_HEAP_CEILING: usize = 8;
+  assert!(
+    allocs_large_d <= ZERO_HEAP_CEILING,
+    "Double placeholder-length path allocated {allocs_large_d} heap blocks for {large} elements \
+     — expected O(1) (≤ {ZERO_HEAP_CEILING}); a per-element `String` regressed back in \
+     (the #150 allocation-DoS class)."
+  );
+  assert!(
+    allocs_large_r <= ZERO_HEAP_CEILING,
+    "Rational placeholder-length path allocated {allocs_large_r} heap blocks for {large_r} elements \
+     — expected O(1) (≤ {ZERO_HEAP_CEILING}); a per-element `String` regressed back in."
+  );
+
+  // And the delta does NOT grow with count: large-count allocs must not exceed
+  // the small-count allocs by more than the constant ceiling (i.e. it is NOT
+  // proportional to the 512× larger element count).
+  assert!(
+    allocs_large_d <= allocs_small_d + ZERO_HEAP_CEILING,
+    "Double allocs scaled with count ({allocs_small_d} → {allocs_large_d} for {small} → {large}) \
+     — the placeholder-length path must be O(1) in `count`."
+  );
+  assert!(
+    allocs_large_r <= allocs_small_r + ZERO_HEAP_CEILING,
+    "Rational allocs scaled with count ({allocs_small_r} → {allocs_large_r}) — must be O(1)."
+  );
 }
 
 // ---------------------------------------------------------------------------

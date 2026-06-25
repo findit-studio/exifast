@@ -107,11 +107,28 @@ impl Rational {
   /// what ExifTool's `$val` would be.
   #[must_use]
   pub fn exiftool_val_str(&self) -> String {
+    let mut s = String::new();
+    // The sink is `String`, whose `write_str` is infallible.
+    let _ = self.exiftool_val_str_into(&mut s);
+    s
+  }
+
+  /// Zero-heap core of [`Self::exiftool_val_str`]: write this rational's
+  /// `$val` text to any [`core::fmt::Write`] sink instead of returning an
+  /// owned `String`. [`Self::exiftool_val_str`] is the thin `String` wrapper
+  /// over this, so both render byte-identically. The byte-length probe in
+  /// [`crate::exif::ifd::read_value_byte_len`] feeds a counting sink here, so a
+  /// large in-bounds rational block is measured with ZERO per-element heap
+  /// allocation.
+  pub fn exiftool_val_str_into<W: core::fmt::Write + ?Sized>(
+    &self,
+    w: &mut W,
+  ) -> core::fmt::Result {
     if self.denominator == 0 {
-      return if self.numerator != 0 { "inf" } else { "undef" }.to_string();
+      return w.write_str(if self.numerator != 0 { "inf" } else { "undef" });
     }
     let v = self.numerator as f64 / self.denominator as f64;
-    format_g(v, self.sig as usize)
+    format_g_into(w, v, self.sig as usize)
   }
 
   /// The raw IEEE quotient `numerator / denominator` as an `f64` — the value
@@ -135,44 +152,165 @@ impl Rational {
 /// the same `$val` text ExifTool would produce.
 #[must_use]
 pub fn format_g(val: f64, precision: usize) -> String {
+  let mut s = String::new();
+  // The sink is `String`, whose `write_str` is infallible, so this never errs.
+  let _ = format_g_into(&mut s, val, precision);
+  s
+}
+
+/// A byte-counting [`core::fmt::Write`] sink: holds nothing, only the running
+/// `write_str` byte total. Feeding [`format_g_into`] / [`Rational::exiftool_val_str_into`]
+/// a `LenSink` yields the formatted byte length with ZERO heap allocation —
+/// the placeholder-length path in [`crate::exif::ifd::read_value_byte_len`]
+/// measures a large in-bounds float/rational block one element at a time
+/// without ever building (and dropping) a per-element `String`.
+#[derive(Default)]
+pub struct LenSink(pub usize);
+
+impl core::fmt::Write for LenSink {
+  fn write_str(&mut self, s: &str) -> core::fmt::Result {
+    self.0 = self.0.saturating_add(s.len());
+    Ok(())
+  }
+}
+
+/// A fixed-capacity stack buffer that implements [`core::fmt::Write`] so the
+/// `%e`/fixed intermediate forms can be rendered WITHOUT a heap `String`. A
+/// write past capacity is reported as an error (so `write!` aborts) and sets
+/// the overflow flag; [`format_g_into`] then falls back to the heap path. The
+/// capacity (128) covers every precision this crate uses (≤ 15 → ≤ ~36 bytes)
+/// with wide margin; only a pathological precision (unreached in practice)
+/// overflows.
+struct StackBuf {
+  buf: [u8; Self::CAP],
+  len: usize,
+  overflow: bool,
+}
+
+impl StackBuf {
+  const CAP: usize = 128;
+
+  const fn new() -> Self {
+    Self {
+      buf: [0u8; Self::CAP],
+      len: 0,
+      overflow: false,
+    }
+  }
+
+  fn as_str(&self) -> &str {
+    // Only `write_str` (valid UTF-8) appended bytes, never past `len`.
+    core::str::from_utf8(self.buf.get(..self.len).unwrap_or(&[])).unwrap_or("")
+  }
+}
+
+impl core::fmt::Write for StackBuf {
+  fn write_str(&mut self, s: &str) -> core::fmt::Result {
+    let bytes = s.as_bytes();
+    let Some(dst) = self.buf.get_mut(self.len..self.len + bytes.len()) else {
+      self.overflow = true;
+      return Err(core::fmt::Error);
+    };
+    dst.copy_from_slice(bytes);
+    self.len += bytes.len();
+    Ok(())
+  }
+}
+
+/// Zero-heap core of [`format_g`]: render `sprintf("%.*g", precision, val)`
+/// directly into any [`core::fmt::Write`] sink instead of returning an owned
+/// `String`. [`format_g`] is the thin `String` wrapper over this, so all
+/// existing callers stay byte-for-byte identical. Feeding a [`LenSink`] yields
+/// the formatted length with no heap allocation — the placeholder-length probe
+/// in [`crate::exif::ifd::read_value_byte_len`] uses exactly that so a large
+/// in-bounds float block is measured element-by-element allocation-free.
+///
+/// The internal `%e`/fixed decomposition is rendered into a fixed [`StackBuf`]
+/// (no heap); a pathological precision that overflows the stack buffer falls
+/// back to the original heap `format!` path so output is correct for any input.
+pub fn format_g_into<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  val: f64,
+  precision: usize,
+) -> core::fmt::Result {
+  use core::fmt::Write as _;
   let p = precision.max(1);
   if val == 0.0 {
     // Perl `%g`: "0" for +0.0, "-0" for -0.0.
-    return if val.is_sign_negative() {
-      "-0".to_string()
-    } else {
-      "0".to_string()
-    };
+    return w.write_str(if val.is_sign_negative() { "-0" } else { "0" });
   }
   // Decompose via `%e` (Rust gives `p-1` fraction digits + decimal exponent)
-  // to obtain the C `%g` exponent X.
-  let e_str = format!("{:.*e}", p - 1, val);
+  // to obtain the C `%g` exponent X — into a stack buffer, no heap `String`.
+  let mut e_buf = StackBuf::new();
+  if write!(e_buf, "{:.*e}", p - 1, val).is_err() {
+    if e_buf.overflow {
+      return format_g_into_heap(w, val, p);
+    }
+    return Err(core::fmt::Error);
+  }
+  let e_str = e_buf.as_str();
   let Some((mantissa, exp_s)) = e_str.split_once('e') else {
     // `{:e}` always contains 'e'; if not, fall back to the raw text.
-    return e_str;
+    return w.write_str(e_str);
   };
   let Ok(x) = exp_s.parse::<i32>() else {
-    return e_str;
+    return w.write_str(e_str);
   };
   if x >= -4 && x < p as i32 {
     // Fixed notation: (p - 1 - x) fraction digits, then strip per `%g`.
     let frac = (p as i32 - 1 - x).max(0) as usize;
-    strip_g_trailing_zeros(&format!("{val:.frac$}"))
+    let mut f_buf = StackBuf::new();
+    if write!(f_buf, "{val:.frac$}").is_err() {
+      if f_buf.overflow {
+        return format_g_into_heap(w, val, p);
+      }
+      return Err(core::fmt::Error);
+    }
+    w.write_str(strip_g_trailing_zeros(f_buf.as_str()))
   } else {
     // Scientific notation; C/Perl exponent: explicit sign, >= 2 digits.
     let m = strip_g_trailing_zeros(mantissa);
     let sign = if x < 0 { '-' } else { '+' };
-    format!("{m}e{sign}{:02}", x.abs())
+    w.write_str(m)?;
+    write!(w, "e{sign}{:02}", x.abs())
+  }
+}
+
+/// Heap fallback for [`format_g_into`] when a (pathological, unreached-in-crate)
+/// precision overflows the stack buffer. Identical formatting to the fast path,
+/// only the `%e`/fixed intermediates are heap `String`s. Kept tiny and separate
+/// so the common path stays branch-light and allocation-free.
+#[cold]
+fn format_g_into_heap<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  val: f64,
+  p: usize,
+) -> core::fmt::Result {
+  let e_str = format!("{:.*e}", p - 1, val);
+  let Some((mantissa, exp_s)) = e_str.split_once('e') else {
+    return w.write_str(&e_str);
+  };
+  let Ok(x) = exp_s.parse::<i32>() else {
+    return w.write_str(&e_str);
+  };
+  if x >= -4 && x < p as i32 {
+    let frac = (p as i32 - 1 - x).max(0) as usize;
+    let fixed = format!("{val:.frac$}");
+    w.write_str(strip_g_trailing_zeros(&fixed))
+  } else {
+    let sign = if x < 0 { '-' } else { '+' };
+    w.write_str(strip_g_trailing_zeros(mantissa))?;
+    write!(w, "e{sign}{:02}", x.abs())
   }
 }
 
 /// `%g` (without `#`) strips trailing zeros in the fraction and a bare
-/// trailing `.`.
-fn strip_g_trailing_zeros(s: &str) -> String {
+/// trailing `.` — by sub-slicing (no allocation).
+fn strip_g_trailing_zeros(s: &str) -> &str {
   if !s.contains('.') {
-    return s.to_string();
+    return s;
   }
-  s.trim_end_matches('0').trim_end_matches('.').to_string()
+  s.trim_end_matches('0').trim_end_matches('.')
 }
 
 /// ExifTool's universal no-`-b` placeholder for a binary value — the string
@@ -2507,5 +2645,120 @@ mod tests {
     assert_eq!(d.doc(), 2);
     assert_eq!(d.family1(), "QuickTime");
     assert_ne!(Group::with_doc("QuickTime", "QuickTime", 1), g);
+  }
+
+  /// `format_g` (the `String` wrapper) is byte-for-byte the SAME as
+  /// `format_g_into` (the zero-heap core) for every value/precision — the
+  /// refactor that added the `_into` core for the placeholder-length DoS fix
+  /// must not change ANY existing caller's output. Sweeps both `%g` branches
+  /// (fixed `-4 <= x < p`, scientific otherwise), the trailing-zero strip, the
+  /// `0`/`-0`/sub-normal/near-`DBL_MAX` edges, and every precision the crate uses
+  /// (2,3,4,6,7,10,15). The literal expectations on the `15`-precision row are
+  /// the values other modules already pin (e.g. `format_g(_, 15)` of `1/3`),
+  /// so a drift would also break those suites.
+  #[test]
+  fn format_g_into_matches_string_wrapper_and_output_unchanged() {
+    let values = [
+      0.0f64,
+      -0.0,
+      1.0,
+      -1.0,
+      0.5,
+      1.0 / 3.0,
+      29.970_029_970_03,
+      1234.5,
+      1_000_000.0,
+      0.000_012_345,
+      1e20,
+      -1e-20,
+      1.5e300,
+      f64::MIN_POSITIVE,
+      f64::MAX,
+      123_456_789_012_345.0,
+      0.1,
+      9.999_999_999_999_9,
+    ];
+    for &v in &values {
+      for &p in &[2usize, 3, 4, 6, 7, 10, 15] {
+        let wrapper = format_g(v, p);
+        let mut core = String::new();
+        format_g_into(&mut core, v, p).unwrap();
+        assert_eq!(
+          wrapper, core,
+          "format_g wrapper != format_g_into core for v={v} p={p}"
+        );
+        // A `LenSink` records the SAME byte length the wrapper's `.len()` gives
+        // — the property the placeholder-length path relies on.
+        let mut sink = LenSink::default();
+        format_g_into(&mut sink, v, p).unwrap();
+        assert_eq!(sink.0, wrapper.len(), "LenSink len != format_g().len()");
+      }
+    }
+    // Pin a couple of exact outputs so the wrapper's bytes are anchored, not
+    // just self-consistent with the core.
+    assert_eq!(format_g(1.0 / 3.0, 15), "0.333333333333333");
+    assert_eq!(format_g(29.970_029_970_03, 15), "29.97002997003");
+    assert_eq!(format_g(0.0, 15), "0");
+    assert_eq!(format_g(-0.0, 15), "-0");
+    assert_eq!(format_g(1e20, 15), "1e+20");
+  }
+
+  /// A pathological precision that overflows the 128-byte `StackBuf` routes
+  /// through the `#[cold]` heap fallback and STILL matches the `String` wrapper
+  /// byte-for-byte (the fallback is only a different scratch buffer, identical
+  /// formatting). This precision is unreached in the crate (max is 15) but the
+  /// fallback must be correct. `precision = 200` makes both the `%.{p-1}e` and
+  /// the fixed `%.{frac}f` intermediates exceed 128 bytes.
+  #[test]
+  fn format_g_into_huge_precision_falls_back_to_heap_path() {
+    for &v in &[1.0f64 / 3.0, 1234.5, 0.1, 9.876_543_21] {
+      let wrapper = format_g(v, 200);
+      let mut sink = LenSink::default();
+      format_g_into(&mut sink, v, 200).unwrap();
+      assert_eq!(
+        sink.0,
+        wrapper.len(),
+        "heap-fallback LenSink len != format_g().len() for v={v}"
+      );
+    }
+  }
+
+  /// `Rational::exiftool_val_str` (the `String` wrapper) is byte-for-byte the
+  /// same as `exiftool_val_str_into` (the zero-heap core), incl. the `inf` /
+  /// `undef` zero-denominator words and both `sig` widths (7 / 10). The
+  /// placeholder-length rational arm feeds a `LenSink` into the core, so this
+  /// pins that the measured length equals `exiftool_val_str().len()`.
+  #[test]
+  fn exiftool_val_str_into_matches_string_wrapper() {
+    let cases = [
+      Rational::rational32(1, 3),
+      Rational::rational64(1, 3),
+      Rational::rational32(355, 113),
+      Rational::rational64(30000, 1001),
+      Rational::rational64(0, 0),  // undef
+      Rational::rational64(5, 0),  // inf
+      Rational::rational64(-5, 0), // inf (sign-agnostic)
+      Rational::rational32(-1, 4),
+      Rational::new(123_456, 7, 15),
+    ];
+    for r in cases {
+      let wrapper = r.exiftool_val_str();
+      let mut core = String::new();
+      r.exiftool_val_str_into(&mut core).unwrap();
+      assert_eq!(
+        wrapper, core,
+        "exiftool_val_str wrapper != _into core for {r:?}"
+      );
+      let mut sink = LenSink::default();
+      r.exiftool_val_str_into(&mut sink).unwrap();
+      assert_eq!(
+        sink.0,
+        wrapper.len(),
+        "LenSink len != exiftool_val_str().len()"
+      );
+    }
+    // Anchor the zero-denominator words explicitly.
+    assert_eq!(Rational::rational64(5, 0).exiftool_val_str(), "inf");
+    assert_eq!(Rational::rational64(0, 0).exiftool_val_str(), "undef");
   }
 }

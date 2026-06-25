@@ -101,6 +101,11 @@ mod iptc;
 // PrintIM (Print Image Matching) — the EXIF IFD0 `0xc4a5` SubDirectory reader
 // (`PrintIM.pm`'s `ProcessPrintIM`), emitting `PrintIM:PrintIMVersion`.
 mod printim;
+// GeoTiff — the IFD0 GeoKey directory reader (`GeoTiff.pm`'s `ProcessGeoTiff`).
+// The three `Binary => 1` block tags (`GeoTiffDirectory` 0x87af /
+// `GeoTiffDoubleParams` 0x87b0 / `GeoTiffAsciiParams` 0x87b1) are captured raw
+// during the IFD0 walk and decoded post-walk into `GeoTiff:*` GeoKey tags.
+mod geotiff;
 
 use std::{string::String, vec::Vec};
 
@@ -108,7 +113,10 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   recovery::Step,
 };
-use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value, read_value_count};
+use ifd::{
+  ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value, read_value_byte_len,
+  read_value_count,
+};
 use makernotes::subdir::{ByteOrderRule, FixBaseMode, ProcessProc, TableRef};
 use tables::Conv;
 
@@ -2045,6 +2053,14 @@ pub struct ExifMeta<'a> {
   /// `PrintIM:PrintIMVersion` tag ([`push_printim_tags`](Self::push_printim_tags)).
   /// EMPTY for the common no-PrintIM case.
   printim_versions: Vec<smol_str::SmolStr>,
+  /// The decoded GeoTiff GeoKeys (`GeoTiff.pm`'s `ProcessGeoTiff`), produced by
+  /// the post-IFD0-walk [`geotiff::process`] pass from the captured
+  /// `GeoTiffDirectory`/`DoubleParams`/`AsciiParams` blocks.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) emits each GeoKey as a
+  /// `GeoTiff:*` tag ([`push_geotiff_tags`](Self::push_geotiff_tags)) and its
+  /// `$et->Warn` corpus rides the [`Diagnose`](crate::diagnostics::Diagnose)
+  /// channel. `None` for the common no-GeoTiff case (no `0x87af` directory).
+  geotiff: Option<geotiff::GeoTiffMeta>,
   /// The synthesized `File:PageCount` value when this `ExifMeta` is the
   /// outer result of a standalone-TIFF walk that triggered the multi-page
   /// gate (`ExifTool.pm:8756-8757`). `Some(n)` ⇒ `serialize_tags` emits
@@ -2424,6 +2440,7 @@ impl<'a> ExifMeta<'a> {
     maker_note: Option<MakerNote<'a>>,
     printim_versions: Vec<smol_str::SmolStr>,
     deferred_subdirs: Vec<DeferredSubdir>,
+    geotiff: Option<geotiff::GeoTiffMeta>,
   ) -> Self {
     // JPEG `APP1` Exif blocks come through `ProcessTIFF` with
     // `Parent='APP1'` (`ExifTool.pm:7779-7783`), so `TIFF_TYPE='APP1'` and
@@ -2436,6 +2453,7 @@ impl<'a> ExifMeta<'a> {
       warnings_ignorable,
       byte_order,
       printim_versions,
+      geotiff,
       maker_note,
       deferred_subdirs,
       multi_page_count: None,
@@ -2654,12 +2672,12 @@ impl<'a> ExifMeta<'a> {
   }
 
   /// Decompose this `ExifMeta` into `(entries, warnings, warnings_ignorable,
-  /// byte_order, maker_note, printim_versions)` — the inverse of
-  /// [`from_jpeg_parts`](Self::from_jpeg_parts), used by the JPEG front-end to
-  /// merge one decoded `APP1` Exif block into the accumulating JPEG-level parts.
-  /// The `MakerNote` borrows from the input TIFF block (the `'a` lifetime), so
-  /// it threads through the merge unchanged. (`pub(crate)`: a merge-time
-  /// internal, not API surface.)
+  /// byte_order, maker_note, printim_versions, deferred_subdirs, geotiff)` — the
+  /// inverse of [`from_jpeg_parts`](Self::from_jpeg_parts), used by the JPEG
+  /// front-end to merge one decoded `APP1` Exif block into the accumulating
+  /// JPEG-level parts. The `MakerNote` borrows from the input TIFF block (the
+  /// `'a` lifetime), so it threads through the merge unchanged. (`pub(crate)`: a
+  /// merge-time internal, not API surface.)
   #[must_use]
   pub(crate) fn into_jpeg_parts(
     self,
@@ -2671,6 +2689,7 @@ impl<'a> ExifMeta<'a> {
     Option<MakerNote<'a>>,
     Vec<smol_str::SmolStr>,
     Vec<DeferredSubdir>,
+    Option<geotiff::GeoTiffMeta>,
   ) {
     // `multi_page_count` is dropped — the JPEG-merge path constructs the
     // merged `ExifMeta` via `from_jpeg_parts`, which always sets
@@ -2680,7 +2699,10 @@ impl<'a> ExifMeta<'a> {
     // PrintIM in the `APP1` Exif block, so it must survive the merge. The
     // deferred-subdir records (#176) thread through alongside the MakerNote,
     // adopted ATOMICALLY with it in [`merge_exif_block`] (same source block) so
-    // they describe the kept MakerNote's ExifIFD region.
+    // they describe the kept MakerNote's ExifIFD region. The GeoTiff GeoKeys
+    // (decoded from the `APP1` block's IFD0 `0x87af`/`0x87b0`/`0x87b1`) thread
+    // through too — a GeoTiff-in-JPEG is exotic but possible — and the JPEG
+    // merge keeps the FIRST block's (first-wins, like the MakerNote).
     (
       self.entries,
       self.warnings,
@@ -2689,6 +2711,7 @@ impl<'a> ExifMeta<'a> {
       self.maker_note,
       self.printim_versions,
       self.deferred_subdirs,
+      self.geotiff,
     )
   }
 }
@@ -3219,6 +3242,9 @@ fn parse_tiff_with_base_no_raf<'a>(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
     // COMMON path: a fresh per-block set ⇒ silent trailing-chain revisit
@@ -3289,6 +3315,16 @@ fn parse_tiff_with_base_no_raf<'a>(
     None
   };
 
+  // POST-IFD0 `ProcessGeoTiff` pass (`GeoTiff.pm:2133-2221`) — decode the GeoKey
+  // directory from the blocks captured during the walk, using the walk's byte
+  // order. `None` (no `GeoTiff:*` tags) when IFD0 carried no `GeoTiffDirectory`.
+  let geotiff = geotiff::process(
+    w.geotiff_directory.as_deref().unwrap_or_default(),
+    w.geotiff_double_params.as_deref(),
+    w.geotiff_ascii_params.as_deref(),
+    w.order,
+  );
+
   Some(ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
@@ -3297,6 +3333,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     maker_note: w.maker_note,
     deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
+    geotiff,
     multi_page_count,
     // The SOF dimension tags are a JPEG-container concern; a standalone TIFF
     // has no JPEG SOF segment.
@@ -3418,6 +3455,9 @@ fn parse_bigtiff<'a>(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
@@ -3459,6 +3499,19 @@ fn parse_bigtiff<'a>(
   // offset was decoded (a BigTIFF IFD1 thumbnail resolves the same way).
   w.finalize_data_tags();
 
+  // NO `ProcessGeoTiff` for a BigTIFF: `DoProcessTIFF`'s `$identifier == 0x2b` arm
+  // `return 1`s at `ExifTool.pm:8668`, BEFORE the `:8740` `if
+  // ($$self{VALUE}{GeoTiffDirectory}) { ProcessGeoTiff }` call (and `BigTIFF.pm`
+  // carries no GeoTiff reference). So a BigTIFF GeoTIFF emits NO `GeoTiff:*` GeoKeys
+  // — the three `Binary => 1` block tags instead survive as `(Binary data N bytes
+  // …)` placeholders, emitted IN the IFD walk by
+  // [`push_binary_placeholder`](Walker::push_binary_placeholder) (the
+  // `ProcessGeoTiff` `DeleteTag` cleanup at `GeoTiff.pm:2215-2220` that removes them
+  // on the classic path never runs). The BigTIFF walker never populates the
+  // `geotiff_*` capture slots, so there is no GeoKey directory to decode here.
+  // Oracle-verified vs bundled ExifTool 13.59 (`GeoTiff_bigtiff.tif`).
+  let geotiff = None;
+
   Some(ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
@@ -3475,6 +3528,7 @@ fn parse_bigtiff<'a>(
     maker_note: w.maker_note,
     deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
+    geotiff,
     // `File:PageCount` IS emitted for a BigTIFF whose IFD chain tripped `MultiPage`
     // (a `SubfileType == 2` / `OldSubfileType == 3` `RawConv` tap in `Walker::emit`,
     // `Exif.pm:456`/`:473`) — the `:8667` `FoundTag` gates on `$$self{MultiPage}`
@@ -3629,6 +3683,9 @@ fn parse_tiff_with_base_shared<'a>(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
     // SHARED path: the external `$$et{PROCESSED}` map. A chain-IFD revisit —
@@ -3678,6 +3735,15 @@ fn parse_tiff_with_base_shared<'a>(
   w.finalize_data_tags();
 
   let cycle_guard_warnings = w.cycle_guard_warnings;
+  // POST-IFD0 `ProcessGeoTiff` (`GeoTiff.pm:2133-2221`) from the walk-captured
+  // blocks, in the walk's byte order. `None` when there is no GeoKey directory
+  // (the overwhelming common case for an embedded PNG `eXIf` / JPEG `APP1` block).
+  let geotiff = geotiff::process(
+    w.geotiff_directory.as_deref().unwrap_or_default(),
+    w.geotiff_double_params.as_deref(),
+    w.geotiff_ascii_params.as_deref(),
+    w.order,
+  );
   let meta = ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
@@ -3686,6 +3752,7 @@ fn parse_tiff_with_base_shared<'a>(
     maker_note: w.maker_note,
     deferred_subdirs: w.deferred_subdirs,
     printim_versions: w.printim_versions,
+    geotiff,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
     multi_page_count: None,
@@ -3898,6 +3965,23 @@ struct Walker<'a, 'g> {
   /// each as a `PrintIM:PrintIMVersion` tag ([`ExifMeta::push_printim_tags`]).
   /// Almost always EMPTY (no PrintIM) or a single `"0300"`/`"0250"`.
   printim_versions: Vec<smol_str::SmolStr>,
+  /// The raw `GeoTiffDirectory` (`0x87af`) bytes captured during the IFD0 walk —
+  /// the GeoKey directory ExifTool's `ProcessGeoTiff` reads (`GeoTiff.pm:2136`).
+  /// Captured WITHOUT emitting the leaf (the tag is `Binary => 1` and deleted
+  /// from default output, `Exif.pm:2059`/`GeoTiff.pm:2217`), the same way the
+  /// `0x927c` MakerNote blob is captured. `None` for a TIFF with no GeoTiff. The
+  /// `RawConv => '$val . GetByteOrder()'` (`Exif.pm:2070`) appends the byte order
+  /// to the WRITTEN block; the port instead threads the real `self.order` to
+  /// `ProcessGeoTiff`, so the captured bytes carry NO 2-byte suffix.
+  geotiff_directory: Option<Vec<u8>>,
+  /// The raw `GeoTiffDoubleParams` (`0x87b0`) bytes (`double` array) — the source
+  /// a GeoKey entry with `loc == 0x87b0` reads (`GeoTiff.pm:2177`). `None` when
+  /// IFD0 has no such tag.
+  geotiff_double_params: Option<Vec<u8>>,
+  /// The raw `GeoTiffAsciiParams` (`0x87b1`) bytes (`string` blob) — the source a
+  /// GeoKey entry with `loc == 0x87b1` reads (`GeoTiff.pm:2179`). `None` when
+  /// IFD0 has no such tag.
+  geotiff_ascii_params: Option<Vec<u8>>,
   /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
   /// the MakerNotes dispatcher (`MakerNotes.pm`'s `$$self{Make}`
   /// conditions) sees it when the ExifIFD's 0x927c is reached. For a
@@ -4831,7 +4915,32 @@ impl Walker<'_, '_> {
     // is already a known leaf, so its tap already runs; `DNGVersion` 0xc612's DNG
     // override is unreachable for a BigTIFF — `ProcessBTF` finalizes `BTF` and
     // `return 1`s at `:8668`, before the `:8763` override — so it is not needed.)
-    if !self.big_tag_known(kind, tag_id) && tag_id != tables::TAG_OLD_SUBFILE_TYPE {
+    //
+    // EXCEPTION — the three GeoTiff block tags (`GeoTiffDirectory` 0x87af /
+    // `GeoTiffDoubleParams` 0x87b0 / `GeoTiffAsciiParams` 0x87b1): they ARE in
+    // `%Exif::Main` (`Binary => 1`, `Exif.pm:2059`/`:2081`/`:2099`) so `defined
+    // $tagInfo` is true and ExifTool does NOT skip them. CRITICALLY, the post-IFD
+    // `ProcessGeoTiff` GeoKey decode is UNREACHABLE for a BigTIFF: `DoProcessTIFF`'s
+    // `$identifier == 0x2b` arm `return 1`s at `ExifTool.pm:8668`, BEFORE the
+    // `if ($$self{VALUE}{GeoTiffDirectory}) { ProcessGeoTiff }` call at `:8740`
+    // (and `BigTIFF.pm` itself contains NO GeoTiff reference). So a BigTIFF GeoTIFF
+    // emits NO `GeoTiff:*` keys — instead the three `Binary => 1` leaves SURVIVE in
+    // the output as the `(Binary data N bytes …)` placeholder (the `ProcessGeoTiff`
+    // `DeleteTag` cleanup at `GeoTiff.pm:2215-2220`, which removes them on the
+    // classic path, never runs). Oracle-verified on bundled ExifTool 13.59
+    // (`GeoTiff_bigtiff.tif`): `IFD0:GeoTiffDirectory`/`DoubleParams`/`AsciiParams`
+    // Binary placeholders, no `GeoTiff:*`. Admit them here so the BigTIFF-specific
+    // Binary-placeholder emission below runs (this differs from the classic path,
+    // where these tags route through `emit`'s capture tap + `ProcessGeoTiff`).
+    if !self.big_tag_known(kind, tag_id)
+      && !matches!(
+        tag_id,
+        tables::TAG_OLD_SUBFILE_TYPE
+          | tables::TAG_GEOTIFF_DIRECTORY
+          | tables::TAG_GEOTIFF_DOUBLE_PARAMS
+          | tables::TAG_GEOTIFF_ASCII_PARAMS
+      )
+    {
       return Step::Skip;
     }
 
@@ -4875,6 +4984,50 @@ impl Walker<'_, '_> {
       };
       (value_offset, size)
     };
+
+    // ---- GeoTiff block tags — the BigTIFF Binary-placeholder leaf ---------
+    // For a BigTIFF, `ProcessGeoTiff` never runs (see the leaf-known gate above:
+    // `DoProcessTIFF` `return 1`s at `ExifTool.pm:8668`, before the `:8740`
+    // `ProcessGeoTiff` call), so the three `Binary => 1` GeoTiff block tags are NOT
+    // decoded into `GeoTiff:*` keys and NOT deleted — they survive as the
+    // `(Binary data N bytes …)` placeholder under their own IFD group. Emit that
+    // here (scoped to the CORE `%Exif::Main` directory, like the classic capture
+    // tap) and DO NOT route them through the shared [`emit`](Self::emit) (whose
+    // classic GeoTiff path captures the raw bytes for `ProcessGeoTiff` and then
+    // drops the unported leaf — the OPPOSITE of the BigTIFF outcome).
+    //
+    // The placeholder BYTE COUNT is `length($val)` of the post-`ReadValue` `$val`,
+    // NOT the on-disk size: `ProcessBigIFD` `HandleTag`s the value `ReadValue`d with
+    // the ON-DISK format (`BigTIFF.pm:123` — no tag-table `Format => 'undef'`
+    // override, unlike `ProcessExif`), so a count>1 `int16u`/`double` block becomes
+    // the space-joined `join(' ', @vals)` STRING; an `undef`/`string` block stays
+    // its raw / NUL-trimmed bytes. 0x87af/0x87b0 then carry `RawConv => '$val .
+    // GetByteOrder()'` (`Exif.pm:2070`/`:2087`), appending the 2-byte order tag
+    // ("II"/"MM"); 0x87b1 has no RawConv. Oracle (bundled ExifTool 13.59,
+    // `GeoTiff_bigtiff.tif`): GeoTiffDirectory = `len("1 1 0 3 …")`+2 = 50,
+    // GeoTiffDoubleParams = `len("6378137")`+2 = 9, GeoTiffAsciiParams =
+    // `len("WGS 84|")` = 7.
+    //
+    // [`read_value_byte_len`] computes that `length($val)` ALLOCATION-FREE — it
+    // never materializes the (attacker-controlled, in-bounds-but-huge under the
+    // `0x7fffffff` size gate) `int16u`/`double` array into a `Vec` + joined
+    // `String` just to measure it (the OOM/DoS the materialize-then-`.len()` path
+    // had). It also counts an `undef`/`string` block as its RAW post-`ReadValue`
+    // byte length, NOT a UTF-8-lossy re-encoding (so a malformed `0xff` counts as
+    // 1 raw byte, faithful to Perl `length`, not the 3 bytes of a U+FFFD).
+    if matches!(self.active_table, TableRef::Exif)
+      && let Some(name) = geotiff_block_tag_name(tag_id)
+    {
+      let mut len = read_value_byte_len(data, value_offset, format, count, read_len, order);
+      // The `$val . GetByteOrder()` RawConv adds the 2-byte order tag to the
+      // directory + double params (0x87af/0x87b0); the ASCII params (0x87b1) has
+      // no RawConv.
+      if tag_id != tables::TAG_GEOTIFF_ASCII_PARAMS {
+        len = len.saturating_add(2);
+      }
+      self.push_binary_placeholder(kind, tag_id, name, len);
+      return Step::Keep;
+    }
 
     // ---- SubIFD pointer tags (ExifOffset/GPSInfo/InteropOffset) ---------
     // `if ($tagInfo and $$tagInfo{SubIFD}) { … process all SubIFD's as BigTIFF }`
@@ -7605,6 +7758,43 @@ impl Walker<'_, '_> {
     }
   }
 
+  /// Push a synthetic `(Binary data N bytes …)` placeholder leaf for a
+  /// `Binary => 1` tag whose payload the port does not decode — the same
+  /// `Conv::None` verbatim-`Text` mechanism the `DataTag` channel uses
+  /// ([`finalize_data_tags`](Self::finalize_data_tags)). The `name` overrides the
+  /// `SYNTHETIC_DATA_TAG` placeholder name; `len` is the byte count the `(Binary
+  /// data N bytes …)` string reports — the length of ExifTool's stored `$val`
+  /// (post-`ReadValue`, post-`RawConv`), which the caller computes. Used by the
+  /// BigTIFF walker for the three GeoTiff block tags, which survive as Binary
+  /// placeholders when `ProcessGeoTiff` is unreachable (a BigTIFF). The synthetic
+  /// leaf has no on-disk presence (`value_offset`/`value_size` 0 — no vendor span
+  /// re-slices it).
+  fn push_binary_placeholder(
+    &mut self,
+    kind: IfdKind,
+    tag_id: u16,
+    name: &'static str,
+    len: usize,
+  ) {
+    let placeholder = crate::value::binary_placeholder(len as u64);
+    let text = placeholder.as_str().to_string();
+    self.entries.push(ExifEntry {
+      ifd: kind,
+      tag_id,
+      name,
+      value: ExifValue::new(RawValue::Text {
+        raw: text.clone().into_bytes().into_boxed_slice(),
+        text,
+      }),
+      on_disk_format: Format::Undef,
+      value_offset: 0,
+      value_size: 0,
+      own_ifd_start: 0,
+      source_block: 0,
+      conv: ResolvedConv::Exif(&SYNTHETIC_DATA_TAG),
+    });
+  }
+
   /// Emit one decoded leaf tag — the faithful equivalent of `FoundTag`
   /// (`Exif.pm:7181`) + `SetGroup($tagKey, $dirName)` (`Exif.pm:7184`).
   ///
@@ -7752,6 +7942,45 @@ impl Walker<'_, '_> {
       && matches!(self.active_table, TableRef::Exif | TableRef::Interop)
     {
       self.dng_version = raw.is_perl_truthy();
+    }
+
+    // GeoTiff block-tag capture — the three `Binary => 1` IFD0 tags
+    // `GeoTiffDirectory` (0x87af) / `GeoTiffDoubleParams` (0x87b0) /
+    // `GeoTiffAsciiParams` (0x87b1) (`Exif.pm:2059`/`:2081`/`:2099`). ExifTool's
+    // `RawConv => '$val . GetByteOrder()'` (`Exif.pm:2070`/`:2087`) saves these
+    // raw blocks for the post-IFD `ProcessGeoTiff` pass, then DELETES the tags
+    // from default output unless explicitly requested (`GeoTiff.pm:2215-2220`) —
+    // the port has no `RequestAll`/request mechanism, so it captures the raw
+    // bytes here (BELOW the leaf table, so it runs even though these tags are
+    // NOT in the port's [`tables`] table → the unknown-tag `next` below drops the
+    // emit) and never surfaces them. The bytes are taken DIRECTLY from the value
+    // slice (the `$val` undef bytes the RawConv operates on), independent of the
+    // on-disk format the walker decoded; the real `self.order` is threaded to
+    // `ProcessGeoTiff` separately, so NO 2-byte order suffix is appended. Like
+    // the other core RawConv DataMember taps, scoped to the CORE Exif IFD
+    // (`%Exif::Main`); a GPS/vendor leaf whose id collides must not capture.
+    // FIRST-wins (the directory pointer in IFD0 is reached once; a crafted
+    // duplicate keeps the first, mirroring `ProcessGeoTiff`'s single pass).
+    if matches!(self.active_table, TableRef::Exif)
+      && matches!(
+        tag_id,
+        tables::TAG_GEOTIFF_DIRECTORY
+          | tables::TAG_GEOTIFF_DOUBLE_PARAMS
+          | tables::TAG_GEOTIFF_ASCII_PARAMS
+      )
+    {
+      let slot = match tag_id {
+        tables::TAG_GEOTIFF_DIRECTORY => &mut self.geotiff_directory,
+        tables::TAG_GEOTIFF_DOUBLE_PARAMS => &mut self.geotiff_double_params,
+        _ => &mut self.geotiff_ascii_params,
+      };
+      if slot.is_none()
+        && let Some(bytes) = self
+          .data
+          .get(value_offset..value_offset.saturating_add(value_size))
+      {
+        *slot = Some(bytes.to_vec());
+      }
     }
 
     // `#### eval IsOffset ($val, $et) … $val += $offsetBase` (Exif.pm:7156-
@@ -8349,6 +8578,22 @@ fn large_array_placeholder(count: usize, format: Format) -> std::string::String 
   std::format!("(large array of {count} {} values)", format.name())
 }
 
+/// The `%Exif::Main` display name for one of the three `Binary => 1` GeoTiff
+/// block tags (`Exif.pm:2060`/`:2082`/`:2100`), or `None` for any other id.
+/// Used by the BigTIFF walker to emit the `(Binary data N bytes …)` placeholder
+/// these tags survive as when `ProcessGeoTiff` is unreachable (a BigTIFF). The
+/// classic path never needs these names — it captures the bytes and lets
+/// `ProcessGeoTiff` delete the tags — so they live here, not in the leaf table.
+#[inline]
+const fn geotiff_block_tag_name(tag_id: u16) -> Option<&'static str> {
+  match tag_id {
+    tables::TAG_GEOTIFF_DIRECTORY => Some("GeoTiffDirectory"),
+    tables::TAG_GEOTIFF_DOUBLE_PARAMS => Some("GeoTiffDoubleParams"),
+    tables::TAG_GEOTIFF_ASCII_PARAMS => Some("GeoTiffAsciiParams"),
+    _ => None,
+  }
+}
+
 /// `true` for an Exif `IsOffset => 1` value tag whose decoded value is a file
 /// offset that ExifTool rebases by `$base + $$et{BASE}` (`Exif.pm:7156-7170`).
 ///
@@ -8848,6 +9093,22 @@ impl ExifMeta<'_> {
     }
   }
 
+  /// Append the decoded GeoTiff GeoKeys (`GeoTiff.pm`'s `ProcessGeoTiff`) to
+  /// `out` as `GeoTiff:*` [`EmittedTag`](crate::emit::EmittedTag)s, in walk
+  /// order — delegating to [`geotiff::GeoTiffMeta`]'s own
+  /// [`Taggable`](crate::emit::Taggable) impl (family-0/1 `GeoTiff`, each key's
+  /// value rendered for the active conv mode through its PrintConv). Inert when
+  /// IFD0 carried no GeoKey directory. The GeoKeys' family-1 group (`GeoTiff`)
+  /// never collides with the EXIF `IFD0:*`/`ExifIFD:*` keys, so emission order
+  /// relative to the EXIF block is conformance-insensitive (the `-G1 -j` compare
+  /// is a key MULTISET, `src/jsondiff.rs`).
+  fn push_geotiff_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    let Some(geotiff) = &self.geotiff else { return };
+    let opts =
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+    out.extend(crate::emit::Taggable::tags(geotiff, opts));
+  }
+
   /// Append the captured MakerNote's cached vendor emissions to `out` as
   /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
   /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags). Called by
@@ -9156,6 +9417,13 @@ impl crate::emit::Taggable for ExifMeta<'_> {
     // EXIF/MakerNote block (the key MULTISET is position-insensitive). EMPTY for
     // the common no-PrintIM case.
     self.push_printim_tags(&mut tags);
+    // The GeoTiff `GeoTiff:*` GeoKeys (IFD0 `0x87af`/`0x87b0`/`0x87b1` decoded by
+    // `ProcessGeoTiff`) — emitted after the EXIF block. ExifTool runs
+    // `ProcessGeoTiff` from `HandleTag`'s post-IFD `ProcessGeoTiff` hook
+    // (`GeoTiff.pm`), so the GeoKeys follow the IFD0 leaves; the family-1
+    // `GeoTiff` group never collides with `IFD0:*`, so the key multiset matches.
+    // EMPTY for the common no-GeoTiff case.
+    self.push_geotiff_tags(print_conv, &mut tags);
     // The JPEG auxiliary `APP`-segment tags (JFIF / MPF / DJI thermal) decoded
     // by [`jpeg_app::process_app_markers`] — appended after the EXIF block. The
     // `-G1 -j` conformance compares the key MULTISET (`src/jsondiff.rs`), so
@@ -9244,14 +9512,35 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
       self.warnings_ignorable.len(),
       "warnings/warnings_ignorable must stay index-aligned",
     );
-    let exif_warnings = || {
-      self.warnings().iter().enumerate().map(|(i, w)| {
-        match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
-          1 => Diagnostic::warn_minor(w.as_str()),
-          2 => Diagnostic::warn_minor_behavioral(w.as_str()),
-          _ => Diagnostic::warn(w.as_str()),
-        }
+    // The GeoTiff `$et->Warn(...)` corpus (`ProcessGeoTiff` — 'Bad GeoTIFF
+    // directory' / 'Unknown GeoTiff location' / 'Missing FORMAT data'), all
+    // NORMAL (non-minor) warnings (`GeoTiff.pm:2174`/`:2189`/`:2213`). ExifTool
+    // runs `ProcessGeoTiff` from the post-IFD `HandleTag` hook, AFTER the IFD
+    // walk, so these trail the EXIF IFD-walk warnings; the closure appends them
+    // after `exif_warnings`. EMPTY for the no-GeoTiff / clean-GeoTiff case.
+    let geotiff_warnings: std::vec::Vec<Diagnostic> = self
+      .geotiff
+      .as_ref()
+      .map(|g| {
+        g.warnings()
+          .iter()
+          .map(|w| Diagnostic::warn(w.message()))
+          .collect()
       })
+      .unwrap_or_default();
+    let exif_warnings = || {
+      self
+        .warnings()
+        .iter()
+        .enumerate()
+        .map(
+          |(i, w)| match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+            1 => Diagnostic::warn_minor(w.as_str()),
+            2 => Diagnostic::warn_minor_behavioral(w.as_str()),
+            _ => Diagnostic::warn(w.as_str()),
+          },
+        )
+        .chain(geotiff_warnings.iter().cloned())
     };
     // Interleave the embedded JPEG `APP1` XMP packet's warning with the EXIF
     // warnings by APP1 marker file position (first-by-position wins, mirroring
@@ -11088,6 +11377,9 @@ pub(in crate::exif) fn apple_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     // The parent IFD0 `Make`, threaded from the dispatch — the format-16
     // (`int64u`) Apple carve-out in the per-entry gate requires
     // `captured_make == Some("Apple")` (`Exif.pm:6464` `$$et{Make} eq 'Apple'`),
@@ -11295,6 +11587,9 @@ pub(in crate::exif) fn sony_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     // `$$self{Model}` gates the four conditional-ARRAY AF tags + the single-HASH
     // `Condition` rows; the Sony walk itself reads no model-conditional structure,
@@ -11590,6 +11885,9 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     // `$$self{Model}` selects the 0x0f AFAreaMode / 0x2c ContrastMode branches; the
     // Panasonic walk itself reads no model-conditional structure, but the captured
@@ -11865,6 +12163,9 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     // `$$self{Model}` gates the AFInfo BigEndian read + the LensData Z telemetry;
     // it is threaded into the capture-loop emitters (NOT the walk), so leave it
@@ -12204,6 +12505,9 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     // `$$self{Make}`/`$$self{Model}` feed the FixBase heuristic
     // (`GetMakerNoteOffset`'s `make.starts_with("PENTAX")` absolute-addressing
     // arm, `MakerNotes.pm:1215-1220`) the AOC/Asahi primaries run via
@@ -12715,6 +13019,9 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     // `$$self{Make}`/`$$self{Model}` feed the generic FixBase heuristic; the
     // Samsung walk reads no model-conditional structure (no PENTAX-style make
     // arm), but thread them for parity with the other vendors.
@@ -13019,6 +13326,9 @@ pub(in crate::exif) fn leica_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     // The Leica6 Typ-006 `Condition` reads `$$self{Model}`; thread it. No Leica
     // leaf reads Make.
     captured_make: None,
@@ -13203,6 +13513,9 @@ pub(in crate::exif) fn canon_makernote_isolated(
     maker_note: None,
     deferred_subdirs: Vec::new(),
     printim_versions: Vec::new(),
+    geotiff_directory: None,
+    geotiff_double_params: None,
+    geotiff_ascii_params: None,
     captured_make: None,
     // `$$self{Model}` (the conditional `SerialNumber` PrintConv is `-j`-only, but
     // the model also gates the 0x96 SerialInfo LIST + ShotInfo branches the `-n`
@@ -16893,6 +17206,9 @@ mod tests {
       maker_note: None,
       deferred_subdirs: Vec::new(),
       printim_versions: Vec::new(),
+      geotiff_directory: None,
+      geotiff_double_params: None,
+      geotiff_ascii_params: None,
       captured_make: None,
       captured_model: None,
       chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
