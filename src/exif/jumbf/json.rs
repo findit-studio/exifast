@@ -432,7 +432,12 @@ fn scalar_to_value(scalar: JsonScalar) -> TagValue {
 ///    the result is < 2 chars OR does NOT start with an ASCII letter
 ///    (`/^[A-Z]/i`) — so a leading `_` (legal in step 3) still gets the
 ///    `Tag` prefix here (e.g. `_x` → `Tag_x`).
-fn legalize_top_key(key: &str) -> SmolStr {
+///
+/// Shared with the sibling [`super::cbor`] decoder (`CBOR::Main`'s `ProcessCBOR`
+/// flattens a top-level key through the SAME `JSON::ProcessTag` → `FoundTag`
+/// path, `CBOR.pm:292`), so a CBOR key with no predefined tag is legalized
+/// identically (oracle-verified vs bundled 13.59).
+pub(super) fn legalize_top_key(key: &str) -> SmolStr {
   // Step 1: `tr/:/_/`.
   let step1: String = key
     .chars()

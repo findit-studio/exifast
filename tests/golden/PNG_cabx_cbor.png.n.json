@@ -1,0 +1,46 @@
+[{
+  "SourceFile": "PNG_cabx_cbor.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "PNG",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 0,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "JUMBF:JUMDType": "63626f7200110010800000aa00389b71",
+  "JUMBF:JUMDLabel": "c2pa.test",
+  "CBOR:Claim_generator": "exifast/1.0",
+  "CBOR:Title": "A Title",
+  "CBOR:Format": "image/jpeg",
+  "CBOR:InstanceID": "xmp:iid:9999",
+  "CBOR:Count": 42,
+  "CBOR:Neg": -6,
+  "CBOR:Score": 0.5,
+  "CBOR:Half": 7.88860905221012e-31,
+  "CBOR:Active": true,
+  "CBOR:Revoked": false,
+  "CBOR:Absent": "null",
+  "CBOR:Raw": "(Binary data 4 bytes, use -b option to extract)",
+  "CBOR:Thumbnail": {
+    "format": "image/jpeg",
+    "neg": -6,
+    "blob": "(Binary data 2 bytes, use -b option to extract)",
+    "tags": []
+  },
+  "CBOR:Ingredients": ["a","b","c"],
+  "CBOR:Assertions": [{
+    "label": "c2pa.hash"
+  },{
+    "label": "stds.exif"
+  }],
+  "CBOR:Created": "2021:06:15 12:30:45Z",
+  "CBOR:Signature": "(Binary data 4 bytes, use -b option to extract)",
+  "CBOR:Serial": "1234567890123456789",
+  "CBOR:C2PAmanifest": "urn:c2pa:abc-123",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

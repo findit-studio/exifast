@@ -228,6 +228,62 @@ pub fn convert_unix_time_local_f64(time: f64) -> String {
   render_local(reduce_unix_time_float(time))
 }
 
+/// `ConvertUnixTime($time, 1, $digits)` (the `$toLocal = 1` localtime branch
+/// with a POSITIVE fractional-format flag) for a *floating-point* `$time` — the
+/// form `CBOR.pm:219` `ConvertUnixTime($val, 1, 6)` hits for a FRACTIONAL tag-1
+/// epoch.
+///
+/// The local-time analogue of [`convert_unix_time_frac_f64`]: a POSITIVE `$dec`
+/// (`$digits`) leaves `$trim` UNSET (`ExifTool.pm:6790`), so the second is
+/// rendered with EXACTLY `$digits` fractional digits (no trailing-zero strip),
+/// the fixed-width suffix appended to the seconds field and BEFORE the
+/// `TimeZoneString` suffix (`ExifTool.pm:6808`
+/// `sprintf("…%.2d$dec%s", …, $tz)`). Faithful chain (`:6791-6796` + `:6808`):
+/// ```text
+/// $itime = int($time);                       # truncate toward zero
+/// $frac  = $time - $itime;
+/// $frac < 0 and $frac += 1, $itime -= 1;     # fold frac into [0,1)
+/// $dec = sprintf('%.*f', $digits, $frac);    # ALWAYS $digits digits: "0.500000"
+/// $dec =~ s/^(\d)// and $1 eq '1' and $itime += 1;   # strip int digit; "1" carries
+/// # (NO trailing-zero trim — the $trim/negative-$dec branch only)
+/// # str = sprintf("…%.2d$dec%s", …, $sec, $tz)   # $dec is ".500000"
+/// ```
+///
+/// The `$time == 0` sentinel (`:6787`) is honoured on the ORIGINAL float, like
+/// [`convert_unix_time_local_f64`].
+#[must_use]
+pub fn convert_unix_time_local_frac_f64(time: f64, digits: u8) -> String {
+  // ExifTool.pm:6787 — sentinel on the ORIGINAL float (a whole `0` is the
+  // sentinel; a sub-second non-zero value is NOT).
+  if time == 0.0 {
+    return "0000:00:00 00:00:00".to_string();
+  }
+  // ExifTool.pm:6791-6793 — `int($time)` truncate-toward-zero, then fold a
+  // negative fraction into `[0,1)` by borrowing a second (true floor).
+  #[allow(clippy::cast_possible_truncation)]
+  let mut itime = time.trunc() as i64;
+  let mut frac = time - time.trunc();
+  if frac < 0.0 {
+    frac += 1.0;
+    itime -= 1;
+  }
+  // ExifTool.pm:6794 `$dec = sprintf('%.*f', $digits, $frac)`. `$frac` is in
+  // `[0,1)`; Rust's `format!("{:.*}", digits, _)` rounds half-to-EVEN exactly
+  // like Perl's `sprintf('%.*f', …)`. Yields `"0.500000"` — or `"1.000000"` if
+  // the fraction rounds up to a full second.
+  let digits = digits as usize;
+  let dec = format!("{frac:.digits$}");
+  // ExifTool.pm:6796 `$dec =~ s/^(\d)// and $1 eq '1' and $itime += 1` — drop
+  // the integer digit; a leading `1` (rounded up to the next whole second)
+  // carries into `$itime`. The `:6797` trailing-zero strip is GATED on `$trim`
+  // (only set for a negative `$dec`), so it is NOT applied here.
+  let (lead, rest) = dec.split_at(1);
+  if lead == "1" {
+    itime += 1;
+  }
+  render_local_with_frac(itime, rest)
+}
+
 /// `int($time)` truncate-toward-zero ⇒ `$itime`, then the fractional
 /// adjustment of `ExifTool.pm:6780-6785` (default `$dec = 0`):
 ///
@@ -307,6 +363,17 @@ pub fn convert_unix_time_local(time: i64) -> String {
 /// form — the float path checks the original float, not the reduced `$itime`).
 #[must_use]
 fn render_local(time: i64) -> String {
+  render_local_with_frac(time, "")
+}
+
+/// `localtime($itime)` + `TimeZoneString` with the fixed-width fractional
+/// suffix `frac` inserted between the seconds field and the timezone
+/// (`ExifTool.pm:6808` `sprintf("…%.2d$dec%s", …, $sec, $tz)`). `frac` is the
+/// post-integer-digit remainder (`".500000"`) for the `$dec` form, or `""` for
+/// the plain whole-second render. Single source of truth for both
+/// [`render_local`] and the fractional local entry points.
+#[must_use]
+fn render_local_with_frac(time: i64, frac: &str) -> String {
   #[cfg(feature = "std")]
   {
     use jiff::{Timestamp, tz::TimeZone};
@@ -321,7 +388,7 @@ fn render_local(time: i64) -> String {
       let off_secs = zoned.offset().seconds();
       let tz = format_tz_offset(i64::from(off_secs));
       return format!(
-        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}{tz}",
+        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}{frac}{tz}",
         dt.year(),
         dt.month(),
         dt.day(),
@@ -336,7 +403,7 @@ fn render_local(time: i64) -> String {
   // `no_std` (no OS TZ) — documented faithful fallback: a UTC host's
   // `localtime` equals `gmtime` and `TimeZoneString` yields `+00:00`.
   let (y, mo, d, h, mi, s) = gmtime(time);
-  format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}+00:00")
+  format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}{frac}+00:00")
 }
 
 /// Faithful `TimeZoneString` numeric rendering (ExifTool.pm:6759-6764) for a
@@ -607,6 +674,57 @@ mod tests {
     assert!(
       s.starts_with("1970:01:01 00:00:00"),
       "sub-second non-zero float must not hit the sentinel: {s}"
+    );
+  }
+
+  #[test]
+  fn convert_unix_time_frac_f64_fixed_width_matches_oracle() {
+    // `ConvertUnixTime($val, 0, 6)` (positive `$dec`, GMT — TZ-stable). Bundled
+    // ExifTool 13.59 keeps EXACTLY 6 fractional digits (no trailing-zero trim,
+    // unlike the negative-`$dec` form): a `.5` stays `.500000`, a whole second
+    // is `.000000`. This is the fixed-width fractional logic the LOCAL CBOR
+    // tag-1 helper reuses (the only difference is the appended TZ suffix).
+    assert_eq!(
+      convert_unix_time_frac_f64(1_234_567_890.5, 6),
+      "2009:02:13 23:31:30.500000"
+    );
+    assert_eq!(
+      convert_unix_time_frac_f64(1_234_567_890.0, 6),
+      "2009:02:13 23:31:30.000000"
+    );
+    // A fraction that rounds UP to a full second carries (`$itime += 1`) and
+    // leaves the full-width `.000000` (no trim for a positive `$dec`).
+    assert_eq!(
+      convert_unix_time_frac_f64(1_234_567_890.999_999_9, 6),
+      "2009:02:13 23:31:31.000000"
+    );
+  }
+
+  #[test]
+  fn convert_unix_time_local_frac_f64_matches_cbor_tag1_oracle() {
+    // `ConvertUnixTime($val, 1, 6)` (CBOR.pm:219, a FRACTIONAL tag-1 epoch).
+    // The fractional refinement is TZ-INDEPENDENT (the `.500000` is the same in
+    // every zone); the localtime TZ suffix is the only OS-dependent part, so
+    // assert the byte-exact prefix-through-fraction + the `±HH:MM` suffix shape.
+    // Under TZ=UTC (the conformance harness) the full string is
+    // `2009:02:13 23:31:30.500000+00:00` (oracle-verified vs bundled 13.59).
+    let s = convert_unix_time_local_frac_f64(1_234_567_890.5, 6);
+    let b = s.as_bytes();
+    // `YYYY:MM:DD HH:MM:SS.dddddd±HH:MM` = 19 + 7 (".500000") + 6 (tz) = 32.
+    assert_eq!(b.len(), 32, "expected fixed-width fractional + tz: {s}");
+    assert!(
+      s.contains(":31:30.500000"),
+      "fractional second must be the fixed 6-digit `.500000`: {s}"
+    );
+    assert!(
+      b[26] == b'+' || b[26] == b'-',
+      "missing tz sign after the fraction: {s}"
+    );
+    assert_eq!(b[29], b':', "missing tz colon: {s}");
+    // The `$time == 0` sentinel still precedes the fractional branch.
+    assert_eq!(
+      convert_unix_time_local_frac_f64(0.0, 6),
+      "0000:00:00 00:00:00"
     );
   }
 

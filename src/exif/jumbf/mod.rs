@@ -93,6 +93,7 @@
 //! accessors only); per-field availability (a tag is emitted iff its bytes are
 //! in range).
 
+mod cbor;
 mod json;
 mod tables;
 #[cfg(test)]
@@ -121,6 +122,18 @@ const GROUP_JPEG2000: &str = "Jpeg2000";
 /// JSON tags emit under `JSON:*` (on the box's `Doc<N>` axis) regardless of any
 /// active JUMBFLabel (oracle-verified vs bundled 13.59).
 const GROUP_JSON: &str = "JSON";
+
+/// Family-0 group of the flattened `cbor` content-box tags (`CBOR::Main`'s
+/// `GROUPS => { 0 => 'JUMBF', 1 => 'CBOR', 2 => 'Other' }`, `CBOR.pm:64`) — the
+/// family-0 group is `JUMBF` (UNLIKE `json`'s `JSON`), but the family-1 group
+/// (the `-G1`/`-G3` prefix) is [`GROUP_CBOR`].
+const GROUP_CBOR_FAMILY0: &str = "JUMBF";
+
+/// Family-1 group of the flattened `cbor` content-box tags (`CBOR::Main`,
+/// `CBOR.pm:64`) — the tags emit under `CBOR:*` on the box's `Doc<N>` axis
+/// (oracle-verified vs bundled 13.59). The JUMBFLabel rename does NOT touch them
+/// (`cbor` lacks `BlockExtract`, so the `Jpeg2000.pm:1206` rename never fires).
+const GROUP_CBOR: &str = "CBOR";
 
 /// Beyond-faithful recursion cap on `jumb`/`asoc` box nesting (the QuickTime
 /// [`MAX_ATOM_DEPTH`](crate::formats::quicktime) pattern). `ProcessJpeg2000Box`
@@ -180,6 +193,14 @@ pub(crate) enum JumbfWarning {
   /// `JSONData`, since `json` carries `BlockExtract`) — so the message is
   /// carried as an owned [`SmolStr`].
   UnrecognizedJsonBox(SmolStr),
+  /// A `cbor` content box whose `ReadCBORValue` hit an error mid-decode
+  /// (`CBOR.pm:289` `$err and $et->Warn($err)`): one of the specific CBOR error
+  /// strings — `Truncated CBOR data`/`… integer value`/`… string value`,
+  /// `Invalid CBOR integer type N`/`… type 7 variant N`, `Unexpected list
+  /// terminator`, `Unknown CBOR format N` — or the beyond-faithful
+  /// `CBOR nesting too deep` depth-budget guard. The message is decoder-supplied,
+  /// so it is carried as an owned [`SmolStr`].
+  CborError(SmolStr),
 }
 
 impl JumbfWarning {
@@ -198,6 +219,9 @@ impl JumbfWarning {
       Self::MissingSignature => SmolStr::new_static("Missing JUMD signature"),
       // `$et->Warn("Unrecognized $$tagInfo{Name} box")` (`Jpeg2000.pm:1332`).
       Self::UnrecognizedJsonBox(name) => SmolStr::from(std::format!("Unrecognized {name} box")),
+      // `$et->Warn($err)` where `$err` is the decoder-supplied CBOR error string
+      // (`CBOR.pm:289`).
+      Self::CborError(msg) => msg.clone(),
     }
   }
 }
@@ -233,6 +257,13 @@ enum JumbfValue {
   /// — a scalar, a [`TagValue::List`] (array), or a [`TagValue::Map`] (object),
   /// identical in both `-n` and `-j` modes (JSON values have no PrintConv).
   Json(crate::value::TagValue),
+  /// A flattened `cbor` content-box value (`CBOR::Main`, Phase 3,
+  /// [`cbor::decode`]): a top-level CBOR item's already-converted [`TagValue`] —
+  /// a native scalar (integer / float / boolean / `null`), a byte string (the
+  /// `(Binary data …)` placeholder via [`TagValue::Bytes`]), a [`TagValue::List`]
+  /// (array), or a [`TagValue::Map`] (map). Identical in both `-n` and `-j`
+  /// modes (the CBOR major-6 conversions are applied at decode; no PrintConv).
+  Cbor(crate::value::TagValue),
 }
 
 /// One decoded JUMBF tag: its family-0/1 group, name, value, the full `Doc<N>`
@@ -488,10 +519,9 @@ impl JumbfWalker {
       // Phase 2 (#142): a `json` content box decodes through `JSON::Main`
       // ([`process_json`]) into flattened `JSON:*` tags.
       BoxKind::Json => self.process_json(content),
-      // Phase 3: a `cbor` content box is RECOGNIZED and traversed (its bounds
-      // were validated in `walk`) but its decoder (`CBOR::Main`) is deferred —
-      // it emits NO tags here.
-      BoxKind::Cbor => {}
+      // Phase 3 (#142): a `cbor` content box decodes through `CBOR::Main`
+      // ([`process_cbor`]) into flattened `CBOR:*` tags.
+      BoxKind::Cbor => self.process_cbor(content),
     }
   }
 
@@ -829,6 +859,36 @@ impl JumbfWalker {
     }
   }
 
+  /// `cbor` → `CBOR::Main` (`Jpeg2000.pm:420-424`, Phase 3 #142): decode the
+  /// CBOR document ([`cbor::decode`]) and emit the flattened `CBOR:<key>` tags
+  /// (family-0 `JUMBF`, family-1 `CBOR`, `CBOR.pm:64`) on THIS box's `Doc<N>`
+  /// axis. Unlike `json`, `ProcessCBOR` never raises `Unrecognized box`; a
+  /// mid-decode `ReadCBORValue` error surfaces as a [`JumbfWarning::CborError`]
+  /// (`CBOR.pm:289`), keeping the tags read before it. The active JUMBFLabel does
+  /// NOT rename these tags (`cbor` lacks `BlockExtract`, so the
+  /// `Jpeg2000.pm:1206` rename condition is false).
+  fn process_cbor(&mut self, content: &[u8]) {
+    let (doc, doc_subpath) = self.current_docpath();
+    let outcome = cbor::decode(content);
+    // A `ReadCBORValue` error (`$err and $et->Warn($err), last`) — raise it AFTER
+    // pushing the tags read before the failure (faithful partial progress).
+    let warning = outcome.warning().map(SmolStr::from);
+    for (name, value) in outcome.tags() {
+      self.push_tag(JumbfTag {
+        family0: GROUP_CBOR_FAMILY0,
+        family1: GROUP_CBOR,
+        name,
+        value: JumbfValue::Cbor(value),
+        doc,
+        doc_subpath: doc_subpath.clone(),
+        unknown: false,
+      });
+    }
+    if let Some(msg) = warning {
+      self.warn(JumbfWarning::CborError(msg));
+    }
+  }
+
   /// The content tag's NAME: the renamed `<Label><Suffix>` when a JUMBFLabel is
   /// active (`Jpeg2000.pm:1205-1212`), else the default `default_name`. The
   /// rename joins the sanitized label + the box's [`tables::jumbf_suffix`] then
@@ -960,9 +1020,10 @@ impl crate::emit::Taggable for JumbfMeta {
         JumbfValue::BinaryLen(len) => {
           crate::value::TagValue::Str(crate::value::binary_placeholder(*len))
         }
-        // A flattened `json` value is already a fully-formed `TagValue`
-        // (scalar / `List` / `Map`), identical in both modes — clone it through.
-        JumbfValue::Json(v) => v.clone(),
+        // A flattened `json`/`cbor` value is already a fully-formed `TagValue`
+        // (scalar / `Bytes` / `List` / `Map`), identical in both modes — clone
+        // it through.
+        JumbfValue::Json(v) | JumbfValue::Cbor(v) => v.clone(),
       };
       let group =
         crate::value::Group::with_subpath(t.family0, t.family1, t.doc, t.doc_subpath.clone());

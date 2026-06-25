@@ -1551,7 +1551,20 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// / quoted-19-digit `EscapeJSON` gate). The three Phase-1 caBX fixtures carry a
 /// `jumd` whose type-UUID is the `(json)` UUID but NO `json` CONTENT box, so
 /// their goldens are UNCHANGED by Phase 2 (only the new fixture emits `JSON:*`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 635;
+/// 635 → 636 (#142 JUMBF / C2PA, Phase 3: the `cbor` content decoder,
+/// `CBOR::Main` / `ProcessCBOR`, the FINAL phase) adds one crafted caBX-PNG
+/// fixture `PNG_cabx_cbor.png` (`jumb`->`jumd`(label "c2pa.test", `(cbor)` UUID)
+/// + `cbor{...}` — a representative C2PA-ish CBOR document flattened to `CBOR:*`
+/// tags: text + predefined keys (`dc:title`->`Title`), a native int / the
+/// faithful `-1*num` negative quirk (`-7`->`-6`) / a quoted-19-digit int, a
+/// byte string + COSE_Sign1 tag(18) as the `(Binary data …)` placeholder, a
+/// nested `-struct` Map (nested negative + placeholder + preserved empty `[]`),
+/// arrays of scalars/maps, a double + the buggy half-float, true/false/null, a
+/// tag-0 `ConvertXMPDate` string, and the C2PA-case hack. The `cbor` tags emit
+/// under family-0 `JUMBF` / family-1 `CBOR`; the JUMBFLabel rename does NOT fire
+/// (`cbor` lacks `BlockExtract`). No prior golden changes (`cbor` only fires for
+/// a `cbor` content box).
+const EXPECTED_ACTIVE_FIXTURES: usize = 636;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

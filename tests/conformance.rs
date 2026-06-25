@@ -12389,6 +12389,51 @@ fn png_cabx_json_conformance() {
   check("PNG_cabx_json.png", "PNG_cabx_json.png.n.json", false);
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_cabx_cbor_conformance() {
+  // #142 (JUMBF / C2PA, Phase 3: the `cbor` content decoder, the FINAL phase) —
+  // a PNG `caBX` chunk whose `jumb -> jumd(label "c2pa.test", `(cbor)` type-UUID)
+  // + cbor{...}` carries a representative C2PA-ish CBOR document (RFC 8949, the
+  // native C2PA manifest-store format). The `cbor` box (`Jpeg2000.pm:420-424`:
+  // `CBORData`, `Flags => ['Binary','Protected']` — NO `BlockExtract`,
+  // `SubDirectory => CBOR::Main`) is decoded by `ProcessCBOR` (`CBOR.pm:274`) over
+  // the recursive `ReadCBORValue` (`CBOR.pm:88`), emitting FLATTENED `CBOR:<key>`
+  // tags (family-0 `JUMBF` / family-1 `CBOR`, `CBOR.pm:64`) on this box's `Doc1`
+  // axis via the SAME `JSON::ProcessTag` flatten the `json` box uses. Exercises
+  // every CBOR major type + the faithful ExifTool QUIRKS, oracle-verified vs
+  // bundled 13.59:
+  //   * the predefined `CBOR::Main` names (`dc:title`->`CBOR:Title`,
+  //     `dc:format`->`CBOR:Format`, `instanceID`->`CBOR:InstanceID`) vs the
+  //     auto-legalized keys (`claim_generator`->`Claim_generator`, the C2PA-case
+  //     hack `c2pa.manifest`->`C2PAmanifest`);
+  //   * a native unsigned int (`CBOR:Count` 42 BARE), the `-1 * num` NEGATIVE
+  //     quirk (wire `-7` -> `CBOR:Neg` `-6`, `CBOR.pm:121`), a 19-digit int
+  //     (`CBOR:Serial` QUOTED by the `EscapeJSON` 15-digit gate);
+  //   * a byte string + a COSE_Sign1 `tag(18)` BOTH as the `(Binary data N
+  //     bytes …)` placeholder — COSE stays OPAQUE, no crypto (`CBOR.pm:138-144`);
+  //   * a nested map as a `-struct` Map with RAW inner keys (`CBOR:Thumbnail` —
+  //     a nested `-6`, a nested placeholder, a nested EMPTY array preserved as
+  //     `[]` — the empty-array skip is TOP-LEVEL only);
+  //   * arrays of scalars (`CBOR:Ingredients`) + of maps (`CBOR:Assertions`);
+  //   * a double (`CBOR:Score` 0.5) + the faithfully-buggy HALF-float (wire
+  //     `0x3c00` = true IEEE 1.0 -> `CBOR:Half` `7.88860905221012e-31` via
+  //     `($mant+1024) ** ($exp-25)`, `CBOR.pm:237-248`), `true`/`false`, and
+  //     `null` (the literal `"null"` `MissingTagValue` default, `CBOR.pm:59`);
+  //   * a `tag(0)` date-time string through `ConvertXMPDate` (`CBOR.pm:213-215`,
+  //     locale-INDEPENDENT: `2021-06-15T12:30:45Z` -> `CBOR:Created`
+  //     `2021:06:15 12:30:45Z`).
+  // The `CBOR:*` tags keep family-1 `CBOR` regardless of the active JUMBFLabel
+  // (`cbor` lacks `BlockExtract`, so the `Jpeg2000.pm:1206` rename never fires).
+  // `-j` and `-n` agree on every CBOR value (the major-6 conversions are applied
+  // at decode; no PrintConv). NO tag-1 epoch is used (`ConvertUnixTime`'s
+  // `$toLocal=1` is machine-locale dependent). Crafted via
+  // `tools/gen_jumbf_fixtures.py`. Oracle: bundled `perl exiftool -j -G1 -struct`
+  // 13.59.
+  check("PNG_cabx_cbor.png", "PNG_cabx_cbor.png.json", true);
+  check("PNG_cabx_cbor.png", "PNG_cabx_cbor.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
