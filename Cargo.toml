@@ -230,7 +230,7 @@ mpeg-audio = []
 [dependencies]
 # Static maps for the xtask-generated tag tables (string-keyed + large int
 # maps). `default-features = false` keeps it no_std-clean (drops `std`/`unicase`).
-phf = { version = "0.13", default-features = false }
+phf = { version = "0.14", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 # Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
 # typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
