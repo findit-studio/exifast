@@ -26,8 +26,8 @@ use smol_str::SmolStr;
 
 use super::subtables::{
   SubEmission, drive_mode, exposure_comp_value, exposure_comp2_value, exposure_program2,
-  hash_hex_value, model_is_a4xx_9pt, model_is_nex355c, read_i16, read_u16, read_u32,
-  signed_setting_value, white_balance_setting,
+  hash_hex_value, model_is_a4xx_9pt, model_is_a4xx_exact, model_is_nex355c, read_i16, read_u16,
+  read_u32, signed_setting_value, white_balance_setting,
 };
 
 /// Walk the `MoreInfo` index directory and emit the leaves of the four ported
@@ -105,7 +105,12 @@ pub fn parse_more_info(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec
         parse_more_settings(block, model, print_conv, &mut out);
         0
       }
-      0x0002 if !model_is_a4xx_9pt(model) => {
+      // FaceInfo vs FaceInfoA is the `$`-anchored EXACT selector
+      // (`Sony.pm:3398`/`3402`): `FaceInfoA` only for a model EQUAL to
+      // DSLR-A450/A500/A550, else this non-A4xx `FaceInfo` — so a suffixed body
+      // still parses FaceInfo. This is NOT the `\b` `model_is_a4xx_9pt` used for
+      // the ExtraInfo3 0x0014 / MoreSettings conditions.
+      0x0002 if !model_is_a4xx_exact(model) => {
         parse_face_info(block, print_conv, &mut out);
         1
       }
@@ -301,29 +306,77 @@ fn parse_more_settings(
   }
 }
 
-/// `%Sony::FaceInfo` (`Sony.pm:4062-4123`) — FORMAT int16u; 0x00 FacesDetected
-/// (int16s RawConv). Only the count leaf is camera-metadata-relevant for the
-/// activation golden (the per-face position rects are gated by FacesDetected and
-/// not present when 0).
+/// `%Sony::FaceInfo` (`Sony.pm:4062-4122`) — the non-A4xx `FaceInfo` variant the
+/// A33-class dispatches (`MoreInfo` 0x0002 when
+/// `Model !~ /^DSLR-(A450|A500|A550)$/`; the A4xx `FaceInfoA` is deferred).
+///
+/// `FORMAT => 'int16u'` ⇒ the `ProcessBinaryData` increment is 2, so a table key
+/// `K` addresses BYTE `K*2` (`ExifTool.pm:9933`). 0x00 `FacesDetected` is
+/// `int16s` with `RawConv => '$$self{FacesDetected} = ($val == -1 ? 0 : $val);
+/// $val'` — the emitted value is the original `$val` (`-1 => 'n/a'` in `-j`),
+/// while the per-face DataMember gate folds `-1` to `0`. Keys
+/// 0x01/0x06/0x0b/0x10/0x15/0x1a/0x1f/0x24 are `Face1..8Position` (`int16u[4]`),
+/// each emitted IFF `FacesDetected >= N` AND its full 8-byte range is in-block
+/// ([[exifast-processbinarydata-per-field]]).
 fn parse_face_info(buf: &[u8], print_conv: bool, out: &mut Vec<SubEmission>) {
-  // 0x00 FacesDetected — int16s, RawConv `($val == -1 ? 0 : $val)`, PrintConv
-  // `-1 => 'n/a'`, OTHER passthrough.
-  if let Some(raw) = read_i16(buf, 0x00) {
-    let value = if print_conv {
-      if raw == -1 {
-        TagValue::Str("n/a".into())
-      } else {
-        TagValue::I64(i64::from(raw))
-      }
-    } else {
-      TagValue::I64(i64::from(raw))
-    };
-    out.push(SubEmission {
-      priority: 1,
-      name: "FacesDetected",
-      value,
-    });
+  // 0x00 FacesDetected — int16s at byte 0 (key 0x00 × 2).
+  let Some(raw) = read_i16(buf, 0x00) else {
+    return;
+  };
+  let value = if print_conv && raw == -1 {
+    TagValue::Str("n/a".into())
+  } else {
+    TagValue::I64(i64::from(raw))
+  };
+  out.push(SubEmission {
+    priority: 1,
+    name: "FacesDetected",
+    value,
+  });
+
+  // DataMember gate for the per-face rows: `($val == -1 ? 0 : $val)`.
+  let faces = if raw == -1 { 0 } else { raw };
+
+  // Face1..8Position — `int16u[4]` at byte (key × 2), gated by
+  // `FacesDetected >= N`. `%faceInfo` has no PrintConv, so `-j` and `-n` render
+  // the same re-ordered/scaled string.
+  const FACES: [(i16, &str, usize); 8] = [
+    (1, "Face1Position", 0x01),
+    (2, "Face2Position", 0x06),
+    (3, "Face3Position", 0x0b),
+    (4, "Face4Position", 0x10),
+    (5, "Face5Position", 0x15),
+    (6, "Face6Position", 0x1a),
+    (7, "Face7Position", 0x1f),
+    (8, "Face8Position", 0x24),
+  ];
+  for (n, name, key) in FACES {
+    if faces < n {
+      continue;
+    }
+    if let Some(value) = face_position_value(buf, key * 2) {
+      out.push(SubEmission {
+        priority: 1,
+        name,
+        value,
+      });
+    }
   }
+}
+
+/// `%faceInfo` (`Sony.pm:4056-4061`) — read the `int16u[4]` rectangle at `byte`
+/// (LE), then `ValueConv => 'my @v=split(" ",$val); $_*=15 foreach @v;
+/// "$v[1] $v[0] $v[3] $v[2]"'`: scale each ×15 and re-order to top, left,
+/// height, width. `None` when the full 8-byte range is not in-block.
+fn face_position_value(buf: &[u8], byte: usize) -> Option<TagValue> {
+  let v0 = u32::from(read_u16(buf, byte)?);
+  let v1 = u32::from(read_u16(buf, byte + 2)?);
+  let v2 = u32::from(read_u16(buf, byte + 4)?);
+  let v3 = u32::from(read_u16(buf, byte + 6)?);
+  let (top, left, height, width) = (v1 * 15, v0 * 15, v3 * 15, v2 * 15);
+  Some(TagValue::Str(SmolStr::new(std::format!(
+    "{top} {left} {height} {width}"
+  ))))
 }
 
 /// `%Sony::MoreInfo0201` (`Sony.pm:3457-3497`) — ImageCount (0x011b) +
@@ -792,3 +845,11 @@ fn push_focal_length2(buf: &[u8], off: usize, out: &mut Vec<SubEmission>, print_
     });
   }
 }
+
+#[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is relaxed for the test
+// module, which indexes fixed-layout byte buffers directly (an out-of-range
+// index is a test-assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
+#[path = "moreinfo_tests.rs"]
+mod tests;

@@ -180,6 +180,18 @@ pub fn model_is_a4xx_9pt(model: Option<&str>) -> bool {
     || word_boundary_after(m, "DSLR-A550")
 }
 
+/// `$$self{Model} =~ /^DSLR-(A450|A500|A550)$/` — the `$`-anchored EXACT match.
+///
+/// This is the `MoreInfo` 0x0002 FaceInfo/FaceInfoA selector (`Sony.pm:3398`/
+/// `3402`): the A4xx-only `FaceInfoA` fires only for a model EQUAL to one of the
+/// three strings. Unlike [`model_is_a4xx_9pt`]'s `\b` boundary a suffixed body
+/// (`DSLR-A500-x`, `DSLR-A500 (...)`) is NOT a match and routes to the non-A4xx
+/// `FaceInfo`, matching ExifTool's `$` anchor.
+#[must_use]
+pub fn model_is_a4xx_exact(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m == "DSLR-A450" || m == "DSLR-A500" || m == "DSLR-A550")
+}
+
 /// `$$self{Model} =~ /^NEX-(3|5|5C)/` (a prefix match, not a `\b` boundary —
 /// the Perl alternation matches `NEX-3`, `NEX-5`, `NEX-5C`).
 #[must_use]

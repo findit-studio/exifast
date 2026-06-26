@@ -15,7 +15,7 @@ use crate::value::TagValue;
 use smol_str::SmolStr;
 
 use super::subtables::{
-  SubEmission, model_is_dslr, model_is_nex_battery_excl, model_is_slt, read_u16,
+  SubEmission, model_is_a4xx_9pt, model_is_dslr, model_is_nex_battery_excl, model_is_slt, read_u16,
 };
 
 /// Walk the `ExtraInfo3` block and emit the battery/orientation leaves.
@@ -72,14 +72,26 @@ pub fn parse_extra_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> V
     });
   }
 
-  // 0x0014 — conditional ARRAY: BatteryState (SLT), ExposureProgram (A4xx),
-  // ModeDialPosition (other DSLR) (Sony.pm:5992-6038).
+  // 0x0014 — conditional ARRAY (`Sony.pm:5989-6035`), evaluated in table order
+  // (first match wins):
+  //   BatteryState     — `Model =~ /^SLT-/`
+  //   ExposureProgram  — `Model =~ /^DSLR-(A450|A500|A550)\b/` (`Priority => 0`)
+  //   ModeDialPosition — `Model =~ /^DSLR-/` (the other DSLR bodies)
+  // The A4xx branch must precede the generic DSLR branch: ExifTool reads this
+  // byte as ExposureProgram for the A450/A500/A550, NOT ModeDialPosition.
   if let Some(&raw) = buf.get(0x0014) {
     if model_is_slt(model) {
       out.push(SubEmission {
         priority: 1,
         name: "BatteryState",
         value: super::hash_print_value(raw, battery_state(raw), print_conv),
+      });
+    } else if model_is_a4xx_9pt(model) {
+      // `Priority => 0` (`Sony.pm:6006` — "some unknown values").
+      out.push(SubEmission {
+        priority: 0,
+        name: "ExposureProgram",
+        value: super::hash_print_value(raw, exposure_program_a4xx(raw), print_conv),
       });
     } else if model_is_dslr(model) {
       out.push(SubEmission {
@@ -147,6 +159,25 @@ fn battery_state(v: u8) -> Option<&'static str> {
   })
 }
 
+/// `ExposureProgram` PrintConv (A450/A500/A550 only; `Sony.pm:6007-6018`). The
+/// `Priority => 0` 0x0014 branch for the 9-point DSLR bodies — a DISTINCT table
+/// from `%sonyExposureProgram2` (the `MoreSettings`/`CameraSettings3`
+/// `ExposureProgram`).
+fn exposure_program_a4xx(v: u8) -> Option<&'static str> {
+  Some(match v {
+    241 => "Landscape",
+    243 => "Aperture-priority AE",
+    245 => "Portrait",
+    246 => "Auto",
+    247 => "Program AE",
+    249 => "Macro",
+    252 => "Sunset",
+    253 => "Sports",
+    255 => "Manual",
+    _ => return None,
+  })
+}
+
 /// `ModeDialPosition` PrintConv (other DSLR models; `Sony.pm:6024-6034`).
 fn mode_dial_position(v: u8) -> Option<&'static str> {
   Some(match v {
@@ -172,3 +203,11 @@ fn camera_orientation(v: u32) -> Option<&'static str> {
     _ => return None,
   })
 }
+
+#[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is relaxed for the test
+// module, which indexes fixed-layout byte buffers directly (an out-of-range
+// index is a test-assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
+#[path = "extrainfo3_tests.rs"]
+mod tests;
