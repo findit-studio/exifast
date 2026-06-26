@@ -71,12 +71,18 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod amount_lens_types;
+pub mod camerainfo3;
+pub mod camerasettings3;
 pub mod decipher;
+pub mod extrainfo3;
 pub mod lens_types;
 pub mod model_ids;
+pub mod moreinfo;
 pub mod printconv;
 pub mod sr2;
+pub mod subtables;
 pub mod tag202a;
+pub mod tag900b;
 pub mod tag9050;
 pub mod tag9400;
 pub mod tag9401;

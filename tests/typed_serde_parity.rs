@@ -243,21 +243,31 @@ const NOT_ACTIVE: &[&str] = &[
   // residual (the IFD0 `0x02bc` ApplicationNotes XMP routing is a separate
   // cross-cutting subsystem — see `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`).
   //
-  // The two OLDER Sony ARW raws (`SLT-A33` / `DSLR-A200`) stay accept-deferred:
-  // their core EXIF/SubIFD + the ENTIRE SR2 subsystem (the `DNGPrivateData`
-  // 0xc634 → `%Sony::SR2Private` descent, the `Decrypt` LFSR, and the decrypted
+  // The `Sony_SLT-A33_real.ARW` raw is now ACTIVE: the OLDER-body `%Sony::Main`
+  // plain-`ProcessBinaryData` sub-table tower is FULLY PORTED — `CameraInfo3`
+  // (incl. the 15-point `AFStatus15` AF grid), `MoreInfo` (→ `MoreSettings`/
+  // `FaceInfo`/`MoreInfo0201`/`MoreInfo0401` + `TiffMeteringImage`),
+  // `CameraSettings3`, `ExtraInfo3` and the enciphered `Tag900b` emit every
+  // remaining `Sony:*` exposure/AF/battery/settings leaf, and the dependent
+  // `Composite:*` (BlueBalance/RedBalance/CFAPattern/FocalLength35efl/
+  // FocusDistance2) now compute byte-exact. A33 carries a per-fixture
+  // `FIXTURE_EXCLUDED_KEYS` entry for the lone `Composite:LensID` (the ambiguous
+  // `Sony:LensType` 55 needs the unported `Exif::PrintLensID` disambiguator —
+  // see `FIXTURE_EXCLUDED_KEYS`).
+  //
+  // The remaining OLDER Sony ARW raw (`DSLR-A200`) stays accept-deferred: its
+  // core EXIF/SubIFD + the ENTIRE SR2 subsystem (the `DNGPrivateData` 0xc634 →
+  // `%Sony::SR2Private` descent, the `Decrypt` LFSR, and the decrypted
   // `%Sony::SR2SubIFD` + `%Sony::SR2DataIFD` walks — `SR2:*`/`SR2SubIFD:*`/
-  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are their
+  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are its
   // Sony ARW `SubIFD:*` raw tags, the `Compression => 'Sony ARW Compressed'`
-  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. Their
-  // RESIDUAL is the OLDER-body `%Sony::Main` sub-table tower (A33: `CameraInfo3`/
-  // `AFInfo`(AFStatus grid)/`CameraSettings3`/`ExtraInfo3`/`MoreInfo`/`Tag900b`
-  // — ~101 leaves; A200: `CameraSettings`/`CameraInfoA200` — ~72 leaves) which
-  // emit the remaining `Sony:*` exposure/AF/lens leaves + the dependent
-  // `Composite:*`; A200 ADDITIONALLY needs the `%MinoltaRaw::Main` MRW port (22
-  // `MinoltaRaw:*`, which also overrides its `Composite:ImageSize`/`Megapixels`).
-  // Those OLDER sub-table towers are a separate faithful campaign.
-  "Sony_SLT-A33_real.ARW",
+  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. Its
+  // RESIDUAL is the A200-specific sub-table tower (`CameraSettings`/
+  // `CameraInfoA200` — ~72 leaves) which emits the remaining `Sony:*`
+  // exposure/AF/lens leaves + the dependent `Composite:*`; A200 ADDITIONALLY
+  // needs the `%MinoltaRaw::Main` MRW port (22 `MinoltaRaw:*`, which also
+  // overrides its `Composite:ImageSize`/`Megapixels`). That OLDER sub-table
+  // tower is a separate faithful campaign.
   "Sony_DSLR-A200_real.ARW",
 ];
 
@@ -491,6 +501,19 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // IS emitted. Mirrors `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s
   // `FX3_DEFERRED`.
   ("Sony_ILME-FX3_real.ARW", &["XMP-xmp:Rating"]),
+  // The `Sony_SLT-A33_real.ARW` raw is now active (its OLDER plain-
+  // `ProcessBinaryData` sub-table tower — `CameraInfo3`/`MoreInfo`/
+  // `CameraSettings3`/`ExtraInfo3`/`Tag900b` — is fully ported, see the
+  // `NOT_ACTIVE` note). The lone residual is `Composite:LensID`: the A33's
+  // `Sony:LensType` (= 55) PrintConv is the multi-candidate `Sony DT 18-55mm
+  // F3.5-5.6 SAM (SAL1855) or SAM II`, and ExifTool's `Composite:LensID`
+  // disambiguates it to the single `SAL1855` via the full `Exif::PrintLensID`
+  // lens-DB matcher (LensSpec + FocalLength + MaxAperture). exifast's composite
+  // post-pass ports only the unambiguous-LensType case (it defers any `" or "`
+  // placeholder), so this composite is dropped from BOTH sides; the ambiguous
+  // `Sony:LensType` MakerNote leaf IS emitted. Mirrors
+  // `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s `A33_DEFERRED`.
+  ("Sony_SLT-A33_real.ARW", &["Composite:LensID"]),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1609,7 +1632,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `Tag9402`/`Tag9406`/`Tag940c`/`Tag9416`/`Tag202a` ProcessBinaryData tables +
 /// the five dependent `Composite:*`), with a single `FIXTURE_EXCLUDED_KEYS`
 /// entry for the `XMP-xmp:Rating` IFD0-`0x02bc`-XMP residual.
-const EXPECTED_ACTIVE_FIXTURES: usize = 637;
+///
+/// 637 → 638: the `Sony_SLT-A33_real.ARW` raw GRADUATES out of `NOT_ACTIVE` —
+/// its OLDER-body plain-`ProcessBinaryData` sub-table tower is fully ported
+/// (`CameraInfo3` with the 15-point `AFStatus15` AF grid, `MoreInfo` →
+/// `MoreSettings`/`FaceInfo`/`MoreInfo0201`/`MoreInfo0401` + `TiffMeteringImage`,
+/// `CameraSettings3`, `ExtraInfo3`, the enciphered `Tag900b` + the five
+/// dependent `Composite:*`), with a single `FIXTURE_EXCLUDED_KEYS` entry for the
+/// `Composite:LensID` ambiguous-LensType-disambiguation residual.
+const EXPECTED_ACTIVE_FIXTURES: usize = 638;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
