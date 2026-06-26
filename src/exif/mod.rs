@@ -12158,9 +12158,82 @@ pub(in crate::exif) fn sony_makernote_isolated(
         print_conv,
         &mut sink,
       );
+      // The older-body plain (un-enciphered) `ProcessBinaryData` SubDirectories
+      // (`CameraInfo3` 0x0010 / `MoreInfo` 0x0020 / `CameraSettings3` 0x0114 /
+      // `ExtraInfo3` 0x0116) the A33-class bodies write — decoded HERE in the
+      // same walk-order pass, so an overlapping leaf shared with a later block
+      // (e.g. `MeteringMode` in both `MoreSettings` 0x0020 and `CameraSettings3`
+      // 0x0114) is last-wins-overridden byte-identically to ExifTool's IFD-order
+      // emission. (`Tag900b` 0x900b is enciphered → handled above.)
+      sony_emit_binary_subdir(data, g1, entry, model, print_conv, &mut sink);
     }
   }
   Some((emissions, typed))
+}
+
+/// Decode an older Sony Main-IFD plain (un-enciphered) `ProcessBinaryData`
+/// SubDirectory the A33-class (SLT / DSLR-A4xx-A5xx / NEX) bodies write —
+/// `CameraInfo3` (0x0010), `MoreInfo` (0x0020), `CameraSettings3` (0x0114) or
+/// `ExtraInfo3` (0x0116) — and emit its ported leaves into `sink`.
+///
+/// `entry` is the Sony Main-IFD SubDirectory row; its verbatim on-disk value
+/// bytes are `data[value_offset .. value_offset + value_size]`. These tables are
+/// NOT enciphered (unlike the `Tag9xxx` series), so the raw block is read
+/// directly. The per-table parsers honour the `ProcessBinaryData` per-field
+/// availability contract + the model `Condition`s; a hostile / out-of-range span
+/// is bounds-checked by `get` (decodes nothing rather than panicking). The
+/// leaves ride the Sony vendor family-1 group; none are `Unknown => 1`.
+#[cfg(feature = "alloc")]
+fn sony_emit_binary_subdir<S: ExifSink>(
+  data: &[u8],
+  group1: &str,
+  entry: &ExifEntry,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut S,
+) {
+  use makernotes::vendors::sony::{camerainfo3, camerasettings3, extrainfo3, moreinfo};
+  let off = entry.value_offset();
+  let Some(end) = off.checked_add(entry.value_size()) else {
+    return;
+  };
+  let Some(raw) = data.get(off..end) else {
+    return;
+  };
+  let emissions = match entry.tag_id() {
+    // `CameraInfo3` — `$count == 15360` (Sony.pm:2280-2300). The `$count` gate
+    // is the entry's value byte-count.
+    0x0010 if entry.value_size() == 15360 => {
+      camerainfo3::parse_camera_info3(raw, model, print_conv)
+    }
+    // `MoreInfo` — dispatched (over `FocusInfo`) when `$count` is NOT
+    // 19154/19148 (Sony.pm:44-63).
+    0x0020 if entry.value_size() != 19154 && entry.value_size() != 19148 => {
+      moreinfo::parse_more_info(raw, model, print_conv)
+    }
+    // `CameraSettings3` — `$count == 1536 || $count == 2048` (Sony.pm:97-127).
+    0x0114 if entry.value_size() == 1536 || entry.value_size() == 2048 => {
+      camerasettings3::parse_camera_settings3(raw, model, print_conv)
+    }
+    // `ExtraInfo3` — the final (non-conditional) `ExtraInfo` ARRAY branch
+    // (Sony.pm:150-167); the A33 writes this variant.
+    0x0116 => extrainfo3::parse_extra_info3(raw, model, print_conv),
+    _ => return,
+  };
+  // Each leaf carries its ExifTool `Priority => N` (the table-level `PRIORITY`,
+  // or the explicit per-leaf `Priority` for `CameraInfo3` `FocalLength`), so the
+  // sink's priority-aware dedup keeps a higher-priority Main-IFD leaf of the
+  // same `(doc, family1, name)` (e.g. `0x0102` `Quality`).
+  for emi in emissions {
+    let Ok(()) = out.write_vendor_value_with_priority(
+      "MakerNotes",
+      group1,
+      emi.name,
+      emi.value,
+      false,
+      emi.priority,
+    );
+  }
 }
 
 /// Decode a Sony Main-IFD `ProcessBinaryData` SubDirectory sub-block
@@ -12205,7 +12278,7 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
 ) {
   use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
-    tag202a, tag940c, tag9050, tag9400, tag9401, tag9402, tag9406, tag9416,
+    tag202a, tag900b, tag940c, tag9050, tag9400, tag9401, tag9402, tag9406, tag9416,
   };
   // The verbatim on-disk value span (the enciphered cipher block, or the plain
   // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
@@ -12277,6 +12350,15 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
     0x9416 => {
       let buf = process_enciphered(raw, double_cipher);
       for emi in tag9416::parse_tag9416(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag900b` — the enciphered face-info block the older A33-class bodies
+    // write, selected by the (still-enciphered) first value byte = `0xae`
+    // (`Condition => '$$valPt =~ /^\xae/'`, `Sony.pm:1080`).
+    0x900b if raw.first() == Some(&0xae) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag900b::parse_tag900b(&buf, model, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
