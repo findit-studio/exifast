@@ -76,8 +76,10 @@ pub mod camera_settings;
 pub mod canon_custom;
 pub mod color_balance;
 pub mod colordata;
+pub mod crop_info;
 pub mod file_info;
 pub mod focal_length;
+pub mod lens_correction;
 pub mod lens_types;
 pub mod measured_color;
 pub mod model_ids;
@@ -87,6 +89,7 @@ pub mod sensor_info;
 pub mod serial_info;
 pub mod shot_info;
 pub mod tags;
+pub mod time_info;
 
 use crate::exif::makernotes::VendorEmission;
 use crate::value::TagValue;

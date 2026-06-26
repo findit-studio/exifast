@@ -11651,8 +11651,8 @@ fn emit_canon_subtable<S: ExifSink>(
   use makernotes::vendors::canon::tags::SubTable;
   use makernotes::vendors::canon::{
     af_info, af_micro_adj, camera_info, camera_settings, canon_custom, color_balance, colordata,
-    file_info, first4_all_zero, focal_length, measured_color, processing, reserialize_int_array,
-    sensor_info, shot_info,
+    crop_info, file_info, first4_all_zero, focal_length, lens_correction, measured_color,
+    processing, reserialize_int_array, reserialize_int32_array, sensor_info, shot_info, time_info,
   };
 
   let blob = reserialize_int_array(raw, order);
@@ -11730,6 +11730,40 @@ fn emit_canon_subtable<S: ExifSink>(
         Vec::new()
       }
     }
+    // The EOS 7D image-info sub-tables (#445). TimeInfo (0x35) / AspectInfo
+    // (0x9a) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) are `int32`-format
+    // tables read as `int32u[N]` IFD entries, so each word must be widened back
+    // to 4 bytes (`reserialize_int32_array`), like AFMicroAdj. CustomFunctions2
+    // (0x99) is likewise `int32u`-read.
+    SubTable::TimeInfo => {
+      let blob32 = reserialize_int32_array(raw, order);
+      time_info::parse(&blob32, order, print_conv)
+    }
+    // CropInfo (0x98) is `int16u` — the shared `int16` blob is correct.
+    SubTable::CropInfo => crop_info::parse_crop(&blob, order, print_conv),
+    SubTable::AspectInfo => {
+      let blob32 = reserialize_int32_array(raw, order);
+      crop_info::parse_aspect(&blob32, order, print_conv)
+    }
+    // VignettingCorr (0x4015) is read as `undef[N]` ⇒ the shared blob is the raw
+    // bytes (its int16s leaves read at byte offsets within it).
+    SubTable::VignettingCorr => lens_correction::parse_vignetting(&blob, order, print_conv),
+    SubTable::VignettingCorr2 => {
+      let blob32 = reserialize_int32_array(raw, order);
+      lens_correction::parse_vignetting2(&blob32, order, print_conv)
+    }
+    SubTable::LightingOpt => {
+      let blob32 = reserialize_int32_array(raw, order);
+      lens_correction::parse_lighting_opt(&blob32, order, print_conv)
+    }
+    // LensInfo (0x4019) is read as `undef[N]` ⇒ the shared raw-bytes blob.
+    SubTable::LensInfo => lens_correction::parse_lens_info(&blob, order, print_conv),
+    // CustomFunctions2 (0x99) — `ProcessCanonCustom2` against `CanonCustom::
+    // Functions2`; emitted into the `CanonCustom` family-1 group (handled below).
+    SubTable::CustomFunctions2 => {
+      let blob32 = reserialize_int32_array(raw, order);
+      canon_custom::parse_functions2(&blob32, order, print_conv, model)
+    }
     // `emit_entry` only routes the `is_walked()` set here; any other variant is
     // a caller bug, not a malformed-input case — emit nothing.
     _ => Vec::new(),
@@ -11738,7 +11772,7 @@ fn emit_canon_subtable<S: ExifSink>(
   // The `CanonCustom::*` tables emit into the `CanonCustom` family-1 group (the
   // `Image::ExifTool::CanonCustom` package group, `CanonCustom.pm:229`), NOT the
   // parent `Canon` group; every other walked sub-table stays in `group1`.
-  let emit_group1 = if matches!(sub, SubTable::CustomFunctions) {
+  let emit_group1 = if matches!(sub, SubTable::CustomFunctions | SubTable::CustomFunctions2) {
     "CanonCustom"
   } else {
     group1
