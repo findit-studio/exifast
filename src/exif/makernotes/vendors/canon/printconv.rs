@@ -65,6 +65,12 @@ pub enum CanonPrintConv {
   /// Canon `LensType` (`Canon.pm:2500-2509`) — `int16u`, PrintConv via
   /// `%canonLensTypes`.
   LensType,
+  /// `BatteryType` (0x38, `Canon.pm:1757-1764`) — `undef`, `Condition =>
+  /// '$count == 76'`, `RawConv => '$val=~/^.{4}([^\0]+)/s ? $1 : undef'`: skip
+  /// the 4-byte header, then capture the leading run of non-NUL bytes (the
+  /// EOS-R fills `\x4c\0\0\0` + `'LP-E6N'` + NUL padding ⇒ `'LP-E6N'`). A
+  /// non-76 count or an empty run falls back to the raw-bytes value.
+  BatteryType,
 }
 
 impl CanonPrintConv {
@@ -171,6 +177,17 @@ impl CanonPrintConv {
         };
         TagValue::Str(SmolStr::from(hex_encode(bytes)))
       }
+      CanonPrintConv::BatteryType => {
+        // `Condition => '$count == 76'` + `RawConv => '$val=~/^.{4}([^\0]+)/s ?
+        // $1 : undef'`. A RawConv (no PrintConv) ⇒ the string in BOTH modes.
+        // The bundled undef-drop (count != 76 OR an empty post-header run)
+        // SUPPRESSES the tag; the shared-`Walker` capture honours that through
+        // [`apply_battery_type`](Self::apply_battery_type) (a `None` ⇒ NO
+        // emission). This plain-`apply` path cannot drop a tag, so it renders the
+        // failure as the raw bytes — mirroring the Panasonic 0xc5/0xe4 split
+        // between `apply` (can't drop) and `apply_lens_type_model` (drops).
+        Self::apply_battery_type(raw).unwrap_or_else(|| raw_to_tag_value(raw))
+      }
       CanonPrintConv::ColorSpace => simple_label(raw, print_conv, |n| match n {
         // `Canon.pm:1943-1947` — Canon's ColorSpace map. 65535 ⇒ 'n/a'
         // (NOT the EXIF 0xa001 'Uncalibrated').
@@ -195,6 +212,40 @@ impl CanonPrintConv {
         }
       }
     }
+  }
+
+  /// `BatteryType` (0x38, `Canon.pm:1757-1764`) `RawConv => '$val=~/^.{4}([^\0]+)/s
+  /// ? $1 : undef'` with the bundled `Condition => '$count == 76'` honoured —
+  /// returns the captured run (`$1`) ONLY when the value is EXACTLY 76 bytes AND
+  /// the leading run of non-NUL bytes AFTER the 4-byte header is non-empty.
+  /// Returns `None` (the `RawConv` yields undef ⇒ ExifTool SUPPRESSES the tag)
+  /// when the count is not 76 OR that run is empty — so a malformed / version-skew
+  /// Canon MakerNote DROPS `BatteryType` rather than leaking the raw bytes. There
+  /// is no `PrintConv`, so the `Some` result is identical in both modes.
+  ///
+  /// The shared-`Walker` Canon capture (`emit_canon_value`) routes `BatteryType`
+  /// through this so a failing value yields NO emission (matching ExifTool),
+  /// exactly like the Panasonic 0xc5/0xe4 `RawConv` undef-drop
+  /// (`apply_lens_type_model`).
+  #[must_use]
+  pub fn apply_battery_type(raw: &RawValue) -> Option<TagValue> {
+    let RawValue::Bytes(b) = raw else {
+      return None;
+    };
+    // `Condition => '$count == 76'` — for the `Format => 'undef'` tag `$count`
+    // IS the byte length.
+    if b.len() != 76 {
+      return None;
+    }
+    // `^.{4}([^\0]+)` — skip the 4-byte header, then capture the leading run of
+    // non-NUL bytes. `b.get(4..)` is `Some` since `b.len() == 76 >= 4`.
+    let rest = b.get(4..)?;
+    let run = rest.split(|&c| c == 0).next().unwrap_or(rest);
+    if run.is_empty() {
+      // Empty run ⇒ the regex fails ⇒ undef ⇒ the tag is suppressed.
+      return None;
+    }
+    Some(TagValue::Str(SmolStr::from(String::from_utf8_lossy(run))))
   }
 }
 
@@ -567,6 +618,52 @@ mod tests {
     let raw = RawValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]);
     let v = CanonPrintConv::HexEncoded.apply(&raw, true, None);
     assert_eq!(v, TagValue::Str("deadbeef".into()));
+  }
+
+  /// `BatteryType` (0x38, `Canon.pm:1757-1764`) — the 76-byte EOS-R value
+  /// `4c 00 00 00` + `'LP-E6N'` + NUL padding extracts `'LP-E6N'` (`$1` of
+  /// `^.{4}([^\0]+)`). A RawConv with no PrintConv ⇒ the same string in BOTH modes.
+  #[test]
+  fn battery_type_extracts_post_header_run() {
+    let mut b = vec![0u8; 76];
+    b[0] = 0x4c; // the 4-byte header is skipped; only $count + the run matter.
+    b[4..10].copy_from_slice(b"LP-E6N");
+    let raw = RawValue::Bytes(b);
+    assert_eq!(
+      CanonPrintConv::apply_battery_type(&raw),
+      Some(TagValue::Str("LP-E6N".into()))
+    );
+    assert_eq!(
+      CanonPrintConv::BatteryType.apply(&raw, true, None),
+      TagValue::Str("LP-E6N".into())
+    );
+    assert_eq!(
+      CanonPrintConv::BatteryType.apply(&raw, false, None),
+      TagValue::Str("LP-E6N".into())
+    );
+  }
+
+  /// `Condition => '$count == 76'` fails for a non-76 count ⇒ the tag is never
+  /// selected ⇒ undef ⇒ `apply_battery_type` SUPPRESSES it (`None`).
+  #[test]
+  fn battery_type_wrong_count_suppressed() {
+    let mut b = vec![0u8; 40];
+    b[4..10].copy_from_slice(b"LP-E6N");
+    assert_eq!(
+      CanonPrintConv::apply_battery_type(&RawValue::Bytes(b)),
+      None
+    );
+  }
+
+  /// A 76-byte value that is all-NUL after the 4-byte header ⇒ `[^\0]+` matches
+  /// NOTHING ⇒ the `RawConv` returns undef ⇒ suppressed (`None`).
+  #[test]
+  fn battery_type_empty_run_suppressed() {
+    let b = vec![0u8; 76];
+    assert_eq!(
+      CanonPrintConv::apply_battery_type(&RawValue::Bytes(b)),
+      None
+    );
   }
 
   #[test]

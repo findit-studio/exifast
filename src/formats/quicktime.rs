@@ -6578,6 +6578,21 @@ impl Meta<'_> {
     self.mime
   }
 
+  /// ExifTool temporarily forces `ExtractEmbedded => 1` while processing a CRX
+  /// file (QuickTime.pm:10010 `$et->Options(ExtractEmbedded => 1) if $fileType
+  /// eq 'CRX'`), so a Canon CR3/CRM still-RAW extracts its `CTMD` timed
+  /// metadata (and the `CRAW` track's `JpgFromRaw` preview sample) WITHOUT an
+  /// explicit `-ee`. The `crx ` ftyp brand resolves to `CRX`, after which the
+  /// `CNCV` CompressorVersion overrides the type to `CR3` / `CRM` — but the
+  /// auto-`-ee` is keyed off the pre-override `CRX`, so all three resolved
+  /// types (`CRX` before override, `CR3` / `CRM` after) mean "came in as a
+  /// CRX" and auto-enable the embedded extraction.
+  #[must_use]
+  #[inline]
+  pub(crate) fn auto_extract_embedded(&self) -> bool {
+    matches!(self.file_type, "CRX" | "CR3" | "CRM")
+  }
+
   /// The FIRST `ProcessMOV` warning, if any — surfaced by the
   /// [`AnyMeta::QuickTime`](crate::format_parser) emission arm as the
   /// document-level `ExifTool:Warning` (the `Taggable` stream has no warning
@@ -8277,6 +8292,10 @@ impl Meta<'_> {
     &self,
     extract_embedded: bool,
   ) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    // CRX (CR3/CRM) auto-enables `ExtractEmbedded` (QuickTime.pm:10010), so the
+    // no-`ee` `EEWarn` is never raised for a Canon still-RAW — mirror the
+    // `tags()` override here so the diagnostics channel agrees.
+    let extract_embedded = extract_embedded || self.auto_extract_embedded();
     let mut out = std::vec::Vec::new();
     // SP4: the `ftyp`-dispatched brand walkers raise their own non-fatal walk
     // warnings (truncated iloc/iinf/ipma + `Item info entries are out of order`
@@ -8569,6 +8588,19 @@ impl crate::emit::Taggable for Meta<'_> {
     &self,
     opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    // ExifTool auto-enables `ExtractEmbedded` for CRX (CR3/CRM) files
+    // (QuickTime.pm:10010), so the `CTMD` timed metadata + the `CRAW`
+    // `JpgFromRaw` preview sample extract without an explicit `-ee`. Force the
+    // flag on here so every `opts.extract_embedded` gate below (the EEWarn
+    // suppression, `emit_timed_samples`, the CTMD block) sees it.
+    let opts = if self.auto_extract_embedded() {
+      crate::emit::EmitOptions {
+        extract_embedded: true,
+        ..opts
+      }
+    } else {
+      opts
+    };
     let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};

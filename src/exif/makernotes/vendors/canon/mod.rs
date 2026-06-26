@@ -77,6 +77,7 @@ pub mod canon_custom;
 pub mod color_balance;
 pub mod colordata;
 pub mod crop_info;
+pub mod eosr_info;
 pub mod file_info;
 pub mod focal_length;
 pub mod lens_correction;
@@ -1361,6 +1362,47 @@ mod tests {
     let (typed, emissions) = parse(&[], ByteOrder::Little);
     assert_eq!(typed, MakerNotesCanon::new());
     assert!(emissions.is_empty());
+  }
+
+  /// 0x38 `BatteryType` (`Canon.pm:1757-1764`) emits its extracted run for a
+  /// well-formed `undef[76]` value, and is SUPPRESSED (no emission) when the
+  /// `RawConv => '$val=~/^.{4}([^\0]+)/s ? $1 : undef'` yields undef — a non-76
+  /// count (`Condition => '$count == 76'` fails) or an all-NUL post-header run
+  /// (`[^\0]+` matches nothing) — matching ExifTool rather than leaking the raw
+  /// bytes.
+  #[test]
+  fn battery_type_emission_suppressed_on_rawconv_undef() {
+    // (a) success — undef[76] = 4-byte header + "LP-E6N" + NUL padding.
+    let mut ok = std::vec![0u8; 76];
+    ok[0] = 0x4c;
+    ok[4..10].copy_from_slice(b"LP-E6N");
+    let blob = one_main_entry_blob(0x38, 7, 76, &ok);
+    let (_t, em) = parse(&blob, ByteOrder::Little);
+    assert_eq!(
+      em.iter()
+        .find(|e| e.name() == "BatteryType")
+        .map(|e| e.value().clone()),
+      Some(TagValue::Str("LP-E6N".into())),
+      "a valid undef[76] BatteryType emits its run"
+    );
+
+    // (b) count != 76 ⇒ Condition fails ⇒ no BatteryType emission.
+    let mut wrong = std::vec![0u8; 40];
+    wrong[4..10].copy_from_slice(b"LP-E6N");
+    let blob = one_main_entry_blob(0x38, 7, 40, &wrong);
+    let (_t, em) = parse(&blob, ByteOrder::Little);
+    assert!(
+      !em.iter().any(|e| e.name() == "BatteryType"),
+      "count != 76 ⇒ BatteryType suppressed (not the raw bytes)"
+    );
+
+    // (c) 76 bytes but all-NUL after the header ⇒ empty run ⇒ no emission.
+    let blob = one_main_entry_blob(0x38, 7, 76, &std::vec![0u8; 76]);
+    let (_t, em) = parse(&blob, ByteOrder::Little);
+    assert!(
+      !em.iter().any(|e| e.name() == "BatteryType"),
+      "empty post-header run ⇒ BatteryType suppressed"
+    );
   }
 
   // -- R6-2: 0x927c per-entry value-offset diagnostics ------------------------
