@@ -10222,6 +10222,34 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     // `Sony:LensType` (the ambiguous MakerNote leaf) IS emitted byte-exact.
     "Composite:LensID",
   ];
+  // A200 (2008 Minolta-derived body): the OLDER `%Sony::Main` sub-table tower —
+  // `CameraInfo2` (0x0010, LittleEndian), `FocusInfo` (0x0020), `CameraSettings`
+  // (0x0114, BigEndian `int16u`) — is now FULLY PORTED on top of chunk 1's
+  // `MinoltaRaw` subsystem, so every `Sony:*` AF/exposure/flash/WB/battery leaf
+  // emits byte-exact, and the dependent `Composite:FocusDistance` (= `inf`, via
+  // the new `Sony:FocusPosition`) computes. The residuals are three composites:
+  const A200_DEFERRED: &[&str] = &[
+    // `Composite:ImageSize`/`Megapixels` (#436): bundled resolves the bare-name
+    // `Composite:ImageSize` from the `MinoltaRaw:ImageWidth`/`ImageHeight`
+    // (`Priority => 1`, the SR2-corrected 3872x2592) over the `SubIFD:ImageWidth`
+    // (`Priority => 0`, the padded 3880x2600). exifast's bare-name Composite
+    // resolver is emission-order-FIRST (it does NOT yet prefer a higher-priority
+    // ingredient), so it picks the earlier `SubIFD` dims (3880x2600 → 10.1 MP).
+    // The priority-aware bare-name resolution is tracked in #436 (owner-deferred,
+    // low priority); changing the shared `composite/mod.rs` resolver is out of
+    // scope here. Both diverging composites are dropped from BOTH sides.
+    "Composite:ImageSize",
+    "Composite:Megapixels",
+    // `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`). The A200's
+    // `Sony:LensType` (= 129) is AMBIGUOUS — its PrintConv is the generic
+    // `Tamron Lens (129)` placeholder; ExifTool's `Composite:LensID`
+    // disambiguates to the single lens via the full `Exif::PrintLensID` lens-DB
+    // matcher (`FocalLength` + `MaxAperture`). Same deferral as the A33's
+    // SAL1855 — exifast's composite post-pass ports only the unambiguous-LensType
+    // case, so this is dropped from BOTH sides; the `Sony:LensType` MakerNote
+    // leaf IS emitted byte-exact.
+    "Composite:LensID",
+  ];
   check_excluding(
     "Sony_ILME-FX3_real.ARW",
     "Sony_ILME-FX3_real.ARW.json",
@@ -10245,6 +10273,18 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "Sony_SLT-A33_real.ARW.n.json",
     false,
     A33_DEFERRED,
+  );
+  check_excluding(
+    "Sony_DSLR-A200_real.ARW",
+    "Sony_DSLR-A200_real.ARW.json",
+    true,
+    A200_DEFERRED,
+  );
+  check_excluding(
+    "Sony_DSLR-A200_real.ARW",
+    "Sony_DSLR-A200_real.ARW.n.json",
+    false,
+    A200_DEFERRED,
   );
 
   // Positively assert the SR2 subsystem actually fired (the decrypt + nested
@@ -10338,10 +10378,11 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
   // The DSLR-A200 (2008 Minolta-derived body) `MinoltaRaw` subsystem — the
   // `%Sony::SR2Private` `MRWInfo` (0x7250) → `%MinoltaRaw::Main` `\0MRI`-block
   // walk emits the 22 `MinoltaRaw:*` PRD/WBG/RIF leaves BYTE-EXACT in BOTH the
-  // PrintConv (`-j`) and raw (`-n`) modes. (The A200 itself is still NOT_ACTIVE
-  // pending its Sony Main `CameraSettings`/`CameraInfoA200` sub-table tower — the
-  // remaining ~72 `Sony:*` AF/exposure leaves + the SR2-corrected `Composite:
-  // ImageSize`/`Megapixels` — but the MinoltaRaw port is proven here.)
+  // PrintConv (`-j`) and raw (`-n`) modes. The A200 is now ACTIVE: its OLDER
+  // `%Sony::Main` sub-table tower (`CameraInfo2` 0x0010 / `FocusInfo` 0x0020 /
+  // `CameraSettings` 0x0114) is fully ported, asserted positively below (the
+  // `check_excluding` above proves the WHOLE output byte-exact modulo the #436
+  // `Composite:ImageSize`/`Megapixels` priority residual + the ambiguous LensID).
   let a200 = std::fs::read(format!("{root}/tests/fixtures/Sony_DSLR-A200_real.ARW"))
     .expect("read Sony_DSLR-A200_real.ARW");
   let a200_j = extract_info("Sony_DSLR-A200_real.ARW", &a200, true);
@@ -10371,10 +10412,39 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "\"MinoltaRaw:ZoneMatching\":\"ISO Setting Used\"",
     "\"MinoltaRaw:ColorTemperature\":\"Auto\"",
     "\"MinoltaRaw:ColorFilter\":0",
+    // CameraInfo2 (0x0010, LittleEndian): the 9-point AFPointSelected /
+    // FocusModeSetting / AFPoint + the `%afStatusInfo` int16s grid.
+    "\"Sony:AFPointSelected\":\"Auto\"",
+    "\"Sony:FocusModeSetting\":\"Manual\"",
+    "\"Sony:AFPoint\":\"Center Vertical\"",
+    "\"Sony:AFStatusActiveSensor\":\"Front Focus (-346)\"",
+    "\"Sony:AFStatusTop-right\":\"Out of Focus\"",
+    // FocusInfo (0x0020): DriveMode2 / Rotation / the exp-ValueConv ISO/ISOSetting
+    // / FocusPosition (128 = infinity) / the TiffMeteringImage placeholder.
+    "\"Sony:DriveMode2\":\"Single Frame\"",
+    "\"Sony:Rotation\":\"Horizontal (normal)\"",
+    "\"Sony:ISOSetting\":800",
+    "\"Sony:ISO\":800",
+    "\"Sony:FocusPosition\":128",
+    "\"Sony:TiffMeteringImage\":\"(Binary data 7404 bytes, use -b option to extract)\"",
+    // CameraSettings (0x0114, BigEndian int16u): the exposure/aperture
+    // ValueConvs, the masked DriveMode, FlashMode, FocusStatus, BatteryLevel.
+    "\"Sony:ExposureTime\":\"1/25\"",
+    "\"Sony:FNumber\":4.6",
+    "\"Sony:DriveMode\":\"Single Frame\"",
+    "\"Sony:FlashMode\":\"Flash Off\"",
+    "\"Sony:FocusStatus\":\"Not confirmed\"",
+    "\"Sony:BatteryLevel\":\"70%\"",
+    "\"Sony:ColorTemperatureSet\":\"5500 K\"",
+    // The dependent Composite:FocusDistance (FocusPosition 128 → "inf").
+    "\"Composite:FocusDistance\":\"inf\"",
+    // The 0x0104 FlashExposureComp rational `0/N` renders as the bare integer
+    // `0` (NOT `0.0`) — the chunk-2 rational-rendering fix.
+    "\"Sony:FlashExposureComp\":0",
   ] {
     assert!(
       a200_j.contains(needle),
-      "A200 MinoltaRaw (-j) must emit {needle}: {a200_j}",
+      "A200 (-j) must emit {needle}: {a200_j}",
     );
   }
   let a200_n = extract_info("Sony_DSLR-A200_real.ARW", &a200, false);
@@ -10388,10 +10458,18 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "\"MinoltaRaw:ISOSetting\":4",
     "\"MinoltaRaw:ZoneMatching\":0",
     "\"MinoltaRaw:ColorTemperature\":0",
+    // The Sony sub-table `-n` raw values (AFPoint / FocusPosition / ExposureProgram
+    // / FocalLength35efl whole-number + FocusDistance "inf").
+    "\"Sony:AFPoint\":4",
+    "\"Sony:FocusPosition\":128",
+    "\"Sony:ExposureProgram\":17",
+    "\"Composite:FocalLength35efl\":120",
+    "\"Composite:FocusDistance\":\"inf\"",
+    "\"Sony:FlashExposureComp\":0",
   ] {
     assert!(
       a200_n.contains(needle),
-      "A200 MinoltaRaw (-n) must emit {needle}: {a200_n}",
+      "A200 (-n) must emit {needle}: {a200_n}",
     );
   }
   // The MRW header check gates the dispatch: the FX3 (modern body, non-MRW 0x7250

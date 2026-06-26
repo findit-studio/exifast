@@ -374,6 +374,91 @@ pub fn exposure_program2(v: u32) -> Option<&'static str> {
   })
 }
 
+/// `%sonyExposureProgram` PrintConv (`Sony.pm:408-423`) — the FIRST
+/// ExposureProgram hash (decoded mainly from the A200), shared by `FocusInfo`
+/// 0x3f and `CameraSettings` 0x3c.
+#[must_use]
+pub fn exposure_program(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "Auto",
+    1 => "Manual",
+    2 => "Program AE",
+    3 => "Aperture-priority AE",
+    4 => "Shutter speed priority AE",
+    8 => "Program Shift A",
+    9 => "Program Shift S",
+    16 => "Portrait",
+    17 => "Sports",
+    18 => "Sunset",
+    19 => "Night Portrait",
+    20 => "Landscape",
+    21 => "Macro",
+    35 => "Auto No Flash",
+    _ => return None,
+  })
+}
+
+/// `CreativeStyle` PrintConv (`Sony.pm:3290-3308`/`4441-4459`) — shared by
+/// `FocusInfo` 0x41 and `CameraSettings` 0x1a (a `Priority => 0` duplicate of
+/// the Main-IFD string `CreativeStyle`).
+#[must_use]
+pub fn creative_style(v: u8) -> Option<&'static str> {
+  Some(match v {
+    1 => "Standard",
+    2 => "Vivid",
+    3 => "Portrait",
+    4 => "Landscape",
+    5 => "Sunset",
+    6 => "Night View/Portrait",
+    8 => "B&W",
+    9 => "Adobe RGB",
+    11 => "Neutral",
+    12 => "Clear",
+    13 => "Deep",
+    14 => "Light",
+    15 => "Autumn Leaves",
+    16 => "Sepia",
+    _ => return None,
+  })
+}
+
+/// `DynamicRangeOptimizerMode` PrintConv (`0 => Off`, `1 => Standard`, `2 =>
+/// Advanced Auto`, `3 => Advanced Level`) — shared by `FocusInfo` 0x15/0x77 and
+/// `CameraSettings` 0x18.
+#[must_use]
+pub fn dro_mode(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "Off",
+    1 => "Standard",
+    2 => "Advanced Auto",
+    3 => "Advanced Level",
+    _ => return None,
+  })
+}
+
+/// `%sonyDriveMode` A200-generation `DriveMode2` (`FocusInfo` 0x0e variant-2) /
+/// `DriveMode` (`CameraSettings` 0x04) PrintConv body (`PrintHex => 1`;
+/// `Sony.pm:3219-3236`/`4259-4272`).
+#[must_use]
+pub fn drive_mode_a200(v: u32) -> Option<&'static str> {
+  Some(match v {
+    0x01 => "Single Frame",
+    0x02 => "Continuous High",
+    0x12 => "Continuous Low",
+    0x04 => "Self-timer 10 sec",
+    0x05 => "Self-timer 2 sec, Mirror Lock-up",
+    0x06 => "Single-frame Bracketing",
+    0x07 => "Continuous Bracketing",
+    0x18 => "White Balance Bracketing Low",
+    0x28 => "White Balance Bracketing High",
+    0x19 => "D-Range Optimizer Bracketing Low",
+    0x29 => "D-Range Optimizer Bracketing High",
+    0x0a => "Remote Commander",
+    0x0b => "Mirror Lock-up",
+    _ => return None,
+  })
+}
+
 /// `%sonyDriveMode` shared `DriveMode2`/`DriveModeSetting`/`DriveMode` body
 /// PrintConv (`PrintHex => 1`; `MoreSettings` 0x01 / `CameraSettings3`
 /// 0x04). The extended `0xd1..0xd6` continuous variants only appear in the

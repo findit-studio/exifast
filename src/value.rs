@@ -158,6 +158,23 @@ pub fn format_g(val: f64, precision: usize) -> String {
   s
 }
 
+/// Build a [`TagValue`] from an `f64` so an EXACTLY-whole value renders as a bare
+/// integer (`120`), not serde's float spelling (`120.0`) — matching how ExifTool
+/// stringifies a numeric scalar (`12.0 → "12"`). A fractional value (or one
+/// outside the exact-integer `f64` range) keeps its full `F64` precision. Used
+/// for the numeric `ConvMode::ValueConv` of composites whose `-n` form ExifTool
+/// emits as a bare integer (e.g. `Composite:FocalLength35efl`).
+#[must_use]
+pub fn whole_f64_to_tag_value(val: f64) -> TagValue {
+  // `2^53` is the largest f64 with no integer-representation gap; beyond it the
+  // `as i64` cast loses precision, so such a value stays `F64`.
+  if val.fract() == 0.0 && val.abs() < 9_007_199_254_740_992.0 {
+    TagValue::I64(val as i64)
+  } else {
+    TagValue::F64(val)
+  }
+}
+
 /// A byte-counting [`core::fmt::Write`] sink: holds nothing, only the running
 /// `write_str` byte total. Feeding [`format_g_into`] / [`Rational::exiftool_val_str_into`]
 /// a `LenSink` yields the formatted byte length with ZERO heap allocation —
@@ -1228,6 +1245,14 @@ const _: () = {
       // `n/d` f64 would emit more digits, a DIFFERENT value than the golden's
       // rounded one.)
       let rounded = self.exiftool_val_str();
+      // ExifTool stringifies a WHOLE rational as a bare integer (`0/256 → "0"`,
+      // `120/1 → "120"`), never serde's float `"0.0"`/`"120.0"`. When the
+      // `%.{sig}g` text is a pure integer, emit it as an `i64` so the token is
+      // byte-identical to bundled; a fractional rational keeps the f64 path
+      // (its rounded text re-parses to the golden's rounded number, value-equal).
+      if let Ok(i) = rounded.parse::<i64>() {
+        return s.serialize_i64(i);
+      }
       match rounded.parse::<f64>() {
         Ok(f) if f.is_finite() => s.serialize_f64(f),
         // Defensive: a rounded form that does not re-parse as finite (not

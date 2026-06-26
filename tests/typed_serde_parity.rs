@@ -255,24 +255,18 @@ const NOT_ACTIVE: &[&str] = &[
   // `Sony:LensType` 55 needs the unported `Exif::PrintLensID` disambiguator —
   // see `FIXTURE_EXCLUDED_KEYS`).
   //
-  // The remaining OLDER Sony ARW raw (`DSLR-A200`) stays accept-deferred: its
-  // core EXIF/SubIFD + the ENTIRE SR2 subsystem (the `DNGPrivateData` 0xc634 →
-  // `%Sony::SR2Private` descent, the `Decrypt` LFSR, and the decrypted
-  // `%Sony::SR2SubIFD` + `%Sony::SR2DataIFD` walks — `SR2:*`/`SR2SubIFD:*`/
-  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are its
-  // Sony ARW `SubIFD:*` raw tags, the `Compression => 'Sony ARW Compressed'`
-  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. The
-  // `%MinoltaRaw::Main` MRW port is now DONE — the `%Sony::SR2Private` `MRWInfo`
-  // (0x7250) → PRD/WBG/RIF `\0MRI` walk emits all 22 `MinoltaRaw:*` leaves
-  // byte-exact (asserted positively in `conformance.rs`). The RESIDUAL keeping
-  // A200 deferred is the A200-specific Sony Main sub-table tower
-  // (`CameraSettings`/`CameraInfoA200` — ~72 `Sony:*` exposure/AF/lens leaves) +
-  // the dependent `Composite:LensID`/`FocusDistance`, plus the SR2-corrected
-  // `Composite:ImageSize`/`Megapixels` (which need the composite bare-name
-  // resolution to prefer `MinoltaRaw:ImageWidth` (Priority 1) over the
-  // `SubIFD:ImageWidth` (`Priority => 0`) — a priority-aware resolution change).
-  // That OLDER sub-table tower is a separate faithful campaign.
-  "Sony_DSLR-A200_real.ARW",
+  // The `Sony_DSLR-A200_real.ARW` raw is now ACTIVE: on top of chunk 1's
+  // `%MinoltaRaw::Main` MRW port (the `%Sony::SR2Private` `MRWInfo` 0x7250 →
+  // PRD/WBG/RIF `\0MRI` walk), chunk 2 ported the OLDER `%Sony::Main`
+  // sub-table tower — `CameraInfo2` (0x0010, LittleEndian, the 9-point AF +
+  // `%afStatusInfo` grid), `FocusInfo` (0x0020, DriveMode2/Rotation/ISO/
+  // FocusPosition/TiffMeteringImage), and `CameraSettings` (0x0114, BigEndian
+  // `int16u`, the exposure/aperture/flash/WB/AF/battery leaves) — so every
+  // `Sony:*` leaf emits byte-exact, and the dependent `Composite:FocusDistance`
+  // (= `inf`, via the new `Sony:FocusPosition` = 128) computes. A200 carries a
+  // `FIXTURE_EXCLUDED_KEYS` entry for `Composite:ImageSize`/`Megapixels` (#436,
+  // the bare-name Composite priority residual) + the ambiguous `Composite:LensID`
+  // (the A33-style `Exif::PrintLensID` lens-DB disambiguation).
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
@@ -518,6 +512,28 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // `Sony:LensType` MakerNote leaf IS emitted. Mirrors
   // `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s `A33_DEFERRED`.
   ("Sony_SLT-A33_real.ARW", &["Composite:LensID"]),
+  // The `Sony_DSLR-A200_real.ARW` raw is now active (its OLDER `%Sony::Main`
+  // sub-table tower — `CameraInfo2`/`FocusInfo`/`CameraSettings` — is fully
+  // ported, see the `NOT_ACTIVE` note). Three composite residuals are dropped:
+  // `Composite:ImageSize`/`Megapixels` (#436 — bundled resolves the bare-name
+  // `Composite:ImageSize` from `MinoltaRaw:ImageWidth` `Priority => 1` over
+  // `SubIFD:ImageWidth` `Priority => 0`; exifast's bare-name Composite resolver
+  // is emission-order-first, picking the padded `SubIFD` 3880x2600 → 10.1 MP,
+  // not the SR2-corrected 3872x2592 → 10.0 MP — a shared-resolver change tracked
+  // in owner-deferred #436), and `Composite:LensID` (the A33-style ambiguous
+  // `Sony:LensType` 129 = `Tamron Lens (129)`, needing the unported
+  // `Exif::PrintLensID` disambiguator). All three are dropped from BOTH sides;
+  // every `Sony:*` MakerNote leaf + the `Composite:FocusDistance` IS byte-exact.
+  // Mirrors `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s
+  // `A200_DEFERRED`.
+  (
+    "Sony_DSLR-A200_real.ARW",
+    &[
+      "Composite:ImageSize",
+      "Composite:Megapixels",
+      "Composite:LensID",
+    ],
+  ),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1644,7 +1660,14 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `CameraSettings3`, `ExtraInfo3`, the enciphered `Tag900b` + the five
 /// dependent `Composite:*`), with a single `FIXTURE_EXCLUDED_KEYS` entry for the
 /// `Composite:LensID` ambiguous-LensType-disambiguation residual.
-const EXPECTED_ACTIVE_FIXTURES: usize = 638;
+///
+/// 638 → 639: the `Sony_DSLR-A200_real.ARW` raw GRADUATES out of `NOT_ACTIVE` —
+/// its OLDER `%Sony::Main` sub-table tower is fully ported (`CameraInfo2` 0x0010
+/// LittleEndian, `FocusInfo` 0x0020, `CameraSettings` 0x0114 BigEndian `int16u`)
+/// on top of chunk 1's `MinoltaRaw` subsystem, with the dependent
+/// `Composite:FocusDistance` computing, and a `FIXTURE_EXCLUDED_KEYS` entry for
+/// `Composite:ImageSize`/`Megapixels` (#436) + the ambiguous `Composite:LensID`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 639;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

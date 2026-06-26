@@ -12248,7 +12248,9 @@ fn sony_emit_binary_subdir<S: ExifSink>(
   print_conv: bool,
   out: &mut S,
 ) {
-  use makernotes::vendors::sony::{camerainfo3, camerasettings3, extrainfo3, moreinfo};
+  use makernotes::vendors::sony::{
+    camerainfo2, camerainfo3, camerasettings, camerasettings3, extrainfo3, focusinfo, moreinfo,
+  };
   let off = entry.value_offset();
   let Some(end) = off.checked_add(entry.value_size()) else {
     return;
@@ -12257,15 +12259,30 @@ fn sony_emit_binary_subdir<S: ExifSink>(
     return;
   };
   let emissions = match entry.tag_id() {
+    // `CameraInfo2` — `$count == 5506 || 6118` (Sony.pm:728-734), LittleEndian.
+    // The A200-A390 generation; dispatched BEFORE `CameraInfo3`'s 15360 gate.
+    0x0010 if entry.value_size() == 5506 || entry.value_size() == 6118 => {
+      camerainfo2::parse_camera_info2(raw, print_conv)
+    }
     // `CameraInfo3` — `$count == 15360` (Sony.pm:2280-2300). The `$count` gate
     // is the entry's value byte-count.
     0x0010 if entry.value_size() == 15360 => {
       camerainfo3::parse_camera_info3(raw, model, print_conv)
     }
+    // `FocusInfo` — `$count == 19154 || 19148` (Sony.pm:753-760), dispatched
+    // OVER `MoreInfo` for the A200-A900 generation.
+    0x0020 if entry.value_size() == 19154 || entry.value_size() == 19148 => {
+      focusinfo::parse_focus_info(raw, model, print_conv)
+    }
     // `MoreInfo` — dispatched (over `FocusInfo`) when `$count` is NOT
     // 19154/19148 (Sony.pm:44-63).
     0x0020 if entry.value_size() != 19154 && entry.value_size() != 19148 => {
       moreinfo::parse_more_info(raw, model, print_conv)
+    }
+    // `CameraSettings` — `$count == 280 || 364` (Sony.pm:805-811), BigEndian
+    // `int16u`. The A200/A300/A350/A700/A850/A900 generation.
+    0x0114 if entry.value_size() == 280 || entry.value_size() == 364 => {
+      camerasettings::parse_camera_settings(raw, print_conv)
     }
     // `CameraSettings3` — `$count == 1536 || $count == 2048` (Sony.pm:97-127).
     0x0114 if entry.value_size() == 1536 || entry.value_size() == 2048 => {

@@ -1641,10 +1641,9 @@ mod exif {
       composite(&val, "ScaleFactor35efl"),
       Some(TagValue::F64(1.5))
     );
-    assert_eq!(
-      composite(&val, "FocalLength35efl"),
-      Some(TagValue::F64(75.0))
-    );
+    // `FocalLength35efl` ValueConv is the bare 35mm-equiv focal; an exactly-whole
+    // value is an `I64` (`75`), not `F64(75.0)`, so the `-n` token is bare `75`.
+    assert_eq!(composite(&val, "FocalLength35efl"), Some(TagValue::I64(75)));
     assert_eq!(
       composite(&val, "DOF"),
       Some(TagValue::Str("0.693325809394639 0.723195615956146".into()))
