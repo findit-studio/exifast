@@ -10334,6 +10334,76 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
       "A33 older-SubDirectory port must emit {needle}: {got}",
     );
   }
+
+  // The DSLR-A200 (2008 Minolta-derived body) `MinoltaRaw` subsystem — the
+  // `%Sony::SR2Private` `MRWInfo` (0x7250) → `%MinoltaRaw::Main` `\0MRI`-block
+  // walk emits the 22 `MinoltaRaw:*` PRD/WBG/RIF leaves BYTE-EXACT in BOTH the
+  // PrintConv (`-j`) and raw (`-n`) modes. (The A200 itself is still NOT_ACTIVE
+  // pending its Sony Main `CameraSettings`/`CameraInfoA200` sub-table tower — the
+  // remaining ~72 `Sony:*` AF/exposure leaves + the SR2-corrected `Composite:
+  // ImageSize`/`Megapixels` — but the MinoltaRaw port is proven here.)
+  let a200 = std::fs::read(format!("{root}/tests/fixtures/Sony_DSLR-A200_real.ARW"))
+    .expect("read Sony_DSLR-A200_real.ARW");
+  let a200_j = extract_info("Sony_DSLR-A200_real.ARW", &a200, true);
+  for needle in [
+    // PRD: a numeric `string[8]` FirmwareID (bare-number JSON), the SR2-corrected
+    // dimensions, the int8u HASH StorageMethod, and the HASH-miss BayerPattern.
+    "\"MinoltaRaw:FirmwareID\":21870002",
+    "\"MinoltaRaw:SensorHeight\":2608",
+    "\"MinoltaRaw:SensorWidth\":3880",
+    "\"MinoltaRaw:ImageHeight\":2592",
+    "\"MinoltaRaw:ImageWidth\":3872",
+    "\"MinoltaRaw:RawDepth\":16",
+    "\"MinoltaRaw:BitDepth\":12",
+    "\"MinoltaRaw:StorageMethod\":\"Padded\"",
+    "\"MinoltaRaw:BayerPattern\":\"Unknown (0)\"",
+    // WBG: the int8u[4] scale + the non-DiMAGE `WB_RGGBLevels` int16u[4] variant.
+    "\"MinoltaRaw:WBScale\":\"2 2 2 2\"",
+    "\"MinoltaRaw:WB_RGGBLevels\":\"345 256 256 800\"",
+    // RIF: the ConvertWBMode/ISOSetting-OTHER/ColorTemperature-?:Auto convs + the
+    // SONY-make ZoneMatching@74 + the A200/A700 ColorTemperature@78/ColorFilter@79.
+    "\"MinoltaRaw:Saturation\":0",
+    "\"MinoltaRaw:WBMode\":\"Auto\"",
+    "\"MinoltaRaw:ProgramMode\":\"Unknown (128)\"",
+    "\"MinoltaRaw:ISOSetting\":2",
+    "\"MinoltaRaw:BWFilter\":0",
+    "\"MinoltaRaw:Hue\":-1",
+    "\"MinoltaRaw:ZoneMatching\":\"ISO Setting Used\"",
+    "\"MinoltaRaw:ColorTemperature\":\"Auto\"",
+    "\"MinoltaRaw:ColorFilter\":0",
+  ] {
+    assert!(
+      a200_j.contains(needle),
+      "A200 MinoltaRaw (-j) must emit {needle}: {a200_j}",
+    );
+  }
+  let a200_n = extract_info("Sony_DSLR-A200_real.ARW", &a200, false);
+  for needle in [
+    // The `-n` raw values for the PrintConv leaves (StorageMethod/BayerPattern/
+    // WBMode/ProgramMode/ISOSetting/ZoneMatching/ColorTemperature).
+    "\"MinoltaRaw:StorageMethod\":82",
+    "\"MinoltaRaw:BayerPattern\":0",
+    "\"MinoltaRaw:WBMode\":0",
+    "\"MinoltaRaw:ProgramMode\":128",
+    "\"MinoltaRaw:ISOSetting\":4",
+    "\"MinoltaRaw:ZoneMatching\":0",
+    "\"MinoltaRaw:ColorTemperature\":0",
+  ] {
+    assert!(
+      a200_n.contains(needle),
+      "A200 MinoltaRaw (-n) must emit {needle}: {a200_n}",
+    );
+  }
+  // The MRW header check gates the dispatch: the FX3 (modern body, non-MRW 0x7250
+  // payload) and A33 emit NO `MinoltaRaw:*` leaves.
+  for fx in ["Sony_ILME-FX3_real.ARW", "Sony_SLT-A33_real.ARW"] {
+    let bytes = std::fs::read(format!("{root}/tests/fixtures/{fx}")).expect("read fixture");
+    let out = extract_info(fx, &bytes, true);
+    assert!(
+      !out.contains("\"MinoltaRaw:"),
+      "{fx} must NOT dispatch MinoltaRaw (non-MRW 0x7250): {out}",
+    );
+  }
 }
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \

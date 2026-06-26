@@ -261,13 +261,17 @@ const NOT_ACTIVE: &[&str] = &[
   // `%Sony::SR2SubIFD` + `%Sony::SR2DataIFD` walks — `SR2:*`/`SR2SubIFD:*`/
   // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are its
   // Sony ARW `SubIFD:*` raw tags, the `Compression => 'Sony ARW Compressed'`
-  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. Its
-  // RESIDUAL is the A200-specific sub-table tower (`CameraSettings`/
-  // `CameraInfoA200` — ~72 leaves) which emits the remaining `Sony:*`
-  // exposure/AF/lens leaves + the dependent `Composite:*`; A200 ADDITIONALLY
-  // needs the `%MinoltaRaw::Main` MRW port (22 `MinoltaRaw:*`, which also
-  // overrides its `Composite:ImageSize`/`Megapixels`). That OLDER sub-table
-  // tower is a separate faithful campaign.
+  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. The
+  // `%MinoltaRaw::Main` MRW port is now DONE — the `%Sony::SR2Private` `MRWInfo`
+  // (0x7250) → PRD/WBG/RIF `\0MRI` walk emits all 22 `MinoltaRaw:*` leaves
+  // byte-exact (asserted positively in `conformance.rs`). The RESIDUAL keeping
+  // A200 deferred is the A200-specific Sony Main sub-table tower
+  // (`CameraSettings`/`CameraInfoA200` — ~72 `Sony:*` exposure/AF/lens leaves) +
+  // the dependent `Composite:LensID`/`FocusDistance`, plus the SR2-corrected
+  // `Composite:ImageSize`/`Megapixels` (which need the composite bare-name
+  // resolution to prefer `MinoltaRaw:ImageWidth` (Priority 1) over the
+  // `SubIFD:ImageWidth` (`Priority => 0`) — a priority-aware resolution change).
+  // That OLDER sub-table tower is a separate faithful campaign.
   "Sony_DSLR-A200_real.ARW",
 ];
 

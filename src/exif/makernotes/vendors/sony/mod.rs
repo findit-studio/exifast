@@ -76,6 +76,7 @@ pub mod camerasettings3;
 pub mod decipher;
 pub mod extrainfo3;
 pub mod lens_types;
+pub mod minoltaraw;
 pub mod model_ids;
 pub mod moreinfo;
 pub mod printconv;

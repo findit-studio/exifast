@@ -193,6 +193,22 @@ pub enum Conv {
   /// 8-digit hex string `0x________`. With print_conv OFF the bare decimal value
   /// emits (the `emit_raw` path).
   SonyHex8,
+  /// `%MinoltaRaw::RIF` `WBMode` (offset 4) PrintConv —
+  /// `Image::ExifTool::MinoltaRaw::ConvertWBMode($val)` (`MinoltaRaw.pm:161`,
+  /// `:348-371`). The low nibble selects the WB name; a high nibble in `6..=12`
+  /// appends ` (hi-8)`. With print_conv OFF the bare `$val` integer emits.
+  MinoltaWbMode,
+  /// `%MinoltaRaw::RIF` `ISOSetting` (offset 6) PrintConv (`MinoltaRaw.pm:179-200`)
+  /// — a HASH (`0 => 'Auto'`, `48 => 100`, …, `174 => '80 (Zone Matching Low)'`)
+  /// with an `OTHER` fall-through `int(2 ** (($val-48)/8) * 100 + 0.5)`. The
+  /// `RawConv => '$val == 255 ? undef'` drop is applied at decode (the leaf is not
+  /// emitted for `255`). With print_conv OFF the bare `$val` integer emits.
+  MinoltaIsoSetting,
+  /// `%MinoltaRaw::RIF` `ColorTemperature` (offset 78, the A200/A700 arm,
+  /// `MinoltaRaw.pm:325-333`) — `ValueConv => '$val * 100'` then
+  /// `PrintConv => '$val ? $val : "Auto"'`. With print_conv OFF the post-ValueConv
+  /// `$val * 100` integer emits (so a zero raw stays `0`, not `"Auto"`).
+  MinoltaColorTemperature,
   /// `FileSource` (0xa300) PrintConv (`Exif.pm:2815-2821`). A HASH whose keys
   /// are the integer codes `1`/`2`/`3` PLUS the literal 4-byte STRING
   /// `"\x03\x00\x00\x00"` (`Exif.pm:2820`) — Sigma incorrectly gives this
