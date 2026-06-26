@@ -101,17 +101,24 @@ impl SonyTag {
 
   /// The ExifTool `Priority => N` of this `%Sony::Main` leaf — `0` for a
   /// `Priority => 0` row (a duplicate that never overrides an earlier same-`(doc,
-  /// family1, name)` tag, `ExifTool.pm:9544-9560`), `1` (the default,
-  /// `:9553`) otherwise. The two `Priority => 0` rows the port WALKS+emits are
-  /// `0x201b FocusMode` (`Sony.pm:1246`) and `0xb04f DynamicRangeOptimizer`
-  /// (`Sony.pm:2652`); every other `Priority => 0` Sony row lives in a deferred
-  /// sub-table (CameraInfo*/Tag2010*/Tag90xx/AFInfo/SR2DataIFD) that emits no
-  /// leaf, so it never reaches here.
+  /// family1, name)` tag, `ExifTool.pm:9544-9560`), `2` for the one
+  /// `Priority => 2` row, `1` (the default, `:9553`) otherwise.
+  ///
+  /// - `0x201b FocusMode` (`Sony.pm:1246`) + `0xb04f DynamicRangeOptimizer`
+  ///   (`Sony.pm:2652`) are `Priority => 0` (the WALKED+emitted ones; every
+  ///   other `Priority => 0` Sony row lives in a deferred sub-table that emits
+  ///   no leaf, so it never reaches here).
+  /// - `0x0115 WhiteBalance` is `Priority => 2` ("more reliable for the RX100",
+  ///   `Sony.pm:839`): it must OUTRANK the default-priority `0xb054
+  ///   WhiteBalance` (`Sony.pm:2685`, also named `WhiteBalance`), which is
+  ///   walked LATER (`0xb054 > 0x0115`) and would otherwise win last-wins. With
+  ///   priority 2 the later 0xb054 (priority 1) cannot override it.
   #[must_use]
   #[inline(always)]
   pub const fn tag_priority(&self) -> u8 {
     match self.id {
       0x201b | 0xb04f => 0,
+      0x0115 => 2,
       _ => 1,
     }
   }

@@ -421,12 +421,14 @@ case "$FIX" in
   # the port defers (these were in its `EXCLUDE` env). `IFD1:ThumbnailImage` is
   # NOW emitted via the #331 EXIF `DataTag` channel (no longer excluded).
   # PR 4: the full lens chain now builds (NIKON, NOT Canon — the simple
-  # `$foc35/$focal` ScaleFactor path: 75/50 = 1.5). The MakerNote-derived
-  # Composites (BlueBalance/RedBalance/AutoFocus/LensID/LensSpec) + the non-
-  # Composite port deferrals remain.
+  # `$foc35/$focal` ScaleFactor path: 75/50 = 1.5). The Sony-deep-table chunk
+  # ports `Composite:RedBalance`/`BlueBalance` (the `RedBlueBalance` rggbLookup
+  # over `Nikon:WB_RGGBLevels` = "562 256 256 537" ⇒ 2.195313 / 2.097656,
+  # byte-exact vs bundled) — NO LONGER excluded. The other MakerNote-derived
+  # Composites (`AutoFocus`/`LensID`/`LensSpec`, unported) + the non-Composite
+  # port deferrals remain.
   NikonD2Hs.jpg)
     EXCLUDE_ARR+=(-x PreviewIFD:all -x ExifIFD:CFAPattern \
-                  -x Composite:BlueBalance -x Composite:RedBalance \
                   -x Composite:AutoFocus -x Composite:LensID -x Composite:LensSpec) ;;
   # Pentax also drops `Pentax:PreviewImageStart`/`PreviewImage` (IsOffset binary
   # extraction, unported). `IFD1:ThumbnailImage` is NOW emitted via the #331 EXIF

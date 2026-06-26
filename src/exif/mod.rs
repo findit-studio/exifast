@@ -208,6 +208,22 @@ pub enum IfdKind {
   /// `JpgFromRawStart`/`JpgFromRawLength` arms of the `0x111`/`0x117` conditional
   /// tag lists (`Exif.pm:673-684`/`:769-778`, #331-P2).
   SubIfd(u32),
+  /// The Sony `SR2Private` directory — the encrypted private IFD reached via the
+  /// IFD0 `DNGPrivateData` 0xc634 pointer (`Sony.pm:10448`, `GROUPS => { 1 =>
+  /// 'SR2' }`). Family-1 group `"SR2"`; walked against `%Sony::SR2Private`.
+  Sr2Private,
+  /// The DECRYPTED `SR2SubIFD` directory (`Sony.pm:10515`, `SET_GROUP1 => 1` ⇒
+  /// the family-1 group is the directory name `"SR2SubIFD"`). Multiple SR2SubIFD
+  /// directories (one per `SR2SubIFDOffset` value) would suffix the number; the
+  /// activation bodies carry exactly one, so the payload is the directory number
+  /// (`0 → "SR2SubIFD"`, `1 → "SR2SubIFD1"`, …). Walked against `%Sony::SR2SubIFD`.
+  Sr2SubIfd(u32),
+  /// One `SR2DataIFD` directory reached via the `0x74c0` SubIFD pointer inside
+  /// `SR2SubIFD` (`Sony.pm:10545-10554`, `GROUPS => { 1 => 'SR2DataIFD' }`,
+  /// `SET_GROUP1 => 1`). The `$dirNum`-th is `"SR2DataIFD"`/`"SR2DataIFD1"`/… —
+  /// `0 → "SR2DataIFD"`, `1 → "SR2DataIFD1"`, … (`Exif.pm:7076`). Walked against
+  /// `%Sony::SR2DataIFD`.
+  Sr2DataIfd(u32),
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -467,6 +483,15 @@ impl IfdKind {
       // (`Exif.pm:7074-7076`): the classic-TIFF SubIFD tower's `$dirNum`-th
       // directory is `SubIFD`/`SubIFD1`/`SubIFD2`/…
       IfdKind::SubIfd(dir_num) => IfdName::sub_ifd(dir_num),
+      // `GROUPS => { 1 => 'SR2' }` (`Sony.pm:10451`).
+      IfdKind::Sr2Private => IfdName::literal("SR2"),
+      // `SET_GROUP1 => 1` ⇒ the family-1 group is the directory name, with the
+      // `$dirNum` suffix appended for the 2nd+ (`DirName "SR2SubIFD$num"`,
+      // `Sony.pm:11838`; `$num 0 → "SR2SubIFD"`).
+      IfdKind::Sr2SubIfd(dir_num) => IfdName::literal_suffixed("SR2SubIFD", dir_num),
+      // `GROUPS => { 1 => 'SR2DataIFD' }` + `SET_GROUP1 => 1` (`Sony.pm:10579`);
+      // the `0x74c0` pointer's `s/\d*$/$dirNum/ if $dirNum` numbers the 2nd+.
+      IfdKind::Sr2DataIfd(dir_num) => IfdName::literal_suffixed("SR2DataIFD", dir_num),
     }
   }
 
@@ -501,6 +526,11 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     // pointer's SubDirectory carries no `TagTable` redirect, so `$newTagTable =
     // $tagTablePtr` (`Exif.pm:6943`).
     IfdKind::SubIfd(_) => TableRef::Exif,
+    // The Sony SR2 subsystem (`Sony.pm:10448-10586`) — each directory carries an
+    // explicit `TagTable` redirect.
+    IfdKind::Sr2Private => TableRef::SonySr2Private,
+    IfdKind::Sr2SubIfd(_) => TableRef::SonySr2SubIfd,
+    IfdKind::Sr2DataIfd(_) => TableRef::SonySr2DataIfd,
   }
 }
 
@@ -1186,6 +1216,11 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // do not flow through this default-group helper), but the mapping is declared
     // here for completeness with the other vendor tables.
     TableRef::NikonPreviewIfd => Some("PreviewIFD"),
+    // The Sony SR2 directories carry their family-1 group on the directory
+    // (`GROUPS => { 1 => 'SR2'/'SR2SubIFD'/'SR2DataIFD' }` + `SET_GROUP1 => 1`),
+    // so the group comes from the `IfdKind` (like a core IFD), NOT a vendor
+    // override — return `None` so `emit_entry` keeps the kind-derived group.
+    TableRef::SonySr2Private | TableRef::SonySr2SubIfd | TableRef::SonySr2DataIfd => None,
     TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
@@ -1251,6 +1286,7 @@ enum MakerNoteValueConvDecode<'a> {
     order: ByteOrder,
     make: Option<smol_str::SmolStr>,
     model: Option<smol_str::SmolStr>,
+    software: Option<smol_str::SmolStr>,
   },
   /// Panasonic — `parse_main_gated(data, mn_offset, mn_len, order, ·, model, base_rule)`.
   Panasonic {
@@ -1406,6 +1442,7 @@ impl MakerNoteValueConvDecode<'_> {
         order,
         make,
         model,
+        software,
       } => {
         // The `-n` recompute is the isolated walk with `print_conv = false` and the
         // typed slot discarded (the `-n` path needs only the ValueConv emissions),
@@ -1421,6 +1458,7 @@ impl MakerNoteValueConvDecode<'_> {
           *order,
           make.as_deref(),
           model.as_deref(),
+          software.as_deref(),
           false,
         )
         .map(|(e, _)| e)
@@ -3262,6 +3300,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
+    captured_software: None,
     // COMMON path: a fresh per-block set ⇒ silent trailing-chain revisit
     // (no cross-source cycle-guard). Byte-identical to before.
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
@@ -3475,6 +3514,7 @@ fn parse_bigtiff<'a>(
     geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     active_ifd_offsets: Vec::new(),
@@ -3703,6 +3743,7 @@ fn parse_tiff_with_base_shared<'a>(
     geotiff_ascii_params: None,
     captured_make: None,
     captured_model: None,
+    captured_software: None,
     // SHARED path: the external `$$et{PROCESSED}` map. A chain-IFD revisit —
     // within this block or from an earlier source — warns + skips.
     chain_guard: ChainGuard::Shared(processed),
@@ -4018,6 +4059,13 @@ struct Walker<'a, 'g> {
   /// (the `RawConv` `$$self{Model} = $val` runs each time — Exif.pm:599), so
   /// a hostile two-`Model` IFD0 hands off the LATER value.
   captured_model: Option<String>,
+  /// IFD0's `Software` tag value (`Exif.pm:906`) — same role as
+  /// [`captured_make`](Self::captured_make): the RawConv-`s/\s+$//`-trimmed,
+  /// IFD0-only, last-wins `$$self{Software}` the dispatcher reads. The Sony
+  /// `Tag9401` ISOInfo sub-block selection (`Sony.pm:8659-8662`) keys on it to
+  /// disambiguate firmware variants (`ILCE-7M4 v2/v3`, `ILCE-1 v2`) whose
+  /// `Ver9401` clashes. Owned `String` (transient builder per SmolStr policy).
+  captured_software: Option<String>,
   /// Chain-IFD (IFD0 / trailing-IFD) reprocess guard — the trailing-chain
   /// loop breaker AND (in [`ChainGuard::Shared`] mode) the cross-source
   /// `$$et{PROCESSED}` cycle-guard. ExifTool records every NON-zero-`DirLen`
@@ -5381,6 +5429,17 @@ impl Walker<'_, '_> {
       // `%Nikon::PreviewIFD` (#242) — the warning-form name resolves against the
       // PreviewIFD table (its renamed `PreviewImageStart`/`Length` leaves).
       TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name()),
+      // The Sony SR2 directories — the warning-form name resolves against the
+      // active SR2 table (`Sony.pm:10448-10586`).
+      TableRef::SonySr2Private => {
+        makernotes::vendors::sony::sr2::sr2_private_lookup(tag_id).map(|t| t.name())
+      }
+      TableRef::SonySr2SubIfd => {
+        makernotes::vendors::sony::sr2::sr2_subifd_lookup(tag_id).map(|t| t.name())
+      }
+      TableRef::SonySr2DataIfd => {
+        makernotes::vendors::sony::sr2::sr2_data_ifd_lookup(tag_id).map(|t| t.name())
+      }
       _ => tables::lookup(tag_id).map(|t| t.name()),
     }
   }
@@ -5884,6 +5943,47 @@ impl Walker<'_, '_> {
       return Step::Keep;
     }
 
+    // ---- Sony SR2Private (`0xc634 DNGPrivateData` on an ARW/SR2) ------------
+    // `%Exif::Main` 0xc634 is a CONDITIONAL tag list (`Exif.pm:3607-3710`): on a
+    // Sony ARW/SR2 (`$$self{TIFF_TYPE} =~ /^(ARW|SR2)$/`) its FIRST arm is the
+    // `SR2Private` SubDirectory (`Flags => 'SubIFD'`, `Start => '$val'`), NOT the
+    // default `DNGPrivateData` Binary leaf. `Start => '$val'` is the int32u value
+    // of the 4 value bytes (the verbose "int8u[4] read as int32u[1]" — `FixFormat
+    // int8u` is a write-side workaround; the Start uses the int32u reading). The
+    // pointed-to IFD is walked against `%Sony::SR2Private`, after which the SR2
+    // decrypt + SR2SubIFD/SR2DataIFD walk runs ([`process_sr2`]). This is
+    // core-Exif-IFD0-scoped (the same `%Exif::Main`-in-IFD0 gate the conditional
+    // tag list keys on); a non-ARW/SR2 file keeps the `DNGPrivateData` leaf
+    // (resolved below via `tables::lookup`). The pointer leaf itself is not
+    // emitted (`Step::Keep`).
+    if matches!(self.active_table, TableRef::Exif)
+      && matches!(kind, IfdKind::Ifd0)
+      && tag_id == 0xc634
+      && matches!(self.file_type.as_deref(), Some("ARW" | "SR2"))
+    {
+      // `$val` — the int32u Start. The 4 value bytes are at `value_offset` (an
+      // inline value, size 4). A short/unreadable value yields no descent.
+      if let Some(start) = get_u32(self.data, value_offset, self.order) {
+        self.process_sr2(start as usize);
+      }
+      return Step::Keep;
+    }
+
+    // ---- Sony SR2DataIFD (`0x74c0` SubIFD pointer inside SR2SubIFD) ---------
+    // `%Sony::SR2SubIFD` 0x74c0 is a `Flags => 'SubIFD'`, `Start => '$val'`,
+    // `MaxSubdirs => 20` pointer to one-or-more `%Sony::SR2DataIFD` directories
+    // (`Sony.pm:10545-10554`). Its value is a multi-offset list (`split ' '`),
+    // each a FILE-relative offset into the SAME decrypted SR2 block this walk is
+    // running over — so the buffer position is `off + value_offset_base` (the sub-
+    // walker's `value_offset_base == -(sr2Offset)`). The `$dirNum`-th directory is
+    // `SR2DataIFD`/`SR2DataIFD1`/… The pointer leaf itself is not emitted.
+    if self.active_table == TableRef::SonySr2SubIfd
+      && tag_id == makernotes::vendors::sony::sr2::SR2_DATA_IFD_POINTER
+    {
+      self.dispatch_sr2_data_ifd(value_offset, read_len, format, count);
+      return Step::Keep;
+    }
+
     // ---- Canon LIST / Format-override specials (`0x28` / `0x96`) ---------
     // `%Canon::Main` carries two leaf tags whose VALUE bytes are rewritten at
     // walk time — `Format => 'undef'` (0x28 ImageUniqueID) and the model-
@@ -6008,6 +6108,14 @@ impl Walker<'_, '_> {
       // `ExposureMode` int8u[4] row. The Walker resolves them off the active
       // Leica variant table exactly as Sony/Pentax/Samsung do.
       TableRef::Leica(v) => makernotes::vendors::leica::format_override(v, tag_id),
+      // `%Sony::SR2Private` (`Sony.pm:10448`) — `SR2SubIFDKey` (0x7221) carries
+      // `Format => 'int32u'` so its `undef[4]` on-disk value re-reads as one
+      // int32u (the decrypt key). SR2SubIFD/SR2DataIFD carry no read-side
+      // override (their on-disk formats already match).
+      TableRef::SonySr2Private => {
+        makernotes::vendors::sony::sr2::sr2_private_format_override(tag_id)
+      }
+      TableRef::SonySr2SubIfd | TableRef::SonySr2DataIfd => None,
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -7128,6 +7236,7 @@ impl Walker<'_, '_> {
                 // branches (Canon/Panasonic-style model threading).
                 let make = self.captured_make.as_deref();
                 let model = self.captured_model.as_deref();
+                let software = self.captured_software.as_deref();
                 // Walk the Sony Main IFD in a FRESH, ISOLATED `Walker`
                 // ([`sony_makernote_isolated`]) — NOT on `self` — then capture its
                 // emissions into the cached-emission buffer (#243 phase 3,
@@ -7146,7 +7255,7 @@ impl Walker<'_, '_> {
                 // emissions are recomputed on demand via the SAME helper with
                 // `print_conv = false`.
                 if let Some((emi_pc, typed_pc)) = sony_makernote_isolated(
-                  self.data, mn_offset, mn_len, body_off, self.order, make, model, true,
+                  self.data, mn_offset, mn_len, body_off, self.order, make, model, software, true,
                 ) {
                   meta.set_sony(typed_pc);
                   cached_pc = emi_pc;
@@ -7158,6 +7267,7 @@ impl Walker<'_, '_> {
                     order: self.order,
                     make: make.map(smol_str::SmolStr::new),
                     model: model.map(smol_str::SmolStr::new),
+                    software: software.map(smol_str::SmolStr::new),
                   };
                 }
               }
@@ -7802,6 +7912,234 @@ impl Walker<'_, '_> {
     }
   }
 
+  /// `ProcessSR2` (`Sony.pm:11650-11864`) — walk the `SR2Private` directory at
+  /// `start` (its leaves emit under `SR2:*` and capture `SR2SubIFDOffset`/
+  /// `SR2SubIFDLength`/`SR2SubIFDKey`), then DECRYPT the SR2SubIFD block and walk
+  /// it (`SR2SubIFD:*`) plus its `0x74c0 SR2DataIFD` children (`SR2DataIFD:*`).
+  ///
+  /// Faithful to the Perl flow: `ProcessExif` runs first on `%Sony::SR2Private`
+  /// (`Sony.pm:11806`), THEN — only if `$$et{SR2SubIFDOffset}` was set — the
+  /// block is read at `$offset + $base` for `$length` bytes, `Decrypt`ed with
+  /// `$key`, and walked as `%Sony::SR2SubIFD` directories (one per offset value,
+  /// `Sony.pm:11808-11859`). For a standalone ARW `$base == 0` (the TIFF block IS
+  /// the file). The decrypted block is a SEPARATE buffer whose byte 0 is file
+  /// offset `$offset`, so its out-of-line value pointers (which are file-relative)
+  /// resolve at `decrypted[V - offset]` — a fresh [`Walker`] over the decrypted
+  /// buffer with `value_offset_base = -(offset)` reproduces `DataPos => $offset`.
+  ///
+  /// MEMORY-SAFE: `offset`/`length` are range-checked against `self.data` before
+  /// the read; the decrypted-buffer walk is bounds-checked by `process_subdir`;
+  /// [`sr2::decrypt`] stops at the buffer end.
+  fn process_sr2(&mut self, start: usize) {
+    use makernotes::vendors::sony::sr2;
+    // 1) Walk the SR2Private IFD. Its leaves (`SR2SubIFDOffset`/`Length`/`Key`)
+    //    are appended to `self.entries`; record the pre-walk length so the
+    //    data-member capture scans ONLY the SR2Private leaves just added.
+    let before = self.entries.len();
+    self.process_subdir(
+      start,
+      IfdKind::Sr2Private,
+      TableRef::SonySr2Private,
+      ByteOrderRule::Fixed(self.order),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+    // 2) Capture the three data members from the SR2Private leaves (the
+    //    `RawConv => '$$self{SR2SubIFDxxx} = $val'` side effects, `Sony.pm:
+    //    10464/10471/10478`). `SR2SubIFDOffset` may be multi-valued (`split ' '`,
+    //    `Sony.pm:11810`); take the first for the primary SubIFD and keep the
+    //    rest for the SR2SubIFD1/2… siblings.
+    let mut offsets: std::vec::Vec<u64> = std::vec::Vec::new();
+    let mut length: Option<u64> = None;
+    let mut key: Option<u32> = None;
+    if let Some(new_entries) = self.entries.get(before..) {
+      for e in new_entries {
+        match e.tag_id {
+          0x7200 => {
+            if let RawValue::U64(v) = e.value.raw() {
+              offsets = v.clone();
+            } else if let Some(n) = first_uint(e.value.raw()) {
+              offsets = std::vec![n];
+            }
+          }
+          0x7201 => length = first_uint(e.value.raw()),
+          0x7221 => key = first_uint(e.value.raw()).and_then(|n| u32::try_from(n).ok()),
+          _ => {}
+        }
+      }
+    }
+    // `$offset and $length and defined $key` (`Sony.pm:11815`).
+    let (Some(&first_offset), Some(length), Some(key)) = (offsets.first(), length, key) else {
+      return;
+    };
+    let Ok(offset) = usize::try_from(first_offset) else {
+      return;
+    };
+    let Ok(length) = usize::try_from(length) else {
+      return;
+    };
+    if offset == 0 || length == 0 {
+      return;
+    }
+    // 3) Read the encrypted block at `offset + base` for `length` bytes
+    //    (`Sony.pm:11818-11822`; `base == self.base`). A short read ⇒ `Warn('Error
+    //    reading SR2 data')` + no walk (`Sony.pm:11862`) — but that warning fires
+    //    only when the offset is in range yet the buffer is short; an entirely
+    //    out-of-range offset simply has no readable block (no SR2 tags), which is
+    //    the faithful no-RAF/short-buffer outcome and emits nothing extra here.
+    let read_base = self.base as usize;
+    let Some(block_start) = offset.checked_add(read_base) else {
+      return;
+    };
+    let Some(block_end) = block_start.checked_add(length) else {
+      return;
+    };
+    let Some(block) = self.data.get(block_start..block_end) else {
+      return;
+    };
+    // Decrypt a COPY (the original TIFF bytes must stay intact for other walks).
+    let mut decrypted = block.to_vec();
+    sr2::decrypt(&mut decrypted, 0, length, key);
+    // 4) Walk the decrypted block as SR2SubIFD directories — one per offset value.
+    //    `DirName => "SR2SubIFD$num"` with `$num` running `'' , 2, 3, …` (the Perl
+    //    `$num = ($num || 1) + 1`, `Sony.pm:11838/11858`): the first directory is
+    //    `SR2SubIFD` (num 0 ⇒ no suffix), the 2nd `SR2SubIFD2`, the 3rd
+    //    `SR2SubIFD3`, … (there is no `SR2SubIFD1`). The decrypted buffer
+    //    represents file bytes `[offset, offset+length)`; an out-of-line value
+    //    pointer `V` (file-relative) lands at `decrypted[V - offset]`, so the sub-
+    //    walker carries `value_offset_base = -(offset)` and `base = 0`. The IFD
+    //    body itself starts at `decrypted[V0 - offset]` — for the primary offset
+    //    `V0 == offset` ⇒ buffer offset 0.
+    let voff_base = -(offset as i64);
+    let mut sub_entries: std::vec::Vec<ExifEntry> = std::vec::Vec::new();
+    let mut num: u32 = 0;
+    for &off in &offsets {
+      let Ok(off) = usize::try_from(off) else {
+        continue;
+      };
+      // `DirStart => $offset - $dPos` (`Sony.pm:11837`, `$dPos == offset` for the
+      // primary) — the IFD body's buffer position is `off - offset`. A 2nd+ offset
+      // before the primary (negative) is unreachable for real SR2 data; skip it.
+      let Some(dir_start) = off.checked_sub(offset) else {
+        continue;
+      };
+      let mut sub = self.spawn_sr2_subwalker(&decrypted, voff_base);
+      sub.process_subdir(
+        dir_start,
+        IfdKind::Sr2SubIfd(num),
+        TableRef::SonySr2SubIfd,
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
+      sub_entries.append(&mut sub.entries);
+      // `$num = ($num || 1) + 1` — 0 → 2, then 2 → 3, 3 → 4, …
+      num = if num == 0 { 2 } else { num + 1 };
+    }
+    // The decrypted-buffer walk is dropped here; its entries (owned names +
+    // values, no buffer borrow) move into the parent stream.
+    self.entries.append(&mut sub_entries);
+  }
+
+  /// Build a fresh [`Walker`] over the DECRYPTED SR2 block (a separate buffer),
+  /// for the SR2SubIFD/SR2DataIFD walk. `value_offset_base` is `-(offset)` so a
+  /// file-relative out-of-line value pointer resolves into the decrypted buffer;
+  /// `base = 0`. Side-effect channels (warnings / cycle guard / DataMembers) are
+  /// FRESH and discarded on return — the SR2 walk must not perturb the parent.
+  fn spawn_sr2_subwalker<'b, 'sg>(
+    &self,
+    decrypted: &'b [u8],
+    value_offset_base: i64,
+  ) -> Walker<'b, 'sg> {
+    Walker {
+      data: decrypted,
+      order: self.order,
+      resolved_subdir_order: None,
+      base: 0,
+      value_offset_base,
+      entries: Vec::new(),
+      warnings: Vec::new(),
+      warnings_ignorable: Vec::new(),
+      maker_note: None,
+      deferred_subdirs: Vec::new(),
+      printim_versions: Vec::new(),
+      geotiff_directory: None,
+      geotiff_double_params: None,
+      geotiff_ascii_params: None,
+      captured_make: None,
+      captured_model: None,
+      captured_software: None,
+      chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+      cycle_guard_warnings: Vec::new(),
+      active_ifd_offsets: Vec::new(),
+      page_count: 0,
+      multi_page: false,
+      dng_version: false,
+      captured_compression: None,
+      captured_subfile_type: None,
+      file_type: None,
+      base_file_type: None,
+      no_raf: false,
+      warn_count: 0,
+      active_table: TableRef::Exif,
+      canon_focal_units: None,
+      canon_lens_type: None,
+      canon_focal_length_blob: None,
+      dir_len: None,
+      data_tag_pairs: Vec::new(),
+      data_tag_lengths: Vec::new(),
+    }
+  }
+
+  /// Descend the `0x74c0 SR2DataIFD` SubIFD pointer inside an SR2SubIFD walk
+  /// (`Sony.pm:10545-10554`, `MaxSubdirs => 20`). The pointer value is a
+  /// multi-offset list of FILE-relative offsets into the SAME decrypted SR2 block
+  /// `self.data` represents; each offset's BUFFER position is `off +
+  /// value_offset_base` (the sub-walker's negated `sr2Offset`). The `$dirNum`-th
+  /// directory is `SR2DataIFD`/`SR2DataIFD1`/…
+  fn dispatch_sr2_data_ifd(
+    &mut self,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+    count: usize,
+  ) {
+    let max = makernotes::vendors::sony::sr2::SR2_DATA_IFD_MAX_SUBDIRS;
+    // Bound BEFORE materializing (the same DoS guard as `dispatch_classic_subifd`):
+    // materialize ONLY the first `min(count, MaxSubdirs)` offsets so an SR2-
+    // controlled huge count cannot build a giant value. The overage warning ExifTool
+    // emits past `MaxSubdirs` is verbose-only (not surfaced under `-j`).
+    let take = count.min(max);
+    let offsets = match read_value(self.data, value_offset, format, take, read_len, self.order) {
+      Some(raw) => raw.subdir_offsets(),
+      None => return,
+    };
+    for (dir_num, off) in offsets.into_iter().enumerate() {
+      let Some(off) = off else {
+        continue;
+      };
+      let Ok(off) = usize::try_from(off) else {
+        continue;
+      };
+      // File-relative offset → decrypted-buffer position: `off + value_offset_base`.
+      let buf_pos = i64::try_from(off)
+        .unwrap_or(i64::MAX)
+        .saturating_add(self.value_offset_base);
+      let Ok(child_start) = usize::try_from(buf_pos) else {
+        continue;
+      };
+      let dir_num = u32::try_from(dir_num).unwrap_or(u32::MAX);
+      self.process_subdir(
+        child_start,
+        IfdKind::Sr2DataIfd(dir_num),
+        TableRef::SonySr2DataIfd,
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
+    }
+  }
+
   /// Push a synthetic `(Binary data N bytes …)` placeholder leaf for a
   /// `Binary => 1` tag whose payload the port does not decode — the same
   /// `Conv::None` verbatim-`Text` mechanism the `DataTag` channel uses
@@ -8182,6 +8520,31 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return,
       },
+      // The Sony SR2 subsystem (`Sony.pm:10448-10586`). Each table is a
+      // `%Exif::Main`-leaf-typed [`tables::ExifTag`] array (the conv set is a
+      // subset of `%Exif::Main`'s), so a resolved leaf rides in `ResolvedConv::
+      // Exif` and renders via `emit_exif_value` exactly like a core Exif leaf;
+      // the SR2-specific names come from the SR2 table, and the family-1 group
+      // (`SR2`/`SR2SubIFD`/`SR2DataIFD`) from the `kind`. An id not in the table
+      // is skipped (the `ProcessExif` `next unless $tagInfo`). The `0x74c0`
+      // SR2DataIFD SubIFD pointer is NOT in `SR2_SUBIFD_TAGS` (it is descended
+      // structurally below), so it skips here.
+      TableRef::SonySr2Private => {
+        match makernotes::vendors::sony::sr2::sr2_private_lookup(tag_id) {
+          Some(t) => (t.name(), ResolvedConv::Exif(t)),
+          None => return,
+        }
+      }
+      TableRef::SonySr2SubIfd => match makernotes::vendors::sony::sr2::sr2_subifd_lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Exif(t)),
+        None => return,
+      },
+      TableRef::SonySr2DataIfd => {
+        match makernotes::vendors::sony::sr2::sr2_data_ifd_lookup(tag_id) {
+          Some(t) => (t.name(), ResolvedConv::Exif(t)),
+          None => return,
+        }
+      }
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
@@ -8210,6 +8573,9 @@ impl Walker<'_, '_> {
       // `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's third
       // directory (`IfdKind::SubIfd(2)`), where 0x111/0x117 name JpgFromRaw.
       in_subifd2: matches!(kind, IfdKind::SubIfd(2)),
+      // `$$self{DIR_NAME} eq 'IFD2'` — the 2nd trailing IFD (`IfdKind::
+      // Trailing(2)`), where 0x201/0x202 name JpgFromRawStart/Length.
+      in_ifd2: matches!(kind, IfdKind::Trailing(2)),
       compression: self.captured_compression.as_deref(),
       subfile_type: self.captured_subfile_type.as_deref(),
     };
@@ -8377,16 +8743,24 @@ impl Walker<'_, '_> {
     // top-level Exif walk (IFD0); a trailing-IFD or maker-note re-emission
     // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
     // Make alone.
-    if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110) {
-      // The RawConv'd `$$self{Make}`/`$$self{Model}`: the stringified `$val`
-      // ([`RawValue::raw_conv_val_string`], faithful to any readable shape),
-      // with the `s/\s+$//` trailing-whitespace trim on top.
+    // `Software` (0x0131, `Exif.pm:902-906`) is captured ALONGSIDE Make/Model:
+    // the same IFD0-only, last-wins, RawConv-`s/\s+$//`-trimmed `$$self{Software}`
+    // the dispatcher reads (the Sony `Tag9401` ISOInfo sub-block selection keys
+    // on it). NOTE 0x0131 is `Software`; 0x0132 is `ModifyDate` (`Exif.pm:909`) —
+    // the DataMember side effect (`$$self{Software} = $val`, `Exif.pm:905-906`)
+    // lives on 0x0131, so the capture MUST key on 0x0131, not the date tag.
+    if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110 || tag_id == 0x0131) {
+      // The RawConv'd `$$self{Make}`/`$$self{Model}`/`$$self{Software}`: the
+      // stringified `$val` ([`RawValue::raw_conv_val_string`], faithful to any
+      // readable shape), with the `s/\s+$//` trailing-whitespace trim on top.
       let trimmed = raw.raw_conv_val_string();
       let trimmed = trimmed.trim_end_matches(is_perl_space);
       if tag_id == 0x010f {
         self.captured_make = Some(trimmed.to_string());
       } else if tag_id == 0x0110 {
         self.captured_model = Some(trimmed.to_string());
+      } else if tag_id == 0x0131 {
+        self.captured_software = Some(trimmed.to_string());
       }
     }
 
@@ -8560,15 +8934,33 @@ impl Walker<'_, '_> {
       // In-buffer bounds (`$offset>=$dataPos and $offset+$len<=$dataPos+len`,
       // `Exif.pm:6227`). The port has no out-of-buffer RAF, so a blob outside
       // the EXIF buffer is unavailable ⇒ no image (+ a faithful warning).
+      //
+      // EXCEPTION — `IsImageData` data tags (`PreviewImage`/`JpgFromRaw`/
+      // `OtherImage`, `Exif.pm:609-1293`) on a RAF-backed STANDALONE TIFF/raw
+      // (e.g. a Sony ARW): ExifTool builds the `(Binary data N bytes, use -b
+      // option to extract)` placeholder LAZILY from the offset+length and does
+      // NOT read the bytes in normal (non-`-b`) mode, so a DECLARED length whose
+      // span runs past the (here, fixture-truncated) file end still surfaces the
+      // placeholder with NO warning — the RAF would seek there in a real file.
+      // The bounded-buffer case (JPEG `APP1`, embedded Exif: `no_raf` or a
+      // sub-block) keeps the strict in-buffer check (a past-segment thumbnail IS
+      // genuinely bad there). `ThumbnailImage` (NOT `IsImageData`) always keeps
+      // the strict check.
+      let is_image_data = matches!(pair.data_tag, "PreviewImage" | "JpgFromRaw" | "OtherImage");
+      let raf_backed_standalone = !self.no_raf && self.base == 0;
       let end = pair.offset.saturating_add(length);
       if pair.offset < base || end > buf_end {
-        self.warn(std::format!(
-          "{}:{} runs past the EXIF data ({}+{length} > {buf_end})",
-          pair.ifd.as_str(),
-          pair.data_tag,
-          pair.offset,
-        ));
-        continue;
+        if is_image_data && raf_backed_standalone {
+          // Fall through to emit the lazy placeholder (declared length), no warning.
+        } else {
+          self.warn(std::format!(
+            "{}:{} runs past the EXIF data ({}+{length} > {buf_end})",
+            pair.ifd.as_str(),
+            pair.data_tag,
+            pair.offset,
+          ));
+          continue;
+        }
       }
       // Emit `<family1>:<DataTag>` AFTER the regular IFD leaves (so the
       // multiset + the immediately-after-ThumbnailLength position match
@@ -11433,6 +11825,7 @@ pub(in crate::exif) fn apple_makernote_isolated(
     // Apple has no model-conditional tag, so `$$self{Model}` is irrelevant to the
     // walk; leave it unset.
     captured_model: None,
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has no ancestor on its recursion stack,
@@ -11574,6 +11967,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
   order: ByteOrder,
   make: Option<&str>,
   model: Option<&str>,
+  software: Option<&str>,
   print_conv: bool,
 ) -> Option<(
   std::vec::Vec<makernotes::VendorEmission>,
@@ -11640,6 +12034,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
     // but the captured model is threaded into the capture-loop gates below (not
     // into the walk), so leave it unset on the Walker.
     captured_model: None,
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
@@ -11702,6 +12097,13 @@ pub(in crate::exif) fn sony_makernote_isolated(
   let mut emissions = std::vec::Vec::new();
   let mut typed = sony::MakerNotesSony::new();
   let mut af_area: Option<i64> = None;
+  // `$$self{DoubleCipher}` (`Sony.pm:1847`) — the write-bug recovery flag set as
+  // a SIDE EFFECT of the `Tag9400a` Condition when the enciphered `0x9400` first
+  // byte ∈ {0x5e,0xe7,0x04} (the double-enciphered 0x07/0x09/0x0a). Once set, EVERY
+  // 0x94xx `ProcessEnciphered` block is deciphered TWICE (`Sony.pm:11553-11556`).
+  // 0x9400 < 0x9402 in IFD-tag order, so this is observed BEFORE the 0x9402 entry
+  // that consumes it — the same set-on-9400/read-on-9402 object-flag ordering.
+  let mut double_cipher = false;
   {
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
@@ -11710,6 +12112,16 @@ pub(in crate::exif) fn sony_makernote_isolated(
       // 0x201e), matching `parse_in_tiff`'s in-walk capture.
       if entry.tag_id == 0x201c {
         af_area = sony::af_area_data_member_from_raw(entry.value.raw(), model);
+      }
+      // 0x9400's `Tag9400a` Condition side-effect (`Sony.pm:1847`): a DoubleCipher
+      // first byte LATCHES the flag for the rest of the walk. Read the entry's
+      // verbatim on-disk value span (the same `$$valPt` the Perl Condition tests).
+      if entry.tag_id == 0x9400
+        && let Some(end) = entry.value_offset().checked_add(entry.value_size())
+        && let Some(raw) = data.get(entry.value_offset()..end)
+        && sony::tag9400::detects_double_cipher(raw)
+      {
+        double_cipher = true;
       }
       // Only `ResolvedConv::Sony` entries live in this run; the resolved `SonyTag`
       // rides in the entry's `conv`. A defensive non-Sony conv (never produced
@@ -11726,9 +12138,177 @@ pub(in crate::exif) fn sony_makernote_isolated(
           &mut sink,
         );
       }
+      // The enciphered `Tag9050x`/`Tag9400x` `ProcessBinaryData` sub-blocks
+      // (`emit_sony_value` skips them as deferred SubDirectory rows). They are
+      // decoded HERE — in walk order, so a leaf name shared with a later
+      // sub-block (e.g. `ReleaseMode2`, also in `Tag9050c`) is overridden
+      // last-wins by the sink, byte-identical to ExifTool's `ProcessMOV`-walk
+      // emission order. The on-disk (enciphered) value bytes are the verbatim
+      // span `data[value_offset .. value_offset + value_size]` (the same
+      // `$valuePtr`/`$size` ExifTool's `ProcessEnciphered` reads); a hostile
+      // span is bounds-checked by `get`, so an out-of-range entry decodes
+      // nothing rather than panicking.
+      sony_emit_enciphered_subblock(
+        data,
+        g1,
+        entry,
+        model,
+        software,
+        double_cipher,
+        print_conv,
+        &mut sink,
+      );
     }
   }
   Some((emissions, typed))
+}
+
+/// Decode a Sony Main-IFD `ProcessBinaryData` SubDirectory sub-block
+/// (`0x9050`/`0x9400`/`0x9401`/`0x9402`/`0x9406`/`0x940c`/`0x9416`/`0x202a`)
+/// and emit its ported leaves into `sink`.
+///
+/// `entry` is the Sony Main-IFD SubDirectory row; its verbatim on-disk value
+/// bytes are `data[value_offset .. value_offset + value_size]`. Most of these
+/// blocks are enciphered (`PROCESS_PROC => \&ProcessEnciphered`): the cipher is
+/// applied CENTRALLY here via [`process_enciphered`](makernotes::vendors::sony::decipher::process_enciphered)
+/// — exactly as ExifTool's `ProcessEnciphered` deciphers the whole block (once,
+/// or TWICE when the file-global `$$self{DoubleCipher}` flag is set,
+/// `Sony.pm:11552-11556`) BEFORE the `ProcessBinaryData` walk — and the
+/// per-table parser receives the ALREADY-DECIPHERED bytes (it no longer runs the
+/// cipher). `0x202a` (`Tag202a`) is the lone plain (un-enciphered)
+/// `%binaryDataAttrs` block, passed through raw and read directly. The variant is
+/// selected faithfully on the RAW (still-enciphered) bytes — the Perl `$$valPt`
+/// `Condition`s are pre-decipher: `Tag9050c` BY MODEL
+/// (`Sony.pm:1810`), `Tag9400c`/`Tag9406`/`Tag202a` BY THE (enciphered or
+/// plain) FIRST/THIRD VALUE BYTE (`Sony.pm:1856`/`:2044`/`:1575`), `Tag9402` by
+/// model + first byte (`Sony.pm:1969`), `Tag9401`'s ISOInfo sub-block by the
+/// deciphered `Ver9401` + `$$self{Software}` (`Sony.pm:8659-8662`). A non-ported
+/// variant (older bodies) emits nothing — its leaves stay deferred. The leaves
+/// ride the Sony vendor family-1 group; none are `Unknown => 1`.
+///
+/// `double_cipher` is the file-global `$$self{DoubleCipher}` flag (latched from
+/// the 0x9400 walk): when set, EVERY enciphered 0x94xx block (0x9050/0x9400/
+/// 0x9401/0x9402/0x9406/0x940c/0x9416) is deciphered TWICE
+/// (`Sony.pm:11553-11556`), not just 0x9402 — `ProcessEnciphered` is the shared
+/// `PROCESS_PROC` for all of them, so on a double-enciphered body ISOInfo/
+/// battery/lens/camera-settings would otherwise be read from once-deciphered
+/// garbage.
+fn sony_emit_enciphered_subblock<S: ExifSink>(
+  data: &[u8],
+  group1: &str,
+  entry: &ExifEntry,
+  model: Option<&str>,
+  software: Option<&str>,
+  double_cipher: bool,
+  print_conv: bool,
+  out: &mut S,
+) {
+  use makernotes::vendors::sony::decipher::process_enciphered;
+  use makernotes::vendors::sony::{
+    tag202a, tag940c, tag9050, tag9400, tag9401, tag9402, tag9406, tag9416,
+  };
+  // The verbatim on-disk value span (the enciphered cipher block, or the plain
+  // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
+  // resolved `$valuePtr`/`$size`.
+  let off = entry.value_offset();
+  let Some(end) = off.checked_add(entry.value_size()) else {
+    return;
+  };
+  let Some(raw) = data.get(off..end) else {
+    return;
+  };
+  // The Main-IFD SubDirectory `Condition`s (below) test the RAW `$$valPt` (the
+  // Perl conditions are pre-decipher), so the variant gates run on `raw`. The
+  // cipher itself is applied CENTRALLY — `ProcessEnciphered` deciphers the whole
+  // block once, or TWICE when `$$self{DoubleCipher}` is latched, BEFORE the
+  // `ProcessBinaryData` walk (`Sony.pm:11552-11556`) — and the result is handed
+  // to the per-table parser, so ALL enciphered 0x94xx blocks (not just 0x9402)
+  // are correctly (double-)deciphered. `0x202a` is the lone plain block and is
+  // never deciphered.
+  match entry.tag_id() {
+    // `Tag9050c` — selected by model (`Sony.pm:1810`).
+    0x9050 if sony_tag9050c_model(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9050::parse_tag9050c(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9400c` — selected by the enciphered first byte (`Sony.pm:1856`).
+    0x9400 if tag9400::selects_tag9400c(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9400::parse_tag9400c(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9401` — the ISOInfo sub-block (selected by deciphered `Ver9401` +
+    // `$$self{Software}`, `Sony.pm:8659-8662`). Dispatched unconditionally
+    // (`Sony.pm:1862-1864`).
+    0x9401 => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9401::parse_tag9401(&buf, model, software) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9402` — not SLT/HV/ILCA and the enciphered first byte ∉ {0x05,0xff}
+    // (`Sony.pm:1969`).
+    0x9402 if tag9402::selects_tag9402(raw, model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9402::parse_tag9402(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9406` — battery temp/level, selected by the enciphered first+third
+    // value bytes (`Sony.pm:2044`).
+    0x9406 if tag9406::selects_tag9406(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9406::parse_tag9406(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag940c` — the E-mount lens table, selected by model (`Sony.pm:2081`).
+    0x940c if tag940c::selects_tag940c(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag940c::parse_tag940c(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9416` — the modern CameraSettings/lens table, dispatched
+    // unconditionally for the bodies that write `0x9416` (`Sony.pm:2115`).
+    0x9416 => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9416::parse_tag9416(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag202a` — the (un-enciphered) FocalPlaneAFPointsUsed grid, selected by
+    // the plain first value byte = 0x01 (`Sony.pm:1575`). NOT a `ProcessEnciphered`
+    // table, so the raw bytes are read directly (never deciphered).
+    0x202a if tag202a::selects_tag202a(raw) => {
+      for emi in tag202a::parse_tag202a(raw, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    _ => {}
+  }
+}
+
+/// `Tag9050c` model `Condition` (`Sony.pm:1810`):
+/// `$$self{Model} =~ /^(ILCE-(1\b|7M4|7RM5|7SM3)|ILME-FX3)/`.
+fn sony_tag9050c_model(model: Option<&str>) -> bool {
+  let Some(m) = model else { return false };
+  // `ILCE-1\b` — `ILCE-1` then a word boundary (so NOT `ILCE-1M2`/`ILCE-10…`).
+  if let Some(rest) = m.strip_prefix("ILCE-1")
+    && rest
+      .chars()
+      .next()
+      .is_none_or(|c| !c.is_ascii_alphanumeric())
+  {
+    return true;
+  }
+  m.starts_with("ILCE-7M4")
+    || m.starts_with("ILCE-7RM5")
+    || m.starts_with("ILCE-7SM3")
+    || m.starts_with("ILME-FX3")
 }
 
 /// Walk the Panasonic `%Panasonic::Main` IFD in a FRESH, ISOLATED [`Walker`] over
@@ -11938,6 +12518,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
     // model is threaded into the capture-loop gates below (not into the walk), so
     // leave it unset on the Walker.
     captured_model: None,
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
@@ -12215,6 +12796,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
     // it is threaded into the capture-loop emitters (NOT the walk), so leave it
     // unset on the Walker.
     captured_model: None,
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
@@ -12560,6 +13142,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
     // from the parent IFD0 captures, mirroring Sony/Canon.
     captured_make: make.map(String::from),
     captured_model: model.map(String::from),
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
@@ -13071,6 +13654,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
     // arm), but thread them for parity with the other vendors.
     captured_make: make.map(String::from),
     captured_model: model.map(String::from),
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
@@ -13377,6 +13961,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
     // leaf reads Make.
     captured_make: None,
     captured_model: model.map(String::from),
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack.
@@ -13565,6 +14150,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
     // the model also gates the 0x96 SerialInfo LIST + ShotInfo branches the `-n`
     // walk traverses).
     captured_model: model.map(String::from),
+    captured_software: None,
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
@@ -13703,6 +14289,18 @@ fn emit_exif_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   match conv {
     Conv::None => emit_raw(group, name, raw, out),
+    Conv::SonyHex8 => {
+      // `SR2SubIFDKey` (0x7221) — `PrintConv => 'sprintf("0x%.8x", $val)'`
+      // (`Sony.pm:10479`). With print_conv ON render the int32u key as a
+      // zero-padded 8-digit hex string; OFF emits the bare decimal value.
+      match first_uint(raw) {
+        Some(v) if print_conv => {
+          out.write_str(group, name, &std::format!("0x{:08x}", v as u32))?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
     Conv::IntLabel(slice) => emit_int_label(group, name, raw, slice, print_conv, out, false),
     Conv::IntLabelHex(slice) => emit_int_label(group, name, raw, slice, print_conv, out, true),
     Conv::FileSource(slice) => {
@@ -13758,10 +14356,12 @@ fn emit_exif_value<S: ExifSink>(
       emit_int_label(group, name, raw, slice, print_conv, out, false)
     }
     Conv::StrLabel(slice) => {
-      // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
-      // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
+      // STRING-keyed HASH PrintConv — `$$self{PrintConv}{$val}` keyed by the
+      // (space-joined) `$val` STRING (`InteropIndex` 0x0001, Exif.pm:417-427;
+      // `YCbCrSubSampling` 0x212 via `%JPEG::yCbCrSubSampling`, Exif.pm:1448 —
+      // an int16u[2] whose `$val` is the space-joined `"2 1"`).
       if let RawValue::Text { text: t, .. } = raw {
-        // Trim a trailing NUL/space the on-disk `string` may carry.
+        // A `string` value: trim a trailing NUL/space `read_value` may carry.
         let key = t.trim_end_matches([' ', '\0']);
         if print_conv {
           match tables::str_label_for(slice, key) {
@@ -13776,7 +14376,21 @@ fn emit_exif_value<S: ExifSink>(
         }
         return Ok(());
       }
-      emit_raw(group, name, raw, out)
+      // A NUMERIC / int-array value (e.g. `YCbCrSubSampling` int16u[2]): the
+      // HASH key is the space-joined `$val` (`ReadValue`'s `join(' ', @vals)`).
+      // `-j` looks it up (a miss ⇒ `Unknown ($val)`); `-n` emits the bare value
+      // through `emit_raw` (a single clean number stays bare, a multi-element
+      // value is the quoted space-joined string).
+      let key = raw.raw_conv_val_string();
+      if print_conv {
+        match tables::str_label_for(slice, &key) {
+          Some(label) => out.write_str(group, name, label)?,
+          None => out.write_str(group, name, &std::format!("Unknown ({key})"))?,
+        }
+      } else {
+        emit_raw(group, name, raw, out)?;
+      }
+      Ok(())
     }
     Conv::ExposureTime => {
       // `ExposureTime` (0x829a) is a `rational64u` — its value IS the rational
@@ -17255,6 +17869,7 @@ mod tests {
       geotiff_ascii_params: None,
       captured_make: None,
       captured_model: None,
+      captured_software: None,
       chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
       cycle_guard_warnings: Vec::new(),
       active_ifd_offsets: Vec::new(),
@@ -21103,6 +21718,7 @@ mod tests {
         ByteOrder::Little,
         Some("Sony Ericsson"),
         Some("C905"),
+        None,
         print_conv,
       );
       assert!(
@@ -21432,6 +22048,7 @@ mod tests {
         ByteOrder::Little,
         Some("SONY"),
         Some("ILCE-7M3"),
+        None,
         print_conv,
       )
       .expect("routes_to_main admits the SONY DSC prefix ⇒ Some, even when the value is short");
@@ -21521,6 +22138,7 @@ mod tests {
           ByteOrder::Little,
           Some("SONY"),
           Some("ILCE-7M3"),
+          None,
           print_conv,
         )
         .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some even when body_offset overflows");
@@ -24350,6 +24968,7 @@ mod tests {
       ByteOrder::Little,
       Some("SONY"),
       None,
+      None,
       true,
     )
     .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some");
@@ -24365,6 +24984,115 @@ mod tests {
     };
     assert_eq!(find("Quality"), Some(TagValue::Str("Fine".into())));
     assert_eq!(find("SonyModelID"), Some(TagValue::Str("ILCE-9".into())));
+  }
+
+  /// DoubleCipher latch ORDER (`Sony.pm:1847` + `ProcessEnciphered`
+  /// `Sony.pm:11552-11556`): the `$$self{DoubleCipher}` DataMember is set as a
+  /// side effect of the 0x9400 `Tag9400a` Condition, and ExifTool's `ProcessExif`
+  /// processes IFD entries in PHYSICAL (ascending-tag-id) order — so a 0x9050
+  /// block, which sorts BEFORE 0x9400, is run through `ProcessEnciphered` with
+  /// `DoubleCipher` STILL UNSET and is deciphered ONCE, even on a
+  /// double-enciphered body. This is the EXACT bundled behaviour (verified vs the
+  /// bundled binary on a crafted FX3 ARW: a 0x9050-before-0x9400 double-enciphered
+  /// file emits `[Deciphered Tag9050c directory] ShutterCount = 1193046` while the
+  /// 0x9400 block alone gets `[Double-deciphered Tag9400a directory]`). A pre-scan
+  /// that latched DoubleCipher BEFORE emitting 0x9050 would double-decipher it and
+  /// DIVERGE from bundled — this test pins the faithful single-pass order.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn double_cipher_latch_does_not_affect_earlier_sorting_0x9050() {
+    use crate::value::TagValue;
+
+    // The Sony forward cipher `c = (b·b·b) mod 249` (`Sony.pm:11521`); identity
+    // for 249..=255. A 0x9050 block enciphered ONCE is the correct on-disk form
+    // for a normal (non-double) body.
+    let encipher = |plain: &[u8]| -> std::vec::Vec<u8> {
+      plain
+        .iter()
+        .map(|&b| {
+          if b <= 248 {
+            ((u32::from(b) * u32::from(b) % 249 * u32::from(b)) % 249) as u8
+          } else {
+            b
+          }
+        })
+        .collect()
+    };
+
+    // ---- The 0x9050 plaintext (Tag9050c, FX3): ShutterCount @0x3a int32u.
+    let mut plain = std::vec![0u8; 0x60];
+    plain[0x3a..0x3e].copy_from_slice(&0x0012_3456u32.to_le_bytes());
+    // Shutter @0x26 int16u[3] = 1 2 3 (a recognizable second leaf).
+    plain[0x26..0x28].copy_from_slice(&1u16.to_le_bytes());
+    plain[0x28..0x2a].copy_from_slice(&2u16.to_le_bytes());
+    plain[0x2a..0x2c].copy_from_slice(&3u16.to_le_bytes());
+    let enc9050 = encipher(&plain); // SINGLE-enciphered (correct on-disk form)
+
+    // ---- The 0x9400 block: raw first byte 0x5e = the DoubleCipher marker
+    // (`Sony.pm:1847`, the once-more-enciphered Tag9400a byte 0x07). Its presence
+    // latches DoubleCipher — but only AFTER 0x9050 has already been emitted.
+    let blk9400 = {
+      let mut b = std::vec![0u8; 0x40];
+      b[0] = 0x5e;
+      b
+    };
+
+    // ---- The Sony MakerNote blob (SONY DSC prefix, body_offset 12), with the
+    // entries in ascending tag-id order: 0x9050 BEFORE 0x9400. Value offsets are
+    // blob-relative (the blob is passed as the buffer with mn_offset 0).
+    let mut blob: std::vec::Vec<u8> = std::vec::Vec::new();
+    blob.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte header
+    let entries_off = blob.len() + 2;
+    let val9050_off = entries_off + 12 * 2 + 4; // after the 2 entries + next-IFD ptr
+    let val9400_off = val9050_off + enc9050.len();
+    blob.extend_from_slice(&2u16.to_le_bytes()); // entry count
+    // entry 0: 0x9050, format 7 (undef), count = block len, value @ val9050_off.
+    blob.extend_from_slice(&0x9050u16.to_le_bytes());
+    blob.extend_from_slice(&7u16.to_le_bytes());
+    blob.extend_from_slice(&(enc9050.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(val9050_off as u32).to_le_bytes());
+    // entry 1: 0x9400, format 7 (undef), count = block len, value @ val9400_off.
+    blob.extend_from_slice(&0x9400u16.to_le_bytes());
+    blob.extend_from_slice(&7u16.to_le_bytes());
+    blob.extend_from_slice(&(blk9400.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(val9400_off as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+    blob.extend_from_slice(&enc9050);
+    blob.extend_from_slice(&blk9400);
+
+    let (emissions, _typed) = sony_makernote_isolated(
+      &blob,
+      0,
+      blob.len(),
+      12,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILME-FX3"),
+      None,
+      true,
+    )
+    .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some");
+
+    let find = |n: &str| {
+      emissions
+        .iter()
+        .rev()
+        .find(|e| e.name() == n)
+        .map(|e| e.value().clone())
+    };
+    // 0x9050 was deciphered ONCE (latch still unset at its walk position), so the
+    // single-enciphered ShutterCount recovers correctly — matching bundled.
+    assert_eq!(
+      find("ShutterCount"),
+      Some(TagValue::I64(0x0012_3456)),
+      "0x9050 sorts before the 0x9400 DoubleCipher marker, so it is single-\
+       deciphered even on a double-enciphered body (bundled-faithful order)"
+    );
+    assert_eq!(
+      find("Shutter"),
+      Some(TagValue::Str("Mechanical (1 2 3)".into())),
+      "the 0x9050 Shutter leaf likewise decodes from the single-deciphered block"
+    );
   }
 
   /// `MakerNotesMeta::from_blob` must gate Nikon type-2 / headerless-Nikon3 blobs
@@ -24954,6 +25682,7 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
         0,
         ByteOrder::Little,
         Some("SONY"),
+        None,
         None,
         print_conv,
       )

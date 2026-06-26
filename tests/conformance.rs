@@ -10160,6 +10160,220 @@ fn arw_preview_image_conformance() {
     );
   }
 }
+
+/// The real Sony ARW raws (FX3 / SLT-A33) — the SR2 subsystem + the Sony ARW
+/// `SubIFD:*` raw tags + the standalone conversions (Compression 32767, the IFD2
+/// `JpgFromRaw*`/`YCbCrSubSampling`, the `IsImageData` placeholders) are
+/// byte-exact in BOTH `-j` and `-n`. The `%Sony::Main` ENCRYPTED sub-table tower
+/// (the `Decipher` cipher + the model-version ProcessBinaryData tables) is a
+/// separate deferred port, so its `Sony:*` exposure/AF/lens leaves and the
+/// dependent `Composite:*` are dropped from BOTH sides here (the SAME keys the
+/// `NOT_ACTIVE` deferral in `tests/typed_serde_parity.rs` documents). This test
+/// LOCKS the SR2/SubIFD/conversion foundation byte-exact as a regression guard;
+/// when the sub-table tower lands, the exclusions shrink and the fixtures move
+/// into the active byte-exact set.
+#[test]
+fn sony_arw_real_sr2_and_subifd_conformance() {
+  // The deferred `%Sony::Main` sub-table leaves (+ extra/divergent Sony Main
+  // leaves whose final value comes from those sub-tables' DataMembers) and the
+  // `Composite:*` that `Require`/`Desire` them. FX3 (newer body: the `Tag9xxx`
+  // encrypted series + `Tag202a`).
+  // The FX3 `%Sony::Main` encrypted sub-table tower is now FULLY PORTED — the
+  // `Decipher` cipher + the model/version-dispatched ProcessBinaryData tables
+  // (`Tag9050c`/`Tag9400c`/`Tag9401`(ISOInfo)/`Tag9402`/`Tag9406`/`Tag940c`/
+  // `Tag9416` + the plain `Tag202a`) emit every remaining `Sony:*` exposure/AF/
+  // lens/battery/ISO leaf, and the five dependent `Composite:*`
+  // (LensID/BlueBalance/RedBalance/CFAPattern/FocusDistance2) now compute
+  // byte-exact. The SOLE residual is one embedded-XMP leaf:
+  const FX3_DEFERRED: &[&str] = &[
+    // `XMP-xmp:Rating` (= 0) — the IFD0 `0x02bc` ApplicationNotes XMP packet
+    // (`<xmp:Rating>0</xmp:Rating>`). exifast routes embedded XMP to the shared
+    // `ProcessXMP` parser ONLY from the JPEG `APP1` marker walk (`src/exif/
+    // jpeg.rs`); the TIFF/raw IFD0 `0x02bc` SubDirectory → `XMP::Main` routing
+    // (`Exif.pm`, the ApplicationNotes arm) is a SEPARATE, cross-cutting
+    // subsystem (it would emit XMP for every TIFF/DNG/CR2/NEF raw) that is NOT
+    // part of the Sony deep-table port — deferred to its own campaign. This is
+    // the lone niche exclusion; the `Sony:Rating` (= 0) MakerNote leaf IS
+    // emitted byte-exact.
+    "XMP-xmp:Rating",
+  ];
+  // A33 (older SLT body: `CameraInfo3`/`AFInfo`(AFStatus grid)/`CameraSettings3`/
+  // `ExtraInfo3`/`MoreInfo`/`Tag900b`).
+  const A33_DEFERRED: &[&str] = &[
+    "Composite:BlueBalance",
+    "Composite:CFAPattern",
+    "Composite:FocalLength35efl",
+    "Composite:FocusDistance2",
+    "Composite:LensID",
+    "Composite:RedBalance",
+    "Sony:AELock",
+    "Sony:AFAreaMode",
+    "Sony:AFButtonPressed",
+    "Sony:AFPoint",
+    "Sony:AFPointSelected",
+    "Sony:AFStatusActiveSensor",
+    "Sony:AFStatusBottomHorizontal",
+    "Sony:AFStatusBottomVertical",
+    "Sony:AFStatusCenterHorizontal",
+    "Sony:AFStatusCenterVertical",
+    "Sony:AFStatusFarLeft",
+    "Sony:AFStatusFarRight",
+    "Sony:AFStatusLeft",
+    "Sony:AFStatusLower-left",
+    "Sony:AFStatusLower-middle",
+    "Sony:AFStatusLower-right",
+    "Sony:AFStatusNearLeft",
+    "Sony:AFStatusNearRight",
+    "Sony:AFStatusRight",
+    "Sony:AFStatusTopHorizontal",
+    "Sony:AFStatusTopVertical",
+    "Sony:AFStatusUpper-left",
+    "Sony:AFStatusUpper-middle",
+    "Sony:AFStatusUpper-right",
+    "Sony:ApertureSetting",
+    "Sony:AspectRatio",
+    "Sony:BatteryLevel",
+    "Sony:BatteryState",
+    "Sony:BatteryTemperature",
+    "Sony:BatteryVoltage1",
+    "Sony:BatteryVoltage2",
+    "Sony:CameraOrientation",
+    "Sony:ColorCompensationFilterSet",
+    "Sony:ColorSpace",
+    "Sony:ColorTemperatureSetting",
+    "Sony:ContrastSetting",
+    "Sony:CreativeStyleSetting",
+    "Sony:CustomWB_RBLevels",
+    "Sony:CustomWB_RGBLevels",
+    "Sony:DriveMode",
+    "Sony:DriveMode2",
+    "Sony:DriveModeSetting",
+    "Sony:DynamicRangeOptimizerLevel",
+    "Sony:DynamicRangeOptimizerSetting",
+    "Sony:ExposureCompensation2",
+    "Sony:ExposureCompensationSet",
+    "Sony:ExposureProgram",
+    "Sony:ExposureTime",
+    "Sony:FNumber",
+    "Sony:FaceDetection",
+    "Sony:FacesDetected",
+    "Sony:FlashAction",
+    "Sony:FlashActionExternal",
+    "Sony:FlashControl",
+    "Sony:FlashExposureComp",
+    "Sony:FlashExposureCompSet",
+    "Sony:FlashExposureCompSet2",
+    "Sony:FlashMode",
+    "Sony:FlashStatus",
+    "Sony:FlashStatusBuilt-in",
+    "Sony:FlashStatusExternal",
+    "Sony:FocalLength",
+    "Sony:FocalLength2",
+    "Sony:FocalLengthTeleZoom",
+    "Sony:FocusMode",
+    "Sony:FocusMode2",
+    "Sony:FocusModeSetting",
+    "Sony:FocusPosition2",
+    "Sony:FocusStatus",
+    "Sony:FolderNumber",
+    "Sony:HDRLevel",
+    "Sony:HDRSetting",
+    "Sony:ISO",
+    "Sony:ISOSetting",
+    "Sony:ImageCount",
+    "Sony:ImageNumber",
+    "Sony:LensMount",
+    "Sony:LiveViewAFMethod",
+    "Sony:LiveViewAFSetting",
+    "Sony:LiveViewFocusMode",
+    "Sony:LiveViewMetering",
+    "Sony:MeteringMode",
+    "Sony:MultiFrameNoiseReduction",
+    "Sony:Orientation2",
+    "Sony:PanoramaSize3D",
+    "Sony:RedEyeReduction",
+    "Sony:SaturationSetting",
+    "Sony:SequenceNumber",
+    "Sony:SharpnessSetting",
+    "Sony:ShotNumberSincePowerUp",
+    "Sony:ShotNumberSincePowerUp2",
+    "Sony:ShutterCount",
+    "Sony:ShutterSpeedSetting",
+    "Sony:SmileShutter",
+    "Sony:SmileShutterMode",
+    "Sony:SonyImageSize",
+    "Sony:SweepPanoramaDirection",
+    "Sony:SweepPanoramaSize",
+    "Sony:TiffMeteringImage",
+    "Sony:ViewingMode",
+    "Sony:ViewingMode2",
+    "Sony:WhiteBalanceSetting",
+  ];
+  check_excluding(
+    "Sony_ILME-FX3_real.ARW",
+    "Sony_ILME-FX3_real.ARW.json",
+    true,
+    FX3_DEFERRED,
+  );
+  check_excluding(
+    "Sony_ILME-FX3_real.ARW",
+    "Sony_ILME-FX3_real.ARW.n.json",
+    false,
+    FX3_DEFERRED,
+  );
+  check_excluding(
+    "Sony_SLT-A33_real.ARW",
+    "Sony_SLT-A33_real.ARW.json",
+    true,
+    A33_DEFERRED,
+  );
+  check_excluding(
+    "Sony_SLT-A33_real.ARW",
+    "Sony_SLT-A33_real.ARW.n.json",
+    false,
+    A33_DEFERRED,
+  );
+
+  // Positively assert the SR2 subsystem actually fired (the decrypt + nested
+  // IFD walk), not just that the residual was excluded: the decrypted SR2SubIFD
+  // WB levels + the SR2DataIFD ColorMode + the SR2SubIFDKey hex render.
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/Sony_ILME-FX3_real.ARW"))
+    .expect("read Sony_ILME-FX3_real.ARW");
+  let got = extract_info("Sony_ILME-FX3_real.ARW", &data, true);
+  for needle in [
+    "\"SR2:SR2SubIFDKey\":\"0x44332211\"",
+    "\"SR2SubIFD:WB_RGGBLevels\":\"2501 1024 1024 1486\"",
+    "\"SR2DataIFD:ColorMode\":\"Standard\"",
+    "\"SR2DataIFD9:ColorMode\":\"Sepia\"",
+    "\"SubIFD:Compression\":\"Sony ARW Compressed\"",
+    // The Tag9050c decipher + ProcessBinaryData (the `0x9050` enciphered block):
+    // Shutter / FlashStatus / ShutterCount(2) / SonyExposureTime / SonyFNumber /
+    // ReleaseMode2 / InternalSerialNumber.
+    "\"Sony:Shutter\":\"Mechanical (2738 5168 6484)\"",
+    "\"Sony:FlashStatus\":\"No Flash present\"",
+    "\"Sony:ShutterCount\":2",
+    "\"Sony:ShutterCount2\":2",
+    "\"Sony:SonyExposureTime\":\"1/128\"",
+    "\"Sony:SonyFNumber\":2.9",
+    "\"Sony:InternalSerialNumber\":\"47ff0000a708\"",
+    // The Tag9400c decipher + ProcessBinaryData (the `0x9400` enciphered block):
+    // ReleaseMode2 (last-wins from Tag9050c) / SequenceImageNumber /
+    // SequenceFileNumber / SequenceLength (the 0x001e "N files" form) /
+    // CameraOrientation / Quality2 (the modern HEIF-aware variant).
+    "\"Sony:ReleaseMode2\":\"Normal\"",
+    "\"Sony:SequenceImageNumber\":1",
+    "\"Sony:SequenceFileNumber\":1",
+    "\"Sony:SequenceLength\":\"1 file\"",
+    "\"Sony:CameraOrientation\":\"Horizontal (normal)\"",
+    "\"Sony:Quality2\":\"RAW\"",
+  ] {
+    assert!(
+      got.contains(needle),
+      "SR2/SubIFD + Tag9050c/Tag9400c foundation must emit {needle}: {got}",
+    );
+  }
+}
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
             `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \

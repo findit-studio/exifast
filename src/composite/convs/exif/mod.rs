@@ -309,5 +309,202 @@ pub(crate) fn flash_print_conv(code: i64) -> std::string::String {
   }
 }
 
+/// The CFA color names (`@cfaColor = qw(Red Green Blue Cyan Magenta Yellow
+/// White)`, Exif.pm:5611). An out-of-range index renders `'Unknown'`.
+#[cfg(feature = "alloc")]
+const CFA_COLOR: [&str; 7] = ["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "White"];
+
+/// `Image::ExifTool::Exif::PrintCFAPattern($val)` (Exif.pm:5604):
+///
+/// ```perl
+/// my @a = split ' ', $val;
+/// return '<truncated data>' unless @a >= 2;
+/// return '<zero pattern size>' unless $a[0] and $a[1];
+/// my $end = 2 + $a[0] * $a[1];
+/// return '<invalid pattern size>' if $end > @a;
+/// my @cfaColor = qw(Red Green Blue Cyan Magenta Yellow White);
+/// my ($pos, $rtnVal) = (2, '[');
+/// for (;;) {
+///     $rtnVal .= $cfaColor[$a[$pos]] || 'Unknown';
+///     last if ++$pos >= $end;
+///     ($pos - 2) % $a[1] and $rtnVal .= ',', next;
+///     $rtnVal .= '][';
+/// }
+/// return $rtnVal . ']';
+/// ```
+///
+/// `val` is the composite's ValueConv result (the space-joined
+/// `"$cols $rows @bytes"` the [`Composite:CFAPattern`] ValueConv built). The
+/// pattern is `cols × rows` color indices; the renderer walks them row-major,
+/// joining a row's colors with `,` and bracketing each row.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub(crate) fn print_cfa_pattern(val: &str) -> std::string::String {
+  let a: std::vec::Vec<i64> = val
+    .split_ascii_whitespace()
+    .map(|t| crate::convert::perl_str_to_f64(t) as i64)
+    .collect();
+  if a.len() < 2 {
+    return "<truncated data>".to_string();
+  }
+  // `$a[0]`/`$a[1]` — cols/rows. `unless $a[0] and $a[1]` (Perl-truthy).
+  let cols = *a.first().unwrap_or(&0);
+  let rows = *a.get(1).unwrap_or(&0);
+  if cols == 0 || rows == 0 {
+    return "<zero pattern size>".to_string();
+  }
+  // `$end = 2 + $a[0]*$a[1]` — uses checked math; an overflow can only exceed
+  // `@a`, which is the `<invalid pattern size>` guard.
+  let Some(area) = cols.checked_mul(rows) else {
+    return "<invalid pattern size>".to_string();
+  };
+  let Some(end) = area.checked_add(2) else {
+    return "<invalid pattern size>".to_string();
+  };
+  if end > a.len() as i64 {
+    return "<invalid pattern size>".to_string();
+  }
+  let mut out = std::string::String::from("[");
+  let mut pos: i64 = 2;
+  loop {
+    // `$cfaColor[$a[$pos]] || 'Unknown'`.
+    let color = usize::try_from(*a.get(pos as usize).unwrap_or(&-1))
+      .ok()
+      .and_then(|i| CFA_COLOR.get(i).copied())
+      .unwrap_or("Unknown");
+    out.push_str(color);
+    pos += 1;
+    if pos >= end {
+      break;
+    }
+    // `($pos - 2) % $a[1]` truthy ⇒ same row, append ',' and continue; else a
+    // new row ⇒ `][`.
+    if (pos - 2) % rows != 0 {
+      out.push(',');
+    } else {
+      out.push_str("][");
+    }
+  }
+  out.push(']');
+  out
+}
+
+/// `@rggbLookup` (Exif.pm:5664) — for each `WB_*Levels` Desire index, the input
+/// component positions `[R, G, G, B]` (a green index `< 4` means "average the
+/// two greens at these positions"; `256` is the literal "green level is 256").
+#[cfg(feature = "alloc")]
+const RGGB_LOOKUP: [[i64; 4]; 9] = [
+  [0, 1, 2, 3],     // 0 RGGB
+  [0, 1, 3, 2],     // 1 RGBG
+  [0, 2, 3, 1],     // 2 RBGG
+  [1, 0, 3, 2],     // 3 GRBG
+  [1, 0, 2, 3],     // 4 GRGB
+  [2, 3, 0, 1],     // 5 GBRG
+  [0, 1, 1, 2],     // 6 RGB
+  [1, 0, 0, 2],     // 7 GRB
+  [0, 256, 256, 1], // 8 RB (green level is 256)
+];
+
+/// `Image::ExifTool::Exif::RedBlueBalance($blue, @val)` (Exif.pm:5676):
+///
+/// ```perl
+/// my $blue = shift;
+/// for ($i=0; $i<@rggbLookup; ++$i) {
+///     $levels = shift or next;
+///     my @levels = split ' ', $levels;
+///     next if @levels < 2;
+///     my $lookup = $rggbLookup[$i];
+///     my $g = $$lookup[1];
+///     if ($g < 4) {
+///         next if @levels < 3;
+///         $g = ($levels[$g] + $levels[$$lookup[2]]) / 2 or next;
+///     } elsif ($levels[$$lookup[$blue * 3]] < 4) {
+///         $g = 1;
+///     }
+///     $val = $levels[$$lookup[$blue * 3]] / $g;
+///     last;
+/// }
+/// $val = $_[0] / $_[1] if not defined $val and ($_[0] and $_[1]);
+/// return $val;
+/// ```
+///
+/// `blue` selects Blue (`true`) vs Red (`false`). `levels[i]` is the
+/// (already-resolved) `WB_*Levels` string for Desire index `i` (`None` ⇒ the
+/// Perl `shift or next` skip). The final fallback divides the LAST two operands
+/// (`WBBlueLevel`/`WBRedLevel` ÷ `WBGreenLevel`, the index 9/10 Desires) when no
+/// earlier lookup matched. Returns the `$val` (or `None` ⇒ the def aborts).
+#[cfg(feature = "alloc")]
+#[must_use]
+pub(crate) fn red_blue_balance(blue: bool, levels: &[Option<std::string::String>]) -> Option<f64> {
+  let blue3 = if blue { 3usize } else { 0 };
+  for (i, lookup) in RGGB_LOOKUP.iter().enumerate() {
+    let Some(Some(level_str)) = levels.get(i) else {
+      continue; // `shift or next`
+    };
+    let parsed: std::vec::Vec<f64> = level_str
+      .split_ascii_whitespace()
+      .map(crate::convert::perl_str_to_f64)
+      .collect();
+    if parsed.len() < 2 {
+      continue;
+    }
+    // `$$lookup[$blue*3]` — the R-or-B component position.
+    let Some(&rb_pos) = lookup.get(blue3) else {
+      continue;
+    };
+    let Some(&rb_val) = rb_pos.try_into().ok().and_then(|p: usize| parsed.get(p)) else {
+      continue;
+    };
+    // `$g = $$lookup[1]` (the green index/level).
+    let g_idx = lookup[1];
+    let g: f64 = if g_idx < 4 {
+      if parsed.len() < 3 {
+        continue;
+      }
+      let Some(&g0) = (g_idx).try_into().ok().and_then(|p: usize| parsed.get(p)) else {
+        continue;
+      };
+      let Some(&g1) = lookup[2].try_into().ok().and_then(|p: usize| parsed.get(p)) else {
+        continue;
+      };
+      let avg = (g0 + g1) / 2.0;
+      if avg == 0.0 {
+        continue; // `… or next`
+      }
+      avg
+    } else if rb_val < 4.0 {
+      1.0 // Some Nikon cameras use a scaling factor of 1 (E5700)
+    } else {
+      // `$g` stays the literal `$$lookup[1]` (256 for the RB lookup).
+      g_idx as f64
+    };
+    return Some(rb_val / g);
+  }
+  // Fallback: `$val = $_[0] / $_[1]` when no lookup matched AND both are truthy.
+  // The loop `shift`s the first 9 operands (`@rggbLookup` has 9 entries) before
+  // reaching here, so `$_[0]`/`$_[1]` are the 10th/11th Desires — `WBRedLevel`/
+  // `WBBlueLevel` (index 9) and `WBGreenLevel` (index 10). (The FX3 matches at
+  // lookup 0 via `WB_RGGBLevels` and `last`s, so this is exercised only by a
+  // body that supplies ONLY the explicit WB*Level pair.)
+  let num = levels.get(RGGB_LOOKUP.len()).and_then(Option::as_deref);
+  let den = levels.get(RGGB_LOOKUP.len() + 1).and_then(Option::as_deref);
+  if let (Some(num), Some(den)) = (num, den)
+    // Perl string truthiness (`$_[0] and $_[1]`): false only for "" / "0".
+    && perl_str_truthy(num)
+    && perl_str_truthy(den)
+  {
+    return Some(crate::convert::perl_str_to_f64(num) / crate::convert::perl_str_to_f64(den));
+  }
+  None
+}
+
+/// Perl string boolean context: a string is FALSE only when empty or exactly
+/// `"0"` (Exif.pm:5697 `$_[0] and $_[1]`).
+#[cfg(feature = "alloc")]
+#[must_use]
+fn perl_str_truthy(s: &str) -> bool {
+  !s.is_empty() && s != "0"
+}
+
 #[cfg(test)]
 mod tests;

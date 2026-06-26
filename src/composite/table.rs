@@ -411,6 +411,19 @@ pub(crate) enum CompositePrintConv {
   /// IPTC.pm:953) — the identity at exifast's option set, in BOTH modes (the
   /// RawConv-assembled `Text` `"$DateCreated $TimeCreated"`).
   DateTimeCreated,
+  /// `Composite:CFAPattern` PrintConv (`Image::ExifTool::Exif::PrintCFAPattern`,
+  /// Exif.pm:5233) — the `[Red,Green][Green,Blue]` grid under `-j`; the
+  /// space-joined ValueConv `"$cols $rows @bytes"` (`Text`) under `-n`.
+  CfaPattern,
+  /// `Composite:RedBalance`/`BlueBalance` PrintConv (`int($val * 1e6 + 0.5) *
+  /// 1e-6`, Exif.pm:5251/5269) — the numeric `$val` (the `RedBlueBalance`
+  /// quotient) rounded to 6 decimals under `-j`; the bare numeric `$val` under
+  /// `-n`.
+  RedBlueBalance,
+  /// `Composite:FocusDistance2` PrintConv (`$val eq "inf" ? $val : sprintf("%.4g
+  /// m", $val)`, Sony.pm:10927) — the `"%.4g m"`-formatted distance (or `"inf"`)
+  /// under `-j`; the numeric `$val` (or the `"inf"` string) under `-n`.
+  FocusDistance2,
 }
 
 impl CompositePrintConv {
@@ -715,21 +728,27 @@ impl CompositePrintConv {
         }
       }
       CompositePrintConv::LensId => {
-        // The UNAMBIGUOUS Pentax-LensType case: `Composite:LensID`'s ValueConv is
-        // `$val` (`= $val[0]`, the raw LensType, carried as `Scalar`), and the
-        // resolved lens name IS the LensType's own PrintConv value `$prt[0]`
-        // (`PrintLensID` returns `$$printConv{$lensType}` for a single hit). So
-        // `-n` emits the raw LensType scalar verbatim; `-j` emits `$prt[0]`.
+        // `Composite:LensID`'s ValueConv is `$val` (`= $val[idx]`, the SELECTED
+        // raw LensType, carried as `Scalar` by [`lens_id`]), and the resolved
+        // lens name IS the selected LensType's PrintConv value `$prt[idx]`
+        // (`PrintLensID` returns `$$printConv{$lensType}` for a single hit). The
+        // index is the Sony LensType2/LensType3 substitution result
+        // ([`lens_id_print_index`]) — `0` for a plain LensType, `2`/`3` for a
+        // Sony E-mount LensType2/LensType3. So `-n` emits the selected raw
+        // scalar verbatim; `-j` emits `$prt[idx]`.
         let CompositeRaw::Scalar(v) = raw else {
           return TagValue::Str(Default::default());
         };
         match mode {
           ConvMode::ValueConv => v.clone(),
-          ConvMode::PrintConv => prts
-            .first()
-            .and_then(Option::as_ref)
-            .cloned()
-            .unwrap_or_else(|| v.clone()),
+          ConvMode::PrintConv => {
+            let idx = lens_id_print_index(vals);
+            prts
+              .get(idx)
+              .and_then(Option::as_ref)
+              .cloned()
+              .unwrap_or_else(|| v.clone())
+          }
         }
       }
       CompositePrintConv::DateTimeCreated => {
@@ -745,6 +764,46 @@ impl CompositePrintConv {
           }
         }
       }
+      CompositePrintConv::CfaPattern => {
+        // ValueConv `$val` = the space-joined `"$cols $rows @bytes"` `Text`;
+        // PrintConv runs `PrintCFAPattern` over it.
+        let CompositeRaw::Text(s) = raw else {
+          return TagValue::Str(Default::default());
+        };
+        match mode {
+          ConvMode::ValueConv => TagValue::Str(s.as_str().into()),
+          ConvMode::PrintConv => {
+            TagValue::Str(crate::composite::convs::exif::print_cfa_pattern(s).into())
+          }
+        }
+      }
+      CompositePrintConv::RedBlueBalance => {
+        // ValueConv `$val` = the raw quotient (`Num`); PrintConv rounds it to 6
+        // decimals (`int($val * 1e6 + 0.5) * 1e-6`).
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            // `int($val * 1e6 + 0.5)` — Perl `int` truncates toward zero.
+            let rounded = (n * 1e6 + 0.5).trunc() * 1e-6;
+            TagValue::F64(rounded)
+          }
+        }
+      }
+      CompositePrintConv::FocusDistance2 => match raw {
+        // The `'inf'` ValueConv branch (`$val >= 255`) — a `Text` carrying
+        // `"inf"`, emitted verbatim in BOTH modes (PrintConv `$val eq "inf" ?
+        // $val : …`).
+        CompositeRaw::Text(s) => TagValue::Str(s.as_str().into()),
+        // The numeric distance — `-n` the bare `$val`, `-j` `sprintf("%.4g m")`.
+        CompositeRaw::Num(n) => match mode {
+          ConvMode::ValueConv => TagValue::F64(*n),
+          ConvMode::PrintConv => {
+            TagValue::Str(std::format!("{} m", crate::value::format_g(*n, 4)).into())
+          }
+        },
+        CompositeRaw::Scalar(_) => TagValue::Str(Default::default()),
+      },
     }
   }
 }
@@ -1577,38 +1636,44 @@ fn lens_id(
 ) -> Option<CompositeRaw> {
   // `$val[0]` — the raw LensType (the `Require`d input). Absent ⇒ no build.
   let raw_lens_type = v.first()?.value()?.clone();
-  // A vendor disambiguator (Sony LensType2 / Canon RFLensType / Pentax
-  // converter) that ExifTool's PrintConv would act on ⇒ the LensID is NOT the
-  // plain LensType name; defer rather than mis-emit a stale value.
-  if lens_id_disambiguator_active(v) {
+  // Canon RFLensType (`$val[12]` truthy, Exif.pm:5348) and the Pentax converter
+  // (Exif.pm:5355) substitute lens DBs exifast has NOT ported — defer rather
+  // than mis-emit. (`Composite:LensID`'s Sony LensType2/LensType3 branch IS
+  // ported below.)
+  if lens_id_rf_or_converter_active(v) {
     return None;
   }
-  // `$prt[0]` — the LensType PrintConv value (the resolved lens name candidate).
-  let name = prts.first().and_then(Option::as_ref)?;
+  // The Sony LensType2/LensType3 substitution (Exif.pm:5335-5346) selects which
+  // ingredient's PRINTCONV name the LensID renders. NOTE: ExifTool's `ValueConv
+  // => '$val'` runs BEFORE the PrintConv and reads the ORIGINAL `$val[0]` (the
+  // plain LensType); the PrintConv's `$val[0] = $val[9]` reassignment is local
+  // to the PrintConv. So the ValueConv (`-n`) value is ALWAYS the plain
+  // LensType raw, while `-j` renders the SELECTED `$prt[idx]`.
+  let idx = lens_id_print_index(v);
+  // `$prt[idx]` — the selected LensType PrintConv (the resolved lens name
+  // candidate). Absent ⇒ no build (no name to emit under `-j`).
+  let name = prts.get(idx).and_then(Option::as_ref)?;
   let name_text = crate::composite::value_text(name);
   // Confirmed resolved lens name: carries a focal-length / aperture token
   // (`PrintLensID`'s lens-name shape) AND is not an ambiguity placeholder.
   if !lens_name_is_resolved(&name_text) {
     return None;
   }
-  // ValueConv `$val` = `$val[0]` (raw LensType) carried verbatim; the PrintConv
-  // renders `$prt[0]` (= `name`).
+  // ValueConv `$val` = `$val[0]` (the PLAIN raw LensType) carried verbatim; the
+  // PrintConv renders `$prt[idx]` (= `name`), selected by the SAME
+  // [`lens_id_print_index`].
   Some(CompositeRaw::Scalar(raw_lens_type))
 }
 
-/// Does a vendor disambiguator ingredient FIRE one of ExifTool's
-/// `Composite:LensID` PrintConv branches (Exif.pm:5335-5366), making the LensID
-/// something other than the plain LensType name?
+/// Does Canon RFLensType (`$val[12]`, Exif.pm:5348) or the Pentax converter
+/// (Exif.pm:5355) fire? Both substitute a lens DB / focal-range disambiguation
+/// exifast has NOT ported, so `Composite:LensID` DEFERS when either fires (the
+/// Sony LensType2/LensType3 branch IS handled — see [`lens_id_print_index`]).
 ///
-/// The compact input layout (see [`LENS_ID`]) is `[0]`=LensType,
-/// `[1]`=FocalLength, `[2]`=LensType2, `[3]`=LensType3, `[4]`=LensFocalLength,
-/// `[5]`=RFLensType — each carrying the RAW (ValueConv) `$val[i]`, exactly what
-/// the Perl branches test. The three branches, mirrored:
+/// The compact input layout (see [`LENS_ID`]) is `[0]`=LensType, `[1]`=
+/// FocalLength, `[2]`=LensType2, `[3]`=LensType3, `[4]`=LensFocalLength,
+/// `[5]`=RFLensType — each carrying the RAW (ValueConv) `$val[i]`.
 ///
-/// * Sony LensType2 (`if (defined $val[9] and ($val[9] & 0x8000 or $val[9] ==
-///   0))`, :5338): substitutes the LensType2/LensType3 base + PrintConv ⇒
-///   different lens DB. Fires when LensType2 is present and its integer value
-///   has bit `0x8000` set OR is `0`.
 /// * Canon RFLensType (`if ($val[12])`, :5350): substitutes the RFLensType
 ///   base ⇒ Canon RF DB. Fires when RFLensType is present and TRUTHY (a `0` /
 ///   "n/a" RFLensType is falsy ⇒ does NOT fire — the `CanonRaw_ctmd.cr3`
@@ -1622,13 +1687,7 @@ fn lens_id(
 ///   ≤ 1.1, e.g. the `JPEG_pentax_k70` 28/27.5 = 1.018) appends NOTHING and
 ///   stays the plain byte-exact name.
 #[cfg(feature = "exif")]
-fn lens_id_disambiguator_active(v: &[CompositeValue]) -> bool {
-  // Sony LensType2 (`$val[9]`): present AND (bit 0x8000 set OR == 0).
-  let lens_type2_fires = v.get(2).is_some_and(|lt2| {
-    lt2
-      .coerce_numeric()
-      .is_some_and(|n| (n as i64) & 0x8000 != 0 || (n as i64) == 0)
-  });
+fn lens_id_rf_or_converter_active(v: &[CompositeValue]) -> bool {
   // Canon RFLensType (`$val[12]`): present AND truthy (Perl `if ($val[12])`).
   let rf_lens_type_fires = v.get(5).is_some_and(CompositeValue::is_truthy);
   // Pentax converter: BOTH LensFocalLength (`$val[11]`) and FocalLength
@@ -1647,7 +1706,145 @@ fn lens_id_disambiguator_active(v: &[CompositeValue]) -> bool {
     }
     _ => false,
   };
-  lens_type2_fires || rf_lens_type_fires || converter_fires
+  rf_lens_type_fires || converter_fires
+}
+
+/// The SELECTED `$val[]`/`$prt[]` index for `Composite:LensID` after the Sony
+/// LensType2/LensType3 substitution (Exif.pm:5335-5346) — shared by the derive
+/// (which carries `$val[idx]`) and the [`CompositePrintConv::LensId`] render
+/// (which emits `$prt[idx]`), so both pick the SAME ingredient.
+///
+/// `0` = the plain LensType (`$val[0]`, the default). Returns `2` (LensType2)
+/// when LensType2 is present and `($val[2] & 0x8000 or $val[2] == 0)`; within
+/// that, returns `3` (LensType3) when `$val[2] == 0 and ($val[3] & 0x8000)`
+/// (the GM-lens case). The Canon RFLensType / Pentax-converter substitutions
+/// are NOT selected here (the caller defers on them via
+/// [`lens_id_rf_or_converter_active`]).
+#[cfg(feature = "exif")]
+fn lens_id_print_index(v: &[CompositeValue]) -> usize {
+  let lens_type2 = v.get(2).and_then(CompositeValue::coerce_numeric);
+  let Some(lt2) = lens_type2 else { return 0 };
+  let lt2 = lt2 as i64;
+  if lt2 & 0x8000 == 0 && lt2 != 0 {
+    return 0;
+  }
+  // LensType2 fires. The GM-lens sub-case: LensType2 == 0 AND LensType3 has bit
+  // 0x8000 ⇒ use LensType3 (`$val[3]`) instead.
+  if lt2 == 0
+    && v
+      .get(3)
+      .and_then(CompositeValue::coerce_numeric)
+      .is_some_and(|lt3| (lt3 as i64) & 0x8000 != 0)
+  {
+    return 3;
+  }
+  2
+}
+
+/// `Composite:CFAPattern` ValueConv (Exif.pm:5227):
+///
+/// ```perl
+/// my @a = split / /, $val[0];      # CFARepeatPatternDim, e.g. "2 2"
+/// my @b = split / /, $val[1];      # CFAPattern2, e.g. "0 1 1 2"
+/// return '?' unless @a==2 and @b==$a[0]*$a[1];
+/// return "$a[0] $a[1] @b";
+/// ```
+///
+/// `$val[0]`=`CFARepeatPatternDim` (Require) is the `cols rows`; `$val[1]`=
+/// `CFAPattern2` (Require) is the `cols*rows` color bytes. The ValueConv `$val`
+/// is the space-joined `"$cols $rows @bytes"` (`Text`); a shape mismatch yields
+/// the literal `"?"`.
+#[cfg(feature = "exif")]
+fn cfa_pattern(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let dim = v.first()?.as_text()?;
+  let pat = v.get(1)?.as_text()?;
+  let a: std::vec::Vec<&str> = dim.split(' ').collect();
+  let b: std::vec::Vec<&str> = pat.split(' ').collect();
+  // `return '?' unless @a==2 and @b==$a[0]*$a[1]`.
+  let well_formed = a.len() == 2 && {
+    let cols = crate::convert::perl_str_to_f64(a.first().copied().unwrap_or("")) as i64;
+    let rows = crate::convert::perl_str_to_f64(a.get(1).copied().unwrap_or("")) as i64;
+    cols.checked_mul(rows) == Some(b.len() as i64)
+  };
+  if !well_formed {
+    return Some(CompositeRaw::Text("?".to_string()));
+  }
+  // `"$a[0] $a[1] @b"` — the dims then the bytes, space-joined.
+  Some(CompositeRaw::Text(std::format!("{dim} {pat}")))
+}
+
+/// `Composite:RedBalance` (`$blue = 0`) / `BlueBalance` (`$blue = 1`) ValueConv
+/// (Exif.pm:5250/5268) — `RedBlueBalance($blue, @val)` over the resolved
+/// `WB_*Levels` Desires (none `Require`d, so the def attempts whenever the gate
+/// fires; `None` ⇒ no usable levels ⇒ not built).
+#[cfg(feature = "exif")]
+fn red_blue_balance(v: &[CompositeValue], blue: bool) -> Option<CompositeRaw> {
+  // Each `WB_*Levels` Desire as its string `$val[i]` (a `Missing` element ⇒
+  // `None`, the Perl `shift or next`).
+  let levels: std::vec::Vec<Option<std::string::String>> = v
+    .iter()
+    .map(|cv| cv.as_text().map(|c| c.into_owned()))
+    .collect();
+  crate::composite::convs::exif::red_blue_balance(blue, &levels).map(CompositeRaw::Num)
+}
+
+/// `Composite:RedBalance` derive (Exif.pm:5235).
+#[cfg(feature = "exif")]
+fn red_balance(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  red_blue_balance(v, false)
+}
+
+/// `Composite:BlueBalance` derive (Exif.pm:5253).
+#[cfg(feature = "exif")]
+fn blue_balance(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  red_blue_balance(v, true)
+}
+
+/// `Composite:FocusDistance2` ValueConv (Sony.pm:10922):
+///
+/// ```perl
+/// return undef unless $val;        # FocusPosition2 (Require)
+/// return 'inf' if $val >= 255;
+/// return (2**($val/16-5) + 1) * $val[1] / 1000;   # $val[1]=FocalLengthIn35mmFormat
+/// ```
+///
+/// `$val`=`Sony:FocusPosition2` (Require, the magnification proxy); `$val[1]`=
+/// `FocalLengthIn35mmFormat` (Require). A falsy (0/absent) FocusPosition2 ⇒ no
+/// build; `>= 255` ⇒ the `"inf"` `Text`; otherwise the metres distance (`Num`).
+#[cfg(feature = "exif")]
+fn focus_distance2(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `return undef unless $val` — Perl-truthy FocusPosition2.
+  let pos_cv = v.first()?;
+  if !pos_cv.is_truthy() {
+    return None;
+  }
+  let pos = pos_cv.coerce_numeric()?;
+  // `return 'inf' if $val >= 255`.
+  if pos >= 255.0 {
+    return Some(CompositeRaw::Text("inf".to_string()));
+  }
+  // `$val[1]` — FocalLengthIn35mmFormat (Require). Its ValueConv value is the
+  // bare focal-length number (the `mm` PrintConv suffix is only `-j`).
+  let focal35 = v.get(1)?.coerce_numeric()?;
+  // `(2**($val/16-5) + 1) * $val[1] / 1000` — Perl `2 ** x` is `2.0.powf(x)`.
+  let dist = (2.0f64.powf(pos / 16.0 - 5.0) + 1.0) * focal35 / 1000.0;
+  Some(CompositeRaw::Num(dist))
 }
 
 /// Is `prt0` (the LensType `$prt[0]`) a CONFIRMED single-lens name — the only
@@ -2509,6 +2706,88 @@ const LENS_ID: CompositeDef = CompositeDef {
   sort_key: "Exif-LensID",
 };
 
+/// `Composite:CFAPattern` (Exif.pm:5221). `Require`s `CFARepeatPatternDim` +
+/// `CFAPattern2`; [`cfa_pattern`] reformats them to the `"$cols $rows @bytes"`
+/// ValueConv string, rendered by `PrintCFAPattern` to the bracketed grid.
+#[cfg(feature = "exif")]
+const CFA_PATTERN: CompositeDef = CompositeDef {
+  name: "CFAPattern",
+  inputs: &[bare_req("CFARepeatPatternDim"), bare_req("CFAPattern2")],
+  derive: cfa_pattern,
+  print_conv: CompositePrintConv::CfaPattern,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Exif-CFAPattern",
+};
+
+/// `Composite:RedBalance` (Exif.pm:5235). `Desire`s the `WB_*Levels` family
+/// (`RedBlueBalance(0, @val)`); the index order MIRRORS Exif.pm:5237-5249 so the
+/// `@rggbLookup` loop reads the right component positions.
+#[cfg(feature = "exif")]
+const RED_BALANCE: CompositeDef = CompositeDef {
+  name: "RedBalance",
+  inputs: &[
+    bare_des("WB_RGGBLevels"), // 0
+    bare_des("WB_RGBGLevels"), // 1
+    bare_des("WB_RBGGLevels"), // 2
+    bare_des("WB_GRBGLevels"), // 3
+    bare_des("WB_GRGBLevels"), // 4
+    bare_des("WB_GBRGLevels"), // 5
+    bare_des("WB_RGBLevels"),  // 6
+    bare_des("WB_GRBLevels"),  // 7
+    bare_des("WB_RBLevels"),   // 8
+    bare_des("WBRedLevel"),    // 9 (red)
+    bare_des("WBGreenLevel"),  // 10
+  ],
+  derive: red_balance,
+  print_conv: CompositePrintConv::RedBlueBalance,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Exif-RedBalance",
+};
+
+/// `Composite:BlueBalance` (Exif.pm:5253). As [`RED_BALANCE`] but
+/// `RedBlueBalance(1, @val)` and the index-9 Desire is `WBBlueLevel`.
+#[cfg(feature = "exif")]
+const BLUE_BALANCE: CompositeDef = CompositeDef {
+  name: "BlueBalance",
+  inputs: &[
+    bare_des("WB_RGGBLevels"), // 0
+    bare_des("WB_RGBGLevels"), // 1
+    bare_des("WB_RBGGLevels"), // 2
+    bare_des("WB_GRBGLevels"), // 3
+    bare_des("WB_GRGBLevels"), // 4
+    bare_des("WB_GBRGLevels"), // 5
+    bare_des("WB_RGBLevels"),  // 6
+    bare_des("WB_GRBLevels"),  // 7
+    bare_des("WB_RBLevels"),   // 8
+    bare_des("WBBlueLevel"),   // 9 (blue)
+    bare_des("WBGreenLevel"),  // 10
+  ],
+  derive: blue_balance,
+  print_conv: CompositePrintConv::RedBlueBalance,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Exif-BlueBalance",
+};
+
+/// `Sony:Composite:FocusDistance2` (Sony.pm:10904). `Require`s
+/// `Sony:FocusPosition2` (family-1 `Sony`) + `FocalLengthIn35mmFormat`;
+/// [`focus_distance2`] applies the Sony magnification-to-distance formula.
+#[cfg(feature = "exif")]
+const FOCUS_DISTANCE2: CompositeDef = CompositeDef {
+  name: "FocusDistance2",
+  inputs: &[
+    req(&["Sony"], "FocusPosition2"),
+    bare_req("FocalLengthIn35mmFormat"),
+  ],
+  derive: focus_distance2,
+  print_conv: CompositePrintConv::FocusDistance2,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Sony-FocusDistance2",
+};
+
 /// `Composite:DateTimeCreated` (IPTC.pm:943, the `Image::ExifTool::IPTC`
 /// Composite table). `Require`s `IPTC:DateCreated` + `IPTC:TimeCreated`;
 /// [`datetime_created`] concatenates them with a space, rendered through
@@ -2867,6 +3146,14 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   FLASH,
   #[cfg(feature = "exif")]
   LENS_ID,
+  #[cfg(feature = "exif")]
+  CFA_PATTERN,
+  #[cfg(feature = "exif")]
+  RED_BALANCE,
+  #[cfg(feature = "exif")]
+  BLUE_BALANCE,
+  #[cfg(feature = "exif")]
+  FOCUS_DISTANCE2,
   #[cfg(feature = "exif")]
   DATETIME_CREATED,
   #[cfg(feature = "exif")]

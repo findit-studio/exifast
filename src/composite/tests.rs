@@ -1750,11 +1750,13 @@ mod exif {
   }
 
   #[test]
-  fn lens_id_active_lens_type2_defers() {
+  fn lens_id_active_lens_type2_emits_lens_type2_name() {
     // A Sony LensType2 whose raw `$val[9]` has bit 0x8000 set (an E-mount lens
     // ID) fires `if (defined $val[9] and ($val[9] & 0x8000 or $val[9] == 0))`:
-    // ExifTool swaps in the LensType2 base + Sony PrintConv. exifast can't, so
-    // it defers. (`$val[9] == 0` — a 3rd-party E-mount — fires the same branch.)
+    // ExifTool swaps in the LensType2 base + Sony PrintConv, so `Composite:LensID`
+    // renders the LensType2 PrintConv name (`$prt[9]`). exifast ports this
+    // substitution — the LensID PrintConv is the LensType2 name (the ValueConv
+    // stays the PLAIN LensType raw, but `lens_id_pj` checks PrintConv).
     let got = lens_id_pj(
       &[
         ("Exif", "LensType", TagValue::U64(0)),
@@ -1773,7 +1775,39 @@ mod exif {
         ),
       ],
     );
-    assert_eq!(got, None, "an active LensType2 (0x8000 set) defers LensID");
+    assert_eq!(
+      got.as_deref(),
+      Some("\"Sony FE 24-70mm F2.8 GM\""),
+      "an active LensType2 (0x8000 set) renders the LensType2 PrintConv name"
+    );
+  }
+
+  #[test]
+  fn lens_id_lens_type2_zero_uses_lens_type3() {
+    // The GM-lens sub-case (Exif.pm:5341): LensType2 == 0 AND LensType3 has bit
+    // 0x8000 ⇒ ExifTool uses LensType3 (`$val[10]`/`$prt[10]`). The LensID
+    // PrintConv is then the LensType3 name.
+    let got = lens_id_pj(
+      &[
+        ("Exif", "LensType", TagValue::U64(0)),
+        ("Exif", "LensType2", TagValue::U64(0)), // 0 ⇒ fires the branch
+        ("Exif", "LensType3", TagValue::U64(40989)), // 0xA01D — 0x8000 set
+      ],
+      &[
+        ("Exif", "LensType", TagValue::Str("Unknown".into())),
+        ("Exif", "LensType2", TagValue::Str("n/a".into())),
+        (
+          "Exif",
+          "LensType3",
+          TagValue::Str("Sony FE 20mm F1.8 G".into()),
+        ),
+      ],
+    );
+    assert_eq!(
+      got.as_deref(),
+      Some("\"Sony FE 20mm F1.8 G\""),
+      "LensType2==0 + LensType3 0x8000 renders the LensType3 PrintConv name"
+    );
   }
 
   #[test]
