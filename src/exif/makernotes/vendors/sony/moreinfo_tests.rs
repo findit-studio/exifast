@@ -158,3 +158,82 @@ fn faceinfo_dispatch_is_exact_match_not_word_boundary() {
     );
   }
 }
+
+/// `MoreSettings` carries TWO A4xx anchor flavors that a single `\b` bool got
+/// wrong in OPPOSITE directions: 0x13 `FocusMode` / 0x15
+/// `MultiFrameNoiseReduction` are `$`-anchored EXACT
+/// (`!~ /^DSLR-(A450|A500|A550)$/`, Sony.pm:3662/3673), while the overlapping
+/// `other` block (0x25 `ISO`, 0x26 `FNumber`, …) is the no-anchor PREFIX
+/// (`/^DSLR-(A450|A500|A550)/`).
+#[test]
+fn moresettings_a4xx_anchors_split_exact_vs_prefix() {
+  // A block long enough to reach 0x86, non-zero at the probed offsets.
+  let mut buf = vec![0u8; 0x90];
+  buf[0x13] = 17; // FocusMode = AF-S
+  buf[0x15] = 1; // MultiFrameNoiseReduction = Off
+  buf[0x25] = 64; // ISO (raw, non-zero)
+  buf[0x26] = 40; // FNumber (raw)
+
+  let has = |model: &str, name: &str| -> bool {
+    let mut out = Vec::new();
+    parse_more_settings(&buf, Some(model), true, &mut out);
+    names(&out).contains(&name)
+  };
+
+  // SLT-A33 (not an A4xx at all): every probed leaf present.
+  for n in ["FocusMode", "MultiFrameNoiseReduction", "ISO", "FNumber"] {
+    assert!(has("SLT-A33", n), "SLT-A33 {n}");
+  }
+
+  // Real exact A4xx bodies: EVERY anchor excludes them.
+  for m in ["DSLR-A450", "DSLR-A500", "DSLR-A550"] {
+    for n in ["FocusMode", "MultiFrameNoiseReduction", "ISO", "FNumber"] {
+      assert!(!has(m, n), "{m} {n} excluded (exact body)");
+    }
+  }
+
+  // Suffixed A4xx strings: NOT a `$`-exact match (so 0x13/0x15 EMIT — the `\b`
+  // port wrongly dropped the hyphen form) but ARE a PREFIX match (so the `other`
+  // block 0x25/0x26 are EXCLUDED — the `\b` port wrongly emitted the alnum
+  // form). Faithful to Sony.pm for BOTH suffix shapes.
+  for m in ["DSLR-A500-x", "DSLR-A500X"] {
+    assert!(has(m, "FocusMode"), "{m} FocusMode must emit ($-exact)");
+    assert!(
+      has(m, "MultiFrameNoiseReduction"),
+      "{m} MFNR must emit ($-exact)"
+    );
+    assert!(!has(m, "ISO"), "{m} ISO must be excluded (prefix)");
+    assert!(!has(m, "FNumber"), "{m} FNumber must be excluded (prefix)");
+  }
+}
+
+/// `MoreInfo0201` 0x011b `ImageCount` / 0x0125 `ShutterCount` carry
+/// `!~ /^DSLR-A(450|500|550)$/` (`$`-anchored EXACT, Sony.pm:3477/3484). A
+/// suffixed A4xx body is NOT an exact match, so it still emits both counts (the
+/// `\b` port wrongly suppressed the hyphen form).
+#[test]
+fn moreinfo0201_imagecount_is_exact_not_word_boundary() {
+  let mut buf = vec![0u8; 0x130];
+  put_u16(&mut buf, 0x011b, 0x1234); // low half of the int32u ImageCount
+  put_u16(&mut buf, 0x0125, 0x5678); // low half of the int32u ShutterCount
+
+  let collect = |model: &str| -> Vec<&'static str> {
+    let mut out = Vec::new();
+    parse_more_info0201(&buf, Some(model), false, &mut out);
+    names(&out)
+  };
+
+  assert_eq!(collect("SLT-A33"), ["ImageCount", "ShutterCount"]);
+  // Suffixed A4xx → still emitted (`$`-exact does not match).
+  for m in ["DSLR-A500-x", "DSLR-A500X"] {
+    assert_eq!(
+      collect(m),
+      ["ImageCount", "ShutterCount"],
+      "{m} 0201 counts"
+    );
+  }
+  // Real exact A4xx bodies use 0x014a (deferred) — 0201 emits nothing.
+  for m in ["DSLR-A450", "DSLR-A500", "DSLR-A550"] {
+    assert!(collect(m).is_empty(), "exact {m} suppresses 0201 counts");
+  }
+}

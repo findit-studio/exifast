@@ -19,7 +19,7 @@
 use crate::value::TagValue;
 use smol_str::SmolStr;
 
-use super::subtables::{SubEmission, model_is_a4xx_9pt};
+use super::subtables::{SubEmission, model_is_a4xx_exact};
 
 /// `FacesDetected` (0x0002) PrintConv (`Sony.pm:7556-7567`) — the deciphered
 /// byte is an opaque code, decoded to the face-count string.
@@ -77,8 +77,10 @@ pub fn parse_tag900b(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<S
     });
   }
 
-  // 0x00bd FaceDetection — `Condition !~ /^DSLR-(A450|A500|A550)$/`.
-  if !model_is_a4xx_9pt(model)
+  // 0x00bd FaceDetection — `Condition !~ /^DSLR-(A450|A500|A550)$/` ($-anchored
+  // EXACT, Sony.pm:7571) — NOT the `\b` boundary, so a suffixed A4xx body still
+  // emits FaceDetection.
+  if !model_is_a4xx_exact(model)
     && let Some(&raw) = buf.get(0x00bd)
   {
     out.push(SubEmission {
@@ -90,3 +92,11 @@ pub fn parse_tag900b(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<S
 
   out
 }
+
+#[cfg(test)]
+// The module-level `#![deny(clippy::indexing_slicing)]` is relaxed for the test
+// module, which indexes fixed-layout byte buffers directly (an out-of-range
+// index is a test-assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
+#[path = "tag900b_tests.rs"]
+mod tests;

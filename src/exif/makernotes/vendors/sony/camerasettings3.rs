@@ -19,7 +19,8 @@ use smol_str::SmolStr;
 
 use super::subtables::{
   SubEmission, drive_mode, exposure_comp_value, exposure_program2, hash_hex_value,
-  model_is_a4xx_9pt, model_is_nex, read_u32, signed_setting_value, white_balance_setting,
+  model_is_a4xx_exact, model_is_a4xx_prefix, model_is_nex, read_u32, signed_setting_value,
+  white_balance_setting,
 };
 
 /// Render a plain (non-hex) hash-PrintConv leaf (`-j` label/`Unknown (N)`, `-n`
@@ -195,8 +196,13 @@ pub fn parse_camera_settings3(
 ) -> Vec<SubEmission> {
   let mut out = std::vec::Vec::new();
   let nex = model_is_nex(model);
-  let a4xx = model_is_a4xx_9pt(model);
-  let other = !a4xx; // the `!~ /^DSLR-(A450|A500|A550)$/` class
+  // The A4xx conditions in this table come in TWO anchor flavors (never `\b`):
+  // most leaves are `$`-anchored EXACT (`!~ /^DSLR-(A450|A500|A550)$/`), while
+  // 0x87/0x88 `FlashStatus*` are the no-anchor PREFIX
+  // (`!~ /^DSLR-(A450|A500|A550)/`). Split the bool so a suffixed A4xx string
+  // follows each field's true anchor.
+  let a4xx_exact = model_is_a4xx_exact(model);
+  let a4xx_prefix = model_is_a4xx_prefix(model);
 
   // 0x00 ShutterSpeedSetting — `$val ? 2**(6 - $val/8) : 0`,
   // `$val ? PrintExposureTime($val) : "Bulb"` (Sony.pm:5144-5150).
@@ -409,9 +415,9 @@ pub fn parse_camera_settings3(
     &mut out,
   );
 
-  // 0x32/0x33/0x34/0x35/0x36/0x38 — `Condition => '$$self{Model} !~
-  // /^DSLR-(A450|A500|A550)$/'` (Sony.pm:5491-5615).
-  if other {
+  // 0x32/0x33/0x34/0x35 — `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored EXACT,
+  // Sony.pm:5454/5462/5472/5496).
+  if !a4xx_exact {
     push_hash(
       buf,
       0x32,
@@ -438,8 +444,12 @@ pub fn parse_camera_settings3(
       &mut out,
     );
   }
-  // 0x36 LiveViewAFSetting / 0x38 PanoramaSize3D — `!~ /^(NEX-|DSLR-A4xx)/`.
-  if other && !nex {
+  // 0x36 LiveViewAFSetting — `!~ /^(NEX-|DSLR-(A450|A500|A550)$)/` (NEX prefix +
+  // A4xx $-exact, Sony.pm:5506). 0x38 PanoramaSize3D is `!~
+  // /^DSLR-(A450|A500|A550)$/` ($-exact only, Sony.pm:5519); its `!nex` gate is a
+  // pre-existing over-exclusion outside this A4xx-anchor fix, kept so real NEX
+  // bodies stay byte-identical.
+  if !a4xx_exact && !nex {
     push_hash(
       buf,
       0x36,
@@ -458,9 +468,10 @@ pub fn parse_camera_settings3(
     );
   }
 
-  // 0x83..0x99 — the `!~ /^(NEX-|DSLR-A4xx)/` SLT/DSLR live-view block
-  // (Sony.pm:5524-5614).
-  if other && !nex {
+  // 0x83/0x84/0x85/0x86/0x8b — `!~ /^(NEX-|DSLR-(A450|A500|A550)$)/` (NEX prefix
+  // + A4xx $-exact, Sony.pm:5531/5539/5548/5558/5591) — the SLT/DSLR live-view
+  // block.
+  if !a4xx_exact && !nex {
     push_hash(
       buf,
       0x83,
@@ -495,8 +506,9 @@ pub fn parse_camera_settings3(
       &mut out,
     );
   }
-  // 0x87/0x88 FlashStatus — `!~ /^DSLR-(A450|A500|A550)/` (Sony.pm:5564-5580).
-  if other {
+  // 0x87/0x88 FlashStatus* — `!~ /^DSLR-(A450|A500|A550)/` (no-anchor PREFIX,
+  // Sony.pm:5566/5574).
+  if !a4xx_prefix {
     push_hash(
       buf,
       0x87,
@@ -514,13 +526,15 @@ pub fn parse_camera_settings3(
       &mut out,
     );
   }
-  // 0x99 LensMount — `!~ /^DSLR-A4xx$/`, DataMember (Sony.pm:5604).
-  if other {
+  // 0x99 LensMount — `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored EXACT),
+  // DataMember (Sony.pm:5608).
+  if !a4xx_exact {
     push_hash(buf, 0x99, "LensMount", lens_mount, print_conv, &mut out);
   }
 
-  // 0x10c SequenceNumber — OTHER-passthrough (Sony.pm:5638).
-  if other && let Some(&raw) = buf.get(0x10c) {
+  // 0x10c SequenceNumber — `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored EXACT,
+  // Sony.pm:5629), OTHER-passthrough PrintConv.
+  if !a4xx_exact && let Some(&raw) = buf.get(0x10c) {
     out.push(SubEmission {
       priority: 1,
       name: "SequenceNumber",
@@ -529,8 +543,9 @@ pub fn parse_camera_settings3(
   }
 
   // 0x0114 FolderNumber (mask 0x00ffc000) + 276.1 ImageNumber (mask
-  // 0x00003fff) — int32u (Sony.pm:5650-5666).
-  if other && let Some(v) = read_u32(buf, 0x0114) {
+  // 0x00003fff) — int32u, `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored EXACT,
+  // Sony.pm:5643/5651).
+  if !a4xx_exact && let Some(v) = read_u32(buf, 0x0114) {
     let folder = (v & 0x00ff_c000) >> 14;
     out.push(SubEmission {
       priority: 1,
@@ -545,8 +560,9 @@ pub fn parse_camera_settings3(
     });
   }
 
-  // 0x200 ShotNumberSincePowerUp2 — int32u (Sony.pm:5675).
-  if other && let Some(v) = read_u32(buf, 0x200) {
+  // 0x200 ShotNumberSincePowerUp2 — int32u, `!~ /^DSLR-(A450|A500|A550)$/`
+  // ($-anchored EXACT, Sony.pm:5665).
+  if !a4xx_exact && let Some(v) = read_u32(buf, 0x200) {
     out.push(SubEmission {
       priority: 1,
       name: "ShotNumberSincePowerUp2",
@@ -956,3 +972,11 @@ fn masked_count_value(val: u32, width: usize, print_conv: bool) -> TagValue {
   }
   TagValue::Str(SmolStr::new(std::format!("{val:0width$}")))
 }
+
+#[cfg(test)]
+// The module-level `#![deny(clippy::indexing_slicing)]` is relaxed for the test
+// module, which indexes fixed-layout byte buffers directly (an out-of-range
+// index is a test-assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
+#[path = "camerasettings3_tests.rs"]
+mod tests;

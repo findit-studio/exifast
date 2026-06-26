@@ -26,7 +26,7 @@ use smol_str::SmolStr;
 
 use super::subtables::{
   SubEmission, drive_mode, exposure_comp_value, exposure_comp2_value, exposure_program2,
-  hash_hex_value, model_is_a4xx_9pt, model_is_a4xx_exact, model_is_nex355c, read_i16, read_u16,
+  hash_hex_value, model_is_a4xx_exact, model_is_a4xx_prefix, model_is_nex355c, read_i16, read_u16,
   read_u32, signed_setting_value, white_balance_setting,
 };
 
@@ -108,8 +108,8 @@ pub fn parse_more_info(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec
       // FaceInfo vs FaceInfoA is the `$`-anchored EXACT selector
       // (`Sony.pm:3398`/`3402`): `FaceInfoA` only for a model EQUAL to
       // DSLR-A450/A500/A550, else this non-A4xx `FaceInfo` — so a suffixed body
-      // still parses FaceInfo. This is NOT the `\b` `model_is_a4xx_9pt` used for
-      // the ExtraInfo3 0x0014 / MoreSettings conditions.
+      // still parses FaceInfo. This is NOT the `\b` `model_is_a4xx_9pt` (the
+      // ExtraInfo3 0x0014 / CameraInfo3 9-point-AF condition).
       0x0002 if !model_is_a4xx_exact(model) => {
         parse_face_info(block, print_conv, &mut out);
         1
@@ -155,9 +155,17 @@ fn parse_more_settings(
   print_conv: bool,
   out: &mut Vec<SubEmission>,
 ) {
-  let a4xx = model_is_a4xx_9pt(model);
+  // Two A4xx anchor flavors live in this table: 0x13/0x15 are `$`-anchored EXACT
+  // (`/^DSLR-(A450|A500|A550)$/`), while every overlapping-offset `other` leaf
+  // (0x1e..0x86) is the no-anchor PREFIX (`/^DSLR-(A450|A500|A550)/`). A single
+  // `\b` bool is wrong in OPPOSITE directions for a suffixed A4xx string, so
+  // split them.
+  let a4xx_exact = model_is_a4xx_exact(model);
+  let a4xx_prefix = model_is_a4xx_prefix(model);
   let nex355c = model_is_nex355c(model);
-  let other = !a4xx && !nex355c; // the `!~ NEX-(3|5|5C)|DSLR-A4xx` class
+  // `!~ /^NEX-(3|5|5C)|DSLR-(A450|A500|A550)/` — the prefix-A4xx + NEX-3/5/5C
+  // exclusion shared by the 0x1e..0x86 overlapping leaves.
+  let other = !a4xx_prefix && !nex355c;
 
   // 0x01 DriveMode2 — PrintHex, %sonyDriveMode (Sony.pm:3534).
   push_hash_hex(
@@ -228,8 +236,9 @@ fn parse_more_settings(
     print_conv,
     out,
   );
-  // 0x13 FocusMode — `!~ DSLR-A4xx` (Sony.pm:3650).
-  if !a4xx {
+  // 0x13 FocusMode — `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored EXACT,
+  // Sony.pm:3662).
+  if !a4xx_exact {
     push_hash(
       buf,
       0x13,
@@ -239,8 +248,9 @@ fn parse_more_settings(
       out,
     );
   }
-  // 0x15 MultiFrameNoiseReduction — `!~ DSLR-A4xx` (Sony.pm:3664).
-  if !a4xx {
+  // 0x15 MultiFrameNoiseReduction — `!~ /^DSLR-(A450|A500|A550)$/` ($-anchored
+  // EXACT, Sony.pm:3673).
+  if !a4xx_exact {
     push_hash(
       buf,
       0x15,
@@ -272,9 +282,11 @@ fn parse_more_settings(
       print_conv,
       out,
     );
-    // 0x25 ISO — `!~ DSLR-A4xx` (Sony.pm:3784).
+    // 0x25 ISO — variant 2, `!~ /^DSLR-(A450|A500|A550)/` (no-anchor PREFIX,
+    // Sony.pm:3843).
     push_iso(buf, 0x25, out, print_conv);
-    // 0x26 FNumber — "other models" (Sony.pm:3800).
+    // 0x26 FNumber — "other models" fallback after the A4xx-prefix / NEX-prefix
+    // variants (Sony.pm:3870).
     push_fnumber(buf, 0x26, "FNumber", print_conv, out);
     // 0x27 ExposureTime — `!~ NEX-(3|5|5C)|DSLR-A4xx` (Sony.pm:3819).
     push_exposure_time(buf, 0x27, "ExposureTime", print_conv, out);
@@ -379,16 +391,21 @@ fn face_position_value(buf: &[u8], byte: usize) -> Option<TagValue> {
   ))))
 }
 
-/// `%Sony::MoreInfo0201` (`Sony.pm:3457-3497`) — ImageCount (0x011b) +
-/// ShutterCount (0x0125), int32u `& 0x00ffffff`, `!~ DSLR-A4xx`.
+/// `%Sony::MoreInfo0201` (`Sony.pm:3457-3496`) — ImageCount (0x011b) +
+/// ShutterCount (0x0125), int32u `& 0x00ffffff`,
+/// `!~ /^DSLR-A(450|500|550)$/` ($-anchored EXACT).
 fn parse_more_info0201(
   buf: &[u8],
   model: Option<&str>,
   print_conv: bool,
   out: &mut Vec<SubEmission>,
 ) {
-  if model_is_a4xx_9pt(model) {
-    return; // A4xx uses 0x014a ShutterCount (deferred — not the A33 path)
+  // `Condition => '$$self{Model} !~ /^DSLR-A(450|500|550)$/'` ($-anchored EXACT,
+  // Sony.pm:3477/3484) — NOT the `\b` boundary, so a hyphen/space-suffixed A4xx
+  // body still emits ImageCount/ShutterCount. The exact A4xx bodies instead
+  // carry 0x014a ShutterCount (deferred — not the A33 path).
+  if model_is_a4xx_exact(model) {
+    return;
   }
   let _ = print_conv;
   if let Some(v) = read_u32(buf, 0x011b) {

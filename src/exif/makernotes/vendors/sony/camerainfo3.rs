@@ -25,7 +25,8 @@
 use crate::value::TagValue;
 
 use super::subtables::{
-  SubEmission, af_status_value, model_is_a4xx_9pt, model_is_slt_15pt, read_i16, read_u16,
+  SubEmission, af_status_value, model_is_a4xx_9pt, model_is_a4xx_exact, model_is_slt_15pt,
+  read_i16, read_u16,
 };
 
 /// `%afPoint15` PrintConv (`Sony.pm:557-575`) — the 15-point AF sensor used.
@@ -164,7 +165,12 @@ fn push_af_status(
 pub fn parse_camera_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<SubEmission> {
   let mut out = std::vec::Vec::new();
   let slt = model_is_slt_15pt(model);
+  // The 9-point AF block (0x14..0x31) is `\b`-anchored
+  // (`/^DSLR-A(450|500|550)\b/`); 0x0e/0x10 `FocalLength*` are `$`-anchored EXACT
+  // (`/^DSLR-(A450|A500|A550)$/`), so they take DISTINCT helpers — they diverge
+  // only for a hypothetical suffixed A4xx string (e.g. `DSLR-A500-x`).
   let a4xx = model_is_a4xx_9pt(model);
+  let a4xx_exact = model_is_a4xx_exact(model);
 
   // 0x00 LensSpec (`Condition !~ NEX-5C`, undef[8]; Sony.pm:2994-3002) is the
   // SAME `LensSpec` name + value as the Main-IFD `0x0029` leaf, which exifast
@@ -172,9 +178,10 @@ pub fn parse_camera_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> 
   // tag-order the Main leaf wins the last-wins dedup either way, so this
   // duplicate is intentionally NOT re-emitted here (it would be dropped).
 
-  // 0x0e FocalLength — int16u, `Condition !~ A450/A500/A550`, `$val/10`,
-  // `Priority => 0`, `sprintf("%.1f mm",$val)` (Sony.pm:3006-3014).
-  if !a4xx && let Some(raw) = read_u16(buf, 0x0e) {
+  // 0x0e FocalLength — int16u, `Condition !~ /^DSLR-(A450|A500|A550)$/`
+  // ($-anchored EXACT, Sony.pm:3006), `$val/10`, `Priority => 0`,
+  // `sprintf("%.1f mm",$val)` (Sony.pm:3004-3013).
+  if !a4xx_exact && let Some(raw) = read_u16(buf, 0x0e) {
     let mm = f64::from(raw) / 10.0;
     out.push(SubEmission {
       // `Priority => 0` (Sony.pm:3011) — this Sony `FocalLength` never overrides
@@ -189,9 +196,10 @@ pub fn parse_camera_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> 
     });
   }
 
-  // 0x10 FocalLengthTeleZoom — int16u, `Condition !~ A450/A500/A550`,
-  // `$val*2/3`, `sprintf("%.1f mm",$val)` (Sony.pm:3015-3023).
-  if !a4xx && let Some(raw) = read_u16(buf, 0x10) {
+  // 0x10 FocalLengthTeleZoom — int16u, `Condition !~ /^DSLR-(A450|A500|A550)$/`
+  // ($-anchored EXACT, Sony.pm:3016), `$val*2/3`, `sprintf("%.1f mm",$val)`
+  // (Sony.pm:3014-3022).
+  if !a4xx_exact && let Some(raw) = read_u16(buf, 0x10) {
     let mm = f64::from(raw) * 2.0 / 3.0;
     out.push(SubEmission {
       priority: 1,
@@ -310,3 +318,11 @@ fn push_af_status15(buf: &[u8], off: usize, print_conv: bool, out: &mut Vec<SubE
     push_af_status(buf, off + i * 2, name, print_conv, out);
   }
 }
+
+#[cfg(test)]
+// The module-level `#![deny(clippy::indexing_slicing)]` is relaxed for the test
+// module, which indexes fixed-layout byte buffers directly (an out-of-range
+// index is a test-assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
+#[path = "camerainfo3_tests.rs"]
+mod tests;

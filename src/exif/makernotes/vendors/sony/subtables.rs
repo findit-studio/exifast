@@ -192,6 +192,24 @@ pub fn model_is_a4xx_exact(model: Option<&str>) -> bool {
   model.is_some_and(|m| m == "DSLR-A450" || m == "DSLR-A500" || m == "DSLR-A550")
 }
 
+/// `$$self{Model} =~ /^DSLR-(A450|A500|A550)/` — the no-anchor PREFIX match (a
+/// `^` but NO `$` and NO `\b`): the model STARTS WITH one of the three strings.
+///
+/// This is the third A4xx anchor flavor, alongside [`model_is_a4xx_exact`]'s `$`
+/// and [`model_is_a4xx_9pt`]'s `\b`. It governs the overlapping-offset
+/// `MoreSettings` / `CameraSettings3` leaves whose ExifTool `Condition` is an
+/// un-anchored `/^DSLR-(A450|A500|A550)/` (e.g. `MoreSettings` 0x25 `ISO`,
+/// `CameraSettings3` 0x87/0x88 `FlashStatus*`). All three A4xx helpers AGREE for
+/// a real body (exactly `DSLR-A450/A500/A550`, or not an A4xx at all) and
+/// diverge only for a hypothetical suffixed string: `DSLR-A500X` is a PREFIX
+/// match but a `\b` NON-match; `DSLR-A500-x` is BOTH.
+#[must_use]
+pub fn model_is_a4xx_prefix(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    m.starts_with("DSLR-A450") || m.starts_with("DSLR-A500") || m.starts_with("DSLR-A550")
+  })
+}
+
 /// `$$self{Model} =~ /^NEX-(3|5|5C)/` (a prefix match, not a `\b` boundary —
 /// the Perl alternation matches `NEX-3`, `NEX-5`, `NEX-5C`).
 #[must_use]
