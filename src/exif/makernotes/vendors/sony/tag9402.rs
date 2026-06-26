@@ -94,17 +94,11 @@ pub fn parse_tag9402(buf: &[u8], print_conv: bool) -> Vec<Tag9402Emission> {
     });
   }
 
-  // 0x0016 FocusMode — int8u, `Mask => 0x7f` (Sony.pm:8709-8720).
+  // 0x0016 FocusMode — int8u, `Mask => 0x7f` (Sony.pm:8709-8720). After the Mask
+  // `$val` is the masked byte, so a hash miss renders `"Unknown ($masked)"`.
   if let Some(&raw) = buf.get(0x16) {
     let masked = raw & 0x7f;
-    let value = if print_conv {
-      match print_focus_mode(masked) {
-        Some(s) => TagValue::Str(s.into()),
-        None => TagValue::I64(i64::from(masked)),
-      }
-    } else {
-      TagValue::I64(i64::from(masked))
-    };
+    let value = super::hash_print_value(masked, print_focus_mode(masked), print_conv);
     out.push(Tag9402Emission {
       name: "FocusMode",
       value,
@@ -113,14 +107,7 @@ pub fn parse_tag9402(buf: &[u8], print_conv: bool) -> Vec<Tag9402Emission> {
 
   // 0x0017 AFAreaMode — int8u hash (Sony.pm:8721-8739).
   if let Some(&raw) = buf.get(0x17) {
-    let value = if print_conv {
-      match print_af_area_mode(raw) {
-        Some(s) => TagValue::Str(s.into()),
-        None => TagValue::I64(i64::from(raw)),
-      }
-    } else {
-      TagValue::I64(i64::from(raw))
-    };
+    let value = super::hash_print_value(raw, print_af_area_mode(raw), print_conv);
     out.push(Tag9402Emission {
       name: "AFAreaMode",
       value,

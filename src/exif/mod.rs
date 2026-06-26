@@ -24986,6 +24986,115 @@ mod tests {
     assert_eq!(find("SonyModelID"), Some(TagValue::Str("ILCE-9".into())));
   }
 
+  /// DoubleCipher latch ORDER (`Sony.pm:1847` + `ProcessEnciphered`
+  /// `Sony.pm:11552-11556`): the `$$self{DoubleCipher}` DataMember is set as a
+  /// side effect of the 0x9400 `Tag9400a` Condition, and ExifTool's `ProcessExif`
+  /// processes IFD entries in PHYSICAL (ascending-tag-id) order — so a 0x9050
+  /// block, which sorts BEFORE 0x9400, is run through `ProcessEnciphered` with
+  /// `DoubleCipher` STILL UNSET and is deciphered ONCE, even on a
+  /// double-enciphered body. This is the EXACT bundled behaviour (verified vs the
+  /// bundled binary on a crafted FX3 ARW: a 0x9050-before-0x9400 double-enciphered
+  /// file emits `[Deciphered Tag9050c directory] ShutterCount = 1193046` while the
+  /// 0x9400 block alone gets `[Double-deciphered Tag9400a directory]`). A pre-scan
+  /// that latched DoubleCipher BEFORE emitting 0x9050 would double-decipher it and
+  /// DIVERGE from bundled — this test pins the faithful single-pass order.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn double_cipher_latch_does_not_affect_earlier_sorting_0x9050() {
+    use crate::value::TagValue;
+
+    // The Sony forward cipher `c = (b·b·b) mod 249` (`Sony.pm:11521`); identity
+    // for 249..=255. A 0x9050 block enciphered ONCE is the correct on-disk form
+    // for a normal (non-double) body.
+    let encipher = |plain: &[u8]| -> std::vec::Vec<u8> {
+      plain
+        .iter()
+        .map(|&b| {
+          if b <= 248 {
+            ((u32::from(b) * u32::from(b) % 249 * u32::from(b)) % 249) as u8
+          } else {
+            b
+          }
+        })
+        .collect()
+    };
+
+    // ---- The 0x9050 plaintext (Tag9050c, FX3): ShutterCount @0x3a int32u.
+    let mut plain = std::vec![0u8; 0x60];
+    plain[0x3a..0x3e].copy_from_slice(&0x0012_3456u32.to_le_bytes());
+    // Shutter @0x26 int16u[3] = 1 2 3 (a recognizable second leaf).
+    plain[0x26..0x28].copy_from_slice(&1u16.to_le_bytes());
+    plain[0x28..0x2a].copy_from_slice(&2u16.to_le_bytes());
+    plain[0x2a..0x2c].copy_from_slice(&3u16.to_le_bytes());
+    let enc9050 = encipher(&plain); // SINGLE-enciphered (correct on-disk form)
+
+    // ---- The 0x9400 block: raw first byte 0x5e = the DoubleCipher marker
+    // (`Sony.pm:1847`, the once-more-enciphered Tag9400a byte 0x07). Its presence
+    // latches DoubleCipher — but only AFTER 0x9050 has already been emitted.
+    let blk9400 = {
+      let mut b = std::vec![0u8; 0x40];
+      b[0] = 0x5e;
+      b
+    };
+
+    // ---- The Sony MakerNote blob (SONY DSC prefix, body_offset 12), with the
+    // entries in ascending tag-id order: 0x9050 BEFORE 0x9400. Value offsets are
+    // blob-relative (the blob is passed as the buffer with mn_offset 0).
+    let mut blob: std::vec::Vec<u8> = std::vec::Vec::new();
+    blob.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte header
+    let entries_off = blob.len() + 2;
+    let val9050_off = entries_off + 12 * 2 + 4; // after the 2 entries + next-IFD ptr
+    let val9400_off = val9050_off + enc9050.len();
+    blob.extend_from_slice(&2u16.to_le_bytes()); // entry count
+    // entry 0: 0x9050, format 7 (undef), count = block len, value @ val9050_off.
+    blob.extend_from_slice(&0x9050u16.to_le_bytes());
+    blob.extend_from_slice(&7u16.to_le_bytes());
+    blob.extend_from_slice(&(enc9050.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(val9050_off as u32).to_le_bytes());
+    // entry 1: 0x9400, format 7 (undef), count = block len, value @ val9400_off.
+    blob.extend_from_slice(&0x9400u16.to_le_bytes());
+    blob.extend_from_slice(&7u16.to_le_bytes());
+    blob.extend_from_slice(&(blk9400.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(val9400_off as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+    blob.extend_from_slice(&enc9050);
+    blob.extend_from_slice(&blk9400);
+
+    let (emissions, _typed) = sony_makernote_isolated(
+      &blob,
+      0,
+      blob.len(),
+      12,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILME-FX3"),
+      None,
+      true,
+    )
+    .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some");
+
+    let find = |n: &str| {
+      emissions
+        .iter()
+        .rev()
+        .find(|e| e.name() == n)
+        .map(|e| e.value().clone())
+    };
+    // 0x9050 was deciphered ONCE (latch still unset at its walk position), so the
+    // single-enciphered ShutterCount recovers correctly — matching bundled.
+    assert_eq!(
+      find("ShutterCount"),
+      Some(TagValue::I64(0x0012_3456)),
+      "0x9050 sorts before the 0x9400 DoubleCipher marker, so it is single-\
+       deciphered even on a double-enciphered body (bundled-faithful order)"
+    );
+    assert_eq!(
+      find("Shutter"),
+      Some(TagValue::Str("Mechanical (1 2 3)".into())),
+      "the 0x9050 Shutter leaf likewise decodes from the single-deciphered block"
+    );
+  }
+
   /// `MakerNotesMeta::from_blob` must gate Nikon type-2 / headerless-Nikon3 blobs
   /// (parent-TIFF-relative offsets, no parent TIFF) to ABSENT, decoding only the
   /// self-contained type-3 embedded TIFF. The negative control proves the gate is

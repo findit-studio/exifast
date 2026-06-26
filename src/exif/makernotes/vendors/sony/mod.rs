@@ -426,9 +426,36 @@ fn first_u32(raw: &RawValue) -> Option<u32> {
   }
 }
 
+/// Render an `int8u` row whose PrintConv is a plain lookup hash, applying
+/// ExifTool's hash-PrintConv MISS fallback for the `0x9050`/`0x9400`/`0x9402`/
+/// `0x940c`/`0x9416` Sony tables.
+///
+/// `hit` is the hash result (`Some(label)` on a key match, `None` on a miss).
+/// A hit renders the label string. A miss follows `ExifTool.pm:3603-3622`: in
+/// PrintConv (`-j`) mode the value becomes `"Unknown ($val)"` (the decimal
+/// `$val`, since NONE of these Sony tables carry `PrintHex => 1`, so the
+/// `sprintf('Unknown (0x%x)', $val)` sub-case never applies — verified against
+/// `Sony.pm`); in ValueConv/numeric (`-n`) mode (`$convType ne 'PrintConv'`)
+/// the raw integer is kept. This mirrors the central
+/// [`apply_hash_conv`](crate::convert) miss path, applied here because these
+/// hand-ported `ProcessBinaryData` tables render PrintConv inline rather than
+/// through the table engine.
+#[must_use]
+pub(crate) fn hash_print_value(raw: u8, hit: Option<&'static str>, print_conv: bool) -> TagValue {
+  match (print_conv, hit) {
+    (true, Some(s)) => TagValue::Str(SmolStr::new(s)),
+    // PrintConv miss ⇒ `"Unknown ($val)"` (decimal; no `PrintHex` on any of
+    // these Sony tables). `-n` keeps the raw integer.
+    (true, None) => TagValue::Str(SmolStr::new(std::format!("Unknown ({raw})"))),
+    (false, _) => TagValue::I64(i64::from(raw)),
+  }
+}
+
 /// `%releaseMode2` PrintConv hash (`Sony.pm:6195-6226`) — shared by the
 /// `Tag9050x`/`Tag9400x`/`Tag2010x` `ReleaseMode2` rows. `None` for an
-/// unmapped value (ExifTool then prints the raw integer).
+/// unmapped value (ExifTool's hash-PrintConv miss then renders
+/// `"Unknown ($val)"` in `-j` / the raw integer in `-n`, via
+/// [`hash_print_value`]).
 #[must_use]
 pub(crate) fn release_mode2_print(v: u8) -> Option<&'static str> {
   Some(match v {

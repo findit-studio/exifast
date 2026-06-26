@@ -186,7 +186,9 @@ fn quality2_uses_modern_variant(model: Option<&str>) -> bool {
   ends_at_boundary("ZV-E10M2") || ends_at_boundary("ZV-E1")
 }
 
-/// Push an `int8u` row whose PrintConv is a lookup hash, raw `$val` for `-n`.
+/// Push an `int8u` row whose PrintConv is a lookup hash. A hash MISS renders
+/// `"Unknown ($val)"` in `-j` / the raw `$val` in `-n`
+/// ([`super::hash_print_value`]).
 fn push_u8_hash(
   buf: &[u8],
   off: usize,
@@ -196,14 +198,7 @@ fn push_u8_hash(
   out: &mut std::vec::Vec<Tag9400Emission>,
 ) {
   let Some(&raw) = buf.get(off) else { return };
-  let value = if print_conv {
-    match hash(raw) {
-      Some(s) => TagValue::Str(s.into()),
-      None => TagValue::I64(i64::from(raw)),
-    }
-  } else {
-    TagValue::I64(i64::from(raw))
-  };
+  let value = super::hash_print_value(raw, hash(raw), print_conv);
   out.push(Tag9400Emission { name, value });
 }
 
@@ -291,12 +286,14 @@ pub fn parse_tag9400c(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   // one the FX3-class bodies select; an older body reaching here keeps its raw
   // value rather than mis-rendering with the wrong table.
   if let Some(&raw) = buf.get(0x2a) {
-    let value = if print_conv && quality2_uses_modern_variant(model) {
-      match print_quality2_modern(raw) {
-        Some(s) => TagValue::Str(s.into()),
-        None => TagValue::I64(i64::from(raw)),
-      }
+    let value = if quality2_uses_modern_variant(model) {
+      // The modern variant's hash applies: a hit renders the label, a miss
+      // renders `"Unknown ($val)"` (`-j`) / raw (`-n`) per ExifTool.
+      super::hash_print_value(raw, print_quality2_modern(raw), print_conv)
     } else {
+      // An older body selects the (unported) first variant; rather than
+      // mis-rendering with the wrong table, the raw value passes through in
+      // BOTH modes — this is a deliberate non-hash path, not a hash miss.
       TagValue::I64(i64::from(raw))
     };
     out.push(Tag9400Emission {

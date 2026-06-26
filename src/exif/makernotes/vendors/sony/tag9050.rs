@@ -155,7 +155,8 @@ fn push_fnumber(
 }
 
 /// Push `ReleaseMode2` (0x004b / 0x006b, `%releaseMode2` `Sony.pm:6195-6226`):
-/// `int8u` PrintConv hash, raw value for `-n`.
+/// `int8u` PrintConv hash. A miss renders `"Unknown ($val)"` (`-j`) / raw
+/// (`-n`) ([`super::hash_print_value`]).
 fn push_release_mode2(
   buf: &[u8],
   off: usize,
@@ -163,14 +164,7 @@ fn push_release_mode2(
   out: &mut std::vec::Vec<Tag9050Emission>,
 ) {
   let Some(&raw) = buf.get(off) else { return };
-  let value = if print_conv {
-    match super::release_mode2_print(raw) {
-      Some(s) => TagValue::Str(s.into()),
-      None => TagValue::I64(i64::from(raw)),
-    }
-  } else {
-    TagValue::I64(i64::from(raw))
-  };
+  let value = super::hash_print_value(raw, super::release_mode2_print(raw), print_conv);
   out.push(Tag9050Emission {
     name: "ReleaseMode2",
     value,
@@ -196,14 +190,7 @@ pub fn parse_tag9050c(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   // (Sony.pm:8228). Captured below to gate 0x0050 ShutterCount2.
   let flash_fired = buf.get(0x39).copied();
   if let Some(v) = flash_fired {
-    let value = if print_conv {
-      match print_flash_status(v) {
-        Some(s) => TagValue::Str(s.into()),
-        None => TagValue::I64(i64::from(v)),
-      }
-    } else {
-      TagValue::I64(i64::from(v))
-    };
+    let value = super::hash_print_value(v, print_flash_status(v), print_conv);
     out.push(Tag9050Emission {
       name: "FlashStatus",
       value,

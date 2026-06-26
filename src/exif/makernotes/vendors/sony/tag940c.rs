@@ -71,14 +71,7 @@ pub fn parse_tag940c(buf: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
   // (Sony.pm:9362-9371). Captured first to gate the rows below.
   let lens_mount = buf.get(0x08).copied();
   if let Some(raw) = lens_mount {
-    let value = if print_conv {
-      match print_lens_mount2(raw) {
-        Some(s) => TagValue::Str(s.into()),
-        None => TagValue::I64(i64::from(raw)),
-      }
-    } else {
-      TagValue::I64(i64::from(raw))
-    };
+    let value = super::hash_print_value(raw, print_lens_mount2(raw), print_conv);
     out.push(Tag940cEmission {
       name: "LensMount2",
       value,
@@ -95,9 +88,12 @@ pub fn parse_tag940c(buf: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
       let value = if print_conv {
         match lens_types::lookup_name(u32::from(raw)) {
           Some(name) => TagValue::Str(name),
-          // `PrintInt => 1` fallback: an ID not in `%sonyLensTypes2` renders as
-          // the bare integer (the `JsonTagValue` number-gate emits it unquoted).
-          None => TagValue::Str(smol_str::SmolStr::from(std::format!("{raw}"))),
+          // A miss renders `"Unknown ($val)"` (`ExifTool.pm:3622`): `PrintInt =>
+          // 1` is a `BuildTagLookup`-only doc flag, NOT a runtime PrintConv
+          // directive, so an id absent from `%sonyLensTypes2` takes the standard
+          // hash-PrintConv miss, exactly as `SonyPrintConv::LensType` renders it
+          // (verified vs bundled: an out-of-table id ⇒ `"Unknown (60000)"`).
+          None => TagValue::Str(smol_str::SmolStr::from(std::format!("Unknown ({raw})"))),
         }
       } else {
         TagValue::I64(i64::from(raw))

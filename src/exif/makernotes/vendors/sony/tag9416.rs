@@ -98,7 +98,9 @@ fn push_aperture(
   out.push(Tag9416Emission { name, value });
 }
 
-/// An `int8u` row whose PrintConv is a lookup hash, raw `$val` for `-n`.
+/// An `int8u` row whose PrintConv is a lookup hash. A hash MISS renders
+/// `"Unknown ($val)"` in `-j` / the raw `$val` in `-n`
+/// ([`super::hash_print_value`]).
 fn push_u8_hash(
   buf: &[u8],
   off: usize,
@@ -108,14 +110,7 @@ fn push_u8_hash(
   out: &mut std::vec::Vec<Tag9416Emission>,
 ) {
   let Some(&raw) = buf.get(off) else { return };
-  let value = if print_conv {
-    match hash(raw) {
-      Some(s) => TagValue::Str(s.into()),
-      None => TagValue::I64(i64::from(raw)),
-    }
-  } else {
-    TagValue::I64(i64::from(raw))
-  };
+  let value = super::hash_print_value(raw, hash(raw), print_conv);
   out.push(Tag9416Emission { name, value });
 }
 
@@ -466,14 +461,18 @@ pub fn parse_tag9416(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   );
 
   // 0x004b LensType2 — int16u, `Condition => '$$self{LensMount} == 2'`,
-  // `%sonyLensTypes2` (`PrintInt => 1`) (Sony.pm:10106-10113).
+  // `%sonyLensTypes2` (Sony.pm:10106-10113). A miss renders `"Unknown ($val)"`
+  // (`-j`) / the raw int16u (`-n`) — `PrintInt => 1` is a `BuildTagLookup`-only
+  // doc flag, NOT a runtime PrintConv directive, so the standard hash-PrintConv
+  // miss (`ExifTool.pm:3622`) applies, exactly as `SonyPrintConv::LensType2`
+  // renders it (verified vs bundled: an out-of-table id ⇒ `"Unknown (60000)"`).
   if lens_mount == Some(2)
     && let Some(raw) = read_u16(buf, 0x4b)
   {
     let value = if print_conv {
       match lens_types::lookup_name(u32::from(raw)) {
         Some(name) => TagValue::Str(name),
-        None => TagValue::Str(smol_str::SmolStr::from(std::format!("{raw}"))),
+        None => TagValue::Str(smol_str::SmolStr::from(std::format!("Unknown ({raw})"))),
       }
     } else {
       TagValue::I64(i64::from(raw))

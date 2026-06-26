@@ -143,6 +143,38 @@ fn truncated_block_emits_only_in_range_fields() {
   assert!(parse_tag9050c(&[], Some("ILME-FX3"), true).is_empty());
 }
 
+/// Hash-PrintConv MISS regression (`ExifTool.pm:3603-3622`): a `Tag9050c`
+/// `int8u`-hash row (here `FlashStatus`, 0x0039) whose value is ABSENT from the
+/// PrintConv hash renders `"Unknown ($val)"` in `-j` (PrintConv) and the raw
+/// integer in `-n` — NOT the raw integer in both. `99` ∉ `%flashStatus`, so
+/// bundled ExifTool prints `"Unknown (99)"` (verified vs the bundled binary; no
+/// `PrintHex` on this table ⇒ the decimal form). Without
+/// [`super::hash_print_value`] the `-j` miss leaked the raw `99`.
+#[test]
+fn flash_status_hash_miss_renders_unknown() {
+  let mut plain = vec![0u8; 256];
+  plain[0x39] = 99; // FlashStatus, out of %flashStatus
+  // A nonzero ShutterCount so the surrounding leaves still emit (unrelated).
+  plain[0x3a..0x3e].copy_from_slice(&7u32.to_le_bytes());
+  let blk = encipher(&plain);
+
+  // -j (PrintConv): the miss ⇒ "Unknown (99)".
+  let pj = parse_tag9050c(&deciphered(&blk), Some("ILME-FX3"), true);
+  assert_eq!(
+    find(&pj, "FlashStatus"),
+    Some(&TagValue::Str("Unknown (99)".into())),
+    "an out-of-table FlashStatus must render Unknown (N) in -j, matching bundled"
+  );
+
+  // -n (numeric): the raw integer 99.
+  let pn = parse_tag9050c(&deciphered(&blk), Some("ILME-FX3"), false);
+  assert_eq!(
+    find(&pn, "FlashStatus"),
+    Some(&TagValue::I64(99)),
+    "an out-of-table FlashStatus must render the raw integer in -n"
+  );
+}
+
 /// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
 /// is latched, the dispatcher's `process_enciphered` deciphers the 0x9050 block
 /// TWICE before parse_tag9050c reads it. A double-enciphered FX3 block recovers
