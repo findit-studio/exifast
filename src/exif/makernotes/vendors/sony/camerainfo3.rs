@@ -191,7 +191,7 @@ pub fn parse_camera_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> 
       value: if print_conv {
         TagValue::Str(std::format!("{mm:.1} mm").into())
       } else {
-        TagValue::F64(mm)
+        crate::value::whole_f64_to_tag_value(mm)
       },
     });
   }
@@ -207,7 +207,7 @@ pub fn parse_camera_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> 
       value: if print_conv {
         TagValue::Str(std::format!("{mm:.1} mm").into())
       } else {
-        TagValue::F64(mm)
+        crate::value::whole_f64_to_tag_value(mm)
       },
     });
   }

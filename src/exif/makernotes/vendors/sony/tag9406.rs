@@ -54,7 +54,7 @@ pub fn parse_tag9406(buf: &[u8], print_conv: bool) -> Vec<Tag9406Emission> {
     let value = if print_conv {
       TagValue::Str(std::format!("{celsius:.1} C").into())
     } else {
-      TagValue::F64(celsius)
+      crate::value::whole_f64_to_tag_value(celsius)
     };
     out.push(Tag9406Emission {
       name: "BatteryTemperature",

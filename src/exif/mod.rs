@@ -224,6 +224,17 @@ pub enum IfdKind {
   /// `0 → "SR2DataIFD"`, `1 → "SR2DataIFD1"`, … (`Exif.pm:7076`). Walked against
   /// `%Sony::SR2DataIFD`.
   Sr2DataIfd(u32),
+  /// The Konica-Minolta `MRW` block reached via the `%Sony::SR2Private` `MRWInfo`
+  /// leaf (0x7250 → `%MinoltaRaw::Main`, `Sony.pm:10506`). `%MinoltaRaw::Main` /
+  /// PRD / WBG / RIF carry `GROUPS => { 0 => 'MakerNotes' }` and no explicit
+  /// family-1, so ExifTool labels the leaves with the table-derived directory
+  /// `"MinoltaRaw"`. Unlike the SR2 directories this is NOT a TIFF IFD — it is a
+  /// `\0MR[MI]`-headed binary-segment block walked by
+  /// [`makernotes::vendors::sony::minoltaraw::process_mrw`], whose leaves the
+  /// `walk_entry` hook wraps into `ResolvedConv::Exif` entries directly (it is
+  /// never handed to [`process_subdir`], so [`table_for_ifd_kind`] is unused for
+  /// it).
+  MinoltaRaw,
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -492,6 +503,9 @@ impl IfdKind {
       // `GROUPS => { 1 => 'SR2DataIFD' }` + `SET_GROUP1 => 1` (`Sony.pm:10579`);
       // the `0x74c0` pointer's `s/\d*$/$dirNum/ if $dirNum` numbers the 2nd+.
       IfdKind::Sr2DataIfd(dir_num) => IfdName::literal_suffixed("SR2DataIFD", dir_num),
+      // `%MinoltaRaw::*` have `GROUPS => { 0 => 'MakerNotes' }` with no family-1,
+      // so ExifTool labels the leaves with the table-derived `"MinoltaRaw"`.
+      IfdKind::MinoltaRaw => IfdName::literal("MinoltaRaw"),
     }
   }
 
@@ -531,6 +545,10 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     IfdKind::Sr2Private => TableRef::SonySr2Private,
     IfdKind::Sr2SubIfd(_) => TableRef::SonySr2SubIfd,
     IfdKind::Sr2DataIfd(_) => TableRef::SonySr2DataIfd,
+    // `MinoltaRaw` is a binary-segment block (`process_mrw`), never walked via
+    // `process_subdir`; this arm is a faithful placeholder (`%MinoltaRaw::*` has
+    // no TIFF tag-table redirect) and is unreachable for a MinoltaRaw entry.
+    IfdKind::MinoltaRaw => TableRef::Exif,
   }
 }
 
@@ -5981,6 +5999,44 @@ impl Walker<'_, '_> {
       && tag_id == makernotes::vendors::sony::sr2::SR2_DATA_IFD_POINTER
     {
       self.dispatch_sr2_data_ifd(value_offset, read_len, format, count);
+      return Step::Keep;
+    }
+
+    // ---- Sony MRWInfo (`0x7250` MinoltaRaw inside SR2Private) ---------------
+    // `%Sony::SR2Private` 0x7250 is `MRWInfo` → `%MinoltaRaw::Main`
+    // (`Sony.pm:10506-10512`), `Condition => '$$valPt !~ /^\0\0\0\0/'` (the value
+    // must not begin with four NUL bytes). Its `read_len`-byte value at
+    // `value_offset` is a `\0MR[MI]`-headed MRW block: [`minoltaraw::process_mrw`]
+    // walks its `\0PRD`/`\0WBG`/`\0RIF` segments and returns the
+    // `MinoltaRaw:*` leaves, which ride `ResolvedConv::Exif` under the
+    // `IfdKind::MinoltaRaw` family-1 group. A block that fails the MRW header check
+    // (the FX3's non-MRW 0x7250 data) emits nothing. The model `Condition`s read
+    // the parent IFD0 `Make`/`Model` (captured before this IFD0→SR2Private descent;
+    // `MRWInfo` 0x7250 < `DNGPrivateData` 0xc634 in IFD0 tag order anyway). The
+    // pointer leaf itself is not emitted (`Step::Keep`).
+    if self.active_table == TableRef::SonySr2Private && tag_id == 0x7250 {
+      let end = value_offset.saturating_add(read_len);
+      if let Some(mrw) = self.data.get(value_offset..end) {
+        // `$$valPt !~ /^\0\0\0\0/` — skip a four-NUL-prefixed block.
+        if mrw.get(0..4) != Some(&[0, 0, 0, 0]) {
+          let make = self.captured_make.as_deref();
+          let model = self.captured_model.as_deref();
+          for leaf in makernotes::vendors::sony::minoltaraw::process_mrw(mrw, make, model) {
+            self.entries.push(ExifEntry {
+              ifd: IfdKind::MinoltaRaw,
+              tag_id: leaf.tag.id(),
+              name: leaf.tag.name(),
+              value: ExifValue::new(leaf.value),
+              on_disk_format: Format::Undef,
+              value_offset: 0,
+              value_size: 0,
+              own_ifd_start: 0,
+              source_block: 0,
+              conv: ResolvedConv::Exif(leaf.tag),
+            });
+          }
+        }
+      }
       return Step::Keep;
     }
 
@@ -12192,7 +12248,9 @@ fn sony_emit_binary_subdir<S: ExifSink>(
   print_conv: bool,
   out: &mut S,
 ) {
-  use makernotes::vendors::sony::{camerainfo3, camerasettings3, extrainfo3, moreinfo};
+  use makernotes::vendors::sony::{
+    camerainfo2, camerainfo3, camerasettings, camerasettings3, extrainfo3, focusinfo, moreinfo,
+  };
   let off = entry.value_offset();
   let Some(end) = off.checked_add(entry.value_size()) else {
     return;
@@ -12201,15 +12259,30 @@ fn sony_emit_binary_subdir<S: ExifSink>(
     return;
   };
   let emissions = match entry.tag_id() {
+    // `CameraInfo2` — `$count == 5506 || 6118` (Sony.pm:728-734), LittleEndian.
+    // The A200-A390 generation; dispatched BEFORE `CameraInfo3`'s 15360 gate.
+    0x0010 if entry.value_size() == 5506 || entry.value_size() == 6118 => {
+      camerainfo2::parse_camera_info2(raw, print_conv)
+    }
     // `CameraInfo3` — `$count == 15360` (Sony.pm:2280-2300). The `$count` gate
     // is the entry's value byte-count.
     0x0010 if entry.value_size() == 15360 => {
       camerainfo3::parse_camera_info3(raw, model, print_conv)
     }
+    // `FocusInfo` — `$count == 19154 || 19148` (Sony.pm:753-760), dispatched
+    // OVER `MoreInfo` for the A200-A900 generation.
+    0x0020 if entry.value_size() == 19154 || entry.value_size() == 19148 => {
+      focusinfo::parse_focus_info(raw, model, print_conv)
+    }
     // `MoreInfo` — dispatched (over `FocusInfo`) when `$count` is NOT
     // 19154/19148 (Sony.pm:44-63).
     0x0020 if entry.value_size() != 19154 && entry.value_size() != 19148 => {
       moreinfo::parse_more_info(raw, model, print_conv)
+    }
+    // `CameraSettings` — `$count == 280 || 364` (Sony.pm:805-811), BigEndian
+    // `int16u`. The A200/A300/A350/A700/A850/A900 generation.
+    0x0114 if entry.value_size() == 280 || entry.value_size() == 364 => {
+      camerasettings::parse_camera_settings(raw, print_conv)
     }
     // `CameraSettings3` — `$count == 1536 || $count == 2048` (Sony.pm:97-127).
     0x0114 if entry.value_size() == 1536 || entry.value_size() == 2048 => {
@@ -14380,6 +14453,55 @@ fn emit_exif_value<S: ExifSink>(
           out.write_str(group, name, &std::format!("0x{:08x}", v as u32))?;
         }
         Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    // `%MinoltaRaw::RIF` `WBMode` — `ConvertWBMode($val)` (`MinoltaRaw.pm:161`).
+    // `-n` keeps the bare `$val` integer.
+    Conv::MinoltaWbMode => {
+      match first_uint(raw) {
+        Some(v) if print_conv => {
+          out.write_str(
+            group,
+            name,
+            &makernotes::vendors::sony::minoltaraw::convert_wb_mode(v),
+          )?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    // `%MinoltaRaw::RIF` `ISOSetting` — the HASH+`OTHER` PrintConv
+    // (`MinoltaRaw.pm:179-200`); the print value is a label STRING or a computed
+    // INTEGER. `-n` keeps the bare `$val` integer (the `255 → undef` RawConv drop
+    // happened at decode, so the value here is never 255).
+    Conv::MinoltaIsoSetting => {
+      match first_uint(raw) {
+        Some(v) if print_conv => {
+          use makernotes::vendors::sony::minoltaraw::{IsoPrint, iso_setting_print};
+          match iso_setting_print(v) {
+            IsoPrint::Str(s) => out.write_str(group, name, s)?,
+            IsoPrint::Int(n) => out.write_i64(group, name, n)?,
+          }
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    // `%MinoltaRaw::RIF` `ColorTemperature` (A200/A700) — `ValueConv => '$val *
+    // 100'` then `PrintConv => '$val ? $val : "Auto"'` (`MinoltaRaw.pm:325-333`).
+    // `-n` emits the post-ValueConv `$val * 100` (a zero raw stays `0`).
+    Conv::MinoltaColorTemperature => {
+      match first_uint(raw) {
+        Some(v) => {
+          let ct = i64::try_from(v.saturating_mul(100)).unwrap_or(i64::MAX);
+          if print_conv && ct == 0 {
+            out.write_str(group, name, "Auto")?;
+          } else {
+            out.write_i64(group, name, ct)?;
+          }
+        }
+        None => emit_raw(group, name, raw, out)?,
       }
       Ok(())
     }

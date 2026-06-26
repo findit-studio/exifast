@@ -81,8 +81,9 @@ fn fx3_print_conv_matches_golden() {
 fn fx3_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
   let em = parse_tag9406(&process_enciphered(&blk, false), false);
-  // BatteryTemperature: the ValueConv result 35.0 → %.15g → "35".
-  assert_eq!(find(&em, "BatteryTemperature"), Some(&TagValue::F64(35.0)));
+  // BatteryTemperature: the ValueConv result 35.0 → `%.15g` token "35" → the
+  // BARE integer `35`, byte-identical to the golden (NOT serde's `35.0`).
+  assert_eq!(find(&em, "BatteryTemperature"), Some(&TagValue::I64(35)));
   assert_eq!(find(&em, "BatteryLevel"), Some(&TagValue::I64(97)));
 }
 

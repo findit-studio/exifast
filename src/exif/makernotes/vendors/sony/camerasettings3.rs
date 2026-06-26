@@ -222,7 +222,7 @@ pub fn parse_camera_settings3(
           TagValue::Str("Bulb".into())
         }
       } else {
-        TagValue::F64(secs)
+        crate::value::whole_f64_to_tag_value(secs)
       },
     });
   }
@@ -600,7 +600,7 @@ fn push_fnumber_leaf(
       value: if print_conv {
         TagValue::Str(print_fnumber(fnum).into())
       } else {
-        TagValue::F64(fnum)
+        crate::value::whole_f64_to_tag_value(fnum)
       },
     });
   }
@@ -723,7 +723,7 @@ fn iso_setting_value(raw: u8, print_conv: bool) -> TagValue {
   if !print_conv {
     // `-n`: the ValueConv result. For 0 / 254 it is the raw integer.
     return if raw != 0 && raw < 254 {
-      TagValue::F64(vc)
+      crate::value::whole_f64_to_tag_value(vc)
     } else {
       TagValue::I64(i64::from(raw))
     };

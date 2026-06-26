@@ -1570,6 +1570,49 @@ mod exif {
     assert_eq!(emit(&n), "-0.0", "bundled emits literal `-0.0`");
   }
 
+  /// `Composite:FocusDistance` `-n` (ValueConv) numeric branch: a WHOLE metres
+  /// distance (`FocusPosition * FocalLength / 1000` over integer operands, e.g.
+  /// `100 * 50 / 1000 = 5`) stringifies as the BARE token `5` — Perl renders a
+  /// whole number bare, NOT serde's `5.0`; a fractional distance keeps the
+  /// full-precision float. (The A200's real FocusDistance is `"inf"` —
+  /// FocusPosition 128 — so this whole-value path is reachable only for a body
+  /// with FocusPosition < 128 whose `pos * FocalLength` is a multiple of 1000.)
+  #[cfg(feature = "json")]
+  #[test]
+  fn focus_distance_n_whole_renders_bare_token() {
+    // pos=100, FocalLength=50 → 100*50/1000 = 5.0 (whole) → bare `5`.
+    let whole = CompositePrintConv::FocusDistance.render(
+      &CompositeRaw::Num(5.0),
+      &[],
+      &[],
+      ConvMode::ValueConv,
+    );
+    assert_eq!(
+      whole,
+      TagValue::I64(5),
+      "a whole distance is a bare integer scalar"
+    );
+    assert_eq!(
+      emit(&whole),
+      "5",
+      "a whole FocusDistance is the bare token `5`, not `5.0`"
+    );
+
+    // A fractional distance keeps the full-precision float.
+    let frac = CompositePrintConv::FocusDistance.render(
+      &CompositeRaw::Num(5.5),
+      &[],
+      &[],
+      ConvMode::ValueConv,
+    );
+    assert_eq!(frac, TagValue::F64(5.5));
+    assert_eq!(
+      emit(&frac),
+      "5.5",
+      "a fractional FocusDistance keeps the float token"
+    );
+  }
+
   // The NikonD2Hs lens-input set (bundled-ExifTool 13.59): the simple
   // `$foc35/$focal` ScaleFactor path (75/50 = 1.5) plus the inputs that drive the
   // whole chain. A bare `ExifIFD:FocalLength` of 50 AND a later `Nikon:FocalLength`
@@ -1641,10 +1684,9 @@ mod exif {
       composite(&val, "ScaleFactor35efl"),
       Some(TagValue::F64(1.5))
     );
-    assert_eq!(
-      composite(&val, "FocalLength35efl"),
-      Some(TagValue::F64(75.0))
-    );
+    // `FocalLength35efl` ValueConv is the bare 35mm-equiv focal; an exactly-whole
+    // value is an `I64` (`75`), not `F64(75.0)`, so the `-n` token is bare `75`.
+    assert_eq!(composite(&val, "FocalLength35efl"), Some(TagValue::I64(75)));
     assert_eq!(
       composite(&val, "DOF"),
       Some(TagValue::Str("0.693325809394639 0.723195615956146".into()))

@@ -424,6 +424,10 @@ pub(crate) enum CompositePrintConv {
   /// m", $val)`, Sony.pm:10927) — the `"%.4g m"`-formatted distance (or `"inf"`)
   /// under `-j`; the numeric `$val` (or the `"inf"` string) under `-n`.
   FocusDistance2,
+  /// `Composite:FocusDistance` PrintConv (`$val eq "inf" ? $val : "$val m"`,
+  /// Sony.pm:10902) — the `"$val m"` distance string (or `"inf"`) under `-j`;
+  /// the numeric `$val` (or the `"inf"` string) under `-n`.
+  FocusDistance,
 }
 
 impl CompositePrintConv {
@@ -625,7 +629,11 @@ impl CompositePrintConv {
         // (`Composite:ScaleFactor35efl`).
         let equiv = raw.as_num().unwrap_or(f64::NAN);
         match mode {
-          ConvMode::ValueConv => TagValue::F64(equiv),
+          // ExifTool emits the bare ValueConv number: an EXACTLY-whole 35mm-equiv
+          // focal renders as a bare integer (`120`), not serde's float `120.0`
+          // (`I64` ⇒ "120", `F64` ⇒ "120.0"). A fractional value keeps its full
+          // f64 precision, byte-identical to bundled.
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(equiv),
           ConvMode::PrintConv => {
             // `$val[0]` is the lens FocalLength; `$val[1]` the (optional) scale
             // factor — both `ToFloat`-coerced as in the ValueConv.
@@ -800,6 +808,24 @@ impl CompositePrintConv {
           ConvMode::ValueConv => TagValue::F64(*n),
           ConvMode::PrintConv => {
             TagValue::Str(std::format!("{} m", crate::value::format_g(*n, 4)).into())
+          }
+        },
+        CompositeRaw::Scalar(_) => TagValue::Str(Default::default()),
+      },
+      CompositePrintConv::FocusDistance => match raw {
+        // The `'inf'` ValueConv branch (`FocusPosition >= 128`) — a `Text`
+        // carrying `"inf"`, emitted verbatim in BOTH modes.
+        CompositeRaw::Text(s) => TagValue::Str(s.as_str().into()),
+        // The numeric distance in metres — `-n` the bare `$val`, `-j` `"$val m"`
+        // (the `$val` text is the rounded numeric scalar). `$val` is
+        // `FocusPosition * FocalLength / 1000` over integer operands, so a WHOLE
+        // result must stringify BARE (`5`, not serde's `5.0`, matching Perl's
+        // number stringification); route it through the whole-`%.15g`-token
+        // helper (a fractional distance keeps the full-precision `F64`).
+        CompositeRaw::Num(n) => match mode {
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(*n),
+          ConvMode::PrintConv => {
+            TagValue::Str(std::format!("{} m", crate::value::format_g(*n, 15)).into())
           }
         },
         CompositeRaw::Scalar(_) => TagValue::Str(Default::default()),
@@ -1847,6 +1873,31 @@ fn focus_distance2(
   Some(CompositeRaw::Num(dist))
 }
 
+/// `Composite:FocusDistance` ValueConv (Sony.pm:10900):
+/// `$val >= 128 ? "inf" : $val * $val[1] / 1000` — distance in metres =
+/// `FocusPosition * FocalLength / 1000`, where `128` (and up) is infinity.
+///
+/// `$val`=`Sony:FocusPosition` (Require, 0-255 with 128=infinity); `$val[1]`=
+/// `FocalLength` (Require). A `>= 128` position ⇒ the `"inf"` `Text`; otherwise
+/// the metres distance (`Num`).
+#[cfg(feature = "exif")]
+fn focus_distance(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$val` — Sony:FocusPosition (Require). (No `return undef unless $val` guard:
+  // a present 0 computes a 0-metre distance.)
+  let pos = v.first()?.coerce_numeric()?;
+  // `$val >= 128 ? "inf"`.
+  if pos >= 128.0 {
+    return Some(CompositeRaw::Text("inf".to_string()));
+  }
+  // `$val[1]` — FocalLength (Require), the bare focal-length number.
+  let focal = v.get(1)?.coerce_numeric()?;
+  Some(CompositeRaw::Num(pos * focal / 1000.0))
+}
+
 /// Is `prt0` (the LensType `$prt[0]`) a CONFIRMED single-lens name — the only
 /// `Composite:LensID` case exifast's resolved-data passthrough handles?
 ///
@@ -2771,6 +2822,20 @@ const BLUE_BALANCE: CompositeDef = CompositeDef {
   sort_key: "Exif-BlueBalance",
 };
 
+/// `Sony:Composite:FocusDistance` (Sony.pm:10895). `Require`s
+/// `Sony:FocusPosition` (family-1 `Sony`) + `FocalLength`; [`focus_distance`]
+/// applies `FocusPosition * FocalLength / 1000` (128 = infinity).
+#[cfg(feature = "exif")]
+const FOCUS_DISTANCE: CompositeDef = CompositeDef {
+  name: "FocusDistance",
+  inputs: &[req(&["Sony"], "FocusPosition"), bare_req("FocalLength")],
+  derive: focus_distance,
+  print_conv: CompositePrintConv::FocusDistance,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Sony-FocusDistance",
+};
+
 /// `Sony:Composite:FocusDistance2` (Sony.pm:10904). `Require`s
 /// `Sony:FocusPosition2` (family-1 `Sony`) + `FocalLengthIn35mmFormat`;
 /// [`focus_distance2`] applies the Sony magnification-to-distance formula.
@@ -3152,6 +3217,8 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   RED_BALANCE,
   #[cfg(feature = "exif")]
   BLUE_BALANCE,
+  #[cfg(feature = "exif")]
+  FOCUS_DISTANCE,
   #[cfg(feature = "exif")]
   FOCUS_DISTANCE2,
   #[cfg(feature = "exif")]

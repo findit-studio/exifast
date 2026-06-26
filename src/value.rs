@@ -158,6 +158,38 @@ pub fn format_g(val: f64, precision: usize) -> String {
   s
 }
 
+/// Build a [`TagValue`] from a numeric ValueConv `f64` so a value whose ExifTool
+/// `%.15g` rendering is a whole number is emitted as a bare integer (`800`, `0`),
+/// not serde's float spelling (`800.0`/`0.0`) — matching how ExifTool stringifies
+/// a `-n` numeric scalar (Perl renders a whole float bare: `12.0 → "12"`).
+///
+/// The decision is made on the `%.15g` TOKEN, NOT `val.fract()`: the f64 need NOT
+/// be EXACTLY whole. The older Sony `ISOSetting` ValueConv yields
+/// `799.9999999999998`, whose `%.15g` rounds to `"800"`; a `fract() == 0.0` test
+/// would miss it and leave an `F64` that the serializer then renders `"800.0"`.
+/// Rendering the SAME `%.15g` text the [`TagValue::F64`] serializer would produce
+/// and picking `I64` iff that text is a pure integer makes the output
+/// byte-identical to bundled. A fractional/exponent token keeps `F64` (the
+/// serializer re-derives the identical token, value-equal to the golden). Used by
+/// every `-n` numeric ValueConv whose ExifTool form is a bare integer (the
+/// composite `FocalLength35efl`; the older / 0x94xx Sony ISO / exposure /
+/// aperture / focal-length / temperature ValueConvs).
+#[must_use]
+pub fn whole_f64_to_tag_value(val: f64) -> TagValue {
+  let token = format_g(val, 15);
+  // A pure-integer `%.15g` token (no `.` / `e` / `E`) → an exact `i64` so the
+  // JSON token is bundled-identical (`800`, not `800.0`). `%.15g` caps the
+  // integer part at 15 digits, so it always fits `i64`; a non-integer or
+  // out-of-range token keeps the full-precision `F64`.
+  if !token.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'))
+    && let Ok(i) = token.parse::<i64>()
+  {
+    TagValue::I64(i)
+  } else {
+    TagValue::F64(val)
+  }
+}
+
 /// A byte-counting [`core::fmt::Write`] sink: holds nothing, only the running
 /// `write_str` byte total. Feeding [`format_g_into`] / [`Rational::exiftool_val_str_into`]
 /// a `LenSink` yields the formatted byte length with ZERO heap allocation —
@@ -1228,6 +1260,19 @@ const _: () = {
       // `n/d` f64 would emit more digits, a DIFFERENT value than the golden's
       // rounded one.)
       let rounded = self.exiftool_val_str();
+      // ExifTool stringifies a WHOLE rational as a bare integer (`0/256 → "0"`,
+      // `120/1 → "120"`), never serde's float `"0.0"`/`"120.0"`. When the
+      // `%.{sig}g` text is a pure integer, emit it as an `i64` so the token is
+      // byte-identical to bundled; a fractional rational keeps the f64 path
+      // (its rounded text re-parses to the golden's rounded number, value-equal).
+      // CRAFTED-INPUT DEFERRAL: a signed `0/-d` rounds to the token `-0`, which
+      // `parse::<i64>("-0") == Ok(0)` collapses to a bare `0` here. That is
+      // value-equivalent and never occurs in real camera data (a 0/negative-
+      // denominator rational); reproducing bundled's bare `-0` token would need a
+      // serde-number-bypass, so it is intentionally not preserved.
+      if let Ok(i) = rounded.parse::<i64>() {
+        return s.serialize_i64(i);
+      }
       match rounded.parse::<f64>() {
         Ok(f) if f.is_finite() => s.serialize_f64(f),
         // Defensive: a rounded form that does not re-parse as finite (not
@@ -2512,6 +2557,54 @@ mod tests {
     assert!(!f64_token_is_faithful(0.0, "9e-400"));
     // NaN is never faithful.
     assert!(!f64_token_is_faithful(f64::NAN, "NaN"));
+  }
+
+  /// [`whole_f64_to_tag_value`] decides on the `%.15g` TOKEN, NOT `val.fract()`:
+  /// a value that ROUNDS to a whole number (the older Sony `ISOSetting` ValueConv
+  /// `799.9999999999998`) becomes an exact `I64` and serializes to the BARE token
+  /// `800` — byte-identical to bundled — not serde's `800.0`. A `fract() == 0.0`
+  /// test would MISS the `799.99…` case and leave the WRONG `800.0` token. A
+  /// genuine fraction keeps the full-precision `F64`.
+  #[cfg(feature = "json")]
+  #[test]
+  fn whole_f64_to_tag_value_uses_g15_token_not_fract() {
+    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // ROUNDS-TO-WHOLE (`fract() != 0.0`) — the masked-hole case.
+    let iso = whole_f64_to_tag_value(799.999_999_999_999_8);
+    assert_eq!(iso, TagValue::I64(800));
+    assert_eq!(j(&iso), "800");
+    // Exactly-whole, zero, and negative-whole — all BARE integers.
+    assert_eq!(whole_f64_to_tag_value(120.0), TagValue::I64(120));
+    assert_eq!(j(&whole_f64_to_tag_value(0.0)), "0");
+    assert_eq!(j(&whole_f64_to_tag_value(-3.0)), "-3");
+    // A GENUINE fraction keeps `F64` (must NOT be integer-ized) and serializes
+    // to its float token.
+    assert!(matches!(
+      whole_f64_to_tag_value(4.555_154_539_026_77),
+      TagValue::F64(_)
+    ));
+    assert_eq!(j(&whole_f64_to_tag_value(0.5)), "0.5");
+  }
+
+  /// A whole rational stringifies as a bare integer (`0/256 → 0`, `120/1 → 120`),
+  /// never serde's float `0.0`. CRAFTED-INPUT DEFERRAL: a signed `0/-d` rounds
+  /// (`%.{sig}g`) to the token `-0`, which the integer fast path
+  /// (`parse::<i64>("-0") == Ok(0)`) collapses to the value-equivalent bare `0` —
+  /// no real rational has a 0/negative denominator, and bundled's bare `-0` token
+  /// would need a serde-number-bypass, so it is intentionally not preserved.
+  #[cfg(feature = "json")]
+  #[test]
+  fn rational_signed_zero_collapses_to_bare_zero() {
+    let j = |r: Rational| serde_json::to_string(&r).unwrap();
+    // 0 / -d (signed) → collapses to the value-equivalent bare `0` (crafted-only;
+    // the bundled bare `-0` token is a deferred serde-bypass corner).
+    assert_eq!(j(Rational::rational32(0, -1)), "0");
+    assert_eq!(j(Rational::rational64(0, -256)), "0");
+    // A POSITIVE-denominator zero is the normal bare `0`.
+    assert_eq!(j(Rational::rational32(0, 256)), "0");
+    assert_eq!(j(Rational::rational32(0, 1)), "0");
+    // A whole positive rational stays a bare integer.
+    assert_eq!(j(Rational::rational32(120, 1)), "120");
   }
 
   /// Contract B / #197 — the integer and float serializers run the SAME

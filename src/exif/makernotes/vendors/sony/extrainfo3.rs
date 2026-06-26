@@ -37,7 +37,7 @@ pub fn parse_extra_info3(buf: &[u8], model: Option<&str>, print_conv: bool) -> V
       value: if print_conv {
         TagValue::Str(SmolStr::new(std::format!("{celsius:.1} C")))
       } else {
-        TagValue::F64(celsius)
+        crate::value::whole_f64_to_tag_value(celsius)
       },
     });
   }
@@ -132,7 +132,7 @@ fn push_voltage(
       value: if print_conv {
         TagValue::Str(SmolStr::new(std::format!("{v:.2} V")))
       } else {
-        TagValue::F64(v)
+        crate::value::whole_f64_to_tag_value(v)
       },
     });
   }
