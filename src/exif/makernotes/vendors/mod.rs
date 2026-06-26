@@ -153,6 +153,30 @@ impl VendorEmission {
     }
   }
 
+  /// Compose a vendor emission carrying BOTH an explicit `Priority => N` AND a
+  /// family-1 group override (`None` ⇒ inherit the captured MakerNote's group1).
+  /// Used by the shared Canon walk's capture sink to route a sub-table whose
+  /// `GROUPS => { 1 => … }` differs from the parent `Canon` group — the
+  /// `CanonCustom::Functions<Model>` leaves group under `CanonCustom`
+  /// (`CanonCustom.pm:229`), not `Canon`.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn new_with_priority_and_group1(
+    name: smol_str::SmolStr,
+    value: crate::value::TagValue,
+    unknown: bool,
+    priority: u8,
+    group1_override: Option<&'static str>,
+  ) -> Self {
+    Self {
+      name,
+      value,
+      unknown,
+      priority,
+      group1_override,
+    }
+  }
+
   /// The resolved tag name.
   #[must_use]
   #[inline(always)]

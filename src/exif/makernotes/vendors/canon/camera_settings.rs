@@ -1090,8 +1090,13 @@ trait ApexFNumber {
 
 impl ApexFNumber for f64 {
   fn exp_f_number(self) -> f64 {
-    // bundled: `exp(CanonEv($val)*log(2)/2)` = `2 ** (CanonEv($val)/2)`.
-    (self / 2.0).exp2()
+    // bundled: `exp(CanonEv($val)*log(2)/2)` (`Canon.pm:2540`). Although this is
+    // mathematically `2 ** (CanonEv($val)/2)`, the `.exp2()` form rounds 1 ULP
+    // differently from the literal `exp(x*ln2)` at some values (e.g. CanonEv 1 ⇒
+    // `MaxAperture` √2: `exp2(0.5)` = 1.4142135623731 but the golden's
+    // `exp(0.5*ln2)` = 1.41421356237309). Match the exact bundled expression so
+    // the `-n` token is byte-identical.
+    (self / 2.0 * core::f64::consts::LN_2).exp()
   }
 }
 

@@ -403,7 +403,7 @@ impl CanonShotInfo {
 }
 
 /// `%canonWhiteBalance` (`Canon.pm:1082-1113`).
-fn white_balance_label(val: i64) -> Option<&'static str> {
+pub(super) fn white_balance_label(val: i64) -> Option<&'static str> {
   Some(match val {
     0 => "Auto",
     1 => "Daylight",

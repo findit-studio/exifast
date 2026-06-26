@@ -553,6 +553,22 @@ case "$FIX" in
   # `ImageSize`/`Megapixels` the port does not build.
   CR2_preview_image.cr2)
     EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
+  # The real-device Canon CR2 fixtures (#84/#85/#87 — the deep Canon sub-table
+  # activation): `Canon_EOS-5D_real.CR2` (ColorData3 / CameraInfo5D /
+  # CustomFunctions5D) and `Canon_EOS-7D_sRAW_real.CR2` (ColorData4 /
+  # CameraInfo7D / CustomFunctions2 / AFMicroAdj). CR2 is a RAW-ImageSize subtype
+  # (`$$self{TIFF_TYPE} =~ /^(CR2|Canon 1D RAW|IIQ|EIP)$/`, Exif.pm:4759), so
+  # exifast's Composite post-pass DEFERS every Composite (no `TIFF_TYPE` handle —
+  # same rationale as `CR2_imagesize.cr2`/`CR2_preview_image.cr2`); `-x
+  # Composite:all` drops the bundled `Aperture`/`ShutterSpeed`/`ISO`/`LensID`/
+  # `WB_RGGBLevels`/… the port does not build. `-x System:all` excludes the
+  # filesystem tags as for the other fixtures. The residual non-Canon deferrals
+  # (IFD3 `CR2CFAPattern`/`RawImageSegmentation`, IFD2/IFD3 `SRawType`, the IFD0
+  # `0x02bc` ApplicationNotes `XMP-xmp:Rating`) are dropped per-fixture at
+  # conformance time (the `FIXTURE_EXCLUDED_KEYS` deferrals) — they are separate
+  # cross-cutting subsystems, NOT part of the Canon MakerNote sub-table port.
+  Canon_EOS-5D_real.CR2 | Canon_EOS-7D_sRAW_real.CR2)
+    EXCLUDE_ARR+=(-x System:all -x Composite:all) ;;
   # ARW_preview_image.arw — 0x0201/0x0202 (`PreviewImageStart`/`Length` in IFD0
   # of ARW, `Exif.pm:1226-1237`, gated `DIR_NAME eq "IFD0" and TIFF_TYPE =~
   # /^(ARW|SR2)$/`). ARW is NOT a RAW-ImageSize subtype, so exifast BUILDS the

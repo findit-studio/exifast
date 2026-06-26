@@ -270,6 +270,12 @@ impl SubTable {
         | SubTable::AfInfo3
         | SubTable::SensorInfo
         | SubTable::ColorBalance
+        | SubTable::Processing
+        | SubTable::MeasuredColor
+        | SubTable::CameraInfo
+        | SubTable::ColorData
+        | SubTable::AfMicroAdj
+        | SubTable::CustomFunctions
     )
   }
 
@@ -329,6 +335,12 @@ impl SubTable {
       (self, name),
       (SubTable::ShotInfo, "BaseISO" | "FNumber" | "ExposureTime")
         | (SubTable::FocalLength, "FocalLength")
+        // `%Canon::CameraInfo5D` carries `PRIORITY => 0` (`Canon.pm:3781`): EVERY
+        // leaf is `Priority => 0`, so a collision with an earlier (walked-first)
+        // `ShotInfo`/`FocalLength`/`CameraSettings` leaf never overrides it.
+        | (SubTable::CameraInfo, _)
+        // `%Canon::Processing` tag 2 `Sharpness` is `Priority => 0` (`Canon.pm:7220`).
+        | (SubTable::Processing, "Sharpness")
     );
     u8::from(!priority_zero)
   }
@@ -900,13 +912,14 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::ColorData),
     unknown: false,
   },
-  // 0x4002 — CRWParam (`Canon.pm:2048-2053`)
+  // 0x4002 — CRWParam (`Canon.pm:2049-2055`). `Flags => [ 'Unknown', 'Binary',
+  // 'Drop' ]` ⇒ suppressed in normal output (only surfaced under `-u`).
   CanonTag {
     id: 0x4002,
     name: "CRWParam",
     conv: CanonPrintConv::None,
     sub_table: None,
-    unknown: false,
+    unknown: true,
   },
   // 0x4003 — ColorInfo (`Canon.pm:2056-2059`) — SubDirectory to
   // `Canon::ColorInfo`. DEFERRED child walk: suppressed (issue #177).
@@ -917,13 +930,14 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::ColorInfo),
     unknown: false,
   },
-  // 0x4005 — Flavor (`Canon.pm:2059-2063`)
+  // 0x4005 — Flavor (`Canon.pm:2060-2065`). `Flags => [ 'Unknown', 'Binary',
+  // 'Drop' ]` ⇒ suppressed in normal output (only surfaced under `-u`).
   CanonTag {
     id: 0x4005,
     name: "Flavor",
     conv: CanonPrintConv::None,
     sub_table: None,
-    unknown: false,
+    unknown: true,
   },
   // 0x4008 — PictureStyleUserDef (`Canon.pm:2066-2073`) — int16u Count=3,
   // PrintHex, array PrintConv [\%pictureStyles x3].
@@ -1213,7 +1227,7 @@ mod tests {
   fn canon_223_second_pass_rows_are_deferred_subdirs() {
     for (id, name, sub) in [
       (0x0au16, "UnknownD30", SubTable::UnknownD30),
-      (0x0f, "CustomFunctions", SubTable::CustomFunctions),
+      // (0x0f CustomFunctions is now WALKED — see `custom_functions_5d_is_walked`.)
       (0x2f, "FaceDetect3", SubTable::FaceDetect3),
       (0x35, "TimeInfo", SubTable::TimeInfo),
       (0x90, "CustomFunctions1D", SubTable::CustomFunctions1D),
@@ -1265,9 +1279,16 @@ mod tests {
       lookup(0x3c).and_then(CanonTag::sub_table),
       Some(SubTable::AfInfo3)
     );
+    // The deep Canon sub-tables (#84/#85/#87) are now walked too.
+    assert!(SubTable::Processing.is_walked());
+    assert!(SubTable::MeasuredColor.is_walked());
+    assert!(SubTable::CameraInfo.is_walked());
+    assert!(SubTable::ColorData.is_walked());
+    assert!(SubTable::AfMicroAdj.is_walked());
+    assert!(SubTable::CustomFunctions.is_walked());
     // Still-deferred sub-tables remain raw.
     assert!(!SubTable::Panorama.is_walked());
     assert!(!SubTable::MyColors.is_walked());
-    assert!(!SubTable::Processing.is_walked());
+    assert!(!SubTable::CustomFunctions2.is_walked());
   }
 }
