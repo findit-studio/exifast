@@ -817,9 +817,13 @@ impl CompositePrintConv {
         // carrying `"inf"`, emitted verbatim in BOTH modes.
         CompositeRaw::Text(s) => TagValue::Str(s.as_str().into()),
         // The numeric distance in metres — `-n` the bare `$val`, `-j` `"$val m"`
-        // (the `$val` text is the rounded numeric scalar).
+        // (the `$val` text is the rounded numeric scalar). `$val` is
+        // `FocusPosition * FocalLength / 1000` over integer operands, so a WHOLE
+        // result must stringify BARE (`5`, not serde's `5.0`, matching Perl's
+        // number stringification); route it through the whole-`%.15g`-token
+        // helper (a fractional distance keeps the full-precision `F64`).
         CompositeRaw::Num(n) => match mode {
-          ConvMode::ValueConv => TagValue::F64(*n),
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(*n),
           ConvMode::PrintConv => {
             TagValue::Str(std::format!("{} m", crate::value::format_g(*n, 15)).into())
           }

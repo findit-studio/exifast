@@ -122,7 +122,7 @@ fn push_exposure_time(
       TagValue::Str("Bulb".into())
     }
   } else {
-    TagValue::F64(secs)
+    crate::value::whole_f64_to_tag_value(secs)
   };
   out.push(Tag9050Emission {
     name: "SonyExposureTime",
@@ -146,7 +146,7 @@ fn push_fnumber(
   let value = if print_conv {
     TagValue::Str(print_fnumber(fnum).into())
   } else {
-    TagValue::F64(fnum)
+    crate::value::whole_f64_to_tag_value(fnum)
   };
   out.push(Tag9050Emission {
     name: "SonyFNumber",

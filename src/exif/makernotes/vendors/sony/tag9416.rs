@@ -72,7 +72,7 @@ fn push_focal_length(
   let value = if print_conv {
     TagValue::Str(std::format!("{mm:.1} mm").into())
   } else {
-    TagValue::F64(mm)
+    crate::value::whole_f64_to_tag_value(mm)
   };
   out.push(Tag9416Emission { name, value });
 }
@@ -93,7 +93,7 @@ fn push_aperture(
   let value = if print_conv {
     TagValue::Str(std::format!("{val:.1}").into())
   } else {
-    TagValue::F64(val)
+    crate::value::whole_f64_to_tag_value(val)
   };
   out.push(Tag9416Emission { name, value });
 }
@@ -326,7 +326,7 @@ pub fn parse_tag9416(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
     let value = if print_conv {
       TagValue::Str(std::format!("{iso:.0}").into())
     } else {
-      TagValue::F64(iso)
+      crate::value::whole_f64_to_tag_value(iso)
     };
     out.push(Tag9416Emission {
       name: "SonyISO",
@@ -340,14 +340,14 @@ pub fn parse_tag9416(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
     let stops = 16.0 - f64::from(raw) / 256.0;
     let value = if print_conv {
       // `$val ? sprintf("%.1f",$val) : $val` — a ValueConv of exactly 0 prints
-      // the bare 0; otherwise "%.1f".
+      // the bare ValueConv result (the integer `0`, not `0.0`); otherwise "%.1f".
       if stops == 0.0 {
-        TagValue::F64(0.0)
+        crate::value::whole_f64_to_tag_value(stops)
       } else {
         TagValue::Str(std::format!("{stops:.1}").into())
       }
     } else {
-      TagValue::F64(stops)
+      crate::value::whole_f64_to_tag_value(stops)
     };
     out.push(Tag9416Emission {
       name: "StopsAboveBaseISO",
@@ -371,7 +371,7 @@ pub fn parse_tag9416(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
         TagValue::Str("Bulb".into())
       }
     } else {
-      TagValue::F64(secs)
+      crate::value::whole_f64_to_tag_value(secs)
     };
     out.push(Tag9416Emission {
       name: "SonyExposureTime2",
@@ -572,7 +572,7 @@ fn push_exposure_time_rational(
       TagValue::Str("Bulb".into())
     }
   } else {
-    TagValue::F64(secs)
+    crate::value::whole_f64_to_tag_value(secs)
   };
   out.push(Tag9416Emission {
     name: "ExposureTime",

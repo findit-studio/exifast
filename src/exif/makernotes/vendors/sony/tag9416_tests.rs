@@ -198,9 +198,11 @@ fn fx3_raw_values_match_golden() {
   assert_eq!(find(&em, "LensMount"), Some(&TagValue::I64(2)));
   assert_eq!(find(&em, "LensType2"), Some(&TagValue::I64(49470)));
   assert_eq!(find(&em, "PictureProfile"), Some(&TagValue::I64(36)));
-  // FocalLength ValueConv $val/10 = 28.0 (serializes BARE-equal to golden 28).
-  assert_eq!(find(&em, "FocalLength"), Some(&TagValue::F64(28.0)));
-  assert_eq!(find(&em, "MaxFocalLength"), Some(&TagValue::F64(75.0)));
+  // FocalLength/MaxFocalLength ValueConv `$val/10` = 28.0/75.0 (whole `%.15g`
+  // tokens) → BARE integers `28`/`75`, byte-identical to the golden (NOT serde's
+  // `28.0`/`75.0`).
+  assert_eq!(find(&em, "FocalLength"), Some(&TagValue::I64(28)));
+  assert_eq!(find(&em, "MaxFocalLength"), Some(&TagValue::I64(75)));
   assert_eq!(find(&em, "APS-CSizeCapture"), Some(&TagValue::I64(0)));
 }
 

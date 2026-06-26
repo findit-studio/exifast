@@ -776,7 +776,7 @@ fn iso_value(raw: u8, print_conv: bool) -> TagValue {
   };
   if !print_conv {
     return if raw != 0 {
-      TagValue::F64(vc)
+      crate::value::whole_f64_to_tag_value(vc)
     } else {
       TagValue::I64(0)
     };
@@ -811,7 +811,7 @@ fn push_fnumber(
       value: if print_conv {
         TagValue::Str(print_fnumber(fnum).into())
       } else {
-        TagValue::F64(fnum)
+        crate::value::whole_f64_to_tag_value(fnum)
       },
     });
   }
@@ -841,7 +841,7 @@ fn push_exposure_time(
           TagValue::Str("Bulb".into())
         }
       } else {
-        TagValue::F64(secs)
+        crate::value::whole_f64_to_tag_value(secs)
       },
     });
   }
@@ -857,7 +857,7 @@ fn push_focal_length2(buf: &[u8], off: usize, out: &mut Vec<SubEmission>, print_
       value: if print_conv {
         TagValue::Str(SmolStr::new(std::format!("{mm:.1} mm")))
       } else {
-        TagValue::F64(mm)
+        crate::value::whole_f64_to_tag_value(mm)
       },
     });
   }

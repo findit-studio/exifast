@@ -77,7 +77,7 @@ fn shutter_time(raw: u16, print_conv: bool, name: &'static str, out: &mut Vec<Su
       TagValue::Str("Bulb".into())
     }
   } else {
-    TagValue::F64(secs)
+    crate::value::whole_f64_to_tag_value(secs)
   };
   out.push(SubEmission::new(name, value));
 }
@@ -89,7 +89,7 @@ fn fnumber(raw: u16, print_conv: bool, name: &'static str, out: &mut Vec<SubEmis
   let value = if print_conv {
     TagValue::Str(print_fnumber(fnum).into())
   } else {
-    TagValue::F64(fnum)
+    crate::value::whole_f64_to_tag_value(fnum)
   };
   out.push(SubEmission::new(name, value));
 }
@@ -106,7 +106,7 @@ fn exposure_comp(raw: u16, print_conv: bool, name: &'static str, out: &mut Vec<S
       TagValue::Str(SmolStr::new(std::format!("{val:+.1}")))
     }
   } else {
-    TagValue::F64(val)
+    crate::value::whole_f64_to_tag_value(val)
   };
   out.push(SubEmission::new(name, value));
 }
@@ -498,7 +498,7 @@ fn iso_value(raw: u16, print_conv: bool) -> TagValue {
   if print_conv {
     TagValue::I64((vc + 0.5) as i64)
   } else {
-    TagValue::F64(vc)
+    crate::value::whole_f64_to_tag_value(vc)
   }
 }
 

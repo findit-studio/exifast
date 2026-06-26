@@ -118,12 +118,16 @@ fn iso_value(raw: u8, print_conv: bool) -> TagValue {
   if print_conv {
     TagValue::I64((vc + 0.5) as i64)
   } else {
-    TagValue::F64(vc)
+    // `-n`: the ValueConv float, emitted as a bare integer when its `%.15g`
+    // token is whole (`exp(3*ln2)*100` = `799.9999999999998` → `"800"`).
+    crate::value::whole_f64_to_tag_value(vc)
   }
 }
 
-/// Walk the `FocusInfo` block and emit the settings/focus leaves (`Priority =>
-/// 0`, set by the caller).
+/// Walk the `FocusInfo` block and emit the settings/focus leaves. `%FocusInfo`
+/// is `PRIORITY => 0` (`Sony.pm:3198`), so every emitted leaf is normalized to
+/// `priority == 0` before returning — a later same-name duplicate never
+/// overrides an earlier (Main-IFD / earlier-walked) value.
 ///
 /// `buf` is the verbatim (un-enciphered) `0x0020` block; `model` is
 /// `$$self{Model}`; `print_conv` selects `-j` vs `-n`.
@@ -237,6 +241,16 @@ pub fn parse_focus_info(buf: &[u8], model: Option<&str>, print_conv: bool) -> Ve
     ));
   }
 
+  // `%FocusInfo` is `PRIORITY => 0` (`Sony.pm:3198`) with no per-leaf `Priority`
+  // override, so EVERY leaf is a `Priority => 0` duplicate: a higher-priority
+  // Main-IFD / `CameraInfo2` same-name leaf (`ISOSetting` / `CreativeStyle` /
+  // `DynamicRangeOptimizerMode` / `ExposureProgram`) is NOT overridden, and an
+  // earlier-walked same-name copy wins the priority-0 first-wins tie. (`SubEmission::new`
+  // defaults to priority 1, so normalize the whole block here — mirrors the
+  // `CameraSettings`/`CameraSettings3` `PRIORITY => 0` fold.)
+  for e in &mut out {
+    e.priority = 0;
+  }
   out
 }
 

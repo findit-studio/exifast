@@ -93,3 +93,35 @@ fn priority_is_zero_and_folder_number_range_gated() {
     Some(TagValue::Str("1867".into()))
   );
 }
+
+/// TOKEN-LEVEL (the conformance comparator masks `0.0 == 0` and `800.0 == 800`):
+/// the `-n` exposure-comp ValueConv `($val-128)/24` at a WHOLE result and the
+/// `-n` `ISOSetting` exp ValueConv SERIALIZE to BARE integer tokens (`0`,
+/// `800`), byte-identical to the bundled `.n` golden — NOT serde's `0.0`/`800.0`.
+/// Asserts the raw serialized JSON string, not the value-equal comparator.
+#[cfg(feature = "json")]
+#[test]
+fn n_whole_valueconvs_serialize_bare_integer_tokens() {
+  let mut buf = vec![0u8; 280];
+  put(&mut buf, 0x03, 128); // ExposureCompensationSet -> (128-128)/24 = 0
+  put(&mut buf, 0x16, 72); // ISOSetting -> exp((72/8-6)*ln2)*100 = 799.9999999999998
+  let n = parse_camera_settings(&buf, false);
+
+  let ec = serde_json::to_string(&find(&n, "ExposureCompensationSet").unwrap()).unwrap();
+  assert_eq!(
+    ec, "0",
+    "ExposureCompensationSet -n must be bare 0, not 0.0"
+  );
+  let iso = serde_json::to_string(&find(&n, "ISOSetting").unwrap()).unwrap();
+  assert_eq!(iso, "800", "ISOSetting -n must be bare 800, not 800.0");
+  assert!(!ec.contains('.') && !iso.contains('.'), "no trailing .0");
+
+  // Regression guard: a genuinely FRACTIONAL exposure-comp keeps its float token
+  // (the helper must NOT integer-ize a non-whole value).
+  put(&mut buf, 0x03, 140); // (140-128)/24 = 0.5
+  let n2 = parse_camera_settings(&buf, false);
+  assert_eq!(
+    serde_json::to_string(&find(&n2, "ExposureCompensationSet").unwrap()).unwrap(),
+    "0.5"
+  );
+}

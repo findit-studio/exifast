@@ -117,7 +117,7 @@ pub fn signed_setting_value(v: i8, print_conv: bool) -> TagValue {
 pub fn exposure_comp_value(raw: u8, print_conv: bool) -> TagValue {
   let val = (f64::from(raw) - 128.0) / 24.0;
   if !print_conv {
-    return TagValue::F64(val);
+    return crate::value::whole_f64_to_tag_value(val);
   }
   if val == 0.0 {
     TagValue::I64(0)
@@ -133,7 +133,7 @@ pub fn exposure_comp_value(raw: u8, print_conv: bool) -> TagValue {
 pub fn exposure_comp2_value(raw: i16, print_conv: bool) -> TagValue {
   let val = f64::from(raw) / 8.0;
   if !print_conv {
-    return TagValue::F64(val);
+    return crate::value::whole_f64_to_tag_value(val);
   }
   if val == 0.0 {
     TagValue::I64(0)
