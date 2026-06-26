@@ -10483,6 +10483,74 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     );
   }
 }
+
+/// Real-device Canon CR2 — the deep Canon MakerNote sub-table activation
+/// (#84/#85/#87). `Canon_EOS-5D_real.CR2` exercises the newly-ported
+/// `ColorData3` (0x4001, count 796), `CameraInfo5D` (0x0d, `PRIORITY => 0`),
+/// `Processing` (0xa0), `MeasuredColor` (0xaa) and `CustomFunctions5D`
+/// (0x0f → `ProcessCanonCustom`, the `CanonCustom` family-1 group) sub-tables,
+/// plus the `CRWParam`/`Flavor` (0x4002/0x4005 `Unknown`) suppression. It is
+/// byte-exact vs ExifTool 13.59 except for the documented residuals dropped from
+/// BOTH sides (separate cross-cutting subsystems, NOT part of the Canon
+/// sub-table port — kept in sync with `FIXTURE_EXCLUDED_KEYS` in
+/// `tests/typed_serde_parity.rs`).
+#[test]
+fn canon_cr2_real_conformance() {
+  const EOS_5D_DEFERRED: &[&str] = &[
+    // `ExifTool:Warning` (= "Invalid original decision data") — the Canon
+    // `OriginalDecisionData` Composite (`Canon.pm:10082`) `Require`s the 0x83
+    // `OriginalDecisionDataOffset` and runs `ReadODD` (`Canon.pm:10368-10459`),
+    // which SEEKS to the file offset, reads the ODD block and validates its
+    // version/signature — warning when invalid. That is the camera `Composite` +
+    // file-level `DataTag` read subsystem (exifast's Composite post-pass ports
+    // only `Composite:Duration`-class tags, no file-seek `RawConv`), NOT part of
+    // the MakerNote sub-table port. The `Canon:OriginalDecisionDataOffset`
+    // MakerNote leaf IS emitted byte-exact.
+    "ExifTool:Warning",
+    // `IFD3:CR2CFAPattern` (0xc5e1) / `IFD3:RawImageSegmentation` (0xc640) — two
+    // CR2-private IFD3 leaves the EXIF leaf-table port does not yet display (the
+    // walker reaches IFD3 and emits its Compression/StripOffsets/StripByteCounts,
+    // but these two tags are deferred leaf-table items). A separate EXIF
+    // leaf-coverage item, NOT the Canon MakerNote port.
+    "IFD3:CR2CFAPattern",
+    "IFD3:RawImageSegmentation",
+  ];
+  check_excluding(
+    "Canon_EOS-5D_real.CR2",
+    "Canon_EOS-5D_real.CR2.json",
+    true,
+    EOS_5D_DEFERRED,
+  );
+  check_excluding(
+    "Canon_EOS-5D_real.CR2",
+    "Canon_EOS-5D_real.CR2.n.json",
+    false,
+    EOS_5D_DEFERRED,
+  );
+
+  // Positively assert the deep sub-tables actually fired (not just that the
+  // residuals were excluded): a ColorData3 WB level, the CameraInfo5D ISO
+  // (`PRIORITY => 0`, the lone non-colliding leaf), and a CanonCustom leaf in
+  // its own family-1 group.
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/Canon_EOS-5D_real.CR2"))
+    .expect("read Canon_EOS-5D_real.CR2");
+  let got = extract_info("Canon_EOS-5D_real.CR2", &data, true);
+  for needle in [
+    "\"Canon:WB_RGGBLevelsAsShot\":\"2158 1024 1024 1382\"",
+    "\"Canon:ISO\":400",
+    "\"Canon:ColorDataVersion\":\"1 (1DmkIIN/5D/30D/400D)\"",
+    "\"CanonCustom:FocusingScreen\":\"Ee-S\"",
+    "\"Canon:MeasuredRGGB\":\"461 1024 1024 769\"",
+  ] {
+    assert!(got.contains(needle), "EOS 5D must emit {needle}: {got}",);
+  }
+  // The 0x4002/0x4005 `Unknown` leaves stay suppressed.
+  assert!(
+    !got.contains("\"Canon:CRWParam\"") && !got.contains("\"Canon:Flavor\""),
+    "EOS 5D must NOT emit the Unknown CRWParam/Flavor leaves: {got}",
+  );
+}
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
             `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \

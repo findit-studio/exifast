@@ -267,6 +267,22 @@ const NOT_ACTIVE: &[&str] = &[
   // `FIXTURE_EXCLUDED_KEYS` entry for `Composite:ImageSize`/`Megapixels` (#436,
   // the bare-name Composite priority residual) + the ambiguous `Composite:LensID`
   // (the A33-style `Exif::PrintLensID` lens-DB disambiguation).
+  //
+  // (`Canon_EOS-5D_real.CR2` was added to the both-goldens set with this chunk
+  // and is ACTIVE — the deep Canon MakerNote sub-tables ColorData3 / CameraInfo5D
+  // / Processing / MeasuredColor / CustomFunctions5D are ported byte-exact, see
+  // `conformance.rs::canon_cr2_real_conformance` + its `FIXTURE_EXCLUDED_KEYS`.)
+  //
+  // `Canon_EOS-7D_sRAW_real.CR2` — the SECOND real-device CR2. This chunk ported
+  // the SHARED infra it needs (the count-797→`ColorData4`/`ColorCoefs` variant +
+  // `AFMicroAdj` 0x4013), but the 7D needs several MORE Canon sub-tables not yet
+  // ported: `CameraInfo7D` (0x0d — a firmware-dependent `Hook`/`varSize` offset
+  // shift, `Canon.pm:4347-4402`), `CustomFunctions2` (0x99 → `ProcessCanonCustom2`,
+  // the grouped/27-tag variant), `TimeInfo` (0x35), `CropInfo` (0x98),
+  // `AspectInfo` (0x9a), `VignettingCorr` (0x4015), `LightingOpt` (0x4018) and
+  // `LensInfo` (0x4019). Accept-deferred until those are ported (its goldens are
+  // committed so the next chunk can diff against them).
+  "Canon_EOS-7D_sRAW_real.CR2",
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
@@ -532,6 +548,26 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "Composite:ImageSize",
       "Composite:Megapixels",
       "Composite:LensID",
+    ],
+  ),
+  // `Canon_EOS-5D_real.CR2` — the deep Canon MakerNote sub-table activation
+  // (#84/#85/#87). The newly-ported ColorData3 (0x4001 count 796) / CameraInfo5D
+  // (0x0d) / Processing (0xa0) / MeasuredColor (0xaa) / CustomFunctions5D (0x0f →
+  // `ProcessCanonCustom`, the `CanonCustom` group) sub-tables emit byte-exact,
+  // and the CRWParam/Flavor (0x4002/0x4005 `Unknown`) leaves are suppressed.
+  // Three residuals are dropped from BOTH sides (separate cross-cutting
+  // subsystems, NOT the MakerNote port): `ExifTool:Warning` (the
+  // `OriginalDecisionData` Composite + `ReadODD` file-seek validation,
+  // `Canon.pm:10368`) and the two CR2-private IFD3 leaves `IFD3:CR2CFAPattern`
+  // (0xc5e1) / `IFD3:RawImageSegmentation` (0xc640) the EXIF leaf-table port does
+  // not yet display. Mirrors
+  // `conformance.rs::canon_cr2_real_conformance`'s `EOS_5D_DEFERRED`.
+  (
+    "Canon_EOS-5D_real.CR2",
+    &[
+      "ExifTool:Warning",
+      "IFD3:CR2CFAPattern",
+      "IFD3:RawImageSegmentation",
     ],
   ),
 ];
@@ -1667,7 +1703,18 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// on top of chunk 1's `MinoltaRaw` subsystem, with the dependent
 /// `Composite:FocusDistance` computing, and a `FIXTURE_EXCLUDED_KEYS` entry for
 /// `Composite:ImageSize`/`Megapixels` (#436) + the ambiguous `Composite:LensID`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 639;
+///
+/// 639 → 640: the `Canon_EOS-5D_real.CR2` raw ACTIVATES — the deep Canon
+/// MakerNote sub-tables it needs are ported byte-exact: `ColorData3` (0x4001
+/// count 796, the count-selected variant), `CameraInfo5D` (0x0d, `PRIORITY => 0`),
+/// `Processing` (0xa0), `MeasuredColor` (0xaa) and `CustomFunctions5D` (0x0f →
+/// `ProcessCanonCustom`, grouped under `CanonCustom`), plus the `CRWParam`/`Flavor`
+/// (0x4002/0x4005 `Unknown`) suppression, with a `FIXTURE_EXCLUDED_KEYS` entry for
+/// the `ExifTool:Warning` (`OriginalDecisionData`/`ReadODD` subsystem) + the two
+/// CR2-private IFD3 leaves. (The sibling `Canon_EOS-7D_sRAW_real.CR2` was added to
+/// the both-goldens set but stays in `NOT_ACTIVE` — it needs `CameraInfo7D` +
+/// `CustomFunctions2` + several smaller sub-tables, deferred to the next chunk.)
+const EXPECTED_ACTIVE_FIXTURES: usize = 640;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

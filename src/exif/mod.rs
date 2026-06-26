@@ -10515,30 +10515,49 @@ impl ExifSink for VendorEmissionSink<'_> {
   fn write_vendor_value_with_priority(
     &mut self,
     _family0: &str,
-    _family1: &str,
+    family1: &str,
     name: &str,
     value: crate::value::TagValue,
     unknown: bool,
     priority: u8,
   ) -> Result<(), core::convert::Infallible> {
-    // The family-0/1 group is fixed (`("MakerNotes", "Canon")`) for every Canon
-    // emission and re-applied by [`ExifMeta::push_maker_note_tags`] from
-    // [`MakerNote::emission_group1`], so it is NOT stored on the
-    // `VendorEmission` (which carries only `name` / `value` / `unknown` /
-    // `priority`, exactly as the vendor body parsers build it). The `priority`
-    // is the Canon row's `Priority => N` (`0` for the `Canon::ShotInfo`
-    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength`
-    // rows), so a CTMD re-dispatch's `Track<N>:FNumber` never overrides the
-    // earlier ExposureInfo value of the same row.
+    // The family-0 group is fixed (`MakerNotes`) and the family-1 group is the
+    // captured MakerNote's group1 (`Canon`) for nearly every Canon emission,
+    // re-applied by [`ExifMeta::push_maker_note_tags`] from
+    // [`MakerNote::emission_group1`] — so the DEFAULT carries NO group override.
+    // The lone exception is the `CanonCustom::Functions<Model>` SubDirectory,
+    // whose leaves group under `CanonCustom` (`CanonCustom.pm:229`), NOT `Canon`:
+    // [`emit_canon_subtable`] passes `family1 == "CanonCustom"` for those, and
+    // it is stored as a per-emission `group1_override`. The `priority` is the
+    // Canon row's `Priority => N` (`0` for the `Canon::ShotInfo`
+    // `FNumber`/`ExposureTime`/`BaseISO` + `Canon::FocalLength` `FocalLength` +
+    // `Canon::CameraInfo*` rows), so a `Priority => 0` leaf never overrides an
+    // earlier same-name duplicate.
+    let group1_override = canon_capture_group1_override(family1);
     self
       .emissions
-      .push(makernotes::VendorEmission::new_with_priority(
+      .push(makernotes::VendorEmission::new_with_priority_and_group1(
         smol_str::SmolStr::new(name),
         value,
         unknown,
         priority,
+        group1_override,
       ));
     Ok(())
+  }
+}
+
+/// Map a Canon walk emission's `family1` to a per-`VendorEmission` group1
+/// OVERRIDE: `None` for the default `Canon` group (inherited from the captured
+/// MakerNote), `Some(g)` for a SubDirectory whose `GROUPS => { 1 => … }` differs
+/// — currently only the `CanonCustom::Functions<Model>` leaves
+/// (`CanonCustom.pm:229`). Returns a `&'static str` so the override fits
+/// [`VendorEmission`]'s field.
+#[cfg(feature = "alloc")]
+fn canon_capture_group1_override(family1: &str) -> Option<&'static str> {
+  match family1 {
+    "CanonCustom" => Some("CanonCustom"),
+    _ => None,
   }
 }
 
@@ -11631,8 +11650,9 @@ fn emit_canon_subtable<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   use makernotes::vendors::canon::tags::SubTable;
   use makernotes::vendors::canon::{
-    af_info, camera_settings, color_balance, file_info, first4_all_zero, focal_length,
-    reserialize_int_array, sensor_info, shot_info,
+    af_info, af_micro_adj, camera_info, camera_settings, canon_custom, color_balance, colordata,
+    file_info, first4_all_zero, focal_length, measured_color, processing, reserialize_int_array,
+    sensor_info, shot_info,
   };
 
   let blob = reserialize_int_array(raw, order);
@@ -11685,9 +11705,43 @@ fn emit_canon_subtable<S: ExifSink>(
     SubTable::AfInfo3 => af_info::parse_af_info3(&blob, order, print_conv, model).1,
     SubTable::SensorInfo => sensor_info::parse(&blob, order, print_conv),
     SubTable::ColorBalance => color_balance::parse(&blob, order, print_conv, model),
+    // Processing (0xa0) / MeasuredColor (0xaa) — plain ProcessBinaryData sub-tables.
+    SubTable::Processing => processing::parse(&blob, order, print_conv, model),
+    SubTable::MeasuredColor => measured_color::parse(&blob, order, print_conv),
+    // CameraInfo (0x0d) — model-conditional list; only the EOS 5D variant is
+    // ported (`PRIORITY => 0`, threaded via `tag_priority`). AFMicroAdj (0x4013).
+    SubTable::CameraInfo => camera_info::parse(&blob, order, print_conv, model),
+    // AFMicroAdj is `FORMAT => 'int32s'` — its IFD entry is read as `int32u[N]`,
+    // so the value words must be widened back to 4 bytes each (the shared `blob`
+    // above truncates every word to `int16`, which would shift every leaf).
+    SubTable::AfMicroAdj => {
+      let blob32 = makernotes::vendors::canon::reserialize_int32_array(raw, order);
+      af_micro_adj::parse(&blob32, order, print_conv)
+    }
+    // ColorData (0x4001) — COUNT-selected ColorData3/ColorData4 variants.
+    SubTable::ColorData => colordata::parse(&blob, order, print_conv),
+    // CustomFunctions (0x0f) — `ProcessCanonCustom` against the model-conditional
+    // `CanonCustom::Functions<Model>` table; emitted into the `CanonCustom`
+    // family-1 group (handled below). Only the EOS 5D table is ported.
+    SubTable::CustomFunctions => {
+      if canon_custom::model_is_functions_5d(model) {
+        canon_custom::parse_functions_5d(&blob, order, print_conv)
+      } else {
+        Vec::new()
+      }
+    }
     // `emit_entry` only routes the `is_walked()` set here; any other variant is
     // a caller bug, not a malformed-input case — emit nothing.
     _ => Vec::new(),
+  };
+
+  // The `CanonCustom::*` tables emit into the `CanonCustom` family-1 group (the
+  // `Image::ExifTool::CanonCustom` package group, `CanonCustom.pm:229`), NOT the
+  // parent `Canon` group; every other walked sub-table stays in `group1`.
+  let emit_group1 = if matches!(sub, SubTable::CustomFunctions) {
+    "CanonCustom"
+  } else {
+    group1
   };
 
   for (name, value) in positions {
@@ -11699,7 +11753,14 @@ fn emit_canon_subtable<S: ExifSink>(
     // fix. Every walked sub-table position is an explicit `BinaryData` entry,
     // never `Unknown`.
     let priority = sub.tag_priority(&name);
-    out.write_vendor_value_with_priority("MakerNotes", group1, &name, value, false, priority)?;
+    out.write_vendor_value_with_priority(
+      "MakerNotes",
+      emit_group1,
+      &name,
+      value,
+      false,
+      priority,
+    )?;
   }
   Ok(())
 }

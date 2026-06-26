@@ -300,7 +300,7 @@ fn firmware_revision_text(val: u64) -> String {
 /// 0x85 => 'Faithful'  0x86 => 'Monochrome'  0x87 => 'Auto'
 /// 0x88 => 'Fine Detail'  0xff => 'n/a'  0xffff => 'n/a'
 /// ```
-fn picture_style_label(n: i64) -> Option<&'static str> {
+pub(super) fn picture_style_label(n: i64) -> Option<&'static str> {
   match n {
     0x00 => Some("None"),
     0x01 => Some("Standard"),

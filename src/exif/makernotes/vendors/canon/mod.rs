@@ -69,14 +69,20 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod af_info;
+pub mod af_micro_adj;
 pub mod body;
+pub mod camera_info;
 pub mod camera_settings;
+pub mod canon_custom;
 pub mod color_balance;
+pub mod colordata;
 pub mod file_info;
 pub mod focal_length;
 pub mod lens_types;
+pub mod measured_color;
 pub mod model_ids;
 pub mod printconv;
+pub mod processing;
 pub mod sensor_info;
 pub mod serial_info;
 pub mod shot_info;
@@ -991,6 +997,41 @@ pub(crate) fn reserialize_int_array(raw: &RawValue, order: ByteOrder) -> Vec<u8>
       }
       out
     }
+    RawValue::Bytes(b) => b.clone(),
+    _ => Vec::new(),
+  }
+}
+
+/// Reserialize a decoded `int32`-array value back to its `$$valPt` byte blob —
+/// the `int32`-format analogue of [`reserialize_int_array`] (whose every word is
+/// an `int16`). The Canon `AFMicroAdj` sub-table (`Canon.pm:8978`, `FORMAT =>
+/// 'int32s'`) is read as an `int32u[N]` IFD entry, so its words MUST be widened
+/// back to 4 bytes each (NOT truncated to `int16`) before the binary-data
+/// decode. A `RawValue::Bytes` (an `undef`-read SubDirectory) is already the
+/// raw byte blob and is returned verbatim.
+#[cfg(feature = "alloc")]
+pub(crate) fn reserialize_int32_array(raw: &RawValue, order: ByteOrder) -> Vec<u8> {
+  match raw {
+    RawValue::I64(words) => words
+      .iter()
+      .flat_map(|&w| {
+        let w32 = w as i32;
+        match order {
+          ByteOrder::Little => w32.to_le_bytes(),
+          ByteOrder::Big => w32.to_be_bytes(),
+        }
+      })
+      .collect(),
+    RawValue::U64(words) => words
+      .iter()
+      .flat_map(|&w| {
+        let w32 = w as u32;
+        match order {
+          ByteOrder::Little => w32.to_le_bytes(),
+          ByteOrder::Big => w32.to_be_bytes(),
+        }
+      })
+      .collect(),
     RawValue::Bytes(b) => b.clone(),
     _ => Vec::new(),
   }
