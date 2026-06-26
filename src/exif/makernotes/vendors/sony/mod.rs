@@ -78,6 +78,9 @@ pub mod printconv;
 pub mod sr2;
 pub mod tag9050;
 pub mod tag9400;
+pub mod tag9402;
+pub mod tag940c;
+pub mod tag9416;
 pub mod tags;
 
 use crate::value::TagValue;

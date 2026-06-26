@@ -12128,7 +12128,7 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   print_conv: bool,
   out: &mut S,
 ) {
-  use makernotes::vendors::sony::{tag9050, tag9400};
+  use makernotes::vendors::sony::{tag940c, tag9050, tag9400, tag9402, tag9416};
   // The verbatim on-disk value span (the enciphered cipher block) — the same
   // buffer the walk read, sliced at the entry's resolved `$valuePtr`/`$size`.
   let off = entry.value_offset();
@@ -12148,6 +12148,26 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
     // `Tag9400c` — selected by the enciphered first byte (`Sony.pm:1856`).
     0x9400 if tag9400::selects_tag9400c(raw) => {
       for emi in tag9400::parse_tag9400c(raw, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9402` — not SLT/HV/ILCA and the enciphered first byte ∉ {0x05,0xff}
+    // (`Sony.pm:1969`).
+    0x9402 if tag9402::selects_tag9402(raw, model) => {
+      for emi in tag9402::parse_tag9402(raw, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag940c` — the E-mount lens table, selected by model (`Sony.pm:2081`).
+    0x940c if tag940c::selects_tag940c(model) => {
+      for emi in tag940c::parse_tag940c(raw, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9416` — the modern CameraSettings/lens table, dispatched
+    // unconditionally for the bodies that write `0x9416` (`Sony.pm:2115`).
+    0x9416 => {
+      for emi in tag9416::parse_tag9416(raw, model, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }

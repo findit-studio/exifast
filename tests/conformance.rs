@@ -10186,41 +10186,20 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "Composite:LensID",
     "Composite:RedBalance",
     "Composite:ScaleFactor35efl",
-    "Sony:AFAreaMode",
-    "Sony:APS-CSizeCapture",
-    "Sony:AmbientTemperature",
+    // The Tag9416 chunk-2 port lands SonyISO/StopsAboveBaseISO/exposure/aperture/
+    // lens/CreativeStyle/PictureProfile/FocalLength/CorrParams; Tag9402 lands
+    // AmbientTemperature/AFAreaMode/FocusPosition2; Tag940c lands LensMount2/
+    // LensType3/CameraE-mountVersion/LensE-mountVersion/LensFirmwareVersion. What
+    // REMAINS deferred (a later chunk) is the Tag2010 battery/exposure-meta block
+    // and the embedded-XMP Rating:
     "Sony:BatteryLevel",
     "Sony:BatteryTemperature",
-    "Sony:CameraE-mountVersion",
-    "Sony:ChromaticAberrationCorrParams",
-    "Sony:CreativeStyle",
-    "Sony:DistortionCorrParams",
-    "Sony:ExposureProgram",
     "Sony:ExposureStandardAdjustment",
-    "Sony:ExposureTime",
     "Sony:FlashExposureComp",
-    "Sony:FocalLength",
     "Sony:FocalPlaneAFPointsUsed",
-    "Sony:FocusPosition2",
     "Sony:ISOAutoMax",
     "Sony:ISOAutoMin",
     "Sony:ISOSetting",
-    "Sony:LensE-mountVersion",
-    "Sony:LensFirmwareVersion",
-    "Sony:LensFormat",
-    "Sony:LensMount",
-    "Sony:LensMount2",
-    "Sony:LensType2",
-    "Sony:LensType3",
-    "Sony:MaxFocalLength",
-    "Sony:MinFocalLength",
-    "Sony:PictureProfile",
-    "Sony:SonyExposureTime2",
-    "Sony:SonyFNumber2",
-    "Sony:SonyISO",
-    "Sony:SonyMaxApertureValue",
-    "Sony:StopsAboveBaseISO",
-    "Sony:VignettingCorrParams",
     "Sony:WhiteBalance",
     // `XMP-xmp:Rating` — the embedded XMP packet (a separate deferred parse for
     // this raw; the Sony-main port is the activation blocker, not this leaf).
