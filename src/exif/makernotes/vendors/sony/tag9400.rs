@@ -11,8 +11,10 @@
 //! is one of `0x23 0x24 0x26 0x28 0x31 0x32 0x33 0x41 0x43` (`Sony.pm:1856`).
 //! The FX3 activation fixture's first byte is `0x31` (`Sony.pm:1837`, decoding
 //! to `40`). The block is enciphered (`PROCESS_PROC => \&ProcessEnciphered`,
-//! `Sony.pm:8519`) so it is [`super::decipher::decipher`]ed before this table
-//! reads it; `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8522,8530`).
+//! `Sony.pm:8519`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes;
+//! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8522,8530`).
 //!
 //! Per the `ProcessBinaryData` contract each tag is emitted IFF its byte range
 //! is in the deciphered block ([[exifast-processbinarydata-per-field]]). Only
@@ -20,7 +22,6 @@
 //! model-conditional `ShotNumberSincePowerUp`/`ModelReleaseYear`/`ShutterType`
 //! rows (whose `Condition`s do not include ILME-FX3) are not.
 
-use super::decipher::deciphered_block;
 use crate::value::TagValue;
 
 /// One emitted `Tag9400c` leaf — the resolved tag name and rendered value.
@@ -226,17 +227,18 @@ fn push_sequence_plus1(
 /// Walk the DECIPHERED `Tag9400c` block and emit the camera-metadata leaves the
 /// FX3 activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x9400` value bytes; the caller has
-/// already confirmed [`selects_tag9400c`]. `model` selects the `Quality2`
-/// PrintConv variant. `print_conv` selects `-j` vs `-n`.
+/// `buf` is the DECIPHERED `0x9400` block — the dispatcher already confirmed
+/// [`selects_tag9400c`] on the raw bytes and ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (twice for a
+/// double-enciphered body). `model` selects the `Quality2` PrintConv variant.
+/// `print_conv` selects `-j` vs `-n`.
 #[must_use]
-pub fn parse_tag9400c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9400Emission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag9400c(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9400Emission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0009 ReleaseMode2 — int8u %releaseMode2 (Sony.pm:8533).
   push_u8_hash(
-    &buf,
+    buf,
     0x09,
     "ReleaseMode2",
     print_conv,
@@ -245,11 +247,11 @@ pub fn parse_tag9400c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   );
 
   // 0x0012 SequenceImageNumber — int32u, `$val + 1` (Sony.pm:8540).
-  push_sequence_plus1(&buf, 0x12, "SequenceImageNumber", &mut out);
+  push_sequence_plus1(buf, 0x12, "SequenceImageNumber", &mut out);
 
   // 0x0016 SequenceLength — int8u "N shots" form (Sony.pm:8541).
   push_u8_hash(
-    &buf,
+    buf,
     0x16,
     "SequenceLength",
     print_conv,
@@ -258,14 +260,14 @@ pub fn parse_tag9400c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   );
 
   // 0x001a SequenceFileNumber — int32u, `$val + 1` (Sony.pm:8560).
-  push_sequence_plus1(&buf, 0x1a, "SequenceFileNumber", &mut out);
+  push_sequence_plus1(buf, 0x1a, "SequenceFileNumber", &mut out);
 
   // 0x001e SequenceLength — int8u "N files" form (Sony.pm:8561). Same name as
   // 0x0016 ⇒ last-wins; the bundled walk emits both, this one final. The
   // `Hook => '$varSize -= 1 …'` shifts later offsets by -1 only for ILCE-7M5/
   // 7RM6 (Sony.pm:8564) — not the FX3-class bodies ported here.
   push_u8_hash(
-    &buf,
+    buf,
     0x1e,
     "SequenceLength",
     print_conv,
@@ -275,7 +277,7 @@ pub fn parse_tag9400c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
 
   // 0x0029 CameraOrientation — int8u hash (Sony.pm:8576).
   push_u8_hash(
-    &buf,
+    buf,
     0x29,
     "CameraOrientation",
     print_conv,

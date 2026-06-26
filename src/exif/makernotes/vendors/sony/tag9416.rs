@@ -9,8 +9,9 @@
 //!
 //! The `0x9416` Main-table row dispatches this table UNCONDITIONALLY
 //! (`Sony.pm:2115-2118`). The block is enciphered (`PROCESS_PROC =>
-//! \&ProcessEnciphered`, `Sony.pm:9980`) so it is
-//! [`super::decipher::deciphered_block`]ed before this table reads it;
+//! \&ProcessEnciphered`, `Sony.pm:9980`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes;
 //! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:9983,9989`).
 //!
 //! ## Offsets are the BASE table offsets for the FX3
@@ -29,7 +30,6 @@
 //! `DataMember` 0x004a (`LensMount`) is read first because `LensType2`/
 //! `LensType` gate on it.
 
-use super::decipher::deciphered_block;
 use super::lens_types;
 use crate::exif::tables::print_exposure_time;
 use crate::value::TagValue;
@@ -315,18 +315,18 @@ fn is_fx3_class_array(model: Option<&str>) -> bool {
 /// Walk the DECIPHERED `Tag9416` block of the FX3-class bodies and emit the
 /// camera-metadata leaves the activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x9416` value bytes; `model` selects the
-/// FX3-class array offsets. The block is deciphered into a fresh buffer first
-/// (`ProcessEnciphered`, `Sony.pm:11552`). `print_conv` selects `-j` (PrintConv)
-/// vs `-n` (raw `$val`/ValueConv).
+/// `buf` is the DECIPHERED `0x9416` block — the dispatcher already ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (`0x9416`
+/// dispatches unconditionally; twice for a double-enciphered body). `model`
+/// selects the FX3-class array offsets. `print_conv` selects `-j` (PrintConv) vs
+/// `-n` (raw `$val`/ValueConv).
 #[must_use]
-pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9416Emission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag9416(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9416Emission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0004 SonyISO — int16u, `ValueConv => '100 * 2**(16 - $val/256)'`,
   // `PrintConv => 'sprintf("%.0f",$val)'` (Sony.pm:9999-10006).
-  if let Some(raw) = read_u16(&buf, 0x04) {
+  if let Some(raw) = read_u16(buf, 0x04) {
     let iso = 100.0 * 2f64.powf(16.0 - f64::from(raw) / 256.0);
     let value = if print_conv {
       TagValue::Str(std::format!("{iso:.0}").into())
@@ -341,7 +341,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x0006 StopsAboveBaseISO (%gain2010) — int16u, `ValueConv => '16 - $val/256'`,
   // `PrintConv => '$val ? sprintf("%.1f",$val) : $val'` (Sony.pm:6274-6286).
-  if let Some(raw) = read_u16(&buf, 0x06) {
+  if let Some(raw) = read_u16(buf, 0x06) {
     let stops = 16.0 - f64::from(raw) / 256.0;
     let value = if print_conv {
       // `$val ? sprintf("%.1f",$val) : $val` — a ValueConv of exactly 0 prints
@@ -363,7 +363,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   // 0x000a SonyExposureTime2 — int16u, `ValueConv => '$val ? 2 ** (16 - $val/256)
   // : 0'`, `PrintConv => '$val ? PrintExposureTime($val) : "Bulb"'`
   // (Sony.pm:10008-10015).
-  if let Some(raw) = read_u16(&buf, 0x0a) {
+  if let Some(raw) = read_u16(buf, 0x0a) {
     let secs = if raw != 0 {
       2f64.powf(16.0 - f64::from(raw) / 256.0)
     } else {
@@ -386,16 +386,16 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x000c ExposureTime — rational32u, `PrintConv => '$val ? PrintExposureTime
   // ($val) : "Bulb"'` (Sony.pm:10016-10021). No ValueConv ⇒ the rational's float.
-  push_exposure_time_rational(&buf, 0x0c, print_conv, &mut out);
+  push_exposure_time_rational(buf, 0x0c, print_conv, &mut out);
 
   // 0x0010 SonyFNumber2 (Sony.pm:10022), 0x0012 SonyMaxApertureValue
   // (Sony.pm:10030).
-  push_aperture(&buf, 0x10, "SonyFNumber2", print_conv, &mut out);
-  push_aperture(&buf, 0x12, "SonyMaxApertureValue", print_conv, &mut out);
+  push_aperture(buf, 0x10, "SonyFNumber2", print_conv, &mut out);
+  push_aperture(buf, 0x12, "SonyMaxApertureValue", print_conv, &mut out);
 
   // 0x001d SequenceImageNumber (%sequenceImageNumber) — int32u, `$val + 1`
   // (Sony.pm:10038, 6180-6187). Same value in `-j`/`-n`.
-  if let Some(raw) = read_u32_le(&buf, 0x1d) {
+  if let Some(raw) = read_u32_le(buf, 0x1d) {
     out.push(Tag9416Emission {
       name: "SequenceImageNumber",
       value: TagValue::I64(i64::from(raw) + 1),
@@ -404,7 +404,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x002b ReleaseMode2 (%releaseMode2) — int8u hash (Sony.pm:10039-10043).
   push_u8_hash(
-    &buf,
+    buf,
     0x2b,
     "ReleaseMode2",
     print_conv,
@@ -414,7 +414,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x0035 ExposureProgram — int8u, %sonyExposureProgram3 (Sony.pm:10044-10049).
   push_u8_hash(
-    &buf,
+    buf,
     0x35,
     "ExposureProgram",
     print_conv,
@@ -424,7 +424,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x0037 CreativeStyle — int8u hash (Sony.pm:10050-10076).
   push_u8_hash(
-    &buf,
+    buf,
     0x37,
     "CreativeStyle",
     print_conv,
@@ -435,7 +435,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   // 0x0048 LensMount — int8u hash; `Condition => '$$self{Model} !~ /^(DSC-)/'`
   // (Sony.pm:10077-10086). The caller only reaches a non-DSC body.
   push_u8_hash(
-    &buf,
+    buf,
     0x48,
     "LensMount",
     print_conv,
@@ -445,7 +445,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x0049 LensFormat — int8u hash (Sony.pm:10087-10095).
   push_u8_hash(
-    &buf,
+    buf,
     0x49,
     "LensFormat",
     print_conv,
@@ -457,7 +457,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   // (Sony.pm:10096-10105). Same name as 0x0048 ⇒ last-wins.
   let lens_mount = buf.get(0x4a).copied();
   push_u8_hash(
-    &buf,
+    buf,
     0x4a,
     "LensMount",
     print_conv,
@@ -468,7 +468,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   // 0x004b LensType2 — int16u, `Condition => '$$self{LensMount} == 2'`,
   // `%sonyLensTypes2` (`PrintInt => 1`) (Sony.pm:10106-10113).
   if lens_mount == Some(2)
-    && let Some(raw) = read_u16(&buf, 0x4b)
+    && let Some(raw) = read_u16(buf, 0x4b)
   {
     let value = if print_conv {
       match lens_types::lookup_name(u32::from(raw)) {
@@ -485,11 +485,11 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
   }
 
   // 0x004f DistortionCorrParams — int16s[16] (Sony.pm:10124-10127).
-  push_i16_array(&buf, 0x4f, 16, "DistortionCorrParams", &mut out);
+  push_i16_array(buf, 0x4f, 16, "DistortionCorrParams", &mut out);
 
   // 0x0070 PictureProfile (%pictureProfile2010) — int8u hash (Sony.pm:10128).
   push_u8_hash(
-    &buf,
+    buf,
     0x70,
     "PictureProfile",
     print_conv,
@@ -499,15 +499,15 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
 
   // 0x0071 FocalLength (Sony.pm:10129), 0x0073 MinFocalLength (Sony.pm:10137),
   // 0x0075 MaxFocalLength (`RawConv => '$val || undef'`, Sony.pm:10145).
-  push_focal_length(&buf, 0x71, "FocalLength", false, print_conv, &mut out);
-  push_focal_length(&buf, 0x73, "MinFocalLength", false, print_conv, &mut out);
-  push_focal_length(&buf, 0x75, "MaxFocalLength", true, print_conv, &mut out);
+  push_focal_length(buf, 0x71, "FocalLength", false, print_conv, &mut out);
+  push_focal_length(buf, 0x73, "MinFocalLength", false, print_conv, &mut out);
+  push_focal_length(buf, 0x75, "MaxFocalLength", true, print_conv, &mut out);
 
   // The FX3-class array rows (model-conditional offsets, Sony.pm:10190-10243):
   // VignettingCorrParams 0x088f int16s[16], APS-CSizeCapture 0x08b5 int8u,
   // ChromaticAberrationCorrParams 0x0914 int16s[32].
   if is_fx3_class_array(model) {
-    push_i16_array(&buf, 0x088f, 16, "VignettingCorrParams", &mut out);
+    push_i16_array(buf, 0x088f, 16, "VignettingCorrParams", &mut out);
     if let Some(&raw) = buf.get(0x08b5) {
       let value = if print_conv {
         match raw {
@@ -523,7 +523,7 @@ pub fn parse_tag9416(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<T
         value,
       });
     }
-    push_i16_array(&buf, 0x0914, 32, "ChromaticAberrationCorrParams", &mut out);
+    push_i16_array(buf, 0x0914, 32, "ChromaticAberrationCorrParams", &mut out);
   }
 
   out

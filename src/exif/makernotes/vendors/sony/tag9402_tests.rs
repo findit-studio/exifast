@@ -16,6 +16,13 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
   plain.iter().map(|&b| encipher_byte(b)).collect()
 }
 
+/// The dispatcher's central decipher (`process_enciphered`) — single pass, or two
+/// passes when `double_cipher` is set — reproducing the production path that hands
+/// `parse_tag9402` ALREADY-DECIPHERED bytes.
+fn process_enciphered(enc: &[u8], double_cipher: bool) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, double_cipher)
+}
+
 /// A 400-byte plaintext `Tag9402` block carrying the real ILME-FX3 field values
 /// (from the bundled `exiftool -v4` deciphered dump), enciphered for input to
 /// `parse_tag9402`. Deciphered: 0x00=0x22, 0x02=0xff (TempTest1), 0x04=0x00
@@ -53,7 +60,7 @@ fn fx3_variant_gate() {
 #[test]
 fn fx3_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9402(&blk, false, true);
+  let em = parse_tag9402(&process_enciphered(&blk, false), true);
   assert_eq!(
     find(&em, "AmbientTemperature"),
     Some(&TagValue::Str("0 C".into()))
@@ -69,7 +76,7 @@ fn fx3_print_conv_matches_golden() {
 #[test]
 fn fx3_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9402(&blk, false, false);
+  let em = parse_tag9402(&process_enciphered(&blk, false), false);
   assert_eq!(find(&em, "AmbientTemperature"), Some(&TagValue::I64(0)));
   assert_eq!(find(&em, "FocusMode"), Some(&TagValue::I64(4)));
   assert_eq!(find(&em, "AFAreaMode"), Some(&TagValue::I64(3)));
@@ -82,7 +89,7 @@ fn ambient_temperature_gated_on_temptest1() {
   let mut plain = vec![0u8; 400];
   plain[0x02] = 0x10; // not 255
   plain[0x04] = 0x05;
-  let em = parse_tag9402(&encipher(&plain), false, true);
+  let em = parse_tag9402(&process_enciphered(&encipher(&plain), false), true);
   assert!(find(&em, "AmbientTemperature").is_none());
 }
 
@@ -92,7 +99,7 @@ fn ambient_temperature_signed() {
   let mut plain = vec![0u8; 400];
   plain[0x02] = 0xff;
   plain[0x04] = 0xee; // -18 as int8s
-  let em = parse_tag9402(&encipher(&plain), false, true);
+  let em = parse_tag9402(&process_enciphered(&encipher(&plain), false), true);
   assert_eq!(
     find(&em, "AmbientTemperature"),
     Some(&TagValue::Str("-18 C".into()))
@@ -105,16 +112,17 @@ fn truncated_block_per_field() {
   let full = fx3_enciphered_block();
   // Keep through 0x18 — AmbientTemperature/FocusMode/AFAreaMode fit, the 0x2d
   // FocusPosition2 does not.
-  let em = parse_tag9402(&full[..0x18], false, true);
+  let em = parse_tag9402(&process_enciphered(&full[..0x18], false), true);
   assert!(find(&em, "AFAreaMode").is_some());
   assert!(find(&em, "FocusPosition2").is_none());
-  assert!(parse_tag9402(&[], false, true).is_empty());
+  assert!(parse_tag9402(&[], true).is_empty());
 }
 
 /// `$$self{DoubleCipher}`: a DOUBLE-enciphered block (the ExifTool 9.04-9.10
-/// write-bug form) needs a SECOND `Decipher` pass (`Sony.pm:11553-11556`). With
-/// `double_cipher=true` it recovers the correct FX3 fields; with `false` (the
-/// pre-fix behavior) the once-deciphered block is GARBAGE, NOT the right fields.
+/// write-bug form) needs a SECOND `Decipher` pass (`Sony.pm:11553-11556`), now
+/// applied CENTRALLY by `process_enciphered`. With `double_cipher=true` the
+/// recovered block yields the correct FX3 fields; with `false` (a single pass)
+/// the once-deciphered block is GARBAGE, NOT the right fields.
 #[test]
 fn double_cipher_second_pass() {
   let mut plain = vec![0u8; 400];
@@ -127,8 +135,9 @@ fn double_cipher_second_pass() {
   // On-disk DOUBLE-enciphered bytes = encipher(encipher(plain)).
   let double = encipher(&encipher(&plain));
 
-  // double_cipher=true ⇒ two Decipher passes recover `plain` exactly.
-  let ok = parse_tag9402(&double, true, true);
+  // double_cipher=true ⇒ process_enciphered runs two Decipher passes, recovering
+  // `plain` exactly before parse_tag9402 reads it.
+  let ok = parse_tag9402(&process_enciphered(&double, true), true);
   assert_eq!(find(&ok, "FocusMode"), Some(&TagValue::Str("AF-A".into())));
   assert_eq!(
     find(&ok, "AFAreaMode"),
@@ -138,7 +147,7 @@ fn double_cipher_second_pass() {
 
   // double_cipher=false ⇒ only one pass ⇒ the leaves do NOT match the truth
   // (the bug this fix closes: once-deciphered garbage, not the real fields).
-  let bad = parse_tag9402(&double, false, true);
+  let bad = parse_tag9402(&process_enciphered(&double, false), true);
   assert_ne!(
     find(&bad, "FocusPosition2"),
     Some(&TagValue::I64(148)),

@@ -16,6 +16,13 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
   plain.iter().map(|&b| encipher_byte(b)).collect()
 }
 
+/// The dispatcher's central decipher (`process_enciphered`) — single pass, or two
+/// passes when `double_cipher` is set — reproducing the production path that hands
+/// `parse_tag940c` ALREADY-DECIPHERED bytes.
+fn process_enciphered(enc: &[u8], double_cipher: bool) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, double_cipher)
+}
+
 /// A 64-byte plaintext `Tag940c` block carrying the real ILME-FX3 + Tamron
 /// 28-75mm field values (from the bundled `exiftool -v4` deciphered dump),
 /// enciphered for input to `parse_tag940c`. Deciphered:
@@ -63,7 +70,7 @@ fn fx3_model_gate() {
 #[test]
 fn fx3_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag940c(&blk, true);
+  let em = parse_tag940c(&process_enciphered(&blk, false), true);
   assert_eq!(
     find(&em, "LensMount2"),
     Some(&TagValue::Str("E-mount".into()))
@@ -91,7 +98,7 @@ fn fx3_print_conv_matches_golden() {
 #[test]
 fn fx3_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag940c(&blk, false);
+  let em = parse_tag940c(&process_enciphered(&blk, false), false);
   assert_eq!(find(&em, "LensMount2"), Some(&TagValue::I64(4)));
   assert_eq!(find(&em, "LensType3"), Some(&TagValue::I64(49470)));
   assert_eq!(find(&em, "CameraE-mountVersion"), Some(&TagValue::I64(384)));
@@ -109,7 +116,7 @@ fn emount_rows_gated_on_lensmount() {
   plain[0x0e] = 0x01;
   plain[0x14] = 0x01;
   plain[0x15] = 0x02;
-  let em = parse_tag940c(&encipher(&plain), true);
+  let em = parse_tag940c(&process_enciphered(&encipher(&plain), false), true);
   // CameraE-mountVersion (0x0b) is NOT gated on LensMount, but LensE-mountVersion
   // and LensFirmwareVersion ARE.
   assert!(find(&em, "LensE-mountVersion").is_none());
@@ -124,9 +131,41 @@ fn truncated_block_per_field() {
   let full = fx3_enciphered_block();
   // Keep through 0x0b (exclusive) — LensMount2 (0x08) + LensType3 (0x09..0x0b)
   // fit; CameraE-mountVersion (0x0b..0x0d) does not.
-  let em = parse_tag940c(&full[..0x0b], true);
+  let em = parse_tag940c(&process_enciphered(&full[..0x0b], false), true);
   assert!(find(&em, "LensMount2").is_some());
   assert!(find(&em, "LensType3").is_some());
   assert!(find(&em, "CameraE-mountVersion").is_none());
   assert!(parse_tag940c(&[], true).is_empty());
+}
+
+/// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
+/// is latched, the dispatcher's `process_enciphered` deciphers the 0x940c block
+/// TWICE before parse_tag940c reads LensMount2/LensType3. A double-enciphered FX3
+/// block recovers the real lens fields with the second pass; a single pass yields
+/// garbage, NOT the true values.
+#[test]
+fn double_cipher_recovers_tag940c_fields() {
+  let plain = {
+    let mut blk = process_enciphered(&fx3_enciphered_block(), false);
+    blk.truncate(64);
+    blk
+  };
+  let double = encipher(&encipher(&plain));
+
+  let ok = parse_tag940c(&process_enciphered(&double, true), true);
+  assert_eq!(
+    find(&ok, "LensMount2"),
+    Some(&TagValue::Str("E-mount".into()))
+  );
+  assert_eq!(
+    find(&ok, "LensType3"),
+    Some(&TagValue::Str("Tamron 28-75mm F2.8 Di III VXD G2".into()))
+  );
+
+  let bad = parse_tag940c(&process_enciphered(&double, false), true);
+  assert_ne!(
+    find(&bad, "LensType3"),
+    Some(&TagValue::Str("Tamron 28-75mm F2.8 Di III VXD G2".into())),
+    "single decipher of a double-enciphered 0x940c block must NOT yield the true lens"
+  );
 }

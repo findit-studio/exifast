@@ -11,22 +11,23 @@
 //! nor `0xff` (`Sony.pm:1969`). The FX3 (`ILME-FX3`) passes the model gate and
 //! its enciphered first byte is `0xd3` (deciphering to `0x22`), so it takes the
 //! `Tag9402` branch. The block is enciphered (`PROCESS_PROC =>
-//! \&ProcessEnciphered`, `Sony.pm:8686`) so it is
-//! [`super::decipher::deciphered_block`]ed before this table reads it;
-//! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8689,8691`).
+//! \&ProcessEnciphered`, `Sony.pm:8686`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it and hands this
+//! table the DECIPHERED bytes; `FORMAT => 'int8u'` + `FIRST_ENTRY => 0`
+//! (`Sony.pm:8689,8691`).
 //!
 //! `ProcessEnciphered` honours the file-global `$$self{DoubleCipher}` flag
 //! (`Sony.pm:11553-11556`): on a file the ExifTool 9.04-9.10 write bug
 //! double-enciphered — latched when the 0x9400 first byte ∈ {0x5e,0xe7,0x04}
-//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`) — the block is
-//! deciphered TWICE. [`parse_tag9402`] takes that flag and applies the second
-//! pass; without it a double-enciphered block emits once-deciphered garbage.
+//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`) — EVERY 0x94xx
+//! block (not just this one) is deciphered TWICE. That second pass is applied
+//! CENTRALLY by [`process_enciphered`](super::decipher::process_enciphered), so
+//! this table always receives correctly-deciphered bytes.
 //!
 //! Per the `ProcessBinaryData` contract each tag is emitted IFF its byte range
 //! is in the deciphered block ([[exifast-processbinarydata-per-field]]). Only
 //! the camera-metadata leaves the FX3 activation golden needs are ported here.
 
-use super::decipher::{decipher, deciphered_block};
 use crate::value::TagValue;
 
 /// One emitted `Tag9402` leaf — the resolved tag name and rendered value.
@@ -60,22 +61,16 @@ fn print_af_area_mode(v: u8) -> Option<&'static str> {
 /// Walk the DECIPHERED `Tag9402` block and emit the camera-metadata leaves the
 /// FX3 activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x9402` value bytes; the caller has
-/// already confirmed the variant gate ([`selects_tag9402`]). `double_cipher` is
-/// the file-global `$$self{DoubleCipher}` flag (latched from the 0x9400 walk,
-/// [`super::tag9400::detects_double_cipher`]): when set, `ProcessEnciphered`
-/// applies a SECOND `Decipher` pass (`Sony.pm:11553-11556`) to undo the 9.04-9.10
-/// double-encipher write bug — without it a double-enciphered block would emit
-/// once-deciphered GARBAGE. `print_conv` selects `-j` (PrintConv) vs `-n` (raw
-/// `$val`).
+/// `buf` is the DECIPHERED `0x9402` block — the dispatcher already confirmed the
+/// variant gate ([`selects_tag9402`]) on the raw bytes and ran
+/// [`process_enciphered`](super::decipher::process_enciphered), which applies the
+/// SECOND `Decipher` pass (`Sony.pm:11553-11556`) when the file-global
+/// `$$self{DoubleCipher}` flag is set (latched from the 0x9400 walk,
+/// [`super::tag9400::detects_double_cipher`]). So a double-enciphered body is
+/// already fully deciphered here, not once-deciphered garbage. `print_conv`
+/// selects `-j` (PrintConv) vs `-n` (raw `$val`).
 #[must_use]
-pub fn parse_tag9402(src: &[u8], double_cipher: bool, print_conv: bool) -> Vec<Tag9402Emission> {
-  let mut buf = deciphered_block(src, 0, src.len());
-  // `if ($$et{DoubleCipher}) { Decipher(\$data) }` (`Sony.pm:11553-11556`) — the
-  // recovery second pass over the same buffer for double-enciphered files.
-  if double_cipher {
-    decipher(&mut buf);
-  }
+pub fn parse_tag9402(buf: &[u8], print_conv: bool) -> Vec<Tag9402Emission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0002 TempTest1 — DataMember, `RawConv` keeps it `undef` unless `Unknown`

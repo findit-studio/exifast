@@ -12,9 +12,10 @@
 //! `Sony.pm:2044`). The FX3 enciphered prefix is `1b 50 08` (deciphering to
 //! `03 9b 02`), so it matches the `Tag9406` branch (NOT the `Tag9406b` `0x40`
 //! variant). The block is enciphered (`PROCESS_PROC => \&ProcessEnciphered`,
-//! `Sony.pm:9201`) so it is [`super::decipher::deciphered_block`]ed before this
-//! table reads it; `FORMAT => 'int8u'` + `FIRST_ENTRY => 0`
-//! (`Sony.pm:9204,9206`).
+//! `Sony.pm:9201`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes;
+//! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:9204,9206`).
 //!
 //! Per the `ProcessBinaryData` contract each tag is emitted IFF its byte range
 //! is in the deciphered block ([[exifast-processbinarydata-per-field]]). Only
@@ -24,7 +25,6 @@
 //! (`Sony.pm:9223,9239` — only valid when non-zero / not 0|255) that drop them
 //! for the FX3 (both are 0), matching the golden.
 
-use super::decipher::deciphered_block;
 use crate::value::TagValue;
 
 /// One emitted `Tag9406` leaf — the resolved tag name and rendered value.
@@ -38,12 +38,13 @@ pub struct Tag9406Emission {
 /// Walk the DECIPHERED `Tag9406` block and emit the battery leaves the FX3
 /// activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x9406` value bytes; the caller has
-/// already confirmed the variant gate ([`selects_tag9406`]). `print_conv`
-/// selects `-j` (PrintConv) vs `-n` (raw `$val`).
+/// `buf` is the DECIPHERED `0x9406` block — the dispatcher already confirmed the
+/// variant gate ([`selects_tag9406`]) on the raw bytes and ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (twice for a
+/// double-enciphered body). `print_conv` selects `-j` (PrintConv) vs `-n` (raw
+/// `$val`).
 #[must_use]
-pub fn parse_tag9406(src: &[u8], print_conv: bool) -> Vec<Tag9406Emission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag9406(buf: &[u8], print_conv: bool) -> Vec<Tag9406Emission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0005 BatteryTemperature — int8u, `ValueConv => '($val - 32) / 1.8'` (to

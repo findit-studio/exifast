@@ -7,8 +7,9 @@
 //!
 //! The `0x9401` Main-table row dispatches to `Tag9401` unconditionally
 //! (`Sony.pm:1862-1864`). The block is enciphered (`PROCESS_PROC =>
-//! \&ProcessEnciphered`, `Sony.pm:8643`) — it is
-//! [`super::decipher::deciphered_block`]ed before any field is read.
+//! \&ProcessEnciphered`, `Sony.pm:8643`) — the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes.
 //!
 //! `Tag9401` carries `DATAMEMBER => [0]` and a 19-entry `IS_SUBDIR` list
 //! (`Sony.pm:8650-8651`). The DataMember `0x0000 Ver9401` (`Sony.pm:8652`,
@@ -28,7 +29,6 @@
 //! PrintConv. Per the `ProcessBinaryData` contract each leaf is emitted IFF its
 //! byte is in range ([[exifast-processbinarydata-per-field]]).
 
-use super::decipher::deciphered_block;
 use crate::value::TagValue;
 
 /// One emitted `Tag9401`/`ISOInfo` leaf — the resolved tag name and value.
@@ -43,16 +43,17 @@ pub struct Tag9401Emission {
 /// `Ver9401`/`Software`/`Model` `IS_SUBDIR` conditions, and emit its three
 /// ISO leaves.
 ///
-/// `src` is the on-disk (enciphered) `0x9401` value bytes (the caller dispatches
-/// `0x9401` unconditionally). `model` / `software` are the dispatcher's
-/// `$$self{Model}` / `$$self{Software}` (IFD0, RawConv-trimmed).
+/// `buf` is the DECIPHERED `0x9401` block — the dispatcher already ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (`0x9401`
+/// dispatches unconditionally; twice for a double-enciphered body). `model` /
+/// `software` are the dispatcher's `$$self{Model}` / `$$self{Software}` (IFD0,
+/// RawConv-trimmed).
 #[must_use]
 pub fn parse_tag9401(
-  src: &[u8],
+  buf: &[u8],
   model: Option<&str>,
   software: Option<&str>,
 ) -> Vec<Tag9401Emission> {
-  let buf = deciphered_block(src, 0, src.len());
   let mut out = std::vec::Vec::new();
 
   // 0x0000 Ver9401 — the deciphered first byte (DataMember; not emitted).

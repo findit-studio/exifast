@@ -16,6 +16,13 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
   plain.iter().map(|&b| encipher_byte(b)).collect()
 }
 
+/// The dispatcher's central decipher (`process_enciphered`) — single pass, or two
+/// passes when `double_cipher` is set — reproducing the production path that hands
+/// `parse_tag9416` ALREADY-DECIPHERED bytes.
+fn process_enciphered(enc: &[u8], double_cipher: bool) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, double_cipher)
+}
+
 fn put_u16(buf: &mut [u8], off: usize, v: u16) {
   buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
@@ -82,7 +89,7 @@ fn find<'a>(em: &'a [Tag9416Emission], name: &str) -> Option<&'a TagValue> {
 #[test]
 fn fx3_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9416(&blk, Some("ILME-FX3"), true);
+  let em = parse_tag9416(&process_enciphered(&blk, false), Some("ILME-FX3"), true);
   assert_eq!(find(&em, "SonyISO"), Some(&TagValue::Str("16156".into())));
   assert_eq!(
     find(&em, "StopsAboveBaseISO"),
@@ -168,7 +175,7 @@ fn fx3_print_conv_matches_golden() {
 #[test]
 fn fx3_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9416(&blk, Some("ILME-FX3"), false);
+  let em = parse_tag9416(&process_enciphered(&blk, false), Some("ILME-FX3"), false);
   // SonyISO -n is the full-precision ValueConv float; assert it renders to the
   // golden `%.15g` token `16156.1260850464` (the `-n` JSON value).
   let iso = find(&em, "SonyISO").expect("SonyISO present");
@@ -203,7 +210,11 @@ fn lens_type2_gated_on_lensmount() {
   let mut p = vec![0u8; 0x0a00];
   p[0x4a] = 1; // A-mount, not 2
   put_u16(&mut p, 0x4b, 49470);
-  let em = parse_tag9416(&encipher(&p), Some("ILME-FX3"), true);
+  let em = parse_tag9416(
+    &process_enciphered(&encipher(&p), false),
+    Some("ILME-FX3"),
+    true,
+  );
   assert!(find(&em, "LensType2").is_none());
 }
 
@@ -212,7 +223,11 @@ fn lens_type2_gated_on_lensmount() {
 fn max_focal_length_zero_dropped() {
   let mut p = vec![0u8; 0x0a00];
   put_u16(&mut p, 0x75, 0);
-  let em = parse_tag9416(&encipher(&p), Some("ILME-FX3"), true);
+  let em = parse_tag9416(
+    &process_enciphered(&encipher(&p), false),
+    Some("ILME-FX3"),
+    true,
+  );
   assert!(find(&em, "MaxFocalLength").is_none());
 }
 
@@ -223,7 +238,7 @@ fn fx3_class_array_offsets_gated() {
   let blk = fx3_enciphered_block();
   // A non-FX3-class body (e.g. ILCE-7M4) reads the array tags at DIFFERENT
   // offsets, so the FX3 offsets must NOT fire.
-  let em = parse_tag9416(&blk, Some("ILCE-7M4"), true);
+  let em = parse_tag9416(&process_enciphered(&blk, false), Some("ILCE-7M4"), true);
   assert!(find(&em, "VignettingCorrParams").is_none());
   assert!(find(&em, "ChromaticAberrationCorrParams").is_none());
   // But the non-conditional leaves still emit.
@@ -236,9 +251,42 @@ fn fx3_class_array_offsets_gated() {
 fn truncated_block_per_field() {
   let full = fx3_enciphered_block();
   // Keep through 0x80 — the early leaves fit, the 0x088f+ array tags do not.
-  let em = parse_tag9416(&full[..0x80], Some("ILME-FX3"), true);
+  let em = parse_tag9416(
+    &process_enciphered(&full[..0x80], false),
+    Some("ILME-FX3"),
+    true,
+  );
   assert!(find(&em, "SonyISO").is_some());
   assert!(find(&em, "FocalLength").is_some());
   assert!(find(&em, "VignettingCorrParams").is_none());
   assert!(parse_tag9416(&[], Some("ILME-FX3"), true).is_empty());
+}
+
+/// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
+/// is latched, the dispatcher's `process_enciphered` deciphers the 0x9416 block
+/// TWICE before parse_tag9416 reads SonyISO/LensType2. A double-enciphered FX3
+/// block recovers the real CameraSettings/lens fields with the second pass; a
+/// single pass yields garbage, NOT the true values.
+#[test]
+fn double_cipher_recovers_tag9416_fields() {
+  let plain = {
+    let mut blk = process_enciphered(&fx3_enciphered_block(), false);
+    blk.truncate(0x0a00);
+    blk
+  };
+  let double = encipher(&encipher(&plain));
+
+  let ok = parse_tag9416(&process_enciphered(&double, true), Some("ILME-FX3"), true);
+  assert_eq!(find(&ok, "SonyISO"), Some(&TagValue::Str("16156".into())));
+  assert_eq!(
+    find(&ok, "LensType2"),
+    Some(&TagValue::Str("Tamron 28-75mm F2.8 Di III VXD G2".into()))
+  );
+
+  let bad = parse_tag9416(&process_enciphered(&double, false), Some("ILME-FX3"), true);
+  assert_ne!(
+    find(&bad, "SonyISO"),
+    Some(&TagValue::Str("16156".into())),
+    "single decipher of a double-enciphered 0x9416 block must NOT yield the true value"
+  );
 }

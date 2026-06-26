@@ -9,8 +9,9 @@
 //! (`Sony.pm:2079-2086`): the `Tag940c` table is selected when the body matches
 //! `/^(NEX-|ILCE-|ILME-|Lunar|ZV-E10|ZV-E10M2|ZV-E1)\b/` (`Sony.pm:2081`); the
 //! FX3 (`ILME-FX3`) matches the `ILME-` alternative. The block is enciphered
-//! (`PROCESS_PROC => \&ProcessEnciphered`, `Sony.pm:9349`) so it is
-//! [`super::decipher::deciphered_block`]ed before this table reads it;
+//! (`PROCESS_PROC => \&ProcessEnciphered`, `Sony.pm:9349`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes;
 //! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:9352,9354`).
 //!
 //! Per the `ProcessBinaryData` contract each tag is emitted IFF its byte range
@@ -18,7 +19,6 @@
 //! `DataMember` 0x0008 (`LensMount`) is read first because the later
 //! `LensType3`/`LensE-mountVersion`/`LensFirmwareVersion` rows gate on it.
 
-use super::decipher::deciphered_block;
 use super::lens_types;
 use crate::value::TagValue;
 
@@ -58,12 +58,13 @@ fn print_emount_version(v: u16) -> std::string::String {
 /// Walk the DECIPHERED `Tag940c` block and emit the camera-metadata leaves the
 /// FX3 activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x940c` value bytes; the caller has
-/// already confirmed the model gate ([`selects_tag940c`]). `print_conv` selects
-/// `-j` (PrintConv) vs `-n` (raw `$val`).
+/// `buf` is the DECIPHERED `0x940c` block — the dispatcher already confirmed the
+/// model gate ([`selects_tag940c`]) and ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (twice for a
+/// double-enciphered body). `print_conv` selects `-j` (PrintConv) vs `-n` (raw
+/// `$val`).
 #[must_use]
-pub fn parse_tag940c(src: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag940c(buf: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0008 LensMount2 — int8u, DataMember `$$self{LensMount} = $val`
@@ -88,7 +89,7 @@ pub fn parse_tag940c(src: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
   // `RawConv => '(($$self{LensMount} != 0) or ($val > 0 and $val < 32784)) ?
   // $val : undef'` (Sony.pm:9378-9385). The `LensMount` DataMember is undef when
   // 0x0008 was out of range, which the Perl `!=` treats as 0.
-  if let Some(raw) = read_u16(&buf, 0x09) {
+  if let Some(raw) = read_u16(buf, 0x09) {
     let mount = lens_mount.unwrap_or(0);
     if mount != 0 || (raw > 0 && raw < 32784) {
       let value = if print_conv {
@@ -110,7 +111,7 @@ pub fn parse_tag940c(src: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
 
   // 0x000b CameraE-mountVersion — int16u,
   // `sprintf("%x.%.2x",$val>>8,$val&0xff)` (Sony.pm:9386-9403).
-  if let Some(raw) = read_u16(&buf, 0x0b) {
+  if let Some(raw) = read_u16(buf, 0x0b) {
     let value = if print_conv {
       TagValue::Str(print_emount_version(raw).into())
     } else {
@@ -125,7 +126,7 @@ pub fn parse_tag940c(src: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
   // 0x000d LensE-mountVersion — int16u, `Condition => '$$self{LensMount} != 0'`,
   // `sprintf("%x.%.2x",$val>>8,$val&0xff)` (Sony.pm:9404-9432).
   if lens_mount.unwrap_or(0) != 0
-    && let Some(raw) = read_u16(&buf, 0x0d)
+    && let Some(raw) = read_u16(buf, 0x0d)
   {
     let value = if print_conv {
       TagValue::Str(print_emount_version(raw).into())
@@ -142,7 +143,7 @@ pub fn parse_tag940c(src: &[u8], print_conv: bool) -> Vec<Tag940cEmission> {
   // `sprintf("Ver.%.2x.%.3d",$val>>8,$val&0xff)` (Sony.pm:9442-9447). No `-n`
   // ValueConv ⇒ the raw int16u.
   if lens_mount.unwrap_or(0) != 0
-    && let Some(raw) = read_u16(&buf, 0x14)
+    && let Some(raw) = read_u16(buf, 0x14)
   {
     let value = if print_conv {
       TagValue::Str(std::format!("Ver.{:02x}.{:03}", raw >> 8, raw & 0xff).into())

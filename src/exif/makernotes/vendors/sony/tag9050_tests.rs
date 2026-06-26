@@ -3,9 +3,10 @@
 
 use super::*;
 
-/// Build a deciphered-then-RE-ENCIPHERED `Tag9050c` block so `parse_tag9050c`
-/// (which deciphers internally) sees the documented plaintext at each offset.
-/// The forward map is `c = (b·b·b) mod 249` (`Sony.pm:11521`).
+/// Encipher a plaintext block, then run it through `process_enciphered` (the
+/// dispatcher's single-pass decipher), reproducing the production path that hands
+/// `parse_tag9050c` ALREADY-DECIPHERED bytes. The forward map is
+/// `c = (b·b·b) mod 249` (`Sony.pm:11521`).
 fn encipher(plain: &[u8]) -> Vec<u8> {
   plain
     .iter()
@@ -17,6 +18,18 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
       }
     })
     .collect()
+}
+
+/// The dispatcher's central single-pass decipher (`process_enciphered` with
+/// `double_cipher = false`) applied to an enciphered block.
+fn deciphered(enc: &[u8]) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, false)
+}
+
+/// The dispatcher's central decipher with `double_cipher = true` — two passes,
+/// the `$$self{DoubleCipher}` recovery path.
+fn deciphered_twice(enc: &[u8]) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, true)
 }
 
 /// A 256-byte plaintext `Tag9050c` block carrying the real ILME-FX3 field
@@ -54,7 +67,7 @@ fn find<'a>(em: &'a [Tag9050Emission], name: &str) -> Option<&'a TagValue> {
 #[test]
 fn fx3_tag9050c_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9050c(&blk, Some("ILME-FX3"), true);
+  let em = parse_tag9050c(&deciphered(&blk), Some("ILME-FX3"), true);
   assert_eq!(
     find(&em, "Shutter"),
     Some(&TagValue::Str("Mechanical (2738 5168 6484)".into()))
@@ -83,7 +96,7 @@ fn fx3_tag9050c_print_conv_matches_golden() {
 #[test]
 fn fx3_tag9050c_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9050c(&blk, Some("ILME-FX3"), false);
+  let em = parse_tag9050c(&deciphered(&blk), Some("ILME-FX3"), false);
   assert_eq!(
     find(&em, "Shutter"),
     Some(&TagValue::Str("2738 5168 6484".into()))
@@ -109,7 +122,7 @@ fn fx3_tag9050c_raw_values_match_golden() {
 #[test]
 fn internal_serial_number_model_gated() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9050c(&blk, Some("ILCE-9"), true);
+  let em = parse_tag9050c(&deciphered(&blk), Some("ILCE-9"), true);
   assert!(find(&em, "InternalSerialNumber").is_none());
 }
 
@@ -119,12 +132,43 @@ fn internal_serial_number_model_gated() {
 fn truncated_block_emits_only_in_range_fields() {
   let full = fx3_enciphered_block();
   // Keep through 0x003e (so Shutter + FlashStatus + ShutterCount fit, but the
-  // SonyExposureTime/FNumber/serial at >= 0x46 do not).
-  let em = parse_tag9050c(&full[..0x3e], Some("ILME-FX3"), true);
+  // SonyExposureTime/FNumber/serial at >= 0x46 do not). The per-byte cipher means
+  // deciphering a truncated block equals truncating the deciphered block.
+  let em = parse_tag9050c(&deciphered(&full[..0x3e]), Some("ILME-FX3"), true);
   assert!(find(&em, "Shutter").is_some());
   assert!(find(&em, "ShutterCount").is_some());
   assert!(find(&em, "SonyExposureTime").is_none());
   assert!(find(&em, "InternalSerialNumber").is_none());
   // An empty block emits nothing and does not panic.
   assert!(parse_tag9050c(&[], Some("ILME-FX3"), true).is_empty());
+}
+
+/// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
+/// is latched, the dispatcher's `process_enciphered` deciphers the 0x9050 block
+/// TWICE before parse_tag9050c reads it. A double-enciphered FX3 block recovers
+/// Shutter/ShutterCount with the second pass; a single pass yields garbage, NOT
+/// the true values.
+#[test]
+fn double_cipher_recovers_tag9050c_fields() {
+  let plain = {
+    let mut blk = deciphered(&fx3_enciphered_block());
+    blk.truncate(256);
+    blk
+  };
+  // On-disk DOUBLE-enciphered bytes = encipher(encipher(plain)).
+  let double = encipher(&encipher(&plain));
+
+  let ok = parse_tag9050c(&deciphered_twice(&double), Some("ILME-FX3"), true);
+  assert_eq!(
+    find(&ok, "Shutter"),
+    Some(&TagValue::Str("Mechanical (2738 5168 6484)".into()))
+  );
+  assert_eq!(find(&ok, "ShutterCount"), Some(&TagValue::I64(2)));
+
+  let bad = parse_tag9050c(&deciphered(&double), Some("ILME-FX3"), true);
+  assert_ne!(
+    find(&bad, "ShutterCount"),
+    Some(&TagValue::I64(2)),
+    "single decipher of a double-enciphered 0x9050 block must NOT yield the true value"
+  );
 }

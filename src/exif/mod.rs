@@ -12169,10 +12169,16 @@ pub(in crate::exif) fn sony_makernote_isolated(
 ///
 /// `entry` is the Sony Main-IFD SubDirectory row; its verbatim on-disk value
 /// bytes are `data[value_offset .. value_offset + value_size]`. Most of these
-/// blocks are enciphered (`PROCESS_PROC => \&ProcessEnciphered`) and are
-/// `super::decipher::deciphered_block`ed inside each per-table parser; `0x202a`
-/// (`Tag202a`) is the lone plain (un-enciphered) `%binaryDataAttrs` block, read
-/// directly. The variant is selected faithfully: `Tag9050c` BY MODEL
+/// blocks are enciphered (`PROCESS_PROC => \&ProcessEnciphered`): the cipher is
+/// applied CENTRALLY here via [`process_enciphered`](makernotes::vendors::sony::decipher::process_enciphered)
+/// — exactly as ExifTool's `ProcessEnciphered` deciphers the whole block (once,
+/// or TWICE when the file-global `$$self{DoubleCipher}` flag is set,
+/// `Sony.pm:11552-11556`) BEFORE the `ProcessBinaryData` walk — and the
+/// per-table parser receives the ALREADY-DECIPHERED bytes (it no longer runs the
+/// cipher). `0x202a` (`Tag202a`) is the lone plain (un-enciphered)
+/// `%binaryDataAttrs` block, passed through raw and read directly. The variant is
+/// selected faithfully on the RAW (still-enciphered) bytes — the Perl `$$valPt`
+/// `Condition`s are pre-decipher: `Tag9050c` BY MODEL
 /// (`Sony.pm:1810`), `Tag9400c`/`Tag9406`/`Tag202a` BY THE (enciphered or
 /// plain) FIRST/THIRD VALUE BYTE (`Sony.pm:1856`/`:2044`/`:1575`), `Tag9402` by
 /// model + first byte (`Sony.pm:1969`), `Tag9401`'s ISOInfo sub-block by the
@@ -12181,8 +12187,12 @@ pub(in crate::exif) fn sony_makernote_isolated(
 /// ride the Sony vendor family-1 group; none are `Unknown => 1`.
 ///
 /// `double_cipher` is the file-global `$$self{DoubleCipher}` flag (latched from
-/// the 0x9400 walk): when set, the `Tag9402` `ProcessEnciphered` block is
-/// deciphered TWICE (`Sony.pm:11553-11556`).
+/// the 0x9400 walk): when set, EVERY enciphered 0x94xx block (0x9050/0x9400/
+/// 0x9401/0x9402/0x9406/0x940c/0x9416) is deciphered TWICE
+/// (`Sony.pm:11553-11556`), not just 0x9402 — `ProcessEnciphered` is the shared
+/// `PROCESS_PROC` for all of them, so on a double-enciphered body ISOInfo/
+/// battery/lens/camera-settings would otherwise be read from once-deciphered
+/// garbage.
 fn sony_emit_enciphered_subblock<S: ExifSink>(
   data: &[u8],
   group1: &str,
@@ -12193,6 +12203,7 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   print_conv: bool,
   out: &mut S,
 ) {
+  use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
     tag202a, tag940c, tag9050, tag9400, tag9401, tag9402, tag9406, tag9416,
   };
@@ -12206,16 +12217,26 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   let Some(raw) = data.get(off..end) else {
     return;
   };
+  // The Main-IFD SubDirectory `Condition`s (below) test the RAW `$$valPt` (the
+  // Perl conditions are pre-decipher), so the variant gates run on `raw`. The
+  // cipher itself is applied CENTRALLY — `ProcessEnciphered` deciphers the whole
+  // block once, or TWICE when `$$self{DoubleCipher}` is latched, BEFORE the
+  // `ProcessBinaryData` walk (`Sony.pm:11552-11556`) — and the result is handed
+  // to the per-table parser, so ALL enciphered 0x94xx blocks (not just 0x9402)
+  // are correctly (double-)deciphered. `0x202a` is the lone plain block and is
+  // never deciphered.
   match entry.tag_id() {
     // `Tag9050c` — selected by model (`Sony.pm:1810`).
     0x9050 if sony_tag9050c_model(model) => {
-      for emi in tag9050::parse_tag9050c(raw, model, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9050::parse_tag9050c(&buf, model, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag9400c` — selected by the enciphered first byte (`Sony.pm:1856`).
     0x9400 if tag9400::selects_tag9400c(raw) => {
-      for emi in tag9400::parse_tag9400c(raw, model, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9400::parse_tag9400c(&buf, model, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
@@ -12223,40 +12244,45 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
     // `$$self{Software}`, `Sony.pm:8659-8662`). Dispatched unconditionally
     // (`Sony.pm:1862-1864`).
     0x9401 => {
-      for emi in tag9401::parse_tag9401(raw, model, software) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9401::parse_tag9401(&buf, model, software) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag9402` — not SLT/HV/ILCA and the enciphered first byte ∉ {0x05,0xff}
-    // (`Sony.pm:1969`). `double_cipher` (latched from the 0x9400 walk) selects the
-    // second `Decipher` pass (`Sony.pm:11553-11556`).
+    // (`Sony.pm:1969`).
     0x9402 if tag9402::selects_tag9402(raw, model) => {
-      for emi in tag9402::parse_tag9402(raw, double_cipher, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9402::parse_tag9402(&buf, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag9406` — battery temp/level, selected by the enciphered first+third
     // value bytes (`Sony.pm:2044`).
     0x9406 if tag9406::selects_tag9406(raw) => {
-      for emi in tag9406::parse_tag9406(raw, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9406::parse_tag9406(&buf, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag940c` — the E-mount lens table, selected by model (`Sony.pm:2081`).
     0x940c if tag940c::selects_tag940c(model) => {
-      for emi in tag940c::parse_tag940c(raw, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag940c::parse_tag940c(&buf, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag9416` — the modern CameraSettings/lens table, dispatched
     // unconditionally for the bodies that write `0x9416` (`Sony.pm:2115`).
     0x9416 => {
-      for emi in tag9416::parse_tag9416(raw, model, print_conv) {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9416::parse_tag9416(&buf, model, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
     // `Tag202a` — the (un-enciphered) FocalPlaneAFPointsUsed grid, selected by
-    // the plain first value byte = 0x01 (`Sony.pm:1575`).
+    // the plain first value byte = 0x01 (`Sony.pm:1575`). NOT a `ProcessEnciphered`
+    // table, so the raw bytes are read directly (never deciphered).
     0x202a if tag202a::selects_tag202a(raw) => {
       for emi in tag202a::parse_tag202a(raw, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);

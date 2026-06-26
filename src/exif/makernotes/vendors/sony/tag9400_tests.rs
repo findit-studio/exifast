@@ -16,6 +16,13 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
   plain.iter().map(|&b| encipher_byte(b)).collect()
 }
 
+/// The dispatcher's central decipher (`process_enciphered`) — single pass, or two
+/// passes when `double_cipher` is set — reproducing the production path that hands
+/// `parse_tag9400c` ALREADY-DECIPHERED bytes.
+fn process_enciphered(enc: &[u8], double_cipher: bool) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, double_cipher)
+}
+
 /// A 456-byte plaintext `Tag9400c` block carrying the real ILME-FX3 field
 /// values (from the bundled `exiftool -v4` deciphered dump), enciphered for
 /// input to `parse_tag9400c`. The first plaintext byte is `0x6a` (which the
@@ -85,7 +92,7 @@ fn double_cipher_first_byte_latch() {
 #[test]
 fn fx3_tag9400c_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9400c(&blk, Some("ILME-FX3"), true);
+  let em = parse_tag9400c(&process_enciphered(&blk, false), Some("ILME-FX3"), true);
   assert_eq!(
     find(&em, "ReleaseMode2"),
     Some(&TagValue::Str("Normal".into()))
@@ -107,7 +114,7 @@ fn fx3_tag9400c_print_conv_matches_golden() {
 #[test]
 fn fx3_tag9400c_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9400c(&blk, Some("ILME-FX3"), false);
+  let em = parse_tag9400c(&process_enciphered(&blk, false), Some("ILME-FX3"), false);
   assert_eq!(find(&em, "ReleaseMode2"), Some(&TagValue::I64(0)));
   assert_eq!(find(&em, "SequenceImageNumber"), Some(&TagValue::I64(1)));
   assert_eq!(find(&em, "SequenceFileNumber"), Some(&TagValue::I64(1)));
@@ -137,7 +144,11 @@ fn truncated_block_per_field() {
   let full = fx3_enciphered_block();
   // Keep through 0x001a (ReleaseMode2 + SequenceImageNumber + 0x16 fit; the
   // 0x1e SequenceLength / 0x29 CameraOrientation / 0x2a Quality2 do not).
-  let em = parse_tag9400c(&full[..0x1a], Some("ILME-FX3"), true);
+  let em = parse_tag9400c(
+    &process_enciphered(&full[..0x1a], false),
+    Some("ILME-FX3"),
+    true,
+  );
   assert!(find(&em, "ReleaseMode2").is_some());
   assert!(find(&em, "SequenceImageNumber").is_some());
   assert!(find(&em, "CameraOrientation").is_none());
@@ -148,4 +159,35 @@ fn truncated_block_per_field() {
     Some(&TagValue::Str("1 shot".into()))
   );
   assert!(parse_tag9400c(&[], Some("ILME-FX3"), true).is_empty());
+}
+
+/// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
+/// is latched, the dispatcher's `process_enciphered` must decipher the 0x9400
+/// block TWICE. A double-enciphered FX3 `Tag9400c` block recovers its real fields
+/// with the second pass; a SINGLE pass yields garbage, NOT the true values.
+#[test]
+fn double_cipher_recovers_tag9400c_fields() {
+  let plain = {
+    let mut blk = process_enciphered(&fx3_enciphered_block(), false);
+    blk.truncate(456);
+    blk
+  };
+  // On-disk DOUBLE-enciphered bytes = encipher(encipher(plain)).
+  let double = encipher(&encipher(&plain));
+
+  // Two passes recover the plaintext exactly.
+  let ok = parse_tag9400c(&process_enciphered(&double, true), Some("ILME-FX3"), true);
+  assert_eq!(
+    find(&ok, "CameraOrientation"),
+    Some(&TagValue::Str("Horizontal (normal)".into()))
+  );
+  assert_eq!(find(&ok, "Quality2"), Some(&TagValue::Str("RAW".into())));
+
+  // A single pass over a double-enciphered block does NOT recover the truth.
+  let bad = parse_tag9400c(&process_enciphered(&double, false), Some("ILME-FX3"), true);
+  assert_ne!(
+    find(&bad, "Quality2"),
+    Some(&TagValue::Str("RAW".into())),
+    "single decipher of a double-enciphered 0x9400 block must NOT yield the true value"
+  );
 }

@@ -10,8 +10,10 @@
 //! activation fixture matches the `Tag9050c` branch
 //! (`$$self{Model} =~ /^(ILCE-(1\b|7M4|7RM5|7SM3)|ILME-FX3)/`, `Sony.pm:1810`).
 //! The block is enciphered (`PROCESS_PROC => \&ProcessEnciphered`,
-//! `Sony.pm:8206`) so it is [`super::decipher::decipher`]ed before this table
-//! reads it. `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8209,8214`):
+//! `Sony.pm:8206`) so the dispatcher
+//! [`process_enciphered`](super::decipher::process_enciphered)s it (once, or
+//! twice for a double-enciphered body) and hands this table the DECIPHERED bytes.
+//! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8209,8214`):
 //! every offset is a byte index into the deciphered block, and a tag's `Format`
 //! overrides the read width.
 //!
@@ -22,7 +24,6 @@
 //! model-conditional rows (e.g. `0x008a` InternalSerialNumber for ILCE-1) are
 //! gated by the model exactly as the bundled `Condition`s.
 
-use super::decipher::deciphered_block;
 use crate::exif::tables::{print_exposure_time, print_fnumber};
 use crate::value::TagValue;
 
@@ -179,17 +180,17 @@ fn push_release_mode2(
 /// Walk the DECIPHERED `Tag9050c` block of the FX3-class bodies and emit the
 /// camera-metadata leaves the activation golden needs.
 ///
-/// `src` is the on-disk (enciphered) `0x9050` value bytes; `model` gates the
-/// model-conditional rows exactly as the bundled `Condition`s. The block is
-/// deciphered into a fresh buffer first (`ProcessEnciphered`, `Sony.pm:11552`).
+/// `buf` is the DECIPHERED `0x9050` block — the dispatcher already ran
+/// [`process_enciphered`](super::decipher::process_enciphered) (`Sony.pm:11552`,
+/// twice for a double-enciphered body), so this table reads plaintext directly.
+/// `model` gates the model-conditional rows exactly as the bundled `Condition`s.
 /// `print_conv` selects `-j` (PrintConv) vs `-n` (raw `$val`).
 #[must_use]
-pub fn parse_tag9050c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9050Emission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag9050c(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag9050Emission> {
   let mut out = std::vec::Vec::new();
 
   // 0x0026 Shutter — int16u[3] (Sony.pm:8217).
-  push_shutter(&buf, print_conv, &mut out);
+  push_shutter(buf, print_conv, &mut out);
 
   // 0x0039 FlashStatus — int8u; `RawConv => '$$self{FlashFired} = $val'`
   // (Sony.pm:8228). Captured below to gate 0x0050 ShutterCount2.
@@ -210,7 +211,7 @@ pub fn parse_tag9050c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   }
 
   // 0x003a ShutterCount — int32u, `RawConv => '$val & 0x00ffffff'` (Sony.pm:8241).
-  if let Some(raw) = read_u32(&buf, 0x3a) {
+  if let Some(raw) = read_u32(buf, 0x3a) {
     out.push(Tag9050Emission {
       name: "ShutterCount",
       value: TagValue::I64(i64::from(raw & 0x00ff_ffff)),
@@ -218,10 +219,10 @@ pub fn parse_tag9050c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   }
 
   // 0x0046 SonyExposureTime (Sony.pm:8249), 0x0048 SonyFNumber (Sony.pm:8257).
-  push_exposure_time(&buf, 0x46, print_conv, &mut out);
-  push_fnumber(&buf, 0x48, print_conv, &mut out);
+  push_exposure_time(buf, 0x46, print_conv, &mut out);
+  push_fnumber(buf, 0x48, print_conv, &mut out);
   // 0x004b ReleaseMode2 (Sony.pm:8265).
-  push_release_mode2(&buf, 0x4b, print_conv, &mut out);
+  push_release_mode2(buf, 0x4b, print_conv, &mut out);
 
   // 0x0050 ShutterCount2 — int32u, `RawConv => '$val & 0x00ffffff'`,
   // `Condition => '($$self{FlashFired} & 0x01) != 1'` (Sony.pm:8269-8274). The
@@ -229,7 +230,7 @@ pub fn parse_tag9050c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   // which case the Perl `&` treats it as 0 (so the condition holds).
   let flash_fired_bit = flash_fired.unwrap_or(0) & 0x01;
   if flash_fired_bit != 1
-    && let Some(raw) = read_u32(&buf, 0x50)
+    && let Some(raw) = read_u32(buf, 0x50)
   {
     out.push(Tag9050Emission {
       name: "ShutterCount2",
@@ -240,9 +241,9 @@ pub fn parse_tag9050c(src: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   // 0x0066 SonyExposureTime, 0x0068 SonyFNumber, 0x006b ReleaseMode2 — the
   // not-valid-in-HDR-mode duplicates (Sony.pm:8275,8283,8291). Same names →
   // last-wins; the bundled walk emits both, and the second pair wins.
-  push_exposure_time(&buf, 0x66, print_conv, &mut out);
-  push_fnumber(&buf, 0x68, print_conv, &mut out);
-  push_release_mode2(&buf, 0x6b, print_conv, &mut out);
+  push_exposure_time(buf, 0x66, print_conv, &mut out);
+  push_fnumber(buf, 0x68, print_conv, &mut out);
+  push_release_mode2(buf, 0x6b, print_conv, &mut out);
 
   // 0x0088 InternalSerialNumber — int8u[6],
   // `Condition => '$$self{Model} =~ /^(ILCE-(7M4|7RM5|7SM3)|ILME-FX3)/'`,

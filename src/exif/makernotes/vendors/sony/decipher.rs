@@ -24,14 +24,19 @@
 //! NEVER reads or writes out of bounds.
 //!
 //! Scope: the DoubleCipher second pass (`Sony.pm:11553-11556`, a write-bug
-//! recovery for ExifTool 9.04-9.10 that applies the cipher twice) is NOT baked
-//! into [`deciphered_block`]/[`decipher`] — those are a single substitution pass,
-//! matching the one `Decipher(\$data)` call. The file-global `$$self{DoubleCipher}`
-//! flag is latched when the 0x9400 first byte ∈ {0x5e,0xe7,0x04}
-//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`), and the affected
-//! `ProcessEnciphered` callers (e.g. [`super::tag9402::parse_tag9402`]) invoke
-//! [`decipher`] a SECOND time over the recovered buffer. Without that flag, a
-//! double-enciphered block decodes to garbage (as in ExifTool), never a panic.
+//! recovery for ExifTool 9.04-9.10 that applies the cipher twice) is the ONE
+//! place the cipher count branches — and ExifTool branches it CENTRALLY inside
+//! `ProcessEnciphered`, applying the second `Decipher(\$data)` to EVERY 0x94xx
+//! block when the flag is set, BEFORE `ProcessBinaryData` ever reads a field.
+//! [`process_enciphered`] mirrors that: it deciphers once and (iff the
+//! file-global `$$self{DoubleCipher}` flag is set) a second time, returning the
+//! plaintext for a `ProcessBinaryData` walk — so the per-table parsers receive
+//! ALREADY-DECIPHERED bytes and never invoke the cipher themselves. The flag is
+//! latched when the 0x9400 first byte ∈ {0x5e,0xe7,0x04}
+//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`). [`decipher`] and
+//! [`deciphered_block`] remain single-pass primitives (one `Decipher(\$data)`).
+//! Without the flag a double-enciphered block decodes to garbage (as in
+//! ExifTool), never a panic.
 
 /// `sub Decipher` (`Sony.pm:11517-11529`) — the inverse substitution table.
 ///
@@ -97,6 +102,34 @@ pub fn deciphered_block(src: &[u8], start: usize, len: usize) -> std::vec::Vec<u
     None => std::vec::Vec::new(),
   };
   decipher(&mut block);
+  block
+}
+
+/// `ProcessEnciphered` (`Sony.pm:11539-11567`) — the full decipher step ExifTool
+/// runs on EVERY 0x94xx `ProcessEnciphered` block before `ProcessBinaryData`.
+///
+/// Deciphers the whole `src` block once (`Decipher(\$data)`, `Sony.pm:11552`) and
+/// — iff the file-global `$$self{DoubleCipher}` recovery flag is set — a SECOND
+/// time (`Sony.pm:11553-11556`, the ExifTool 9.04-9.10 double-encipher write-bug
+/// fix). The returned plaintext is what the per-table `ProcessBinaryData` walk
+/// reads, so each Sony 0x94xx parser takes these ALREADY-DECIPHERED bytes rather
+/// than re-running the cipher. Centralizing the (double-)decipher HERE — exactly
+/// as `ProcessEnciphered` does — is what makes ISOInfo/battery/lens/camera
+/// fields after a double-enciphered 0x9400 recover correctly across the WHOLE
+/// 0x94xx set, not just 0x9402.
+///
+/// The `DoubleCipher` flag must be detected on the RAW (still-enciphered) 0x9400
+/// bytes ([`super::tag9400::detects_double_cipher`]) BEFORE this runs; likewise
+/// the Main-IFD variant `Condition`s (`selects_tag9400c`/`selects_tag9402`/
+/// `selects_tag9406`) test the raw `$$valPt` and so are evaluated on `src`, not
+/// on the deciphered output. MEMORY-SAFE: a hostile length is clamped by
+/// [`deciphered_block`], so this never panics.
+#[must_use]
+pub fn process_enciphered(src: &[u8], double_cipher: bool) -> std::vec::Vec<u8> {
+  let mut block = deciphered_block(src, 0, src.len());
+  if double_cipher {
+    decipher(&mut block);
+  }
   block
 }
 

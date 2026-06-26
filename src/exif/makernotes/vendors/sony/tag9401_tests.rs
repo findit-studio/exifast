@@ -16,6 +16,13 @@ fn encipher(plain: &[u8]) -> Vec<u8> {
   plain.iter().map(|&b| encipher_byte(b)).collect()
 }
 
+/// The dispatcher's central decipher (`process_enciphered`) — single pass, or two
+/// passes when `double_cipher` is set — reproducing the production path that hands
+/// `parse_tag9401` ALREADY-DECIPHERED bytes.
+fn process_enciphered(enc: &[u8], double_cipher: bool) -> Vec<u8> {
+  super::super::decipher::process_enciphered(enc, double_cipher)
+}
+
 /// A plaintext `Tag9401` block carrying the real ILME-FX3 deciphered values:
 /// 0x0000=160 (Ver9401), and the ISOInfo 5-byte sub-block at 0x04a1 =
 /// `ff 22 00 0b 00` (ISOSetting=255 → "Unknown (255)", ISOAutoMin=0 → "Auto",
@@ -38,7 +45,11 @@ fn find<'a>(em: &'a [Tag9401Emission], name: &str) -> Option<&'a TagValue> {
 #[test]
 fn fx3_iso_info_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9401(&blk, Some("ILME-FX3"), Some("ILME-FX3 v4.00"));
+  let em = parse_tag9401(
+    &process_enciphered(&blk, false),
+    Some("ILME-FX3"),
+    Some("ILME-FX3 v4.00"),
+  );
   // ValueConv hash applies identically in -j and -n (no separate PrintConv).
   assert_eq!(
     find(&em, "ISOSetting"),
@@ -112,7 +123,53 @@ fn truncated_block_per_field() {
     p[0] = 160;
     p
   };
-  assert!(parse_tag9401(&encipher(&plain), Some("ILME-FX3"), Some("ILME-FX3 v4.00")).is_empty());
+  assert!(
+    parse_tag9401(
+      &process_enciphered(&encipher(&plain), false),
+      Some("ILME-FX3"),
+      Some("ILME-FX3 v4.00")
+    )
+    .is_empty()
+  );
   // Empty block ⇒ no Ver9401 ⇒ nothing.
   assert!(parse_tag9401(&[], None, None).is_empty());
+}
+
+/// Double-encipher regression (`Sony.pm:11553-11556`): when `$$self{DoubleCipher}`
+/// is latched, the dispatcher's `process_enciphered` deciphers the 0x9401 block
+/// TWICE before parse_tag9401 reads `Ver9401` + the ISOInfo sub-block. A
+/// double-enciphered FX3 block recovers its ISO leaves with the second pass; a
+/// single pass deciphers `Ver9401` to the WRONG value (so no ISOInfo offset is
+/// selected) and yields nothing.
+#[test]
+fn double_cipher_recovers_tag9401_iso_info() {
+  let plain = {
+    let mut blk = process_enciphered(&fx3_enciphered_block(), false);
+    blk.truncate(0x04a1 + 5);
+    blk
+  };
+  let double = encipher(&encipher(&plain));
+
+  let ok = parse_tag9401(
+    &process_enciphered(&double, true),
+    Some("ILME-FX3"),
+    Some("ILME-FX3 v4.00"),
+  );
+  assert_eq!(
+    find(&ok, "ISOSetting"),
+    Some(&TagValue::Str("Unknown (255)".into()))
+  );
+  assert_eq!(find(&ok, "ISOAutoMin"), Some(&TagValue::Str("Auto".into())));
+
+  // A single pass deciphers Ver9401 to 199 (not 160), which selects no ISOInfo
+  // row — the ISO leaves are absent (NOT the recovered values).
+  let bad = parse_tag9401(
+    &process_enciphered(&double, false),
+    Some("ILME-FX3"),
+    Some("ILME-FX3 v4.00"),
+  );
+  assert!(
+    find(&bad, "ISOSetting").is_none(),
+    "single decipher of a double-enciphered 0x9401 block must NOT recover ISOInfo"
+  );
 }
