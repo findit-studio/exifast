@@ -273,16 +273,11 @@ const NOT_ACTIVE: &[&str] = &[
   // / Processing / MeasuredColor / CustomFunctions5D are ported byte-exact, see
   // `conformance.rs::canon_cr2_real_conformance` + its `FIXTURE_EXCLUDED_KEYS`.)
   //
-  // `Canon_EOS-7D_sRAW_real.CR2` — the SECOND real-device CR2. This chunk ported
-  // the SHARED infra it needs (the count-797→`ColorData4`/`ColorCoefs` variant +
-  // `AFMicroAdj` 0x4013), but the 7D needs several MORE Canon sub-tables not yet
-  // ported: `CameraInfo7D` (0x0d — a firmware-dependent `Hook`/`varSize` offset
-  // shift, `Canon.pm:4347-4402`), `CustomFunctions2` (0x99 → `ProcessCanonCustom2`,
-  // the grouped/27-tag variant), `TimeInfo` (0x35), `CropInfo` (0x98),
-  // `AspectInfo` (0x9a), `VignettingCorr` (0x4015), `LightingOpt` (0x4018) and
-  // `LensInfo` (0x4019). Accept-deferred until those are ported (its goldens are
-  // committed so the next chunk can diff against them).
-  "Canon_EOS-7D_sRAW_real.CR2",
+  // (`Canon_EOS-7D_sRAW_real.CR2` is now ACTIVE — #445 ported the firmware-Hook
+  // `CameraInfo7D` + nested `PSInfo`, `CustomFunctions2` (`ProcessCanonCustom2`),
+  // `TimeInfo`/`CropInfo`/`AspectInfo`/`VignettingCorr`{,2}/`LightingOpt`/
+  // `LensInfo` byte-exact, see `conformance.rs::canon_eos_7d_conformance` + its
+  // `FIXTURE_EXCLUDED_KEYS`.)
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a
@@ -566,6 +561,26 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
     "Canon_EOS-5D_real.CR2",
     &[
       "ExifTool:Warning",
+      "IFD3:CR2CFAPattern",
+      "IFD3:RawImageSegmentation",
+    ],
+  ),
+  // `Canon_EOS-7D_sRAW_real.CR2` — the EOS 7D deep Canon MakerNote sub-table
+  // activation (#445). The firmware-Hook `CameraInfo7D` (0x0d) + nested `PSInfo`,
+  // `CustomFunctions2` (0x99 → `ProcessCanonCustom2`), `TimeInfo`/`CropInfo`/
+  // `AspectInfo`/`VignettingCorr`{,2}/`LightingOpt`/`LensInfo` all emit
+  // byte-exact. The niche residuals dropped from BOTH sides: `XMP-xmp:Rating`
+  // (the TIFF-0x02bc XMP-packet routing, a cross-cutting XMP subsystem) and the
+  // four CR2-private SRaw/CFA IFD2/IFD3 leaves (`IFD2:SRawType`/`IFD3:SRawType`/
+  // `IFD3:CR2CFAPattern`/`IFD3:RawImageSegmentation`) the EXIF leaf-table port
+  // does not yet display. Mirrors `conformance.rs::canon_eos_7d_conformance`'s
+  // `EOS_7D_DEFERRED`.
+  (
+    "Canon_EOS-7D_sRAW_real.CR2",
+    &[
+      "XMP-xmp:Rating",
+      "IFD2:SRawType",
+      "IFD3:SRawType",
       "IFD3:CR2CFAPattern",
       "IFD3:RawImageSegmentation",
     ],
@@ -1711,10 +1726,20 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `ProcessCanonCustom`, grouped under `CanonCustom`), plus the `CRWParam`/`Flavor`
 /// (0x4002/0x4005 `Unknown`) suppression, with a `FIXTURE_EXCLUDED_KEYS` entry for
 /// the `ExifTool:Warning` (`OriginalDecisionData`/`ReadODD` subsystem) + the two
-/// CR2-private IFD3 leaves. (The sibling `Canon_EOS-7D_sRAW_real.CR2` was added to
-/// the both-goldens set but stays in `NOT_ACTIVE` — it needs `CameraInfo7D` +
-/// `CustomFunctions2` + several smaller sub-tables, deferred to the next chunk.)
-const EXPECTED_ACTIVE_FIXTURES: usize = 640;
+/// CR2-private IFD3 leaves.
+///
+/// 640 → 641: the `Canon_EOS-7D_sRAW_real.CR2` raw GRADUATES out of `NOT_ACTIVE`
+/// (#445) — the EOS 7D deep sub-table tower is ported byte-exact: the
+/// firmware-Hook `CameraInfo7D` (0x0d, `PRIORITY => 0`, with the `varSize` shift
+/// keyed off the 0x1a8/0x1ac `FirmwareVersionLookAhead`) + its nested `PSInfo`
+/// picture-style SubDirectory, `CustomFunctions2` (0x99 → `ProcessCanonCustom2`,
+/// the grouped-record walker, under `CanonCustom`), `TimeInfo` (0x35), `CropInfo`
+/// (0x98), `AspectInfo` (0x9a), `VignettingCorr` (0x4015) + `VignettingCorr2`
+/// (0x4016), `LightingOpt` (0x4018) and `LensInfo` (0x4019) — reusing the
+/// chunk-1 `ColorData4`/`AFMicroAdj` infra. A `FIXTURE_EXCLUDED_KEYS` entry
+/// drops the `XMP-xmp:Rating` (TIFF-0x02bc XMP routing) + the four CR2-private
+/// SRaw/CFA IFD2/IFD3 leaves.
+const EXPECTED_ACTIVE_FIXTURES: usize = 641;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

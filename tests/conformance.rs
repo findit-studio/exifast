@@ -10551,6 +10551,72 @@ fn canon_cr2_real_conformance() {
     "EOS 5D must NOT emit the Unknown CRWParam/Flavor leaves: {got}",
   );
 }
+
+/// Real-device Canon CR2 #2 — the EOS 7D deep Canon MakerNote sub-table
+/// activation (#445). `Canon_EOS-7D_sRAW_real.CR2` exercises the firmware-Hook
+/// `CameraInfo7D` (0x0d, `PRIORITY => 0`, with its nested `PSInfo` picture-style
+/// SubDirectory), `CustomFunctions2` (0x99 → `ProcessCanonCustom2`, the grouped
+/// record walker, into the `CanonCustom` family-1 group), `TimeInfo` (0x35),
+/// `CropInfo` (0x98), `AspectInfo` (0x9a), `VignettingCorr` (0x4015) +
+/// `VignettingCorr2` (0x4016), `LightingOpt` (0x4018) and `LensInfo` (0x4019).
+/// Byte-exact vs ExifTool 13.59 except for the documented niche residuals
+/// (separate cross-cutting subsystems, kept in sync with `FIXTURE_EXCLUDED_KEYS`
+/// in `tests/typed_serde_parity.rs`).
+#[test]
+fn canon_eos_7d_conformance() {
+  const EOS_7D_DEFERRED: &[&str] = &[
+    // `XMP-xmp:Rating` — the TIFF tag-0x02bc (`ApplicationNotes`) XMP packet
+    // routing (a cross-cutting XMP subsystem), niche-deferred like the Sony
+    // fixtures. NOT part of the Canon MakerNote sub-table port.
+    "XMP-xmp:Rating",
+    // The CR2-private SRaw / CFA-pattern IFD2/IFD3 leaves (0xc6c5 SRawType,
+    // 0xc5e1 CR2CFAPattern, 0xc640 RawImageSegmentation) — deferred EXIF
+    // leaf-table items (the same EXIF leaf-coverage class the EOS 5D defers),
+    // NOT the Canon MakerNote port.
+    "IFD2:SRawType",
+    "IFD3:SRawType",
+    "IFD3:CR2CFAPattern",
+    "IFD3:RawImageSegmentation",
+  ];
+  check_excluding(
+    "Canon_EOS-7D_sRAW_real.CR2",
+    "Canon_EOS-7D_sRAW_real.CR2.json",
+    true,
+    EOS_7D_DEFERRED,
+  );
+  check_excluding(
+    "Canon_EOS-7D_sRAW_real.CR2",
+    "Canon_EOS-7D_sRAW_real.CR2.n.json",
+    false,
+    EOS_7D_DEFERRED,
+  );
+
+  // Positively assert the firmware-Hook CameraInfo7D leaf (the lone
+  // non-colliding `Canon:ISO`), a nested PSInfo picture-style leaf, the six
+  // smaller sub-tables and a CustomFunctions2 leaf in its own family-1 group.
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/Canon_EOS-7D_sRAW_real.CR2"))
+    .expect("read Canon_EOS-7D_sRAW_real.CR2");
+  let got = extract_info("Canon_EOS-7D_sRAW_real.CR2", &data, true);
+  for needle in [
+    "\"Canon:ISO\":1234",                                        // CameraInfo7D 0x06
+    "\"Canon:FirmwareVersion\":\"2.0.3\"",                       // CameraInfo7D 0x1ac
+    "\"Canon:FileIndex\":5334",                                  // CameraInfo7D 0x1eb (+1)
+    "\"Canon:CameraPictureStyle\":\"User Defined 3\"",           // CameraInfo7D 0xaf
+    "\"Canon:SaturationLandscape\":4",                           // nested PSInfo
+    "\"Canon:UserDef3PictureStyle\":\"Standard\"",               // nested PSInfo (0x81)
+    "\"Canon:TimeZoneCity\":\"Paris\"",                          // TimeInfo 0x35
+    "\"Canon:AspectRatio\":\"Unknown (256)\"",                   // AspectInfo 0x9a
+    "\"Canon:OriginalImageWidth\":5184",                         // VignettingCorr 0x4015
+    "\"Canon:PeripheralLightingSetting\":\"Off\"",               // VignettingCorr2 0x4016
+    "\"Canon:AutoLightingOptimizer\":\"Off\"",                   // LightingOpt 0x4018
+    "\"Canon:LensSerialNumber\":\"00001469a3\"",                 // LensInfo 0x4019
+    "\"CanonCustom:AFMicroadjustment\":\"Disable; 0; 0; 0; 0\"", // CustomFunctions2
+    "\"CanonCustom:SelectAFAreaSelectMode\":\"Enable; Flags 0x1f\"",
+  ] {
+    assert!(got.contains(needle), "EOS 7D must emit {needle}: {got}",);
+  }
+}
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
             `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \

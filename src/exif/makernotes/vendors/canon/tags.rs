@@ -276,6 +276,18 @@ impl SubTable {
         | SubTable::ColorData
         | SubTable::AfMicroAdj
         | SubTable::CustomFunctions
+        // The EOS 7D image-info sub-tables (#445): TimeInfo (0x35) / CropInfo
+        // (0x98) / CustomFunctions2 (0x99) / AspectInfo (0x9a) / VignettingCorr
+        // (0x4015) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) / LensInfo
+        // (0x4019).
+        | SubTable::TimeInfo
+        | SubTable::CropInfo
+        | SubTable::CustomFunctions2
+        | SubTable::AspectInfo
+        | SubTable::VignettingCorr
+        | SubTable::VignettingCorr2
+        | SubTable::LightingOpt
+        | SubTable::LensInfo
     )
   }
 
@@ -341,6 +353,9 @@ impl SubTable {
         | (SubTable::CameraInfo, _)
         // `%Canon::Processing` tag 2 `Sharpness` is `Priority => 0` (`Canon.pm:7220`).
         | (SubTable::Processing, "Sharpness")
+        // `%Canon::LensInfo` (0x4019) `LensSerialNumber` is `Priority => 0`
+        // (`Canon.pm:9143`).
+        | (SubTable::LensInfo, "LensSerialNumber")
     );
     u8::from(!priority_zero)
   }
@@ -1229,7 +1244,9 @@ mod tests {
       (0x0au16, "UnknownD30", SubTable::UnknownD30),
       // (0x0f CustomFunctions is now WALKED — see `custom_functions_5d_is_walked`.)
       (0x2f, "FaceDetect3", SubTable::FaceDetect3),
-      (0x35, "TimeInfo", SubTable::TimeInfo),
+      // (0x35 TimeInfo / 0x98 CropInfo / 0x99 CustomFunctions2 / 0x9a AspectInfo
+      // / 0x4015 VignettingCorr / 0x4016 VignettingCorr2 / 0x4018 LightingOpt /
+      // 0x4019 LensInfo are now WALKED — the #445 EOS 7D sub-tables.)
       (0x90, "CustomFunctions1D", SubTable::CustomFunctions1D),
       (0x91, "PersonalFunctions", SubTable::PersonalFunctions),
       (
@@ -1241,9 +1258,6 @@ mod tests {
       (0xb1, "ModifiedInfo", SubTable::ModifiedInfo),
       (0xb6, "PreviewImageInfo", SubTable::PreviewImageInfo),
       (0x4003, "ColorInfo", SubTable::ColorInfo),
-      (0x4015, "VignettingCorr", SubTable::VignettingCorr),
-      (0x4016, "VignettingCorr2", SubTable::VignettingCorr2),
-      (0x4018, "LightingOpt", SubTable::LightingOpt),
       (0x4020, "AmbienceInfo", SubTable::AmbienceInfo),
       (0x4021, "MultiExp", SubTable::MultiExp),
       (0x4024, "FilterInfo", SubTable::FilterInfo),
@@ -1286,9 +1300,18 @@ mod tests {
     assert!(SubTable::ColorData.is_walked());
     assert!(SubTable::AfMicroAdj.is_walked());
     assert!(SubTable::CustomFunctions.is_walked());
+    // The EOS 7D image-info sub-tables (#445) are now walked too.
+    assert!(SubTable::TimeInfo.is_walked());
+    assert!(SubTable::CropInfo.is_walked());
+    assert!(SubTable::CustomFunctions2.is_walked());
+    assert!(SubTable::AspectInfo.is_walked());
+    assert!(SubTable::VignettingCorr.is_walked());
+    assert!(SubTable::VignettingCorr2.is_walked());
+    assert!(SubTable::LightingOpt.is_walked());
+    assert!(SubTable::LensInfo.is_walked());
     // Still-deferred sub-tables remain raw.
     assert!(!SubTable::Panorama.is_walked());
     assert!(!SubTable::MyColors.is_walked());
-    assert!(!SubTable::CustomFunctions2.is_walked());
+    assert!(!SubTable::AmbienceInfo.is_walked());
   }
 }
