@@ -418,7 +418,20 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // `-n` 137 → 213. The intended cost of the newly-built video composites (the
     // `Composite:GPSPosition` is the unported timed-GPS deferral), NOT a redundant
     // clone. Ceilings raised to (210, 230).
-    "QuickTime_frea_rexing17b.mov" => (210, 230), // measured (195, 213) — #133 PR 5 video composites
+    //
+    // RE-BASELINED (composite-def scratch drift): the `BuildCompositeTags`
+    // fixpoint evaluates more `Composite` defs per pass than at the (195, 213)
+    // baseline (the post-`#133` def additions — e.g. the `Flash`/`LensID`/
+    // `DateTimeCreated` set that also re-baselined `MakerNotes_Apple` above),
+    // over BOTH views. None of the added defs builds for this dashcam — the
+    // golden still emits only `Composite:AvgBitrate`, and `FocalLength35efl`/
+    // `FocusDistance` never fire (no `FocalLength`, no Sony `FocusInfo`), so the
+    // now-zero-heap `whole_f64_to_tag_value` is not on this path — but each
+    // evaluated def still allocates its per-def `$val[]`/`$prt[]` scratch pair,
+    // so `-j` 195 → 217 and `-n` 213 → 234. Documented engine-overhead scratch
+    // (a future perf PR could reuse the scratch Vecs), NOT a redundant clone /
+    // double decode. Ceilings raised to (232, 250).
+    "QuickTime_frea_rexing17b.mov" => (232, 250), // measured (217, 234) — +composite-def scratch
     "Real.ra" => (100, 100),                      // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }
