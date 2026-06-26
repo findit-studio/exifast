@@ -71,10 +71,13 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod amount_lens_types;
+pub mod decipher;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
 pub mod sr2;
+pub mod tag9050;
+pub mod tag9400;
 pub mod tags;
 
 use crate::value::TagValue;
@@ -415,6 +418,39 @@ fn first_u32(raw: &RawValue) -> Option<u32> {
       .and_then(|n| if n >= 0 { u32::try_from(n).ok() } else { None }),
     _ => None,
   }
+}
+
+/// `%releaseMode2` PrintConv hash (`Sony.pm:6195-6226`) — shared by the
+/// `Tag9050x`/`Tag9400x`/`Tag2010x` `ReleaseMode2` rows. `None` for an
+/// unmapped value (ExifTool then prints the raw integer).
+#[must_use]
+pub(crate) fn release_mode2_print(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "Normal",
+    1 => "Continuous",
+    2 => "Continuous - Exposure Bracketing",
+    3 => "DRO or White Balance Bracketing",
+    5 => "Continuous - Burst",
+    6 => "Single Frame - Capture During Movie",
+    7 => "Continuous - Sweep Panorama",
+    8 => "Continuous - Anti-Motion Blur, Hand-held Twilight",
+    9 => "Continuous - HDR",
+    10 => "Continuous - Background defocus",
+    13 => "Continuous - 3D Sweep Panorama",
+    15 => "Continuous - High Resolution Sweep Panorama",
+    16 => "Continuous - 3D Image",
+    17 => "Continuous - Burst 2",
+    18 => "Normal - iAuto+",
+    19 => "Continuous - Speed/Advance Priority",
+    20 => "Continuous - Multi Frame NR",
+    23 => "Single-frame - Exposure Bracketing",
+    26 => "Continuous Low",
+    27 => "Continuous - High Sensitivity",
+    28 => "Smile Shutter",
+    29 => "Continuous - Tele-zoom Advance Priority",
+    146 => "Single Frame - Movie Capture",
+    _ => return None,
+  })
 }
 
 /// 0x201c's `AFAreaILCE`/`AFAreaILCA` DataMember side-effect

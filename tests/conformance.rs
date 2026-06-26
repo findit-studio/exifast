@@ -10192,7 +10192,6 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "Sony:BatteryLevel",
     "Sony:BatteryTemperature",
     "Sony:CameraE-mountVersion",
-    "Sony:CameraOrientation",
     "Sony:ChromaticAberrationCorrParams",
     "Sony:CreativeStyle",
     "Sony:DistortionCorrParams",
@@ -10200,14 +10199,12 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "Sony:ExposureStandardAdjustment",
     "Sony:ExposureTime",
     "Sony:FlashExposureComp",
-    "Sony:FlashStatus",
     "Sony:FocalLength",
     "Sony:FocalPlaneAFPointsUsed",
     "Sony:FocusPosition2",
     "Sony:ISOAutoMax",
     "Sony:ISOAutoMin",
     "Sony:ISOSetting",
-    "Sony:InternalSerialNumber",
     "Sony:LensE-mountVersion",
     "Sony:LensFirmwareVersion",
     "Sony:LensFormat",
@@ -10218,17 +10215,7 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "Sony:MaxFocalLength",
     "Sony:MinFocalLength",
     "Sony:PictureProfile",
-    "Sony:Quality2",
-    "Sony:ReleaseMode2",
-    "Sony:SequenceFileNumber",
-    "Sony:SequenceImageNumber",
-    "Sony:SequenceLength",
-    "Sony:Shutter",
-    "Sony:ShutterCount",
-    "Sony:ShutterCount2",
-    "Sony:SonyExposureTime",
     "Sony:SonyExposureTime2",
-    "Sony:SonyFNumber",
     "Sony:SonyFNumber2",
     "Sony:SonyISO",
     "Sony:SonyMaxApertureValue",
@@ -10389,10 +10376,30 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     "\"SR2DataIFD:ColorMode\":\"Standard\"",
     "\"SR2DataIFD9:ColorMode\":\"Sepia\"",
     "\"SubIFD:Compression\":\"Sony ARW Compressed\"",
+    // The Tag9050c decipher + ProcessBinaryData (the `0x9050` enciphered block):
+    // Shutter / FlashStatus / ShutterCount(2) / SonyExposureTime / SonyFNumber /
+    // ReleaseMode2 / InternalSerialNumber.
+    "\"Sony:Shutter\":\"Mechanical (2738 5168 6484)\"",
+    "\"Sony:FlashStatus\":\"No Flash present\"",
+    "\"Sony:ShutterCount\":2",
+    "\"Sony:ShutterCount2\":2",
+    "\"Sony:SonyExposureTime\":\"1/128\"",
+    "\"Sony:SonyFNumber\":2.9",
+    "\"Sony:InternalSerialNumber\":\"47ff0000a708\"",
+    // The Tag9400c decipher + ProcessBinaryData (the `0x9400` enciphered block):
+    // ReleaseMode2 (last-wins from Tag9050c) / SequenceImageNumber /
+    // SequenceFileNumber / SequenceLength (the 0x001e "N files" form) /
+    // CameraOrientation / Quality2 (the modern HEIF-aware variant).
+    "\"Sony:ReleaseMode2\":\"Normal\"",
+    "\"Sony:SequenceImageNumber\":1",
+    "\"Sony:SequenceFileNumber\":1",
+    "\"Sony:SequenceLength\":\"1 file\"",
+    "\"Sony:CameraOrientation\":\"Horizontal (normal)\"",
+    "\"Sony:Quality2\":\"RAW\"",
   ] {
     assert!(
       got.contains(needle),
-      "SR2/SubIFD foundation must emit {needle}: {got}",
+      "SR2/SubIFD + Tag9050c/Tag9400c foundation must emit {needle}: {got}",
     );
   }
 }

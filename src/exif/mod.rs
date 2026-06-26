@@ -12094,9 +12094,84 @@ pub(in crate::exif) fn sony_makernote_isolated(
           &mut sink,
         );
       }
+      // The enciphered `Tag9050x`/`Tag9400x` `ProcessBinaryData` sub-blocks
+      // (`emit_sony_value` skips them as deferred SubDirectory rows). They are
+      // decoded HERE — in walk order, so a leaf name shared with a later
+      // sub-block (e.g. `ReleaseMode2`, also in `Tag9050c`) is overridden
+      // last-wins by the sink, byte-identical to ExifTool's `ProcessMOV`-walk
+      // emission order. The on-disk (enciphered) value bytes are the verbatim
+      // span `data[value_offset .. value_offset + value_size]` (the same
+      // `$valuePtr`/`$size` ExifTool's `ProcessEnciphered` reads); a hostile
+      // span is bounds-checked by `get`, so an out-of-range entry decodes
+      // nothing rather than panicking.
+      sony_emit_enciphered_subblock(data, g1, entry, model, print_conv, &mut sink);
     }
   }
   Some((emissions, typed))
+}
+
+/// Decode an enciphered Sony `0x9050`/`0x9400` `ProcessBinaryData` sub-block and
+/// emit its ported leaves into `sink`.
+///
+/// `entry` is the Sony Main-IFD `0x9050`/`0x9400` SubDirectory row; its verbatim
+/// on-disk (still-enciphered) value bytes are
+/// `data[value_offset .. value_offset + value_size]`. The variant is selected
+/// faithfully: `Tag9050c` BY MODEL (`Sony.pm:1810`), `Tag9400c` BY THE
+/// ENCIPHERED FIRST BYTE (`Sony.pm:1856`). A non-`c` variant (older bodies) is
+/// not ported here, so it emits nothing — its leaves stay deferred. The leaves
+/// ride the Sony vendor family-1 group; none are `Unknown => 1`.
+fn sony_emit_enciphered_subblock<S: ExifSink>(
+  data: &[u8],
+  group1: &str,
+  entry: &ExifEntry,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut S,
+) {
+  use makernotes::vendors::sony::{tag9050, tag9400};
+  // The verbatim on-disk value span (the enciphered cipher block) — the same
+  // buffer the walk read, sliced at the entry's resolved `$valuePtr`/`$size`.
+  let off = entry.value_offset();
+  let Some(end) = off.checked_add(entry.value_size()) else {
+    return;
+  };
+  let Some(raw) = data.get(off..end) else {
+    return;
+  };
+  match entry.tag_id() {
+    // `Tag9050c` — selected by model (`Sony.pm:1810`).
+    0x9050 if sony_tag9050c_model(model) => {
+      for emi in tag9050::parse_tag9050c(raw, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9400c` — selected by the enciphered first byte (`Sony.pm:1856`).
+    0x9400 if tag9400::selects_tag9400c(raw) => {
+      for emi in tag9400::parse_tag9400c(raw, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    _ => {}
+  }
+}
+
+/// `Tag9050c` model `Condition` (`Sony.pm:1810`):
+/// `$$self{Model} =~ /^(ILCE-(1\b|7M4|7RM5|7SM3)|ILME-FX3)/`.
+fn sony_tag9050c_model(model: Option<&str>) -> bool {
+  let Some(m) = model else { return false };
+  // `ILCE-1\b` — `ILCE-1` then a word boundary (so NOT `ILCE-1M2`/`ILCE-10…`).
+  if let Some(rest) = m.strip_prefix("ILCE-1")
+    && rest
+      .chars()
+      .next()
+      .is_none_or(|c| !c.is_ascii_alphanumeric())
+  {
+    return true;
+  }
+  m.starts_with("ILCE-7M4")
+    || m.starts_with("ILCE-7RM5")
+    || m.starts_with("ILCE-7SM3")
+    || m.starts_with("ILME-FX3")
 }
 
 /// Walk the Panasonic `%Panasonic::Main` IFD in a FRESH, ISOLATED [`Walker`] over
