@@ -231,6 +231,32 @@ const NOT_ACTIVE: &[&str] = &[
   // ACTIVE: #393 ported their MakerNote variants byte-exact, so they moved out of
   // NOT_ACTIVE into the active set with per-fixture FIXTURE_EXCLUDED_KEYS for the
   // non-MakerNote residuals.)
+  // The three real Sony ARW raws (FX3 / SLT-A33 / DSLR-A200) carry paired
+  // `.json`/`.n.json` goldens but are accept-deferred from the byte-exact set:
+  // their core EXIF/SubIFD + the ENTIRE SR2 subsystem (the `DNGPrivateData`
+  // 0xc634 → `%Sony::SR2Private` descent, the `Decrypt` LFSR, and the decrypted
+  // `%Sony::SR2SubIFD` + `%Sony::SR2DataIFD` walks — `SR2:*`/`SR2SubIFD:*`/
+  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are the
+  // Sony ARW `SubIFD:*` raw tags (`SonyRawFileType`/`SonyToneCurve`/
+  // Vignetting/Distortion/ChromaticAberration/CropTopLeft/CropSize/CFA/
+  // BlackLevel/WhiteLevel/WB_RGGBLevels), the `Compression => 'Sony ARW
+  // Compressed'` (32767), the IFD2 `JpgFromRawStart`/`Length`/`JpgFromRaw` +
+  // `YCbCrSubSampling`, and the IFD0/IFD2 `IsImageData` PreviewImage/JpgFromRaw
+  // placeholders. The RESIDUAL is the `%Sony::Main` ENCRYPTED sub-table tower —
+  // the `Decipher` substitution cipher + the model-version-dispatched
+  // ProcessBinaryData tables (`Tag9050x`/`Tag9400x`/`Tag9402`/`Tag9403`/
+  // `Tag9406`/`Tag940c`/`Sony_0x9416`/`CameraSettings*`/`CameraInfo*`/`AFInfo`/
+  // `ExtraInfo*`/`MoreInfo`) — which emit the ~45 (FX3) / ~101 (A33) / ~72
+  // (A200) remaining `Sony:*` exposure/AF/lens leaves and the 5 `Composite:*`
+  // (LensID/FocalLength35efl/BlueBalance/RedBalance/CFAPattern) that depend on
+  // them; A200 ADDITIONALLY needs the `%MinoltaRaw::Main` MRW port (22
+  // `MinoltaRaw:*`, which also overrides its `Composite:ImageSize`/`Megapixels`).
+  // That sub-table tower is a separate faithful campaign (it must port the
+  // Decipher cipher + each ~100-offset conditional table 1:1); the SR2/SubIFD/
+  // conversion foundation landed here is its prerequisite.
+  "Sony_ILME-FX3_real.ARW",
+  "Sony_SLT-A33_real.ARW",
+  "Sony_DSLR-A200_real.ARW",
 ];
 
 /// ACTIVE fixtures that emit a tag whose VALUE diverges from bundled because a

@@ -74,6 +74,7 @@ pub mod amount_lens_types;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
+pub mod sr2;
 pub mod tags;
 
 use crate::value::TagValue;

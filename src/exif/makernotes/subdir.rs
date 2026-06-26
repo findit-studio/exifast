@@ -75,6 +75,17 @@ pub enum TableRef {
   /// Walked under `ByteOrder => Unknown` with the family-1 group `PreviewIFD`
   /// (applied by the Samsung capture, not the walker).
   NikonPreviewIfd,
+  /// `%Sony::SR2Private` (`Sony.pm:10448`) — the encrypted private IFD's
+  /// data-member leaves (`SR2SubIFDOffset`/`Length`/`Key`), reached via the IFD0
+  /// `DNGPrivateData` 0xc634 pointer on an ARW/SR2. A SIBLING of [`Sony`](Self::Sony)
+  /// because its tag IDs (0x72xx) are disjoint from `%Sony::Main` and resolve
+  /// against [`crate::exif::makernotes::vendors::sony::sr2`].
+  SonySr2Private,
+  /// `%Sony::SR2SubIFD` (`Sony.pm:10515`) — the tags in the DECRYPTED SR2SubIFD
+  /// block (WB levels, BlackLevel, ColorMatrix, the correction-param arrays).
+  SonySr2SubIfd,
+  /// `%Sony::SR2DataIFD` (`Sony.pm:10576`) — `ColorMode` (the 0x74c0 SubIFD).
+  SonySr2DataIfd,
   /// One of `%Panasonic::Leica2`..`Leica9` — the Leica MakerNote variant
   /// tables (`Panasonic.pm:1604-2256`). The payload selects which of the SIX
   /// distinct tables (Leica7 reuses `%Leica6`, Leica8 reuses `%Leica5`); the

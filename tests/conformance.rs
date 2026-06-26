@@ -10160,6 +10160,242 @@ fn arw_preview_image_conformance() {
     );
   }
 }
+
+/// The real Sony ARW raws (FX3 / SLT-A33) — the SR2 subsystem + the Sony ARW
+/// `SubIFD:*` raw tags + the standalone conversions (Compression 32767, the IFD2
+/// `JpgFromRaw*`/`YCbCrSubSampling`, the `IsImageData` placeholders) are
+/// byte-exact in BOTH `-j` and `-n`. The `%Sony::Main` ENCRYPTED sub-table tower
+/// (the `Decipher` cipher + the model-version ProcessBinaryData tables) is a
+/// separate deferred port, so its `Sony:*` exposure/AF/lens leaves and the
+/// dependent `Composite:*` are dropped from BOTH sides here (the SAME keys the
+/// `NOT_ACTIVE` deferral in `tests/typed_serde_parity.rs` documents). This test
+/// LOCKS the SR2/SubIFD/conversion foundation byte-exact as a regression guard;
+/// when the sub-table tower lands, the exclusions shrink and the fixtures move
+/// into the active byte-exact set.
+#[test]
+fn sony_arw_real_sr2_and_subifd_conformance() {
+  // The deferred `%Sony::Main` sub-table leaves (+ extra/divergent Sony Main
+  // leaves whose final value comes from those sub-tables' DataMembers) and the
+  // `Composite:*` that `Require`/`Desire` them. FX3 (newer body: the `Tag9xxx`
+  // encrypted series + `Tag202a`).
+  const FX3_DEFERRED: &[&str] = &[
+    "Composite:BlueBalance",
+    "Composite:CFAPattern",
+    "Composite:FocalLength35efl",
+    "Composite:FocusDistance2",
+    "Composite:LensID",
+    "Composite:RedBalance",
+    "Composite:ScaleFactor35efl",
+    "Sony:AFAreaMode",
+    "Sony:APS-CSizeCapture",
+    "Sony:AmbientTemperature",
+    "Sony:BatteryLevel",
+    "Sony:BatteryTemperature",
+    "Sony:CameraE-mountVersion",
+    "Sony:CameraOrientation",
+    "Sony:ChromaticAberrationCorrParams",
+    "Sony:CreativeStyle",
+    "Sony:DistortionCorrParams",
+    "Sony:ExposureProgram",
+    "Sony:ExposureStandardAdjustment",
+    "Sony:ExposureTime",
+    "Sony:FlashExposureComp",
+    "Sony:FlashStatus",
+    "Sony:FocalLength",
+    "Sony:FocalPlaneAFPointsUsed",
+    "Sony:FocusPosition2",
+    "Sony:ISOAutoMax",
+    "Sony:ISOAutoMin",
+    "Sony:ISOSetting",
+    "Sony:InternalSerialNumber",
+    "Sony:LensE-mountVersion",
+    "Sony:LensFirmwareVersion",
+    "Sony:LensFormat",
+    "Sony:LensMount",
+    "Sony:LensMount2",
+    "Sony:LensType2",
+    "Sony:LensType3",
+    "Sony:MaxFocalLength",
+    "Sony:MinFocalLength",
+    "Sony:PictureProfile",
+    "Sony:Quality2",
+    "Sony:ReleaseMode2",
+    "Sony:SequenceFileNumber",
+    "Sony:SequenceImageNumber",
+    "Sony:SequenceLength",
+    "Sony:Shutter",
+    "Sony:ShutterCount",
+    "Sony:ShutterCount2",
+    "Sony:SonyExposureTime",
+    "Sony:SonyExposureTime2",
+    "Sony:SonyFNumber",
+    "Sony:SonyFNumber2",
+    "Sony:SonyISO",
+    "Sony:SonyMaxApertureValue",
+    "Sony:StopsAboveBaseISO",
+    "Sony:VignettingCorrParams",
+    "Sony:WhiteBalance",
+    // `XMP-xmp:Rating` — the embedded XMP packet (a separate deferred parse for
+    // this raw; the Sony-main port is the activation blocker, not this leaf).
+    "XMP-xmp:Rating",
+  ];
+  // A33 (older SLT body: `CameraInfo3`/`AFInfo`(AFStatus grid)/`CameraSettings3`/
+  // `ExtraInfo3`/`MoreInfo`/`Tag900b`).
+  const A33_DEFERRED: &[&str] = &[
+    "Composite:BlueBalance",
+    "Composite:CFAPattern",
+    "Composite:FocalLength35efl",
+    "Composite:FocusDistance2",
+    "Composite:LensID",
+    "Composite:RedBalance",
+    "Sony:AELock",
+    "Sony:AFAreaMode",
+    "Sony:AFButtonPressed",
+    "Sony:AFPoint",
+    "Sony:AFPointSelected",
+    "Sony:AFStatusActiveSensor",
+    "Sony:AFStatusBottomHorizontal",
+    "Sony:AFStatusBottomVertical",
+    "Sony:AFStatusCenterHorizontal",
+    "Sony:AFStatusCenterVertical",
+    "Sony:AFStatusFarLeft",
+    "Sony:AFStatusFarRight",
+    "Sony:AFStatusLeft",
+    "Sony:AFStatusLower-left",
+    "Sony:AFStatusLower-middle",
+    "Sony:AFStatusLower-right",
+    "Sony:AFStatusNearLeft",
+    "Sony:AFStatusNearRight",
+    "Sony:AFStatusRight",
+    "Sony:AFStatusTopHorizontal",
+    "Sony:AFStatusTopVertical",
+    "Sony:AFStatusUpper-left",
+    "Sony:AFStatusUpper-middle",
+    "Sony:AFStatusUpper-right",
+    "Sony:ApertureSetting",
+    "Sony:AspectRatio",
+    "Sony:BatteryLevel",
+    "Sony:BatteryState",
+    "Sony:BatteryTemperature",
+    "Sony:BatteryVoltage1",
+    "Sony:BatteryVoltage2",
+    "Sony:CameraOrientation",
+    "Sony:ColorCompensationFilterSet",
+    "Sony:ColorSpace",
+    "Sony:ColorTemperatureSetting",
+    "Sony:ContrastSetting",
+    "Sony:CreativeStyleSetting",
+    "Sony:CustomWB_RBLevels",
+    "Sony:CustomWB_RGBLevels",
+    "Sony:DriveMode",
+    "Sony:DriveMode2",
+    "Sony:DriveModeSetting",
+    "Sony:DynamicRangeOptimizerLevel",
+    "Sony:DynamicRangeOptimizerSetting",
+    "Sony:ExposureCompensation2",
+    "Sony:ExposureCompensationSet",
+    "Sony:ExposureProgram",
+    "Sony:ExposureTime",
+    "Sony:FNumber",
+    "Sony:FaceDetection",
+    "Sony:FacesDetected",
+    "Sony:FlashAction",
+    "Sony:FlashActionExternal",
+    "Sony:FlashControl",
+    "Sony:FlashExposureComp",
+    "Sony:FlashExposureCompSet",
+    "Sony:FlashExposureCompSet2",
+    "Sony:FlashMode",
+    "Sony:FlashStatus",
+    "Sony:FlashStatusBuilt-in",
+    "Sony:FlashStatusExternal",
+    "Sony:FocalLength",
+    "Sony:FocalLength2",
+    "Sony:FocalLengthTeleZoom",
+    "Sony:FocusMode",
+    "Sony:FocusMode2",
+    "Sony:FocusModeSetting",
+    "Sony:FocusPosition2",
+    "Sony:FocusStatus",
+    "Sony:FolderNumber",
+    "Sony:HDRLevel",
+    "Sony:HDRSetting",
+    "Sony:ISO",
+    "Sony:ISOSetting",
+    "Sony:ImageCount",
+    "Sony:ImageNumber",
+    "Sony:LensMount",
+    "Sony:LiveViewAFMethod",
+    "Sony:LiveViewAFSetting",
+    "Sony:LiveViewFocusMode",
+    "Sony:LiveViewMetering",
+    "Sony:MeteringMode",
+    "Sony:MultiFrameNoiseReduction",
+    "Sony:Orientation2",
+    "Sony:PanoramaSize3D",
+    "Sony:RedEyeReduction",
+    "Sony:SaturationSetting",
+    "Sony:SequenceNumber",
+    "Sony:SharpnessSetting",
+    "Sony:ShotNumberSincePowerUp",
+    "Sony:ShotNumberSincePowerUp2",
+    "Sony:ShutterCount",
+    "Sony:ShutterSpeedSetting",
+    "Sony:SmileShutter",
+    "Sony:SmileShutterMode",
+    "Sony:SonyImageSize",
+    "Sony:SweepPanoramaDirection",
+    "Sony:SweepPanoramaSize",
+    "Sony:TiffMeteringImage",
+    "Sony:ViewingMode",
+    "Sony:ViewingMode2",
+    "Sony:WhiteBalanceSetting",
+  ];
+  check_excluding(
+    "Sony_ILME-FX3_real.ARW",
+    "Sony_ILME-FX3_real.ARW.json",
+    true,
+    FX3_DEFERRED,
+  );
+  check_excluding(
+    "Sony_ILME-FX3_real.ARW",
+    "Sony_ILME-FX3_real.ARW.n.json",
+    false,
+    FX3_DEFERRED,
+  );
+  check_excluding(
+    "Sony_SLT-A33_real.ARW",
+    "Sony_SLT-A33_real.ARW.json",
+    true,
+    A33_DEFERRED,
+  );
+  check_excluding(
+    "Sony_SLT-A33_real.ARW",
+    "Sony_SLT-A33_real.ARW.n.json",
+    false,
+    A33_DEFERRED,
+  );
+
+  // Positively assert the SR2 subsystem actually fired (the decrypt + nested
+  // IFD walk), not just that the residual was excluded: the decrypted SR2SubIFD
+  // WB levels + the SR2DataIFD ColorMode + the SR2SubIFDKey hex render.
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/Sony_ILME-FX3_real.ARW"))
+    .expect("read Sony_ILME-FX3_real.ARW");
+  let got = extract_info("Sony_ILME-FX3_real.ARW", &data, true);
+  for needle in [
+    "\"SR2:SR2SubIFDKey\":\"0x44332211\"",
+    "\"SR2SubIFD:WB_RGGBLevels\":\"2501 1024 1024 1486\"",
+    "\"SR2DataIFD:ColorMode\":\"Standard\"",
+    "\"SR2DataIFD9:ColorMode\":\"Sepia\"",
+    "\"SubIFD:Compression\":\"Sony ARW Compressed\"",
+  ] {
+    assert!(
+      got.contains(needle),
+      "SR2/SubIFD foundation must emit {needle}: {got}",
+    );
+  }
+}
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
             `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \

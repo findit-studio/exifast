@@ -208,6 +208,22 @@ pub enum IfdKind {
   /// `JpgFromRawStart`/`JpgFromRawLength` arms of the `0x111`/`0x117` conditional
   /// tag lists (`Exif.pm:673-684`/`:769-778`, #331-P2).
   SubIfd(u32),
+  /// The Sony `SR2Private` directory — the encrypted private IFD reached via the
+  /// IFD0 `DNGPrivateData` 0xc634 pointer (`Sony.pm:10448`, `GROUPS => { 1 =>
+  /// 'SR2' }`). Family-1 group `"SR2"`; walked against `%Sony::SR2Private`.
+  Sr2Private,
+  /// The DECRYPTED `SR2SubIFD` directory (`Sony.pm:10515`, `SET_GROUP1 => 1` ⇒
+  /// the family-1 group is the directory name `"SR2SubIFD"`). Multiple SR2SubIFD
+  /// directories (one per `SR2SubIFDOffset` value) would suffix the number; the
+  /// activation bodies carry exactly one, so the payload is the directory number
+  /// (`0 → "SR2SubIFD"`, `1 → "SR2SubIFD1"`, …). Walked against `%Sony::SR2SubIFD`.
+  Sr2SubIfd(u32),
+  /// One `SR2DataIFD` directory reached via the `0x74c0` SubIFD pointer inside
+  /// `SR2SubIFD` (`Sony.pm:10545-10554`, `GROUPS => { 1 => 'SR2DataIFD' }`,
+  /// `SET_GROUP1 => 1`). The `$dirNum`-th is `"SR2DataIFD"`/`"SR2DataIFD1"`/… —
+  /// `0 → "SR2DataIFD"`, `1 → "SR2DataIFD1"`, … (`Exif.pm:7076`). Walked against
+  /// `%Sony::SR2DataIFD`.
+  Sr2DataIfd(u32),
 }
 
 /// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
@@ -467,6 +483,15 @@ impl IfdKind {
       // (`Exif.pm:7074-7076`): the classic-TIFF SubIFD tower's `$dirNum`-th
       // directory is `SubIFD`/`SubIFD1`/`SubIFD2`/…
       IfdKind::SubIfd(dir_num) => IfdName::sub_ifd(dir_num),
+      // `GROUPS => { 1 => 'SR2' }` (`Sony.pm:10451`).
+      IfdKind::Sr2Private => IfdName::literal("SR2"),
+      // `SET_GROUP1 => 1` ⇒ the family-1 group is the directory name, with the
+      // `$dirNum` suffix appended for the 2nd+ (`DirName "SR2SubIFD$num"`,
+      // `Sony.pm:11838`; `$num 0 → "SR2SubIFD"`).
+      IfdKind::Sr2SubIfd(dir_num) => IfdName::literal_suffixed("SR2SubIFD", dir_num),
+      // `GROUPS => { 1 => 'SR2DataIFD' }` + `SET_GROUP1 => 1` (`Sony.pm:10579`);
+      // the `0x74c0` pointer's `s/\d*$/$dirNum/ if $dirNum` numbers the 2nd+.
+      IfdKind::Sr2DataIfd(dir_num) => IfdName::literal_suffixed("SR2DataIFD", dir_num),
     }
   }
 
@@ -501,6 +526,11 @@ const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
     // pointer's SubDirectory carries no `TagTable` redirect, so `$newTagTable =
     // $tagTablePtr` (`Exif.pm:6943`).
     IfdKind::SubIfd(_) => TableRef::Exif,
+    // The Sony SR2 subsystem (`Sony.pm:10448-10586`) — each directory carries an
+    // explicit `TagTable` redirect.
+    IfdKind::Sr2Private => TableRef::SonySr2Private,
+    IfdKind::Sr2SubIfd(_) => TableRef::SonySr2SubIfd,
+    IfdKind::Sr2DataIfd(_) => TableRef::SonySr2DataIfd,
   }
 }
 
@@ -1186,6 +1216,11 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // do not flow through this default-group helper), but the mapping is declared
     // here for completeness with the other vendor tables.
     TableRef::NikonPreviewIfd => Some("PreviewIFD"),
+    // The Sony SR2 directories carry their family-1 group on the directory
+    // (`GROUPS => { 1 => 'SR2'/'SR2SubIFD'/'SR2DataIFD' }` + `SET_GROUP1 => 1`),
+    // so the group comes from the `IfdKind` (like a core IFD), NOT a vendor
+    // override — return `None` so `emit_entry` keeps the kind-derived group.
+    TableRef::SonySr2Private | TableRef::SonySr2SubIfd | TableRef::SonySr2DataIfd => None,
     TableRef::Exif | TableRef::Gps | TableRef::Interop => None,
   }
 }
@@ -5381,6 +5416,17 @@ impl Walker<'_, '_> {
       // `%Nikon::PreviewIFD` (#242) — the warning-form name resolves against the
       // PreviewIFD table (its renamed `PreviewImageStart`/`Length` leaves).
       TableRef::NikonPreviewIfd => tables::nikon_preview_ifd_lookup(tag_id).map(|t| t.name()),
+      // The Sony SR2 directories — the warning-form name resolves against the
+      // active SR2 table (`Sony.pm:10448-10586`).
+      TableRef::SonySr2Private => {
+        makernotes::vendors::sony::sr2::sr2_private_lookup(tag_id).map(|t| t.name())
+      }
+      TableRef::SonySr2SubIfd => {
+        makernotes::vendors::sony::sr2::sr2_subifd_lookup(tag_id).map(|t| t.name())
+      }
+      TableRef::SonySr2DataIfd => {
+        makernotes::vendors::sony::sr2::sr2_data_ifd_lookup(tag_id).map(|t| t.name())
+      }
       _ => tables::lookup(tag_id).map(|t| t.name()),
     }
   }
@@ -5884,6 +5930,47 @@ impl Walker<'_, '_> {
       return Step::Keep;
     }
 
+    // ---- Sony SR2Private (`0xc634 DNGPrivateData` on an ARW/SR2) ------------
+    // `%Exif::Main` 0xc634 is a CONDITIONAL tag list (`Exif.pm:3607-3710`): on a
+    // Sony ARW/SR2 (`$$self{TIFF_TYPE} =~ /^(ARW|SR2)$/`) its FIRST arm is the
+    // `SR2Private` SubDirectory (`Flags => 'SubIFD'`, `Start => '$val'`), NOT the
+    // default `DNGPrivateData` Binary leaf. `Start => '$val'` is the int32u value
+    // of the 4 value bytes (the verbose "int8u[4] read as int32u[1]" — `FixFormat
+    // int8u` is a write-side workaround; the Start uses the int32u reading). The
+    // pointed-to IFD is walked against `%Sony::SR2Private`, after which the SR2
+    // decrypt + SR2SubIFD/SR2DataIFD walk runs ([`process_sr2`]). This is
+    // core-Exif-IFD0-scoped (the same `%Exif::Main`-in-IFD0 gate the conditional
+    // tag list keys on); a non-ARW/SR2 file keeps the `DNGPrivateData` leaf
+    // (resolved below via `tables::lookup`). The pointer leaf itself is not
+    // emitted (`Step::Keep`).
+    if matches!(self.active_table, TableRef::Exif)
+      && matches!(kind, IfdKind::Ifd0)
+      && tag_id == 0xc634
+      && matches!(self.file_type.as_deref(), Some("ARW" | "SR2"))
+    {
+      // `$val` — the int32u Start. The 4 value bytes are at `value_offset` (an
+      // inline value, size 4). A short/unreadable value yields no descent.
+      if let Some(start) = get_u32(self.data, value_offset, self.order) {
+        self.process_sr2(start as usize);
+      }
+      return Step::Keep;
+    }
+
+    // ---- Sony SR2DataIFD (`0x74c0` SubIFD pointer inside SR2SubIFD) ---------
+    // `%Sony::SR2SubIFD` 0x74c0 is a `Flags => 'SubIFD'`, `Start => '$val'`,
+    // `MaxSubdirs => 20` pointer to one-or-more `%Sony::SR2DataIFD` directories
+    // (`Sony.pm:10545-10554`). Its value is a multi-offset list (`split ' '`),
+    // each a FILE-relative offset into the SAME decrypted SR2 block this walk is
+    // running over — so the buffer position is `off + value_offset_base` (the sub-
+    // walker's `value_offset_base == -(sr2Offset)`). The `$dirNum`-th directory is
+    // `SR2DataIFD`/`SR2DataIFD1`/… The pointer leaf itself is not emitted.
+    if self.active_table == TableRef::SonySr2SubIfd
+      && tag_id == makernotes::vendors::sony::sr2::SR2_DATA_IFD_POINTER
+    {
+      self.dispatch_sr2_data_ifd(value_offset, read_len, format, count);
+      return Step::Keep;
+    }
+
     // ---- Canon LIST / Format-override specials (`0x28` / `0x96`) ---------
     // `%Canon::Main` carries two leaf tags whose VALUE bytes are rewritten at
     // walk time — `Format => 'undef'` (0x28 ImageUniqueID) and the model-
@@ -6008,6 +6095,14 @@ impl Walker<'_, '_> {
       // `ExposureMode` int8u[4] row. The Walker resolves them off the active
       // Leica variant table exactly as Sony/Pentax/Samsung do.
       TableRef::Leica(v) => makernotes::vendors::leica::format_override(v, tag_id),
+      // `%Sony::SR2Private` (`Sony.pm:10448`) — `SR2SubIFDKey` (0x7221) carries
+      // `Format => 'int32u'` so its `undef[4]` on-disk value re-reads as one
+      // int32u (the decrypt key). SR2SubIFD/SR2DataIFD carry no read-side
+      // override (their on-disk formats already match).
+      TableRef::SonySr2Private => {
+        makernotes::vendors::sony::sr2::sr2_private_format_override(tag_id)
+      }
+      TableRef::SonySr2SubIfd | TableRef::SonySr2DataIfd => None,
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -7802,6 +7897,233 @@ impl Walker<'_, '_> {
     }
   }
 
+  /// `ProcessSR2` (`Sony.pm:11650-11864`) — walk the `SR2Private` directory at
+  /// `start` (its leaves emit under `SR2:*` and capture `SR2SubIFDOffset`/
+  /// `SR2SubIFDLength`/`SR2SubIFDKey`), then DECRYPT the SR2SubIFD block and walk
+  /// it (`SR2SubIFD:*`) plus its `0x74c0 SR2DataIFD` children (`SR2DataIFD:*`).
+  ///
+  /// Faithful to the Perl flow: `ProcessExif` runs first on `%Sony::SR2Private`
+  /// (`Sony.pm:11806`), THEN — only if `$$et{SR2SubIFDOffset}` was set — the
+  /// block is read at `$offset + $base` for `$length` bytes, `Decrypt`ed with
+  /// `$key`, and walked as `%Sony::SR2SubIFD` directories (one per offset value,
+  /// `Sony.pm:11808-11859`). For a standalone ARW `$base == 0` (the TIFF block IS
+  /// the file). The decrypted block is a SEPARATE buffer whose byte 0 is file
+  /// offset `$offset`, so its out-of-line value pointers (which are file-relative)
+  /// resolve at `decrypted[V - offset]` — a fresh [`Walker`] over the decrypted
+  /// buffer with `value_offset_base = -(offset)` reproduces `DataPos => $offset`.
+  ///
+  /// MEMORY-SAFE: `offset`/`length` are range-checked against `self.data` before
+  /// the read; the decrypted-buffer walk is bounds-checked by `process_subdir`;
+  /// [`sr2::decrypt`] stops at the buffer end.
+  fn process_sr2(&mut self, start: usize) {
+    use makernotes::vendors::sony::sr2;
+    // 1) Walk the SR2Private IFD. Its leaves (`SR2SubIFDOffset`/`Length`/`Key`)
+    //    are appended to `self.entries`; record the pre-walk length so the
+    //    data-member capture scans ONLY the SR2Private leaves just added.
+    let before = self.entries.len();
+    self.process_subdir(
+      start,
+      IfdKind::Sr2Private,
+      TableRef::SonySr2Private,
+      ByteOrderRule::Fixed(self.order),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+    // 2) Capture the three data members from the SR2Private leaves (the
+    //    `RawConv => '$$self{SR2SubIFDxxx} = $val'` side effects, `Sony.pm:
+    //    10464/10471/10478`). `SR2SubIFDOffset` may be multi-valued (`split ' '`,
+    //    `Sony.pm:11810`); take the first for the primary SubIFD and keep the
+    //    rest for the SR2SubIFD1/2… siblings.
+    let mut offsets: std::vec::Vec<u64> = std::vec::Vec::new();
+    let mut length: Option<u64> = None;
+    let mut key: Option<u32> = None;
+    if let Some(new_entries) = self.entries.get(before..) {
+      for e in new_entries {
+        match e.tag_id {
+          0x7200 => {
+            if let RawValue::U64(v) = e.value.raw() {
+              offsets = v.clone();
+            } else if let Some(n) = first_uint(e.value.raw()) {
+              offsets = std::vec![n];
+            }
+          }
+          0x7201 => length = first_uint(e.value.raw()),
+          0x7221 => key = first_uint(e.value.raw()).and_then(|n| u32::try_from(n).ok()),
+          _ => {}
+        }
+      }
+    }
+    // `$offset and $length and defined $key` (`Sony.pm:11815`).
+    let (Some(&first_offset), Some(length), Some(key)) = (offsets.first(), length, key) else {
+      return;
+    };
+    let Ok(offset) = usize::try_from(first_offset) else {
+      return;
+    };
+    let Ok(length) = usize::try_from(length) else {
+      return;
+    };
+    if offset == 0 || length == 0 {
+      return;
+    }
+    // 3) Read the encrypted block at `offset + base` for `length` bytes
+    //    (`Sony.pm:11818-11822`; `base == self.base`). A short read ⇒ `Warn('Error
+    //    reading SR2 data')` + no walk (`Sony.pm:11862`) — but that warning fires
+    //    only when the offset is in range yet the buffer is short; an entirely
+    //    out-of-range offset simply has no readable block (no SR2 tags), which is
+    //    the faithful no-RAF/short-buffer outcome and emits nothing extra here.
+    let read_base = self.base as usize;
+    let Some(block_start) = offset.checked_add(read_base) else {
+      return;
+    };
+    let Some(block_end) = block_start.checked_add(length) else {
+      return;
+    };
+    let Some(block) = self.data.get(block_start..block_end) else {
+      return;
+    };
+    // Decrypt a COPY (the original TIFF bytes must stay intact for other walks).
+    let mut decrypted = block.to_vec();
+    sr2::decrypt(&mut decrypted, 0, length, key);
+    // 4) Walk the decrypted block as SR2SubIFD directories — one per offset value.
+    //    `DirName => "SR2SubIFD$num"` with `$num` running `'' , 2, 3, …` (the Perl
+    //    `$num = ($num || 1) + 1`, `Sony.pm:11838/11858`): the first directory is
+    //    `SR2SubIFD` (num 0 ⇒ no suffix), the 2nd `SR2SubIFD2`, the 3rd
+    //    `SR2SubIFD3`, … (there is no `SR2SubIFD1`). The decrypted buffer
+    //    represents file bytes `[offset, offset+length)`; an out-of-line value
+    //    pointer `V` (file-relative) lands at `decrypted[V - offset]`, so the sub-
+    //    walker carries `value_offset_base = -(offset)` and `base = 0`. The IFD
+    //    body itself starts at `decrypted[V0 - offset]` — for the primary offset
+    //    `V0 == offset` ⇒ buffer offset 0.
+    let voff_base = -(offset as i64);
+    let mut sub_entries: std::vec::Vec<ExifEntry> = std::vec::Vec::new();
+    let mut num: u32 = 0;
+    for &off in &offsets {
+      let Ok(off) = usize::try_from(off) else {
+        continue;
+      };
+      // `DirStart => $offset - $dPos` (`Sony.pm:11837`, `$dPos == offset` for the
+      // primary) — the IFD body's buffer position is `off - offset`. A 2nd+ offset
+      // before the primary (negative) is unreachable for real SR2 data; skip it.
+      let Some(dir_start) = off.checked_sub(offset) else {
+        continue;
+      };
+      let mut sub = self.spawn_sr2_subwalker(&decrypted, voff_base);
+      sub.process_subdir(
+        dir_start,
+        IfdKind::Sr2SubIfd(num),
+        TableRef::SonySr2SubIfd,
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
+      sub_entries.append(&mut sub.entries);
+      // `$num = ($num || 1) + 1` — 0 → 2, then 2 → 3, 3 → 4, …
+      num = if num == 0 { 2 } else { num + 1 };
+    }
+    // The decrypted-buffer walk is dropped here; its entries (owned names +
+    // values, no buffer borrow) move into the parent stream.
+    self.entries.append(&mut sub_entries);
+  }
+
+  /// Build a fresh [`Walker`] over the DECRYPTED SR2 block (a separate buffer),
+  /// for the SR2SubIFD/SR2DataIFD walk. `value_offset_base` is `-(offset)` so a
+  /// file-relative out-of-line value pointer resolves into the decrypted buffer;
+  /// `base = 0`. Side-effect channels (warnings / cycle guard / DataMembers) are
+  /// FRESH and discarded on return — the SR2 walk must not perturb the parent.
+  fn spawn_sr2_subwalker<'b, 'sg>(
+    &self,
+    decrypted: &'b [u8],
+    value_offset_base: i64,
+  ) -> Walker<'b, 'sg> {
+    Walker {
+      data: decrypted,
+      order: self.order,
+      resolved_subdir_order: None,
+      base: 0,
+      value_offset_base,
+      entries: Vec::new(),
+      warnings: Vec::new(),
+      warnings_ignorable: Vec::new(),
+      maker_note: None,
+      deferred_subdirs: Vec::new(),
+      printim_versions: Vec::new(),
+      geotiff_directory: None,
+      geotiff_double_params: None,
+      geotiff_ascii_params: None,
+      captured_make: None,
+      captured_model: None,
+      chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+      cycle_guard_warnings: Vec::new(),
+      active_ifd_offsets: Vec::new(),
+      page_count: 0,
+      multi_page: false,
+      dng_version: false,
+      captured_compression: None,
+      captured_subfile_type: None,
+      file_type: None,
+      base_file_type: None,
+      no_raf: false,
+      warn_count: 0,
+      active_table: TableRef::Exif,
+      canon_focal_units: None,
+      canon_lens_type: None,
+      canon_focal_length_blob: None,
+      dir_len: None,
+      data_tag_pairs: Vec::new(),
+      data_tag_lengths: Vec::new(),
+    }
+  }
+
+  /// Descend the `0x74c0 SR2DataIFD` SubIFD pointer inside an SR2SubIFD walk
+  /// (`Sony.pm:10545-10554`, `MaxSubdirs => 20`). The pointer value is a
+  /// multi-offset list of FILE-relative offsets into the SAME decrypted SR2 block
+  /// `self.data` represents; each offset's BUFFER position is `off +
+  /// value_offset_base` (the sub-walker's negated `sr2Offset`). The `$dirNum`-th
+  /// directory is `SR2DataIFD`/`SR2DataIFD1`/…
+  fn dispatch_sr2_data_ifd(
+    &mut self,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+    count: usize,
+  ) {
+    let max = makernotes::vendors::sony::sr2::SR2_DATA_IFD_MAX_SUBDIRS;
+    // Bound BEFORE materializing (the same DoS guard as `dispatch_classic_subifd`):
+    // materialize ONLY the first `min(count, MaxSubdirs)` offsets so an SR2-
+    // controlled huge count cannot build a giant value. The overage warning ExifTool
+    // emits past `MaxSubdirs` is verbose-only (not surfaced under `-j`).
+    let take = count.min(max);
+    let offsets = match read_value(self.data, value_offset, format, take, read_len, self.order) {
+      Some(raw) => raw.subdir_offsets(),
+      None => return,
+    };
+    for (dir_num, off) in offsets.into_iter().enumerate() {
+      let Some(off) = off else {
+        continue;
+      };
+      let Ok(off) = usize::try_from(off) else {
+        continue;
+      };
+      // File-relative offset → decrypted-buffer position: `off + value_offset_base`.
+      let buf_pos = i64::try_from(off)
+        .unwrap_or(i64::MAX)
+        .saturating_add(self.value_offset_base);
+      let Ok(child_start) = usize::try_from(buf_pos) else {
+        continue;
+      };
+      let dir_num = u32::try_from(dir_num).unwrap_or(u32::MAX);
+      self.process_subdir(
+        child_start,
+        IfdKind::Sr2DataIfd(dir_num),
+        TableRef::SonySr2DataIfd,
+        ByteOrderRule::Fixed(self.order),
+        FixBaseMode::No,
+        ProcessProc::Exif,
+      );
+    }
+  }
+
   /// Push a synthetic `(Binary data N bytes …)` placeholder leaf for a
   /// `Binary => 1` tag whose payload the port does not decode — the same
   /// `Conv::None` verbatim-`Text` mechanism the `DataTag` channel uses
@@ -8182,6 +8504,31 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return,
       },
+      // The Sony SR2 subsystem (`Sony.pm:10448-10586`). Each table is a
+      // `%Exif::Main`-leaf-typed [`tables::ExifTag`] array (the conv set is a
+      // subset of `%Exif::Main`'s), so a resolved leaf rides in `ResolvedConv::
+      // Exif` and renders via `emit_exif_value` exactly like a core Exif leaf;
+      // the SR2-specific names come from the SR2 table, and the family-1 group
+      // (`SR2`/`SR2SubIFD`/`SR2DataIFD`) from the `kind`. An id not in the table
+      // is skipped (the `ProcessExif` `next unless $tagInfo`). The `0x74c0`
+      // SR2DataIFD SubIFD pointer is NOT in `SR2_SUBIFD_TAGS` (it is descended
+      // structurally below), so it skips here.
+      TableRef::SonySr2Private => {
+        match makernotes::vendors::sony::sr2::sr2_private_lookup(tag_id) {
+          Some(t) => (t.name(), ResolvedConv::Exif(t)),
+          None => return,
+        }
+      }
+      TableRef::SonySr2SubIfd => match makernotes::vendors::sony::sr2::sr2_subifd_lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Exif(t)),
+        None => return,
+      },
+      TableRef::SonySr2DataIfd => {
+        match makernotes::vendors::sony::sr2::sr2_data_ifd_lookup(tag_id) {
+          Some(t) => (t.name(), ResolvedConv::Exif(t)),
+          None => return,
+        }
+      }
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
@@ -8210,6 +8557,9 @@ impl Walker<'_, '_> {
       // `$$self{DIR_NAME} eq 'SubIFD2'` — the classic-TIFF SubIFD tower's third
       // directory (`IfdKind::SubIfd(2)`), where 0x111/0x117 name JpgFromRaw.
       in_subifd2: matches!(kind, IfdKind::SubIfd(2)),
+      // `$$self{DIR_NAME} eq 'IFD2'` — the 2nd trailing IFD (`IfdKind::
+      // Trailing(2)`), where 0x201/0x202 name JpgFromRawStart/Length.
+      in_ifd2: matches!(kind, IfdKind::Trailing(2)),
       compression: self.captured_compression.as_deref(),
       subfile_type: self.captured_subfile_type.as_deref(),
     };
@@ -8560,15 +8910,33 @@ impl Walker<'_, '_> {
       // In-buffer bounds (`$offset>=$dataPos and $offset+$len<=$dataPos+len`,
       // `Exif.pm:6227`). The port has no out-of-buffer RAF, so a blob outside
       // the EXIF buffer is unavailable ⇒ no image (+ a faithful warning).
+      //
+      // EXCEPTION — `IsImageData` data tags (`PreviewImage`/`JpgFromRaw`/
+      // `OtherImage`, `Exif.pm:609-1293`) on a RAF-backed STANDALONE TIFF/raw
+      // (e.g. a Sony ARW): ExifTool builds the `(Binary data N bytes, use -b
+      // option to extract)` placeholder LAZILY from the offset+length and does
+      // NOT read the bytes in normal (non-`-b`) mode, so a DECLARED length whose
+      // span runs past the (here, fixture-truncated) file end still surfaces the
+      // placeholder with NO warning — the RAF would seek there in a real file.
+      // The bounded-buffer case (JPEG `APP1`, embedded Exif: `no_raf` or a
+      // sub-block) keeps the strict in-buffer check (a past-segment thumbnail IS
+      // genuinely bad there). `ThumbnailImage` (NOT `IsImageData`) always keeps
+      // the strict check.
+      let is_image_data = matches!(pair.data_tag, "PreviewImage" | "JpgFromRaw" | "OtherImage");
+      let raf_backed_standalone = !self.no_raf && self.base == 0;
       let end = pair.offset.saturating_add(length);
       if pair.offset < base || end > buf_end {
-        self.warn(std::format!(
-          "{}:{} runs past the EXIF data ({}+{length} > {buf_end})",
-          pair.ifd.as_str(),
-          pair.data_tag,
-          pair.offset,
-        ));
-        continue;
+        if is_image_data && raf_backed_standalone {
+          // Fall through to emit the lazy placeholder (declared length), no warning.
+        } else {
+          self.warn(std::format!(
+            "{}:{} runs past the EXIF data ({}+{length} > {buf_end})",
+            pair.ifd.as_str(),
+            pair.data_tag,
+            pair.offset,
+          ));
+          continue;
+        }
       }
       // Emit `<family1>:<DataTag>` AFTER the regular IFD leaves (so the
       // multiset + the immediately-after-ThumbnailLength position match
@@ -13703,6 +14071,18 @@ fn emit_exif_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   match conv {
     Conv::None => emit_raw(group, name, raw, out),
+    Conv::SonyHex8 => {
+      // `SR2SubIFDKey` (0x7221) — `PrintConv => 'sprintf("0x%.8x", $val)'`
+      // (`Sony.pm:10479`). With print_conv ON render the int32u key as a
+      // zero-padded 8-digit hex string; OFF emits the bare decimal value.
+      match first_uint(raw) {
+        Some(v) if print_conv => {
+          out.write_str(group, name, &std::format!("0x{:08x}", v as u32))?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
     Conv::IntLabel(slice) => emit_int_label(group, name, raw, slice, print_conv, out, false),
     Conv::IntLabelHex(slice) => emit_int_label(group, name, raw, slice, print_conv, out, true),
     Conv::FileSource(slice) => {
@@ -13758,10 +14138,12 @@ fn emit_exif_value<S: ExifSink>(
       emit_int_label(group, name, raw, slice, print_conv, out, false)
     }
     Conv::StrLabel(slice) => {
-      // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
-      // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
+      // STRING-keyed HASH PrintConv — `$$self{PrintConv}{$val}` keyed by the
+      // (space-joined) `$val` STRING (`InteropIndex` 0x0001, Exif.pm:417-427;
+      // `YCbCrSubSampling` 0x212 via `%JPEG::yCbCrSubSampling`, Exif.pm:1448 —
+      // an int16u[2] whose `$val` is the space-joined `"2 1"`).
       if let RawValue::Text { text: t, .. } = raw {
-        // Trim a trailing NUL/space the on-disk `string` may carry.
+        // A `string` value: trim a trailing NUL/space `read_value` may carry.
         let key = t.trim_end_matches([' ', '\0']);
         if print_conv {
           match tables::str_label_for(slice, key) {
@@ -13776,7 +14158,21 @@ fn emit_exif_value<S: ExifSink>(
         }
         return Ok(());
       }
-      emit_raw(group, name, raw, out)
+      // A NUMERIC / int-array value (e.g. `YCbCrSubSampling` int16u[2]): the
+      // HASH key is the space-joined `$val` (`ReadValue`'s `join(' ', @vals)`).
+      // `-j` looks it up (a miss ⇒ `Unknown ($val)`); `-n` emits the bare value
+      // through `emit_raw` (a single clean number stays bare, a multi-element
+      // value is the quoted space-joined string).
+      let key = raw.raw_conv_val_string();
+      if print_conv {
+        match tables::str_label_for(slice, &key) {
+          Some(label) => out.write_str(group, name, label)?,
+          None => out.write_str(group, name, &std::format!("Unknown ({key})"))?,
+        }
+      } else {
+        emit_raw(group, name, raw, out)?;
+      }
+      Ok(())
     }
     Conv::ExposureTime => {
       // `ExposureTime` (0x829a) is a `rational64u` — its value IS the rational

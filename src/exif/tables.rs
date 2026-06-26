@@ -188,6 +188,11 @@ pub enum Conv {
   /// (the `emit_raw` path) — `PrintHex` affects only the print string, e.g.
   /// `ColorSpace 12` → `"Unknown (0xc)"` (`-j`) / `12` (`-n`).
   IntLabelHex(&'static [(i64, &'static str)]),
+  /// `SR2SubIFDKey` (0x7221) PrintConv — `sprintf("0x%.8x", $val)`
+  /// (`Sony.pm:10479`). The int32u key value is rendered as a zero-padded
+  /// 8-digit hex string `0x________`. With print_conv OFF the bare decimal value
+  /// emits (the `emit_raw` path).
+  SonyHex8,
   /// `FileSource` (0xa300) PrintConv (`Exif.pm:2815-2821`). A HASH whose keys
   /// are the integer codes `1`/`2`/`3` PLUS the literal 4-byte STRING
   /// `"\x03\x00\x00\x00"` (`Exif.pm:2820`) — Sigma incorrectly gives this
@@ -436,6 +441,12 @@ pub struct OffsetTagContext<'a> {
   /// directory ([`IfdKind::SubIfd(2)`]), where `0x111`/`0x117` name
   /// `JpgFromRawStart`/`JpgFromRawLength` (`Exif.pm:673-684`/`:769-778`).
   pub in_subifd2: bool,
+  /// `$$self{DIR_NAME} eq 'IFD2'` — the SECOND trailing IFD
+  /// ([`IfdKind::Trailing(2)`]), where `0x201`/`0x202` name `JpgFromRawStart`/
+  /// `JpgFromRawLength` (`DataTag => 'JpgFromRaw'`, `Exif.pm:1251-1263`/
+  /// `:1346-1357` — "JpgFromRaw is in IFD2 of PEF files", and a Sony ARW's IFD2
+  /// JPEG preview).
+  pub in_ifd2: bool,
   /// `$$self{Compression}` (the 0x103 DataMember) as the EXACT scalar `$val`
   /// STRING (`None` ≡ ExifTool's `''` sentinel). The DNG/TIFF `PreviewImage`/
   /// `JpgFromRaw` arms gate on `Compression eq '7'` (JPEG) with STRING equality;
@@ -524,6 +535,16 @@ pub fn exif_main_offset_name_override(
       _ => {}
     }
   }
+  // `0x201`/`0x202` in IFD2 (any TIFF type) — `JpgFromRawStart`/`JpgFromRawLength`
+  // (`Exif.pm:1251-1263`/`:1346-1357`, `DIR_NAME eq "IFD2"`). The Sony ARW IFD2
+  // holds the full-res embedded JPEG.
+  if ctx.in_ifd2 {
+    match tag_id {
+      0x0201 => return Some("JpgFromRawStart"),
+      0x0202 => return Some("JpgFromRawLength"),
+      _ => {}
+    }
+  }
   // The DNG/TIFF JPEG-preview arms (0x111/0x117): `JpgFromRawStart`/`Length` in
   // SubIFD2, `PreviewImageStart`/`Length` elsewhere — both gated on the
   // JPEG-preview DataMember test (`Compression == 7` + `SubfileType != 0`).
@@ -581,6 +602,14 @@ pub fn exif_main_data_tag_spec_in_context(
       }
       _ => {}
     }
+  }
+  // `0x201` in IFD2 — `JpgFromRawStart`, `OffsetPair => 0x202`, `DataTag =>
+  // 'JpgFromRaw'` (`Exif.pm:1251-1263`). The ARW IFD2 embedded JPEG.
+  if ctx.in_ifd2 && tag.id == 0x0201 {
+    return Some(DataTagSpec {
+      offset_pair: 0x0202,
+      data_tag: "JpgFromRaw",
+    });
   }
   // DNG/TIFF JPEG-preview 0x111 — `JpgFromRaw` in SubIFD2, `PreviewImage`
   // elsewhere. Only the OFFSET id (0x111) carries a `DataTag` (its `OffsetPair`
@@ -719,7 +748,39 @@ const COMPRESSION: &[(i64, &str)] = &[
   (9, "JBIG B&W or VC-5"),
   (10, "JBIG Color"),
   (99, "JPEG"),
+  (262, "Kodak 262"),
+  (32766, "NeXt or Sony ARW Compressed 2"),
+  (32767, "Sony ARW Compressed"),
+  (32769, "Packed RAW"),
+  (32770, "Samsung SRW Compressed"),
+  (32771, "CCIRLEW"),
+  (32772, "Samsung SRW Compressed 2"),
   (32773, "PackBits"),
+  (32809, "Thunderscan"),
+  (32867, "Kodak KDC Compressed"),
+  (32895, "IT8CTPAD"),
+  (32896, "IT8LW"),
+  (32897, "IT8MP"),
+  (32898, "IT8BL"),
+  (32908, "PixarFilm"),
+  (32909, "PixarLog"),
+  (32946, "Deflate"),
+  (32947, "DCS"),
+  (33003, "Aperio JPEG 2000 YCbCr"),
+  (33005, "Aperio JPEG 2000 RGB"),
+  (34661, "JBIG"),
+  (34676, "SGILog"),
+  (34677, "SGILog24"),
+  (34712, "JPEG 2000"),
+  (34713, "Nikon NEF Compressed"),
+  (34715, "JBIG2 TIFF FX"),
+  (34718, "Microsoft Document Imaging (MDI) Binary Level Codec"),
+  (
+    34719,
+    "Microsoft Document Imaging (MDI) Progressive Transform Codec",
+  ),
+  (34720, "Microsoft Document Imaging (MDI) Vector"),
+  (34887, "ESRI Lerc"),
   (34892, "Lossy JPEG"),
   (34925, "LZMA2"),
   (34926, "Zstd (old)"),
@@ -732,6 +793,58 @@ const COMPRESSION: &[(i64, &str)] = &[
   (52546, "JPEG XL"),
   (65000, "Kodak DCR Compressed"),
   (65535, "Pentax PEF Compressed"),
+];
+
+/// `%JPEG::yCbCrSubSampling` PrintConv (`ExifTool.pm`) — keyed by the
+/// space-joined int16u[2] value. Ordered by key string to match the `-listx`
+/// generated shadow (the `generated_shadow_matches_hand_table` parity proof
+/// compares the slice contents IN ORDER).
+const YCBCR_SUBSAMPLING: &[(&str, &str)] = &[
+  ("1 1", "YCbCr4:4:4 (1 1)"),
+  ("1 2", "YCbCr4:4:0 (1 2)"),
+  ("1 4", "YCbCr4:4:1 (1 4)"),
+  ("2 1", "YCbCr4:2:2 (2 1)"),
+  ("2 2", "YCbCr4:2:0 (2 2)"),
+  ("2 4", "YCbCr4:2:1 (2 4)"),
+  ("4 1", "YCbCr4:1:1 (4 1)"),
+  ("4 2", "YCbCr4:1:0 (4 2)"),
+];
+
+/// `SonyRawFileType` (0x7000) PrintConv (`Exif.pm:1620-1627`) — found in Sony
+/// ARW `SubIFD`.
+const SONY_RAW_FILE_TYPE: &[(i64, &str)] = &[
+  (0, "Sony Uncompressed 14-bit RAW"),
+  (1, "Sony Uncompressed 12-bit RAW"),
+  (2, "Sony Compressed RAW"),
+  (3, "Sony Lossless Compressed RAW"),
+  (4, "Sony Lossless Compressed RAW 2"),
+  (6, "Sony Compressed RAW 2"),
+];
+
+/// `VignettingCorrection` (0x7031) PrintConv (`Exif.pm:1645-1650`) — found in
+/// Sony ARW `SubIFD`.
+const SONY_VIGNETTING_CORRECTION: &[(i64, &str)] = &[
+  (256, "Off"),
+  (257, "Auto"),
+  (272, "Auto (ILCE-1)"),
+  (511, "No correction params available"),
+];
+
+/// `ChromaticAberrationCorrection` (0x7034) PrintConv (`Exif.pm:1668-1672`) —
+/// found in Sony ARW `SubIFD`.
+const SONY_CHROMATIC_ABERRATION_CORRECTION: &[(i64, &str)] = &[
+  (0, "Off"),
+  (1, "Auto"),
+  (255, "No correction params available"),
+];
+
+/// `DistortionCorrection` (0x7036) PrintConv (`Exif.pm:1690-1695`) — found in
+/// Sony ARW `SubIFD`.
+const SONY_DISTORTION_CORRECTION: &[(i64, &str)] = &[
+  (0, "Off"),
+  (1, "Auto"),
+  (17, "Auto fixed by lens"),
+  (255, "No correction params available"),
 ];
 
 /// `%photometricInterpretation` PrintConv (`Exif.pm:271-289`).
@@ -1082,6 +1195,15 @@ pub const EXIF_TAGS: &[ExifTag] = &[
     conv: Conv::None,
   },
   ExifTag {
+    id: 0x0212,
+    name: "YCbCrSubSampling",
+    // `%JPEG::yCbCrSubSampling` — a STRING-keyed HASH PrintConv keyed by the
+    // space-joined int16u[2] `$val` (`"2 1"` → `"YCbCr4:2:2 (2 1)"`). Rides the
+    // shared `Conv::StrLabel` (which space-joins a numeric value for the key),
+    // matching the `-listx` generated shadow.
+    conv: Conv::StrLabel(YCBCR_SUBSAMPLING),
+  },
+  ExifTag {
     id: 0x0213,
     name: "YCbCrPositioning",
     conv: Conv::IntLabel(YCBCR_POSITIONING),
@@ -1089,6 +1211,108 @@ pub const EXIF_TAGS: &[ExifTag] = &[
   ExifTag {
     id: 0x0214,
     name: "ReferenceBlackWhite",
+    conv: Conv::None,
+  },
+  // ---- Sony ARW SubIFD raw tags (`%Exif::Main`, `Exif.pm:1616-1742`) -------
+  // These live in `%Exif::Main` (so the shared Exif table) and surface in the
+  // `SubIFD` of Sony ARW raws. Most are bare values (space-joined when count>1);
+  // the three correction-mode tags carry a HASH PrintConv.
+  ExifTag {
+    id: 0x7000,
+    name: "SonyRawFileType",
+    // `{ 0 => 'Sony Uncompressed 14-bit RAW', 1 => 'Sony Uncompressed 12-bit
+    // RAW', 2 => 'Sony Compressed RAW', 3 => 'Sony Lossless Compressed RAW',
+    // 4 => 'Sony Lossless Compressed RAW 2', 6 => 'Sony Compressed RAW 2' }`
+    // (`Exif.pm:1618-1627`).
+    conv: Conv::IntLabel(SONY_RAW_FILE_TYPE),
+  },
+  ExifTag {
+    id: 0x7010,
+    name: "SonyToneCurve",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7031,
+    name: "VignettingCorrection",
+    conv: Conv::IntLabel(SONY_VIGNETTING_CORRECTION),
+  },
+  ExifTag {
+    id: 0x7032,
+    name: "VignettingCorrParams",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7034,
+    name: "ChromaticAberrationCorrection",
+    conv: Conv::IntLabel(SONY_CHROMATIC_ABERRATION_CORRECTION),
+  },
+  ExifTag {
+    id: 0x7035,
+    name: "ChromaticAberrationCorrParams",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7036,
+    name: "DistortionCorrection",
+    conv: Conv::IntLabel(SONY_DISTORTION_CORRECTION),
+  },
+  ExifTag {
+    id: 0x7037,
+    name: "DistortionCorrParams",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7038,
+    name: "SonyRawImageSize",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7310,
+    name: "BlackLevel",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x7313,
+    name: "WB_RGGBLevels",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x74c7,
+    name: "SonyCropTopLeft",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x74c8,
+    name: "SonyCropSize",
+    conv: Conv::None,
+  },
+  // `CFARepeatPatternDim` (0x828d, `Exif.pm:1775`) / `CFAPattern2` (0x828e,
+  // `Exif.pm:1782`) — the SubIFD CFA descriptors. 0x828e carries
+  // `Format => 'int8u'` (`Exif.pm:1784`), applied via [`format_override`].
+  ExifTag {
+    id: 0x828d,
+    name: "CFARepeatPatternDim",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0x828e,
+    name: "CFAPattern2",
+    conv: Conv::None,
+  },
+  // ---- DNG SubIFD crop / level tags (`%Exif::Main`, `Exif.pm:3453-3480`) ----
+  ExifTag {
+    id: 0xc61d,
+    name: "WhiteLevel",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0xc61f,
+    name: "DefaultCropOrigin",
+    conv: Conv::None,
+  },
+  ExifTag {
+    id: 0xc620,
+    name: "DefaultCropSize",
     conv: Conv::None,
   },
   ExifTag {
@@ -1599,6 +1823,11 @@ pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
     // PrintConv sees the raw value bytes one-per-element even when the tag was
     // mis-written as `string`/`int16u`/etc. (#201).
     0x9101 => Some(crate::exif::ifd::Format::Int8u),
+    // `CFAPattern2` (0x828e) — `Format => 'int8u'` (`Exif.pm:1784`, "written
+    // incorrectly as 'undef' in Nikon NRW images"). The on-disk value is re-read
+    // as `int(size/1)` int8u elements so a mis-written `undef`/`int16u` CFA
+    // descriptor still decodes to the per-byte `0 1 1 2` (the Sony ARW SubIFD).
+    0x828e => Some(crate::exif::ifd::Format::Int8u),
     // `XPComment` (0x9c9c) / `XPKeywords` (0x9c9e) carry `Format => 'undef'`
     // (`Exif.pm:2645`/`:2663`): the on-disk `int8u[N]` value is re-read as raw
     // `undef` bytes so the `WindowsXp` UCS-2(LE) `Decode` ValueConv sees the

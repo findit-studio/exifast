@@ -186,6 +186,20 @@ static EXIF_YCBCRCOEFFICIENTS: ExifTag = ExifTag {
   name: "YCbCrCoefficients",
   conv: Conv::None,
 };
+static EXIF_YCBCRSUBSAMPLING: ExifTag = ExifTag {
+  id: 0x0212,
+  name: "YCbCrSubSampling",
+  conv: Conv::StrLabel(&[
+    ("1 1", "YCbCr4:4:4 (1 1)"),
+    ("1 2", "YCbCr4:4:0 (1 2)"),
+    ("1 4", "YCbCr4:4:1 (1 4)"),
+    ("2 1", "YCbCr4:2:2 (2 1)"),
+    ("2 2", "YCbCr4:2:0 (2 2)"),
+    ("2 4", "YCbCr4:2:1 (2 4)"),
+    ("4 1", "YCbCr4:1:1 (4 1)"),
+    ("4 2", "YCbCr4:1:0 (4 2)"),
+  ]),
+};
 static EXIF_YCBCRPOSITIONING: ExifTag = ExifTag {
   id: 0x0213,
   name: "YCbCrPositioning",
@@ -194,6 +208,102 @@ static EXIF_YCBCRPOSITIONING: ExifTag = ExifTag {
 static EXIF_REFERENCEBLACKWHITE: ExifTag = ExifTag {
   id: 0x0214,
   name: "ReferenceBlackWhite",
+  conv: Conv::None,
+};
+static EXIF_SONYRAWFILETYPE: ExifTag = ExifTag {
+  id: 0x7000,
+  name: "SonyRawFileType",
+  conv: Conv::IntLabel(&[
+    (0, "Sony Uncompressed 14-bit RAW"),
+    (1, "Sony Uncompressed 12-bit RAW"),
+    (2, "Sony Compressed RAW"),
+    (3, "Sony Lossless Compressed RAW"),
+    (4, "Sony Lossless Compressed RAW 2"),
+    (6, "Sony Compressed RAW 2"),
+  ]),
+};
+static EXIF_SONYTONECURVE: ExifTag = ExifTag {
+  id: 0x7010,
+  name: "SonyToneCurve",
+  conv: Conv::None,
+};
+static EXIF_VIGNETTINGCORRECTION: ExifTag = ExifTag {
+  id: 0x7031,
+  name: "VignettingCorrection",
+  conv: Conv::IntLabel(&[
+    (256, "Off"),
+    (257, "Auto"),
+    (272, "Auto (ILCE-1)"),
+    (511, "No correction params available"),
+  ]),
+};
+static EXIF_VIGNETTINGCORRPARAMS: ExifTag = ExifTag {
+  id: 0x7032,
+  name: "VignettingCorrParams",
+  conv: Conv::None,
+};
+static EXIF_CHROMATICABERRATIONCORRECTION: ExifTag = ExifTag {
+  id: 0x7034,
+  name: "ChromaticAberrationCorrection",
+  conv: Conv::IntLabel(&[
+    (0, "Off"),
+    (1, "Auto"),
+    (255, "No correction params available"),
+  ]),
+};
+static EXIF_CHROMATICABERRATIONCORRPARAMS: ExifTag = ExifTag {
+  id: 0x7035,
+  name: "ChromaticAberrationCorrParams",
+  conv: Conv::None,
+};
+static EXIF_DISTORTIONCORRECTION: ExifTag = ExifTag {
+  id: 0x7036,
+  name: "DistortionCorrection",
+  conv: Conv::IntLabel(&[
+    (0, "Off"),
+    (1, "Auto"),
+    (17, "Auto fixed by lens"),
+    (255, "No correction params available"),
+  ]),
+};
+static EXIF_DISTORTIONCORRPARAMS: ExifTag = ExifTag {
+  id: 0x7037,
+  name: "DistortionCorrParams",
+  conv: Conv::None,
+};
+static EXIF_SONYRAWIMAGESIZE: ExifTag = ExifTag {
+  id: 0x7038,
+  name: "SonyRawImageSize",
+  conv: Conv::None,
+};
+static EXIF_BLACKLEVEL: ExifTag = ExifTag {
+  id: 0x7310,
+  name: "BlackLevel",
+  conv: Conv::None,
+};
+static EXIF_WB_RGGBLEVELS: ExifTag = ExifTag {
+  id: 0x7313,
+  name: "WB_RGGBLevels",
+  conv: Conv::None,
+};
+static EXIF_SONYCROPTOPLEFT: ExifTag = ExifTag {
+  id: 0x74c7,
+  name: "SonyCropTopLeft",
+  conv: Conv::None,
+};
+static EXIF_SONYCROPSIZE: ExifTag = ExifTag {
+  id: 0x74c8,
+  name: "SonyCropSize",
+  conv: Conv::None,
+};
+static EXIF_CFAREPEATPATTERNDIM: ExifTag = ExifTag {
+  id: 0x828d,
+  name: "CFARepeatPatternDim",
+  conv: Conv::None,
+};
+static EXIF_CFAPATTERN2: ExifTag = ExifTag {
+  id: 0x828e,
+  name: "CFAPattern2",
   conv: Conv::None,
 };
 static EXIF_COPYRIGHT: ExifTag = ExifTag {
@@ -688,8 +798,23 @@ static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
   name: "CompositeImageExposureTimes",
   conv: Conv::CompositeImageExposureTimes,
 };
+static EXIF_WHITELEVEL: ExifTag = ExifTag {
+  id: 0xc61d,
+  name: "WhiteLevel",
+  conv: Conv::None,
+};
+static EXIF_DEFAULTCROPORIGIN: ExifTag = ExifTag {
+  id: 0xc61f,
+  name: "DefaultCropOrigin",
+  conv: Conv::None,
+};
+static EXIF_DEFAULTCROPSIZE: ExifTag = ExifTag {
+  id: 0xc620,
+  name: "DefaultCropSize",
+  conv: Conv::None,
+};
 
-/// `Exif::Main` — the generated shadow (123 ids: the ported hand subset + the
+/// `Exif::Main` — the generated shadow (142 ids: the ported hand subset + the
 /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
 /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
 /// in the hand table) is the only one this fallback actually returns.
@@ -728,8 +853,24 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x0201 => Some(&EXIF_THUMBNAILOFFSET),
     0x0202 => Some(&EXIF_THUMBNAILLENGTH),
     0x0211 => Some(&EXIF_YCBCRCOEFFICIENTS),
+    0x0212 => Some(&EXIF_YCBCRSUBSAMPLING),
     0x0213 => Some(&EXIF_YCBCRPOSITIONING),
     0x0214 => Some(&EXIF_REFERENCEBLACKWHITE),
+    0x7000 => Some(&EXIF_SONYRAWFILETYPE),
+    0x7010 => Some(&EXIF_SONYTONECURVE),
+    0x7031 => Some(&EXIF_VIGNETTINGCORRECTION),
+    0x7032 => Some(&EXIF_VIGNETTINGCORRPARAMS),
+    0x7034 => Some(&EXIF_CHROMATICABERRATIONCORRECTION),
+    0x7035 => Some(&EXIF_CHROMATICABERRATIONCORRPARAMS),
+    0x7036 => Some(&EXIF_DISTORTIONCORRECTION),
+    0x7037 => Some(&EXIF_DISTORTIONCORRPARAMS),
+    0x7038 => Some(&EXIF_SONYRAWIMAGESIZE),
+    0x7310 => Some(&EXIF_BLACKLEVEL),
+    0x7313 => Some(&EXIF_WB_RGGBLEVELS),
+    0x74c7 => Some(&EXIF_SONYCROPTOPLEFT),
+    0x74c8 => Some(&EXIF_SONYCROPSIZE),
+    0x828d => Some(&EXIF_CFAREPEATPATTERNDIM),
+    0x828e => Some(&EXIF_CFAPATTERN2),
     0x8298 => Some(&EXIF_COPYRIGHT),
     0x829a => Some(&EXIF_EXPOSURETIME),
     0x829d => Some(&EXIF_FNUMBER),
@@ -818,6 +959,9 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0xa460 => Some(&EXIF_COMPOSITEIMAGE),
     0xa461 => Some(&EXIF_COMPOSITEIMAGECOUNT),
     0xa462 => Some(&EXIF_COMPOSITEIMAGEEXPOSURETIMES),
+    0xc61d => Some(&EXIF_WHITELEVEL),
+    0xc61f => Some(&EXIF_DEFAULTCROPORIGIN),
+    0xc620 => Some(&EXIF_DEFAULTCROPSIZE),
     _ => None,
   }
 }
