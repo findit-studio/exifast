@@ -176,7 +176,22 @@ pub fn format_g(val: f64, precision: usize) -> String {
 /// aperture / focal-length / temperature ValueConvs).
 #[must_use]
 pub fn whole_f64_to_tag_value(val: f64) -> TagValue {
-  let token = format_g(val, 15);
+  // Render the `%.15g` token onto the STACK (no heap `String`): a `StackBuf`'s
+  // 128-byte capacity covers every `%.15g` token (≤ ~24 bytes) with wide
+  // margin, so `format_g_into` never overflows here — the cold overflow branch
+  // is unreached for precision 15 (and falling back to `F64` there is the
+  // conservative choice the integer-detection below would anyway take on a
+  // half-rendered token). These are exactly the bytes `format_g` would
+  // heap-allocate — only the backing store changes — so the I64/F64 decision
+  // stays byte-identical. The helper runs on the composite
+  // `FocalLength35efl`/`FocusDistance` ValueConv paths (and every Sony `-n`
+  // ValueConv), so dropping its per-call `String` keeps those paths
+  // allocation-free.
+  let mut buf = StackBuf::new();
+  if format_g_into(&mut buf, val, 15).is_err() {
+    return TagValue::F64(val);
+  }
+  let token = buf.as_str();
   // A pure-integer `%.15g` token (no `.` / `e` / `E`) → an exact `i64` so the
   // JSON token is bundled-identical (`800`, not `800.0`). `%.15g` caps the
   // integer part at 15 digits, so it always fits `i64`; a non-integer or
