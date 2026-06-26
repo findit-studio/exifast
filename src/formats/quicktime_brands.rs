@@ -1667,15 +1667,27 @@ fn render_cmt3_block(
 ) -> Vec<crate::emit::EmittedTag> {
   use crate::emit::EmittedTag;
   use crate::value::Group;
-  let group = Group::new("MakerNotes", "Canon");
   crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(body, print_conv, model)
     .into_iter()
     .map(|e| {
-      EmittedTag::new(
-        group.clone(),
+      // Preserve each emission's family-1 group OVERRIDE (the
+      // `CanonCustom::Functions2` 0x0099 leaves group under `CanonCustom`,
+      // `CanonCustom.pm:229`, NOT the parent `Canon`); the default is `Canon`.
+      let group1 = e.group1_override().unwrap_or("Canon");
+      // Carry the emission's ExifTool `Priority => N` too — `0` for the
+      // `Canon::ShotInfo` FNumber/ExposureTime/BaseISO, `Canon::FocalLength`
+      // FocalLength, `Canon::LensInfo` LensSerialNumber and every
+      // `%Canon::CameraInfo*` leaf (`tags::tag_priority`, `ExifTool.pm:9544-9560`).
+      // A `Priority => 0` CMT3 leaf must NEVER override an earlier same-`(doc,
+      // family1, name)` value, so the sink's priority-aware dedup needs the REAL
+      // priority, not the `EmittedTag::new` default `1` (which would let a later
+      // priority-0 duplicate wrongly win).
+      EmittedTag::new_with_priority(
+        Group::new("MakerNotes", group1),
         smol_str::SmolStr::new(e.name()),
         e.value().clone(),
         e.unknown(),
+        e.priority(),
       )
     })
     .collect()
@@ -3800,6 +3812,77 @@ mod tests {
     let mut m = Cr3Meta::new();
     assert!(scan_canon_uuid(&blob, &mut m));
     assert_eq!(m.cmt3().unwrap().length(), 6);
+  }
+
+  /// A CMT3 Canon-MakerNote TIFF block whose IFD0 has ONE entry: a `ShotInfo`
+  /// (0x04) SubDirectory pointer to a 3-word `int16s` array. ShotInfo position 1
+  /// (`AutoISO`, `Priority => 1`) and position 2 (`BaseISO`, `Priority => 0`,
+  /// RawConv drops a raw 0) both emit, so the block yields a priority-0 leaf
+  /// ALONGSIDE a priority-1 one — the input the CMT3 priority-preservation check
+  /// needs. (LE: header 8 + IFD 18 + 6 value bytes at offset 26.)
+  fn cmt3_shotinfo_body() -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // 1 IFD0 entry
+    t.extend_from_slice(&0x0004u16.to_le_bytes()); // tag 0x04 CanonShotInfo
+    t.extend_from_slice(&8u16.to_le_bytes()); // format int16s
+    t.extend_from_slice(&3u32.to_le_bytes()); // count 3 words
+    t.extend_from_slice(&26u32.to_le_bytes()); // out-of-line value pointer
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    // ShotInfo words: [0] unused, [1] AutoISO raw 0 (→ ISO 100), [2] BaseISO raw
+    // 160 (→ exp(5·ln2)·100/32 = 100; nonzero, so NOT RawConv-dropped).
+    t.extend_from_slice(&0i16.to_le_bytes());
+    t.extend_from_slice(&0i16.to_le_bytes());
+    t.extend_from_slice(&160i16.to_le_bytes());
+    t
+  }
+
+  /// `render_cmt3_block` must thread each Canon emission's ExifTool `Priority =>
+  /// N`, NOT reset it to the `EmittedTag::new` default `1`: a `Priority => 0`
+  /// CMT3 leaf (`ShotInfo` `BaseISO`) keeps priority 0 so the sink's dedup keeps
+  /// an EARLIER same-`(group, name)` value (`ExifTool.pm:9544-9560`), while still
+  /// preserving the per-emission family-1 group OVERRIDE (`Canon`).
+  #[test]
+  fn render_cmt3_block_preserves_canon_priority_zero() {
+    let body = cmt3_shotinfo_body();
+    let emissions =
+      crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(&body, true, None);
+    // The block DOES yield a `Priority => 0` emission (BaseISO) — else the test
+    // could not tell the fix apart from the bug.
+    assert!(
+      emissions.iter().any(|e| e.priority() == 0),
+      "the ShotInfo body must yield a Priority => 0 emission: {emissions:?}"
+    );
+    let rendered = render_cmt3_block(&body, true, None);
+    assert_eq!(
+      rendered.len(),
+      emissions.len(),
+      "one EmittedTag per emission"
+    );
+    for (r, e) in rendered.iter().zip(emissions.iter()) {
+      // Priority threaded through, AND the family-1 group OVERRIDE preserved.
+      assert_eq!(
+        r.priority(),
+        e.priority(),
+        "render_cmt3_block must preserve {}'s priority",
+        e.name()
+      );
+      assert_eq!(r.tag().group_ref().family0(), "MakerNotes");
+      assert_eq!(r.tag().group_ref().family1(), "Canon");
+    }
+    // BaseISO specifically stays `Priority => 0` …
+    let base = rendered
+      .iter()
+      .find(|t| t.tag().name() == "BaseISO")
+      .expect("BaseISO emitted");
+    assert_eq!(base.priority(), 0);
+    // … so a later priority-0 BaseISO duplicate does NOT override an earlier
+    // (priority-1) same-key value: the earlier value SURVIVES, as ExifTool's
+    // duplicate handler requires (`ExifTool.pm:9544-9560`). Before the fix the
+    // reset-to-1 priority would have let the CMT3 value WIN — the bug.
+    assert!(
+      !crate::tagmap::dedup_override(base.priority(), 1),
+      "a Priority => 0 CMT3 leaf must not override an earlier value"
+    );
   }
 
   #[test]

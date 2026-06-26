@@ -269,6 +269,53 @@ fn enable_disable(v: i64) -> Option<&'static str> {
   })
 }
 
+/// `{0=>'Normal',1=>'Reversed'}` (ControlRingRotation / FocusRingRotation).
+fn normal_reversed(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Normal",
+    1 => "Reversed",
+    _ => return None,
+  })
+}
+
+/// `RFLensMFFocusRingSensitivity` PrintConv (`CanonCustom.pm:1259-1264`).
+fn rf_lens_mf_sensitivity_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Varies With Rotation Speed",
+    1 => "Linked To Rotation Angle",
+    _ => return None,
+  })
+}
+
+/// `SameExposureForNewAperture` PrintConv (`CanonCustom.pm:367-374`, 5DS arm).
+fn same_exposure_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Disable",
+    1 => "ISO Speed",
+    2 => "Shutter Speed",
+    _ => return None,
+  })
+}
+
+/// `DefaultEraseOption` PrintConv (`CanonCustom.pm:1401-1409`).
+fn default_erase_option_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Cancel selected",
+    1 => "Erase selected",
+    2 => "Erase RAW selected",
+    3 => "Erase non-RAW selected",
+    _ => return None,
+  })
+}
+
+/// `AEBShotCount` single-value PrintConv render: the label, or `Unknown (N)`.
+fn aeb_shots_hash(v: i64, label: fn(i64) -> Option<&'static str>) -> TagValue {
+  match label(v) {
+    Some(l) => TagValue::Str(SmolStr::new_static(l)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
 // ─── ProcessCanonCustom2 (`Canon::Main` 0x99) ────────────────────────────────
 
 /// Decode a `ProcessCanonCustom2` block (`CanonCustom.pm:2642-2745`) against
@@ -397,6 +444,61 @@ fn functions2_render(
     }
     // 0x70c CustomControls (no PrintConv — passthrough).
     0x70c => return Some(("CustomControls", joined(num, vals))),
+    // 0x715 CustomizeDials (no PrintConv — passthrough; `CanonCustom.pm:1265`).
+    0x715 => return Some(("CustomizeDials", joined(num, vals))),
+    // 0x106 AEBShotCount — model + count conditional list (`CanonCustom.pm:95`).
+    0x106 => {
+      let value = if !print_conv {
+        joined(num, vals)
+      } else if model_has(model, "90D") {
+        // Arm 1 (EOS 90D): the shot count keys directly.
+        aeb_shots_hash(v0, |n| match n {
+          2 => Some("2 shots"),
+          3 => Some("3 shots"),
+          5 => Some("5 shots"),
+          7 => Some("7 shots"),
+          _ => None,
+        })
+      } else if num == 1 {
+        // Arm 2 (other models, single value): the EOS R path.
+        aeb_shots_hash(v0, |n| match n {
+          0 => Some("3 shots"),
+          1 => Some("2 shots"),
+          2 => Some("5 shots"),
+          3 => Some("7 shots"),
+          _ => None,
+        })
+      } else {
+        // Arm 3 (Count 2): the space-joined pair keys the label.
+        let key = space_joined(vals);
+        match key.as_str() {
+          "3 0" => TagValue::Str(SmolStr::new_static("3 shots")),
+          "2 1" => TagValue::Str(SmolStr::new_static("2 shots")),
+          "5 2" => TagValue::Str(SmolStr::new_static("5 shots")),
+          "7 3" => TagValue::Str(SmolStr::new_static("7 shots")),
+          _ => TagValue::Str(SmolStr::from(std::format!("Unknown ({key})"))),
+        }
+      };
+      return Some(("AEBShotCount", value));
+    }
+    // 0x114 AELockMeterModeAfterFocus — `BITMASK` (DecodeBits, `CanonCustom.pm:388`).
+    0x114 => {
+      let value = if print_conv {
+        TagValue::Str(SmolStr::from(crate::convert::decode_bits(
+          &v0.to_string(),
+          Some(&[
+            (0, "Evaluative"),
+            (1, "Partial"),
+            (2, "Spot"),
+            (3, "Center-weighted"),
+          ]),
+          0,
+        )))
+      } else {
+        TagValue::I64(v0)
+      };
+      return Some(("AELockMeterModeAfterFocus", value));
+    }
     _ => {}
   }
   // Single-value hash tags.
@@ -436,6 +538,15 @@ fn functions2_render(
     0x706 => ("DialDirectionTvAv", dial_direction_tv_av_label),
     0x80e => ("AddAspectRatioInfo", add_aspect_ratio_info_label),
     0x80f => ("AddOriginalDecisionData", off_on),
+    // EOS-R-era CustomFunctions2 leaves (`CanonCustom.pm`).
+    0x112 => ("SameExposureForNewAperture", same_exposure_label),
+    0x711 => ("ShutterReleaseWithoutLens", disable_enable),
+    0x712 => ("ControlRingRotation", normal_reversed),
+    0x713 => ("FocusRingRotation", normal_reversed),
+    0x714 => ("RFLensMFFocusRingSensitivity", rf_lens_mf_sensitivity_label),
+    0x813 => ("DefaultEraseOption", default_erase_option_label),
+    0x814 => ("RetractLensOnPowerOff", enable_disable),
+    0x815 => ("AddIPTCInformation", disable_enable),
     _ => return None,
   };
   let value = if num != 1 {

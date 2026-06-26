@@ -133,7 +133,31 @@ pub fn parse_lighting_opt(
       hash(v, print_conv, high_iso_nr_label),
     ));
   }
+  // 10 DigitalLensOptimizer @ 40 (`Canon.pm:9117-9123`, forum14286).
+  if let Some(v) = i32s(data, 40, order) {
+    out.push((
+      SmolStr::new_static("DigitalLensOptimizer"),
+      hash(v, print_conv, digital_lens_optimizer_label),
+    ));
+  }
+  // 11 DualPixelRaw @ 44 (`Canon.pm:9125-9128`, forum15445, `%offOn`).
+  if let Some(v) = i32s(data, 44, order) {
+    out.push((
+      SmolStr::new_static("DualPixelRaw"),
+      hash(v, print_conv, off_on_label),
+    ));
+  }
   out
+}
+
+/// `DigitalLensOptimizer` PrintConv (`Canon.pm:9119-9122`).
+fn digital_lens_optimizer_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Off",
+    1 => "Standard",
+    2 => "High",
+    _ => return None,
+  })
 }
 
 /// Decode `%Canon::LensInfo` (0x4019) from the `undef[N]` blob.

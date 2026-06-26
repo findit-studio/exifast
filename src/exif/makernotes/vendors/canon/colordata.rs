@@ -46,9 +46,74 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
     692 | 674 | 702 | 1227 | 1250 | 1251 | 1337 | 1338 | 1346
   ) {
     color_data_4(data, order, print_conv)
+  } else if matches!(count, 1816 | 1820 | 1824) {
+    color_data_9(data, order, print_conv)
   } else {
     Vec::new()
   }
+}
+
+/// `%Canon::ColorData9` (`Canon.pm:8186-8330`, `$count` in `1816|1820|1824`) —
+/// EOS M50 / R / RP / 250D / 90D … The WB_RGGBLevels*/ColorTemp* pairs are
+/// inline at non-contiguous word offsets (interleaved with `Unknown` pairs);
+/// the per-channel black + normal/specular white + linearity-margin levels are
+/// far down the block. `FORMAT => 'int16s'`, `FIRST_ENTRY => 0`. The CanonEOSR
+/// CTMD (type-8) carries this variant (`ColorDataVersion == 17`).
+fn color_data_9(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  // 0x00 ColorDataVersion (DataMember + PrintConv).
+  if let Some(v) = read_i16(data, 0, order) {
+    out.push((
+      "ColorDataVersion".into(),
+      if print_conv {
+        let label = match v {
+          16 => Some("16 (M50)"),
+          17 => Some("17 (R)"),
+          18 => Some("18 (RP/250D)"),
+          19 => Some("19 (90D/850D/M6mkII/M200)"),
+          _ => None,
+        };
+        match label {
+          Some(l) => TagValue::Str(SmolStr::new_static(l)),
+          None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+        }
+      } else {
+        TagValue::I64(v)
+      },
+    ));
+  }
+  // WB_RGGBLevels<X> (int16s[4]) + ColorTemp<X> (int16s) pairs (`Canon.pm`
+  // 0x47..0xaa, skipping the `Unknown` 0x56..0x87 / 0xab.. runs).
+  const WB_PAIRS_9: &[(usize, &str, &str)] = &[
+    (0x47, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+    (0x4c, "WB_RGGBLevelsAuto", "ColorTempAuto"),
+    (0x51, "WB_RGGBLevelsMeasured", "ColorTempMeasured"),
+    (0x88, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+    (0x8d, "WB_RGGBLevelsShade", "ColorTempShade"),
+    (0x92, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+    (0x97, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+    (0x9c, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+    (0xa1, "WB_RGGBLevelsKelvin", "ColorTempKelvin"),
+    (0xa6, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+  ];
+  push_wb_pairs(&mut out, data, order, WB_PAIRS_9);
+  // 0x149 PerChannelBlackLevel (int16u[4]).
+  push_u16_quad(&mut out, data, order, 0x149, "PerChannelBlackLevel");
+  // 0x31c NormalWhiteLevel (int16u, RawConv `$val || undef` ⇒ drop a zero).
+  if let Some(v) = read_u16(data, 0x31c, order)
+    && v != 0
+  {
+    out.push(("NormalWhiteLevel".into(), TagValue::I64(v)));
+  }
+  // 0x31d SpecularWhiteLevel (int16u).
+  if let Some(v) = read_u16(data, 0x31d, order) {
+    out.push(("SpecularWhiteLevel".into(), TagValue::I64(v)));
+  }
+  // 0x31e LinearityUpperMargin (int16u).
+  if let Some(v) = read_u16(data, 0x31e, order) {
+    out.push(("LinearityUpperMargin".into(), TagValue::I64(v)));
+  }
+  out
 }
 
 /// `%Canon::ColorData3` (`Canon.pm:7557-7646`).

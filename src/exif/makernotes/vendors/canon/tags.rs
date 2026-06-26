@@ -288,6 +288,12 @@ impl SubTable {
         | SubTable::VignettingCorr2
         | SubTable::LightingOpt
         | SubTable::LensInfo
+        // The EOS-R feature sub-tables (CanonEOSR.cr3): AmbienceInfo (0x4020) /
+        // MultiExp (0x4021) / HDRInfo (0x4025) / AFConfig (0x4028).
+        | SubTable::AmbienceInfo
+        | SubTable::MultiExp
+        | SubTable::HdrInfo
+        | SubTable::AfConfig
     )
   }
 
@@ -635,11 +641,12 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::TimeInfo),
     unknown: false,
   },
-  // 0x38 — BatteryType (`Canon.pm:1757-1764`) — string
+  // 0x38 — BatteryType (`Canon.pm:1757-1764`) — `undef`, `$count == 76`,
+  // RawConv strips the 4-byte header + captures the non-NUL run (⇒ 'LP-E6N').
   CanonTag {
     id: 0x38,
     name: "BatteryType",
-    conv: CanonPrintConv::None,
+    conv: CanonPrintConv::BatteryType,
     sub_table: None,
     unknown: false,
   },
@@ -1258,12 +1265,10 @@ mod tests {
       (0xb1, "ModifiedInfo", SubTable::ModifiedInfo),
       (0xb6, "PreviewImageInfo", SubTable::PreviewImageInfo),
       (0x4003, "ColorInfo", SubTable::ColorInfo),
-      (0x4020, "AmbienceInfo", SubTable::AmbienceInfo),
-      (0x4021, "MultiExp", SubTable::MultiExp),
+      // (0x4020 AmbienceInfo / 0x4021 MultiExp / 0x4025 HDRInfo / 0x4028 AFConfig
+      // are now WALKED — the EOS-R feature sub-tables.)
       (0x4024, "FilterInfo", SubTable::FilterInfo),
-      (0x4025, "HDRInfo", SubTable::HdrInfo),
       (0x4026, "LogInfo", SubTable::LogInfo),
-      (0x4028, "AFConfig", SubTable::AfConfig),
       (0x403f, "RawBurstModeRoll", SubTable::RawBurstModeRoll),
       (0x4053, "FocusBracketingInfo", SubTable::FocusBracketingInfo),
       (0x4059, "LevelInfo", SubTable::LevelInfo),
@@ -1309,9 +1314,14 @@ mod tests {
     assert!(SubTable::VignettingCorr2.is_walked());
     assert!(SubTable::LightingOpt.is_walked());
     assert!(SubTable::LensInfo.is_walked());
+    // The EOS-R feature sub-tables (CanonEOSR.cr3) are now walked too.
+    assert!(SubTable::AmbienceInfo.is_walked());
+    assert!(SubTable::MultiExp.is_walked());
+    assert!(SubTable::HdrInfo.is_walked());
+    assert!(SubTable::AfConfig.is_walked());
     // Still-deferred sub-tables remain raw.
     assert!(!SubTable::Panorama.is_walked());
     assert!(!SubTable::MyColors.is_walked());
-    assert!(!SubTable::AmbienceInfo.is_walked());
+    assert!(!SubTable::FilterInfo.is_walked());
   }
 }

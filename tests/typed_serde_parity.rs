@@ -217,6 +217,28 @@ const NOT_ACTIVE: &[&str] = &[
   // emits only the structural moov/track scalars + the `Track1:Warning`
   // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
   "CanonRaw_ctmd.cr3",
+  // `CanonEOSR.cr3` (the REAL 27MB Canon EOS R CR3/MOV-container RAW) — PARTIAL.
+  // This chunk activated its CRX auto-`-ee` (QuickTime.pm:10010 forces
+  // `ExtractEmbedded` for CRX, so the `Track4` CTMD timed metadata + the `CRAW`
+  // preview extract WITHOUT an explicit `-ee`) and ported the EOS-R Canon
+  // MakerNote sub-tables: `BatteryType` (0x38 ⇒ 'LP-E6N'), `LightingOpt`
+  // DigitalLensOptimizer/DualPixelRaw, the new `Ambience`/`MultiExp`/`HDRInfo`/
+  // `AFConfig` (0x4020/0x4021/0x4025/0x4028) ProcessBinaryData tables, the
+  // EOS-R `CustomFunctions2` leaves + their `CanonCustom` re-grouping (the CMT3
+  // block now preserves each emission's group1 override), and `ColorData9`
+  // (count 1816/1820/1824 ⇒ the Track4 WB_RGGBLevels*/ColorTemp*/black+white
+  // levels). The no-`ee` `.json`/`.n.json` remain accept-deferred (~30-key
+  // residual): the lens/MakerNote-derived `Composite:*` (LensID/Lens/DOF/FOV/
+  // FocalLength35efl + BlueBalance/RedBalance/WB_RGGBLevels/DriveMode/FlashType…
+  // — the port-wide ScaleFactor35efl Canon-rational + MakerNote-composite
+  // deferrals); the `Composite:Aperture`/`ShutterSpeed` `inf` (the CTMD
+  // `FNumber`/`ExposureTime`=inf collapses to the Main doc under `-G1`, an open
+  // timed-metadata `Doc<N>` composite-scoping question); the `CRAW`
+  // `JpgFromRaw`/`QuickTime:PreviewImage`/`Track1:SampleTime`+`SampleDuration`
+  // CR3 preview-sample extraction; the two complex exp/log `CanonCustom`
+  // ApertureRange/ShutterSpeedRange; and the Track4 CTMD CameraTemperature/
+  // VignettingCorrVersion/AFPointsSelected niches + `Canon:ThumbnailImage`.
+  "CanonEOSR.cr3",
   // `DNG_preview_image.dng` (#352/#353) — the #331-P2 PreviewImage fixture set's
   // DNG member. Its IFD0→SubIFD (0x014a) carries `SubfileType=1` + StripOffsets/
   // StripByteCounts; the P2 PreviewImage gating is CORRECT (the DNG must — and

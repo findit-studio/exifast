@@ -10946,6 +10946,12 @@ fn emit_entry<S: ExifSink>(
 /// how a Canon `VendorEmission`'s `is_unknown()` flows through
 /// [`ExifMeta::push_maker_note_tags`].
 ///
+/// `BatteryType` (0x38) is the one leaf whose `RawConv` can yield undef — it is
+/// routed through
+/// [`CanonPrintConv::apply_battery_type`](makernotes::vendors::canon::printconv::CanonPrintConv::apply_battery_type)
+/// so a count `!= 76` or an empty post-header run SUPPRESSES the tag (emits
+/// NOTHING), matching ExifTool's `? $1 : undef`.
+///
 /// `model` is the parent body `$$self{Model}`, consumed only by the conditional
 /// `SerialNumber` list (`Canon.pm:1282-1306`); every other Canon `PrintConv`
 /// ignores it.
@@ -10959,6 +10965,19 @@ fn emit_canon_value<S: ExifSink>(
   model: Option<&str>,
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::canon::CanonPrintConv;
+  // `BatteryType` (0x38, `Canon.pm:1757-1764`) — its `RawConv => '$val=~/^.{4}
+  // ([^\0]+)/s ? $1 : undef'` (with `Condition => '$count == 76'`) YIELDS undef,
+  // and ExifTool SUPPRESSES the tag, when the count is not 76 OR the post-header
+  // non-NUL run is empty. Honour that undef-drop here — a `None` emits NOTHING
+  // rather than leaking the raw bytes — mirroring the Panasonic 0xc5/0xe4
+  // `apply_lens_type_model` drop in [`emit_panasonic_value`].
+  if canon_tag.conv() == CanonPrintConv::BatteryType {
+    let Some(value) = CanonPrintConv::apply_battery_type(raw) else {
+      return Ok(());
+    };
+    return out.write_vendor_value("MakerNotes", group1, name, value, canon_tag.is_unknown());
+  }
   let value = canon_tag.conv().apply(raw, print_conv, model);
   out.write_vendor_value("MakerNotes", group1, name, value, canon_tag.is_unknown())
 }
@@ -11651,8 +11670,9 @@ fn emit_canon_subtable<S: ExifSink>(
   use makernotes::vendors::canon::tags::SubTable;
   use makernotes::vendors::canon::{
     af_info, af_micro_adj, camera_info, camera_settings, canon_custom, color_balance, colordata,
-    crop_info, file_info, first4_all_zero, focal_length, lens_correction, measured_color,
-    processing, reserialize_int_array, reserialize_int32_array, sensor_info, shot_info, time_info,
+    crop_info, eosr_info, file_info, first4_all_zero, focal_length, lens_correction,
+    measured_color, processing, reserialize_int_array, reserialize_int32_array, sensor_info,
+    shot_info, time_info,
   };
 
   let blob = reserialize_int_array(raw, order);
@@ -11758,6 +11778,27 @@ fn emit_canon_subtable<S: ExifSink>(
     }
     // LensInfo (0x4019) is read as `undef[N]` ⇒ the shared raw-bytes blob.
     SubTable::LensInfo => lens_correction::parse_lens_info(&blob, order, print_conv),
+    // The EOS-R feature sub-tables (CanonEOSR.cr3): AmbienceInfo (0x4020) /
+    // MultiExp (0x4021) / HDRInfo (0x4025) / AFConfig (0x4028) — all `int32s`
+    // read as `undef[N]`/`int32u[N]`, so widen each word back to 4 bytes
+    // (`reserialize_int32_array` returns a `Bytes` undef-read blob verbatim).
+    // AFConfig threads `model` for its model-conditional indices 7/10/18/19.
+    SubTable::AmbienceInfo => {
+      let blob32 = reserialize_int32_array(raw, order);
+      eosr_info::parse_ambience(&blob32, order, print_conv)
+    }
+    SubTable::MultiExp => {
+      let blob32 = reserialize_int32_array(raw, order);
+      eosr_info::parse_multi_exp(&blob32, order, print_conv)
+    }
+    SubTable::HdrInfo => {
+      let blob32 = reserialize_int32_array(raw, order);
+      eosr_info::parse_hdr_info(&blob32, order, print_conv)
+    }
+    SubTable::AfConfig => {
+      let blob32 = reserialize_int32_array(raw, order);
+      eosr_info::parse_af_config(&blob32, order, print_conv, model)
+    }
     // CustomFunctions2 (0x99) — `ProcessCanonCustom2` against `CanonCustom::
     // Functions2`; emitted into the `CanonCustom` family-1 group (handled below).
     SubTable::CustomFunctions2 => {
