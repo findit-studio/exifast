@@ -53,7 +53,7 @@ fn fx3_variant_gate() {
 #[test]
 fn fx3_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9402(&blk, true);
+  let em = parse_tag9402(&blk, false, true);
   assert_eq!(
     find(&em, "AmbientTemperature"),
     Some(&TagValue::Str("0 C".into()))
@@ -69,7 +69,7 @@ fn fx3_print_conv_matches_golden() {
 #[test]
 fn fx3_raw_values_match_golden() {
   let blk = fx3_enciphered_block();
-  let em = parse_tag9402(&blk, false);
+  let em = parse_tag9402(&blk, false, false);
   assert_eq!(find(&em, "AmbientTemperature"), Some(&TagValue::I64(0)));
   assert_eq!(find(&em, "FocusMode"), Some(&TagValue::I64(4)));
   assert_eq!(find(&em, "AFAreaMode"), Some(&TagValue::I64(3)));
@@ -82,7 +82,7 @@ fn ambient_temperature_gated_on_temptest1() {
   let mut plain = vec![0u8; 400];
   plain[0x02] = 0x10; // not 255
   plain[0x04] = 0x05;
-  let em = parse_tag9402(&encipher(&plain), true);
+  let em = parse_tag9402(&encipher(&plain), false, true);
   assert!(find(&em, "AmbientTemperature").is_none());
 }
 
@@ -92,7 +92,7 @@ fn ambient_temperature_signed() {
   let mut plain = vec![0u8; 400];
   plain[0x02] = 0xff;
   plain[0x04] = 0xee; // -18 as int8s
-  let em = parse_tag9402(&encipher(&plain), true);
+  let em = parse_tag9402(&encipher(&plain), false, true);
   assert_eq!(
     find(&em, "AmbientTemperature"),
     Some(&TagValue::Str("-18 C".into()))
@@ -105,8 +105,43 @@ fn truncated_block_per_field() {
   let full = fx3_enciphered_block();
   // Keep through 0x18 — AmbientTemperature/FocusMode/AFAreaMode fit, the 0x2d
   // FocusPosition2 does not.
-  let em = parse_tag9402(&full[..0x18], true);
+  let em = parse_tag9402(&full[..0x18], false, true);
   assert!(find(&em, "AFAreaMode").is_some());
   assert!(find(&em, "FocusPosition2").is_none());
-  assert!(parse_tag9402(&[], true).is_empty());
+  assert!(parse_tag9402(&[], false, true).is_empty());
+}
+
+/// `$$self{DoubleCipher}`: a DOUBLE-enciphered block (the ExifTool 9.04-9.10
+/// write-bug form) needs a SECOND `Decipher` pass (`Sony.pm:11553-11556`). With
+/// `double_cipher=true` it recovers the correct FX3 fields; with `false` (the
+/// pre-fix behavior) the once-deciphered block is GARBAGE, NOT the right fields.
+#[test]
+fn double_cipher_second_pass() {
+  let mut plain = vec![0u8; 400];
+  plain[0x00] = 0x22;
+  plain[0x02] = 0xff;
+  plain[0x04] = 0x00;
+  plain[0x16] = 0x84; // FocusMode masked → 4 (AF-A)
+  plain[0x17] = 0x03; // AFAreaMode → Flexible Spot
+  plain[0x2d] = 0x94; // FocusPosition2 = 148
+  // On-disk DOUBLE-enciphered bytes = encipher(encipher(plain)).
+  let double = encipher(&encipher(&plain));
+
+  // double_cipher=true ⇒ two Decipher passes recover `plain` exactly.
+  let ok = parse_tag9402(&double, true, true);
+  assert_eq!(find(&ok, "FocusMode"), Some(&TagValue::Str("AF-A".into())));
+  assert_eq!(
+    find(&ok, "AFAreaMode"),
+    Some(&TagValue::Str("Flexible Spot".into()))
+  );
+  assert_eq!(find(&ok, "FocusPosition2"), Some(&TagValue::I64(148)));
+
+  // double_cipher=false ⇒ only one pass ⇒ the leaves do NOT match the truth
+  // (the bug this fix closes: once-deciphered garbage, not the real fields).
+  let bad = parse_tag9402(&double, false, true);
+  assert_ne!(
+    find(&bad, "FocusPosition2"),
+    Some(&TagValue::I64(148)),
+    "single decipher of a double-enciphered block must NOT yield the true value"
+  );
 }

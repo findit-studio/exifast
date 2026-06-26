@@ -15,11 +15,18 @@
 //! [`super::decipher::deciphered_block`]ed before this table reads it;
 //! `FORMAT => 'int8u'` + `FIRST_ENTRY => 0` (`Sony.pm:8689,8691`).
 //!
+//! `ProcessEnciphered` honours the file-global `$$self{DoubleCipher}` flag
+//! (`Sony.pm:11553-11556`): on a file the ExifTool 9.04-9.10 write bug
+//! double-enciphered — latched when the 0x9400 first byte ∈ {0x5e,0xe7,0x04}
+//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`) — the block is
+//! deciphered TWICE. [`parse_tag9402`] takes that flag and applies the second
+//! pass; without it a double-enciphered block emits once-deciphered garbage.
+//!
 //! Per the `ProcessBinaryData` contract each tag is emitted IFF its byte range
 //! is in the deciphered block ([[exifast-processbinarydata-per-field]]). Only
 //! the camera-metadata leaves the FX3 activation golden needs are ported here.
 
-use super::decipher::deciphered_block;
+use super::decipher::{decipher, deciphered_block};
 use crate::value::TagValue;
 
 /// One emitted `Tag9402` leaf — the resolved tag name and rendered value.
@@ -54,11 +61,21 @@ fn print_af_area_mode(v: u8) -> Option<&'static str> {
 /// FX3 activation golden needs.
 ///
 /// `src` is the on-disk (enciphered) `0x9402` value bytes; the caller has
-/// already confirmed the variant gate ([`selects_tag9402`]). `print_conv`
-/// selects `-j` (PrintConv) vs `-n` (raw `$val`).
+/// already confirmed the variant gate ([`selects_tag9402`]). `double_cipher` is
+/// the file-global `$$self{DoubleCipher}` flag (latched from the 0x9400 walk,
+/// [`super::tag9400::detects_double_cipher`]): when set, `ProcessEnciphered`
+/// applies a SECOND `Decipher` pass (`Sony.pm:11553-11556`) to undo the 9.04-9.10
+/// double-encipher write bug — without it a double-enciphered block would emit
+/// once-deciphered GARBAGE. `print_conv` selects `-j` (PrintConv) vs `-n` (raw
+/// `$val`).
 #[must_use]
-pub fn parse_tag9402(src: &[u8], print_conv: bool) -> Vec<Tag9402Emission> {
-  let buf = deciphered_block(src, 0, src.len());
+pub fn parse_tag9402(src: &[u8], double_cipher: bool, print_conv: bool) -> Vec<Tag9402Emission> {
+  let mut buf = deciphered_block(src, 0, src.len());
+  // `if ($$et{DoubleCipher}) { Decipher(\$data) }` (`Sony.pm:11553-11556`) — the
+  // recovery second pass over the same buffer for double-enciphered files.
+  if double_cipher {
+    decipher(&mut buf);
+  }
   let mut out = std::vec::Vec::new();
 
   // 0x0002 TempTest1 — DataMember, `RawConv` keeps it `undef` unless `Unknown`

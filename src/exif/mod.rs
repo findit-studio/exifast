@@ -8743,11 +8743,13 @@ impl Walker<'_, '_> {
     // top-level Exif walk (IFD0); a trailing-IFD or maker-note re-emission
     // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
     // Make alone.
-    // `Software` (0x0132, `Exif.pm:906`) is captured ALONGSIDE Make/Model: the
-    // same IFD0-only, last-wins, RawConv-`s/\s+$//`-trimmed `$$self{Software}`
+    // `Software` (0x0131, `Exif.pm:902-906`) is captured ALONGSIDE Make/Model:
+    // the same IFD0-only, last-wins, RawConv-`s/\s+$//`-trimmed `$$self{Software}`
     // the dispatcher reads (the Sony `Tag9401` ISOInfo sub-block selection keys
-    // on it).
-    if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110 || tag_id == 0x0132) {
+    // on it). NOTE 0x0131 is `Software`; 0x0132 is `ModifyDate` (`Exif.pm:909`) —
+    // the DataMember side effect (`$$self{Software} = $val`, `Exif.pm:905-906`)
+    // lives on 0x0131, so the capture MUST key on 0x0131, not the date tag.
+    if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110 || tag_id == 0x0131) {
       // The RawConv'd `$$self{Make}`/`$$self{Model}`/`$$self{Software}`: the
       // stringified `$val` ([`RawValue::raw_conv_val_string`], faithful to any
       // readable shape), with the `s/\s+$//` trailing-whitespace trim on top.
@@ -8757,7 +8759,7 @@ impl Walker<'_, '_> {
         self.captured_make = Some(trimmed.to_string());
       } else if tag_id == 0x0110 {
         self.captured_model = Some(trimmed.to_string());
-      } else if tag_id == 0x0132 {
+      } else if tag_id == 0x0131 {
         self.captured_software = Some(trimmed.to_string());
       }
     }
@@ -12095,6 +12097,13 @@ pub(in crate::exif) fn sony_makernote_isolated(
   let mut emissions = std::vec::Vec::new();
   let mut typed = sony::MakerNotesSony::new();
   let mut af_area: Option<i64> = None;
+  // `$$self{DoubleCipher}` (`Sony.pm:1847`) — the write-bug recovery flag set as
+  // a SIDE EFFECT of the `Tag9400a` Condition when the enciphered `0x9400` first
+  // byte ∈ {0x5e,0xe7,0x04} (the double-enciphered 0x07/0x09/0x0a). Once set, EVERY
+  // 0x94xx `ProcessEnciphered` block is deciphered TWICE (`Sony.pm:11553-11556`).
+  // 0x9400 < 0x9402 in IFD-tag order, so this is observed BEFORE the 0x9402 entry
+  // that consumes it — the same set-on-9400/read-on-9402 object-flag ordering.
+  let mut double_cipher = false;
   {
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
@@ -12103,6 +12112,16 @@ pub(in crate::exif) fn sony_makernote_isolated(
       // 0x201e), matching `parse_in_tiff`'s in-walk capture.
       if entry.tag_id == 0x201c {
         af_area = sony::af_area_data_member_from_raw(entry.value.raw(), model);
+      }
+      // 0x9400's `Tag9400a` Condition side-effect (`Sony.pm:1847`): a DoubleCipher
+      // first byte LATCHES the flag for the rest of the walk. Read the entry's
+      // verbatim on-disk value span (the same `$$valPt` the Perl Condition tests).
+      if entry.tag_id == 0x9400
+        && let Some(end) = entry.value_offset().checked_add(entry.value_size())
+        && let Some(raw) = data.get(entry.value_offset()..end)
+        && sony::tag9400::detects_double_cipher(raw)
+      {
+        double_cipher = true;
       }
       // Only `ResolvedConv::Sony` entries live in this run; the resolved `SonyTag`
       // rides in the entry's `conv`. A defensive non-Sony conv (never produced
@@ -12129,7 +12148,16 @@ pub(in crate::exif) fn sony_makernote_isolated(
       // `$valuePtr`/`$size` ExifTool's `ProcessEnciphered` reads); a hostile
       // span is bounds-checked by `get`, so an out-of-range entry decodes
       // nothing rather than panicking.
-      sony_emit_enciphered_subblock(data, g1, entry, model, software, print_conv, &mut sink);
+      sony_emit_enciphered_subblock(
+        data,
+        g1,
+        entry,
+        model,
+        software,
+        double_cipher,
+        print_conv,
+        &mut sink,
+      );
     }
   }
   Some((emissions, typed))
@@ -12151,12 +12179,17 @@ pub(in crate::exif) fn sony_makernote_isolated(
 /// deciphered `Ver9401` + `$$self{Software}` (`Sony.pm:8659-8662`). A non-ported
 /// variant (older bodies) emits nothing — its leaves stay deferred. The leaves
 /// ride the Sony vendor family-1 group; none are `Unknown => 1`.
+///
+/// `double_cipher` is the file-global `$$self{DoubleCipher}` flag (latched from
+/// the 0x9400 walk): when set, the `Tag9402` `ProcessEnciphered` block is
+/// deciphered TWICE (`Sony.pm:11553-11556`).
 fn sony_emit_enciphered_subblock<S: ExifSink>(
   data: &[u8],
   group1: &str,
   entry: &ExifEntry,
   model: Option<&str>,
   software: Option<&str>,
+  double_cipher: bool,
   print_conv: bool,
   out: &mut S,
 ) {
@@ -12195,9 +12228,10 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
       }
     }
     // `Tag9402` — not SLT/HV/ILCA and the enciphered first byte ∉ {0x05,0xff}
-    // (`Sony.pm:1969`).
+    // (`Sony.pm:1969`). `double_cipher` (latched from the 0x9400 walk) selects the
+    // second `Decipher` pass (`Sony.pm:11553-11556`).
     0x9402 if tag9402::selects_tag9402(raw, model) => {
-      for emi in tag9402::parse_tag9402(raw, print_conv) {
+      for emi in tag9402::parse_tag9402(raw, double_cipher, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }

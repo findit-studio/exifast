@@ -23,13 +23,15 @@
 //! in place, mirroring `Decipher(\$data)` — a pure per-byte substitution that
 //! NEVER reads or writes out of bounds.
 //!
-//! Scope: the DoubleCipher path (`Sony.pm:11553-11556`, a write-bug recovery for
-//! ExifTool 9.04-9.10 that applies the cipher twice) is NOT handled here — it is
-//! triggered only for the `Tag9400a`/`Tag9402`/`Tag9404`/`Tag9405` variants whose
-//! enciphered first byte is `\x5e`/`\xe7`/`\x04` (`Sony.pm:1847`), none of which
-//! are the single-ciphered `Tag9050c`/`Tag9400c` blocks this module's callers
-//! decode. A double-ciphered block would simply decode to garbage leaves (as it
-//! does in ExifTool without the `DoubleCipher` flag set), never a panic.
+//! Scope: the DoubleCipher second pass (`Sony.pm:11553-11556`, a write-bug
+//! recovery for ExifTool 9.04-9.10 that applies the cipher twice) is NOT baked
+//! into [`deciphered_block`]/[`decipher`] — those are a single substitution pass,
+//! matching the one `Decipher(\$data)` call. The file-global `$$self{DoubleCipher}`
+//! flag is latched when the 0x9400 first byte ∈ {0x5e,0xe7,0x04}
+//! ([`super::tag9400::detects_double_cipher`], `Sony.pm:1847`), and the affected
+//! `ProcessEnciphered` callers (e.g. [`super::tag9402::parse_tag9402`]) invoke
+//! [`decipher`] a SECOND time over the recovered buffer. Without that flag, a
+//! double-enciphered block decodes to garbage (as in ExifTool), never a panic.
 
 /// `sub Decipher` (`Sony.pm:11517-11529`) — the inverse substitution table.
 ///

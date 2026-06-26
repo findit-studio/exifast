@@ -51,6 +51,17 @@ pub fn selects_tag9400c(raw: &[u8]) -> bool {
   matches!(raw.first(), Some(b) if TAG9400C_FIRST_BYTES.contains(b))
 }
 
+/// The `Tag9400a` `Condition` side-effect that latches `$$self{DoubleCipher} = 1`
+/// (`Sony.pm:1847`): the enciphered `0x9400` first byte ∈ {0x5e,0xe7,0x04} — the
+/// DOUBLE-enciphered forms of 0x07/0x09/0x0a (the single-cipher `Tag9400a` first
+/// bytes), produced by the ExifTool 9.04-9.10 double-encipher write bug. When
+/// this fires, `ProcessEnciphered` deciphers every 0x94xx block twice
+/// (`Sony.pm:11553-11556`). Tested against the RAW on-disk bytes (pre-decipher).
+#[must_use]
+pub fn detects_double_cipher(raw: &[u8]) -> bool {
+  matches!(raw.first(), Some(0x5e | 0xe7 | 0x04))
+}
+
 /// 0x0016 `SequenceLength` PrintConv hash (the "N shots" form, `Sony.pm:8542`).
 fn print_sequence_length_shots(v: u8) -> Option<&'static str> {
   Some(match v {

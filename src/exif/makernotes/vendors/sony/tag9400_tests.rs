@@ -61,6 +61,27 @@ fn fx3_first_byte_selects_tag9400c() {
   assert!(!selects_tag9400c(&[]));
 }
 
+/// The `Tag9400a` Condition latches `$$self{DoubleCipher}` for first bytes
+/// {0x5e,0xe7,0x04} (`Sony.pm:1847`). These are the ENCIPHERED forms of the
+/// single-cipher `Tag9400a` first bytes 0x07/0x09/0x0a: on a doubly-enciphered
+/// file the on-disk first byte is `encipher(plaintext-cipher-byte)`, so it
+/// deciphers ONCE to 0x07/0x09/0x0a (the normal first byte) and needs a second
+/// pass to reach the true plaintext.
+#[test]
+fn double_cipher_first_byte_latch() {
+  for &b in &[0x5eu8, 0xe7, 0x04] {
+    assert!(detects_double_cipher(&[b, 0x00]));
+  }
+  // encipher(0x07/0x09/0x0a) == 0x5e/0xe7/0x04 (the over-enciphered first byte).
+  assert_eq!(encipher(&[0x07]), vec![0x5e]);
+  assert_eq!(encipher(&[0x09]), vec![0xe7]);
+  assert_eq!(encipher(&[0x0a]), vec![0x04]);
+  // The single-cipher Tag9400a/c first bytes (and an empty block) do NOT latch it.
+  assert!(!detects_double_cipher(&[0x07, 0x00]));
+  assert!(!detects_double_cipher(&[0x31, 0x00]));
+  assert!(!detects_double_cipher(&[]));
+}
+
 #[test]
 fn fx3_tag9400c_print_conv_matches_golden() {
   let blk = fx3_enciphered_block();
