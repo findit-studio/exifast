@@ -10178,31 +10178,23 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
   // leaves whose final value comes from those sub-tables' DataMembers) and the
   // `Composite:*` that `Require`/`Desire` them. FX3 (newer body: the `Tag9xxx`
   // encrypted series + `Tag202a`).
+  // The FX3 `%Sony::Main` encrypted sub-table tower is now FULLY PORTED — the
+  // `Decipher` cipher + the model/version-dispatched ProcessBinaryData tables
+  // (`Tag9050c`/`Tag9400c`/`Tag9401`(ISOInfo)/`Tag9402`/`Tag9406`/`Tag940c`/
+  // `Tag9416` + the plain `Tag202a`) emit every remaining `Sony:*` exposure/AF/
+  // lens/battery/ISO leaf, and the five dependent `Composite:*`
+  // (LensID/BlueBalance/RedBalance/CFAPattern/FocusDistance2) now compute
+  // byte-exact. The SOLE residual is one embedded-XMP leaf:
   const FX3_DEFERRED: &[&str] = &[
-    "Composite:BlueBalance",
-    "Composite:CFAPattern",
-    "Composite:FocalLength35efl",
-    "Composite:FocusDistance2",
-    "Composite:LensID",
-    "Composite:RedBalance",
-    "Composite:ScaleFactor35efl",
-    // The Tag9416 chunk-2 port lands SonyISO/StopsAboveBaseISO/exposure/aperture/
-    // lens/CreativeStyle/PictureProfile/FocalLength/CorrParams; Tag9402 lands
-    // AmbientTemperature/AFAreaMode/FocusPosition2; Tag940c lands LensMount2/
-    // LensType3/CameraE-mountVersion/LensE-mountVersion/LensFirmwareVersion. What
-    // REMAINS deferred (a later chunk) is the Tag2010 battery/exposure-meta block
-    // and the embedded-XMP Rating:
-    "Sony:BatteryLevel",
-    "Sony:BatteryTemperature",
-    "Sony:ExposureStandardAdjustment",
-    "Sony:FlashExposureComp",
-    "Sony:FocalPlaneAFPointsUsed",
-    "Sony:ISOAutoMax",
-    "Sony:ISOAutoMin",
-    "Sony:ISOSetting",
-    "Sony:WhiteBalance",
-    // `XMP-xmp:Rating` — the embedded XMP packet (a separate deferred parse for
-    // this raw; the Sony-main port is the activation blocker, not this leaf).
+    // `XMP-xmp:Rating` (= 0) — the IFD0 `0x02bc` ApplicationNotes XMP packet
+    // (`<xmp:Rating>0</xmp:Rating>`). exifast routes embedded XMP to the shared
+    // `ProcessXMP` parser ONLY from the JPEG `APP1` marker walk (`src/exif/
+    // jpeg.rs`); the TIFF/raw IFD0 `0x02bc` SubDirectory → `XMP::Main` routing
+    // (`Exif.pm`, the ApplicationNotes arm) is a SEPARATE, cross-cutting
+    // subsystem (it would emit XMP for every TIFF/DNG/CR2/NEF raw) that is NOT
+    // part of the Sony deep-table port — deferred to its own campaign. This is
+    // the lone niche exclusion; the `Sony:Rating` (= 0) MakerNote leaf IS
+    // emitted byte-exact.
     "XMP-xmp:Rating",
   ];
   // A33 (older SLT body: `CameraInfo3`/`AFInfo`(AFStatus grid)/`CameraSettings3`/

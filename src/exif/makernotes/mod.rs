@@ -393,6 +393,10 @@ impl MakerNotesMeta {
           parent_order,
           make,
           model,
+          // The `from_blob` path has no parent IFD0, so `$$self{Software}` is
+          // unavailable; the `Tag9401` ISOInfo Software-disambiguated rows fall
+          // through (the non-Software-keyed `Ver9401` rows still resolve).
+          None,
           true,
         ) {
           meta.sony = Some(typed);

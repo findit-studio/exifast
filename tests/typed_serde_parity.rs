@@ -231,30 +231,32 @@ const NOT_ACTIVE: &[&str] = &[
   // ACTIVE: #393 ported their MakerNote variants byte-exact, so they moved out of
   // NOT_ACTIVE into the active set with per-fixture FIXTURE_EXCLUDED_KEYS for the
   // non-MakerNote residuals.)
-  // The three real Sony ARW raws (FX3 / SLT-A33 / DSLR-A200) carry paired
-  // `.json`/`.n.json` goldens but are accept-deferred from the byte-exact set:
+  // The `Sony_ILME-FX3_real.ARW` raw is now ACTIVE: the `%Sony::Main` ENCRYPTED
+  // sub-table tower for the FX3 body is FULLY PORTED — the `Decipher`
+  // substitution cipher + the model/version-dispatched ProcessBinaryData tables
+  // (`Tag9050c`/`Tag9400c`/`Tag9401`(ISOInfo)/`Tag9402`/`Tag9406`/`Tag940c`/
+  // `Tag9416` + the plain `Tag202a`) emit every `Sony:*` exposure/AF/lens/
+  // battery/ISO leaf, and the five dependent `Composite:*` (LensID/BlueBalance/
+  // RedBalance/CFAPattern/FocusDistance2) now compute byte-exact (with the
+  // FocalLength35efl/ScaleFactor35efl pair). It moves into the active set with a
+  // per-fixture `FIXTURE_EXCLUDED_KEYS` entry for the lone `XMP-xmp:Rating`
+  // residual (the IFD0 `0x02bc` ApplicationNotes XMP routing is a separate
+  // cross-cutting subsystem — see `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`).
+  //
+  // The two OLDER Sony ARW raws (`SLT-A33` / `DSLR-A200`) stay accept-deferred:
   // their core EXIF/SubIFD + the ENTIRE SR2 subsystem (the `DNGPrivateData`
   // 0xc634 → `%Sony::SR2Private` descent, the `Decrypt` LFSR, and the decrypted
   // `%Sony::SR2SubIFD` + `%Sony::SR2DataIFD` walks — `SR2:*`/`SR2SubIFD:*`/
-  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are the
-  // Sony ARW `SubIFD:*` raw tags (`SonyRawFileType`/`SonyToneCurve`/
-  // Vignetting/Distortion/ChromaticAberration/CropTopLeft/CropSize/CFA/
-  // BlackLevel/WhiteLevel/WB_RGGBLevels), the `Compression => 'Sony ARW
-  // Compressed'` (32767), the IFD2 `JpgFromRawStart`/`Length`/`JpgFromRaw` +
-  // `YCbCrSubSampling`, and the IFD0/IFD2 `IsImageData` PreviewImage/JpgFromRaw
-  // placeholders. The RESIDUAL is the `%Sony::Main` ENCRYPTED sub-table tower —
-  // the `Decipher` substitution cipher + the model-version-dispatched
-  // ProcessBinaryData tables (`Tag9050x`/`Tag9400x`/`Tag9402`/`Tag9403`/
-  // `Tag9406`/`Tag940c`/`Sony_0x9416`/`CameraSettings*`/`CameraInfo*`/`AFInfo`/
-  // `ExtraInfo*`/`MoreInfo`) — which emit the ~45 (FX3) / ~101 (A33) / ~72
-  // (A200) remaining `Sony:*` exposure/AF/lens leaves and the 5 `Composite:*`
-  // (LensID/FocalLength35efl/BlueBalance/RedBalance/CFAPattern) that depend on
-  // them; A200 ADDITIONALLY needs the `%MinoltaRaw::Main` MRW port (22
+  // `SR2DataIFD*:ColorMode`) ARE byte-exact in BOTH `-j` and `-n`, as are their
+  // Sony ARW `SubIFD:*` raw tags, the `Compression => 'Sony ARW Compressed'`
+  // (32767), the IFD2 `JpgFromRaw*`, and the `IsImageData` placeholders. Their
+  // RESIDUAL is the OLDER-body `%Sony::Main` sub-table tower (A33: `CameraInfo3`/
+  // `AFInfo`(AFStatus grid)/`CameraSettings3`/`ExtraInfo3`/`MoreInfo`/`Tag900b`
+  // — ~101 leaves; A200: `CameraSettings`/`CameraInfoA200` — ~72 leaves) which
+  // emit the remaining `Sony:*` exposure/AF/lens leaves + the dependent
+  // `Composite:*`; A200 ADDITIONALLY needs the `%MinoltaRaw::Main` MRW port (22
   // `MinoltaRaw:*`, which also overrides its `Composite:ImageSize`/`Megapixels`).
-  // That sub-table tower is a separate faithful campaign (it must port the
-  // Decipher cipher + each ~100-offset conditional table 1:1); the SR2/SubIFD/
-  // conversion foundation landed here is its prerequisite.
-  "Sony_ILME-FX3_real.ARW",
+  // Those OLDER sub-table towers are a separate faithful campaign.
   "Sony_SLT-A33_real.ARW",
   "Sony_DSLR-A200_real.ARW",
 ];
@@ -479,6 +481,16 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // the prior `Invalid zxIf chunk`) is what this fixture pins. Mirrors
   // `conformance.rs::png_crafted_input_hardening_conformance`'s `check_excluding`.
   ("PNG_nested_zxif.png", &["PNG:zxIf"]),
+  // The `Sony_ILME-FX3_real.ARW` raw is now active (its `%Sony::Main` encrypted
+  // sub-table tower is fully ported — see the `NOT_ACTIVE` note). The lone
+  // residual is `XMP-xmp:Rating` (= 0) from the IFD0 `0x02bc` ApplicationNotes
+  // XMP packet: exifast routes embedded XMP to the shared `ProcessXMP` parser
+  // only from the JPEG `APP1` marker walk, not the TIFF/raw `0x02bc`
+  // SubDirectory (a separate cross-cutting subsystem deferred to its own
+  // campaign). Dropped from BOTH sides; the `Sony:Rating` (= 0) MakerNote leaf
+  // IS emitted. Mirrors `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s
+  // `FX3_DEFERRED`.
+  ("Sony_ILME-FX3_real.ARW", &["XMP-xmp:Rating"]),
 ];
 
 /// The fully-qualified `Family1:Name` keys to drop for `fixture` (empty when
@@ -1590,7 +1602,14 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// under family-0 `JUMBF` / family-1 `CBOR`; the JUMBFLabel rename does NOT fire
 /// (`cbor` lacks `BlockExtract`). No prior golden changes (`cbor` only fires for
 /// a `cbor` content box).
-const EXPECTED_ACTIVE_FIXTURES: usize = 636;
+///
+/// 636 → 637: the `Sony_ILME-FX3_real.ARW` raw GRADUATES out of `NOT_ACTIVE`
+/// into the active set — its `%Sony::Main` encrypted sub-table tower is fully
+/// ported (the `Decipher` cipher + `Tag9050c`/`Tag9400c`/`Tag9401`(ISOInfo)/
+/// `Tag9402`/`Tag9406`/`Tag940c`/`Tag9416`/`Tag202a` ProcessBinaryData tables +
+/// the five dependent `Composite:*`), with a single `FIXTURE_EXCLUDED_KEYS`
+/// entry for the `XMP-xmp:Rating` IFD0-`0x02bc`-XMP residual.
+const EXPECTED_ACTIVE_FIXTURES: usize = 637;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

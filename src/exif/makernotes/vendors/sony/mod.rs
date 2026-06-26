@@ -76,9 +76,12 @@ pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
 pub mod sr2;
+pub mod tag202a;
 pub mod tag9050;
 pub mod tag9400;
+pub mod tag9401;
 pub mod tag9402;
+pub mod tag9406;
 pub mod tag940c;
 pub mod tag9416;
 pub mod tags;
@@ -538,6 +541,7 @@ mod tests {
       order,
       Some("SONY"),
       model,
+      None,
       print_conv,
     ) {
       Some((emissions, typed)) => (typed, emissions),
