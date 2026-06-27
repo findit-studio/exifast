@@ -12583,7 +12583,7 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
     afinfo, tag202a, tag900b, tag940a, tag940c, tag940e, tag9050, tag9400, tag9401, tag9402,
-    tag9403, tag9404, tag9406, tag9416,
+    tag9403, tag9404, tag9405, tag9406, tag9416,
   };
   // The verbatim on-disk value span (the enciphered cipher block, or the plain
   // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
@@ -12663,6 +12663,29 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
       let buf = process_enciphered(raw, double_cipher);
       for emi in tag9404::parse_tag9404c(&buf, print_conv) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9405a`/`Tag9405b` — the color/lens block (lens-mount/-type, distortion/
+    // vignetting/chromatic-aberration correction params; `Tag9405b` also ISO/
+    // exposure/aperture/CreativeStyle). The variant is selected by the RAW
+    // (enciphered) first value byte (`Sony.pm:2024-2040`): `0x1b`/`0x40`/`0x7d`
+    // ⇒ `Tag9405a`, the 8-value set ⇒ `Tag9405b`; anything else is the unknown
+    // `Sony_0x9405` (emits nothing).
+    // Both tables are `PRIORITY => 0` (`Sony.pm:8887`/`8964`), so each leaf rides
+    // priority 0 — it never overrides an earlier same-name duplicate (e.g. a
+    // `Tag9050`/`CameraSettings` `LensType`).
+    0x9405 if tag9405::selects_tag9405a(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9405::parse_tag9405a(&buf, model, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x9405 if tag9405::selects_tag9405b(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9405::parse_tag9405b(&buf, model, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
       }
     }
     // `Tag9406` — battery temp/level, selected by the enciphered first+third
