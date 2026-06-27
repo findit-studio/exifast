@@ -217,28 +217,16 @@ const NOT_ACTIVE: &[&str] = &[
   // emits only the structural moov/track scalars + the `Track1:Warning`
   // ExtractEmbedded hint. The #81 proof is pinned at `-ee`, not the no-`ee` path.
   "CanonRaw_ctmd.cr3",
-  // `CanonEOSR.cr3` (the REAL 27MB Canon EOS R CR3/MOV-container RAW) — PARTIAL.
-  // This chunk activated its CRX auto-`-ee` (QuickTime.pm:10010 forces
-  // `ExtractEmbedded` for CRX, so the `Track4` CTMD timed metadata + the `CRAW`
-  // preview extract WITHOUT an explicit `-ee`) and ported the EOS-R Canon
-  // MakerNote sub-tables: `BatteryType` (0x38 ⇒ 'LP-E6N'), `LightingOpt`
-  // DigitalLensOptimizer/DualPixelRaw, the new `Ambience`/`MultiExp`/`HDRInfo`/
-  // `AFConfig` (0x4020/0x4021/0x4025/0x4028) ProcessBinaryData tables, the
-  // EOS-R `CustomFunctions2` leaves + their `CanonCustom` re-grouping (the CMT3
-  // block now preserves each emission's group1 override), and `ColorData9`
-  // (count 1816/1820/1824 ⇒ the Track4 WB_RGGBLevels*/ColorTemp*/black+white
-  // levels). The no-`ee` `.json`/`.n.json` remain accept-deferred (~30-key
-  // residual): the lens/MakerNote-derived `Composite:*` (LensID/Lens/DOF/FOV/
-  // FocalLength35efl + BlueBalance/RedBalance/WB_RGGBLevels/DriveMode/FlashType…
-  // — the port-wide ScaleFactor35efl Canon-rational + MakerNote-composite
-  // deferrals); the `Composite:Aperture`/`ShutterSpeed` `inf` (the CTMD
-  // `FNumber`/`ExposureTime`=inf collapses to the Main doc under `-G1`, an open
-  // timed-metadata `Doc<N>` composite-scoping question); the `CRAW`
-  // `JpgFromRaw`/`QuickTime:PreviewImage`/`Track1:SampleTime`+`SampleDuration`
-  // CR3 preview-sample extraction; the two complex exp/log `CanonCustom`
-  // ApertureRange/ShutterSpeedRange; and the Track4 CTMD CameraTemperature/
-  // VignettingCorrVersion/AFPointsSelected niches + `Canon:ThumbnailImage`.
-  "CanonEOSR.cr3",
+  // (`CanonEOSR.cr3` — the REAL 27MB Canon EOS R CR3 — is now ACTIVE: the
+  // ScaleFactor35efl Canon-rational + full %Canon::Composite chain, the CRX
+  // `JpgFromRaw`/`PreviewImage`/`SampleTime`/`SampleDuration` preview subsystem,
+  // `Canon:ThumbnailImage`, the CTMD AFInfo2 `AFPointsSelected` + CameraTemperature
+  // (EOS model-threaded), and the EOS-R CustomFunctions `ApertureRange`/
+  // `ShutterSpeedRange` all landed byte-exact. It moved into the active set with a
+  // `FIXTURE_EXCLUDED_KEYS` entry for the two niche residuals — `Composite:LensID`
+  // (ambiguous RF-lens disambiguation) + `Track4:VignettingCorrVersion`
+  // (`0x4015` VignettingCorrUnknown2 conditional variant) — see
+  // `conformance.rs::canon_eos_r_cr3_conformance`.)
   // `DNG_preview_image.dng` (#352/#353) — the #331-P2 PreviewImage fixture set's
   // DNG member. Its IFD0→SubIFD (0x014a) carries `SubfileType=1` + StripOffsets/
   // StripByteCounts; the P2 PreviewImage gating is CORRECT (the DNG must — and
@@ -606,6 +594,17 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
       "IFD3:CR2CFAPattern",
       "IFD3:RawImageSegmentation",
     ],
+  ),
+  // The REAL 27MB Canon EOS R CR3 — byte-exact except two genuinely-niche
+  // deferrals (mirrors `conformance.rs::canon_eos_r_cr3_conformance`'s
+  // `CR3_DEFERRED`): `Composite:LensID` (the ambiguous Canon RF `LensType` needs
+  // the unported `Exif::PrintLensID` lens-DB disambiguation, like the Sony A33/
+  // A200 LensID) + `Track4:VignettingCorrVersion` (the CTMD `0x4015`
+  // `VignettingCorrUnknown2` model-keyed Unknown variant — the ported
+  // `VignettingCorr`/`VignettingCorr2` tables do not cover the Unknown2 branch).
+  (
+    "CanonEOSR.cr3",
+    &["Composite:LensID", "Track4:VignettingCorrVersion"],
   ),
 ];
 
@@ -1761,7 +1760,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// chunk-1 `ColorData4`/`AFMicroAdj` infra. A `FIXTURE_EXCLUDED_KEYS` entry
 /// drops the `XMP-xmp:Rating` (TIFF-0x02bc XMP routing) + the four CR2-private
 /// SRaw/CFA IFD2/IFD3 leaves.
-const EXPECTED_ACTIVE_FIXTURES: usize = 641;
+///
+/// `642`: `CanonEOSR.cr3` (the REAL 27MB Canon EOS R CR3) graduated — the
+/// ScaleFactor35efl Canon-rational + %Canon::Composite chain, the CRX preview
+/// subsystem (`JpgFromRaw`/`PreviewImage`/`SampleTime`/`SampleDuration`),
+/// `Canon:ThumbnailImage`, the CTMD AFInfo2 `AFPointsSelected`/CameraTemperature,
+/// and the EOS-R CustomFunctions `ApertureRange`/`ShutterSpeedRange` all byte-exact;
+/// a `FIXTURE_EXCLUDED_KEYS` entry drops the two niche residuals
+/// (`Composite:LensID` + `Track4:VignettingCorrVersion`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 642;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

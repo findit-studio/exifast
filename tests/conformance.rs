@@ -10620,14 +10620,22 @@ fn canon_eos_7d_conformance() {
 
 #[test]
 fn canon_eos_r_cr3_conformance() {
-  // The remaining deferred keys (shrunk as the CRX-preview + Track4-niche ports
-  // land). `Composite:LensID` stays deferred (the Canon RF-lens disambiguation —
-  // see `FIXTURE_EXCLUDED_KEYS` in `tests/typed_serde_parity.rs`).
-  const CR3_DEFERRED: &[&str] = &[
-    "Composite:LensID",
-    "Track4:CameraTemperature",
-    "Track4:VignettingCorrVersion",
-  ];
+  // The REAL 27MB Canon EOS R CR3 — byte-exact at `-j`/`-n` except two
+  // genuinely-niche deferrals (mirrored in `FIXTURE_EXCLUDED_KEYS`,
+  // `tests/typed_serde_parity.rs`):
+  //   * `Composite:LensID` — the ambiguous Canon RF `LensType` (61182, "or other
+  //     Canon RF Lens") needs the unported `Exif::PrintLensID` focal-range
+  //     disambiguation (the RFLensType lens-DB lookup); exifast defers rather than
+  //     emit the wrong ambiguous name (same class as the Sony A33/A200 LensID).
+  //   * `Track4:VignettingCorrVersion` — the CTMD `0x4015` `VignettingCorrUnknown2`
+  //     conditional variant (a model-keyed Unknown ProcessBinaryData whose only
+  //     non-Unknown leaf is this version byte); the ported `VignettingCorr`/
+  //     `VignettingCorr2` tables do not cover the Unknown2 branch.
+  // Everything else — the ScaleFactor35efl Canon-rational + full %Canon::Composite
+  // chain, the CRX `JpgFromRaw`/`PreviewImage`/`SampleTime`/`SampleDuration`,
+  // `Canon:ThumbnailImage`, the CTMD AFInfo2 `AFPointsSelected`, the EOS-R
+  // CustomFunctions `ApertureRange`/`ShutterSpeedRange` — is byte-exact.
+  const CR3_DEFERRED: &[&str] = &["Composite:LensID", "Track4:VignettingCorrVersion"];
   check_excluding("CanonEOSR.cr3", "CanonEOSR.cr3.json", true, CR3_DEFERRED);
   check_excluding("CanonEOSR.cr3", "CanonEOSR.cr3.n.json", false, CR3_DEFERRED);
 }
