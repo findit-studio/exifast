@@ -130,14 +130,23 @@ pub fn model_is_camera_info_750d(model: Option<&str>) -> bool {
   })
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo5DmkII` (`Canon.pm:1347`,
+/// `$$self{Model} =~ /EOS 5D Mark II$/` — end-anchored, so the "Mark II", NOT the
+/// "Mark III" (which ends with `III`, never matching the `II$`)).
+#[must_use]
+pub fn model_is_camera_info_5dmkii(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 5D Mark II"))
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: the 1-series no-Hook bodies (1D / 1DS / 1DmkII / 1DmkIIN /
 /// 1DmkIII), the 5D / 6D / 7D, and the xxxD DSLR batch (40D / 50D / 60D / 70D /
 /// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
-/// 1100D / 1200D aliases); any other model yields nothing (deferred). The
-/// multi-Hook pro bodies (1DmkIV / 1DX / 5DmkII / 5DmkIII), the mirrorless and
-/// PowerShot count-keyed tables remain deferred. `print_conv` selects the
+/// 1100D / 1200D aliases), and the single-Hook pro 5DmkII; any other model
+/// yields nothing (deferred). The remaining multi-Hook pro bodies (1DmkIV / 1DX
+/// / 5DmkIII), the mirrorless and PowerShot count-keyed tables remain deferred.
+/// `print_conv` selects the
 /// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
@@ -159,6 +168,8 @@ pub fn parse(
     camera_info_1dmkiii(data, order, print_conv, model, canon_lens_type)
   } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
+  } else if model_is_camera_info_5dmkii(model) {
+    camera_info_5dmkii(data, order, print_conv, canon_lens_type)
   } else if model_is_camera_info_6d(model) {
     camera_info_6d(data, order, print_conv)
   } else if model_is_camera_info_7d(model) {
@@ -1344,6 +1355,147 @@ fn canon_firm_50d(data: &[u8]) -> u8 {
   if firmware_prefix_at(data, 0x15a) {
     1
   } else if firmware_prefix_at(data, 0x15e) {
+    2
+  } else {
+    0
+  }
+}
+
+/// Map a `CameraInfo` table offset to its byte offset under the firmware
+/// `hooks`. Each `(hook_off, delta)` shifts every leaf STRICTLY after `hook_off`
+/// by `delta`, and the shifts accumulate — a faithful port of ExifTool's
+/// `varSize` mechanism (`ExifTool.pm:9957`/`10049`/`10076`): a tag's offset is
+/// computed with the PRE-Hook `varSize`, its `Hook` then adjusts `varSize` for
+/// every LATER tag, so the Hook-bearing entry itself is read UNSHIFTED (hence
+/// `off > hook_off`, strictly). `None` ⇒ the shifted offset is not
+/// representable — the unrecognized-firmware `+0x10000` abort pushes later
+/// leaves out of range, where ExifTool (having `Warn`ed and set `CanonFirm = 0`)
+/// emits nothing.
+fn shifted_at(off: usize, hooks: &[(usize, i64)]) -> Option<usize> {
+  let mut a = off as i64;
+  for &(hook_off, delta) in hooks {
+    if off > hook_off {
+      a += delta;
+    }
+  }
+  usize::try_from(a).ok()
+}
+
+/// `%Canon::CameraInfo5DmkII` (`Canon.pm:3967-4109`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`. The `0x00 FirmwareVersionLookAhead` sets
+/// `CanonFirm` (probing the version string at 0x15a then 0x17e); the SINGLE
+/// `0xea` `Hook` shifts every leaf AFTER 0xea. `0x2f7 PictureStyleInfo` walks
+/// `%Canon::PSInfo`; `canon_lens_type` gates the `0x1b MacroMagnification` leaf.
+fn camera_info_5dmkii(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  canon_lens_type: Option<u16>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let canon_firm = canon_firm_5dmkii(data);
+  let hooks: [(usize, i64); 1] = [(0xea, hook_5dmkii_ea(canon_firm))];
+  let at = |off: usize| shifted_at(off, &hooks);
+
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_flash_model(data, 0x13, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_macro_magnification(data, 0x1b, canon_lens_type, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x31, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x50,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x52,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x6f, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x73, order, &mut push);
+  emit_picture_style(data, 0xa7, print_conv, &mut push);
+  emit_high_iso_nr(data, 0xbd, print_conv, &mut push);
+  emit_auto_lighting_optimizer(data, 0xbf, print_conv, &mut push);
+  emit_lens_type(data, 0xe6, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xe8,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  // 0xea MaxFocalLength — the `Hook` entry, read at the UNSHIFTED 0xea.
+  emit_focal_mm(
+    data,
+    0xea,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  // 0x17e FirmwareVersion (string[6], RawConv `/^\d+\.\d+\.\d+\s*$/`).
+  if let Some(off) = at(0x17e) {
+    emit_firmware_version(data, off, true, &mut push);
+  }
+  // 0x18e OwnerName (string[32], Priority 0).
+  if let Some(off) = at(0x18e) {
+    emit_string_leaf(data, off, 32, "OwnerName", &mut push);
+  }
+  if let Some(off) = at(0x1bb) {
+    emit_file_index(data, off, order, &mut push);
+  }
+  if let Some(off) = at(0x1c7) {
+    emit_directory_index(data, off, order, true, &mut push);
+  }
+  if let Some(ps_start) = at(0x2f7) {
+    ps_info(data, ps_start, order, print_conv, &mut push);
+  }
+  out
+}
+
+/// `%Canon::CameraInfo5DmkII` `0xea` `Hook` `varSize` delta (`Canon.pm:4077`,
+/// `$varSize += ($$self{CanonFirm} ? -36 : 0x10000) if $$self{CanonFirm} < 2`):
+/// `-36` for firmware 1 (3.4.6/3.6.1), `+0x10000` (out-of-range abort) for an
+/// unrecognized firmware (`CanonFirm == 0`, after the `Warn`), `0` for firmware
+/// 2 (4.1.1/1.0.6).
+fn hook_5dmkii_ea(canon_firm: u8) -> i64 {
+  if canon_firm < 2 {
+    if canon_firm != 0 { -36 } else { 0x1_0000 }
+  } else {
+    0
+  }
+}
+
+/// `%Canon::CameraInfo5DmkII` `0x00 FirmwareVersionLookAhead` RawConv
+/// (`Canon.pm:3984-3992`): `CanonFirm = 1` if a `D.D.D` version prefix sits at
+/// 0x15a, else `2` if at 0x17e, else `0` (ExifTool warns then the `Hook` shifts
+/// every later leaf out of range).
+fn canon_firm_5dmkii(data: &[u8]) -> u8 {
+  if firmware_prefix_at(data, 0x15a) {
+    1
+  } else if firmware_prefix_at(data, 0x17e) {
     2
   } else {
     0
@@ -3206,14 +3358,19 @@ mod tests {
     assert!(model_is_camera_info_7d(Some("Canon EOS 7D")));
     assert!(!model_is_camera_info_7d(Some("Canon EOS 7D Mark II")));
     assert!(!model_is_camera_info_7d(Some("Canon EOS 5D")));
-    // A model handled by neither table yields nothing (5D Mark II is not yet
-    // ported; the 60D/etc. are now handled, so a still-unported model is used).
+    // The `/EOS 5D Mark II$/` anchor matches the Mark II but not the plain 5D nor
+    // the Mark III (which ends with `III`, never `II$`).
+    assert!(model_is_camera_info_5dmkii(Some("Canon EOS 5D Mark II")));
+    assert!(!model_is_camera_info_5dmkii(Some("Canon EOS 5D")));
+    assert!(!model_is_camera_info_5dmkii(Some("Canon EOS 5D Mark III")));
+    // A model handled by no table yields nothing (the mirrorless R-series
+    // CameraInfo tables remain deferred to a later chunk).
     assert!(
       parse(
         &[0u8; 0x120],
         ByteOrder::Little,
         true,
-        Some("Canon EOS 5D Mark II"),
+        Some("Canon EOS R6"),
         None
       )
       .is_empty()
@@ -3366,6 +3523,192 @@ mod tests {
     assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.3".into())));
     assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
     assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+  }
+
+  /// `/EOS 5D Mark II$/` routes to the 5DmkII table; the plain `EOS 5D` selects a
+  /// different table (it has `FirmwareRevision`, never `FirmwareVersion`).
+  #[test]
+  fn dispatch_anchored_5dmkii() {
+    let mut b = vec![0u8; 0x400];
+    b[0x17e..0x184].copy_from_slice(b"1.0.6\0"); // CanonFirm 2
+    let mk2 = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      None,
+    );
+    assert!(mk2.iter().any(|(k, _)| k == "FirmwareVersion"));
+    let plain = parse(&b, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
+    assert!(plain.iter().all(|(k, _)| k != "FirmwareVersion"));
+  }
+
+  /// `%Canon::CameraInfo5DmkII` firmware-2 (`CanonFirm == 2`): no `varSize` shift,
+  /// every leaf at its nominal offset.
+  #[test]
+  fn camera_info_5dmkii_firmware2_fields() {
+    let mut b = vec![0u8; 0x400];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x13] = 17; // FlashModel (Mask 0x7f) ⇒ Speedlite 580EX II
+    b[0x15] = 0; // FlashMeteringMode E-TTL
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength int16uRev (BE) 0x0032 = 50 mm
+    b[0x31] = 1; // CameraOrientation Rotate 90 CW
+    b[0x73] = 0x50;
+    b[0x74] = 0x14; // ColorTemperature int16u LE 0x1450 = 5200
+    b[0xa7] = 0x81; // PictureStyle 0x81 Standard
+    b[0xbd] = 2; // HighISONoiseReduction Strong
+    b[0xbf] = 1; // AutoLightingOptimizer Low
+    b[0xe8] = 0x00;
+    b[0xe9] = 0x18; // MinFocalLength 24 mm
+    b[0xea] = 0x00;
+    b[0xeb] = 0x69; // MaxFocalLength 105 mm (Hook entry, read UNSHIFTED)
+    b[0x17e..0x184].copy_from_slice(b"1.0.6\0"); // version at 0x17e ⇒ CanonFirm 2
+    b[0x18e..0x193].copy_from_slice(b"Owner"); // OwnerName string[32]
+    b[0x1bb..0x1bf].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ +1 = 201
+    b[0x1c7..0x1cb].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ -1 = 199
+    b[0x2f7..0x2fb].copy_from_slice(&5i32.to_le_bytes()); // PSInfo ContrastStandard = 5
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(
+      find("FlashModel"),
+      Some(TagValue::Str("Speedlite 580EX II".into()))
+    );
+    assert_eq!(
+      find("FlashMeteringMode"),
+      Some(TagValue::Str("E-TTL".into()))
+    );
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(
+      find("HighISONoiseReduction"),
+      Some(TagValue::Str("Strong".into()))
+    );
+    assert_eq!(
+      find("AutoLightingOptimizer"),
+      Some(TagValue::Str("Low".into()))
+    );
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.6".into())));
+    assert_eq!(find("OwnerName"), Some(TagValue::Str("Owner".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(5)));
+  }
+
+  /// `%Canon::CameraInfo5DmkII` firmware-1 (`CanonFirm == 1`, version prefix at
+  /// 0x15a): `varSize -= 36` for every leaf AFTER the 0xea Hook; MaxFocalLength
+  /// (0xea, the Hook entry) is read UNSHIFTED.
+  #[test]
+  fn camera_info_5dmkii_firmware1_shift() {
+    let mut b = vec![0u8; 0x400];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0xea] = 0x00;
+    b[0xeb] = 0x69; // MaxFocalLength 105 mm (Hook entry, UNSHIFTED)
+    b[0x15a..0x160].copy_from_slice(b"3.4.6\0"); // prefix at 0x15a ⇒ CanonFirm 1
+    // Post-Hook leaves shift by -0x24: FirmwareVersion 0x17e ⇒ 0x15a (reuses the
+    // version string), OwnerName 0x18e ⇒ 0x16a, FileIndex 0x1bb ⇒ 0x197,
+    // DirectoryIndex 0x1c7 ⇒ 0x1a3, PSInfo 0x2f7 ⇒ 0x2d3.
+    b[0x16a..0x16f].copy_from_slice(b"Mike\0");
+    b[0x197..0x19b].copy_from_slice(&500u32.to_le_bytes());
+    b[0x1a3..0x1a7].copy_from_slice(&500u32.to_le_bytes());
+    b[0x2d3..0x2d7].copy_from_slice(&7i32.to_le_bytes());
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("3.4.6".into())));
+    assert_eq!(find("OwnerName"), Some(TagValue::Str("Mike".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(501)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(499)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(7)));
+  }
+
+  /// `%Canon::CameraInfo5DmkII` unrecognized firmware (`CanonFirm == 0`): the
+  /// 0xea Hook adds `+0x10000`, pushing every post-Hook leaf out of range
+  /// (ExifTool `Warn`s and emits nothing for them); pre-Hook leaves still emit.
+  #[test]
+  fn camera_info_5dmkii_unrecognized_firmware() {
+    let mut b = vec![0u8; 0x400];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0xea] = 0x00;
+    b[0xeb] = 0x69; // MaxFocalLength 105 (Hook entry, still emitted)
+    b[0x17e..0x184].copy_from_slice(b"badfw\0"); // not a version ⇒ CanonFirm 0
+    b[0x1bb..0x1bf].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), None);
+    assert_eq!(find("FileIndex"), None);
+    assert_eq!(find("DirectoryIndex"), None);
+    assert!(em.iter().all(|(k, _)| k != "ContrastStandard"));
+  }
+
+  /// `%Canon::CameraInfo5DmkII` `0x1b MacroMagnification` (`%ciMacroMagnification`)
+  /// is gated on the pre-scanned `LensType == 124`.
+  #[test]
+  fn camera_info_5dmkii_macro_magnification() {
+    let mut b = vec![0u8; 0x400];
+    b[0x1b] = 75; // 75 ⇒ 1.0x
+    b[0x17e..0x184].copy_from_slice(b"1.0.6\0"); // CanonFirm 2
+    let with = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      Some(124),
+    );
+    assert_eq!(
+      with
+        .iter()
+        .find(|(k, _)| k == "MacroMagnification")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("1.0x".into()))
+    );
+    let without = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark II"),
+      None,
+    );
+    assert!(without.iter().all(|(k, _)| k != "MacroMagnification"));
   }
 
   #[test]
