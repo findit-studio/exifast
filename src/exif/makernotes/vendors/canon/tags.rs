@@ -39,7 +39,8 @@
 //!   own micro-table.
 //! - `CustomFunctionsXXX` at tag 0x0f (`Canon.pm:1500-1582`) are
 //!   DEFERRED — each model has its own micro-table.
-//! - `ColorData1..12` (`Canon.pm:7435-8941`) are DEFERRED.
+//! - `ColorData1..12` (`Canon.pm:7435-8941`) are decoded in `colordata.rs`
+//!   (#84); only the trailing `ColorDataUnknown` fallback is deferred.
 
 // Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
 // this is the Canon Main tag table + dispatch; any raw index/slice is
@@ -174,8 +175,8 @@ pub enum SubTable {
   /// `%Canon::MeasuredColor` (`Canon.pm:1913-1918`) — Main tag 0xaa. DEFERRED.
   MeasuredColor,
   /// `Canon::ColorData<N>` conditional SubDirectory list — Main tag 0x4001
-  /// (`Canon.pm:1973-2046`). Count-selected `ColorData1..12`. DEFERRED
-  /// (issue #84): `is_walked() == false` so the parent pointer is suppressed.
+  /// (`Canon.pm:1973-2046`). Count-selected `ColorData1..12`, decoded in
+  /// `colordata.rs` (#84); the `ColorDataUnknown` count fallback is deferred.
   ColorData,
   /// `%Canon::AFMicroAdj` (`Canon.pm:2088-2095`) — Main tag 0x4013. DEFERRED.
   AfMicroAdj,
