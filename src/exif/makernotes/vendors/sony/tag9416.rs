@@ -151,8 +151,9 @@ fn push_i16_array(
 }
 
 /// 0x0035 `ExposureProgram` — `%sonyExposureProgram3` (`Sony.pm:10044-10049`,
-/// `Sony.pm:464-499`).
-fn print_exposure_program3(v: u8) -> Option<&'static str> {
+/// `Sony.pm:464-499`). Also the `%exposureProgram2010` PrintConv shared by the
+/// `Tag9404a/b/c` `ExposureProgram` rows (re-exported from the parent module).
+pub(crate) fn print_exposure_program3(v: u8) -> Option<&'static str> {
   Some(match v {
     0 => "Program AE",
     1 => "Aperture-priority AE",
