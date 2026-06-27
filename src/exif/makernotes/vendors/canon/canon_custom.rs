@@ -1632,6 +1632,81 @@ fn i32s_at(data: &[u8], off: usize, order: ByteOrder) -> Option<i64> {
   }))
 }
 
+// ─── PersonalFuncs (`Canon::Main` 0x91) ──────────────────────────────────────
+
+/// Decode `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1091-1133`) — the
+/// EOS-1D personal-function on/off flags. `ProcessBinaryData`, `FORMAT =>
+/// 'int16u'`, `FIRST_ENTRY => 1`: a named position `index` reads the `int16u` at
+/// byte offset `index * 2` (the size word at offset 0 is index 0, unread). Each
+/// flag renders via [`convert_pfn`] (`%convPFn`). A position past the block end
+/// is dropped (per-field availability — bundled `next unless defined $val`).
+#[must_use]
+pub fn parse_personal_funcs(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  for &(index, name) in PERSONAL_FUNCS {
+    let Some(v) = u16_at(data, usize::from(index) * 2, order) else {
+      continue;
+    };
+    let v = v as i64;
+    let value = if print_conv {
+      TagValue::Str(convert_pfn(v))
+    } else {
+      TagValue::I64(v)
+    };
+    out.push((SmolStr::new_static(name), value));
+  }
+  out
+}
+
+/// `%convPFn` PrintConv (`CanonCustom.pm:2622-2627`, `sub ConvertPfn`):
+/// `0 => 'Off'`, `1 => 'On'`, otherwise `'On (N)'`.
+fn convert_pfn(v: i64) -> SmolStr {
+  match v {
+    0 => SmolStr::new_static("Off"),
+    1 => SmolStr::new_static("On"),
+    n => SmolStr::from(std::format!("On ({n})")),
+  }
+}
+
+/// `(index, Name)` for `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1100-1132`).
+/// Indices 12/13 (`PF11`/`PF12`) and 23 (`PF22`) are commented out in bundled
+/// (unused) and are absent here.
+const PERSONAL_FUNCS: &[(u16, &str)] = &[
+  (1, "PF0CustomFuncRegistration"),
+  (2, "PF1DisableShootingModes"),
+  (3, "PF2DisableMeteringModes"),
+  (4, "PF3ManualExposureMetering"),
+  (5, "PF4ExposureTimeLimits"),
+  (6, "PF5ApertureLimits"),
+  (7, "PF6PresetShootingModes"),
+  (8, "PF7BracketContinuousShoot"),
+  (9, "PF8SetBracketShots"),
+  (10, "PF9ChangeBracketSequence"),
+  (11, "PF10RetainProgramShift"),
+  (14, "PF13DrivePriority"),
+  (15, "PF14DisableFocusSearch"),
+  (16, "PF15DisableAFAssistBeam"),
+  (17, "PF16AutoFocusPointShoot"),
+  (18, "PF17DisableAFPointSel"),
+  (19, "PF18EnableAutoAFPointSel"),
+  (20, "PF19ContinuousShootSpeed"),
+  (21, "PF20LimitContinousShots"),
+  (22, "PF21EnableQuietOperation"),
+  (24, "PF23SetTimerLengths"),
+  (25, "PF24LightLCDDuringBulb"),
+  (26, "PF25DefaultClearSettings"),
+  (27, "PF26ShortenReleaseLag"),
+  (28, "PF27ReverseDialRotation"),
+  (29, "PF28NoQuickDialExpComp"),
+  (30, "PF29QuickDialSwitchOff"),
+  (31, "PF30EnlargementMode"),
+  (32, "PF31OriginalDecisionData"),
+];
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -1852,6 +1927,49 @@ mod tests {
     assert_eq!(em.len(), 2); // the unnamed tag 99 is dropped
     let em2 = parse_functions_1d(&build_custom(&[(0, 9)]), ByteOrder::Little, true);
     want_str(&em2, "FocusingScreen", "Unknown (9)");
+  }
+
+  /// Build a `%CanonCustom::PersonalFuncs`/`PersonalFuncValues` `int16u` block
+  /// from `words` (word 0 is the unread size; named positions start at index 1).
+  fn build_u16(words: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 2);
+    for w in words {
+      out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+  }
+
+  /// `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1091-1133`) — `int16u`,
+  /// `FIRST_ENTRY 1`; each flag renders via `ConvertPfn`.
+  #[test]
+  fn personal_funcs_decode() {
+    let mut words = [0u16; 33]; // indices 0..=32
+    words[1] = 0; // PF0CustomFuncRegistration = Off
+    words[2] = 1; // PF1DisableShootingModes = On
+    words[8] = 5; // PF7BracketContinuousShoot = On (5)
+    words[32] = 1; // PF31OriginalDecisionData = On
+    let em = parse_personal_funcs(&build_u16(&words), ByteOrder::Little, true);
+    want_str(&em, "PF0CustomFuncRegistration", "Off");
+    want_str(&em, "PF1DisableShootingModes", "On");
+    want_str(&em, "PF7BracketContinuousShoot", "On (5)");
+    want_str(&em, "PF31OriginalDecisionData", "On");
+    // 29 named indices (1..=32 minus the unused 12/13/23).
+    assert_eq!(em.len(), 29);
+  }
+
+  /// Per-field availability: a position past the block end is dropped; numeric
+  /// mode keeps the raw `int16u`.
+  #[test]
+  fn personal_funcs_per_field_and_numeric() {
+    // 6 words = 12 bytes ⇒ indices 0..=5 present; index 6 (offset 12) is past.
+    let em = parse_personal_funcs(&build_u16(&[0, 9, 0, 0, 0, 2]), ByteOrder::Little, false);
+    assert_eq!(
+      find(&em, "PF0CustomFuncRegistration"),
+      Some(TagValue::I64(9))
+    );
+    assert_eq!(find(&em, "PF4ExposureTimeLimits"), Some(TagValue::I64(2)));
+    assert_eq!(find(&em, "PF5ApertureLimits"), None); // index 6, dropped
+    assert_eq!(em.len(), 5);
   }
 
   /// A single-group `ProcessCanonCustom2` block (`int32u` words): size, group

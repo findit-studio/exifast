@@ -11834,6 +11834,10 @@ fn emit_canon_subtable<S: ExifSink>(
     // CustomFunctions1D (0x90) — `ProcessCanonCustom` against
     // `CanonCustom::Functions1D` (`Canon.pm:1796-1802`, the 1D/1Ds direct tag).
     SubTable::CustomFunctions1D => canon_custom::parse_functions_1d(&blob, order, print_conv),
+    // PersonalFunctions (0x91) — `ProcessBinaryData` against
+    // `CanonCustom::PersonalFuncs` (`Canon.pm:1803-1809`), the EOS-1D
+    // personal-function on/off flags.
+    SubTable::PersonalFunctions => canon_custom::parse_personal_funcs(&blob, order, print_conv),
     // The EOS 7D image-info sub-tables (#445). TimeInfo (0x35) / AspectInfo
     // (0x9a) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) are `int32`-format
     // tables read as `int32u[N]` IFD entries, so each word must be widened back
@@ -11899,7 +11903,10 @@ fn emit_canon_subtable<S: ExifSink>(
   // parent `Canon` group; every other walked sub-table stays in `group1`.
   let emit_group1 = if matches!(
     sub,
-    SubTable::CustomFunctions | SubTable::CustomFunctions1D | SubTable::CustomFunctions2
+    SubTable::CustomFunctions
+      | SubTable::CustomFunctions1D
+      | SubTable::CustomFunctions2
+      | SubTable::PersonalFunctions
   ) {
     "CanonCustom"
   } else {
