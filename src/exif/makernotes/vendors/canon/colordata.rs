@@ -50,6 +50,8 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
     692 | 674 | 702 | 1227 | 1250 | 1251 | 1337 | 1338 | 1346
   ) {
     color_data_4(data, order, print_conv)
+  } else if count == 5120 {
+    color_data_5(data, order, print_conv)
   } else if matches!(count, 1273 | 1275) {
     color_data_6(data, order, print_conv)
   } else if matches!(count, 1312 | 1313 | 1316 | 1506) {
@@ -542,6 +544,66 @@ fn color_data_12(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolSt
   out
 }
 
+/// `%Canon::ColorData5` (`Canon.pm:7946-8013`, `$count == 5120`) — many EOS M
+/// and PowerShot models. The outlier: `ColorDataVersion` is negative (`-3`/`-4`)
+/// and the WB pairs live in a nested `ColorCoefs` (`-3`) / `ColorCoefs2` (`-4`)
+/// SubDirectory anchored at word `0x47` (`Canon.pm:7775`/`:7833`). `ColorCoefs2`
+/// uses an 8-word stride (temperature at `+7`). The black-/white-level leaves
+/// and the SubDirectory choice are version-gated; `PerChannelBlackLevel` is
+/// `int16s[4]` here (signed), unlike the other variants.
+fn color_data_5(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let version = color_data_version(
+    &mut out,
+    data,
+    order,
+    print_conv,
+    &[(-3, "-3 (M10/M3)"), (-4, "-4 (M100/M5/M6)")],
+  );
+  match version {
+    Some(-3) => {
+      // ColorCoefs at word 0x47 (`Canon.pm:7775`; standard +4 temperature).
+      const WB_PAIRS_5_V3: &[(usize, &str, &str)] = &[
+        (0x47, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+        (0x4c, "WB_RGGBLevelsAuto", "ColorTempAuto"),
+        (0x51, "WB_RGGBLevelsMeasured", "ColorTempMeasured"),
+        (0x5b, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+        (0x60, "WB_RGGBLevelsShade", "ColorTempShade"),
+        (0x65, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+        (0x6a, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+        (0x6f, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+        (0x74, "WB_RGGBLevelsKelvin", "ColorTempKelvin"),
+        (0x79, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+      ];
+      push_wb_pairs(&mut out, data, order, WB_PAIRS_5_V3);
+      push_i16_quad(&mut out, data, order, 0x108, "PerChannelBlackLevel");
+      push_white_level(&mut out, data, order, 0x296, "SpecularWhiteLevel", false);
+    }
+    Some(-4) => {
+      // ColorCoefs2 at word 0x47 (`Canon.pm:7833`; 8-word stride, temp at +7).
+      const WB_PAIRS_5_V4: &[(usize, &str, &str)] = &[
+        (0x47, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+        (0x4f, "WB_RGGBLevelsAuto", "ColorTempAuto"),
+        (0x57, "WB_RGGBLevelsMeasured", "ColorTempMeasured"),
+        (0x67, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+        (0x6f, "WB_RGGBLevelsShade", "ColorTempShade"),
+        (0x77, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+        (0x7f, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+        (0x87, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+        (0x8f, "WB_RGGBLevelsKelvin", "ColorTempKelvin"),
+        (0x97, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+      ];
+      push_wb_pairs_strided(&mut out, data, order, WB_PAIRS_5_V4, 7);
+      push_i16_quad(&mut out, data, order, 0x14d, "PerChannelBlackLevel");
+      // NormalWhiteLevel here has no RawConv (it is not dropped on zero).
+      push_white_level(&mut out, data, order, 0x569, "NormalWhiteLevel", false);
+      push_white_level(&mut out, data, order, 0x56a, "SpecularWhiteLevel", false);
+    }
+    _ => {}
+  }
+  out
+}
+
 /// Emit `ColorDataVersion` (word `0x00`, `int16s`) and return the raw version
 /// for the variants whose later leaves are `$$self{ColorDataVersion}`-keyed.
 /// With `print_conv`, a `labels` hit renders as the descriptive string and a
@@ -566,12 +628,26 @@ fn color_data_version(
   Some(v)
 }
 
-/// Push the `WB_RGGBLevels<X>` (`int16s[4]`) + `ColorTemp<X>` (`int16s`) pairs.
+/// Push the `WB_RGGBLevels<X>` (`int16s[4]`) + `ColorTemp<X>` (`int16s`) pairs
+/// with the temperature word at the standard `+4` (immediately after the quad).
 fn push_wb_pairs(
   out: &mut Vec<(SmolStr, TagValue)>,
   data: &[u8],
   order: ByteOrder,
   pairs: &[(usize, &'static str, &'static str)],
+) {
+  push_wb_pairs_strided(out, data, order, pairs, 4);
+}
+
+/// Like `push_wb_pairs` but the `ColorTemp` word sits `temp_delta` words after
+/// the WB quad start. ColorData5's `ColorCoefs2` (`Canon.pm:7833`) uses an
+/// 8-word stride with the temperature at `+7`.
+fn push_wb_pairs_strided(
+  out: &mut Vec<(SmolStr, TagValue)>,
+  data: &[u8],
+  order: ByteOrder,
+  pairs: &[(usize, &'static str, &'static str)],
+  temp_delta: usize,
 ) {
   for &(off, wb_name, temp_name) in pairs {
     if let Some(quad) = read_i16x4(data, off, order) {
@@ -580,7 +656,7 @@ fn push_wb_pairs(
         TagValue::Str(SmolStr::from(join_i64(&quad))),
       ));
     }
-    if let Some(t) = read_i16(data, off + 4, order) {
+    if let Some(t) = read_i16(data, off + temp_delta, order) {
       out.push((SmolStr::new_static(temp_name), TagValue::I64(t)));
     }
   }
@@ -595,6 +671,23 @@ fn push_u16_quad(
   name: &'static str,
 ) {
   if let Some(quad) = read_u16x4(data, off, order) {
+    out.push((
+      SmolStr::new_static(name),
+      TagValue::Str(SmolStr::from(join_i64(&quad))),
+    ));
+  }
+}
+
+/// Push an `int16s[4]` quad (space-joined) at word `off` if in range — used by
+/// ColorData5's signed `PerChannelBlackLevel` (`Canon.pm:7991`/`:8001`).
+fn push_i16_quad(
+  out: &mut Vec<(SmolStr, TagValue)>,
+  data: &[u8],
+  order: ByteOrder,
+  off: usize,
+  name: &'static str,
+) {
+  if let Some(quad) = read_i16x4(data, off, order) {
     out.push((
       SmolStr::new_static(name),
       TagValue::Str(SmolStr::from(join_i64(&quad))),
@@ -1217,5 +1310,102 @@ mod tests {
       find_in(&em12, "ColorDataVersion"),
       Some(&TagValue::Str("65 (R50V)".into()))
     );
+  }
+
+  #[test]
+  fn color_data_5_version_neg3_colorcoefs() {
+    let mut buf = vec![0u8; 5120 * 2];
+    put_i16(&mut buf, 0x00, -3); // ColorDataVersion (negative)
+    for (i, v) in [2070i16, 1024, 1024, 1485].iter().enumerate() {
+      put_i16(&mut buf, 0x47 + i, *v); // WB_RGGBLevelsAsShot (ColorCoefs anchor 0x47)
+    }
+    put_i16(&mut buf, 0x4b, 5240); // ColorTempAsShot (+4)
+    for (i, v) in [2300i16, 1024, 1024, 1380].iter().enumerate() {
+      put_i16(&mut buf, 0x5b + i, *v); // WB_RGGBLevelsDaylight
+    }
+    put_i16(&mut buf, 0x5f, 5100); // ColorTempDaylight
+    for (i, v) in [-5i16, 6, -7, 8].iter().enumerate() {
+      put_i16(&mut buf, 0x108 + i, *v); // PerChannelBlackLevel (int16s — signed)
+    }
+    put_u16(&mut buf, 0x296, 16300); // SpecularWhiteLevel
+    let em = parse(&buf, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em, "ColorDataVersion"),
+      Some(&TagValue::Str("-3 (M10/M3)".into()))
+    );
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAsShot"),
+      Some(&TagValue::Str("2070 1024 1024 1485".into()))
+    );
+    assert_eq!(find_in(&em, "ColorTempAsShot"), Some(&TagValue::I64(5240)));
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsDaylight"),
+      Some(&TagValue::Str("2300 1024 1024 1380".into()))
+    );
+    assert_eq!(
+      find_in(&em, "ColorTempDaylight"),
+      Some(&TagValue::I64(5100))
+    );
+    // int16s signedness is preserved (would be 65531.. if read unsigned).
+    assert_eq!(
+      find_in(&em, "PerChannelBlackLevel"),
+      Some(&TagValue::Str("-5 6 -7 8".into()))
+    );
+    assert_eq!(
+      find_in(&em, "SpecularWhiteLevel"),
+      Some(&TagValue::I64(16300))
+    );
+    // The -3 variant has no NormalWhiteLevel.
+    assert_eq!(find_in(&em, "NormalWhiteLevel"), None);
+  }
+
+  #[test]
+  fn color_data_5_version_neg4_colorcoefs2_stride8() {
+    let mut buf = vec![0u8; 5120 * 2];
+    put_i16(&mut buf, 0x00, -4); // ColorDataVersion (negative)
+    for (i, v) in [2090i16, 1024, 1024, 1450].iter().enumerate() {
+      put_i16(&mut buf, 0x47 + i, *v); // WB_RGGBLevelsAsShot (ColorCoefs2 anchor 0x47)
+    }
+    put_i16(&mut buf, 0x4e, 5380); // ColorTempAsShot (+7 stride)
+    for (i, v) in [2222i16, 1024, 1024, 1390].iter().enumerate() {
+      put_i16(&mut buf, 0x4f + i, *v); // WB_RGGBLevelsAuto (8-word stride: 0x47 + 8)
+    }
+    put_i16(&mut buf, 0x56, 5500); // ColorTempAuto (0x4f + 7)
+    put_u16(&mut buf, 0x569, 0); // NormalWhiteLevel (no RawConv ⇒ a 0 is kept)
+    put_u16(&mut buf, 0x56a, 16400); // SpecularWhiteLevel
+    let em = parse(&buf, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em, "ColorDataVersion"),
+      Some(&TagValue::Str("-4 (M100/M5/M6)".into()))
+    );
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAsShot"),
+      Some(&TagValue::Str("2090 1024 1024 1450".into()))
+    );
+    assert_eq!(find_in(&em, "ColorTempAsShot"), Some(&TagValue::I64(5380)));
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAuto"),
+      Some(&TagValue::Str("2222 1024 1024 1390".into()))
+    );
+    assert_eq!(find_in(&em, "ColorTempAuto"), Some(&TagValue::I64(5500)));
+    // NormalWhiteLevel here has no RawConv, so a zero is still emitted.
+    assert_eq!(find_in(&em, "NormalWhiteLevel"), Some(&TagValue::I64(0)));
+    assert_eq!(
+      find_in(&em, "SpecularWhiteLevel"),
+      Some(&TagValue::I64(16400))
+    );
+  }
+
+  #[test]
+  fn color_data_5_unknown_version_emits_only_version() {
+    let mut buf = vec![0u8; 5120 * 2];
+    put_i16(&mut buf, 0x00, 7); // neither -3 nor -4
+    for (i, v) in [1i16, 2, 3, 4].iter().enumerate() {
+      put_i16(&mut buf, 0x47 + i, *v); // would-be WB pair bytes; must stay unread
+    }
+    let em = parse(&buf, ByteOrder::Little, false);
+    assert_eq!(find_in(&em, "ColorDataVersion"), Some(&TagValue::I64(7)));
+    assert_eq!(find_in(&em, "WB_RGGBLevelsAsShot"), None);
+    assert_eq!(em.len(), 1);
   }
 }
