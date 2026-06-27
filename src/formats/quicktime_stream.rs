@@ -1957,6 +1957,11 @@ struct StreamTrack {
   ee: EeData,
   /// The `mebx` `keys`-table map (empty for non-`mebx` tracks).
   meta_keys: Vec<(u32, MetaKey)>,
+  /// `true` when the `vide` track's `stsd` sample entry carries a `JPEG` child
+  /// box — the `%eeBox` `vide => { JPEG => 'stsd' }` flag (QuickTime.pm:525) that
+  /// marks the Canon CR3 `CRAW` track as the `JpgFromRaw` preview stream
+  /// (QuickTimeStream.pl:1323 `$$ee{JPEG}` ⇒ `$type = 'JPEG'`).
+  has_jpeg: bool,
 }
 
 /// `ProcessSamples` (QuickTimeStream.pl:1304-1592) — the per-`stbl` sample
@@ -2120,6 +2125,23 @@ fn decode_one_sample(
   set_group1_cleared: &mut bool,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
+  // The Canon CR3 `CRAW` `JpgFromRaw` preview sample (QuickTimeStream.pl:316,
+  // 1570-1573 `$$tagTbl{$type}` with `$type = 'JPEG'`): a `vide` track flagged
+  // by a `JPEG` stsd child. `FoundSomething` opens the `Doc<N>` + records this
+  // sample's SampleTime/SampleDuration, then `HandleTag('JPEG')` emits the
+  // `JpgFromRaw` (`Binary => 1` ⇒ the `(Binary data N bytes…)` placeholder; the
+  // bytes are not retained). One JPEG-flagged `CRAW` track per CR3.
+  if &track.handler == b"vide" && track.has_jpeg {
+    let doc = out.open_doc();
+    out.set_cr3_jpg_from_raw(crate::metadata::Cr3JpgFromRaw::new(
+      track_index,
+      doc,
+      buff.len() as u64,
+      sample.time,
+      sample.dur,
+    ));
+    return false;
+  }
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
   // SampleTime/SampleDuration; the decoded `mebx` pairs carry both.
   if &track.meta_format == b"mebx" {
@@ -2867,6 +2889,26 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
         }
       });
     }
+    // A `vide` sample entry's child atoms follow the VisualSampleEntry header
+    // (>= 86 bytes: the 16-byte base SampleEntry + the 70-byte visual fields,
+    // sometimes a few extra codec bytes — the Canon CRAW entry has 4). A `JPEG`
+    // child there is the `%eeBox` `vide => { JPEG => 'stsd' }` flag
+    // (QuickTime.pm:525) marking the CR3 `CRAW` track as the `JpgFromRaw`
+    // preview stream. The header size varies by codec, so locate the `JPEG` 4cc
+    // by signature (past offset 86, beyond the 32-byte compressorname) rather
+    // than at a fixed offset.
+    if &track.handler == b"vide"
+      && let Some(entry) = data.get(pos..entry_end)
+    {
+      let mut k = 86usize;
+      while k + 8 <= entry.len() {
+        if entry.get(k + 4..k + 8) == Some(&b"JPEG"[..]) {
+          track.has_jpeg = true;
+          break;
+        }
+        k += 1;
+      }
+    }
     pos = entry_end;
   }
   track.meta_keys = merged_keys;
@@ -3298,7 +3340,12 @@ fn walk_moov(
         // the `moov` level — QuickTime.pm:523-533), so a `trak` whose `hdlr`
         // HandlerType is `gps ` is ignored for embedded extraction. See
         // [`is_meta_handler`].
-        if is_meta_handler(&track.handler) {
+        // Metadata-bearing handlers feed `ProcessSamples`; ALSO a `vide` track
+        // whose `stsd` carries a `JPEG` child (`%eeBox` `vide => { JPEG =>
+        // 'stsd' }`, QuickTime.pm:525) — the Canon CR3 `CRAW` `JpgFromRaw`
+        // preview stream (QuickTimeStream.pl:1318-1323, gated on `$eeOpt`, which
+        // CRX auto-enables).
+        if is_meta_handler(&track.handler) || (&track.handler == b"vide" && track.has_jpeg) {
           gopro_found_embedded |= process_samples(
             data,
             &track,
