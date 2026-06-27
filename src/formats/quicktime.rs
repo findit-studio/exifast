@@ -10906,11 +10906,17 @@ impl crate::emit::Taggable for Meta<'_> {
           let t = sample.track_index();
           if t == 0 { 1 } else { t }
         });
-        let group = if g3 {
-          Group::with_doc("QuickTime", track.as_str(), doc_n)
-        } else {
-          Group::new("QuickTime", track.as_str())
-        };
+        // Stamp the per-sample family-3 `Doc<N>` in EVERY mode. At `-G3` the doc
+        // prefixes the rendered key; at `-G1` the serializer DROPS the doc axis
+        // (so the leaf output is byte-identical to a doc-0 group), but the
+        // Composite engine resolves on family-3 — a CTMD sample's degenerate
+        // `Track<N>:FNumber`/`ExposureTime` (`inf`) lives on `Doc<N>` (the
+        // bundled `-G1:3` axis, `Doc2` here), so the Main `Composite:Aperture`/
+        // `ShutterSpeed` resolve the doc-0 `ExifIFD:FNumber`/`ExposureTime` (the
+        // real exposure) instead of collapsing onto the CTMD `inf`. The
+        // cross-sample first-wins collapse below is doc-independent (keyed by
+        // `(family1, name)`), so the surviving leaf set is unchanged.
+        let group = Group::with_doc("QuickTime", track.as_str(), doc_n);
         ctmd_scratch.clear();
         // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
         // `-n`) — the sample-table timing emitted ahead of the decoded payload.
@@ -11003,14 +11009,7 @@ impl crate::emit::Taggable for Meta<'_> {
         // sample's `Doc<N>`). The blocks ride after the type-1/4/5 scalars in
         // walk order; the same g3 / first-wins dedup below folds them.
         for info in sample.exif_info() {
-          emit_ctmd_exif_info(
-            info,
-            track.as_str(),
-            doc_n,
-            g3,
-            print_conv,
-            &mut ctmd_scratch,
-          );
+          emit_ctmd_exif_info(info, track.as_str(), doc_n, print_conv, &mut ctmd_scratch);
         }
         if g3 {
           // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
@@ -15582,29 +15581,28 @@ fn canon_ctmd_exposure_time_value(
 ///    `Track<N>`, `Doc<N>` (NO `ExifByteOrder` — the MakerNote re-dispatch does
 ///    not surface it).
 ///
-/// `print_conv` selects `-j` (PrintConv) vs `-n` (ValueConv); `g3` adds the
-/// `Doc<N>` family-3 axis (collapsed at `-G1`, where the across-doc first-wins
-/// dedup in the caller keeps the first sample's value per `family1:name`).
+/// `print_conv` selects `-j` (PrintConv) vs `-n` (ValueConv). The `Doc<N>`
+/// family-3 axis is always stamped (collapsed at `-G1`, where the across-doc
+/// first-wins dedup in the caller keeps the first sample's value per
+/// `family1:name`).
 #[cfg(feature = "alloc")]
 fn emit_ctmd_exif_info(
   info: &crate::metadata::CtmdExifInfo,
   track: &str,
   doc_n: u32,
-  g3: bool,
   print_conv: bool,
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::{EmittedTag, Taggable};
   use crate::value::Group;
-  // Build a group on the CTMD sample's family-3 axis: `Doc<N>` when `-G3`, else
-  // collapsed (doc 0) — the caller's first-wins dedup folds the doc axis.
-  let scoped = |family0: &str, family1: &str| -> Group {
-    if g3 {
-      Group::with_doc(family0, family1, doc_n)
-    } else {
-      Group::new(family0, family1)
-    }
-  };
+  // Build a group on the CTMD sample's family-3 axis. The `Doc<N>` is stamped in
+  // EVERY mode: at `-G3` it prefixes the key; at `-G1` the serializer DROPS the
+  // doc (leaf output unchanged), but the Composite engine resolves on family-3,
+  // so the CTMD `Track<N>:*` exposure leaves stay on their `Doc<N>` (NOT doc 0),
+  // keeping the Main `Composite:Aperture`/`ShutterSpeed` off the degenerate CTMD
+  // `inf`. The caller's first-wins dedup (keyed by `(family1, name)`) is
+  // doc-independent, so the surviving leaf set is unchanged.
+  let scoped = |family0: &str, family1: &str| -> Group { Group::with_doc(family0, family1, doc_n) };
   match info.tag() {
     crate::metadata::CtmdExifTag::ExifIfd => {
       // The embedded TIFF is self-contained (base 0); `ProcessExifInfo`'s
