@@ -12380,6 +12380,13 @@ pub(in crate::exif) fn sony_makernote_isolated(
   // 0x9400 < 0x9402 in IFD-tag order, so this is observed BEFORE the 0x9402 entry
   // that consumes it — the same set-on-9400/read-on-9402 object-flag ordering.
   let mut double_cipher = false;
+  // `$$self{Panorama}` (`Sony.pm:902`) — ASSIGNED as a SIDE EFFECT of the `0x1003`
+  // `Panorama` SubDirectory `Condition` (`$$self{Panorama} = ($$valPt =~
+  // /^(\0\0)?\x01\x01/)`): each readable 0x1003 re-evaluates it to the match result
+  // (true for a little-/big-endian int32u 257, false otherwise), last-wins.
+  // `0x1003 < 0x2010` in IFD-tag order, so it is observed BEFORE the `0x2010` entry
+  // whose `Tag2010d` dispatch (`Sony.pm:1140-1145`) gates on `not Panorama`.
+  let mut panorama = false;
   {
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in &w.entries {
@@ -12398,6 +12405,21 @@ pub(in crate::exif) fn sony_makernote_isolated(
         && sony::tag9400::detects_double_cipher(raw)
       {
         double_cipher = true;
+      }
+      // 0x1003's `Panorama` Condition side-effect (`Sony.pm:902`): the Perl
+      // `Condition` is an ASSIGNMENT — `$$self{Panorama} = ($$valPt =~
+      // /^(\0\0)?\x01\x01/)` — so EACH readable 0x1003 RE-EVALUATES the flag to the
+      // match RESULT (true on a little-/big-endian int32u 257, FALSE otherwise),
+      // NOT a one-way latch: a later non-matching 0x1003 CLEARS an earlier match, so
+      // the LAST 0x1003 before 0x2010 controls the `Tag2010d` `not $$self{Panorama}`
+      // gate. An unreadable/absent 0x1003 leaves the flag untouched — ExifTool only
+      // evaluates the `Condition` (and so only assigns) when the value is read.
+      // 0x1003 precedes 0x2010 in IFD-tag order.
+      if entry.tag_id == 0x1003
+        && let Some(end) = entry.value_offset().checked_add(entry.value_size())
+        && let Some(raw) = data.get(entry.value_offset()..end)
+      {
+        panorama = sony::tag2010::detects_panorama(raw);
       }
       // Only `ResolvedConv::Sony` entries live in this run; the resolved `SonyTag`
       // rides in the entry's `conv`. A defensive non-Sony conv (never produced
@@ -12431,6 +12453,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
         model,
         software,
         double_cipher,
+        panorama,
         print_conv,
         &mut sink,
       );
@@ -12540,8 +12563,9 @@ fn sony_emit_binary_subdir<S: ExifSink>(
 }
 
 /// Decode a Sony Main-IFD `ProcessBinaryData` SubDirectory sub-block
-/// (`0x9050`/`0x9400`/`0x9401`/`0x9402`/`0x9403`/`0x9404`/`0x9406`/`0x940a`/
-/// `0x940c`/`0x940e`/`0x9416`/`0x202a`) and emit its ported leaves into `sink`.
+/// (`0x2010`/`0x9050`/`0x9400`/`0x9401`/`0x9402`/`0x9403`/`0x9404`/`0x9406`/
+/// `0x940a`/`0x940c`/`0x940e`/`0x9416`/`0x202a`) and emit its ported leaves into
+/// `sink`.
 ///
 /// `entry` is the Sony Main-IFD SubDirectory row; its verbatim on-disk value
 /// bytes are `data[value_offset .. value_offset + value_size]`. Most of these
@@ -12570,6 +12594,11 @@ fn sony_emit_binary_subdir<S: ExifSink>(
 /// `PROCESS_PROC` for all of them, so on a double-enciphered body ISOInfo/
 /// battery/lens/camera-settings would otherwise be read from once-deciphered
 /// garbage.
+///
+/// `panorama` is the file-global `$$self{Panorama}` DataMember (`Sony.pm:902`,
+/// latched on the earlier 0x1003 walk); it gates the `0x2010` `Tag2010d` variant
+/// (`Sony.pm:1140-1145`). `0x2010` is enciphered too, but precedes 0x9400 in
+/// IFD-tag order, so `double_cipher` is normally unset when its block is read.
 fn sony_emit_enciphered_subblock<S: ExifSink>(
   data: &[u8],
   group1: &str,
@@ -12577,13 +12606,14 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   model: Option<&str>,
   software: Option<&str>,
   double_cipher: bool,
+  panorama: bool,
   print_conv: bool,
   out: &mut S,
 ) {
   use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
-    afinfo, tag202a, tag900b, tag940a, tag940c, tag940e, tag9050, tag9400, tag9401, tag9402,
-    tag9403, tag9404, tag9405, tag9406, tag9416,
+    afinfo, tag202a, tag900b, tag940a, tag940c, tag940e, tag2010, tag9050, tag9400, tag9401,
+    tag9402, tag9403, tag9404, tag9405, tag9406, tag9416,
   };
   // The verbatim on-disk value span (the enciphered cipher block, or the plain
   // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
@@ -12604,6 +12634,55 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   // are correctly (double-)deciphered. `0x202a` is the lone plain block and is
   // never deciphered.
   match entry.tag_id() {
+    // `Tag2010a`/`b`/`c`/`d`/`f` — the enciphered `0x2010` shot-info / WB block
+    // (release / self-timer / flash, gain / brightness / exposure-comp, DRO / HDR
+    // / PictureProfile / PictureEffect, metering / exposure program, WB_RGBLevels,
+    // SonyISO, distortion params, + DSC focal-length / aspect-ratio). The variant
+    // is selected by the EXACT (`$`-anchored) `$$self{Model}` (`Sony.pm:1100-1173`).
+    // The LARGER `e`/`g`/`h`/`i` variants are not yet ported, so their bodies (and
+    // any unknown one) fall through to `Tag_0x2010` (`%unknownCipherData`, emits
+    // nothing) — faithful until they are ported. `Tag2010d` additionally requires
+    // `not $$self{Panorama}` (the `0x1003` DataMember latched earlier in the walk).
+    // Every `Tag2010x` table is `PRIORITY => 0` (`Sony.pm:6473` etc.), so each leaf
+    // rides priority 0 (never overrides an earlier same-name duplicate). `0x2010 <
+    // 0x9400` in IFD-tag order, so `double_cipher` is normally unset at this point
+    // (ExifTool single-deciphers `0x2010`); it is threaded for consistency and to
+    // honor ExifTool's encounter-order `DoubleCipher` semantics.
+    0x2010 if tag2010::selects_tag2010a(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010a(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x2010 if tag2010::selects_tag2010b(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010b(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x2010 if tag2010::selects_tag2010c(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010c(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x2010 if tag2010::selects_tag2010d(model, panorama) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010d(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x2010 if tag2010::selects_tag2010f(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010f(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
     // `Tag9050c` — selected by model (`Sony.pm:1810`).
     0x9050 if sony_tag9050c_model(model) => {
       let buf = process_enciphered(raw, double_cipher);
@@ -22718,6 +22797,92 @@ mod tests {
         out.is_none(),
         "print_conv={print_conv}: a SEMC (SonyEricsson) blob with a non-`^SONY` Make \
          routes away from %Sony::Main ⇒ sony_makernote_isolated must return None"
+      );
+    }
+  }
+
+  /// `$$self{Panorama}` (`Sony.pm:902`) is an ASSIGNMENT, not a one-way latch:
+  /// `Condition => '$$self{Panorama} = ($$valPt =~ /^(\0\0)?\x01\x01/)'` RE-EVALUATES
+  /// the flag on EVERY readable `0x1003`, so a later non-matching `0x1003` CLEARS an
+  /// earlier match. A duplicate / out-of-order MakerNote whose LAST `0x1003` before
+  /// `0x2010` is non-matching must leave `Panorama` FALSE — so the `Tag2010d`
+  /// `not $$self{Panorama}` gate (`Sony.pm:1140-1145`) passes and the enciphered
+  /// `0x2010` block decodes as `Tag2010d` (its `SequenceImageNumber` leaf appears).
+  /// Before the fix the OR-latch kept a stale `true` and `0x2010` fell through to
+  /// `%unknownCipherData`, emitting nothing. Model `DSC-HX10V` selects `Tag2010d`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_last_0x1003_non_match_clears_panorama_decodes_tag2010d() {
+    // Two `0x1003` (Panorama) entries before `0x2010`: the FIRST matches (LE int32u
+    // 257 ⇒ `\x01\x01..`), the SECOND is all-zero (non-match) ⇒ the last assignment
+    // CLEARS `Panorama`. The `0x2010` value is a 16-byte all-zero cipher block:
+    // decipher is a per-byte substitution with `0x00 ↦ 0x00`, so the plaintext is
+    // all-zero and `parse_tag2010d` emits `SequenceImageNumber` (u32 @0x0000 + 1).
+    let zero_2010 = [0u8; 0x10];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x1003, 7, 4, &[0x01, 0x01, 0x00, 0x00], &[]), // matches → Panorama = true
+      (0x1003, 7, 4, &[0x00, 0x00, 0x00, 0x00], &[]), // non-match → CLEARS to false
+      (0x2010, 7, 0x10, &[], &zero_2010),
+    ];
+    let blob = crafted_sony_blob(entries);
+    for print_conv in [true, false] {
+      let (emissions, _typed) = sony_makernote_isolated(
+        &blob,
+        0,
+        blob.len(),
+        12,
+        ByteOrder::Little,
+        Some("SONY"),
+        Some("DSC-HX10V"),
+        None,
+        print_conv,
+      )
+      .expect("the SONY DSC prefix routes to %Sony::Main");
+      assert!(
+        emissions.iter().any(|e| e.name() == "SequenceImageNumber"),
+        "pc={print_conv}: the LAST 0x1003 before 0x2010 is non-matching ⇒ Panorama=false \
+         ⇒ Tag2010d decodes (SequenceImageNumber present); the OR-latch bug kept a stale \
+         true and suppressed it. emitted: {:?}",
+        emissions.iter().map(|e| e.name()).collect::<Vec<_>>()
+      );
+    }
+  }
+
+  /// The reverse: the LAST `0x1003` before `0x2010` MATCHES (a panorama image), so
+  /// the assignment SETS `Panorama` true and the `Tag2010d` `not $$self{Panorama}`
+  /// gate FAILS — the `0x2010` block falls through to `%unknownCipherData` and emits
+  /// no `Tag2010d` leaf. Pins that the assignment honors a trailing match as well as
+  /// a trailing clear, not just last-wins in one direction. (This direction holds
+  /// under BOTH the buggy latch and the fix — the leading non-match never set the
+  /// flag — so it guards the symmetric case alongside the discriminating test above.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_last_0x1003_match_sets_panorama_suppresses_tag2010d() {
+    let zero_2010 = [0u8; 0x10];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x1003, 7, 4, &[0x00, 0x00, 0x00, 0x00], &[]), // non-match
+      (0x1003, 7, 4, &[0x01, 0x01, 0x00, 0x00], &[]), // matches → SETS Panorama = true
+      (0x2010, 7, 0x10, &[], &zero_2010),
+    ];
+    let blob = crafted_sony_blob(entries);
+    for print_conv in [true, false] {
+      let (emissions, _typed) = sony_makernote_isolated(
+        &blob,
+        0,
+        blob.len(),
+        12,
+        ByteOrder::Little,
+        Some("SONY"),
+        Some("DSC-HX10V"),
+        None,
+        print_conv,
+      )
+      .expect("the SONY DSC prefix routes to %Sony::Main");
+      assert!(
+        !emissions.iter().any(|e| e.name() == "SequenceImageNumber"),
+        "pc={print_conv}: the LAST 0x1003 before 0x2010 matches ⇒ Panorama=true ⇒ Tag2010d \
+         is gated OFF (no SequenceImageNumber). emitted: {:?}",
+        emissions.iter().map(|e| e.name()).collect::<Vec<_>>()
       );
     }
   }
