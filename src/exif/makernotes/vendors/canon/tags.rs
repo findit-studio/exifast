@@ -277,6 +277,9 @@ impl SubTable {
         | SubTable::ColorData
         | SubTable::AfMicroAdj
         | SubTable::CustomFunctions
+        // CustomFunctions1D (0x90) — the 1D/1Ds `CanonCustom::Functions1D` tag
+        // (`Canon.pm:1796-1802`), the per-body 0x0f tables (#87).
+        | SubTable::CustomFunctions1D
         // The EOS 7D image-info sub-tables (#445): TimeInfo (0x35) / CropInfo
         // (0x98) / CustomFunctions2 (0x99) / AspectInfo (0x9a) / VignettingCorr
         // (0x4015) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) / LensInfo
@@ -1255,7 +1258,7 @@ mod tests {
       // (0x35 TimeInfo / 0x98 CropInfo / 0x99 CustomFunctions2 / 0x9a AspectInfo
       // / 0x4015 VignettingCorr / 0x4016 VignettingCorr2 / 0x4018 LightingOpt /
       // 0x4019 LensInfo are now WALKED — the #445 EOS 7D sub-tables.)
-      (0x90, "CustomFunctions1D", SubTable::CustomFunctions1D),
+      // (0x90 CustomFunctions1D is now WALKED — see `walked_subtables_are_marked`.)
       (0x91, "PersonalFunctions", SubTable::PersonalFunctions),
       (
         0x92,
@@ -1306,6 +1309,8 @@ mod tests {
     assert!(SubTable::ColorData.is_walked());
     assert!(SubTable::AfMicroAdj.is_walked());
     assert!(SubTable::CustomFunctions.is_walked());
+    // CustomFunctions1D (0x90) — the 1D/1Ds tag (#87).
+    assert!(SubTable::CustomFunctions1D.is_walked());
     // The EOS 7D image-info sub-tables (#445) are now walked too.
     assert!(SubTable::TimeInfo.is_walked());
     assert!(SubTable::CropInfo.is_walked());
