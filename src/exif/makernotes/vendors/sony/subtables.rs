@@ -66,6 +66,21 @@ pub fn read_i16(buf: &[u8], off: usize) -> Option<i16> {
   }
 }
 
+/// Read a big-endian `int16s` at byte `off` of the block (`None` if the 2-byte
+/// range is out of bounds).
+///
+/// The base `%Sony::CameraInfo` SubDirectory (A700/A850/A900) is declared
+/// `ByteOrder => 'BigEndian'` (`Sony.pm:725`), so UNLIKE the little-endian
+/// `CameraInfo2`/`CameraInfo3` its inline `%afStatusInfo` `int16s` grid reads
+/// big-endian.
+#[must_use]
+pub fn read_i16_be(buf: &[u8], off: usize) -> Option<i16> {
+  match buf.get(off..off + 2) {
+    Some(&[a, b]) => Some(i16::from_be_bytes([a, b])),
+    _ => None,
+  }
+}
+
 /// Read a little-endian `int32u` at byte `off` of the block.
 #[must_use]
 pub fn read_u32(buf: &[u8], off: usize) -> Option<u32> {

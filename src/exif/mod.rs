@@ -12469,7 +12469,8 @@ fn sony_emit_binary_subdir<S: ExifSink>(
   out: &mut S,
 ) {
   use makernotes::vendors::sony::{
-    camerainfo2, camerainfo3, camerasettings, camerasettings3, extrainfo3, focusinfo, moreinfo,
+    camerainfo, camerainfo2, camerainfo3, camerasettings, camerasettings3, extrainfo3, focusinfo,
+    moreinfo, shotinfo,
   };
   let off = entry.value_offset();
   let Some(end) = off.checked_add(entry.value_size()) else {
@@ -12479,6 +12480,12 @@ fn sony_emit_binary_subdir<S: ExifSink>(
     return;
   };
   let emissions = match entry.tag_id() {
+    // base `CameraInfo` — `$count == 368 || 5478` (Sony.pm:720-726), BigEndian.
+    // The A700 (368) / A850/A900 (5478) generation; dispatched BEFORE the
+    // little-endian `CameraInfo2`/`CameraInfo3` count gates.
+    0x0010 if entry.value_size() == 368 || entry.value_size() == 5478 => {
+      camerainfo::parse_camera_info(raw, model, print_conv)
+    }
     // `CameraInfo2` — `$count == 5506 || 6118` (Sony.pm:728-734), LittleEndian.
     // The A200-A390 generation; dispatched BEFORE `CameraInfo3`'s 15360 gate.
     0x0010 if entry.value_size() == 5506 || entry.value_size() == 6118 => {
@@ -12511,6 +12518,9 @@ fn sony_emit_binary_subdir<S: ExifSink>(
     // `ExtraInfo3` — the final (non-conditional) `ExtraInfo` ARRAY branch
     // (Sony.pm:150-167); the A33 writes this variant.
     0x0116 => extrainfo3::parse_extra_info3(raw, model, print_conv),
+    // `ShotInfo` — the (un-enciphered) `0x3000` SubDirectory (DSC / Xperia
+    // bodies); unconditional ARRAY branch (Sony.pm:1769-1771).
+    0x3000 => shotinfo::parse_shot_info(raw, print_conv),
     _ => return,
   };
   // Each leaf carries its ExifTool `Priority => N` (the table-level `PRIORITY`,
@@ -12572,8 +12582,8 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
 ) {
   use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
-    tag202a, tag900b, tag940a, tag940c, tag940e, tag9050, tag9400, tag9401, tag9402, tag9403,
-    tag9404, tag9406, tag9416,
+    afinfo, tag202a, tag900b, tag940a, tag940c, tag940e, tag9050, tag9400, tag9401, tag9402,
+    tag9403, tag9404, tag9406, tag9416,
   };
   // The verbatim on-disk value span (the enciphered cipher block, or the plain
   // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
@@ -12678,9 +12688,27 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
+    // `AFInfo` — the SLT/HV/ILCA variant of 0x940e (`$$self{Model} =~
+    // /^(SLT-|HV|ILCA-)/`, `Sony.pm:2094-2097`), dispatched BEFORE the E-mount
+    // `Tag940e` (matching ExifTool's conditional-ARRAY order). `PRIORITY => 0`,
+    // so each leaf rides priority 0 (never overrides an earlier same-name
+    // duplicate, e.g. a `CameraInfo3` `FocusMode`).
+    0x940e if sony_selects_afinfo(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in afinfo::parse_af_info(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value_with_priority(
+          "MakerNotes",
+          group1,
+          emi.name,
+          emi.value,
+          false,
+          emi.priority,
+        );
+      }
+    }
     // `Tag940e` — `TiffMeteringImage*`, the E-mount variant selected by model
     // `/^(NEX-|ILCE-|Lunar)/` (`Sony.pm:2094-2105`); the SLT/HV/ILCA `AFInfo`
-    // variant routes to a separate (deferred) `%Sony::AFInfo` table.
+    // variant routes to the separate `%Sony::AFInfo` table above.
     0x940e if tag940e::selects_tag940e(model) => {
       let buf = process_enciphered(raw, double_cipher);
       for emi in tag940e::parse_tag940e(&buf, model, software) {
@@ -12714,6 +12742,13 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
     }
     _ => {}
   }
+}
+
+/// `AFInfo` 0x940e model `Condition` (`Sony.pm:2096`):
+/// `$$self{Model} =~ /^(SLT-|HV|ILCA-)/`. Selects the SLT/HV/ILCA `%Sony::AFInfo`
+/// table over the E-mount `Tag940e`.
+fn sony_selects_afinfo(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.starts_with("SLT-") || m.starts_with("HV") || m.starts_with("ILCA-"))
 }
 
 /// `Tag9050c` model `Condition` (`Sony.pm:1810`):
