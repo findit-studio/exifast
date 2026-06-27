@@ -31,6 +31,7 @@
 #![deny(clippy::indexing_slicing)]
 
 use super::camera_settings::canon_ev;
+use super::canon_custom::word_bounded;
 use super::lens_types;
 use super::printconv::picture_style_label;
 use super::shot_info::white_balance_label;
@@ -49,23 +50,90 @@ pub fn model_is_camera_info_5d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 5D"))
 }
 
-/// Decode the `Canon::CameraInfo` block for the parent `model`. Only the EOS 5D
-/// variant is ported; any other model yields nothing (deferred). `print_conv`
-/// selects the PrintConv vs ValueConv view.
+/// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
+/// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
+/// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
+/// 550D / 1000D); any other model yields nothing (deferred). `print_conv`
+/// selects the PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
+/// `$$self{LensType}` (the CameraSettings DataMember) that gates the
+/// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
 #[must_use]
 pub fn parse(
   data: &[u8],
   order: ByteOrder,
   print_conv: bool,
   model: Option<&str>,
+  canon_lens_type: Option<u16>,
 ) -> Vec<(SmolStr, TagValue)> {
   if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_7d(model) {
     camera_info_7d(data, order, print_conv)
+  } else if model_is_camera_info_40d(model) {
+    camera_info_40d(data, order, print_conv, canon_lens_type)
+  } else if model_is_camera_info_50d(model) {
+    camera_info_50d(data, order, print_conv)
+  } else if model_is_camera_info_450d(model) {
+    camera_info_450d(data, order, print_conv, canon_lens_type)
+  } else if model_is_camera_info_500d(model) {
+    camera_info_500d(data, order, print_conv)
+  } else if model_is_camera_info_550d(model) {
+    camera_info_550d(data, order, print_conv)
+  } else if model_is_camera_info_1000d(model) {
+    camera_info_1000d(data, order, print_conv, canon_lens_type)
   } else {
     Vec::new()
   }
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo40D` (`Canon.pm:1366`,
+/// `$$self{Model} =~ /EOS 40D$/`).
+#[must_use]
+pub fn model_is_camera_info_40d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 40D"))
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo50D` (`Canon.pm:1371`,
+/// `$$self{Model} =~ /EOS 50D$/`).
+#[must_use]
+pub fn model_is_camera_info_50d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 50D"))
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo450D` (`Canon.pm:1391`,
+/// `$$self{Model} =~ /\b(450D|REBEL XSi|Kiss X2)\b/`).
+#[must_use]
+pub fn model_is_camera_info_450d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "450D") || word_bounded(m, "REBEL XSi") || word_bounded(m, "Kiss X2")
+  })
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo500D` (`Canon.pm:1396`,
+/// `$$self{Model} =~ /\b(500D|REBEL T1i|Kiss X3)\b/`).
+#[must_use]
+pub fn model_is_camera_info_500d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "500D") || word_bounded(m, "REBEL T1i") || word_bounded(m, "Kiss X3")
+  })
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo550D` (`Canon.pm:1401`,
+/// `$$self{Model} =~ /\b(550D|REBEL T2i|Kiss X4)\b/`).
+#[must_use]
+pub fn model_is_camera_info_550d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "550D") || word_bounded(m, "REBEL T2i") || word_bounded(m, "Kiss X4")
+  })
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo1000D` (`Canon.pm:1431`,
+/// `$$self{Model} =~ /\b(1000D|REBEL XS|Kiss F)\b/`).
+#[must_use]
+pub fn model_is_camera_info_1000d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "1000D") || word_bounded(m, "REBEL XS") || word_bounded(m, "Kiss F")
+  })
 }
 
 /// `true` when `model` selects `%Canon::CameraInfo7D` via the `0x0d`
@@ -445,6 +513,808 @@ fn camera_info_7d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolS
     ps_info(data, ps_start, order, print_conv, &mut push);
   }
   out
+}
+
+/// `%Canon::CameraInfo40D` (`Canon.pm:4492-4581`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, NO firmware `Hook` (every leaf at its nominal offset). The
+/// `0x25b PictureStyleInfo` `IS_SUBDIR` walks the nested `%Canon::PSInfo` table.
+fn camera_info_40d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  canon_lens_type: Option<u16>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x18, print_conv, &mut push);
+  emit_macro_magnification(data, 0x1b, canon_lens_type, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1d,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x30, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x43,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x45,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x6f, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x73, order, &mut push);
+  emit_lens_type(data, 0xd6, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xd8,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xda,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0xff, false, &mut push);
+  emit_file_index(data, 0x133, order, &mut push);
+  emit_directory_index(data, 0x13f, order, true, &mut push);
+  ps_info(data, 0x25b, order, print_conv, &mut push);
+  emit_string_leaf(data, 0x92b, 64, "LensModel", &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo50D` (`Canon.pm:4584-4715`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`. The `0x00 FirmwareVersionLookAhead` sets `CanonFirm` (probing
+/// the version string at 0x15a then 0x15e); the `0xee` `Hook`
+/// (`$varSize += ($$self{CanonFirm} ? -4 : 0x10000) if $$self{CanonFirm} < 2`)
+/// shifts every leaf AFTER 0xee. `0x2d7 PictureStyleInfo` walks `%Canon::PSInfo`.
+fn camera_info_50d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let canon_firm = canon_firm_50d(data);
+  let var_size: i64 = if canon_firm < 2 {
+    if canon_firm != 0 { -4 } else { 0x1_0000 }
+  } else {
+    0
+  };
+  // The `0xee` Hook fires AFTER its own entry's value is read (ExifTool.pm:9957
+  // computes the offset, :10049 runs the Hook, :10076 reads at the PRE-Hook
+  // offset), so MaxFocalLength (0xee) is read UNSHIFTED and only leaves STRICTLY
+  // after 0xee take the `varSize` shift. `None` ⇒ the shifted offset is out of
+  // range (CanonFirm == 0 pushes every later leaf out — ExifTool emits nothing).
+  let at = |off: usize| -> Option<usize> {
+    let a: i64 = if off > 0xee {
+      off as i64 + var_size
+    } else {
+      off as i64
+    };
+    usize::try_from(a).ok()
+  };
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x31, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x50,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x52,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x6f, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x73, order, &mut push);
+  emit_picture_style(data, 0xa7, print_conv, &mut push);
+  emit_high_iso_nr(data, 0xbd, print_conv, &mut push);
+  emit_auto_lighting_optimizer(data, 0xbf, print_conv, &mut push);
+  emit_lens_type(data, 0xea, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xec,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xee,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if let Some(off) = at(0x15e) {
+    emit_firmware_version(data, off, false, &mut push);
+  }
+  if let Some(off) = at(0x19b) {
+    emit_file_index(data, off, order, &mut push);
+  }
+  if let Some(off) = at(0x1a7) {
+    emit_directory_index(data, off, order, true, &mut push);
+  }
+  if let Some(ps_start) = at(0x2d7) {
+    ps_info(data, ps_start, order, print_conv, &mut push);
+  }
+  out
+}
+
+/// `%Canon::CameraInfo50D` `0x00 FirmwareVersionLookAhead` RawConv
+/// (`Canon.pm:4601-4609`): `CanonFirm = 1` if a `D.D.D` version prefix sits at
+/// 0x15a, else `2` if at 0x15e, else `0` (ExifTool warns then the `Hook` shifts
+/// every later leaf out of range).
+fn canon_firm_50d(data: &[u8]) -> u8 {
+  if firmware_prefix_at(data, 0x15a) {
+    1
+  } else if firmware_prefix_at(data, 0x15e) {
+    2
+  } else {
+    0
+  }
+}
+
+/// `%Canon::CameraInfo450D` (`Canon.pm:5042-5130`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Carries `OwnerName` (string[32]) and a
+/// PLAIN `DirectoryIndex` (no `$val-1`); `0x263 PictureStyleInfo` walks `%PSInfo`.
+fn camera_info_450d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  canon_lens_type: Option<u16>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x18, print_conv, &mut push);
+  emit_macro_magnification(data, 0x1b, canon_lens_type, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1d,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x30, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x43,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x45,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x6f, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x73, order, &mut push);
+  emit_lens_type(data, 0xde, order, print_conv, &mut push);
+  emit_firmware_version(data, 0x107, false, &mut push);
+  emit_string_leaf(data, 0x10f, 32, "OwnerName", &mut push);
+  emit_directory_index(data, 0x133, order, false, &mut push);
+  emit_file_index(data, 0x13f, order, &mut push);
+  ps_info(data, 0x263, order, print_conv, &mut push);
+  emit_string_leaf(data, 0x933, 64, "LensModel", &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo500D` (`Canon.pm:5133-5243`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. `FirmwareVersion` carries the
+/// `/^\d+\.\d+\.\d+\s*$/` RawConv guard; `0x30b PictureStyleInfo` walks `%PSInfo`.
+fn camera_info_500d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x31, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x50,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x52,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x73, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x77, order, &mut push);
+  emit_picture_style(data, 0xab, print_conv, &mut push);
+  emit_high_iso_nr(data, 0xbc, print_conv, &mut push);
+  emit_auto_lighting_optimizer(data, 0xbe, print_conv, &mut push);
+  emit_lens_type(data, 0xf6, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xf8,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xfa,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x190, true, &mut push);
+  emit_file_index(data, 0x1d3, order, &mut push);
+  emit_directory_index(data, 0x1df, order, true, &mut push);
+  ps_info(data, 0x30b, order, print_conv, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo550D` (`Canon.pm:5247-5340`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Like the 500D but with NO
+/// HighISONoiseReduction/AutoLightingOptimizer; `0x31c PictureStyleInfo` walks
+/// `%PSInfo`.
+fn camera_info_550d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x35, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x54,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x56,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x78, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x7c, order, &mut push);
+  emit_picture_style(data, 0xb0, print_conv, &mut push);
+  emit_lens_type(data, 0xff, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x101,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x103,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x1a4, true, &mut push);
+  emit_file_index(data, 0x1e4, order, &mut push);
+  emit_directory_index(data, 0x1f0, order, true, &mut push);
+  ps_info(data, 0x31c, order, print_conv, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo1000D` (`Canon.pm:5623-5707`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Carries `FlashModel` (`Mask => 0x7f`,
+/// `%flashModel`), `MacroMagnification` (LensType==124), and a PLAIN
+/// `DirectoryIndex` (no `$val-1`); `0x267 PictureStyleInfo` walks `%PSInfo`.
+fn camera_info_1000d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  canon_lens_type: Option<u16>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_flash_model(data, 0x13, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x18, print_conv, &mut push);
+  emit_macro_magnification(data, 0x1b, canon_lens_type, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1d,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x30, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x43,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x45,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x6f, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x73, order, &mut push);
+  emit_lens_type(data, 0xe2, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xe4,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xe6,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x10b, false, &mut push);
+  emit_directory_index(data, 0x137, order, false, &mut push);
+  emit_file_index(data, 0x143, order, &mut push);
+  ps_info(data, 0x267, order, print_conv, &mut push);
+  emit_string_leaf(data, 0x937, 64, "LensModel", &mut push);
+  out
+}
+
+// ─── shared per-field emitters for the int8u xxxD `CameraInfo` tables ─────────
+// Each reads at the byte offset the caller already resolved (applying any
+// firmware `Hook` shift) and pushes the rendered leaf, reusing the same value
+// renderers as the 5D/7D tables. Faithful to the shared `%ci*` common defs
+// (`Canon.pm:3086-3153`) and the inline rows of each per-model table.
+
+/// `%ciFNumber` (0x03) / `%ciExposureTime` (0x04) / `%ciISO` (0x06) — the int8u
+/// exposure triple shared by every xxxD `CameraInfo` table at fixed offsets
+/// (`Canon.pm:3087-3115`). FNumber/ExposureTime drop a zero raw; ISO does not.
+fn emit_exposure_triple<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i8u(data, 0x03)
+    && raw != 0
+  {
+    let vc = ((raw as f64 - 8.0) / 16.0 * std::f64::consts::LN_2).exp();
+    push("FNumber", value_or_print(print_conv, vc, format_g2(vc)));
+  }
+  if let Some(raw) = i8u(data, 0x04)
+    && raw != 0
+  {
+    let vc = (4.0 * std::f64::consts::LN_2 * (1.0 - canon_ev(raw - 24))).exp();
+    push(
+      "ExposureTime",
+      value_or_print(print_conv, vc, print_exposure_time(vc)),
+    );
+  }
+  if let Some(raw) = i8u(data, 0x06) {
+    let vc = 100.0 * ((raw as f64 / 8.0 - 9.0) * std::f64::consts::LN_2).exp();
+    push(
+      "ISO",
+      value_or_print(print_conv, vc, std::format!("{vc:.0}")),
+    );
+  }
+}
+
+/// `%ciCameraTemperature` (`Canon.pm:3116`, int8u, `$val-128`, "$val C").
+fn emit_camera_temperature<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i8u(data, off) {
+    let c = raw - 128;
+    push(
+      "CameraTemperature",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{c} C")))
+      } else {
+        TagValue::I64(c)
+      },
+    );
+  }
+}
+
+/// `%ciMacroMagnification` (`Canon.pm:3124-3133`): gated on the pre-scanned
+/// `$$self{LensType} == 124` (the MP-E 65mm Macro), `exp((75-$val)*ln2*3/40)`,
+/// PrintConv `%.1fx`.
+fn emit_macro_magnification<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  canon_lens_type: Option<u16>,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if canon_lens_type != Some(124) {
+    return;
+  }
+  if let Some(raw) = i8u(data, off) {
+    let vc = ((75.0 - raw as f64) * std::f64::consts::LN_2 * 3.0 / 40.0).exp();
+    let value = if print_conv {
+      TagValue::Str(SmolStr::from(std::format!("{vc:.1}x")))
+    } else if vc.fract() == 0.0 && vc.is_finite() {
+      TagValue::I64(vc as i64)
+    } else {
+      TagValue::F64(vc)
+    };
+    push("MacroMagnification", value);
+  }
+}
+
+/// `%ciFocalLength`/`%ciMinFocal`/`%ciMaxFocal` (`Canon.pm:3134-3153`, int16uRev,
+/// "$val mm"). `drop_zero` mirrors `%ciFocalLength`'s `RawConv => '$val ? $val :
+/// undef'` (Min/Max focal carry no such drop).
+fn emit_focal_mm<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  name: &'static str,
+  drop_zero: bool,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = u16_rev(data, off, order) {
+    if drop_zero && v == 0 {
+      return;
+    }
+    push(name, mm_value(v, print_conv));
+  }
+}
+
+/// `CameraOrientation` (int8u, `%camera_orientation_label`).
+fn emit_camera_orientation<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push(
+      "CameraOrientation",
+      enum8(v, print_conv, camera_orientation_label),
+    );
+  }
+}
+
+/// `FocusDistanceUpper`/`FocusDistanceLower` (`%focusDistanceByteSwap`, int16uRev,
+/// `$val/100`, `>655.345 ? inf : '$val m'`).
+fn emit_focus_distance<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  name: &'static str,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = u16_rev(data, off, order) {
+    push(name, focus_distance_value(raw, print_conv));
+  }
+}
+
+/// `WhiteBalance` (int16u, `%canonWhiteBalance`).
+fn emit_white_balance<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = u16(data, off, order) {
+    push(
+      "WhiteBalance",
+      if print_conv {
+        hash16(v, white_balance_label(v))
+      } else {
+        TagValue::I64(v)
+      },
+    );
+  }
+}
+
+/// `ColorTemperature` (int16u, plain integer).
+fn emit_color_temperature<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  push: &mut F,
+) {
+  if let Some(v) = u16(data, off, order) {
+    push("ColorTemperature", TagValue::I64(v));
+  }
+}
+
+/// `LensType` (int16uRev, `%canonLensTypes`, `PrintInt`).
+fn emit_lens_type<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = u16_rev(data, off, order) {
+    push("LensType", lens_type_value(v, print_conv));
+  }
+}
+
+/// `PictureStyle` (int8u, `PrintHex`, `%pictureStyles`).
+fn emit_picture_style<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push("PictureStyle", picture_style_value(v, print_conv));
+  }
+}
+
+/// `HighlightTonePriority` (int8u, `%offOn`).
+fn emit_highlight_tone_priority<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push("HighlightTonePriority", enum8(v, print_conv, off_on_label));
+  }
+}
+
+/// `HighISONoiseReduction` (int8u, `Canon.pm:4663-4669`).
+fn emit_high_iso_nr<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push(
+      "HighISONoiseReduction",
+      enum8(v, print_conv, high_iso_nr_label),
+    );
+  }
+}
+
+/// `AutoLightingOptimizer` (int8u, `Canon.pm:4672-4678`).
+fn emit_auto_lighting_optimizer<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push(
+      "AutoLightingOptimizer",
+      enum8(v, print_conv, auto_lighting_optimizer_label),
+    );
+  }
+}
+
+/// `FirmwareVersion` (string[6]). `validate` mirrors the `RawConv =>
+/// '$val=~/^\d+\.\d+\.\d+\s*$/ ? $val : undef'` carried by the 500D/550D rows
+/// (`Canon.pm:5224`/`:5320`); the 40D/50D/450D/1000D rows have no such guard.
+fn emit_firmware_version<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  validate: bool,
+  push: &mut F,
+) {
+  if let Some(s) = read_string(data, off, 6) {
+    if validate && !is_firmware_version(&s) {
+      return;
+    }
+    push("FirmwareVersion", TagValue::Str(SmolStr::from(s)));
+  }
+}
+
+/// A plain `string[len]` leaf (`OwnerName`/`LensModel`).
+fn emit_string_leaf<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  len: usize,
+  name: &'static str,
+  push: &mut F,
+) {
+  if let Some(s) = read_string(data, off, len) {
+    push(name, TagValue::Str(SmolStr::from(s)));
+  }
+}
+
+/// `FileIndex` (int32u, ValueConv `$val + 1`).
+fn emit_file_index<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  push: &mut F,
+) {
+  if let Some(v) = u32(data, off, order) {
+    push("FileIndex", TagValue::I64(v + 1));
+  }
+}
+
+/// `DirectoryIndex` (int32u). `minus_one` applies the `ValueConv => '$val - 1'`
+/// carried by the 40D/50D/500D/550D rows; the 450D/1000D rows emit the raw value.
+fn emit_directory_index<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  minus_one: bool,
+  push: &mut F,
+) {
+  if let Some(v) = u32(data, off, order) {
+    let value = if minus_one { v - 1 } else { v };
+    push("DirectoryIndex", TagValue::I64(value));
+  }
+}
+
+/// `FlashMeteringMode` (int8u, `Canon.pm:4503-4512`).
+fn emit_flash_metering_mode<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push(
+      "FlashMeteringMode",
+      enum8(v, print_conv, flash_metering_mode_label),
+    );
+  }
+}
+
+/// `AutoLightingOptimizer` PrintConv (`Canon.pm:4672-4678`) — the same labels as
+/// `HighISONoiseReduction`, kept distinct to mirror the source table structure.
+fn auto_lighting_optimizer_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Standard",
+    1 => "Low",
+    2 => "Strong",
+    3 => "Off",
+    _ => return None,
+  })
+}
+
+/// `FlashModel` (`Canon.pm:5634`, `Mask => 0x7f`, `%flashModel`). The mask has no
+/// `BitShift`, so the value is `raw & 0x7f`; a hash miss renders the DECIMAL
+/// `Unknown (N)` (the row carries no `PrintHex`).
+fn emit_flash_model<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i8u(data, off) {
+    let v = raw & 0x7f;
+    let value = if print_conv {
+      match flash_model_label(v) {
+        Some(l) => TagValue::Str(SmolStr::new_static(l)),
+        None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+      }
+    } else {
+      TagValue::I64(v)
+    };
+    push("FlashModel", value);
+  }
+}
+
+/// `%flashModel` (`Canon.pm:1029-1049`).
+fn flash_model_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "n/a",
+    4 => "Speedlite 540EZ",
+    5 => "Speedlite 380EX",
+    6 => "Speedlite 550EX",
+    8 => "Speedlite ST-E2",
+    9 => "Speedlite MR-14EX",
+    12 => "Speedlite 580EX",
+    13 => "Speedlite 430EX",
+    17 => "Speedlite 580EX II",
+    18 => "Speedlite 430EX II",
+    22 => "Speedlite 600EX-RT",
+    23 => "Speedlite 600EX II-RT",
+    24 => "Speedlite 90EX",
+    25 => "Speedlite 430EX III-RT",
+    31 => "Speedlite EL-1 ver2",
+    33 => "Speedlite EL-5",
+    34 => "Speedlite EL-10",
+    _ => return None,
+  })
 }
 
 /// `%Canon::CameraInfo7D` `0x00 FirmwareVersionLookAhead` RawConv
@@ -1047,7 +1917,7 @@ mod tests {
   #[test]
   fn camera_info_5d_print_values() {
     let data = blob();
-    let em = parse(&data, ByteOrder::Little, true, Some("Canon EOS 5D"));
+    let em = parse(&data, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -1083,7 +1953,7 @@ mod tests {
   #[test]
   fn camera_info_5d_numeric_iso() {
     let data = blob();
-    let em = parse(&data, ByteOrder::Little, false, Some("Canon EOS 5D"));
+    let em = parse(&data, ByteOrder::Little, false, Some("Canon EOS 5D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::I64(400)));
     assert_eq!(find("FileIndex"), Some(TagValue::I64(1428)));
@@ -1103,9 +1973,365 @@ mod tests {
         &[0u8; 0x120],
         ByteOrder::Little,
         true,
-        Some("Canon EOS 60D")
+        Some("Canon EOS 60D"),
+        None
       )
       .is_empty()
+    );
+  }
+
+  #[test]
+  fn dispatch_anchored_40d_50d() {
+    assert!(model_is_camera_info_40d(Some("Canon EOS 40D")));
+    assert!(!model_is_camera_info_40d(Some("Canon EOS 400D")));
+    assert!(model_is_camera_info_50d(Some("Canon EOS 50D")));
+    assert!(!model_is_camera_info_50d(Some("Canon EOS 500D")));
+    assert!(!model_is_camera_info_50d(Some("Canon EOS 5D")));
+  }
+
+  /// `%Canon::CameraInfo40D` (no firmware `Hook`) print values + the
+  /// `MacroMagnification` LensType gate + the `PSInfo` subdir.
+  #[test]
+  fn camera_info_40d_fields() {
+    let mut b = vec![0u8; 0x980];
+    b[0x06] = 88; // ISO 400
+    b[0x18] = 148; // CameraTemperature 20 C
+    b[0x1b] = 75; // MacroMagnification raw (1.0x when LensType == 124)
+    b[0x1d] = 0x00;
+    b[0x1e] = 0x32; // FocalLength int16uRev = 50
+    b[0x30] = 1; // CameraOrientation Rotate 90 CW
+    b[0x73] = 0x50;
+    b[0x74] = 0x14; // ColorTemperature 5200
+    b[0xd8] = 0x00;
+    b[0xd9] = 0x0a; // MinFocalLength 10
+    b[0xda] = 0x00;
+    b[0xdb] = 0xc8; // MaxFocalLength 200
+    b[0xff..0x105].copy_from_slice(b"1.0.3\0"); // FirmwareVersion string[6]
+    b[0x133..0x137].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x13f..0x143].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    b[0x92b..0x934].copy_from_slice(b"EF24-70mm"); // LensModel string[64]
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 40D"),
+      Some(124),
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(
+      find("MacroMagnification"),
+      Some(TagValue::Str("1.0x".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.3".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("LensModel"), Some(TagValue::Str("EF24-70mm".into())));
+    // MacroMagnification is gated on the pre-scanned LensType == 124.
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), Some(50));
+    assert!(em2.iter().all(|(k, _)| k != "MacroMagnification"));
+    // -n view: ISO / FileIndex render as bare integers.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 40D"), None);
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("ISO"), Some(TagValue::I64(400)));
+    assert_eq!(findn("FileIndex"), Some(TagValue::I64(101)));
+  }
+
+  /// Per-field availability: a blob that ends before the later leaves emits the
+  /// in-range tags only (each leaf gated on `buf.get(off..off+size)`).
+  #[test]
+  fn camera_info_40d_truncated_per_field() {
+    let mut b = vec![0u8; 0x80];
+    b[0x06] = 88; // ISO 400 (in range)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert!(find("FirmwareVersion").is_none());
+    assert!(find("FileIndex").is_none());
+    assert!(find("LensModel").is_none());
+    assert!(find("MinFocalLength").is_none());
+  }
+
+  /// `%Canon::CameraInfo50D` firmware-1 (`CanonFirm == 1`): the `0xee` `Hook`
+  /// shifts every leaf AFTER 0xee by `-4`; the Hook entry (MaxFocalLength) and
+  /// the earlier leaves stay at their nominal offsets.
+  #[test]
+  fn camera_info_50d_firmware1_shift() {
+    let mut b = vec![0u8; 0x3c0];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50
+    b[0xa7] = 0x81; // PictureStyle 0x81 Standard
+    b[0xbd] = 2; // HighISONoiseReduction Strong
+    b[0xbf] = 1; // AutoLightingOptimizer Low
+    b[0xee] = 0x00;
+    b[0xef] = 0x64; // MaxFocalLength 100 (Hook entry — read UNSHIFTED)
+    b[0x15a..0x160].copy_from_slice(b"2.6.1\0"); // version prefix at 0x15a ⇒ CanonFirm 1
+    b[0x197..0x19b].copy_from_slice(&200u32.to_le_bytes()); // FileIndex @ 0x19b-4
+    b[0x1a3..0x1a7].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex @ 0x1a7-4
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(
+      find("HighISONoiseReduction"),
+      Some(TagValue::Str("Strong".into()))
+    );
+    assert_eq!(
+      find("AutoLightingOptimizer"),
+      Some(TagValue::Str("Low".into()))
+    );
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("100 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("2.6.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+  }
+
+  /// `%Canon::CameraInfo50D` firmware-2 (`CanonFirm == 2`): no `varSize` shift —
+  /// the post-Hook leaves stay at their nominal offsets.
+  #[test]
+  fn camera_info_50d_firmware2_no_shift() {
+    let mut b = vec![0u8; 0x3c0];
+    b[0xee] = 0x00;
+    b[0xef] = 0x64; // MaxFocalLength 100
+    b[0x15e..0x164].copy_from_slice(b"1.0.3\0"); // version prefix at 0x15e ⇒ CanonFirm 2
+    b[0x19b..0x19f].copy_from_slice(&200u32.to_le_bytes()); // FileIndex @ 0x19b
+    b[0x1a7..0x1ab].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex @ 0x1a7
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("100 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.3".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+  }
+
+  #[test]
+  fn dispatch_word_bounded_450d_500d_550d() {
+    assert!(model_is_camera_info_450d(Some("Canon EOS 450D")));
+    assert!(model_is_camera_info_450d(Some("Canon EOS REBEL XSi")));
+    assert!(model_is_camera_info_450d(Some("Canon EOS Kiss X2")));
+    assert!(model_is_camera_info_500d(Some("Canon EOS 500D")));
+    assert!(model_is_camera_info_500d(Some("Canon EOS REBEL T1i")));
+    assert!(model_is_camera_info_550d(Some("Canon EOS 550D")));
+    assert!(model_is_camera_info_550d(Some("Canon EOS Kiss X4")));
+    // `\bREBEL XS\b` (a 1000D) must NOT match the 450D `REBEL XSi` token.
+    assert!(!model_is_camera_info_450d(Some("Canon EOS REBEL XS")));
+    // No cross-matching between the three.
+    assert!(!model_is_camera_info_450d(Some("Canon EOS 500D")));
+    assert!(!model_is_camera_info_550d(Some("Canon EOS 450D")));
+  }
+
+  /// `%Canon::CameraInfo450D`: OwnerName + the PLAIN DirectoryIndex (no `$val-1`,
+  /// unlike 40D/50D/500D/550D) + the LensType MacroMagnification gate.
+  #[test]
+  fn camera_info_450d_fields() {
+    let mut b = vec![0u8; 0x980];
+    b[0x06] = 88; // ISO 400
+    b[0x18] = 148; // CameraTemperature 20 C
+    b[0x1d] = 0x00;
+    b[0x1e] = 0x32; // FocalLength 50
+    b[0x107..0x10d].copy_from_slice(b"1.2.4\0"); // FirmwareVersion (no RawConv guard)
+    b[0x10f..0x117].copy_from_slice(b"Jane Doe"); // OwnerName string[32]
+    b[0x133..0x137].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex PLAIN = 200
+    b[0x13f..0x143].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
+    b[0x933..0x93e].copy_from_slice(b"EF-S18-55mm"); // LensModel
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 450D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.2.4".into())));
+    assert_eq!(find("OwnerName"), Some(TagValue::Str("Jane Doe".into())));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(200))); // PLAIN, no -1
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("LensModel"), Some(TagValue::Str("EF-S18-55mm".into())));
+  }
+
+  /// `%Canon::CameraInfo500D`: HighlightTonePriority/PictureStyle/HighISO/ALO +
+  /// the `/^\d+\.\d+\.\d+\s*$/` FirmwareVersion RawConv guard.
+  #[test]
+  fn camera_info_500d_fields() {
+    let mut b = vec![0u8; 0x400];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50
+    b[0xab] = 0x81; // PictureStyle Standard
+    b[0xbc] = 2; // HighISONoiseReduction Strong
+    b[0xbe] = 1; // AutoLightingOptimizer Low
+    b[0xf8] = 0x00;
+    b[0xf9] = 0x0a; // MinFocalLength 10
+    b[0xfa] = 0x00;
+    b[0xfb] = 0xc8; // MaxFocalLength 200
+    b[0x190..0x196].copy_from_slice(b"1.1.1\0"); // FirmwareVersion (valid)
+    b[0x1d3..0x1d7].copy_from_slice(&200u32.to_le_bytes()); // FileIndex 201
+    b[0x1df..0x1e3].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex 199
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(
+      find("HighISONoiseReduction"),
+      Some(TagValue::Str("Strong".into()))
+    );
+    assert_eq!(
+      find("AutoLightingOptimizer"),
+      Some(TagValue::Str("Low".into()))
+    );
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.1.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    // The RawConv drops a non-version FirmwareVersion string.
+    b[0x190..0x196].copy_from_slice(b"BADVER");
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
+    assert!(em2.iter().all(|(k, _)| k != "FirmwareVersion"));
+  }
+
+  /// `%Canon::CameraInfo550D`: like 500D but with NO HighISONoiseReduction /
+  /// AutoLightingOptimizer rows (different offsets throughout).
+  #[test]
+  fn camera_info_550d_fields() {
+    let mut b = vec![0u8; 0x410];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50
+    b[0x35] = 1; // CameraOrientation Rotate 90 CW
+    b[0xb0] = 0x81; // PictureStyle Standard
+    b[0x101] = 0x00;
+    b[0x102] = 0x0a; // MinFocalLength 10
+    b[0x103] = 0x00;
+    b[0x104] = 0xc8; // MaxFocalLength 200
+    b[0x1a4..0x1aa].copy_from_slice(b"2.0.0\0"); // FirmwareVersion (valid)
+    b[0x1e4..0x1e8].copy_from_slice(&200u32.to_le_bytes()); // FileIndex 201
+    b[0x1f0..0x1f4].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex 199
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 550D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("2.0.0".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    // 550D has no HighISONoiseReduction / AutoLightingOptimizer rows.
+    assert!(em.iter().all(|(k, _)| k != "HighISONoiseReduction"));
+    assert!(em.iter().all(|(k, _)| k != "AutoLightingOptimizer"));
+  }
+
+  #[test]
+  fn dispatch_word_bounded_1000d() {
+    assert!(model_is_camera_info_1000d(Some("Canon EOS 1000D")));
+    assert!(model_is_camera_info_1000d(Some("Canon EOS REBEL XS")));
+    assert!(model_is_camera_info_1000d(Some("Canon EOS Kiss F")));
+    // `REBEL XS` (1000D) is distinct from `REBEL XSi` (450D).
+    assert!(!model_is_camera_info_1000d(Some("Canon EOS REBEL XSi")));
+    assert!(!model_is_camera_info_450d(Some("Canon EOS REBEL XS")));
+  }
+
+  /// `%Canon::CameraInfo1000D`: FlashModel (Mask 0x7f drops the high bit) +
+  /// MacroMagnification + a PLAIN DirectoryIndex.
+  #[test]
+  fn camera_info_1000d_fields() {
+    let mut b = vec![0u8; 0x980];
+    b[0x06] = 88; // ISO 400
+    b[0x13] = 0x91; // FlashModel: 0x91 & 0x7f = 0x11 (17) ⇒ Speedlite 580EX II
+    b[0x18] = 148; // CameraTemperature 20 C
+    b[0x1b] = 75; // MacroMagnification raw (1.0x when LensType == 124)
+    b[0x1d] = 0x00;
+    b[0x1e] = 0x32; // FocalLength 50
+    b[0xe4] = 0x00;
+    b[0xe5] = 0x0a; // MinFocalLength 10
+    b[0xe6] = 0x00;
+    b[0xe7] = 0xc8; // MaxFocalLength 200
+    b[0x10b..0x111].copy_from_slice(b"1.0.7\0"); // FirmwareVersion
+    b[0x137..0x13b].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex PLAIN = 200
+    b[0x143..0x147].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
+    b[0x937..0x943].copy_from_slice(b"EF-S55-250mm"); // LensModel
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 1000D"),
+      Some(124),
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("FlashModel"),
+      Some(TagValue::Str("Speedlite 580EX II".into()))
+    );
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(
+      find("MacroMagnification"),
+      Some(TagValue::Str("1.0x".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.7".into())));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(200))); // PLAIN, no -1
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(
+      find("LensModel"),
+      Some(TagValue::Str("EF-S55-250mm".into()))
+    );
+    // -n view: FlashModel renders the masked raw integer.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 1000D"), None);
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("FlashModel"), Some(TagValue::I64(17)));
+    // A FlashModel value absent from %flashModel ⇒ decimal "Unknown (N)".
+    b[0x13] = 0x7f; // 127 (not in the hash)
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1000D"), None);
+    assert_eq!(
+      em2
+        .iter()
+        .find(|(k, _)| k == "FlashModel")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("Unknown (127)".into()))
     );
   }
 }
