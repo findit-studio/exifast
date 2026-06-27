@@ -85,6 +85,8 @@ pub fn parse(
     camera_info_50d(data, order, print_conv)
   } else if model_is_camera_info_60d(model) {
     camera_info_60d(data, order, print_conv, model)
+  } else if model_is_camera_info_70d(model) {
+    camera_info_70d(data, order, print_conv)
   } else if model_is_camera_info_450d(model) {
     camera_info_450d(data, order, print_conv, canon_lens_type)
   } else if model_is_camera_info_500d(model) {
@@ -131,6 +133,13 @@ fn model_is_1200d(model: Option<&str>) -> bool {
   model.is_some_and(|m| {
     word_bounded(m, "1200D") || word_bounded(m, "REBEL T5") || word_bounded(m, "Kiss X70")
   })
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo70D` (`Canon.pm:1382`,
+/// `$$self{Model} =~ /EOS 70D$/`).
+#[must_use]
+pub fn model_is_camera_info_70d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 70D"))
 }
 
 /// `true` when `model` selects `%Canon::CameraInfo450D` (`Canon.pm:1391`,
@@ -876,6 +885,68 @@ fn camera_info_60d(
   if is_60d {
     ps_info2(data, 0x321, order, print_conv, &mut push);
   }
+  out
+}
+
+/// `%Canon::CameraInfo70D` (`Canon.pm:4908-4975`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Like the 6D but with NO `WhiteBalance`
+/// leaf; `FirmwareVersion` (0x25e) has NO `RawConv` guard. The `0x3cf
+/// PictureStyleInfo` `IS_SUBDIR` walks `%PSInfo2`.
+fn camera_info_70d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x23,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x84, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x93,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x95,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_color_temperature(data, 0xc7, order, &mut push);
+  emit_lens_type(data, 0x166, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x168,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x16a,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x25e, false, &mut push);
+  emit_file_index(data, 0x2b3, order, &mut push);
+  emit_directory_index(data, 0x2bf, order, true, &mut push);
+  ps_info2(data, 0x3cf, order, print_conv, &mut push);
   out
 }
 
@@ -2840,5 +2911,86 @@ mod tests {
     assert!(find2("ColorTemperature").is_none());
     assert!(find2("FileIndex").is_none());
     assert!(find2("DirectoryIndex").is_none());
+  }
+
+  #[test]
+  fn dispatch_anchored_70d() {
+    assert!(model_is_camera_info_70d(Some("Canon EOS 70D")));
+    assert!(!model_is_camera_info_70d(Some("Canon EOS 7D")));
+    // /EOS 70D$/ must NOT match the 700D.
+    assert!(!model_is_camera_info_70d(Some("Canon EOS 700D")));
+  }
+
+  /// `%Canon::CameraInfo70D` print values + the nested `%PSInfo2` subdir; the
+  /// table carries NO `WhiteBalance` leaf.
+  #[test]
+  fn camera_info_70d_fields() {
+    let mut b = vec![0u8; 0x4d0];
+    b[0x06] = 88; // ISO 400
+    b[0x1b] = 148; // CameraTemperature 20 C
+    b[0x23] = 0x00;
+    b[0x24] = 0x32; // FocalLength 50
+    b[0x84] = 1; // CameraOrientation Rotate 90 CW
+    b[0x93] = 0x01;
+    b[0x94] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+    b[0x95] = 0x01;
+    b[0x96] = 0x2c; // FocusDistanceLower 300 -> 3 m
+    b[0xc7] = 0x50;
+    b[0xc8] = 0x14; // ColorTemperature 5200
+    b[0x166] = 0x00;
+    b[0x167] = 0x01; // LensType int16uRev = 1 (-n)
+    b[0x168] = 0x00;
+    b[0x169] = 0x0a; // MinFocalLength 10
+    b[0x16a] = 0x00;
+    b[0x16b] = 0xc8; // MaxFocalLength 200
+    b[0x25e..0x264].copy_from_slice(b"6.1.2\0"); // FirmwareVersion (no guard)
+    b[0x2b3..0x2b7].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x2bf..0x2c3].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    b[0x3cf..0x3d3].copy_from_slice(&4i32.to_le_bytes()); // PSInfo2 ContrastStandard
+    b[0x45f..0x463].copy_from_slice(&2i32.to_le_bytes()); // PSInfo2 ContrastAuto (0x3cf+0x90)
+    b[0x4bf..0x4c1].copy_from_slice(&0x86u16.to_le_bytes()); // UserDef1PictureStyle (0x3cf+0xf0)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 70D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("6.1.2".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(4)));
+    assert_eq!(find("ContrastAuto"), Some(TagValue::I64(2)));
+    assert_eq!(
+      find("UserDef1PictureStyle"),
+      Some(TagValue::Str("Monochrome".into()))
+    );
+    // The 70D table has no WhiteBalance row.
+    assert!(find("WhiteBalance").is_none());
+    // -n view: LensType renders the bare integer.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 70D"), None);
+    assert_eq!(
+      emn
+        .iter()
+        .find(|(k, _)| k == "LensType")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::I64(1))
+    );
   }
 }
