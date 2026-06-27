@@ -151,8 +151,9 @@ pub fn format_override(id: u16) -> Option<Format> {
 #[non_exhaustive]
 pub enum SubTable {
   /// `%Sony::CameraInfo`/`CameraInfo2`/`CameraInfo3`/`CameraInfoUnknown`
-  /// dispatcher at 0x0010 (`Sony.pm:716-747`). Per-`count` conditional;
-  /// deferred.
+  /// dispatcher at 0x0010 (`Sony.pm:716-747`). Per-`count` conditional; the
+  /// base (368/5478), `2` (5506/6118) and `3` (15360) tables are ported in
+  /// `camerainfo`/`camerainfo2`/`camerainfo3` (`CameraInfoUnknown` stays raw).
   CameraInfo,
   /// `%Sony::FocusInfo`/`MoreInfo` dispatcher at 0x0020 (`Sony.pm:750-769`).
   /// Deferred.
@@ -164,7 +165,7 @@ pub enum SubTable {
   /// `%Sony::ExtraInfo`/`ExtraInfo2`/`ExtraInfo3` dispatcher at 0x0116
   /// (`Sony.pm:856-873`). Deferred.
   ExtraInfo,
-  /// `%Sony::ShotInfo` at 0x3000 (`Sony.pm:1768-1771`). Deferred.
+  /// `%Sony::ShotInfo` at 0x3000 (`Sony.pm:1768-1771`). Ported in `shotinfo`.
   ShotInfo,
   /// `%Sony::Tag2010a`..`Tag2010i` dispatcher at 0x2010 (`Sony.pm:1100-1173`)
   /// — model-specific. Deferred.
@@ -174,8 +175,8 @@ pub enum SubTable {
   /// `Tag900b`/`Tag202a` series (`Sony.pm:1573-2118`) — model-specific
   /// deciphered shot/AF/lens info. Deferred.
   Tag9xxx,
-  /// `%Sony::AFInfo`/`Tag940e` dispatcher at 0x940e (`Sony.pm:2094-2105`).
-  /// Deferred.
+  /// `%Sony::AFInfo`/`Tag940e` dispatcher at 0x940e (`Sony.pm:2094-2105`). Both
+  /// ported: `afinfo` (SLT/HV/ILCA `%AFInfo`) and `tag940e` (E-mount `Tag940e`).
   AfInfo,
   /// `%Sony::Panorama` at 0x1003 (`Sony.pm:898-904`). Deferred.
   Panorama,

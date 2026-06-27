@@ -42,10 +42,13 @@
 //!   color-data sub-tables in `Sony::Tag9405a/b`, `Tag2010x`, etc.; raw-
 //!   processing-only.
 //! - **Sony per-model CameraInfo<XXX>** — `CameraInfo` / `CameraInfo2` /
-//!   `CameraInfo3` / `CameraInfoUnknown` (`Sony.pm:2722-3170`) — each
-//!   gated by `$count`; defer.
-//! - **Sony AFInfo / FocusInfo** (`Sony.pm:3171-3502`, `9431-9876`) —
-//!   AF-point sensor data; defer.
+//!   `CameraInfo3` / `CameraInfoUnknown` (`Sony.pm:2722-3170`), each gated by
+//!   `$count`: the base/`2`/`3` tables are ported
+//!   (`camerainfo`/`camerainfo2`/`camerainfo3`); only `CameraInfoUnknown`
+//!   stays raw.
+//! - **Sony AFInfo / FocusInfo / ShotInfo** (`Sony.pm:6113`, `:9453`, plus
+//!   `FocusInfo`) — AF-point / face / shot sensor data, ported in
+//!   `afinfo`/`focusinfo`/`shotinfo`.
 //! - **Sony CustomFunctions** — no dedicated CustomFunctions tag table
 //!   in Sony.pm (Canon-style); Sony embeds these in the per-model
 //!   CameraSettings sub-tables which are themselves deferred.
@@ -70,7 +73,9 @@
 
 #![deny(clippy::indexing_slicing)]
 
+pub mod afinfo;
 pub mod amount_lens_types;
+pub mod camerainfo;
 pub mod camerainfo2;
 pub mod camerainfo3;
 pub mod camerasettings;
@@ -83,6 +88,7 @@ pub mod minoltaraw;
 pub mod model_ids;
 pub mod moreinfo;
 pub mod printconv;
+pub mod shotinfo;
 pub mod sr2;
 pub mod subtables;
 pub mod tag202a;

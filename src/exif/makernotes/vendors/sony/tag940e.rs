@@ -9,8 +9,8 @@
 //! (`Sony.pm:2094-2105`):
 //!
 //! - `AFInfo` — `$$self{Model} =~ /^(SLT-|HV|ILCA-)/` ⇒ the separate large
-//!   `%Sony::AFInfo` AF-status table (`Sony.pm:9452+`), which is NOT ported here
-//!   (deferred); for those bodies this module emits nothing.
+//!   `%Sony::AFInfo` AF-status table (`Sony.pm:9452+`), ported in [`super::afinfo`];
+//!   for those bodies this module emits nothing.
 //! - `Tag940e` — `$$self{Model} =~ /^(NEX-|ILCE-|Lunar)/` ⇒ this table.
 //! - else `Sony_0x940e` (`%unknownCipherData`) — emits nothing.
 //!
@@ -39,7 +39,8 @@ pub struct Tag940eEmission {
 
 /// `true` when `$$self{Model} =~ /^(NEX-|ILCE-|Lunar)/` selects the `Tag940e`
 /// variant (`Sony.pm:2100`). Tested against the parent `$$self{Model}`. (The
-/// `AFInfo` SLT/HV/ILCA variant is handled by a separate, deferred table.)
+/// `AFInfo` SLT/HV/ILCA variant is handled by the separate [`super::afinfo`]
+/// table.)
 #[must_use]
 pub fn selects_tag940e(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.starts_with("NEX-") || m.starts_with("ILCE-") || m.starts_with("Lunar"))
