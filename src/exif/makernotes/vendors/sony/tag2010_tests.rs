@@ -935,6 +935,176 @@ fn tag2010h_ilca99m2_amount_lens() {
   assert!(find(&em, "LensType2").is_none());
 }
 
+// --- Tag2010i (repacked offsets: Quality2@0x0247, SonyISO@0x0320, %selfTimerB) -
+
+/// `selects_tag2010i`: the `A?`/`[AF]?` optionals expand to base+suffix stems;
+/// the `\b` distinguishes `ILCE-9` from `ILCE-9M2` and keeps `DSC-RX0M2` out of
+/// `Tag2010h` (whose `DSC-RX0` stem fails the boundary before `M`).
+#[test]
+fn tag2010i_gate_word_boundary() {
+  for m in [
+    "ILCE-6100",
+    "ILCE-6100A",
+    "ILCE-6400",
+    "ILCE-6400A",
+    "ILCE-6600",
+    "ILCE-7C",
+    "ILCE-7M3",
+    "ILCE-7RM3",
+    "ILCE-7RM3A",
+    "ILCE-7RM4",
+    "ILCE-7RM4A",
+    "ILCE-9",
+    "ILCE-9M2",
+    "DSC-RX10M4",
+    "DSC-RX100M6",
+    "DSC-RX100M5A",
+    "DSC-RX100M7",
+    "DSC-RX100M7A",
+    "DSC-HX95",
+    "DSC-HX99",
+    "DSC-RX0M2",
+    "ZV-1",
+    "ZV-1A",
+    "ZV-1F",
+    "ZV-1M2",
+    "ZV-E10",
+  ] {
+    assert!(selects_tag2010i(Some(m)), "{m} should select i");
+  }
+  assert!(!selects_tag2010i(Some("ILCE-9X"))); // \b fails before X
+  assert!(!selects_tag2010i(Some("DSC-RX0"))); // h
+  assert!(!selects_tag2010i(Some("ILCE-7RM2"))); // h
+  assert!(!selects_tag2010i(Some("ILCE-7M2"))); // g
+  assert!(!selects_tag2010h(Some("DSC-RX0M2"))); // routes to i, not h
+  assert!(!selects_tag2010i(None));
+}
+
+/// `ILCE-9` (E-mount): the repacked scalar block (Quality2 at 0x0247 where
+/// `g`/`h` have a second PictureProfile), SonyISO at 0x0320, the
+/// `%selfTimerB2010` SelfTimer at 0x0210, the E-mount `LensType2` at 0x17f3, and
+/// AspectRatio at 0x188c.
+#[test]
+fn tag2010i_ilce9_emount_scalars() {
+  let mut p = vec![0u8; 0x1900];
+  put_u32(&mut p, 0x0004, 1); // ReleaseMode2 int32u → Continuous
+  p[0x004e] = 1; // DynamicRangeOptimizer (first) → Auto
+  p[0x021b] = 1; // DynamicRangeOptimizer (second, last-wins) → Auto
+  p[0x0204] = 1; // ReleaseMode3 → Continuous
+  p[0x0210] = 1; // SelfTimer (%selfTimerB2010) → Self-timer 5 or 10 s
+  put_u16(&mut p, 0x0217, 512); // StopsAboveBaseISO → 14.0
+  p[0x0237] = 8; // PictureProfile (first) → Gamma Still - Vivid
+  p[0x0238] = 8; // PictureProfile (second, last-wins) → Gamma Still - Vivid
+  p[0x0247] = 1; // Quality2 → RAW (NOT a PictureProfile here)
+  p[0x024b] = 3; // MeteringMode → Spot
+  put_u16(&mut p, 0x0252, 7000);
+  put_u16(&mut p, 0x0252 + 2, 4096);
+  put_u16(&mut p, 0x0252 + 4, 6500);
+  put_u16(&mut p, 0x030a, 240); // FocalLength → 24.0 mm
+  put_u16(&mut p, 0x0320, 2048); // SonyISO → 25600
+  p[0x17f1] = 2; // LensFormat → Full-frame
+  p[0x17f2] = 2; // LensMount → E-mount
+  put_u16(&mut p, 0x17f3, 32784); // LensType2 → Sony E 16mm F2.8
+  p[0x17f9] = 16; // DistortionCorrParamsNumber → 16 (Full-frame)
+  p[0x188c] = 2; // AspectRatio → 3:2
+
+  let em = parse_tag2010i(&p, Some("ILCE-9"), true);
+  assert_eq!(
+    find_first(&em, "ReleaseMode2"),
+    Some(&TagValue::Str("Continuous".into()))
+  );
+  assert_eq!(
+    find(&em, "DynamicRangeOptimizer"),
+    Some(&TagValue::Str("Auto".into()))
+  );
+  assert_eq!(
+    find(&em, "ReleaseMode3"),
+    Some(&TagValue::Str("Continuous".into()))
+  );
+  assert_eq!(
+    find(&em, "SelfTimer"),
+    Some(&TagValue::Str("Self-timer 5 or 10 s".into()))
+  );
+  assert_eq!(
+    find(&em, "StopsAboveBaseISO"),
+    Some(&TagValue::Str("14.0".into()))
+  );
+  assert_eq!(count(&em, "PictureProfile"), 2);
+  assert_eq!(
+    find(&em, "PictureProfile"),
+    Some(&TagValue::Str("Gamma Still - Vivid".into()))
+  );
+  assert_eq!(find(&em, "Quality2"), Some(&TagValue::Str("RAW".into())));
+  assert_eq!(
+    find(&em, "WB_RGBLevels"),
+    Some(&TagValue::Str("7000 4096 6500".into()))
+  );
+  assert_eq!(
+    find(&em, "FocalLength"),
+    Some(&TagValue::Str("24.0 mm".into()))
+  );
+  assert_eq!(find(&em, "SonyISO"), Some(&TagValue::Str("25600".into())));
+  assert_eq!(
+    find(&em, "LensMount"),
+    Some(&TagValue::Str("E-mount".into()))
+  );
+  assert_eq!(
+    find(&em, "LensType2"),
+    Some(&TagValue::Str("Sony E 16mm F2.8".into()))
+  );
+  assert!(find(&em, "LensType").is_none());
+  assert_eq!(
+    find(&em, "DistortionCorrParamsNumber"),
+    Some(&TagValue::Str("16 (Full-frame)".into()))
+  );
+  assert_eq!(find(&em, "AspectRatio"), Some(&TagValue::Str("3:2".into())));
+}
+
+/// `DSC-RX0M2`: unconditional FocalLength / SonyISO / AspectRatio emit; the
+/// `Model !~ /^DSC-/` lens / distortion-correction rows are suppressed.
+#[test]
+fn tag2010i_dsc_rx0m2_suppression() {
+  let mut p = vec![0u8; 0x1900];
+  put_u16(&mut p, 0x030a, 240); // FocalLength (unconditional)
+  put_u16(&mut p, 0x0320, 2048); // SonyISO (unconditional)
+  p[0x17f1] = 2; // LensFormat byte (DSC → suppressed)
+  p[0x17f2] = 1; // LensMount byte (DSC → suppressed)
+  p[0x17f8] = 1; // DistortionCorrParamsPresent (DSC → suppressed)
+  p[0x17f9] = 11; // DistortionCorrParamsNumber (DSC → suppressed)
+  p[0x188c] = 1; // AspectRatio (unconditional) → 4:3
+
+  let em = parse_tag2010i(&p, Some("DSC-RX0M2"), true);
+  assert_eq!(
+    find(&em, "FocalLength"),
+    Some(&TagValue::Str("24.0 mm".into()))
+  );
+  assert_eq!(find(&em, "SonyISO"), Some(&TagValue::Str("25600".into())));
+  assert_eq!(find(&em, "AspectRatio"), Some(&TagValue::Str("4:3".into())));
+  assert!(find(&em, "LensFormat").is_none());
+  assert!(find(&em, "LensMount").is_none());
+  assert!(find(&em, "DistortionCorrParamsPresent").is_none());
+  assert!(find(&em, "DistortionCorrParamsNumber").is_none());
+}
+
+/// A-mount lens on an E-mount body (e.g. via an LA-EA adapter): `LensMount == 1`
+/// at 0x17f2 emits the A-mount `LensType` at 0x17f6.
+#[test]
+fn tag2010i_amount_lens() {
+  let mut p = vec![0u8; 0x1900];
+  p[0x17f2] = 1; // LensMount → A-mount
+  put_u16(&mut p, 0x17f6, 18); // LensType (A-mount)
+  let em = parse_tag2010i(&p, Some("ILCE-9M2"), true);
+  assert_eq!(
+    find(&em, "LensMount"),
+    Some(&TagValue::Str("A-mount".into()))
+  );
+  assert_eq!(
+    find(&em, "LensType"),
+    Some(&TagValue::Str("Minolta AF 28-80mm F3.5-5.6 II".into()))
+  );
+  assert!(find(&em, "LensType2").is_none());
+}
+
 // --- shared-conversion edges -------------------------------------------------
 
 /// `StopsAboveBaseISO` ValueConv of exactly 0 prints the bare integer `0`;
@@ -1000,4 +1170,5 @@ fn per_field_truncation() {
   assert!(parse_tag2010f(&[], true).is_empty());
   assert!(parse_tag2010g(&[], Some("ILCE-7M2"), true).is_empty());
   assert!(parse_tag2010h(&[], Some("ILCE-7RM2"), true).is_empty());
+  assert!(parse_tag2010i(&[], Some("ILCE-9"), true).is_empty());
 }
