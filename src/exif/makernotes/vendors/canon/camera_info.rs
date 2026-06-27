@@ -95,6 +95,8 @@ pub fn parse(
     camera_info_550d(data, order, print_conv)
   } else if model_is_camera_info_600d(model) {
     camera_info_600d(data, order, print_conv)
+  } else if model_is_camera_info_650d(model) {
+    camera_info_650d(data, order, print_conv, model)
   } else if model_is_camera_info_1000d(model) {
     camera_info_1000d(data, order, print_conv, canon_lens_type)
   } else {
@@ -157,6 +159,31 @@ pub fn model_is_camera_info_600d(model: Option<&str>) -> bool {
       || word_bounded(m, "1100D")
       || word_bounded(m, "REBEL T3")
       || word_bounded(m, "Kiss X50")
+  })
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo650D` — the 650D
+/// (`Canon.pm:1412`, `/\b(650D|REBEL T4i|Kiss X6i)\b/`) or the 700D alias
+/// (`Canon.pm:1417`, `/\b(700D|REBEL T5i|Kiss X7i)\b/`); both share the table,
+/// which carries per-model `Condition`s on FirmwareVersion/FileIndex/Dir.
+#[must_use]
+pub fn model_is_camera_info_650d(model: Option<&str>) -> bool {
+  model_is_650d_proper(model) || model_is_700d(model)
+}
+
+/// The 650D proper (`/(650D|REBEL T4i|Kiss X6i)\b/`) — gates the 650D-location
+/// FirmwareVersion/FileIndex/DirectoryIndex rows of `%CameraInfo650D`.
+fn model_is_650d_proper(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "650D") || word_bounded(m, "REBEL T4i") || word_bounded(m, "Kiss X6i")
+  })
+}
+
+/// The 700D alias (`/(700D|REBEL T5i|Kiss X7i)\b/`) — gates the 700D-location
+/// FirmwareVersion/FileIndex/DirectoryIndex rows of `%CameraInfo650D`.
+fn model_is_700d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "700D") || word_bounded(m, "REBEL T5i") || word_bounded(m, "Kiss X7i")
   })
 }
 
@@ -1218,6 +1245,95 @@ fn camera_info_600d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(Smo
   emit_file_index(data, 0x1db, order, &mut push);
   emit_directory_index(data, 0x1e7, order, true, &mut push);
   ps_info2(data, 0x2fb, order, print_conv, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo650D` (`Canon.pm:5439-5551`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Shared by the 650D and 700D, which carry
+/// the `FirmwareVersion`/`FileIndex`/`DirectoryIndex` leaves at DIFFERENT
+/// firmware-location offsets selected by per-model `Condition`s (650D: 0x21b/
+/// 0x270/0x27c; 700D: 0x220/0x274/0x280). All three FirmwareVersion variants have
+/// the `/^\d+\.\d+\.\d+\s*$/` RawConv guard. `0x390 PictureStyleInfo` walks
+/// `%PSInfo2` (both models).
+fn camera_info_650d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let is_650d = model_is_650d_proper(model);
+  let is_700d = model_is_700d(model);
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x23,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x7d, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x8c,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x8e,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0xbc, order, print_conv, &mut push);
+  emit_color_temperature(data, 0xc0, order, &mut push);
+  emit_picture_style(data, 0xf4, print_conv, &mut push);
+  emit_lens_type(data, 0x127, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x129,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x12b,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if is_650d {
+    emit_firmware_version(data, 0x21b, true, &mut push);
+  }
+  if is_700d {
+    emit_firmware_version(data, 0x220, true, &mut push);
+  }
+  if is_650d {
+    emit_file_index(data, 0x270, order, &mut push);
+  }
+  if is_700d {
+    emit_file_index(data, 0x274, order, &mut push);
+  }
+  if is_650d {
+    emit_directory_index(data, 0x27c, order, true, &mut push);
+  }
+  if is_700d {
+    emit_directory_index(data, 0x280, order, true, &mut push);
+  }
+  ps_info2(data, 0x390, order, print_conv, &mut push);
   out
 }
 
@@ -3185,5 +3301,101 @@ mod tests {
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
     assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
+  }
+
+  #[test]
+  fn dispatch_650d_700d() {
+    assert!(model_is_camera_info_650d(Some("Canon EOS 650D")));
+    assert!(model_is_camera_info_650d(Some("Canon EOS REBEL T4i")));
+    assert!(model_is_camera_info_650d(Some("Canon EOS Kiss X6i")));
+    assert!(model_is_camera_info_650d(Some("Canon EOS 700D")));
+    assert!(model_is_camera_info_650d(Some("Canon EOS REBEL T5i")));
+    assert!(model_is_camera_info_650d(Some("Canon EOS Kiss X7i")));
+    // per-model discriminators used inside the table:
+    assert!(model_is_650d_proper(Some("Canon EOS 650D")));
+    assert!(!model_is_650d_proper(Some("Canon EOS 700D")));
+    assert!(model_is_700d(Some("Canon EOS 700D")));
+    assert!(!model_is_700d(Some("Canon EOS 650D")));
+    // REBEL T5i (700D) is distinct from REBEL T5 (1200D), across both tables.
+    assert!(!model_is_camera_info_650d(Some("Canon EOS REBEL T5")));
+    assert!(!model_is_camera_info_60d(Some("Canon EOS REBEL T5i")));
+  }
+
+  /// `%Canon::CameraInfo650D` shared 650D/700D table: the per-model
+  /// FirmwareVersion/FileIndex/DirectoryIndex offsets and the common `%PSInfo2`
+  /// subdir. Two blobs (the firmware leaves at 0x21b/0x220 physically overlap).
+  #[test]
+  fn camera_info_650d_and_700d_alias() {
+    let base = |b: &mut [u8]| {
+      b[0x06] = 88; // ISO 400
+      b[0x1b] = 148; // CameraTemperature 20 C
+      b[0x23] = 0x00;
+      b[0x24] = 0x32; // FocalLength 50
+      b[0x7d] = 1; // CameraOrientation Rotate 90 CW
+      b[0x8c] = 0x01;
+      b[0x8d] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+      b[0x8e] = 0x01;
+      b[0x8f] = 0x2c; // FocusDistanceLower 300 -> 3 m
+      b[0xbc] = 0x02; // WhiteBalance raw 2
+      b[0xc0] = 0x50;
+      b[0xc1] = 0x14; // ColorTemperature 5200
+      b[0xf4] = 0x81; // PictureStyle Standard
+      b[0x127] = 0x00;
+      b[0x128] = 0x01; // LensType int16uRev = 1
+      b[0x129] = 0x00;
+      b[0x12a] = 0x0a; // MinFocalLength 10
+      b[0x12b] = 0x00;
+      b[0x12c] = 0xc8; // MaxFocalLength 200
+      b[0x390..0x394].copy_from_slice(&7i32.to_le_bytes()); // PSInfo2 ContrastStandard
+      b[0x480..0x482].copy_from_slice(&0x84u16.to_le_bytes()); // UserDef1PictureStyle (0x390+0xf0)
+    };
+
+    // 650D: FirmwareVersion@0x21b, FileIndex@0x270, DirectoryIndex@0x27c.
+    let mut b = vec![0u8; 0x490];
+    base(&mut b);
+    b[0x21b..0x221].copy_from_slice(b"1.0.1\0");
+    b[0x270..0x274].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x27c..0x280].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 650D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(7)));
+    assert_eq!(
+      find("UserDef1PictureStyle"),
+      Some(TagValue::Str("Neutral".into()))
+    );
+
+    // 700D alias: FirmwareVersion@0x220, FileIndex@0x274, DirectoryIndex@0x280.
+    let mut b2 = vec![0u8; 0x490];
+    base(&mut b2);
+    b2[0x220..0x226].copy_from_slice(b"2.1.1\0");
+    b2[0x274..0x278].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
+    b2[0x280..0x284].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex - 1 = 199
+    let em2 = parse(&b2, ByteOrder::Little, true, Some("Canon EOS 700D"), None);
+    let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find2("FirmwareVersion"),
+      Some(TagValue::Str("2.1.1".into()))
+    );
+    assert_eq!(find2("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find2("DirectoryIndex"), Some(TagValue::I64(199)));
+    assert_eq!(find2("ContrastStandard"), Some(TagValue::I64(7))); // shared PSInfo2
+    // The 650D-location leaves are not read for the 700D (and vice versa).
+    assert_eq!(find2("FocalLength"), Some(TagValue::Str("50 mm".into())));
   }
 }
