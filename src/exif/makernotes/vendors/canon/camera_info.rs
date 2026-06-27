@@ -93,6 +93,8 @@ pub fn parse(
     camera_info_500d(data, order, print_conv)
   } else if model_is_camera_info_550d(model) {
     camera_info_550d(data, order, print_conv)
+  } else if model_is_camera_info_600d(model) {
+    camera_info_600d(data, order, print_conv)
   } else if model_is_camera_info_1000d(model) {
     camera_info_1000d(data, order, print_conv, canon_lens_type)
   } else {
@@ -140,6 +142,22 @@ fn model_is_1200d(model: Option<&str>) -> bool {
 #[must_use]
 pub fn model_is_camera_info_70d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 70D"))
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo600D` — the 600D
+/// (`Canon.pm:1407`, `/\b(600D|REBEL T3i|Kiss X5)\b/`) or the 1100D alias
+/// (`Canon.pm:1437`, `/\b(1100D|REBEL T3|Kiss X50)\b/`); both share the table
+/// with identical rows (no per-model `Condition`s).
+#[must_use]
+pub fn model_is_camera_info_600d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "600D")
+      || word_bounded(m, "REBEL T3i")
+      || word_bounded(m, "Kiss X5")
+      || word_bounded(m, "1100D")
+      || word_bounded(m, "REBEL T3")
+      || word_bounded(m, "Kiss X50")
+  })
 }
 
 /// `true` when `model` selects `%Canon::CameraInfo450D` (`Canon.pm:1391`,
@@ -1133,6 +1151,73 @@ fn camera_info_550d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(Smo
   emit_file_index(data, 0x1e4, order, &mut push);
   emit_directory_index(data, 0x1f0, order, true, &mut push);
   ps_info(data, 0x31c, order, print_conv, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo600D` (`Canon.pm:5343-5436`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Shared by the 600D and 1100D with every
+/// row unconditional. Carries `HighlightTonePriority`/`FlashMeteringMode`/
+/// `WhiteBalance`/`PictureStyle`; `FirmwareVersion` (0x19b) has the
+/// `/^\d+\.\d+\.\d+\s*$/` RawConv guard. `0x2fb PictureStyleInfo` walks `%PSInfo2`.
+fn camera_info_600d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x38, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x57,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x59,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x7b, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x7f, order, &mut push);
+  emit_picture_style(data, 0xb3, print_conv, &mut push);
+  emit_lens_type(data, 0xea, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xec,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xee,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x19b, true, &mut push);
+  emit_file_index(data, 0x1db, order, &mut push);
+  emit_directory_index(data, 0x1e7, order, true, &mut push);
+  ps_info2(data, 0x2fb, order, print_conv, &mut push);
   out
 }
 
@@ -2992,5 +3077,113 @@ mod tests {
         .map(|(_, v)| v.clone()),
       Some(TagValue::I64(1))
     );
+  }
+
+  #[test]
+  fn dispatch_600d_1100d() {
+    assert!(model_is_camera_info_600d(Some("Canon EOS 600D")));
+    assert!(model_is_camera_info_600d(Some("Canon EOS REBEL T3i")));
+    assert!(model_is_camera_info_600d(Some("Canon EOS Kiss X5")));
+    assert!(model_is_camera_info_600d(Some("Canon EOS 1100D")));
+    assert!(model_is_camera_info_600d(Some("Canon EOS REBEL T3")));
+    assert!(model_is_camera_info_600d(Some("Canon EOS Kiss X50")));
+    // REBEL T3 (1100D) vs REBEL T3i (600D): the T3i token must not leak into the
+    // T5 (1200D) family, and Kiss X6i (650D) must not match.
+    assert!(!model_is_camera_info_600d(Some("Canon EOS REBEL T5")));
+    assert!(!model_is_camera_info_600d(Some("Canon EOS Kiss X6i")));
+  }
+
+  /// `%Canon::CameraInfo600D` shared 600D/1100D table (all rows unconditional):
+  /// print values, the `FirmwareVersion` RawConv guard, and the `%PSInfo2` subdir.
+  #[test]
+  fn camera_info_600d_fields() {
+    let mut b = vec![0u8; 0x400];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x15] = 0; // FlashMeteringMode E-TTL
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50
+    b[0x38] = 2; // CameraOrientation Rotate 270 CW
+    b[0x57] = 0x01;
+    b[0x58] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+    b[0x59] = 0x01;
+    b[0x5a] = 0x2c; // FocusDistanceLower 300 -> 3 m
+    b[0x7b] = 0x02; // WhiteBalance raw 2 (-n)
+    b[0x7f] = 0x50;
+    b[0x80] = 0x14; // ColorTemperature 5200
+    b[0xb3] = 0x81; // PictureStyle Standard
+    b[0xea] = 0x00;
+    b[0xeb] = 0x01; // LensType int16uRev = 1 (-n)
+    b[0xec] = 0x00;
+    b[0xed] = 0x0a; // MinFocalLength 10
+    b[0xee] = 0x00;
+    b[0xef] = 0xc8; // MaxFocalLength 200
+    b[0x19b..0x1a1].copy_from_slice(b"1.0.2\0"); // FirmwareVersion (valid, guarded)
+    b[0x1db..0x1df].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x1e7..0x1eb].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    b[0x2fb..0x2ff].copy_from_slice(&6i32.to_le_bytes()); // PSInfo2 ContrastStandard
+    b[0x39b..0x39f].copy_from_slice(&1i32.to_le_bytes()); // PSInfo2 FilterEffectAuto (0x2fb+0xa0)
+    b[0x3eb..0x3ed].copy_from_slice(&0x83u16.to_le_bytes()); // UserDef1PictureStyle (0x2fb+0xf0)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(
+      find("FlashMeteringMode"),
+      Some(TagValue::Str("E-TTL".into()))
+    );
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 270 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.2".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(6)));
+    assert_eq!(
+      find("FilterEffectAuto"),
+      Some(TagValue::Str("Yellow".into()))
+    );
+    assert_eq!(
+      find("UserDef1PictureStyle"),
+      Some(TagValue::Str("Landscape".into()))
+    );
+    // 1100D alias yields the identical table.
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1100D"), None);
+    let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find2("FirmwareVersion"),
+      Some(TagValue::Str("1.0.2".into()))
+    );
+    assert_eq!(find2("ContrastStandard"), Some(TagValue::I64(6)));
+    // The RawConv guard drops a non-version FirmwareVersion string.
+    b[0x19b..0x1a1].copy_from_slice(b"BADVER");
+    let em3 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
+    assert!(em3.iter().all(|(k, _)| k != "FirmwareVersion"));
+    // -n view: WhiteBalance / LensType render as bare integers.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 600D"), None);
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
+    assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
   }
 }
