@@ -893,6 +893,14 @@ pub struct Cr3Meta {
   cnth: Option<Cr3Block>,
   /// Offset / length of THMB (ThumbnailImage) — Canon.pm:9727-9733.
   thmb: Option<Cr3Block>,
+  /// The file-walk `$$self{Model}` seeded by the CMT1 IFD0 `Model` (Canon.pm:
+  /// 9686). ExifTool keeps this as object state across the whole file walk, so a
+  /// model-conditional sub-table reached LATER — the CTMD timed-metadata
+  /// `0x927c` MakerNote re-dispatch (`Canon::AFInfo2` `AFPointsSelected`,
+  /// model-conditional CameraInfo) — evaluates against it even though the CTMD's
+  /// own `0x8769` block (an `ExifIFD`, no `Model`) carries none. `None` when no
+  /// CMT1 `Model` was seen.
+  model: Option<SmolStr>,
 }
 
 /// One Canon CR3 CMT-family block LOCATION: an absolute file offset + length.
@@ -975,6 +983,7 @@ impl Cr3Meta {
       cmt_value: Vec::new(),
       cnth: None,
       thmb: None,
+      model: None,
     }
   }
 
@@ -1043,6 +1052,14 @@ impl Cr3Meta {
   #[inline(always)]
   pub const fn cnth(&self) -> Option<&Cr3Block> {
     self.cnth.as_ref()
+  }
+
+  /// The file-walk `$$self{Model}` (CMT1 IFD0 `Model`), threaded into the CTMD
+  /// timed-metadata re-dispatch for model-conditional Canon sub-tables.
+  #[inline(always)]
+  #[must_use]
+  pub fn model(&self) -> Option<&str> {
+    self.model.as_deref()
   }
 
   /// The THMB block (ThumbnailImage — Canon.pm:9727-9733).
@@ -1124,6 +1141,16 @@ impl Cr3Meta {
   #[inline(always)]
   pub fn set_thmb(&mut self, v: Option<Cr3Block>) -> &mut Self {
     self.thmb = v;
+    self
+  }
+
+  /// Setter (the file-walk CMT1 `Model`). Set ONLY when a CMT1 carries a Model
+  /// (a model-less CMT1 does not clear an earlier one — file-walk persistence).
+  #[inline(always)]
+  pub fn set_model(&mut self, v: Option<SmolStr>) -> &mut Self {
+    if v.is_some() {
+      self.model = v;
+    }
     self
   }
 }

@@ -10625,11 +10625,8 @@ fn canon_eos_r_cr3_conformance() {
   // see `FIXTURE_EXCLUDED_KEYS` in `tests/typed_serde_parity.rs`).
   const CR3_DEFERRED: &[&str] = &[
     "Composite:LensID",
-    "Canon:ThumbnailImage",
     "CanonCustom:ApertureRange",
     "CanonCustom:ShutterSpeedRange",
-    "Track4:AFPointsSelected",
-    "Track4:PrimaryAFPoint",
     "Track4:CameraTemperature",
     "Track4:VignettingCorrVersion",
   ];

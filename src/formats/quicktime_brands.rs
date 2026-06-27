@@ -1813,6 +1813,11 @@ pub fn walk_canon_uuid_with_state(
         if let Some(meta) = crate::exif::parse_exif_block(h.body) {
           if let Some(model) = meta.dispatcher_model() {
             *current_model = Some(SmolStr::new(model));
+            // Persist the file-walk `$$self{Model}` so the later CTMD
+            // timed-metadata re-dispatch can resolve model-conditional Canon
+            // sub-tables (AFInfo2 AFPointsSelected) — the CTMD's own ExifIFD
+            // block carries no Model.
+            out.set_model(Some(SmolStr::new(model)));
           }
           let print = render_exif_block(&meta, "IFD0", true);
           let value = render_exif_block(&meta, "IFD0", false);
@@ -1859,10 +1864,10 @@ pub fn walk_canon_uuid_with_state(
       b"CNTH" => {
         out.set_cnth(Some(Cr3Block::at(h.body_abs_start, h.body.len() as u64)));
       }
-      // THMB — ThumbnailImage (Canon.pm:9727-9733).
-      // TODO(#159-followup: CR3 ThumbnailImage): only the THMB block location
-      // is recorded; the `(Binary data N bytes, …)` ThumbnailImage extraction
-      // is out of camera-indexing scope.
+      // THMB — ThumbnailImage (Canon.pm:9727-9733): `RawConv => substr($val,16)`
+      // ⇒ the image is the box body minus the 16-byte THMB header. The block
+      // location + body length are recorded; the emitter renders the
+      // `(Binary data <body-16> bytes, …)` placeholder.
       b"THMB" => {
         out.set_thmb(Some(Cr3Block::at(h.body_abs_start, h.body.len() as u64)));
       }

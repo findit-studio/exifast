@@ -11068,7 +11068,14 @@ impl crate::emit::Taggable for Meta<'_> {
         // sample's `Doc<N>`). The blocks ride after the type-1/4/5 scalars in
         // walk order; the same g3 / first-wins dedup below folds them.
         for info in sample.exif_info() {
-          emit_ctmd_exif_info(info, track.as_str(), doc_n, print_conv, &mut ctmd_scratch);
+          emit_ctmd_exif_info(
+            info,
+            track.as_str(),
+            doc_n,
+            print_conv,
+            self.cr3().model(),
+            &mut ctmd_scratch,
+          );
         }
         if g3 {
           // `-G3`: each sample is its OWN `Doc<N>`, so the rows of ONE sample's
@@ -11750,6 +11757,19 @@ impl crate::emit::Taggable for Meta<'_> {
       tags.push(EmittedTag::new(
         Group::new("QuickTime", "QuickTime"),
         "PreviewImage".into(),
+        TagValue::Str(binary_placeholder(len)),
+        false,
+      ));
+    }
+    // CR3 Canon `uuid`-`THMB` ThumbnailImage (Canon.pm:9729-9735) — `RawConv =>
+    // substr($val, 16)`, `Binary => 1` ⇒ the `(Binary data N bytes…)` placeholder
+    // (body length minus the 16-byte THMB header) under `MakerNotes`/`Canon`.
+    if let Some(thmb) = self.cr3().thmb()
+      && let Some(len) = thmb.length().checked_sub(16)
+    {
+      tags.push(EmittedTag::new(
+        Group::new("MakerNotes", "Canon"),
+        "ThumbnailImage".into(),
         TagValue::Str(binary_placeholder(len)),
         false,
       ));
@@ -15661,6 +15681,11 @@ fn emit_ctmd_exif_info(
   track: &str,
   doc_n: u32,
   print_conv: bool,
+  // The file-walk `$$self{Model}` (CMT1 IFD0 Model) — the fallback when this
+  // CTMD sample's own `0x8769` block (an `ExifIFD`) carried no Model, so
+  // model-conditional Canon sub-tables (AFInfo2 `AFPointsSelected`) resolve
+  // against the body Model exactly as ExifTool's persisted object state does.
+  file_model: Option<&str>,
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::{EmittedTag, Taggable};
@@ -15731,7 +15756,9 @@ fn emit_ctmd_exif_info(
       let emissions = crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(
         info.tiff(),
         print_conv,
-        info.model(),
+        // The CTMD sample's own `0x8769` Model, else the file-walk CMT1 Model
+        // (ExifTool's persisted `$$self{Model}`).
+        info.model().or(file_model),
       );
       let group = scoped("MakerNotes", track);
       for e in emissions {
