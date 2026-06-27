@@ -41,6 +41,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// allocations happening on that same thread (the parse is synchronous).
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Process-wide allocation BYTE counter (the requested `layout.size()` summed
+/// over every `alloc`/`alloc_zeroed`, plus the `new_size` of every `realloc`).
+/// Complements [`ALLOC_COUNT`]: an alloc-COUNT delta is size-blind (one big copy
+/// and two big copies differ by only ONE count), so proving "a block is copied
+/// once, not twice" needs the BYTE volume. Read on the same single thread as the
+/// measured closure, so `Relaxed` is sufficient.
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// A `System`-delegating allocator that counts allocations. `dealloc` is NOT
 /// counted (we measure allocation pressure, the KPI for a streaming indexer);
 /// `realloc` counts as one allocation (a growth event).
@@ -51,6 +59,7 @@ unsafe impl GlobalAlloc for Counting {
     let p = unsafe { System.alloc(layout) };
     if !p.is_null() {
       ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+      ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
     }
     p
   }
@@ -63,6 +72,7 @@ unsafe impl GlobalAlloc for Counting {
     let p = unsafe { System.alloc_zeroed(layout) };
     if !p.is_null() {
       ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+      ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
     }
     p
   }
@@ -71,6 +81,7 @@ unsafe impl GlobalAlloc for Counting {
     let p = unsafe { System.realloc(ptr, layout, new_size) };
     if !p.is_null() {
       ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+      ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
     }
     p
   }
@@ -95,6 +106,17 @@ fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
   let before = ALLOC_COUNT.load(Ordering::Relaxed);
   let out = f();
   let after = ALLOC_COUNT.load(Ordering::Relaxed);
+  (out, after - before)
+}
+
+/// Count the BYTE VOLUME (`layout.size()` summed) allocated by `f`, returning the
+/// closure's result alongside the delta. Used to prove a copy happens once, not
+/// twice — a property the size-blind [`count_allocs`] cannot see (it differs by
+/// only ONE count between a single and a double materialization of the same block).
+fn count_alloc_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+  let before = ALLOC_BYTES.load(Ordering::Relaxed);
+  let out = f();
+  let after = ALLOC_BYTES.load(Ordering::Relaxed);
   (out, after - before)
 }
 
@@ -189,6 +211,7 @@ fn alloc_budget() {
   }
 
   read_value_byte_len_float_rational_is_zero_heap();
+  geotiff_block_capture_is_single_copy();
 }
 
 /// The placeholder-length path ([`exifast::exif::ifd::read_value_byte_len`]) for
@@ -291,6 +314,98 @@ fn read_value_byte_len_float_rational_is_zero_heap() {
   assert!(
     allocs_large_r <= allocs_small_r + ZERO_HEAP_CEILING,
     "Rational allocs scaled with count ({allocs_small_r} → {allocs_large_r}) — must be O(1)."
+  );
+}
+
+/// #429 — the classic-TIFF GeoTiff block-capture fast-path copies an over-large
+/// `GeoTiffDoubleParams` (0x87b0) block AT MOST ONCE.
+///
+/// The three `Binary => 1` GeoTiff block tags (`GeoTiffDirectory` 0x87af /
+/// `GeoTiffDoubleParams` 0x87b0 / `GeoTiffAsciiParams` 0x87b1) are never emitted
+/// as leaves — they are captured raw for the post-IFD0 `ProcessGeoTiff` pass and
+/// then dropped. The pre-fix classic walker still fell through to the generic
+/// `read_value`, materializing the full `undef` payload into a THROWAWAY
+/// `RawValue::Bytes`, and THEN `emit` copied the same slice AGAIN into the
+/// capture slot — TWO heap copies of an attacker-controlled, in-bounds-but-huge
+/// block, both BEFORE `geotiff::process` (and so before its `MAX_GEOKEY_ELEMENTS`
+/// `DirectoryTooLarge` budget) could run. The fix special-cases the three tags in
+/// `walk_entry` BEFORE `read_value`: it captures the block ONCE and returns,
+/// never building the throwaway `RawValue`/`ExifEntry`.
+///
+/// This crafts a TIFF whose sole IFD0 entry is a `GeoTiffDoubleParams` block with
+/// NO `GeoTiffDirectory` — so `geotiff::process` returns early (`$et->GetValue
+/// ('GeoTiffDirectory') or return`, `GeoTiff.pm:2136`) and its budget NEVER runs
+/// on the params, leaving the `walk_entry` capture as the ONLY bound. It measures
+/// the BYTE volume of a SMALL-block vs a LARGE-block parse: the block-proportional
+/// GROWTH must be ~ONE copy of the size increase (the single capture), not TWO.
+/// The constant structural overhead cancels in the delta, so a `1.5×` ceiling
+/// cleanly separates the single-copy fast-path (~1.0×) from the pre-fix
+/// double-copy (~2.0×).
+///
+/// Called INLINE from the single `alloc_budget` test (the allocation counters are
+/// process-global, so a parallel second `#[test]` would cross-contaminate this
+/// window — see the module doc).
+fn geotiff_block_capture_is_single_copy() {
+  use exifast::parse_exif;
+
+  // A classic little-endian TIFF whose sole IFD0 entry is a `GeoTiffDoubleParams`
+  // (0x87b0) `undef[block]` value out-of-line at offset 26, with NO 0x87af
+  // directory. On-disk `undef` (1-byte element) so `count == block == read_len`.
+  fn tiff_with_double_params(block: usize) -> Vec<u8> {
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // IFD0 numEntries = 1
+    t.extend_from_slice(&0x87b0u16.to_le_bytes()); // tag = GeoTiffDoubleParams
+    t.extend_from_slice(&7u16.to_le_bytes()); // format = UNDEF (1-byte element)
+    t.extend_from_slice(&u32::try_from(block).expect("fits u32").to_le_bytes()); // count
+    t.extend_from_slice(&26u32.to_le_bytes()); // out-of-line value offset
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    assert_eq!(t.len(), 26, "the value must start exactly at offset 26");
+    t.resize(26 + block, 0x5a); // the in-bounds params block
+    t
+  }
+
+  const SMALL: usize = 64 * 1024; // 64 KiB
+  const LARGE: usize = 4 * 1024 * 1024; // 4 MiB
+  let small_tiff = tiff_with_double_params(SMALL);
+  let large_tiff = tiff_with_double_params(LARGE);
+
+  // Warm-up OUTSIDE the measured region (lazy statics, first-call init).
+  assert!(parse_exif(&small_tiff).is_some());
+  assert!(parse_exif(&large_tiff).is_some());
+
+  let (small_ok, small_bytes) = count_alloc_bytes(|| parse_exif(&small_tiff).is_some());
+  let (large_ok, large_bytes) = count_alloc_bytes(|| parse_exif(&large_tiff).is_some());
+  assert!(small_ok && large_ok, "both crafted TIFFs parse");
+
+  println!("\n=== alloc_budget: geotiff block-capture single-copy ===");
+  println!("  0x87b0 small({SMALL})={small_bytes}B  large({LARGE})={large_bytes}B");
+
+  // The large parse must allocate AT LEAST one full block (proves the capture
+  // actually ran — not a short-circuit that never touched the params).
+  assert!(
+    large_bytes >= LARGE,
+    "the large block must be captured at least once: {large_bytes} < {LARGE}"
+  );
+
+  // THE REGRESSION GUARD: the block-proportional GROWTH between the two parses
+  // must be ~ONE copy of the block-size increase (the single capture). A growth
+  // approaching 2× means the block was materialized TWICE — the `read_value`
+  // throwaway plus the `emit` slot copy that the #429 fast-path removed.
+  let block_delta = LARGE - SMALL;
+  let measured_delta = large_bytes.saturating_sub(small_bytes);
+  let ceiling = block_delta + block_delta / 2; // 1.5× — between 1 copy and 2.
+  assert!(
+    measured_delta < ceiling,
+    "GeoTiff 0x87b0 capture grew {measured_delta} bytes for a {block_delta}-byte \
+     block-size increase (ceiling {ceiling} = 1.5×) — a growth near 2× means the \
+     block is copied TWICE (the read_value throwaway + the emit copy the #429 \
+     fast-path eliminated)."
+  );
+  // And it IS at least one copy of the delta (the capture scales with the block),
+  // bracketing the growth to ~[1×, 1.5×) — i.e. exactly one copy.
+  assert!(
+    measured_delta >= block_delta,
+    "the capture must scale one-for-one with the block: {measured_delta} < {block_delta}"
   );
 }
 
