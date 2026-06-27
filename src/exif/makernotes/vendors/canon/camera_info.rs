@@ -78,6 +78,21 @@ fn model_is_1ds(model: Option<&str>) -> bool {
   model_ends_with(model, "1DS")
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo1DmkII` (`Canon.pm:1317`,
+/// `$$self{Model} =~ /\b1Ds? Mark II$/` — the 1DmkII or 1DSmkII; the trailing
+/// `$` excludes the "Mark II N" of the 1DmkIIN).
+#[must_use]
+pub fn model_is_camera_info_1dmkii(model: Option<&str>) -> bool {
+  model_ends_with(model, "1D Mark II") || model_ends_with(model, "1Ds Mark II")
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo1DmkIIN` (`Canon.pm:1322`,
+/// `$$self{Model} =~ /\b1Ds? Mark II N$/`).
+#[must_use]
+pub fn model_is_camera_info_1dmkiin(model: Option<&str>) -> bool {
+  model_ends_with(model, "1D Mark II N") || model_ends_with(model, "1Ds Mark II N")
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
@@ -95,6 +110,10 @@ pub fn parse(
 ) -> Vec<(SmolStr, TagValue)> {
   if model_is_camera_info_1d(model) {
     camera_info_1d(data, order, print_conv, model)
+  } else if model_is_camera_info_1dmkiin(model) {
+    camera_info_1dmkiin(data, order, print_conv)
+  } else if model_is_camera_info_1dmkii(model) {
+    camera_info_1dmkii(data, order, print_conv)
   } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_6d(model) {
@@ -322,6 +341,126 @@ fn camera_info_1d(
     emit_color_temperature(data, 0x4e, order, &mut push);
     emit_picture_style(data, 0x51, print_conv, &mut push);
   }
+  out
+}
+
+/// `%Canon::CameraInfo1DmkII` (`Canon.pm:3287-3361`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook`. Shared by the 1DmkII
+/// and 1DSmkII. `LensType` (0x0c) is drop-0 int16uRev; `ColorTemperature` (0x37)
+/// is int16uRev (unlike the plain-int16u variant elsewhere); `WhiteBalance`
+/// (0x36) is 1-byte int8u; `ISO` (0x75) is a `string[5]`; `Saturation`/`ColorTone`/
+/// `Contrast` use `Exif::printParameter` while `Sharpness` (0x72) is a plain int8s.
+fn camera_info_1dmkii(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_ci_exposure_time(data, 0x04, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x09,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if let Some(v) = u16_rev(data, 0x0c, order)
+    && v != 0
+  {
+    push("LensType", lens_type_value(v, print_conv));
+  }
+  emit_focal_mm(
+    data,
+    0x11,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x13,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if let Some(v) = i8u(data, 0x2d) {
+    push("FocalType", enum8(v, print_conv, focal_type_label));
+  }
+  emit_white_balance_int8u(data, 0x36, print_conv, &mut push);
+  emit_color_temperature_rev(data, 0x37, order, &mut push);
+  emit_canon_image_size(data, 0x39, order, print_conv, &mut push);
+  if let Some(v) = i8u(data, 0x66) {
+    push("JPEGQuality", TagValue::I64(v));
+  }
+  emit_picture_style(data, 0x6c, print_conv, &mut push);
+  emit_print_parameter(data, 0x6e, "Saturation", print_conv, &mut push);
+  emit_print_parameter(data, 0x6f, "ColorTone", print_conv, &mut push);
+  if let Some(v) = i8s(data, 0x72) {
+    push("Sharpness", TagValue::I64(v));
+  }
+  emit_print_parameter(data, 0x73, "Contrast", print_conv, &mut push);
+  emit_string_leaf(data, 0x75, 5, "ISO", &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo1DmkIIN` (`Canon.pm:3365-3422`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook`. Like the 1DmkII but
+/// without `FocalType`/`CanonImageSize`/`JPEGQuality`, and with the
+/// `PictureStyle`/`Sharpness`/`Contrast`/`Saturation`/`ColorTone`/`ISO` leaves at
+/// different (0x73-row) offsets.
+fn camera_info_1dmkiin(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_ci_exposure_time(data, 0x04, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x09,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if let Some(v) = u16_rev(data, 0x0c, order)
+    && v != 0
+  {
+    push("LensType", lens_type_value(v, print_conv));
+  }
+  emit_focal_mm(
+    data,
+    0x11,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x13,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance_int8u(data, 0x36, print_conv, &mut push);
+  emit_color_temperature_rev(data, 0x37, order, &mut push);
+  emit_picture_style(data, 0x73, print_conv, &mut push);
+  if let Some(v) = i8s(data, 0x74) {
+    push("Sharpness", TagValue::I64(v));
+  }
+  emit_print_parameter(data, 0x75, "Contrast", print_conv, &mut push);
+  emit_print_parameter(data, 0x76, "Saturation", print_conv, &mut push);
+  emit_print_parameter(data, 0x77, "ColorTone", print_conv, &mut push);
+  emit_string_leaf(data, 0x79, 5, "ISO", &mut push);
   out
 }
 
@@ -1682,6 +1821,56 @@ fn emit_color_temperature<F: FnMut(&'static str, TagValue)>(
   }
 }
 
+/// `ColorTemperature` as an `int16uRev` word (the 1DmkII / 1DmkIIN 0x37 rows,
+/// `Canon.pm:3319-3322`/`:3390-3393`) — byte order reversed vs the plain-int16u
+/// `ColorTemperature` of the other tables.
+fn emit_color_temperature_rev<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  push: &mut F,
+) {
+  if let Some(v) = u16_rev(data, off, order) {
+    push("ColorTemperature", TagValue::I64(v));
+  }
+}
+
+/// `CanonImageSize` (`%canonImageSize`, int16u) — the 1DmkII 0x39 leaf. The hash
+/// carries no `PrintHex`, so an unresolved value renders the DECIMAL
+/// `Unknown (N)` fallback.
+fn emit_canon_image_size<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = u16(data, off, order) {
+    let value = if print_conv {
+      match canon_image_size_label(v) {
+        Some(l) => TagValue::Str(SmolStr::new_static(l)),
+        None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+      }
+    } else {
+      TagValue::I64(v)
+    };
+    push("CanonImageSize", value);
+  }
+}
+
+/// An `Exif::printParameter` int8s leaf (`Saturation`/`ColorTone`/`Contrast`).
+fn emit_print_parameter<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  name: &'static str,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8s(data, off) {
+    push(name, print_parameter_value(v, print_conv));
+  }
+}
+
 /// `WhiteBalance` as a 1-byte `int8u` (`%canonWhiteBalance`). The 1D / 1DmkII /
 /// 1DmkIIN rows have no `Format` override, so they read a single byte (unlike the
 /// `int16u` `WhiteBalance` of the later tables).
@@ -2234,6 +2423,15 @@ fn sharpness_frequency_label(v: i64) -> Option<&'static str> {
   })
 }
 
+/// `FocalType` PrintConv (`Canon.pm:3307-3313`) — the `%CameraInfo1DmkII` 0x2d leaf.
+fn focal_type_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Fixed",
+    2 => "Zoom",
+    _ => return None,
+  })
+}
+
 /// `HighISONoiseReduction` PrintConv (`Canon.pm:4447-4452`).
 fn high_iso_nr_label(v: i64) -> Option<&'static str> {
   Some(match v {
@@ -2280,6 +2478,49 @@ fn focus_distance_value(raw: i64, print_conv: bool) -> TagValue {
     TagValue::I64(v as i64)
   } else {
     TagValue::F64(v)
+  }
+}
+
+/// `%canonImageSize` (`Canon.pm:1062-1082`).
+fn canon_image_size_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    -1 => "n/a",
+    0 => "Large",
+    1 => "Medium",
+    2 => "Small",
+    5 => "Medium 1",
+    6 => "Medium 2",
+    7 => "Medium 3",
+    8 => "Postcard",
+    9 => "Widescreen",
+    10 => "Medium Widescreen",
+    14 => "Small 1",
+    15 => "Small 2",
+    16 => "Small 3",
+    128 => "640x480 Movie",
+    129 => "Medium Movie",
+    130 => "Small Movie",
+    137 => "1280x720 Movie",
+    142 => "1920x1080 Movie",
+    143 => "4096x2160 Movie",
+    _ => return None,
+  })
+}
+
+/// `%Image::ExifTool::Exif::printParameter` (`Exif.pm:327-332`): `0 => 'Normal'`,
+/// `OTHER => PrintParameter` (`Exif.pm:5628-5640`, `$val > 0 ⇒ "+$val"`, else
+/// `$val`). The `$val > 0xfff0` negative-in-disguise branch is unreachable for an
+/// int8s source. Raw int under `-n`.
+fn print_parameter_value(v: i64, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::I64(v);
+  }
+  if v == 0 {
+    TagValue::Str(SmolStr::new_static("Normal"))
+  } else if v > 0 {
+    TagValue::Str(SmolStr::from(std::format!("+{v}")))
+  } else {
+    TagValue::Str(SmolStr::from(std::format!("{v}")))
   }
 }
 
@@ -3661,5 +3902,130 @@ mod tests {
     assert!(find("LensType").is_none());
     assert!(find("MinFocalLength").is_none());
     assert!(find("WhiteBalance").is_none());
+  }
+
+  #[test]
+  fn dispatch_1dmkii_1dmkiin() {
+    assert!(model_is_camera_info_1dmkii(Some("Canon EOS-1D Mark II")));
+    assert!(model_is_camera_info_1dmkii(Some("Canon EOS-1Ds Mark II")));
+    // the IIN must NOT match the mkII condition (the trailing `$`).
+    assert!(!model_is_camera_info_1dmkii(Some("Canon EOS-1D Mark II N")));
+    assert!(!model_is_camera_info_1dmkii(Some("Canon EOS-1D Mark III")));
+    assert!(model_is_camera_info_1dmkiin(Some("Canon EOS-1D Mark II N")));
+    assert!(model_is_camera_info_1dmkiin(Some(
+      "Canon EOS-1Ds Mark II N"
+    )));
+    assert!(!model_is_camera_info_1dmkiin(Some("Canon EOS-1D Mark II")));
+  }
+
+  /// `%Canon::CameraInfo1DmkII`: int16uRev FocalLength/LensType/Min/Max, the
+  /// int16uRev `ColorTemperature` (0x37), int8u `WhiteBalance`, `FocalType`,
+  /// `CanonImageSize`, plain int8s `Sharpness`, `printParameter` Sat/Tone/Contrast,
+  /// and the `string[5]` ISO.
+  #[test]
+  fn camera_info_1dmkii_fields() {
+    let mut b = vec![0u8; 0x80];
+    b[0x04] = 0x20; // ExposureTime present
+    b[0x0a] = 0x32; // FocalLength int16uRev BE(00 32) = 50
+    b[0x0d] = 0x01; // LensType int16uRev BE(00 01) = 1
+    b[0x12] = 0x0a; // MinFocalLength int16uRev = 10
+    b[0x14] = 0xc8; // MaxFocalLength int16uRev = 200
+    b[0x2d] = 2; // FocalType Zoom
+    b[0x36] = 3; // WhiteBalance int8u Tungsten
+    b[0x37] = 0x14;
+    b[0x38] = 0x50; // ColorTemperature int16uRev BE(14 50) = 5200
+    b[0x39] = 0x01; // CanonImageSize int16u LE = 1 => Medium
+    b[0x66] = 7; // JPEGQuality 7
+    b[0x6c] = 0x83; // PictureStyle Landscape
+    b[0x6e] = 0x02; // Saturation +2
+    b[0x6f] = 0xfe; // ColorTone -2
+    b[0x72] = 0x03; // Sharpness plain int8s = 3
+    b[0x73] = 0x00; // Contrast Normal
+    b[0x75..0x78].copy_from_slice(b"100"); // ISO string[5]
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark II"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert!(find("ExposureTime").is_some());
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FocalType"), Some(TagValue::Str("Zoom".into())));
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Tungsten".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("CanonImageSize"), Some(TagValue::Str("Medium".into())));
+    assert_eq!(find("JPEGQuality"), Some(TagValue::I64(7)));
+    assert_eq!(
+      find("PictureStyle"),
+      Some(TagValue::Str("Landscape".into()))
+    );
+    assert_eq!(find("Saturation"), Some(TagValue::Str("+2".into())));
+    assert_eq!(find("ColorTone"), Some(TagValue::Str("-2".into())));
+    assert_eq!(find("Sharpness"), Some(TagValue::I64(3)));
+    assert_eq!(find("Contrast"), Some(TagValue::Str("Normal".into())));
+    assert_eq!(find("ISO"), Some(TagValue::Str("100".into())));
+    // -n view: LensType / CanonImageSize / Saturation render as bare values.
+    let emn = parse(
+      &b,
+      ByteOrder::Little,
+      false,
+      Some("Canon EOS-1D Mark II"),
+      None,
+    );
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
+    assert_eq!(findn("CanonImageSize"), Some(TagValue::I64(1)));
+    assert_eq!(findn("Saturation"), Some(TagValue::I64(2)));
+  }
+
+  /// `%Canon::CameraInfo1DmkIIN`: like the 1DmkII but without FocalType /
+  /// CanonImageSize / JPEGQuality, and with PictureStyle/Sharpness/Contrast/
+  /// Saturation/ColorTone/ISO at the 0x73-row offsets.
+  #[test]
+  fn camera_info_1dmkiin_fields() {
+    let mut b = vec![0u8; 0x80];
+    b[0x04] = 0x20; // ExposureTime
+    b[0x0a] = 0x32; // FocalLength 50
+    b[0x0d] = 0x01; // LensType 1
+    b[0x12] = 0x0a; // MinFocalLength 10
+    b[0x14] = 0xc8; // MaxFocalLength 200
+    b[0x36] = 2; // WhiteBalance Cloudy
+    b[0x37] = 0x14;
+    b[0x38] = 0x50; // ColorTemperature int16uRev = 5200
+    b[0x73] = 0x86; // PictureStyle Monochrome
+    b[0x74] = 0x04; // Sharpness plain int8s = 4
+    b[0x75] = 0x03; // Contrast +3
+    b[0x76] = 0xfd; // Saturation -3
+    b[0x77] = 0x00; // ColorTone Normal
+    b[0x79..0x7c].copy_from_slice(b"200"); // ISO string[5]
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark II N"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Cloudy".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(
+      find("PictureStyle"),
+      Some(TagValue::Str("Monochrome".into()))
+    );
+    assert_eq!(find("Sharpness"), Some(TagValue::I64(4)));
+    assert_eq!(find("Contrast"), Some(TagValue::Str("+3".into())));
+    assert_eq!(find("Saturation"), Some(TagValue::Str("-3".into())));
+    assert_eq!(find("ColorTone"), Some(TagValue::Str("Normal".into())));
+    assert_eq!(find("ISO"), Some(TagValue::Str("200".into())));
+    // The 1DmkIIN table has no FocalType / CanonImageSize / JPEGQuality rows.
+    assert!(find("FocalType").is_none());
+    assert!(find("CanonImageSize").is_none());
+    assert!(find("JPEGQuality").is_none());
   }
 }
