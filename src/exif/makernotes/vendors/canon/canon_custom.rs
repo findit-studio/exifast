@@ -84,7 +84,7 @@ pub fn parse_custom_functions(
   model: Option<&str>,
 ) -> Vec<(SmolStr, TagValue)> {
   match select_custom_table(model) {
-    Some(entry) => walk_canon_custom(data, order, print_conv, entry),
+    Some(entry) => walk_canon_custom(data, order, print_conv, model, entry),
     None => Vec::new(),
   }
 }
@@ -147,7 +147,8 @@ pub fn parse_functions_5d(
   order: ByteOrder,
   print_conv: bool,
 ) -> Vec<(SmolStr, TagValue)> {
-  walk_canon_custom(data, order, print_conv, functions_5d_entry)
+  // The 0x0f EOS 5D arm — never a D60, so the length gate needs no model.
+  walk_canon_custom(data, order, print_conv, None, functions_5d_entry)
 }
 
 /// Decode a `ProcessCanonCustom` block against the 1D table
@@ -160,22 +161,46 @@ pub fn parse_functions_1d(
   order: ByteOrder,
   print_conv: bool,
 ) -> Vec<(SmolStr, TagValue)> {
-  walk_canon_custom(data, order, print_conv, functions_1d_entry)
+  // The 0x90 CustomFunctions1D tag / 0x0f EOS-1D arm — never a D60.
+  walk_canon_custom(data, order, print_conv, None, functions_1d_entry)
 }
 
 /// The shared `ProcessCanonCustom` record walk (`CanonCustom.pm:2772-2801`): the
-/// leading length word is skipped; each subsequent `int16u` record yields
-/// `tag = val >> 8`, `value = val & 0xff` (an `int8u`). A record whose `tag` is
-/// not a named `entry` is `Unknown` and dropped (bundled gates it behind `-u`).
-/// `print_conv` selects the PrintConv label vs the raw `int8u`.
+/// leading `int16u` length word at offset 0 must equal the block size, else the
+/// whole block is rejected (`CanonCustom.pm:2782-2785`, "Invalid CanonCustom
+/// data", `return 0`) and emits nothing — it is NOT clamped to the declared
+/// length. The lone tolerance is the EOS D60, which declares a length 2 bytes
+/// short of its block (`$$et{Model} =~ /\bD60\b/ and $len+2 == $size`). Each
+/// subsequent `int16u` record yields `tag = val >> 8`, `value = val & 0xff` (an
+/// `int8u`); once the gate passes, the walk always covers the full buffer. A
+/// record whose `tag` is not a named `entry` is `Unknown` and dropped (bundled
+/// gates it behind `-u`). `print_conv` selects the PrintConv label vs the raw
+/// `int8u`.
 fn walk_canon_custom(
   data: &[u8],
   order: ByteOrder,
   print_conv: bool,
+  model: Option<&str>,
   entry: EntryFn,
 ) -> Vec<(SmolStr, TagValue)> {
   let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
   let size = data.len();
+  // The "Invalid CanonCustom data" gate (`CanonCustom.pm:2782-2785`).
+  let Some(len_bytes) = data.get(0..2) else {
+    return out;
+  };
+  let len_arr: [u8; 2] = match len_bytes.try_into() {
+    Ok(a) => a,
+    Err(_) => return out,
+  };
+  let len = usize::from(match order {
+    ByteOrder::Little => u16::from_le_bytes(len_arr),
+    ByteOrder::Big => u16::from_be_bytes(len_arr),
+  });
+  let d60 = model.is_some_and(|m| word_bounded(m, "D60"));
+  if !(len == size || (d60 && len + 2 == size)) {
+    return out;
+  }
   let mut pos = 2usize;
   while pos + 2 <= size {
     let Some(arr) = data.get(pos..pos + 2) else {
@@ -1707,6 +1732,98 @@ const PERSONAL_FUNCS: &[(u16, &str)] = &[
   (32, "PF31OriginalDecisionData"),
 ];
 
+// ─── PersonalFuncValues (`Canon::Main` 0x92) ─────────────────────────────────
+
+/// The per-position conversion for `%CanonCustom::PersonalFuncValues`.
+#[derive(Clone, Copy)]
+enum PfvConv {
+  /// No `ValueConv`/`PrintConv` — the raw `int16u` in both `-j` and `-n`.
+  Plain,
+  /// `PF4ExposureTimeMin`/`Max` (`CanonCustom.pm:1155-1170`): `ValueConv =>
+  /// 'exp(-CanonEv($val*4)*log(2))*1000/8'`, `PrintConv => PrintExposureTime`.
+  ExposureTime,
+  /// `PF5ApertureMin`/`Max` (`CanonCustom.pm:1171-1186`): `ValueConv =>
+  /// 'exp(CanonEv($val*4-32)*log(2)/2)'`, `PrintConv => 'sprintf("%.2g",$val)'`.
+  Aperture,
+}
+
+/// Decode `%CanonCustom::PersonalFuncValues` (`CanonCustom.pm:1135-1197`) — the
+/// EOS-1D personal-function values reached via the `Canon::Main` 0x92
+/// SubDirectory (`Canon.pm:1810-1816`). `ProcessBinaryData`, `FORMAT =>
+/// 'int16u'`, `FIRST_ENTRY => 1`: position `index` reads the `int16u` at byte
+/// offset `index * 2`. Most positions are passthrough; the four exposure-time /
+/// aperture positions carry a `CanonEv`-based `ValueConv` (emitted as the
+/// converted float in `-n`) and a `PrintExposureTime` / `%.2g` `PrintConv`.
+/// A position past the block end is dropped (per-field availability). The
+/// `RawConv => '$val > 0 ? $val : 0'` is an identity for the `int16u` read here.
+#[must_use]
+pub fn parse_personal_func_values(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  use super::camera_settings::canon_ev;
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  for &(index, name, conv) in PERSONAL_FUNC_VALUES {
+    let Some(raw) = u16_at(data, usize::from(index) * 2, order) else {
+      continue;
+    };
+    let raw = raw as i64;
+    let value = match conv {
+      PfvConv::Plain => TagValue::I64(raw),
+      PfvConv::ExposureTime => {
+        let vc = (-canon_ev(raw * 4) * core::f64::consts::LN_2).exp() * 1000.0 / 8.0;
+        if print_conv {
+          TagValue::Str(SmolStr::from(
+            crate::composite::convs::exif::print_exposure_time(vc),
+          ))
+        } else {
+          TagValue::F64(vc)
+        }
+      }
+      PfvConv::Aperture => {
+        let vc = (canon_ev(raw * 4 - 32) * core::f64::consts::LN_2 / 2.0).exp();
+        if print_conv {
+          TagValue::Str(SmolStr::from(crate::value::format_g(vc, 2)))
+        } else {
+          TagValue::F64(vc)
+        }
+      }
+    };
+    out.push((SmolStr::new_static(name), value));
+  }
+  out
+}
+
+/// `(index, Name, conv)` for `%CanonCustom::PersonalFuncValues`
+/// (`CanonCustom.pm:1144-1196`).
+const PERSONAL_FUNC_VALUES: &[(u16, &str, PfvConv)] = &[
+  (1, "PF1Value", PfvConv::Plain),
+  (2, "PF2Value", PfvConv::Plain),
+  (3, "PF3Value", PfvConv::Plain),
+  (4, "PF4ExposureTimeMin", PfvConv::ExposureTime),
+  (5, "PF4ExposureTimeMax", PfvConv::ExposureTime),
+  (6, "PF5ApertureMin", PfvConv::Aperture),
+  (7, "PF5ApertureMax", PfvConv::Aperture),
+  (8, "PF8BracketShots", PfvConv::Plain),
+  (9, "PF19ShootingSpeedLow", PfvConv::Plain),
+  (10, "PF19ShootingSpeedHigh", PfvConv::Plain),
+  (11, "PF20MaxContinousShots", PfvConv::Plain),
+  (12, "PF23ShutterButtonTime", PfvConv::Plain),
+  (13, "PF23FELockTime", PfvConv::Plain),
+  (14, "PF23PostReleaseTime", PfvConv::Plain),
+  (15, "PF25AEMode", PfvConv::Plain),
+  (16, "PF25MeteringMode", PfvConv::Plain),
+  (17, "PF25DriveMode", PfvConv::Plain),
+  (18, "PF25AFMode", PfvConv::Plain),
+  (19, "PF25AFPointSel", PfvConv::Plain),
+  (20, "PF25ImageSize", PfvConv::Plain),
+  (21, "PF25WBMode", PfvConv::Plain),
+  (22, "PF25Parameters", PfvConv::Plain),
+  (23, "PF25ColorMatrix", PfvConv::Plain),
+  (24, "PF27Value", PfvConv::Plain),
+];
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -1929,6 +2046,52 @@ mod tests {
     want_str(&em2, "FocusingScreen", "Unknown (9)");
   }
 
+  /// `ProcessCanonCustom` (`CanonCustom.pm:2782-2785`) REJECTS the whole block
+  /// when the offset-0 `int16u` length word does not equal the block size — it
+  /// is NOT clamped to the declared length. A length shorter than the buffer
+  /// (trailing record-shaped padding) and a length longer than the buffer both
+  /// emit nothing; only an exact `len == size` decodes.
+  #[test]
+  fn rejects_length_word_mismatch() {
+    // Sanity: an exact `len == size` block decodes its four 1D records.
+    let exact = build_custom(&[(0, 0), (5, 2), (19, 4), (21, 1)]);
+    assert_eq!(parse_functions_1d(&exact, ByteOrder::Little, true).len(), 4);
+
+    // SHORTER: declared len = 4, but three record-shaped words follow (size = 8)
+    // — a full walk would decode them; ExifTool rejects (len != size) → nothing.
+    let shorter = build_u16(&[4, 0x0000, 0x0500, 0x1304]);
+    assert_eq!(shorter.len(), 8);
+    assert!(parse_functions_1d(&shorter, ByteOrder::Little, true).is_empty());
+    assert!(
+      parse_custom_functions(&shorter, ByteOrder::Little, true, Some("Canon EOS 5D")).is_empty()
+    );
+
+    // LONGER: declared len = 0xffff overruns the 8-byte buffer → rejected, no OOB.
+    let longer = build_u16(&[0xffff, 0x0000, 0x0500, 0x1304]);
+    assert!(parse_functions_1d(&longer, ByteOrder::Little, true).is_empty());
+    assert!(parse_functions_5d(&longer, ByteOrder::Little, true).is_empty());
+  }
+
+  /// The lone `ProcessCanonCustom` length tolerance (`CanonCustom.pm:2782`): an
+  /// EOS D60 whose declared length is 2 bytes short of the block
+  /// (`$$et{Model} =~ /\bD60\b/ and $len+2 == $size`) still decodes; the same
+  /// 2-short block on any other body is rejected.
+  #[test]
+  fn d60_length_word_two_short() {
+    // len = 4, then two FunctionsD30 records → size = 6 (= len + 2).
+    let blk = build_u16(&[4, 0x0101, 0x0300]);
+    assert_eq!(blk.len(), 6);
+    let em = parse_custom_functions(&blk, ByteOrder::Little, true, Some("Canon EOS D60"));
+    want_str(&em, "LongExposureNoiseReduction", "On");
+    want_str(&em, "MirrorLockup", "Disable");
+    assert_eq!(em.len(), 2);
+    // A non-D60 body (D30, which shares the table) with the same 2-short length
+    // falls to the gate.
+    assert!(
+      parse_custom_functions(&blk, ByteOrder::Little, true, Some("Canon EOS D30")).is_empty()
+    );
+  }
+
   /// Build a `%CanonCustom::PersonalFuncs`/`PersonalFuncValues` `int16u` block
   /// from `words` (word 0 is the unread size; named positions start at index 1).
   fn build_u16(words: &[u16]) -> Vec<u8> {
@@ -1970,6 +2133,48 @@ mod tests {
     assert_eq!(find(&em, "PF4ExposureTimeLimits"), Some(TagValue::I64(2)));
     assert_eq!(find(&em, "PF5ApertureLimits"), None); // index 6, dropped
     assert_eq!(em.len(), 5);
+  }
+
+  /// `%CanonCustom::PersonalFuncValues` (`CanonCustom.pm:1135-1197`) — `-j`:
+  /// plain positions pass through; the exposure-time / aperture positions render
+  /// their `CanonEv` `ValueConv` via `PrintExposureTime` / `%.2g`. The expected
+  /// labels are ground-truthed against the bundled Perl.
+  #[test]
+  fn personal_func_values_print() {
+    let mut words = [0u16; 25]; // indices 0..=24
+    words[1] = 100; // PF1Value (plain)
+    words[4] = 32; // PF4ExposureTimeMin -> 7.8125 -> "7.8"
+    words[5] = 64; // PF4ExposureTimeMax -> 0.48828125 -> "0.5"
+    words[6] = 8; // PF5ApertureMin -> f/1.0 -> "1"
+    words[7] = 40; // PF5ApertureMax -> f/4.0 -> "4"
+    words[8] = 3; // PF8BracketShots (plain)
+    words[24] = 7; // PF27Value (plain)
+    let em = parse_personal_func_values(&build_u16(&words), ByteOrder::Little, true);
+    assert_eq!(find(&em, "PF1Value"), Some(TagValue::I64(100)));
+    want_str(&em, "PF4ExposureTimeMin", "7.8");
+    want_str(&em, "PF4ExposureTimeMax", "0.5");
+    want_str(&em, "PF5ApertureMin", "1");
+    want_str(&em, "PF5ApertureMax", "4");
+    assert_eq!(find(&em, "PF8BracketShots"), Some(TagValue::I64(3)));
+    assert_eq!(find(&em, "PF27Value"), Some(TagValue::I64(7)));
+    assert_eq!(em.len(), 24); // indices 1..=24 all present
+  }
+
+  /// `-n`: the converted `ValueConv` float for the exposure-time / aperture
+  /// positions, raw `int16u` for plain; a position past the block end is dropped.
+  #[test]
+  fn personal_func_values_numeric_and_per_field() {
+    let mut words = [0u16; 8]; // indices 0..=7 (16 bytes)
+    words[1] = 100;
+    words[4] = 0; // PF4ExposureTimeMin raw 0 -> ValueConv 125.0
+    words[6] = 8; // PF5ApertureMin raw 8 -> ValueConv f/1.0
+    let em = parse_personal_func_values(&build_u16(&words), ByteOrder::Little, false);
+    assert_eq!(find(&em, "PF1Value"), Some(TagValue::I64(100)));
+    assert_eq!(find(&em, "PF4ExposureTimeMin"), Some(TagValue::F64(125.0)));
+    assert_eq!(find(&em, "PF5ApertureMin"), Some(TagValue::F64(1.0)));
+    // index 8 (PF8BracketShots, offset 16) is past the 16-byte block.
+    assert_eq!(find(&em, "PF8BracketShots"), None);
+    assert_eq!(em.len(), 7); // indices 1..=7
   }
 
   /// A single-group `ProcessCanonCustom2` block (`int32u` words): size, group

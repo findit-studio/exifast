@@ -11838,6 +11838,11 @@ fn emit_canon_subtable<S: ExifSink>(
     // `CanonCustom::PersonalFuncs` (`Canon.pm:1803-1809`), the EOS-1D
     // personal-function on/off flags.
     SubTable::PersonalFunctions => canon_custom::parse_personal_funcs(&blob, order, print_conv),
+    // PersonalFunctionValues (0x92) — `ProcessBinaryData` against
+    // `CanonCustom::PersonalFuncValues` (`Canon.pm:1810-1816`).
+    SubTable::PersonalFunctionValues => {
+      canon_custom::parse_personal_func_values(&blob, order, print_conv)
+    }
     // The EOS 7D image-info sub-tables (#445). TimeInfo (0x35) / AspectInfo
     // (0x9a) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) are `int32`-format
     // tables read as `int32u[N]` IFD entries, so each word must be widened back
@@ -11907,6 +11912,7 @@ fn emit_canon_subtable<S: ExifSink>(
       | SubTable::CustomFunctions1D
       | SubTable::CustomFunctions2
       | SubTable::PersonalFunctions
+      | SubTable::PersonalFunctionValues
   ) {
     "CanonCustom"
   } else {

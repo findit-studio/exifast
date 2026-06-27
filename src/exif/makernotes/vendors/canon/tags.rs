@@ -168,7 +168,7 @@ pub enum SubTable {
   /// `%Canon::CropInfo` (`Canon.pm:1880-1882`) — Main tag 0x98. DEFERRED.
   CropInfo,
   /// `CanonCustom::Functions2` (`Canon.pm:1884-1889`) — Main tag 0x99
-  /// (`CustomFunctions2`). DEFERRED (issue #87).
+  /// (`CustomFunctions2`). WALKED via `ProcessCanonCustom2` (#87).
   CustomFunctions2,
   /// `%Canon::AspectInfo` (`Canon.pm:1891-1893`) — Main tag 0x9a. DEFERRED.
   AspectInfo,
@@ -184,21 +184,21 @@ pub enum SubTable {
   UnknownD30,
   /// `CanonCustom::Functions<Model>` conditional SubDirectory list — Main tag
   /// 0x0f (`Canon.pm:1501-1583`): `CustomFunctions1D`/`5D`/`10D`/`20D`/`30D`/
-  /// `350D`/`400D`/`D30`/`D60`/`Unknown`, all `SubDirectory` arms. DEFERRED
-  /// (issue #87): the parent pointer is suppressed.
+  /// `350D`/`400D`/`D30`/`D60`/`Unknown`, all `SubDirectory` arms. WALKED via
+  /// `ProcessCanonCustom` (the per-body model select, #87).
   CustomFunctions,
   /// `%Canon::FaceDetect3` (`Canon.pm:1741-1747`) — Main tag 0x2f. DEFERRED.
   FaceDetect3,
   /// `%Canon::TimeInfo` (`Canon.pm:1750-1756`) — Main tag 0x35. DEFERRED.
   TimeInfo,
   /// `CanonCustom::Functions1D` (`Canon.pm:1796-1802`) — Main tag 0x90
-  /// (`CustomFunctions1D`, used by 1D/1Ds). DEFERRED (issue #87).
+  /// (`CustomFunctions1D`, used by 1D/1Ds). WALKED via `ProcessCanonCustom` (#87).
   CustomFunctions1D,
   /// `CanonCustom::PersonalFuncs` (`Canon.pm:1803-1809`) — Main tag 0x91
-  /// (`PersonalFunctions`). DEFERRED (issue #87).
+  /// (`PersonalFunctions`). WALKED via `ProcessBinaryData` (#87).
   PersonalFunctions,
   /// `CanonCustom::PersonalFuncValues` (`Canon.pm:1810-1816`) — Main tag 0x92
-  /// (`PersonalFunctionValues`). DEFERRED (issue #87).
+  /// (`PersonalFunctionValues`). WALKED via `ProcessBinaryData` (#87).
   PersonalFunctionValues,
   /// `%Canon::Flags` (`Canon.pm:1924-1930`) — Main tag 0xb0 (`CanonFlags`).
   /// DEFERRED.
@@ -282,6 +282,8 @@ impl SubTable {
         | SubTable::CustomFunctions1D
         // PersonalFunctions (0x91) — `CanonCustom::PersonalFuncs` (#87).
         | SubTable::PersonalFunctions
+        // PersonalFunctionValues (0x92) — `CanonCustom::PersonalFuncValues` (#87).
+        | SubTable::PersonalFunctionValues
         // The EOS 7D image-info sub-tables (#445): TimeInfo (0x35) / CropInfo
         // (0x98) / CustomFunctions2 (0x99) / AspectInfo (0x9a) / VignettingCorr
         // (0x4015) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) / LensInfo
@@ -1260,13 +1262,8 @@ mod tests {
       // (0x35 TimeInfo / 0x98 CropInfo / 0x99 CustomFunctions2 / 0x9a AspectInfo
       // / 0x4015 VignettingCorr / 0x4016 VignettingCorr2 / 0x4018 LightingOpt /
       // 0x4019 LensInfo are now WALKED — the #445 EOS 7D sub-tables.)
-      // (0x90 CustomFunctions1D / 0x91 PersonalFunctions are now WALKED — see
-      // `walked_subtables_are_marked`.)
-      (
-        0x92,
-        "PersonalFunctionValues",
-        SubTable::PersonalFunctionValues,
-      ),
+      // (0x90 CustomFunctions1D / 0x91 PersonalFunctions / 0x92
+      // PersonalFunctionValues are now WALKED — see `walked_subtables_are_marked`.)
       (0xb0, "CanonFlags", SubTable::CanonFlags),
       (0xb1, "ModifiedInfo", SubTable::ModifiedInfo),
       (0xb6, "PreviewImageInfo", SubTable::PreviewImageInfo),
@@ -1311,9 +1308,11 @@ mod tests {
     assert!(SubTable::ColorData.is_walked());
     assert!(SubTable::AfMicroAdj.is_walked());
     assert!(SubTable::CustomFunctions.is_walked());
-    // CustomFunctions1D (0x90) / PersonalFunctions (0x91) tags (#87).
+    // CustomFunctions1D (0x90) / PersonalFunctions (0x91) /
+    // PersonalFunctionValues (0x92) tags (#87).
     assert!(SubTable::CustomFunctions1D.is_walked());
     assert!(SubTable::PersonalFunctions.is_walked());
+    assert!(SubTable::PersonalFunctionValues.is_walked());
     // The EOS 7D image-info sub-tables (#445) are now walked too.
     assert!(SubTable::TimeInfo.is_walked());
     assert!(SubTable::CropInfo.is_walked());
