@@ -106,11 +106,39 @@ fn model_is_1dmkiii_proper(model: Option<&str>) -> bool {
   model_ends_with(model, "1D Mark III")
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo80D` (`Canon.pm:1387`,
+/// `$$self{Model} =~ /EOS 80D$/`).
+#[must_use]
+pub fn model_is_camera_info_80d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 80D"))
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo750D` — the 750D
+/// (`Canon.pm:1422`, `/\b(750D|Rebel T6i|Kiss X8i)\b/`) or the 760D alias
+/// (`Canon.pm:1427`, `/\b(760D|Rebel T6s|8000D)\b/`); both share the table with
+/// every row unconditional. Note the mixed-case "Rebel" (vs the "REBEL" of the
+/// older Rebel tables).
+#[must_use]
+pub fn model_is_camera_info_750d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "750D")
+      || word_bounded(m, "Rebel T6i")
+      || word_bounded(m, "Kiss X8i")
+      || word_bounded(m, "760D")
+      || word_bounded(m, "Rebel T6s")
+      || word_bounded(m, "8000D")
+  })
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
-/// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
-/// 550D / 1000D); any other model yields nothing (deferred). `print_conv`
-/// selects the PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
+/// Ported variants: the 1-series no-Hook bodies (1D / 1DS / 1DmkII / 1DmkIIN /
+/// 1DmkIII), the 5D / 6D / 7D, and the xxxD DSLR batch (40D / 50D / 60D / 70D /
+/// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
+/// 1100D / 1200D aliases); any other model yields nothing (deferred). The
+/// multi-Hook pro bodies (1DmkIV / 1DX / 5DmkII / 5DmkIII), the mirrorless and
+/// PowerShot count-keyed tables remain deferred. `print_conv` selects the
+/// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
 #[must_use]
@@ -143,6 +171,8 @@ pub fn parse(
     camera_info_60d(data, order, print_conv, model)
   } else if model_is_camera_info_70d(model) {
     camera_info_70d(data, order, print_conv)
+  } else if model_is_camera_info_80d(model) {
+    camera_info_80d(data, order, print_conv)
   } else if model_is_camera_info_450d(model) {
     camera_info_450d(data, order, print_conv, canon_lens_type)
   } else if model_is_camera_info_500d(model) {
@@ -153,6 +183,8 @@ pub fn parse(
     camera_info_600d(data, order, print_conv)
   } else if model_is_camera_info_650d(model) {
     camera_info_650d(data, order, print_conv, model)
+  } else if model_is_camera_info_750d(model) {
+    camera_info_750d(data, order, print_conv)
   } else if model_is_camera_info_1000d(model) {
     camera_info_1000d(data, order, print_conv, canon_lens_type)
   } else {
@@ -572,6 +604,133 @@ fn camera_info_1dmkiii(
       TagValue::Str(SmolStr::from(convert_unix_time(v))),
     );
   }
+  out
+}
+
+/// `%Canon::CameraInfo80D` (`Canon.pm:4978-5039`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook` and NO
+/// `PictureStyleInfo` subdir. Carries the `%ci*` triple, int16u
+/// `ColorTemperature`, int16uRev `LensType`, and a `FirmwareVersion` (0x45a) with
+/// NO `RawConv` guard; no `WhiteBalance`/`PictureStyle` leaf.
+fn camera_info_80d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x23,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x96, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0xa5,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0xa7,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_color_temperature(data, 0x13a, order, &mut push);
+  emit_lens_type(data, 0x189, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x18b,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x18d,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x45a, false, &mut push);
+  emit_file_index(data, 0x4ae, order, &mut push);
+  emit_directory_index(data, 0x4ba, order, true, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo750D` (`Canon.pm:5554-5620`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook` and NO
+/// `PictureStyleInfo` subdir. Shared by the 750D and 760D. Carries int16u
+/// `WhiteBalance`/`ColorTemperature`, an int8u `PictureStyle`, an int16uRev
+/// `LensType`, and TWO `FirmwareVersion` rows (0x43d firmware 6.7.2, 0x449
+/// firmware 1.0.0) — both carrying the `/^\d+\.\d+\.\d+\s*$/` RawConv guard, so a
+/// real file emits from whichever location holds the valid version string.
+fn camera_info_750d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x23,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x96, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0xa5,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0xa7,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x131, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x135, order, &mut push);
+  emit_picture_style(data, 0x169, print_conv, &mut push);
+  emit_lens_type(data, 0x184, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x186,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x188,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x43d, true, &mut push);
+  emit_firmware_version(data, 0x449, true, &mut push);
   out
 }
 
@@ -4256,5 +4415,159 @@ mod tests {
         .map(|(_, v)| v.clone()),
       Some(TagValue::Str("2013:06:08 11:14:40".into()))
     );
+  }
+
+  #[test]
+  fn dispatch_80d_750d() {
+    assert!(model_is_camera_info_80d(Some("Canon EOS 80D")));
+    // "8000D" routes to the 750D table, NOT the 80D (the `EOS 80D$` anchor).
+    assert!(!model_is_camera_info_80d(Some("Canon EOS 8000D")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS 750D")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS 760D")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS Rebel T6i")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS Rebel T6s")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS Kiss X8i")));
+    assert!(model_is_camera_info_750d(Some("Canon EOS 8000D")));
+    // No cross-matching between the two tables.
+    assert!(!model_is_camera_info_750d(Some("Canon EOS 80D")));
+    assert!(!model_is_camera_info_80d(Some("Canon EOS 750D")));
+  }
+
+  /// `%Canon::CameraInfo80D`: the `%ci*` triple, int16u ColorTemperature,
+  /// int16uRev LensType, the unguarded FirmwareVersion (0x45a), and the
+  /// File/DirectoryIndex; no WhiteBalance/PictureStyle/PSInfo.
+  #[test]
+  fn camera_info_80d_fields() {
+    let mut b = vec![0u8; 0x4c0];
+    b[0x06] = 88; // ISO 400
+    b[0x1b] = 148; // CameraTemperature 20 C
+    b[0x24] = 0x32; // FocalLength int16uRev = 50
+    b[0x96] = 1; // CameraOrientation Rotate 90 CW
+    b[0xa5] = 0x01;
+    b[0xa6] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+    b[0xa7] = 0x01;
+    b[0xa8] = 0x2c; // FocusDistanceLower 300 -> 3 m
+    b[0x13a] = 0x50;
+    b[0x13b] = 0x14; // ColorTemperature 5200
+    b[0x18a] = 0x01; // LensType int16uRev = 1
+    b[0x18c] = 0x0a; // MinFocalLength int16uRev = 10
+    b[0x18e] = 0xc8; // MaxFocalLength int16uRev = 200
+    b[0x45a..0x460].copy_from_slice(b"1.0.1\0"); // FirmwareVersion (no guard)
+    b[0x4ae..0x4b2].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x4ba..0x4be].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    // 80D has no WhiteBalance / PictureStyle leaf.
+    assert!(find("WhiteBalance").is_none());
+    assert!(find("PictureStyle").is_none());
+    // FirmwareVersion (0x45a) has NO RawConv guard — a non-version string emits.
+    b[0x45a..0x460].copy_from_slice(b"BADVER");
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
+    assert_eq!(
+      em2
+        .iter()
+        .find(|(k, _)| k == "FirmwareVersion")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("BADVER".into()))
+    );
+    // -n view: LensType renders the bare int16uRev value.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 80D"), None);
+    assert_eq!(
+      emn
+        .iter()
+        .find(|(k, _)| k == "LensType")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::I64(1))
+    );
+  }
+
+  /// `%Canon::CameraInfo750D` (shared 750D/760D): int16u WhiteBalance, int8u
+  /// PictureStyle, int16uRev LensType, and the TWO guarded FirmwareVersion rows
+  /// (0x43d / 0x449) — a real file emits from whichever holds the valid string.
+  #[test]
+  fn camera_info_750d_and_760d_alias() {
+    let mut b = vec![0u8; 0x450];
+    b[0x06] = 88; // ISO 400
+    b[0x1b] = 148; // CameraTemperature 20 C
+    b[0x24] = 0x32; // FocalLength int16uRev = 50
+    b[0x96] = 1; // CameraOrientation Rotate 90 CW
+    b[0xa5] = 0x01;
+    b[0xa6] = 0xf4; // FocusDistanceUpper 5 m
+    b[0x131] = 0x02; // WhiteBalance int16u raw 2 -> Cloudy
+    b[0x135] = 0x50;
+    b[0x136] = 0x14; // ColorTemperature 5200
+    b[0x169] = 0x81; // PictureStyle Standard
+    b[0x185] = 0x01; // LensType int16uRev = 1
+    b[0x187] = 0x0a; // MinFocalLength int16uRev = 10
+    b[0x189] = 0xc8; // MaxFocalLength int16uRev = 200
+    b[0x449..0x44f].copy_from_slice(b"6.7.2\0"); // FirmwareVersion @ 0x449 (valid)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Cloudy".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    // Only the 0x449 location holds a valid version (0x43d is zeroed).
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("6.7.2".into())));
+    // 760D alias yields the identical table.
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
+    assert_eq!(
+      em2
+        .iter()
+        .find(|(k, _)| k == "FirmwareVersion")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("6.7.2".into()))
+    );
+    // The other FirmwareVersion location (0x43d) is read independently.
+    let mut b3 = b.clone();
+    b3[0x449..0x44f].copy_from_slice(b"\0\0\0\0\0\0");
+    b3[0x43d..0x443].copy_from_slice(b"1.2.3\0");
+    let em3 = parse(&b3, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
+    assert_eq!(
+      em3
+        .iter()
+        .find(|(k, _)| k == "FirmwareVersion")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("1.2.3".into()))
+    );
+    // The RawConv guard drops a non-version string at either location.
+    let mut b4 = b.clone();
+    b4[0x449..0x44f].copy_from_slice(b"BADVER");
+    let em4 = parse(&b4, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
+    assert!(em4.iter().all(|(k, _)| k != "FirmwareVersion"));
   }
 }
