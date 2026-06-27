@@ -12530,8 +12530,8 @@ fn sony_emit_binary_subdir<S: ExifSink>(
 }
 
 /// Decode a Sony Main-IFD `ProcessBinaryData` SubDirectory sub-block
-/// (`0x9050`/`0x9400`/`0x9401`/`0x9402`/`0x9406`/`0x940c`/`0x9416`/`0x202a`)
-/// and emit its ported leaves into `sink`.
+/// (`0x9050`/`0x9400`/`0x9401`/`0x9402`/`0x9403`/`0x9404`/`0x9406`/`0x940a`/
+/// `0x940c`/`0x940e`/`0x9416`/`0x202a`) and emit its ported leaves into `sink`.
 ///
 /// `entry` is the Sony Main-IFD SubDirectory row; its verbatim on-disk value
 /// bytes are `data[value_offset .. value_offset + value_size]`. Most of these
@@ -12554,7 +12554,8 @@ fn sony_emit_binary_subdir<S: ExifSink>(
 ///
 /// `double_cipher` is the file-global `$$self{DoubleCipher}` flag (latched from
 /// the 0x9400 walk): when set, EVERY enciphered 0x94xx block (0x9050/0x9400/
-/// 0x9401/0x9402/0x9406/0x940c/0x9416) is deciphered TWICE
+/// 0x9401/0x9402/0x9403/0x9404/0x9406/0x940a/0x940c/0x940e/0x9416) is deciphered
+/// TWICE
 /// (`Sony.pm:11553-11556`), not just 0x9402 — `ProcessEnciphered` is the shared
 /// `PROCESS_PROC` for all of them, so on a double-enciphered body ISOInfo/
 /// battery/lens/camera-settings would otherwise be read from once-deciphered
@@ -12571,7 +12572,8 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
 ) {
   use makernotes::vendors::sony::decipher::process_enciphered;
   use makernotes::vendors::sony::{
-    tag202a, tag900b, tag940c, tag9050, tag9400, tag9401, tag9402, tag9406, tag9416,
+    tag202a, tag900b, tag940a, tag940c, tag940e, tag9050, tag9400, tag9401, tag9402, tag9403,
+    tag9404, tag9406, tag9416,
   };
   // The verbatim on-disk value span (the enciphered cipher block, or the plain
   // `Tag202a` bytes) — the same buffer the walk read, sliced at the entry's
@@ -12623,6 +12625,36 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
+    // `Tag9403` — the camera/sensor-temperature block; an UNCONDITIONAL
+    // SubDirectory (`Sony.pm:1975-1978`).
+    0x9403 => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9403::parse_tag9403(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag9404a`/`b`/`c` — ExposureProgram/IntelligentAuto/LensZoomPosition/
+    // FocusPosition2, the variant selected by the RAW (enciphered) first + fourth
+    // value bytes (`Sony.pm:1990-2008`); a non-matching value is the unknown
+    // `Sony_0x9404` (emits nothing).
+    0x9404 if tag9404::selects_tag9404a(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9404::parse_tag9404a(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    0x9404 if tag9404::selects_tag9404b(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9404::parse_tag9404b(&buf, model, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    0x9404 if tag9404::selects_tag9404c(raw) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag9404::parse_tag9404c(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
     // `Tag9406` — battery temp/level, selected by the enciphered first+third
     // value bytes (`Sony.pm:2044`).
     0x9406 if tag9406::selects_tag9406(raw) => {
@@ -12631,10 +12663,27 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }
+    // `Tag940a` — `AFPointsSelected`, selected by model `/^(SLT-|HV)/`
+    // (`Sony.pm:2067-2074`); SLT models only.
+    0x940a if tag940a::selects_tag940a(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag940a::parse_tag940a(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
     // `Tag940c` — the E-mount lens table, selected by model (`Sony.pm:2081`).
     0x940c if tag940c::selects_tag940c(model) => {
       let buf = process_enciphered(raw, double_cipher);
       for emi in tag940c::parse_tag940c(&buf, print_conv) {
+        let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
+      }
+    }
+    // `Tag940e` — `TiffMeteringImage*`, the E-mount variant selected by model
+    // `/^(NEX-|ILCE-|Lunar)/` (`Sony.pm:2094-2105`); the SLT/HV/ILCA `AFInfo`
+    // variant routes to a separate (deferred) `%Sony::AFInfo` table.
+    0x940e if tag940e::selects_tag940e(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag940e::parse_tag940e(&buf, model, software) {
         let Ok(()) = out.write_vendor_value("MakerNotes", group1, emi.name, emi.value, false);
       }
     }

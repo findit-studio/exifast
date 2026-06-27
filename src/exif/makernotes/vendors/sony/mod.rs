@@ -91,8 +91,12 @@ pub mod tag9050;
 pub mod tag9400;
 pub mod tag9401;
 pub mod tag9402;
+pub mod tag9403;
+pub mod tag9404;
 pub mod tag9406;
+pub mod tag940a;
 pub mod tag940c;
+pub mod tag940e;
 pub mod tag9416;
 pub mod tags;
 
@@ -105,6 +109,10 @@ pub use printconv::{
   CONDITION_GATED_IDS, RAWCONV_DROP_IDS, SonyPrintConv, rawconv_drops, single_hash_condition_holds,
 };
 pub use tags::{SONY_TAGS, SonyTag, SubTable, format_override, lookup};
+// `%sonyExposureProgram3` (= the `%exposureProgram2010` PrintConv) is shared by
+// the `Tag9416` `0x0035` row and the `Tag9404a/b/c` `ExposureProgram` rows, so
+// the `Tag9404` parser reaches it as `super::print_exposure_program3`.
+pub(crate) use tag9416::print_exposure_program3;
 
 use super::super::super::ifd::RawValue;
 
