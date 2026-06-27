@@ -94,7 +94,7 @@ pub fn parse_custom_functions(
 /// use word-anchored alternations (`\b(350D|REBEL XT|…)\b`, `Canon.pm:1543`/
 /// `:1551`), so a plain substring test would mis-route "REBEL XTi" (a 400D) to
 /// the 350D `REBEL XT` arm.
-fn word_bounded(hay: &str, needle: &str) -> bool {
+pub(super) fn word_bounded(hay: &str, needle: &str) -> bool {
   if needle.is_empty() {
     return false;
   }
