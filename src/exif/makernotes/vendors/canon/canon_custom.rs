@@ -481,6 +481,61 @@ fn functions2_render(
       };
       return Some(("AEBShotCount", value));
     }
+    // 0x10c ShutterSpeedRange (EOS R, Count 4 — `CanonCustom.pm:1410-1436`).
+    // Per-element ValueConv `exp(-$val/(1600*log(2)))`; positional PrintConv
+    // "Manual: Hi"/"Lo"/"Auto: Hi"/"Lo" + `PrintExposureTime`, joined "; ". `-n`
+    // is the space-joined ValueConv values (Perl `%.15g`).
+    0x10c if num == 4 => {
+      let vc = |r: i64| (-(r as f64) / (1600.0 * core::f64::consts::LN_2)).exp();
+      let value = if print_conv {
+        const PFX: [&str; 4] = ["Manual: Hi ", "Lo ", "Auto: Hi ", "Lo "];
+        let s = vals
+          .iter()
+          .zip(PFX)
+          .map(|(&r, p)| {
+            std::format!(
+              "{p}{}",
+              crate::composite::convs::exif::print_exposure_time(vc(r))
+            )
+          })
+          .collect::<Vec<_>>()
+          .join("; ");
+        TagValue::Str(SmolStr::from(s))
+      } else {
+        let s = vals
+          .iter()
+          .map(|&r| crate::value::format_g(vc(r), 15))
+          .collect::<Vec<_>>()
+          .join(" ");
+        TagValue::Str(SmolStr::from(s))
+      };
+      return Some(("ShutterSpeedRange", value));
+    }
+    // 0x10d ApertureRange (EOS R, Count 4 — `CanonCustom.pm:1463-1490`).
+    // Per-element ValueConv `exp($val/2400)`; positional PrintConv "Manual:
+    // Closed"/"Open"/"Auto: Closed"/"Open" + `%.2g`, joined "; ". `-n` is the
+    // space-joined ValueConv values (Perl `%.15g`).
+    0x10d if num == 4 => {
+      let vc = |r: i64| ((r as f64) / 2400.0).exp();
+      let value = if print_conv {
+        const PFX: [&str; 4] = ["Manual: Closed ", "Open ", "Auto: Closed ", "Open "];
+        let s = vals
+          .iter()
+          .zip(PFX)
+          .map(|(&r, p)| std::format!("{p}{}", crate::value::format_g(vc(r), 2)))
+          .collect::<Vec<_>>()
+          .join("; ");
+        TagValue::Str(SmolStr::from(s))
+      } else {
+        let s = vals
+          .iter()
+          .map(|&r| crate::value::format_g(vc(r), 15))
+          .collect::<Vec<_>>()
+          .join(" ");
+        TagValue::Str(SmolStr::from(s))
+      };
+      return Some(("ApertureRange", value));
+    }
     // 0x114 AELockMeterModeAfterFocus — `BITMASK` (DecodeBits, `CanonCustom.pm:388`).
     0x114 => {
       let value = if print_conv {
