@@ -91,6 +91,7 @@ pub mod printconv;
 pub mod shotinfo;
 pub mod sr2;
 pub mod subtables;
+pub mod tag2010;
 pub mod tag202a;
 pub mod tag900b;
 pub mod tag9050;
