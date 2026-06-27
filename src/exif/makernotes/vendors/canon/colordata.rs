@@ -58,6 +58,12 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
     color_data_8(data, order, print_conv)
   } else if matches!(count, 1816 | 1820 | 1824) {
     color_data_9(data, order, print_conv)
+  } else if matches!(count, 2024 | 3656) {
+    color_data_10(data, order, print_conv)
+  } else if (count == 3973 || count == 3778) && data.first().is_some_and(|&b| b <= 0x40) {
+    color_data_11(data, order, print_conv)
+  } else if count == 4528 || count == 3778 {
+    color_data_12(data, order, print_conv)
   } else {
     Vec::new()
   }
@@ -431,6 +437,108 @@ fn color_data_8(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr
     push_white_level(&mut out, data, order, 0x30f, "SpecularWhiteLevel", false);
     push_white_level(&mut out, data, order, 0x310, "LinearityUpperMargin", false);
   }
+  out
+}
+
+/// `%Canon::ColorData10` (`Canon.pm:8554-8686`, `$count` in `2024|3656`) —
+/// 1DXmkIII / R5 / R6. Ten named WB pairs (the WB run starts at word `0x55`),
+/// `PerChannelBlackLevel`, `FlashOutput`/`FlashBatteryLevel`, then the three
+/// white-level leaves. No version-conditional leaves.
+fn color_data_10(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  color_data_version(
+    &mut out,
+    data,
+    order,
+    print_conv,
+    &[(32, "32 (1DXmkIII)"), (33, "33 (R5/R6)")],
+  );
+  const WB_PAIRS_10: &[(usize, &str, &str)] = &[
+    (0x55, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+    (0x5a, "WB_RGGBLevelsAuto", "ColorTempAuto"),
+    (0x5f, "WB_RGGBLevelsMeasured", "ColorTempMeasured"),
+    (0x96, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+    (0x9b, "WB_RGGBLevelsShade", "ColorTempShade"),
+    (0xa0, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+    (0xa5, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+    (0xaa, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+    (0xaf, "WB_RGGBLevelsKelvin", "ColorTempKelvin"),
+    (0xb4, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+  ];
+  push_wb_pairs(&mut out, data, order, WB_PAIRS_10);
+  push_u16_quad(&mut out, data, order, 0x157, "PerChannelBlackLevel");
+  push_flash_output(&mut out, data, order, 0x299, print_conv);
+  push_flash_battery(&mut out, data, order, 0x29a, print_conv);
+  push_white_level(&mut out, data, order, 0x32a, "NormalWhiteLevel", true);
+  push_white_level(&mut out, data, order, 0x32b, "SpecularWhiteLevel", false);
+  push_white_level(&mut out, data, order, 0x32c, "LinearityUpperMargin", false);
+  out
+}
+
+/// `%Canon::ColorData11` (`Canon.pm:8689-8806`, `$count` in `3973|3778` with the
+/// raw first byte in `0x00..=0x40`) — R3 / R7 / R10 / R50 / R6mkII. Ten named WB
+/// pairs (WB run starts at word `0x69`), `PerChannelBlackLevel`, then the three
+/// white-level leaves. The shared `3778` count is split from ColorData12 by the
+/// `$$valPt =~ /^[\0-\x40]/` first-byte gate at the dispatch site.
+fn color_data_11(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  color_data_version(
+    &mut out,
+    data,
+    order,
+    print_conv,
+    &[(34, "34 (R3)"), (48, "48 (R7/R10/R50/R6mkII)")],
+  );
+  const WB_PAIRS_11: &[(usize, &str, &str)] = &[
+    (0x69, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+    (0x6e, "WB_RGGBLevelsAuto", "ColorTempAuto"),
+    (0x73, "WB_RGGBLevelsMeasured", "ColorTempMeasured"),
+    (0xcd, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+    (0xd2, "WB_RGGBLevelsShade", "ColorTempShade"),
+    (0xd7, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+    (0xdc, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+    (0xe1, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+    (0xe6, "WB_RGGBLevelsKelvin", "ColorTempKelvin"),
+    (0xeb, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+  ];
+  push_wb_pairs(&mut out, data, order, WB_PAIRS_11);
+  push_u16_quad(&mut out, data, order, 0x16b, "PerChannelBlackLevel");
+  push_white_level(&mut out, data, order, 0x280, "NormalWhiteLevel", true);
+  push_white_level(&mut out, data, order, 0x281, "SpecularWhiteLevel", false);
+  push_white_level(&mut out, data, order, 0x282, "LinearityUpperMargin", false);
+  out
+}
+
+/// `%Canon::ColorData12` (`Canon.pm:8809-8941`, `$count` in `4528|3778`) — R1 /
+/// R5mkII / R50V. Seven named WB pairs only — the run is AsShot, Daylight,
+/// Shade, Cloudy, Tungsten, Fluorescent, Flash from word `0x69` (no `Auto`,
+/// `Measured` or `Kelvin` slot) — then `PerChannelBlackLevel`,
+/// `FlashOutput`/`FlashBatteryLevel`, and the three white-level leaves.
+fn color_data_12(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  color_data_version(
+    &mut out,
+    data,
+    order,
+    print_conv,
+    &[(64, "64 (R1/R5mkII)"), (65, "65 (R50V)")],
+  );
+  const WB_PAIRS_12: &[(usize, &str, &str)] = &[
+    (0x69, "WB_RGGBLevelsAsShot", "ColorTempAsShot"),
+    (0x6e, "WB_RGGBLevelsDaylight", "ColorTempDaylight"),
+    (0x73, "WB_RGGBLevelsShade", "ColorTempShade"),
+    (0x78, "WB_RGGBLevelsCloudy", "ColorTempCloudy"),
+    (0x7d, "WB_RGGBLevelsTungsten", "ColorTempTungsten"),
+    (0x82, "WB_RGGBLevelsFluorescent", "ColorTempFluorescent"),
+    (0x87, "WB_RGGBLevelsFlash", "ColorTempFlash"),
+  ];
+  push_wb_pairs(&mut out, data, order, WB_PAIRS_12);
+  push_u16_quad(&mut out, data, order, 0x17f, "PerChannelBlackLevel");
+  push_flash_output(&mut out, data, order, 0x203, print_conv);
+  push_flash_battery(&mut out, data, order, 0x204, print_conv);
+  push_white_level(&mut out, data, order, 0x294, "NormalWhiteLevel", true);
+  push_white_level(&mut out, data, order, 0x295, "SpecularWhiteLevel", false);
+  push_white_level(&mut out, data, order, 0x296, "LinearityUpperMargin", false);
   out
 }
 
@@ -982,6 +1090,132 @@ mod tests {
     assert_eq!(
       find_in(&em, "NormalWhiteLevel"),
       Some(&TagValue::I64(16000))
+    );
+  }
+
+  #[test]
+  fn color_data_10_wb_and_levels() {
+    let mut buf = vec![0u8; 2024 * 2];
+    put_i16(&mut buf, 0x00, 33);
+    for (i, v) in [2060i16, 1024, 1024, 1490].iter().enumerate() {
+      put_i16(&mut buf, 0x55 + i, *v); // WB_RGGBLevelsAsShot (run starts at 0x55)
+    }
+    put_i16(&mut buf, 0x59, 5250); // ColorTempAsShot
+    for (i, v) in [100u16, 101, 102, 103].iter().enumerate() {
+      put_u16(&mut buf, 0x157 + i, *v); // PerChannelBlackLevel
+    }
+    put_u16(&mut buf, 0x32a, 16200); // NormalWhiteLevel
+    put_u16(&mut buf, 0x32c, 13500); // LinearityUpperMargin
+    let em = parse(&buf, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em, "ColorDataVersion"),
+      Some(&TagValue::Str("33 (R5/R6)".into()))
+    );
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAsShot"),
+      Some(&TagValue::Str("2060 1024 1024 1490".into()))
+    );
+    assert_eq!(find_in(&em, "ColorTempAsShot"), Some(&TagValue::I64(5250)));
+    assert_eq!(
+      find_in(&em, "PerChannelBlackLevel"),
+      Some(&TagValue::Str("100 101 102 103".into()))
+    );
+    assert_eq!(
+      find_in(&em, "NormalWhiteLevel"),
+      Some(&TagValue::I64(16200))
+    );
+    assert_eq!(
+      find_in(&em, "LinearityUpperMargin"),
+      Some(&TagValue::I64(13500))
+    );
+  }
+
+  #[test]
+  fn color_data_11_wb_and_levels() {
+    let mut buf = vec![0u8; 3973 * 2];
+    put_i16(&mut buf, 0x00, 34); // version 34 (R3); first byte 0x22 <= 0x40
+    for (i, v) in [2040i16, 1024, 1024, 1470].iter().enumerate() {
+      put_i16(&mut buf, 0x69 + i, *v); // WB_RGGBLevelsAsShot (run starts at 0x69)
+    }
+    put_i16(&mut buf, 0x6d, 5150); // ColorTempAsShot
+    for (i, v) in [2200i16, 1024, 1024, 1400].iter().enumerate() {
+      put_i16(&mut buf, 0xcd + i, *v); // WB_RGGBLevelsDaylight (after the 0x78..0xcc gap)
+    }
+    put_u16(&mut buf, 0x280, 16100); // NormalWhiteLevel
+    let em = parse(&buf, ByteOrder::Little, false);
+    assert_eq!(find_in(&em, "ColorDataVersion"), Some(&TagValue::I64(34)));
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAsShot"),
+      Some(&TagValue::Str("2040 1024 1024 1470".into()))
+    );
+    assert_eq!(find_in(&em, "ColorTempAsShot"), Some(&TagValue::I64(5150)));
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsDaylight"),
+      Some(&TagValue::Str("2200 1024 1024 1400".into()))
+    );
+    assert_eq!(
+      find_in(&em, "NormalWhiteLevel"),
+      Some(&TagValue::I64(16100))
+    );
+  }
+
+  #[test]
+  fn color_data_12_skips_auto_measured_kelvin() {
+    let mut buf = vec![0u8; 4528 * 2];
+    put_i16(&mut buf, 0x00, 64); // version 64 (R1/R5mkII)
+    for (i, v) in [2030i16, 1024, 1024, 1460].iter().enumerate() {
+      put_i16(&mut buf, 0x69 + i, *v); // WB_RGGBLevelsAsShot
+    }
+    put_i16(&mut buf, 0x6d, 5100); // ColorTempAsShot
+    for (i, v) in [2100i16, 1024, 1024, 1500].iter().enumerate() {
+      put_i16(&mut buf, 0x6e + i, *v); // WB_RGGBLevelsDaylight (directly after AsShot — no Auto)
+    }
+    put_i16(&mut buf, 0x72, 5300); // ColorTempDaylight
+    put_u16(&mut buf, 0x294, 16000); // NormalWhiteLevel
+    let em = parse(&buf, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em, "ColorDataVersion"),
+      Some(&TagValue::Str("64 (R1/R5mkII)".into()))
+    );
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsAsShot"),
+      Some(&TagValue::Str("2030 1024 1024 1460".into()))
+    );
+    assert_eq!(
+      find_in(&em, "WB_RGGBLevelsDaylight"),
+      Some(&TagValue::Str("2100 1024 1024 1500".into()))
+    );
+    assert_eq!(
+      find_in(&em, "ColorTempDaylight"),
+      Some(&TagValue::I64(5300))
+    );
+    assert_eq!(
+      find_in(&em, "NormalWhiteLevel"),
+      Some(&TagValue::I64(16000))
+    );
+    // ColorData12 has no Auto/Measured/Kelvin WB slots.
+    assert_eq!(find_in(&em, "WB_RGGBLevelsAuto"), None);
+    assert_eq!(find_in(&em, "WB_RGGBLevelsMeasured"), None);
+    assert_eq!(find_in(&em, "WB_RGGBLevelsKelvin"), None);
+  }
+
+  #[test]
+  fn color_data_11_vs_12_share_count_3778_split_by_first_byte() {
+    // version 48 (0x30): first byte 0x30 <= 0x40 ⇒ ColorData11.
+    let mut buf11 = vec![0u8; 3778 * 2];
+    put_i16(&mut buf11, 0x00, 48);
+    let em11 = parse(&buf11, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em11, "ColorDataVersion"),
+      Some(&TagValue::Str("48 (R7/R10/R50/R6mkII)".into()))
+    );
+    // version 65 (0x41): first byte 0x41 > 0x40 ⇒ falls through to ColorData12.
+    let mut buf12 = vec![0u8; 3778 * 2];
+    put_i16(&mut buf12, 0x00, 65);
+    let em12 = parse(&buf12, ByteOrder::Little, true);
+    assert_eq!(
+      find_in(&em12, "ColorDataVersion"),
+      Some(&TagValue::Str("65 (R50V)".into()))
     );
   }
 }
