@@ -26,15 +26,17 @@
 //! - `Tag2010g` — `/^(DSC-(QX30|RX10|RX100M3|HX60V|HX350|HX400V|WX220|WX350)|`
 //!   `ILCE-(7(R|S|M2)?|[56]000|5100|QX1)|ILCA-(68|77M2))\b/` (`Sony.pm:1159-1161`).
 //!   The `\b` (NOT `$`) means a bare `ILCE-7` does not swallow `ILCE-7RM2`.
-//! - `Tag2010h`/`i` (`Sony.pm:1162-1169`) — the remaining LARGE variants, not yet
-//!   ported: those bodies (and any unknown one) fall through to `Tag_0x2010`
-//!   (`%unknownCipherData`, emits nothing), faithful until they are ported.
+//! - `Tag2010h` — `/^(DSC-(RX0|RX1RM2|RX10M2|RX10M3|RX100M4|RX100M5|HX80|HX90V?|`
+//!   `WX500)|ILCE-(6300|6500|7RM2|7SM2)|ILCA-99M2)\b/` (`Sony.pm:1162-1164`).
+//! - `Tag2010i` (`Sony.pm:1166-1169`) — the last LARGE variant, not yet ported:
+//!   that body (and any unknown one) falls through to `Tag_0x2010`
+//!   (`%unknownCipherData`, emits nothing), faithful until it is ported.
 //! - else `Tag_0x2010` (`%unknownCipherData`) — emits nothing.
 //!
-//! The `a`-`f` model sets are pairwise disjoint and disjoint from `g`'s
-//! `\b`-anchored set, so the dispatcher tests `a`/`b`/`c`/`d`/`e`/`f`/`g`
-//! independently; a body matching `h`/`i` matches none of them and correctly
-//! falls to the unknown branch.
+//! The `a`-`f` model sets are pairwise disjoint and disjoint from the
+//! `\b`-anchored `g`/`h` sets, so the dispatcher tests
+//! `a`/`b`/`c`/`d`/`e`/`f`/`g`/`h` independently; a body matching `i` matches
+//! none of them and correctly falls to the unknown branch.
 //!
 //! ## Cipher + priority + availability
 //!
@@ -53,12 +55,13 @@
 //! used"), so it is NOT emitted in default output and is skipped here.
 //!
 //! The `a`/`b`/`c`/`d`/`f` tables have NO per-leaf model `Condition`s; their
-//! model gate lives entirely in the dispatcher. `Tag2010e`/`g` (like `Tag9405b`)
-//! DO carry per-leaf `Condition`s — for `e` the `\b`-anchored SonyISO /
-//! FocalLength offset sets and the two mutually-exclusive `AspectRatio` offsets;
-//! for both, the `LensFormat`/`LensMount`/`DistortionCorr*` DSC(-or-Stellar)
-//! exclusions and the `LensType2`/`LensType` `LensMount`-DataMember gates — so
-//! `parse_tag2010e`/`g` take the resolved `$$self{Model}`.
+//! model gate lives entirely in the dispatcher. `Tag2010e`/`g`/`h` (like
+//! `Tag9405b`) DO carry per-leaf `Condition`s — for `e` the `\b`-anchored SonyISO
+//! / FocalLength offset sets and the two mutually-exclusive `AspectRatio`
+//! offsets; for all three, the `LensFormat`/`LensMount`/`DistortionCorr*`
+//! DSC(-or-Stellar) exclusions and the `LensType2`/`LensType`
+//! `LensMount`-DataMember gates — so `parse_tag2010e`/`g`/`h` take the resolved
+//! `$$self{Model}`.
 
 use super::{amount_lens_types, lens_types};
 use crate::value::{TagValue, whole_f64_to_tag_value};
@@ -246,6 +249,35 @@ pub fn selects_tag2010g(model: Option<&str>) -> bool {
   )
 }
 
+/// `Sony.pm:1164`
+/// `/^(DSC-(RX0|RX1RM2|RX10M2|RX10M3|RX100M4|RX100M5|HX80|HX90V?|WX500)|`
+/// `ILCE-(6300|6500|7RM2|7SM2)|ILCA-99M2)\b/` — selects `Tag2010h`. The `\b`
+/// keeps `DSC-RX0` from swallowing `DSC-RX0M2` and `DSC-RX100M5` from swallowing
+/// `DSC-RX100M5A` (`Tag2010i` models); `HX90V?` expands to `DSC-HX90`/`-HX90V`.
+#[must_use]
+pub fn selects_tag2010h(model: Option<&str>) -> bool {
+  super::tag9405::starts_with_word_boundary(
+    model,
+    &[
+      "DSC-RX0",
+      "DSC-RX1RM2",
+      "DSC-RX10M2",
+      "DSC-RX10M3",
+      "DSC-RX100M4",
+      "DSC-RX100M5",
+      "DSC-HX80",
+      "DSC-HX90",
+      "DSC-HX90V",
+      "DSC-WX500",
+      "ILCE-6300",
+      "ILCE-6500",
+      "ILCE-7RM2",
+      "ILCE-7SM2",
+      "ILCA-99M2",
+    ],
+  )
+}
+
 /// `$$self{Panorama} = ($$valPt =~ /^(\0\0)?\x01\x01/)` (`Sony.pm:902`) — the
 /// `0x1003` `Panorama` SubDirectory `Condition` DataMember side-effect: a raw
 /// value that begins with `\x01\x01` (little-endian int32u 257) or
@@ -414,6 +446,18 @@ fn aspect_ratio_print(v: u8) -> Option<&'static str> {
     2 => "3:2",
     3 => "1:1",
     5 => "Panorama",
+    _ => return None,
+  })
+}
+
+/// `%selfTimerB2010` `SelfTimer` (`Sony.pm:6266-6273`) — the `Tag2010h`/`i`
+/// variant where value `1` is "Self-timer 5 or 10 s" (the new 5 s mode), vs
+/// `%selfTimer2010`'s "Self-timer 10 s".
+fn self_timer_b_print(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "Off",
+    1 => "Self-timer 5 or 10 s",
+    2 => "Self-timer 2 s",
     _ => return None,
   })
 }
@@ -1836,6 +1880,214 @@ pub fn parse_tag2010g(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<
   push_u8_hash(
     buf,
     0x1958,
+    "AspectRatio",
+    print_conv,
+    aspect_ratio_print,
+    &mut out,
+  );
+  out
+}
+
+/// Walk the DECIPHERED `Tag2010h` block (`Sony.pm:7121-7268`).
+///
+/// Structurally `Tag2010g` with: `SelfTimer` via `%selfTimerB2010` (value `1` =
+/// "Self-timer 5 or 10 s"), `SonyISO` at 0x0346, the lens / distortion rows at
+/// 0x18cc-0x18f5, and `AspectRatio` at 0x192c. `model` drives the
+/// `Model !~ /^DSC-/` exclusions + the `LensMount` gate; `print_conv` selects
+/// `-j`/`-n`.
+#[must_use]
+pub fn parse_tag2010h(buf: &[u8], model: Option<&str>, print_conv: bool) -> Vec<Tag2010Emission> {
+  use super::tag9405::{model_is_dsc, print_lens_format, print_lens_mount, print_no_yes};
+  let mut out = std::vec::Vec::new();
+  let not_dsc = !model_is_dsc(model);
+
+  push_release_mode2_u32(buf, 0x0004, "ReleaseMode2", print_conv, &mut out);
+  push_u8_hash(
+    buf,
+    0x0050,
+    "DynamicRangeOptimizer",
+    print_conv,
+    dynamic_range_optimizer_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x020c,
+    "ReleaseMode3",
+    print_conv,
+    release_mode3_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x0210,
+    "ReleaseMode2",
+    print_conv,
+    super::release_mode2_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x0218,
+    "SelfTimer",
+    print_conv,
+    self_timer_b_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x021c,
+    "FlashMode",
+    print_conv,
+    flash_mode_print,
+    &mut out,
+  );
+  push_gain2010(buf, 0x0222, "StopsAboveBaseISO", print_conv, &mut out);
+  push_brightness_value(buf, 0x0224, "BrightnessValue", &mut out);
+  push_u8_hash(
+    buf,
+    0x0228,
+    "DynamicRangeOptimizer",
+    print_conv,
+    dynamic_range_optimizer_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x022c,
+    "HDRSetting",
+    print_conv,
+    hdr_setting_print,
+    &mut out,
+  );
+  push_exposure_comp(buf, 0x0230, "ExposureCompensation", print_conv, &mut out);
+  push_u8_hash(
+    buf,
+    0x0246,
+    "PictureProfile",
+    print_conv,
+    picture_profile_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x0247,
+    "PictureProfile",
+    print_conv,
+    picture_profile_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x024b,
+    "PictureEffect2",
+    print_conv,
+    picture_effect2_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x0258,
+    "Quality2",
+    print_conv,
+    quality2_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x025c,
+    "MeteringMode",
+    print_conv,
+    metering_mode_print,
+    &mut out,
+  );
+  push_u8_hash(
+    buf,
+    0x025d,
+    "ExposureProgram",
+    print_conv,
+    super::print_exposure_program3,
+    &mut out,
+  );
+  push_u16_array(buf, 0x0264, 3, "WB_RGBLevels", &mut out);
+  push_focal_length(buf, 0x032c, "FocalLength", print_conv, &mut out);
+  push_focal_length(buf, 0x032e, "MinFocalLength", print_conv, &mut out);
+  push_focal_length_nonzero(buf, 0x0330, "MaxFocalLength", print_conv, &mut out);
+  push_sony_iso(buf, 0x0346, "SonyISO", print_conv, &mut out);
+  // 0x0388 / 0x0398 MeterInfo (Unknown SubDirectory, model-conditioned) — skipped.
+  // 0x18cc DistortionCorrParams int16s[16] — Condition Model !~ /^DSC-/.
+  if not_dsc {
+    push_i16_array(buf, 0x18cc, 16, "DistortionCorrParams", &mut out);
+  }
+  // 0x18ed LensFormat — same Condition.
+  if not_dsc {
+    push_u8_hash(
+      buf,
+      0x18ed,
+      "LensFormat",
+      print_conv,
+      print_lens_format,
+      &mut out,
+    );
+  }
+  // 0x18ee LensMount — DataMember (raw always latched, drives LensType2/LensType);
+  // the tag is emitted iff Model !~ /^DSC-/.
+  let lens_mount = buf.get(0x18ee).copied();
+  if not_dsc {
+    push_u8_hash(
+      buf,
+      0x18ee,
+      "LensMount",
+      print_conv,
+      print_lens_mount,
+      &mut out,
+    );
+  }
+  // 0x18ef LensType2 — Condition LensMount == 2 (E-mount, %sonyLensTypes2).
+  push_lens_type(
+    buf,
+    0x18ef,
+    "LensType2",
+    lens_mount == Some(2),
+    lens_types::lookup_name,
+    print_conv,
+    &mut out,
+  );
+  // 0x18f2 LensType — Condition LensMount == 1 (A-mount, %sonyLensTypes).
+  push_lens_type(
+    buf,
+    0x18f2,
+    "LensType",
+    lens_mount == Some(1),
+    amount_lens_types::lookup_name,
+    print_conv,
+    &mut out,
+  );
+  // 0x18f4 DistortionCorrParamsPresent — Condition Model !~ /^DSC-/.
+  if not_dsc {
+    push_u8_hash(
+      buf,
+      0x18f4,
+      "DistortionCorrParamsPresent",
+      print_conv,
+      print_no_yes,
+      &mut out,
+    );
+  }
+  // 0x18f5 DistortionCorrParamsNumber — same Condition.
+  if not_dsc {
+    push_u8_hash(
+      buf,
+      0x18f5,
+      "DistortionCorrParamsNumber",
+      print_conv,
+      distortion_corr_params_number_print,
+      &mut out,
+    );
+  }
+  push_u8_hash(
+    buf,
+    0x192c,
     "AspectRatio",
     print_conv,
     aspect_ratio_print,

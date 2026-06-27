@@ -806,6 +806,135 @@ fn tag2010g_ilca_amount_lens() {
   assert!(find(&em, "LensType2").is_none());
 }
 
+// --- Tag2010h (\b-anchored dispatch, %selfTimerB2010, SonyISO@0x0346) ---------
+
+/// `selects_tag2010h`: the `\b` keeps `DSC-RX0`/`DSC-RX100M5` from swallowing
+/// the `Tag2010i` models `DSC-RX0M2`/`DSC-RX100M5A`.
+#[test]
+fn tag2010h_gate_word_boundary() {
+  for m in [
+    "DSC-RX0",
+    "DSC-RX1RM2",
+    "DSC-RX10M2",
+    "DSC-RX10M3",
+    "DSC-RX100M4",
+    "DSC-RX100M5",
+    "DSC-HX80",
+    "DSC-HX90",
+    "DSC-HX90V",
+    "DSC-WX500",
+    "ILCE-6300",
+    "ILCE-6500",
+    "ILCE-7RM2",
+    "ILCE-7SM2",
+    "ILCA-99M2",
+  ] {
+    assert!(selects_tag2010h(Some(m)), "{m} should select h");
+  }
+  assert!(!selects_tag2010h(Some("DSC-RX0M2"))); // i: \b fails before M
+  assert!(!selects_tag2010h(Some("DSC-RX100M5A"))); // i
+  assert!(!selects_tag2010h(Some("DSC-RX10"))); // g
+  assert!(!selects_tag2010h(Some("DSC-RX100"))); // e
+  // ILCE-7RM2 routes to h, not g.
+  assert!(!selects_tag2010g(Some("ILCE-7RM2")));
+  assert!(!selects_tag2010h(None));
+}
+
+/// `ILCE-7RM2` (E-mount): `%selfTimerB2010` SelfTimer (value 1 = "5 or 10 s"),
+/// SonyISO at 0x0346, AspectRatio at 0x192c, and E-mount `LensType2` at 0x18ef.
+#[test]
+fn tag2010h_ilce7rm2_selftimer_b_and_emount() {
+  let mut p = vec![0u8; 0x1a00];
+  put_u32(&mut p, 0x0004, 1); // ReleaseMode2 int32u → Continuous
+  p[0x0218] = 1; // SelfTimer (%selfTimerB2010) → Self-timer 5 or 10 s
+  put_u16(&mut p, 0x0222, 512); // StopsAboveBaseISO → 14.0
+  put_u16(&mut p, 0x032c, 240); // FocalLength → 24.0 mm
+  put_u16(&mut p, 0x0346, 2048); // SonyISO → 25600
+  p[0x18ed] = 2; // LensFormat → Full-frame
+  p[0x18ee] = 2; // LensMount → E-mount
+  put_u16(&mut p, 0x18ef, 32784); // LensType2 → Sony E 16mm F2.8
+  p[0x18f5] = 11; // DistortionCorrParamsNumber → 11 (APS-C)
+  p[0x192c] = 2; // AspectRatio → 3:2
+
+  let em = parse_tag2010h(&p, Some("ILCE-7RM2"), true);
+  assert_eq!(
+    find_first(&em, "ReleaseMode2"),
+    Some(&TagValue::Str("Continuous".into()))
+  );
+  assert_eq!(
+    find(&em, "SelfTimer"),
+    Some(&TagValue::Str("Self-timer 5 or 10 s".into()))
+  );
+  assert_eq!(
+    find(&em, "StopsAboveBaseISO"),
+    Some(&TagValue::Str("14.0".into()))
+  );
+  assert_eq!(
+    find(&em, "FocalLength"),
+    Some(&TagValue::Str("24.0 mm".into()))
+  );
+  assert_eq!(find(&em, "SonyISO"), Some(&TagValue::Str("25600".into())));
+  assert_eq!(
+    find(&em, "LensMount"),
+    Some(&TagValue::Str("E-mount".into()))
+  );
+  assert_eq!(
+    find(&em, "LensType2"),
+    Some(&TagValue::Str("Sony E 16mm F2.8".into()))
+  );
+  assert!(find(&em, "LensType").is_none());
+  assert_eq!(
+    find(&em, "DistortionCorrParamsNumber"),
+    Some(&TagValue::Str("11 (APS-C)".into()))
+  );
+  assert_eq!(find(&em, "AspectRatio"), Some(&TagValue::Str("3:2".into())));
+}
+
+/// `DSC-RX0`: unconditional FocalLength / SonyISO / AspectRatio emit; the
+/// `Model !~ /^DSC-/` lens / distortion-correction rows are suppressed.
+#[test]
+fn tag2010h_dsc_rx0_suppression() {
+  let mut p = vec![0u8; 0x1a00];
+  put_u16(&mut p, 0x032c, 240); // FocalLength (unconditional)
+  put_u16(&mut p, 0x0346, 2048); // SonyISO (unconditional)
+  p[0x18ed] = 2; // LensFormat byte (DSC → suppressed)
+  p[0x18ee] = 1; // LensMount byte (DSC → suppressed)
+  p[0x18f4] = 1; // DistortionCorrParamsPresent (DSC → suppressed)
+  p[0x18f5] = 16; // DistortionCorrParamsNumber (DSC → suppressed)
+  p[0x192c] = 1; // AspectRatio (unconditional) → 4:3
+
+  let em = parse_tag2010h(&p, Some("DSC-RX0"), true);
+  assert_eq!(
+    find(&em, "FocalLength"),
+    Some(&TagValue::Str("24.0 mm".into()))
+  );
+  assert_eq!(find(&em, "SonyISO"), Some(&TagValue::Str("25600".into())));
+  assert_eq!(find(&em, "AspectRatio"), Some(&TagValue::Str("4:3".into())));
+  assert!(find(&em, "LensFormat").is_none());
+  assert!(find(&em, "LensMount").is_none());
+  assert!(find(&em, "DistortionCorrParamsPresent").is_none());
+  assert!(find(&em, "DistortionCorrParamsNumber").is_none());
+}
+
+/// `ILCA-99M2` (A-mount): the A-mount `LensType` at 0x18f2 gated by
+/// `LensMount == 1`.
+#[test]
+fn tag2010h_ilca99m2_amount_lens() {
+  let mut p = vec![0u8; 0x1a00];
+  p[0x18ee] = 1; // LensMount → A-mount
+  put_u16(&mut p, 0x18f2, 18); // LensType (A-mount)
+  let em = parse_tag2010h(&p, Some("ILCA-99M2"), true);
+  assert_eq!(
+    find(&em, "LensMount"),
+    Some(&TagValue::Str("A-mount".into()))
+  );
+  assert_eq!(
+    find(&em, "LensType"),
+    Some(&TagValue::Str("Minolta AF 28-80mm F3.5-5.6 II".into()))
+  );
+  assert!(find(&em, "LensType2").is_none());
+}
+
 // --- shared-conversion edges -------------------------------------------------
 
 /// `StopsAboveBaseISO` ValueConv of exactly 0 prints the bare integer `0`;
@@ -870,4 +999,5 @@ fn per_field_truncation() {
   assert!(parse_tag2010e(&[], Some("SLT-A99V"), true).is_empty());
   assert!(parse_tag2010f(&[], true).is_empty());
   assert!(parse_tag2010g(&[], Some("ILCE-7M2"), true).is_empty());
+  assert!(parse_tag2010h(&[], Some("ILCE-7RM2"), true).is_empty());
 }
