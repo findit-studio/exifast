@@ -93,6 +93,19 @@ pub fn model_is_camera_info_1dmkiin(model: Option<&str>) -> bool {
   model_ends_with(model, "1D Mark II N") || model_ends_with(model, "1Ds Mark II N")
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo1DmkIII` (`Canon.pm:1327`,
+/// `$$self{Model} =~ /\b1Ds? Mark III$/` — the 1DmkIII or 1DSmkIII).
+#[must_use]
+pub fn model_is_camera_info_1dmkiii(model: Option<&str>) -> bool {
+  model_is_1dmkiii_proper(model) || model_ends_with(model, "1Ds Mark III")
+}
+
+/// The 1DmkIII proper (`/\b1D Mark III$/`) — gates the 1DmkIII-only `TimeStamp1`
+/// leaf (`Canon.pm:3512`), which is absent on the 1DSmkIII.
+fn model_is_1dmkiii_proper(model: Option<&str>) -> bool {
+  model_ends_with(model, "1D Mark III")
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
@@ -114,6 +127,8 @@ pub fn parse(
     camera_info_1dmkiin(data, order, print_conv)
   } else if model_is_camera_info_1dmkii(model) {
     camera_info_1dmkii(data, order, print_conv)
+  } else if model_is_camera_info_1dmkiii(model) {
+    camera_info_1dmkiii(data, order, print_conv, model, canon_lens_type)
   } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_6d(model) {
@@ -461,6 +476,102 @@ fn camera_info_1dmkiin(
   emit_print_parameter(data, 0x76, "Saturation", print_conv, &mut push);
   emit_print_parameter(data, 0x77, "ColorTone", print_conv, &mut push);
   emit_string_leaf(data, 0x79, 5, "ISO", &mut push);
+  out
+}
+
+/// `%Canon::CameraInfo1DmkIII` (`Canon.pm:3425-3538`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook`, but `IS_SUBDIR =>
+/// [0x2aa]` (the `PictureStyleInfo` walks `%Canon::PSInfo`). Shared by the
+/// 1DmkIII and 1DSmkIII; carries the full `%ci*` triple plus `ShutterCount`
+/// (int32u `$val+1`) and TWO timestamps — `TimeStamp1` (0x45a, 1DmkIII-only via
+/// `/\b1D Mark III$/`) and `TimeStamp` (0x45e, both), each drop-0 + ConvertUnixTime.
+fn camera_info_1dmkiii(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+  canon_lens_type: Option<u16>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x18, print_conv, &mut push);
+  emit_macro_magnification(data, 0x1b, canon_lens_type, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1d,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x30, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x43,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x45,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0x5e, order, print_conv, &mut push);
+  emit_color_temperature(data, 0x62, order, &mut push);
+  emit_picture_style(data, 0x86, print_conv, &mut push);
+  emit_lens_type(data, 0x111, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x113,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x115,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x136, false, &mut push);
+  emit_file_index(data, 0x172, order, &mut push);
+  // 0x176 ShutterCount (int32u, ValueConv `$val + 1`, no RawConv guard).
+  if let Some(v) = u32(data, 0x176, order) {
+    push("ShutterCount", TagValue::I64(v + 1));
+  }
+  emit_directory_index(data, 0x17e, order, true, &mut push);
+  ps_info(data, 0x2aa, order, print_conv, &mut push);
+  // 0x45a TimeStamp1 (1DmkIII proper only) / 0x45e TimeStamp (both) — int32u,
+  // RawConv drop-0, ConvertUnixTime (rendered identically in `-j`/`-n`).
+  if model_is_1dmkiii_proper(model)
+    && let Some(v) = u32(data, 0x45a, order)
+    && v != 0
+  {
+    push(
+      "TimeStamp1",
+      TagValue::Str(SmolStr::from(convert_unix_time(v))),
+    );
+  }
+  if let Some(v) = u32(data, 0x45e, order)
+    && v != 0
+  {
+    push(
+      "TimeStamp",
+      TagValue::Str(SmolStr::from(convert_unix_time(v))),
+    );
+  }
   out
 }
 
@@ -4027,5 +4138,123 @@ mod tests {
     assert!(find("FocalType").is_none());
     assert!(find("CanonImageSize").is_none());
     assert!(find("JPEGQuality").is_none());
+  }
+
+  #[test]
+  fn dispatch_1dmkiii() {
+    assert!(model_is_camera_info_1dmkiii(Some("Canon EOS-1D Mark III")));
+    assert!(model_is_camera_info_1dmkiii(Some("Canon EOS-1Ds Mark III")));
+    assert!(!model_is_camera_info_1dmkiii(Some("Canon EOS-1D Mark II")));
+    assert!(!model_is_camera_info_1dmkiii(Some("Canon EOS-1D Mark IV")));
+    // TimeStamp1 discriminator: 1DmkIII proper only, not the 1DSmkIII.
+    assert!(model_is_1dmkiii_proper(Some("Canon EOS-1D Mark III")));
+    assert!(!model_is_1dmkiii_proper(Some("Canon EOS-1Ds Mark III")));
+  }
+
+  /// `%Canon::CameraInfo1DmkIII`: the full `%ci*` triple, int16u WhiteBalance/
+  /// ColorTemperature, the int16uRev LensType, `ShutterCount` (+1), the nested
+  /// `%PSInfo` subdir at 0x2aa, and both `TimeStamp1` (1DmkIII-only) + `TimeStamp`.
+  #[test]
+  fn camera_info_1dmkiii_proper_fields() {
+    let mut b = vec![0u8; 0x470];
+    b[0x04] = 0x20; // ExposureTime present
+    b[0x06] = 88; // ISO 400
+    b[0x18] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x32; // FocalLength int16uRev = 50
+    b[0x30] = 1; // CameraOrientation Rotate 90 CW
+    b[0x43] = 0x01;
+    b[0x44] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+    b[0x45] = 0x01;
+    b[0x46] = 0x2c; // FocusDistanceLower 300 -> 3 m
+    b[0x5e] = 0x02; // WhiteBalance int16u raw 2 -> Cloudy
+    b[0x62] = 0x50;
+    b[0x63] = 0x14; // ColorTemperature 5200
+    b[0x86] = 0x81; // PictureStyle Standard
+    b[0x112] = 0x01; // LensType int16uRev = 1
+    b[0x114] = 0x0a; // MinFocalLength int16uRev = 10
+    b[0x116] = 0xc8; // MaxFocalLength int16uRev = 200
+    b[0x136..0x13c].copy_from_slice(b"1.1.0\0"); // FirmwareVersion (no guard)
+    b[0x172..0x176].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
+    b[0x176..0x17a].copy_from_slice(&5000u32.to_le_bytes()); // ShutterCount + 1 = 5001
+    b[0x17e..0x182].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
+    b[0x2aa..0x2ae].copy_from_slice(&3i32.to_le_bytes()); // PSInfo ContrastStandard
+    b[0x45a..0x45e].copy_from_slice(&1_370_690_080u32.to_le_bytes()); // TimeStamp1
+    b[0x45e..0x462].copy_from_slice(&1_370_690_080u32.to_le_bytes()); // TimeStamp
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark III"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert!(find("ExposureTime").is_some());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Cloudy".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.1.0".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("ShutterCount"), Some(TagValue::I64(5001)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(3))); // PSInfo @ 0x2aa
+    assert_eq!(
+      find("TimeStamp1"),
+      Some(TagValue::Str("2013:06:08 11:14:40".into()))
+    );
+    assert_eq!(
+      find("TimeStamp"),
+      Some(TagValue::Str("2013:06:08 11:14:40".into()))
+    );
+    // -n view: LensType renders the bare int16uRev value.
+    let emn = parse(
+      &b,
+      ByteOrder::Little,
+      false,
+      Some("Canon EOS-1D Mark III"),
+      None,
+    );
+    assert_eq!(
+      emn
+        .iter()
+        .find(|(k, _)| k == "LensType")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::I64(1))
+    );
+    // The 1DSmkIII shares the table but has NO TimeStamp1 leaf.
+    let ems = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1Ds Mark III"),
+      None,
+    );
+    assert!(ems.iter().all(|(k, _)| k != "TimeStamp1"));
+    assert_eq!(
+      ems
+        .iter()
+        .find(|(k, _)| k == "TimeStamp")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::Str("2013:06:08 11:14:40".into()))
+    );
   }
 }
