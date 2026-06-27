@@ -12634,17 +12634,18 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
   // are correctly (double-)deciphered. `0x202a` is the lone plain block and is
   // never deciphered.
   match entry.tag_id() {
-    // `Tag2010a`/`b`/`c`/`d`/`e`/`f` — the enciphered `0x2010` shot-info / WB block
-    // (release / self-timer / flash, gain / brightness / exposure-comp, DRO / HDR
-    // / PictureProfile / PictureEffect, metering / exposure program, WB_RGBLevels,
-    // SonyISO, distortion params, + DSC focal-length / aspect-ratio, + the `e`
-    // lens-mount / lens-type / distortion-correction rows). The variant is selected
-    // by the EXACT (`$`-anchored) `$$self{Model}` (`Sony.pm:1100-1173`). The
-    // remaining LARGE `g`/`h`/`i` variants are not yet ported, so their bodies (and
-    // any unknown one) fall through to `Tag_0x2010` (`%unknownCipherData`, emits
-    // nothing) — faithful until they are ported. `Tag2010d`/`e` additionally
-    // require `not $$self{Panorama}` (the `0x1003` DataMember latched earlier in the
-    // walk; for `e` only the second model alternation is panorama-gated).
+    // `Tag2010a`/`b`/`c`/`d`/`e`/`f`/`g` — the enciphered `0x2010` shot-info / WB
+    // block (release / self-timer / flash, gain / brightness / exposure-comp, DRO /
+    // HDR / PictureProfile / PictureEffect, metering / exposure program,
+    // WB_RGBLevels, SonyISO, distortion params, + DSC focal-length / aspect-ratio, +
+    // the `e`/`g` lens-mount / lens-type / distortion-correction rows). `a`-`f` are
+    // selected by the EXACT (`$`-anchored) `$$self{Model}`; `g` by a `\b`-anchored
+    // model set (`Sony.pm:1100-1173`). The remaining LARGE `h`/`i` variants are not
+    // yet ported, so their bodies (and any unknown one) fall through to `Tag_0x2010`
+    // (`%unknownCipherData`, emits nothing) — faithful until they are ported.
+    // `Tag2010d`/`e` additionally require `not $$self{Panorama}` (the `0x1003`
+    // DataMember latched earlier in the walk; for `e` only the second model
+    // alternation is panorama-gated).
     // Every `Tag2010x` table is `PRIORITY => 0` (`Sony.pm:6473` etc.), so each leaf
     // rides priority 0 (never overrides an earlier same-name duplicate). `0x2010 <
     // 0x9400` in IFD-tag order, so `double_cipher` is normally unset at this point
@@ -12688,6 +12689,13 @@ fn sony_emit_enciphered_subblock<S: ExifSink>(
     0x2010 if tag2010::selects_tag2010f(model) => {
       let buf = process_enciphered(raw, double_cipher);
       for emi in tag2010::parse_tag2010f(&buf, print_conv) {
+        let Ok(()) =
+          out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
+      }
+    }
+    0x2010 if tag2010::selects_tag2010g(model) => {
+      let buf = process_enciphered(raw, double_cipher);
+      for emi in tag2010::parse_tag2010g(&buf, model, print_conv) {
         let Ok(()) =
           out.write_vendor_value_with_priority("MakerNotes", group1, emi.name, emi.value, false, 0);
       }
