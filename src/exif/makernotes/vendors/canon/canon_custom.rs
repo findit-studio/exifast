@@ -10,8 +10,10 @@
 //! the LOW byte is the `int8u` value. Every record routes through the per-model
 //! table's PrintConv.
 //!
-//! This module ports the EOS 5D table (`%CanonCustom::Functions5D`,
-//! `CanonCustom.pm:228-383`, selected by `$$self{Model} =~ /EOS 5D/`) and the
+//! This module ports the per-body `ProcessCanonCustom` tables the `0x0f`
+//! conditional list selects by Model (`%CanonCustom::Functions{D30,10D,20D,30D,
+//! 350D,400D,1D,5D}`, `CanonCustom.pm:41-1084`) — `Functions1D` is also the
+//! `Canon::Main` 0x90 `CustomFunctions1D` tag (1D/1Ds). It also ports the
 //! consistent `%CanonCustom::Functions2` (`CanonCustom.pm:1198-2640`) used from
 //! the EOS 1D Mark III onward — the `Canon::Main` tag `0x99` `CustomFunctions2`,
 //! processed by a DIFFERENT walker, `ProcessCanonCustom2`
@@ -33,30 +35,172 @@ use std::string::String;
 use std::string::ToString;
 use std::vec::Vec;
 
-/// `true` when `model` selects `%CanonCustom::Functions5D` via the `0x0f`
-/// conditional list (`Canon.pm:1511-1512`, `$$self{Model} =~ /EOS 5D/`). The
-/// earlier `/EOS-1D/` arm (`Canon.pm:1503-1504`) is excluded so a 1D body never
-/// mis-dispatches here.
+/// Select the `%CanonCustom::Functions<Model>` table for the `Canon::Main` 0x0f
+/// `CustomFunctions` conditional list (`Canon.pm:1501-1583`), evaluated in the
+/// SAME order as bundled (the FIRST matching `Condition` wins). `None` is the
+/// `CustomFunctionsUnknown` fallback (`%CanonCustom::FuncsUnknown`,
+/// `CanonCustom.pm:1085-1090`) — a tagless table that emits nothing.
+fn select_custom_table(model: Option<&str>) -> Option<EntryFn> {
+  let m = model?;
+  Some(if m.contains("EOS-1D") {
+    // 1DmkII / 1DSmkII / 1DmkIIN (`Canon.pm:1502-1509`).
+    functions_1d_entry
+  } else if m.contains("EOS 5D") {
+    functions_5d_entry
+  } else if m.contains("EOS 10D") {
+    functions_10d_entry
+  } else if m.contains("EOS 20D") {
+    functions_20d_entry
+  } else if m.contains("EOS 30D") {
+    functions_30d_entry
+  } else if word_bounded(m, "350D")
+    || word_bounded(m, "REBEL XT")
+    || word_bounded(m, "Kiss Digital N")
+  {
+    functions_350d_entry
+  } else if word_bounded(m, "400D")
+    || word_bounded(m, "REBEL XTi")
+    || word_bounded(m, "Kiss Digital X")
+    || word_bounded(m, "K236")
+  {
+    functions_400d_entry
+  } else if trailing_bounded(m, "EOS D30") || trailing_bounded(m, "EOS D60") {
+    // D30 + D60 share `%CanonCustom::FunctionsD30` (`Canon.pm:1560-1574`).
+    functions_d30_entry
+  } else {
+    return None;
+  })
+}
+
+/// Decode the `Canon::Main` 0x0f `CustomFunctions` SubDirectory: select the
+/// per-body `%CanonCustom::Functions<Model>` table (`Canon.pm:1501-1583`) and
+/// run the shared `ProcessCanonCustom` record walk. A model matching no arm
+/// (`CustomFunctionsUnknown`) emits nothing.
 #[must_use]
-pub fn model_is_functions_5d(model: Option<&str>) -> bool {
-  let Some(m) = model else { return false };
-  m.contains("EOS 5D") && !m.contains("EOS-1D")
+pub fn parse_custom_functions(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<(SmolStr, TagValue)> {
+  match select_custom_table(model) {
+    Some(entry) => walk_canon_custom(data, order, print_conv, model, entry),
+    None => Vec::new(),
+  }
+}
+
+/// `\bNEEDLE\b` — `needle` appears in `hay` bounded by a non-word byte (or the
+/// string edge) on each side (Perl `\w` = `[0-9A-Za-z_]`). The 350D/400D arms
+/// use word-anchored alternations (`\b(350D|REBEL XT|…)\b`, `Canon.pm:1543`/
+/// `:1551`), so a plain substring test would mis-route "REBEL XTi" (a 400D) to
+/// the 350D `REBEL XT` arm.
+fn word_bounded(hay: &str, needle: &str) -> bool {
+  if needle.is_empty() {
+    return false;
+  }
+  let hb = hay.as_bytes();
+  let nlen = needle.len();
+  let mut start = 0usize;
+  while let Some(rel) = hay.get(start..).and_then(|s| s.find(needle)) {
+    let i = start + rel;
+    let before_ok = i == 0 || hb.get(i - 1).is_none_or(|&b| !is_word_byte(b));
+    let after_ok = hb.get(i + nlen).is_none_or(|&b| !is_word_byte(b));
+    if before_ok && after_ok {
+      return true;
+    }
+    start = i + 1;
+  }
+  false
+}
+
+/// `NEEDLE\b` — `needle` appears in `hay` followed by a non-word byte (or the
+/// string edge); the leading edge is unanchored. The D30/D60 arms are
+/// `/EOS D30\b/` / `/EOS D60\b/` (`Canon.pm:1561`/`:1569`), so a model
+/// "EOS D3000" must NOT match.
+fn trailing_bounded(hay: &str, needle: &str) -> bool {
+  if needle.is_empty() {
+    return false;
+  }
+  let hb = hay.as_bytes();
+  let nlen = needle.len();
+  let mut start = 0usize;
+  while let Some(rel) = hay.get(start..).and_then(|s| s.find(needle)) {
+    let i = start + rel;
+    if hb.get(i + nlen).is_none_or(|&b| !is_word_byte(b)) {
+      return true;
+    }
+    start = i + 1;
+  }
+  false
+}
+
+/// Perl `\w` byte — `[0-9A-Za-z_]`.
+fn is_word_byte(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Decode a `ProcessCanonCustom` block (`CanonCustom.pm:2772-2801`) against the
-/// EOS 5D table. The leading length word is skipped; each subsequent `int16u`
-/// record yields `tag = val >> 8`, `value = val & 0xff` (an `int8u`). A record
-/// whose `tag` is not a named `Functions5D` entry is `Unknown` and dropped
-/// (bundled gates it behind `-u`). `print_conv` selects the PrintConv label vs
-/// the raw `int8u`.
+/// EOS 5D table (`%CanonCustom::Functions5D`). See [`walk_canon_custom`].
 #[must_use]
 pub fn parse_functions_5d(
   data: &[u8],
   order: ByteOrder,
   print_conv: bool,
 ) -> Vec<(SmolStr, TagValue)> {
+  // The 0x0f EOS 5D arm — never a D60, so the length gate needs no model.
+  walk_canon_custom(data, order, print_conv, None, functions_5d_entry)
+}
+
+/// Decode a `ProcessCanonCustom` block against the 1D table
+/// (`%CanonCustom::Functions1D`, `CanonCustom.pm:41-227`) — the `Canon::Main`
+/// 0x90 `CustomFunctions1D` SubDirectory (`Canon.pm:1796-1802`, the 1D/1Ds
+/// path) and the 0x0f `EOS-1D` arm. See [`walk_canon_custom`].
+#[must_use]
+pub fn parse_functions_1d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  // The 0x90 CustomFunctions1D tag / 0x0f EOS-1D arm — never a D60.
+  walk_canon_custom(data, order, print_conv, None, functions_1d_entry)
+}
+
+/// The shared `ProcessCanonCustom` record walk (`CanonCustom.pm:2772-2801`): the
+/// leading `int16u` length word at offset 0 must equal the block size, else the
+/// whole block is rejected (`CanonCustom.pm:2782-2785`, "Invalid CanonCustom
+/// data", `return 0`) and emits nothing — it is NOT clamped to the declared
+/// length. The lone tolerance is the EOS D60, which declares a length 2 bytes
+/// short of its block (`$$et{Model} =~ /\bD60\b/ and $len+2 == $size`). Each
+/// subsequent `int16u` record yields `tag = val >> 8`, `value = val & 0xff` (an
+/// `int8u`); once the gate passes, the walk always covers the full buffer. A
+/// record whose `tag` is not a named `entry` is `Unknown` and dropped (bundled
+/// gates it behind `-u`). `print_conv` selects the PrintConv label vs the raw
+/// `int8u`.
+fn walk_canon_custom(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+  entry: EntryFn,
+) -> Vec<(SmolStr, TagValue)> {
   let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
   let size = data.len();
+  // The "Invalid CanonCustom data" gate (`CanonCustom.pm:2782-2785`).
+  let Some(len_bytes) = data.get(0..2) else {
+    return out;
+  };
+  let len_arr: [u8; 2] = match len_bytes.try_into() {
+    Ok(a) => a,
+    Err(_) => return out,
+  };
+  let len = usize::from(match order {
+    ByteOrder::Little => u16::from_le_bytes(len_arr),
+    ByteOrder::Big => u16::from_be_bytes(len_arr),
+  });
+  let d60 = model.is_some_and(|m| word_bounded(m, "D60"));
+  if !(len == size || (d60 && len + 2 == size)) {
+    return out;
+  }
   let mut pos = 2usize;
   while pos + 2 <= size {
     let Some(arr) = data.get(pos..pos + 2) else {
@@ -72,7 +216,7 @@ pub fn parse_functions_5d(
     };
     let tag = (word >> 8) as u8;
     let val = (word & 0xff) as i64;
-    if let Some((name, label)) = functions_5d_entry(tag) {
+    if let Some((name, label)) = entry(tag) {
       let value = if print_conv {
         match label(val) {
           Some(l) => TagValue::Str(SmolStr::new_static(l)),
@@ -91,6 +235,11 @@ pub fn parse_functions_5d(
 /// A record's `int8u`-value → PrintConv-label lookup (`None` ⇒ the `Unknown (N)`
 /// fallback at the call site).
 type LabelFn = fn(i64) -> Option<&'static str>;
+
+/// One `%CanonCustom::Functions<Model>` record-table lookup: a custom-function
+/// number → its `Name` and PrintConv (`None` for an `Unknown` record, dropped).
+/// Every `ProcessCanonCustom` per-body table shares this shape.
+type EntryFn = fn(u8) -> Option<(&'static str, LabelFn)>;
 
 /// One `%CanonCustom::Functions5D` record → its `Name` and PrintConv
 /// (`CanonCustom.pm:234-382`). Tags 0..=20 are named; any other tag is
@@ -229,6 +378,595 @@ fn functions_5d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
       })
     }),
     20 => ("AddOriginalDecisionData", off_on),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions1D` record (`CanonCustom.pm:41-227`) — all 1D
+/// models up to (not including) the Mark III. Tags 0..=21 are named.
+fn functions_1d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    0 => ("FocusingScreen", |v| {
+      Some(match v {
+        0 => "Ec-N, R",
+        1 => "Ec-A,B,C,CII,CIII,D,H,I,L",
+        _ => return None,
+      })
+    }),
+    1 => ("FinderDisplayDuringExposure", off_on),
+    2 => ("ShutterReleaseNoCFCard", yes_no),
+    3 => ("ISOSpeedExpansion", |v| {
+      Some(match v {
+        0 => "No",
+        1 => "Yes",
+        _ => return None,
+      })
+    }),
+    4 => ("ShutterAELButton", |v| {
+      Some(match v {
+        0 => "AF/AE lock stop",
+        1 => "AE lock/AF",
+        2 => "AF/AF lock, No AE lock",
+        3 => "AE/AF, No AE lock",
+        _ => return None,
+      })
+    }),
+    5 => ("ManualTv", |v| {
+      Some(match v {
+        0 => "Tv=Main/Av=Control",
+        1 => "Tv=Control/Av=Main",
+        2 => "Tv=Main/Av=Main w/o lens",
+        3 => "Tv=Control/Av=Main w/o lens",
+        _ => return None,
+      })
+    }),
+    6 => ("ExposureLevelIncrements", |v| {
+      Some(match v {
+        0 => "1/3-stop set, 1/3-stop comp.",
+        1 => "1-stop set, 1/3-stop comp.",
+        2 => "1/2-stop set, 1/2-stop comp.",
+        _ => return None,
+      })
+    }),
+    7 => ("USMLensElectronicMF", |v| {
+      Some(match v {
+        0 => "Turns on after one-shot AF",
+        1 => "Turns off after one-shot AF",
+        2 => "Always turned off",
+        _ => return None,
+      })
+    }),
+    8 => ("LCDPanels", |v| {
+      Some(match v {
+        0 => "Remain. shots/File no.",
+        1 => "ISO/Remain. shots",
+        2 => "ISO/File no.",
+        3 => "Shots in folder/Remain. shots",
+        _ => return None,
+      })
+    }),
+    9 => ("AEBSequenceAutoCancel", aeb_sequence_auto_cancel),
+    10 => ("AFPointIllumination", |v| {
+      Some(match v {
+        0 => "On",
+        1 => "Off",
+        2 => "On without dimming",
+        3 => "Brighter",
+        _ => return None,
+      })
+    }),
+    11 => ("AFPointSelection", |v| {
+      Some(match v {
+        0 => "H=AF+Main/V=AF+Command",
+        1 => "H=Comp+Main/V=Comp+Command",
+        2 => "H=Command only/V=Assist+Main",
+        3 => "H=FEL+Main/V=FEL+Command",
+        _ => return None,
+      })
+    }),
+    12 => ("MirrorLockup", disable_enable),
+    13 => ("AFPointSpotMetering", |v| {
+      Some(match v {
+        0 => "45/Center AF point",
+        1 => "11/Active AF point",
+        2 => "11/Center AF point",
+        3 => "9/Active AF point",
+        _ => return None,
+      })
+    }),
+    14 => ("FillFlashAutoReduction", enable_disable),
+    15 => ("ShutterCurtainSync", curtain_sync),
+    16 => ("SafetyShiftInAvOrTv", disable_enable),
+    17 => ("AFPointActivationArea", |v| {
+      Some(match v {
+        0 => "Single AF point",
+        1 => "Expanded (TTL. of 7 AF points)",
+        2 => "Automatic expanded (max. 13)",
+        _ => return None,
+      })
+    }),
+    18 => ("SwitchToRegisteredAFPoint", |v| {
+      Some(match v {
+        0 => "Assist + AF",
+        1 => "Assist",
+        2 => "Only while pressing assist",
+        _ => return None,
+      })
+    }),
+    19 => ("LensAFStopButton", |v| {
+      Some(match v {
+        0 => "AF stop",
+        1 => "AF start",
+        2 => "AE lock while metering",
+        3 => "AF point: M -> Auto / Auto -> Ctr.",
+        4 => "AF mode: ONE SHOT <-> AI SERVO",
+        5 => "IS start",
+        _ => return None,
+      })
+    }),
+    20 => ("AIServoTrackingSensitivity", |v| {
+      Some(match v {
+        0 => "Standard",
+        1 => "Slow",
+        2 => "Moderately slow",
+        3 => "Moderately fast",
+        4 => "Fast",
+        _ => return None,
+      })
+    }),
+    21 => ("AIServoContinuousShooting", |v| {
+      Some(match v {
+        0 => "Shooting not possible without focus",
+        1 => "Shooting possible without focus",
+        _ => return None,
+      })
+    }),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions10D` record (`CanonCustom.pm:386-531`). Tags
+/// 1..=17 are named.
+fn functions_10d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    1 => ("SetButtonWhenShooting", |v| {
+      Some(match v {
+        0 => "Normal (disabled)",
+        1 => "Image quality",
+        2 => "Change parameters",
+        3 => "Menu display",
+        4 => "Image playback",
+        _ => return None,
+      })
+    }),
+    2 => ("ShutterReleaseNoCFCard", yes_no),
+    3 => ("FlashSyncSpeedAv", flash_sync_200),
+    4 => ("Shutter-AELock", shutter_ae_lock),
+    5 => ("AFAssist", |v| {
+      Some(match v {
+        0 => "Emits/Fires",
+        1 => "Does not emit/Fires",
+        2 => "Only ext. flash emits/Fires",
+        3 => "Emits/Does not fire",
+        _ => return None,
+      })
+    }),
+    6 => ("ExposureLevelIncrements", |v| {
+      Some(match v {
+        0 => "1/2 Stop",
+        1 => "1/3 Stop",
+        _ => return None,
+      })
+    }),
+    7 => ("AFPointRegistration", |v| {
+      Some(match v {
+        0 => "Center",
+        1 => "Bottom",
+        2 => "Right",
+        3 => "Extreme Right",
+        4 => "Automatic",
+        5 => "Extreme Left",
+        6 => "Left",
+        7 => "Top",
+        _ => return None,
+      })
+    }),
+    8 => ("RawAndJpgRecording", |v| {
+      Some(match v {
+        0 => "RAW+Small/Normal",
+        1 => "RAW+Small/Fine",
+        2 => "RAW+Medium/Normal",
+        3 => "RAW+Medium/Fine",
+        4 => "RAW+Large/Normal",
+        5 => "RAW+Large/Fine",
+        _ => return None,
+      })
+    }),
+    9 => ("AEBSequenceAutoCancel", aeb_sequence_auto_cancel),
+    10 => ("SuperimposedDisplay", on_off),
+    11 => ("MenuButtonDisplayPosition", menu_button_display_position),
+    12 => ("MirrorLockup", disable_enable),
+    13 => ("AssistButtonFunction", |v| {
+      Some(match v {
+        0 => "Normal",
+        1 => "Select Home Position",
+        2 => "Select HP (while pressing)",
+        3 => "Av+/- (AF point by QCD)",
+        4 => "FE lock",
+        _ => return None,
+      })
+    }),
+    14 => ("FillFlashAutoReduction", enable_disable),
+    15 => ("ShutterCurtainSync", curtain_sync),
+    16 => ("SafetyShiftInAvOrTv", disable_enable),
+    17 => ("LensAFStopButton", |v| {
+      Some(match v {
+        0 => "AF stop",
+        1 => "AF start",
+        2 => "AE lock while metering",
+        3 => "AF point: M->Auto/Auto->ctr",
+        4 => "One Shot <-> AI servo",
+        5 => "IS start",
+        _ => return None,
+      })
+    }),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions20D` record (`CanonCustom.pm:532-664`). Tags
+/// 0..=17 are named.
+fn functions_20d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    0 => ("SetFunctionWhenShooting", set_function_when_shooting),
+    1 => ("LongExposureNoiseReduction", off_on),
+    2 => ("FlashSyncSpeedAv", flash_sync_250),
+    3 => ("Shutter-AELock", shutter_ae_lock),
+    4 => ("AFAssistBeam", af_assist_beam_3),
+    5 => ("ExposureLevelIncrements", exposure_level_third_half),
+    6 => ("FlashFiring", |v| {
+      Some(match v {
+        0 => "Fires",
+        1 => "Does not fire",
+        _ => return None,
+      })
+    }),
+    7 => ("ISOExpansion", off_on),
+    8 => ("AEBSequenceAutoCancel", aeb_sequence_auto_cancel),
+    9 => ("SuperimposedDisplay", on_off),
+    10 => ("MenuButtonDisplayPosition", menu_button_display_position),
+    11 => ("MirrorLockup", disable_enable),
+    12 => ("AFPointSelectionMethod", af_point_selection_method),
+    13 => ("ETTLII", ettl_ii),
+    14 => ("ShutterCurtainSync", curtain_sync),
+    15 => ("SafetyShiftInAvOrTv", disable_enable),
+    16 => ("LensAFStopButton", lens_af_stop_button),
+    17 => ("AddOriginalDecisionData", off_on),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions30D` record (`CanonCustom.pm:665-808`). Tags
+/// 1..=19 are named.
+fn functions_30d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    1 => ("SetFunctionWhenShooting", |v| {
+      Some(match v {
+        0 => "Default (no function)",
+        1 => "Change quality",
+        2 => "Change Picture Style",
+        3 => "Menu display",
+        4 => "Image replay",
+        _ => return None,
+      })
+    }),
+    2 => ("LongExposureNoiseReduction", |v| {
+      Some(match v {
+        0 => "Off",
+        1 => "Auto",
+        2 => "On",
+        _ => return None,
+      })
+    }),
+    3 => ("FlashSyncSpeedAv", flash_sync_250),
+    4 => ("Shutter-AELock", shutter_ae_lock),
+    5 => ("AFAssistBeam", af_assist_beam_3),
+    6 => ("ExposureLevelIncrements", exposure_level_third_half),
+    7 => ("FlashFiring", |v| {
+      Some(match v {
+        0 => "Fires",
+        1 => "Does not fire",
+        _ => return None,
+      })
+    }),
+    8 => ("ISOExpansion", off_on),
+    9 => ("AEBSequenceAutoCancel", aeb_sequence_auto_cancel),
+    10 => ("SuperimposedDisplay", on_off),
+    11 => ("MenuButtonDisplayPosition", menu_button_display_position),
+    12 => ("MirrorLockup", disable_enable),
+    13 => ("AFPointSelectionMethod", af_point_selection_method),
+    14 => ("ETTLII", ettl_ii),
+    15 => ("ShutterCurtainSync", curtain_sync),
+    16 => ("SafetyShiftInAvOrTv", disable_enable),
+    17 => ("MagnifiedView", magnified_view),
+    18 => ("LensAFStopButton", lens_af_stop_button),
+    19 => ("AddOriginalDecisionData", off_on),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions350D` record (`CanonCustom.pm:809-881`). Tags
+/// 0..=8 are named.
+fn functions_350d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    0 => ("SetButtonCrossKeysFunc", |v| {
+      Some(match v {
+        0 => "Normal",
+        1 => "Set: Quality",
+        2 => "Set: Parameter",
+        3 => "Set: Playback",
+        4 => "Cross keys: AF point select",
+        _ => return None,
+      })
+    }),
+    1 => ("LongExposureNoiseReduction", off_on),
+    2 => ("FlashSyncSpeedAv", flash_sync_200),
+    3 => ("Shutter-AELock", shutter_ae_lock),
+    4 => ("AFAssistBeam", af_assist_beam_3),
+    5 => ("ExposureLevelIncrements", exposure_level_third_half),
+    6 => ("MirrorLockup", disable_enable),
+    7 => ("ETTLII", ettl_ii),
+    8 => ("ShutterCurtainSync", curtain_sync),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::Functions400D` record (`CanonCustom.pm:882-972`). Tags
+/// 0..=10 are named.
+fn functions_400d_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    0 => ("SetButtonCrossKeysFunc", |v| {
+      Some(match v {
+        0 => "Set: Picture Style",
+        1 => "Set: Quality",
+        2 => "Set: Flash Exposure Comp",
+        3 => "Set: Playback",
+        4 => "Cross keys: AF point select",
+        _ => return None,
+      })
+    }),
+    1 => ("LongExposureNoiseReduction", |v| {
+      Some(match v {
+        0 => "Off",
+        1 => "Auto",
+        2 => "On",
+        _ => return None,
+      })
+    }),
+    2 => ("FlashSyncSpeedAv", flash_sync_200),
+    3 => ("Shutter-AELock", shutter_ae_lock),
+    4 => ("AFAssistBeam", af_assist_beam_3),
+    5 => ("ExposureLevelIncrements", exposure_level_third_half),
+    6 => ("MirrorLockup", disable_enable),
+    7 => ("ETTLII", ettl_ii),
+    8 => ("ShutterCurtainSync", curtain_sync),
+    9 => ("MagnifiedView", magnified_view),
+    10 => ("LCDDisplayAtPowerOn", |v| {
+      Some(match v {
+        0 => "Display",
+        1 => "Retain power off status",
+        _ => return None,
+      })
+    }),
+    _ => return None,
+  })
+}
+
+/// One `%CanonCustom::FunctionsD30` record (`CanonCustom.pm:973-1084`) — the
+/// shared EOS D30/D60 table. Tags 1..=15 are named.
+fn functions_d30_entry(tag: u8) -> Option<(&'static str, LabelFn)> {
+  Some(match tag {
+    1 => ("LongExposureNoiseReduction", off_on),
+    2 => ("Shutter-AELock", |v| {
+      Some(match v {
+        0 => "AF/AE lock",
+        1 => "AE lock/AF",
+        2 => "AF/AF lock",
+        3 => "AE+release/AE+AF",
+        _ => return None,
+      })
+    }),
+    3 => ("MirrorLockup", disable_enable),
+    4 => ("ExposureLevelIncrements", |v| {
+      Some(match v {
+        0 => "1/2 Stop",
+        1 => "1/3 Stop",
+        _ => return None,
+      })
+    }),
+    5 => ("AFAssist", |v| {
+      Some(match v {
+        0 => "Emits/Fires",
+        1 => "Does not emit/Fires",
+        2 => "Only ext. flash emits/Fires",
+        3 => "Emits/Does not fire",
+        _ => return None,
+      })
+    }),
+    6 => ("FlashSyncSpeedAv", flash_sync_200),
+    7 => ("AEBSequenceAutoCancel", aeb_sequence_auto_cancel),
+    8 => ("ShutterCurtainSync", curtain_sync),
+    9 => ("LensAFStopButton", |v| {
+      Some(match v {
+        0 => "AF Stop",
+        1 => "Operate AF",
+        2 => "Lock AE and start timer",
+        _ => return None,
+      })
+    }),
+    10 => ("FillFlashAutoReduction", enable_disable),
+    11 => ("MenuButtonReturn", |v| {
+      Some(match v {
+        0 => "Top",
+        1 => "Previous (volatile)",
+        2 => "Previous",
+        _ => return None,
+      })
+    }),
+    12 => ("SetButtonWhenShooting", |v| {
+      Some(match v {
+        0 => "Default (no function)",
+        1 => "Image quality",
+        2 => "Change ISO speed",
+        3 => "Change parameters",
+        _ => return None,
+      })
+    }),
+    13 => ("SensorCleaning", disable_enable),
+    14 => ("SuperimposedDisplay", on_off),
+    15 => ("ShutterReleaseNoCFCard", yes_no),
+    _ => return None,
+  })
+}
+
+/// `{ 0 => 'Yes', 1 => 'No' }` — `ShutterReleaseNoCFCard` (1D/10D/D30).
+fn yes_no(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Yes",
+    1 => "No",
+    _ => return None,
+  })
+}
+
+/// `{ 0 => '1st-curtain sync', 1 => '2nd-curtain sync' }` — `ShutterCurtainSync`
+/// (every pre-Mark-III body table).
+fn curtain_sync(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "1st-curtain sync",
+    1 => "2nd-curtain sync",
+    _ => return None,
+  })
+}
+
+/// `AEBSequenceAutoCancel` (1D/10D/20D/30D/D30) — `{ 0,-,+/Enabled; …}`.
+fn aeb_sequence_auto_cancel(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "0,-,+/Enabled",
+    1 => "0,-,+/Disabled",
+    2 => "-,0,+/Enabled",
+    3 => "-,0,+/Disabled",
+    _ => return None,
+  })
+}
+
+/// `Shutter-AELock` 4-value form (10D/20D/30D/350D/400D).
+fn shutter_ae_lock(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "AF/AE lock",
+    1 => "AE lock/AF",
+    2 => "AF/AF lock, No AE lock",
+    3 => "AE/AF, No AE lock",
+    _ => return None,
+  })
+}
+
+/// `ETTLII` (20D/30D/350D/400D) — `{ 0 => 'Evaluative', 1 => 'Average' }`.
+fn ettl_ii(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Evaluative",
+    1 => "Average",
+    _ => return None,
+  })
+}
+
+/// `AFAssistBeam` 3-value form (20D/30D/350D/400D).
+fn af_assist_beam_3(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Emits",
+    1 => "Does not emit",
+    2 => "Only ext. flash emits",
+    _ => return None,
+  })
+}
+
+/// `MagnifiedView` (30D/400D).
+fn magnified_view(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Image playback only",
+    1 => "Image review and playback",
+    _ => return None,
+  })
+}
+
+/// `MenuButtonDisplayPosition` (10D/20D/30D).
+fn menu_button_display_position(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Previous (top if power off)",
+    1 => "Previous",
+    2 => "Top",
+    _ => return None,
+  })
+}
+
+/// `AFPointSelectionMethod` (20D/30D).
+fn af_point_selection_method(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Normal",
+    1 => "Multi-controller direct",
+    2 => "Quick Control Dial direct",
+    _ => return None,
+  })
+}
+
+/// `LensAFStopButton` 6-value form (20D/30D — same labels as the 5D table).
+fn lens_af_stop_button(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "AF stop",
+    1 => "AF start",
+    2 => "AE lock while metering",
+    3 => "AF point: M -> Auto / Auto -> Ctr.",
+    4 => "ONE SHOT <-> AI SERVO",
+    5 => "IS start",
+    _ => return None,
+  })
+}
+
+/// `SetFunctionWhenShooting` (20D) — `{ 0 => 'Default (no function)', … }`.
+fn set_function_when_shooting(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Default (no function)",
+    1 => "Change quality",
+    2 => "Change Parameters",
+    3 => "Menu display",
+    4 => "Image replay",
+    _ => return None,
+  })
+}
+
+/// `ExposureLevelIncrements` `{ 0 => '1/3 Stop', 1 => '1/2 Stop' }`
+/// (20D/30D/350D/400D).
+fn exposure_level_third_half(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "1/3 Stop",
+    1 => "1/2 Stop",
+    _ => return None,
+  })
+}
+
+/// `FlashSyncSpeedAv` `{ 0 => 'Auto', 1 => '1/200 Fixed' }` (10D/350D/400D/D30).
+fn flash_sync_200(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Auto",
+    1 => "1/200 Fixed",
+    _ => return None,
+  })
+}
+
+/// `FlashSyncSpeedAv` `{ 0 => 'Auto', 1 => '1/250 Fixed' }` (20D/30D).
+fn flash_sync_250(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "Auto",
+    1 => "1/250 Fixed",
     _ => return None,
   })
 }
@@ -919,6 +1657,173 @@ fn i32s_at(data: &[u8], off: usize, order: ByteOrder) -> Option<i64> {
   }))
 }
 
+// ─── PersonalFuncs (`Canon::Main` 0x91) ──────────────────────────────────────
+
+/// Decode `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1091-1133`) — the
+/// EOS-1D personal-function on/off flags. `ProcessBinaryData`, `FORMAT =>
+/// 'int16u'`, `FIRST_ENTRY => 1`: a named position `index` reads the `int16u` at
+/// byte offset `index * 2` (the size word at offset 0 is index 0, unread). Each
+/// flag renders via [`convert_pfn`] (`%convPFn`). A position past the block end
+/// is dropped (per-field availability — bundled `next unless defined $val`).
+#[must_use]
+pub fn parse_personal_funcs(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  for &(index, name) in PERSONAL_FUNCS {
+    let Some(v) = u16_at(data, usize::from(index) * 2, order) else {
+      continue;
+    };
+    let v = v as i64;
+    let value = if print_conv {
+      TagValue::Str(convert_pfn(v))
+    } else {
+      TagValue::I64(v)
+    };
+    out.push((SmolStr::new_static(name), value));
+  }
+  out
+}
+
+/// `%convPFn` PrintConv (`CanonCustom.pm:2622-2627`, `sub ConvertPfn`):
+/// `0 => 'Off'`, `1 => 'On'`, otherwise `'On (N)'`.
+fn convert_pfn(v: i64) -> SmolStr {
+  match v {
+    0 => SmolStr::new_static("Off"),
+    1 => SmolStr::new_static("On"),
+    n => SmolStr::from(std::format!("On ({n})")),
+  }
+}
+
+/// `(index, Name)` for `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1100-1132`).
+/// Indices 12/13 (`PF11`/`PF12`) and 23 (`PF22`) are commented out in bundled
+/// (unused) and are absent here.
+const PERSONAL_FUNCS: &[(u16, &str)] = &[
+  (1, "PF0CustomFuncRegistration"),
+  (2, "PF1DisableShootingModes"),
+  (3, "PF2DisableMeteringModes"),
+  (4, "PF3ManualExposureMetering"),
+  (5, "PF4ExposureTimeLimits"),
+  (6, "PF5ApertureLimits"),
+  (7, "PF6PresetShootingModes"),
+  (8, "PF7BracketContinuousShoot"),
+  (9, "PF8SetBracketShots"),
+  (10, "PF9ChangeBracketSequence"),
+  (11, "PF10RetainProgramShift"),
+  (14, "PF13DrivePriority"),
+  (15, "PF14DisableFocusSearch"),
+  (16, "PF15DisableAFAssistBeam"),
+  (17, "PF16AutoFocusPointShoot"),
+  (18, "PF17DisableAFPointSel"),
+  (19, "PF18EnableAutoAFPointSel"),
+  (20, "PF19ContinuousShootSpeed"),
+  (21, "PF20LimitContinousShots"),
+  (22, "PF21EnableQuietOperation"),
+  (24, "PF23SetTimerLengths"),
+  (25, "PF24LightLCDDuringBulb"),
+  (26, "PF25DefaultClearSettings"),
+  (27, "PF26ShortenReleaseLag"),
+  (28, "PF27ReverseDialRotation"),
+  (29, "PF28NoQuickDialExpComp"),
+  (30, "PF29QuickDialSwitchOff"),
+  (31, "PF30EnlargementMode"),
+  (32, "PF31OriginalDecisionData"),
+];
+
+// ─── PersonalFuncValues (`Canon::Main` 0x92) ─────────────────────────────────
+
+/// The per-position conversion for `%CanonCustom::PersonalFuncValues`.
+#[derive(Clone, Copy)]
+enum PfvConv {
+  /// No `ValueConv`/`PrintConv` — the raw `int16u` in both `-j` and `-n`.
+  Plain,
+  /// `PF4ExposureTimeMin`/`Max` (`CanonCustom.pm:1155-1170`): `ValueConv =>
+  /// 'exp(-CanonEv($val*4)*log(2))*1000/8'`, `PrintConv => PrintExposureTime`.
+  ExposureTime,
+  /// `PF5ApertureMin`/`Max` (`CanonCustom.pm:1171-1186`): `ValueConv =>
+  /// 'exp(CanonEv($val*4-32)*log(2)/2)'`, `PrintConv => 'sprintf("%.2g",$val)'`.
+  Aperture,
+}
+
+/// Decode `%CanonCustom::PersonalFuncValues` (`CanonCustom.pm:1135-1197`) — the
+/// EOS-1D personal-function values reached via the `Canon::Main` 0x92
+/// SubDirectory (`Canon.pm:1810-1816`). `ProcessBinaryData`, `FORMAT =>
+/// 'int16u'`, `FIRST_ENTRY => 1`: position `index` reads the `int16u` at byte
+/// offset `index * 2`. Most positions are passthrough; the four exposure-time /
+/// aperture positions carry a `CanonEv`-based `ValueConv` (emitted as the
+/// converted float in `-n`) and a `PrintExposureTime` / `%.2g` `PrintConv`.
+/// A position past the block end is dropped (per-field availability). The
+/// `RawConv => '$val > 0 ? $val : 0'` is an identity for the `int16u` read here.
+#[must_use]
+pub fn parse_personal_func_values(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue)> {
+  use super::camera_settings::canon_ev;
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  for &(index, name, conv) in PERSONAL_FUNC_VALUES {
+    let Some(raw) = u16_at(data, usize::from(index) * 2, order) else {
+      continue;
+    };
+    let raw = raw as i64;
+    let value = match conv {
+      PfvConv::Plain => TagValue::I64(raw),
+      PfvConv::ExposureTime => {
+        let vc = (-canon_ev(raw * 4) * core::f64::consts::LN_2).exp() * 1000.0 / 8.0;
+        if print_conv {
+          TagValue::Str(SmolStr::from(
+            crate::composite::convs::exif::print_exposure_time(vc),
+          ))
+        } else {
+          TagValue::F64(vc)
+        }
+      }
+      PfvConv::Aperture => {
+        let vc = (canon_ev(raw * 4 - 32) * core::f64::consts::LN_2 / 2.0).exp();
+        if print_conv {
+          TagValue::Str(SmolStr::from(crate::value::format_g(vc, 2)))
+        } else {
+          TagValue::F64(vc)
+        }
+      }
+    };
+    out.push((SmolStr::new_static(name), value));
+  }
+  out
+}
+
+/// `(index, Name, conv)` for `%CanonCustom::PersonalFuncValues`
+/// (`CanonCustom.pm:1144-1196`).
+const PERSONAL_FUNC_VALUES: &[(u16, &str, PfvConv)] = &[
+  (1, "PF1Value", PfvConv::Plain),
+  (2, "PF2Value", PfvConv::Plain),
+  (3, "PF3Value", PfvConv::Plain),
+  (4, "PF4ExposureTimeMin", PfvConv::ExposureTime),
+  (5, "PF4ExposureTimeMax", PfvConv::ExposureTime),
+  (6, "PF5ApertureMin", PfvConv::Aperture),
+  (7, "PF5ApertureMax", PfvConv::Aperture),
+  (8, "PF8BracketShots", PfvConv::Plain),
+  (9, "PF19ShootingSpeedLow", PfvConv::Plain),
+  (10, "PF19ShootingSpeedHigh", PfvConv::Plain),
+  (11, "PF20MaxContinousShots", PfvConv::Plain),
+  (12, "PF23ShutterButtonTime", PfvConv::Plain),
+  (13, "PF23FELockTime", PfvConv::Plain),
+  (14, "PF23PostReleaseTime", PfvConv::Plain),
+  (15, "PF25AEMode", PfvConv::Plain),
+  (16, "PF25MeteringMode", PfvConv::Plain),
+  (17, "PF25DriveMode", PfvConv::Plain),
+  (18, "PF25AFMode", PfvConv::Plain),
+  (19, "PF25AFPointSel", PfvConv::Plain),
+  (20, "PF25ImageSize", PfvConv::Plain),
+  (21, "PF25WBMode", PfvConv::Plain),
+  (22, "PF25Parameters", PfvConv::Plain),
+  (23, "PF25ColorMatrix", PfvConv::Plain),
+  (24, "PF27Value", PfvConv::Plain),
+];
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -989,12 +1894,287 @@ mod tests {
     assert_eq!(find("AddOriginalDecisionData"), Some(TagValue::I64(1)));
   }
 
+  /// Build a `ProcessCanonCustom` block from `(tag, int8u)` pairs: the leading
+  /// `int16u` length word (the byte size) then one `int16u` record per pair
+  /// (`tag << 8 | value`), little-endian.
+  fn build_custom(pairs: &[(u8, u8)]) -> Vec<u8> {
+    let size = (pairs.len() + 1) * 2;
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(&(size as u16).to_le_bytes());
+    for &(t, v) in pairs {
+      out.extend_from_slice(&((u16::from(t) << 8) | u16::from(v)).to_le_bytes());
+    }
+    out
+  }
+
+  fn find(em: &[(SmolStr, TagValue)], n: &str) -> Option<TagValue> {
+    em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone())
+  }
+
+  fn want_str(em: &[(SmolStr, TagValue)], n: &str, label: &str) {
+    assert_eq!(find(em, n), Some(TagValue::Str(label.into())), "{n}");
+  }
+
+  /// The `0x0f` conditional list selects the per-body table by Model in the
+  /// SAME order as bundled — the `EOS-1D` arm precedes `EOS 5D` (`Canon.pm:1502`
+  /// before `:1510`), and an unmatched model falls to the tagless `FuncsUnknown`.
   #[test]
-  fn model_dispatch() {
-    assert!(model_is_functions_5d(Some("Canon EOS 5D")));
-    assert!(!model_is_functions_5d(Some("Canon EOS 7D")));
-    assert!(!model_is_functions_5d(Some("Canon EOS-1D Mark III")));
-    assert!(!model_is_functions_5d(None));
+  fn custom_functions_model_select() {
+    // tag 0 distinguishes the 1D table ("Ec-N, R") from the 5D table ("Ee-A").
+    let blk = build_custom(&[(0, 0)]);
+    let sel = |m: Option<&str>| parse_custom_functions(&blk, ByteOrder::Little, true, m);
+    want_str(
+      &sel(Some("Canon EOS-1D Mark II")),
+      "FocusingScreen",
+      "Ec-N, R",
+    );
+    want_str(&sel(Some("Canon EOS 5D")), "FocusingScreen", "Ee-A");
+    // FuncsUnknown / no model → nothing.
+    assert!(sel(Some("Canon EOS 1100D")).is_empty());
+    assert!(sel(None).is_empty());
+  }
+
+  /// `\b(350D|REBEL XT|…)\b` vs `\b(400D|REBEL XTi|…)\b` (`Canon.pm:1543`/`:1551`)
+  /// — the word boundary keeps "REBEL XTi" (a 400D) off the 350D `REBEL XT` arm.
+  #[test]
+  fn rebel_xt_vs_xti_word_boundary() {
+    let blk = build_custom(&[(0, 0)]);
+    let sel = |m: &str| parse_custom_functions(&blk, ByteOrder::Little, true, Some(m));
+    // 350D tag-0 label is "Normal"; the 400D tag-0 label is "Set: Picture Style".
+    want_str(
+      &sel("Canon EOS REBEL XT"),
+      "SetButtonCrossKeysFunc",
+      "Normal",
+    );
+    want_str(
+      &sel("Canon EOS REBEL XTi"),
+      "SetButtonCrossKeysFunc",
+      "Set: Picture Style",
+    );
+    want_str(
+      &sel("Canon EOS Kiss Digital N"),
+      "SetButtonCrossKeysFunc",
+      "Normal",
+    );
+    want_str(
+      &sel("Canon EOS Kiss Digital X"),
+      "SetButtonCrossKeysFunc",
+      "Set: Picture Style",
+    );
+  }
+
+  /// D30 and D60 share `%FunctionsD30`; the `/EOS D30\b/` trailing boundary keeps
+  /// a hypothetical "EOS D3000" off the arm.
+  #[test]
+  fn d30_d60_share_table_and_boundary() {
+    let blk = build_custom(&[(11, 1)]); // MenuButtonReturn = "Previous (volatile)"
+    for model in ["Canon EOS D30", "Canon EOS D60"] {
+      want_str(
+        &parse_custom_functions(&blk, ByteOrder::Little, true, Some(model)),
+        "MenuButtonReturn",
+        "Previous (volatile)",
+      );
+    }
+    assert!(
+      parse_custom_functions(&blk, ByteOrder::Little, true, Some("Canon EOS D3000")).is_empty()
+    );
+  }
+
+  /// `%CanonCustom::Functions1D` (`CanonCustom.pm:41-227`) — the 0x90 direct tag.
+  #[test]
+  fn functions_1d_decodes() {
+    let data = build_custom(&[(0, 0), (5, 2), (19, 4), (21, 1)]);
+    let em = parse_functions_1d(&data, ByteOrder::Little, true);
+    want_str(&em, "FocusingScreen", "Ec-N, R");
+    want_str(&em, "ManualTv", "Tv=Main/Av=Main w/o lens");
+    want_str(&em, "LensAFStopButton", "AF mode: ONE SHOT <-> AI SERVO");
+    want_str(
+      &em,
+      "AIServoContinuousShooting",
+      "Shooting possible without focus",
+    );
+    assert_eq!(em.len(), 4);
+  }
+
+  /// Spot-check each per-body table's distinctive tags + shared PrintConv helpers.
+  #[test]
+  fn per_body_tables_decode() {
+    let pc = |model: &str, pairs: &[(u8, u8)]| {
+      parse_custom_functions(&build_custom(pairs), ByteOrder::Little, true, Some(model))
+    };
+    let em = pc("Canon EOS 10D", &[(1, 2), (5, 2), (17, 3)]);
+    want_str(&em, "SetButtonWhenShooting", "Change parameters");
+    want_str(&em, "AFAssist", "Only ext. flash emits/Fires");
+    want_str(&em, "LensAFStopButton", "AF point: M->Auto/Auto->ctr");
+
+    let em = pc("Canon EOS 20D", &[(0, 1), (13, 1), (16, 4)]);
+    want_str(&em, "SetFunctionWhenShooting", "Change quality");
+    want_str(&em, "ETTLII", "Average");
+    want_str(&em, "LensAFStopButton", "ONE SHOT <-> AI SERVO");
+
+    let em = pc("Canon EOS 30D", &[(1, 2), (17, 1), (2, 1)]);
+    want_str(&em, "SetFunctionWhenShooting", "Change Picture Style");
+    want_str(&em, "MagnifiedView", "Image review and playback");
+    want_str(&em, "LongExposureNoiseReduction", "Auto");
+
+    let em = pc("Canon EOS 350D", &[(0, 4), (5, 1)]);
+    want_str(&em, "SetButtonCrossKeysFunc", "Cross keys: AF point select");
+    want_str(&em, "ExposureLevelIncrements", "1/2 Stop");
+
+    let em = pc("Canon EOS 400D", &[(2, 1), (10, 1)]);
+    want_str(&em, "FlashSyncSpeedAv", "1/200 Fixed");
+    want_str(&em, "LCDDisplayAtPowerOn", "Retain power off status");
+
+    let em = pc("Canon EOS D30", &[(13, 1), (5, 3)]);
+    want_str(&em, "SensorCleaning", "Enable");
+    want_str(&em, "AFAssist", "Emits/Does not fire");
+  }
+
+  /// Numeric mode keeps the raw `int8u`; an unnamed tag is dropped; an
+  /// out-of-range value renders `Unknown (N)`.
+  #[test]
+  fn custom_functions_numeric_and_unknown() {
+    let data = build_custom(&[(0, 1), (99, 7), (21, 1)]);
+    let em = parse_functions_1d(&data, ByteOrder::Little, false);
+    assert_eq!(find(&em, "FocusingScreen"), Some(TagValue::I64(1)));
+    assert_eq!(
+      find(&em, "AIServoContinuousShooting"),
+      Some(TagValue::I64(1))
+    );
+    assert_eq!(em.len(), 2); // the unnamed tag 99 is dropped
+    let em2 = parse_functions_1d(&build_custom(&[(0, 9)]), ByteOrder::Little, true);
+    want_str(&em2, "FocusingScreen", "Unknown (9)");
+  }
+
+  /// `ProcessCanonCustom` (`CanonCustom.pm:2782-2785`) REJECTS the whole block
+  /// when the offset-0 `int16u` length word does not equal the block size — it
+  /// is NOT clamped to the declared length. A length shorter than the buffer
+  /// (trailing record-shaped padding) and a length longer than the buffer both
+  /// emit nothing; only an exact `len == size` decodes.
+  #[test]
+  fn rejects_length_word_mismatch() {
+    // Sanity: an exact `len == size` block decodes its four 1D records.
+    let exact = build_custom(&[(0, 0), (5, 2), (19, 4), (21, 1)]);
+    assert_eq!(parse_functions_1d(&exact, ByteOrder::Little, true).len(), 4);
+
+    // SHORTER: declared len = 4, but three record-shaped words follow (size = 8)
+    // — a full walk would decode them; ExifTool rejects (len != size) → nothing.
+    let shorter = build_u16(&[4, 0x0000, 0x0500, 0x1304]);
+    assert_eq!(shorter.len(), 8);
+    assert!(parse_functions_1d(&shorter, ByteOrder::Little, true).is_empty());
+    assert!(
+      parse_custom_functions(&shorter, ByteOrder::Little, true, Some("Canon EOS 5D")).is_empty()
+    );
+
+    // LONGER: declared len = 0xffff overruns the 8-byte buffer → rejected, no OOB.
+    let longer = build_u16(&[0xffff, 0x0000, 0x0500, 0x1304]);
+    assert!(parse_functions_1d(&longer, ByteOrder::Little, true).is_empty());
+    assert!(parse_functions_5d(&longer, ByteOrder::Little, true).is_empty());
+  }
+
+  /// The lone `ProcessCanonCustom` length tolerance (`CanonCustom.pm:2782`): an
+  /// EOS D60 whose declared length is 2 bytes short of the block
+  /// (`$$et{Model} =~ /\bD60\b/ and $len+2 == $size`) still decodes; the same
+  /// 2-short block on any other body is rejected.
+  #[test]
+  fn d60_length_word_two_short() {
+    // len = 4, then two FunctionsD30 records → size = 6 (= len + 2).
+    let blk = build_u16(&[4, 0x0101, 0x0300]);
+    assert_eq!(blk.len(), 6);
+    let em = parse_custom_functions(&blk, ByteOrder::Little, true, Some("Canon EOS D60"));
+    want_str(&em, "LongExposureNoiseReduction", "On");
+    want_str(&em, "MirrorLockup", "Disable");
+    assert_eq!(em.len(), 2);
+    // A non-D60 body (D30, which shares the table) with the same 2-short length
+    // falls to the gate.
+    assert!(
+      parse_custom_functions(&blk, ByteOrder::Little, true, Some("Canon EOS D30")).is_empty()
+    );
+  }
+
+  /// Build a `%CanonCustom::PersonalFuncs`/`PersonalFuncValues` `int16u` block
+  /// from `words` (word 0 is the unread size; named positions start at index 1).
+  fn build_u16(words: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 2);
+    for w in words {
+      out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+  }
+
+  /// `%CanonCustom::PersonalFuncs` (`CanonCustom.pm:1091-1133`) — `int16u`,
+  /// `FIRST_ENTRY 1`; each flag renders via `ConvertPfn`.
+  #[test]
+  fn personal_funcs_decode() {
+    let mut words = [0u16; 33]; // indices 0..=32
+    words[1] = 0; // PF0CustomFuncRegistration = Off
+    words[2] = 1; // PF1DisableShootingModes = On
+    words[8] = 5; // PF7BracketContinuousShoot = On (5)
+    words[32] = 1; // PF31OriginalDecisionData = On
+    let em = parse_personal_funcs(&build_u16(&words), ByteOrder::Little, true);
+    want_str(&em, "PF0CustomFuncRegistration", "Off");
+    want_str(&em, "PF1DisableShootingModes", "On");
+    want_str(&em, "PF7BracketContinuousShoot", "On (5)");
+    want_str(&em, "PF31OriginalDecisionData", "On");
+    // 29 named indices (1..=32 minus the unused 12/13/23).
+    assert_eq!(em.len(), 29);
+  }
+
+  /// Per-field availability: a position past the block end is dropped; numeric
+  /// mode keeps the raw `int16u`.
+  #[test]
+  fn personal_funcs_per_field_and_numeric() {
+    // 6 words = 12 bytes ⇒ indices 0..=5 present; index 6 (offset 12) is past.
+    let em = parse_personal_funcs(&build_u16(&[0, 9, 0, 0, 0, 2]), ByteOrder::Little, false);
+    assert_eq!(
+      find(&em, "PF0CustomFuncRegistration"),
+      Some(TagValue::I64(9))
+    );
+    assert_eq!(find(&em, "PF4ExposureTimeLimits"), Some(TagValue::I64(2)));
+    assert_eq!(find(&em, "PF5ApertureLimits"), None); // index 6, dropped
+    assert_eq!(em.len(), 5);
+  }
+
+  /// `%CanonCustom::PersonalFuncValues` (`CanonCustom.pm:1135-1197`) — `-j`:
+  /// plain positions pass through; the exposure-time / aperture positions render
+  /// their `CanonEv` `ValueConv` via `PrintExposureTime` / `%.2g`. The expected
+  /// labels are ground-truthed against the bundled Perl.
+  #[test]
+  fn personal_func_values_print() {
+    let mut words = [0u16; 25]; // indices 0..=24
+    words[1] = 100; // PF1Value (plain)
+    words[4] = 32; // PF4ExposureTimeMin -> 7.8125 -> "7.8"
+    words[5] = 64; // PF4ExposureTimeMax -> 0.48828125 -> "0.5"
+    words[6] = 8; // PF5ApertureMin -> f/1.0 -> "1"
+    words[7] = 40; // PF5ApertureMax -> f/4.0 -> "4"
+    words[8] = 3; // PF8BracketShots (plain)
+    words[24] = 7; // PF27Value (plain)
+    let em = parse_personal_func_values(&build_u16(&words), ByteOrder::Little, true);
+    assert_eq!(find(&em, "PF1Value"), Some(TagValue::I64(100)));
+    want_str(&em, "PF4ExposureTimeMin", "7.8");
+    want_str(&em, "PF4ExposureTimeMax", "0.5");
+    want_str(&em, "PF5ApertureMin", "1");
+    want_str(&em, "PF5ApertureMax", "4");
+    assert_eq!(find(&em, "PF8BracketShots"), Some(TagValue::I64(3)));
+    assert_eq!(find(&em, "PF27Value"), Some(TagValue::I64(7)));
+    assert_eq!(em.len(), 24); // indices 1..=24 all present
+  }
+
+  /// `-n`: the converted `ValueConv` float for the exposure-time / aperture
+  /// positions, raw `int16u` for plain; a position past the block end is dropped.
+  #[test]
+  fn personal_func_values_numeric_and_per_field() {
+    let mut words = [0u16; 8]; // indices 0..=7 (16 bytes)
+    words[1] = 100;
+    words[4] = 0; // PF4ExposureTimeMin raw 0 -> ValueConv 125.0
+    words[6] = 8; // PF5ApertureMin raw 8 -> ValueConv f/1.0
+    let em = parse_personal_func_values(&build_u16(&words), ByteOrder::Little, false);
+    assert_eq!(find(&em, "PF1Value"), Some(TagValue::I64(100)));
+    assert_eq!(find(&em, "PF4ExposureTimeMin"), Some(TagValue::F64(125.0)));
+    assert_eq!(find(&em, "PF5ApertureMin"), Some(TagValue::F64(1.0)));
+    // index 8 (PF8BracketShots, offset 16) is past the 16-byte block.
+    assert_eq!(find(&em, "PF8BracketShots"), None);
+    assert_eq!(em.len(), 7); // indices 1..=7
   }
 
   /// A single-group `ProcessCanonCustom2` block (`int32u` words): size, group

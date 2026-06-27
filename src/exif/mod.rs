@@ -11825,14 +11825,23 @@ fn emit_canon_subtable<S: ExifSink>(
     // ColorData (0x4001) — COUNT-selected ColorData3/ColorData4 variants.
     SubTable::ColorData => colordata::parse(&blob, order, print_conv),
     // CustomFunctions (0x0f) — `ProcessCanonCustom` against the model-conditional
-    // `CanonCustom::Functions<Model>` table; emitted into the `CanonCustom`
-    // family-1 group (handled below). Only the EOS 5D table is ported.
+    // `CanonCustom::Functions<Model>` table (`Canon.pm:1501-1583`): the per-body
+    // D30/D60/10D/20D/30D/350D/400D/1D/5D select. Emitted into the `CanonCustom`
+    // family-1 group (handled below).
     SubTable::CustomFunctions => {
-      if canon_custom::model_is_functions_5d(model) {
-        canon_custom::parse_functions_5d(&blob, order, print_conv)
-      } else {
-        Vec::new()
-      }
+      canon_custom::parse_custom_functions(&blob, order, print_conv, model)
+    }
+    // CustomFunctions1D (0x90) — `ProcessCanonCustom` against
+    // `CanonCustom::Functions1D` (`Canon.pm:1796-1802`, the 1D/1Ds direct tag).
+    SubTable::CustomFunctions1D => canon_custom::parse_functions_1d(&blob, order, print_conv),
+    // PersonalFunctions (0x91) — `ProcessBinaryData` against
+    // `CanonCustom::PersonalFuncs` (`Canon.pm:1803-1809`), the EOS-1D
+    // personal-function on/off flags.
+    SubTable::PersonalFunctions => canon_custom::parse_personal_funcs(&blob, order, print_conv),
+    // PersonalFunctionValues (0x92) — `ProcessBinaryData` against
+    // `CanonCustom::PersonalFuncValues` (`Canon.pm:1810-1816`).
+    SubTable::PersonalFunctionValues => {
+      canon_custom::parse_personal_func_values(&blob, order, print_conv)
     }
     // The EOS 7D image-info sub-tables (#445). TimeInfo (0x35) / AspectInfo
     // (0x9a) / VignettingCorr2 (0x4016) / LightingOpt (0x4018) are `int32`-format
@@ -11897,7 +11906,14 @@ fn emit_canon_subtable<S: ExifSink>(
   // The `CanonCustom::*` tables emit into the `CanonCustom` family-1 group (the
   // `Image::ExifTool::CanonCustom` package group, `CanonCustom.pm:229`), NOT the
   // parent `Canon` group; every other walked sub-table stays in `group1`.
-  let emit_group1 = if matches!(sub, SubTable::CustomFunctions | SubTable::CustomFunctions2) {
+  let emit_group1 = if matches!(
+    sub,
+    SubTable::CustomFunctions
+      | SubTable::CustomFunctions1D
+      | SubTable::CustomFunctions2
+      | SubTable::PersonalFunctions
+      | SubTable::PersonalFunctionValues
+  ) {
     "CanonCustom"
   } else {
     group1
