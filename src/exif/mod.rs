@@ -10142,6 +10142,28 @@ trait ExifSink {
     name: &str,
     value: &[u8],
   ) -> Result<(), core::convert::Infallible>;
+  /// A single non-zero-denominator rational, PRESERVING the numerator/denominator
+  /// ([`TagValue::Rational`]). The default COLLAPSES it to the gated numeric
+  /// scalar — `exiftool_val_str` (`RoundFloat(n/d, sig)`) through the `EscapeJSON`
+  /// number gate, byte-identical to the pre-existing single-rational emit. The
+  /// value-storing [`EmittedTagSink`] OVERRIDES it to keep the [`TagValue::
+  /// Rational`] (whose serializer renders the SAME token, so the JSON output is
+  /// unchanged) so a downstream consumer can recover the raw num/den — the Canon
+  /// `Composite:ScaleFactor35efl` `CalcSensorDiag` (Canon.pm:10145) reads the
+  /// FocalPlaneX/YResolution rationals. Used ONLY for those two FocalPlane tags
+  /// (see [`emit_raw`]); every other rational keeps the collapsing path.
+  #[inline(always)]
+  fn write_rational(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: crate::value::Rational,
+  ) -> Result<(), core::convert::Infallible>
+  where
+    Self: Sized,
+  {
+    emit_gated_number(group, name, &value.exiftool_val_str(), self)
+  }
   /// Write an ALREADY-RENDERED vendor maker-note value under a FULL group
   /// (`family0`, `family1`) with its `Unknown=>1` flag, taking ExifTool's
   /// default duplicate `Priority => 1` (`ExifTool.pm:9553`). A provided method
@@ -10400,6 +10422,20 @@ impl ExifSink for EmittedTagSink<'_> {
     value: &[u8],
   ) -> Result<(), core::convert::Infallible> {
     self.push(group, name, crate::value::TagValue::Bytes(value.to_vec()));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_rational(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: crate::value::Rational,
+  ) -> Result<(), core::convert::Infallible> {
+    // Keep the raw rational (its serializer renders the SAME `RoundFloat`-rounded
+    // token a collapsed `F64`/`I64` would, so the JSON is byte-identical), so the
+    // Composite engine can recover the numerator/denominator — only the
+    // FocalPlaneX/YResolution tags reach here (see [`emit_raw`]).
+    self.push(group, name, crate::value::TagValue::Rational(value));
     Ok(())
   }
   #[inline(always)]
@@ -15623,6 +15659,19 @@ fn emit_raw<S: ExifSink>(
     }
     RawValue::Rational(rs) => {
       if let [r] = rs.as_slice() {
+        // FocalPlaneX/YResolution PRESERVE the raw rational (num/den) for the
+        // Canon `Composite:ScaleFactor35efl` `CalcSensorDiag` (Canon.pm:10145,
+        // which reads `$$et{TAG_EXTRA}{FocalPlaneXResolution}{Rational}` — the
+        // denominator is the sensor dimension). `write_rational` stores
+        // [`TagValue::Rational`] in the value-storing sink (its serializer
+        // renders the SAME `RoundFloat`-rounded token, so JSON is byte-identical)
+        // and COLLAPSES to the gated scalar in every other sink — but only for a
+        // non-zero denominator (a `0`-denom `inf`/`undef` has no num/den to
+        // preserve and stays the quoted word via the default collapse).
+        if matches!(name, "FocalPlaneXResolution" | "FocalPlaneYResolution") && r.denominator() != 0
+        {
+          return out.write_rational(group, name, *r);
+        }
         // A single rational — emit its ExifTool-rounded scalar
         // (`exiftool_val_str`) through the `EscapeJSON` number gate: a
         // non-zero-denominator quotient is always in-gate ⇒ a bare JSON number

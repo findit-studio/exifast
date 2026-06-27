@@ -428,6 +428,38 @@ pub(crate) enum CompositePrintConv {
   /// Sony.pm:10902) — the `"$val m"` distance string (or `"inf"`) under `-j`;
   /// the numeric `$val` (or the `"inf"` string) under `-n`.
   FocusDistance,
+  /// A small `%Canon::Composite` integer→label PrintConv hash
+  /// (`DriveMode`/`FlashType`/`RedEyeReduction`/`ShutterCurtainHack`,
+  /// Canon.pm:9990-10080). `-n` the bare ValueConv integer; `-j` the matched
+  /// label (a miss falls through to the bare integer — never reached by the
+  /// ported Canon fixtures, whose ValueConv results are always in the hash).
+  CanonHashPrint(&'static [(i64, &'static str)]),
+  /// `Composite:ShootingMode` PrintConv (Canon.pm:10027) — `$val eq "7" ? "Bulb"
+  /// : ($val[0] ? $prt[0] : $prt[1])`: `"Bulb"` for the bulb sentinel, else the
+  /// `CanonExposureMode` (`$prt[0]`) print value when that ingredient is truthy,
+  /// otherwise the `EasyMode` (`$prt[1]`) print. `-n` the bare ValueConv integer.
+  CanonShootingMode,
+  /// `Composite:Lens` PrintConv (`PrintFocalRange(@val)`, Canon.pm:9996) — the
+  /// min/max focal range (no scale). `-n` the bare `$val` (`= $val[0]`,
+  /// MinFocalLength).
+  CanonLens,
+  /// `Composite:Lens35efl` PrintConv (Canon.pm:10010) — `$prt[3] . ($val[2] ?
+  /// sprintf(" (35 mm equivalent: %s)", PrintFocalRange(@val)) : "")`: the
+  /// `Composite:Lens` print (`$prt[3]`) plus the scaled 35mm-equiv range when a
+  /// `ScaleFactor35efl` (`$val[2]`) is present. `-n` the bare `$val` (`$val[3] *
+  /// (scale||1)`).
+  CanonLens35efl,
+  /// `Composite:ISO` PrintConv (`sprintf("%.0f", $val)`, Canon.pm:10070) — the
+  /// rounded-integer string (a bare number through the `EscapeJSON` gate); `-n`
+  /// the bare ValueConv number.
+  CanonIso,
+  /// `Composite:ConditionalFEC` PrintConv (`$prt[0]`, Canon.pm:10052) — the
+  /// `FlashExposureComp` print value (`$prt[0]`); `-n` the ValueConv `$val[0]`
+  /// (carried verbatim as [`CompositeRaw::Scalar`]).
+  CanonConditionalFec,
+  /// `Composite:WB_RGGBLevels` (Canon.pm:10058) — the selected WB-level STRING,
+  /// identity PrintConv (both modes emit the `$val` string `"R G G B"`).
+  CanonWbRggbLevels,
 }
 
 impl CompositePrintConv {
@@ -830,6 +862,127 @@ impl CompositePrintConv {
         },
         CompositeRaw::Scalar(_) => TagValue::Str(Default::default()),
       },
+      CompositePrintConv::CanonHashPrint(map) => {
+        // `-n` the bare ValueConv integer; `-j` the matched label (else the bare
+        // integer, faithful to ExifTool returning `$val` on a hash miss).
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(n),
+          ConvMode::PrintConv => match map.iter().find(|(k, _)| *k == n as i64) {
+            Some((_, label)) => TagValue::Str((*label).into()),
+            None => crate::value::whole_f64_to_tag_value(n),
+          },
+        }
+      }
+      CompositePrintConv::CanonShootingMode => {
+        // `$val eq "7" ? "Bulb" : ($val[0] ? $prt[0] : $prt[1])`.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(n),
+          ConvMode::PrintConv if n as i64 == 7 => TagValue::Str("Bulb".into()),
+          ConvMode::PrintConv => {
+            // `$val[0] ? $prt[0] : $prt[1]` — CanonExposureMode (idx 0) truthy
+            // picks its print, else EasyMode's (idx 1).
+            let idx = if vals.first().is_some_and(CompositeValue::is_truthy) {
+              0
+            } else {
+              1
+            };
+            prts
+              .get(idx)
+              .and_then(Option::as_ref)
+              .cloned()
+              .unwrap_or_else(|| TagValue::Str(Default::default()))
+          }
+        }
+      }
+      CompositePrintConv::CanonLens => {
+        // ValueConv `$val` = `$val[0]` (MinFocalLength); PrintConv
+        // `PrintFocalRange(@val)` over MinFocalLength (`$val[0]`)/MaxFocalLength
+        // (`$val[1]`), no scale.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(n),
+          ConvMode::PrintConv => {
+            let min = vals
+              .first()
+              .and_then(CompositeValue::coerce_numeric)
+              .unwrap_or(0.0);
+            let max = vals
+              .get(1)
+              .and_then(CompositeValue::coerce_numeric)
+              .unwrap_or(0.0);
+            TagValue::Str(crate::composite::convs::lens::print_focal_range(min, max, 0.0).into())
+          }
+        }
+      }
+      CompositePrintConv::CanonLens35efl => {
+        // ValueConv `$val` = `$val[3] * (scale||1)`; PrintConv `$prt[3] . ($val[2]
+        // ? " (35 mm equivalent: <range>)" : "")`.
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => TagValue::F64(n),
+          ConvMode::PrintConv => {
+            let prt3 = prts
+              .get(3)
+              .and_then(Option::as_ref)
+              .map(crate::composite::value_text)
+              .unwrap_or_default();
+            let scale = vals.get(2).and_then(CompositeValue::coerce_numeric);
+            let out = match scale {
+              Some(sc) if sc != 0.0 => {
+                let min = vals
+                  .first()
+                  .and_then(CompositeValue::coerce_numeric)
+                  .unwrap_or(0.0);
+                let max = vals
+                  .get(1)
+                  .and_then(CompositeValue::coerce_numeric)
+                  .unwrap_or(0.0);
+                std::format!(
+                  "{prt3} (35 mm equivalent: {})",
+                  crate::composite::convs::lens::print_focal_range(min, max, sc)
+                )
+              }
+              _ => prt3.into_owned(),
+            };
+            TagValue::Str(out.into())
+          }
+        }
+      }
+      CompositePrintConv::CanonIso => {
+        // ValueConv numeric; PrintConv `sprintf("%.0f", $val)` (a bare number
+        // through the `EscapeJSON` gate).
+        let n = raw.as_num().unwrap_or(f64::NAN);
+        match mode {
+          ConvMode::ValueConv => crate::value::whole_f64_to_tag_value(n),
+          ConvMode::PrintConv => TagValue::Str(std::format!("{n:.0}").into()),
+        }
+      }
+      CompositePrintConv::CanonConditionalFec => {
+        // ValueConv `$val[0]` (the FlashExposureComp operand, carried as
+        // `Scalar`); PrintConv `$prt[0]` (its print value).
+        match mode {
+          ConvMode::ValueConv => match raw {
+            CompositeRaw::Scalar(v) => v.clone(),
+            CompositeRaw::Num(x) => TagValue::F64(*x),
+            CompositeRaw::Text(s) => TagValue::Str(s.as_str().into()),
+          },
+          ConvMode::PrintConv => prts
+            .first()
+            .and_then(Option::as_ref)
+            .cloned()
+            .unwrap_or_else(|| TagValue::Str(Default::default())),
+        }
+      }
+      CompositePrintConv::CanonWbRggbLevels => {
+        // Identity (no PrintConv) — the selected WB-level string in both modes.
+        match raw {
+          CompositeRaw::Scalar(v) => v.clone(),
+          CompositeRaw::Text(s) => TagValue::Str(s.as_str().into()),
+          CompositeRaw::Num(x) => TagValue::F64(*x),
+        }
+      }
     }
   }
 }
@@ -3071,6 +3224,399 @@ const LIGHT_VALUE: CompositeDef = CompositeDef {
   sort_key: "Composite-LightValue",
 };
 
+// ── %Image::ExifTool::Canon::Composite (Canon.pm:9988-10090) ─────────────────
+// The Canon MakerNote-derived camera Composites. Each `Require`/`Desire`
+// resolves a Canon MakerNote leaf's RAW (ValueConv) value `$val[i]` — for the
+// EOS-R CR3 these live at family-1 `Canon` (the CMT3 still MakerNote, doc 0); a
+// minimal CRX (`CanonRaw_ctmd.cr3`) carries them only on a `Track<N>` timed
+// doc, reached by the bare-name cross-document fallback.
+
+/// `Composite:DriveMode` ValueConv (Canon.pm:9991) `$val[0] ? 0 : ($val[1] ? 1
+/// : 2)`. `$val[0]`=ContinuousDrive, `$val[1]`=SelfTimer (both `Require`d, so
+/// present here); the first truthy selects Continuous (0) / Self-timer (1),
+/// else Single-frame (2).
+#[cfg(feature = "exif")]
+fn canon_drive_mode(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let cont = v.first()?.is_truthy();
+  let timer = v.get(1)?.is_truthy();
+  let mode = if cont {
+    0.0
+  } else if timer {
+    1.0
+  } else {
+    2.0
+  };
+  Some(CompositeRaw::Num(mode))
+}
+
+/// `Composite:Lens` ValueConv `$val[0]` (Canon.pm:9996) — MinFocalLength (the
+/// range bounds drive the `PrintFocalRange` PrintConv from `$val[0]`/`$val[1]`).
+#[cfg(feature = "exif")]
+fn canon_lens(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  Some(CompositeRaw::Num(v.first()?.coerce_numeric()?))
+}
+
+/// `Composite:Lens35efl` ValueConv `$val[3] * ($val[2] ? $val[2] : 1)`
+/// (Canon.pm:10018). `$val[3]`=`Composite:Lens` (MinFocalLength), `$val[2]`=
+/// `Composite:ScaleFactor35efl` (Desire — `1` when absent).
+#[cfg(feature = "exif")]
+fn canon_lens35efl(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let lens = v.get(3)?.coerce_numeric()?;
+  let scale = match v.get(2).and_then(CompositeValue::coerce_numeric) {
+    Some(s) if s != 0.0 => s,
+    _ => 1.0,
+  };
+  Some(CompositeRaw::Num(lens * scale))
+}
+
+/// `Composite:ShootingMode` ValueConv (Canon.pm:10033) `$val[0] ? (($val[0] eq
+/// "4" and $val[2]) ? 7 : $val[0]) : $val[1] + 10`. `$val[0]`=CanonExposureMode,
+/// `$val[1]`=EasyMode, `$val[2]`=BulbDuration (Desire). The `eq "4"` bulb
+/// special-case tests the RAW value in string context.
+#[cfg(feature = "exif")]
+fn canon_shooting_mode(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let exposure = v.first()?;
+  if exposure.is_truthy() {
+    let m = exposure.coerce_numeric()?;
+    let is_four = exposure
+      .value()
+      .is_some_and(|v| crate::composite::value_text(v) == "4");
+    let bulb = v.get(2).is_some_and(CompositeValue::is_truthy);
+    Some(CompositeRaw::Num(if is_four && bulb { 7.0 } else { m }))
+  } else {
+    let easy = v.get(1)?.coerce_numeric()?;
+    Some(CompositeRaw::Num(easy + 10.0))
+  }
+}
+
+/// `Composite:FlashType` RawConv `$val[0] ? $val : undef`, ValueConv
+/// `$val[0]&(1<<14)? 1 : 0` (Canon.pm:10043). Built only when FlashBits
+/// (`$val[0]`) is truthy; bit 14 distinguishes External (1) from Built-In (0).
+#[cfg(feature = "exif")]
+fn canon_flash_type(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let bits = v.first()?;
+  // RawConv `$val[0] ? $val : undef` — no FlashBits ⇒ no composite.
+  if !bits.is_truthy() {
+    return None;
+  }
+  let n = bits.coerce_numeric()? as i64;
+  Some(CompositeRaw::Num(if n & (1 << 14) != 0 {
+    1.0
+  } else {
+    0.0
+  }))
+}
+
+/// `Composite:RedEyeReduction` RawConv `$val[1] ? $val : undef`, ValueConv
+/// `($val[0]==3 or $val[0]==4 or $val[0]==6) ? 1 : 0` (Canon.pm:10049).
+/// `$val[0]`=CanonFlashMode, `$val[1]`=FlashBits (the build gate).
+#[cfg(feature = "exif")]
+fn canon_red_eye_reduction(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let flash_mode = v.first()?;
+  let bits = v.get(1)?;
+  if !bits.is_truthy() {
+    return None;
+  }
+  let m = flash_mode.coerce_numeric()? as i64;
+  Some(CompositeRaw::Num(if m == 3 || m == 4 || m == 6 {
+    1.0
+  } else {
+    0.0
+  }))
+}
+
+/// `Composite:ConditionalFEC` RawConv `$val[1] ? $val : undef`, ValueConv
+/// `$val[0]` (Canon.pm:10054). `$val[0]`=FlashExposureComp (carried verbatim as
+/// the print is `$prt[0]`), `$val[1]`=FlashBits (the build gate).
+#[cfg(feature = "exif")]
+fn canon_conditional_fec(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let fec = v.first()?;
+  let bits = v.get(1)?;
+  if !bits.is_truthy() {
+    return None;
+  }
+  Some(CompositeRaw::Scalar(fec.value()?.clone()))
+}
+
+/// `Composite:ShutterCurtainHack` RawConv `$val[1] ? $val : undef`, ValueConv
+/// `defined($val[0]) ? $val[0] : 0` (Canon.pm:10066). `$val[0]`=ShutterCurtainSync
+/// (Desire — `0` when absent, the "assume 1st-curtain" hack), `$val[1]`=FlashBits.
+#[cfg(feature = "exif")]
+fn canon_shutter_curtain_hack(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  let bits = v.get(1)?;
+  if !bits.is_truthy() {
+    return None;
+  }
+  let sync = v.first().and_then(CompositeValue::coerce_numeric);
+  Some(CompositeRaw::Num(sync.unwrap_or(0.0)))
+}
+
+/// `Composite:WB_RGGBLevels` ValueConv `$val[1] ? $val[1] : $val[($val[0] || 0)
+/// + 2]` (Canon.pm:10058). `$val[0]`=Canon:WhiteBalance (Require), `$val[1]`=
+/// WB_RGGBLevelsAsShot; absent an AsShot the WhiteBalance value indexes the
+/// per-preset WB level (Canon.pm's `Canon:WhiteBalance + 2` mapping, with the
+/// index-9 gap — WhiteBalance 7 has no preset). The selected WB-level STRING is
+/// carried verbatim (identity PrintConv).
+#[cfg(feature = "exif")]
+fn canon_wb_rggb_levels(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `$val[1] ? $val[1]` — a truthy AsShot wins.
+  if let Some(as_shot) = v.get(1)
+    && as_shot.is_truthy()
+  {
+    return Some(CompositeRaw::Scalar(as_shot.value()?.clone()));
+  }
+  // `$val[($val[0] || 0) + 2]` — index by WhiteBalance. The exifast input slice
+  // is compact (the ExifTool index-9 gap is dropped), so map the WhiteBalance
+  // value to the corresponding compact Desire position (2..=10).
+  let wb = v
+    .first()
+    .and_then(CompositeValue::coerce_numeric)
+    .unwrap_or(0.0) as i64;
+  let idx = match wb {
+    0..=6 => (wb + 2) as usize, // Auto..Custom — same compact position
+    8 => 9,                     // Shade (ExifTool index 10)
+    9 => 10,                    // Kelvin (ExifTool index 11)
+    _ => return None,           // 7 (gap) / out of range ⇒ undef
+  };
+  Some(CompositeRaw::Scalar(v.get(idx)?.value()?.clone()))
+}
+
+/// `Composite:ISO` ValueConv (Canon.pm:10074): `return $val[0] if $val[0] and
+/// $val[0]=~/^\d+$/; return undef unless $val[1] and $val[2]; return $val[1] *
+/// $val[2] / 100`. `$val[0]`=CameraISO, `$val[1]`=BaseISO, `$val[2]`=AutoISO (all
+/// Desire). `Priority => 0` (lets EXIF:ISO take the bare-name precedence).
+#[cfg(feature = "exif")]
+fn canon_iso(
+  v: &[CompositeValue],
+  _prts: &[Option<TagValue>],
+  _ctx: &CompositeContext,
+) -> Option<CompositeRaw> {
+  // `return $val[0] if $val[0] and $val[0] =~ /^\d+$/` — a present all-digit
+  // CameraISO is used verbatim (numeric).
+  if let Some(cam) = v.first()
+    && cam.is_truthy()
+    && let Some(text) = cam.as_text()
+    && !text.is_empty()
+    && text.bytes().all(|b| b.is_ascii_digit())
+  {
+    return cam.coerce_numeric().map(CompositeRaw::Num);
+  }
+  // `return undef unless $val[1] and $val[2]` then `$val[1] * $val[2] / 100`.
+  let base = v.get(1)?;
+  let auto = v.get(2)?;
+  if !base.is_truthy() || !auto.is_truthy() {
+    return None;
+  }
+  Some(CompositeRaw::Num(
+    base.coerce_numeric()? * auto.coerce_numeric()? / 100.0,
+  ))
+}
+
+/// `%Canon::Composite` `DriveMode` PrintConv hash.
+#[cfg(feature = "exif")]
+const CANON_DRIVE_MODE_PC: &[(i64, &str)] = &[
+  (0, "Continuous Shooting"),
+  (1, "Self-timer Operation"),
+  (2, "Single-frame Shooting"),
+];
+
+#[cfg(feature = "exif")]
+const CANON_DRIVE_MODE: CompositeDef = CompositeDef {
+  name: "DriveMode",
+  inputs: &[bare_req("ContinuousDrive"), bare_req("SelfTimer")],
+  derive: canon_drive_mode,
+  print_conv: CompositePrintConv::CanonHashPrint(CANON_DRIVE_MODE_PC),
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-DriveMode",
+};
+
+#[cfg(feature = "exif")]
+const CANON_LENS: CompositeDef = CompositeDef {
+  name: "Lens",
+  inputs: &[
+    req(&["Canon"], "MinFocalLength"),
+    req(&["Canon"], "MaxFocalLength"),
+  ],
+  derive: canon_lens,
+  print_conv: CompositePrintConv::CanonLens,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-Lens",
+};
+
+#[cfg(feature = "exif")]
+const CANON_LENS_35EFL: CompositeDef = CompositeDef {
+  name: "Lens35efl",
+  // ExifTool index order: 0/1 = Min/MaxFocalLength (Require), 2 = ScaleFactor35efl
+  // (Desire, Composite-qualified for the dependency deferral), 3 = Lens (Require,
+  // the Canon `Composite:Lens`).
+  inputs: &[
+    req(&["Canon"], "MinFocalLength"),
+    req(&["Canon"], "MaxFocalLength"),
+    des(&["Composite"], "ScaleFactor35efl"),
+    req(&["Composite"], "Lens"),
+  ],
+  derive: canon_lens35efl,
+  print_conv: CompositePrintConv::CanonLens35efl,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-Lens35efl",
+};
+
+#[cfg(feature = "exif")]
+const CANON_SHOOTING_MODE: CompositeDef = CompositeDef {
+  name: "ShootingMode",
+  inputs: &[
+    bare_req("CanonExposureMode"),
+    bare_req("EasyMode"),
+    bare_des("BulbDuration"),
+  ],
+  derive: canon_shooting_mode,
+  print_conv: CompositePrintConv::CanonShootingMode,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-ShootingMode",
+};
+
+/// `%Canon::Composite` `FlashType` PrintConv hash.
+#[cfg(feature = "exif")]
+const CANON_FLASH_TYPE_PC: &[(i64, &str)] = &[(0, "Built-In Flash"), (1, "External")];
+
+#[cfg(feature = "exif")]
+const CANON_FLASH_TYPE: CompositeDef = CompositeDef {
+  name: "FlashType",
+  inputs: &[bare_req("FlashBits")],
+  derive: canon_flash_type,
+  print_conv: CompositePrintConv::CanonHashPrint(CANON_FLASH_TYPE_PC),
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-FlashType",
+};
+
+/// `%Canon::Composite` `RedEyeReduction` PrintConv hash.
+#[cfg(feature = "exif")]
+const CANON_RED_EYE_PC: &[(i64, &str)] = &[(0, "Off"), (1, "On")];
+
+#[cfg(feature = "exif")]
+const CANON_RED_EYE_REDUCTION: CompositeDef = CompositeDef {
+  name: "RedEyeReduction",
+  inputs: &[bare_req("CanonFlashMode"), bare_req("FlashBits")],
+  derive: canon_red_eye_reduction,
+  print_conv: CompositePrintConv::CanonHashPrint(CANON_RED_EYE_PC),
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-RedEyeReduction",
+};
+
+#[cfg(feature = "exif")]
+const CANON_CONDITIONAL_FEC: CompositeDef = CompositeDef {
+  name: "ConditionalFEC",
+  inputs: &[bare_req("FlashExposureComp"), bare_req("FlashBits")],
+  derive: canon_conditional_fec,
+  print_conv: CompositePrintConv::CanonConditionalFec,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-ConditionalFEC",
+};
+
+/// `%Canon::Composite` `ShutterCurtainHack` PrintConv hash.
+#[cfg(feature = "exif")]
+const CANON_SHUTTER_CURTAIN_PC: &[(i64, &str)] =
+  &[(0, "1st-curtain sync"), (1, "2nd-curtain sync")];
+
+#[cfg(feature = "exif")]
+const CANON_SHUTTER_CURTAIN_HACK: CompositeDef = CompositeDef {
+  name: "ShutterCurtainHack",
+  // ExifTool index order: 0 = ShutterCurtainSync (Desire), 1 = FlashBits (Require).
+  inputs: &[bare_des("ShutterCurtainSync"), bare_req("FlashBits")],
+  derive: canon_shutter_curtain_hack,
+  print_conv: CompositePrintConv::CanonHashPrint(CANON_SHUTTER_CURTAIN_PC),
+  sub_doc: SubDoc::No,
+  priority: 1,
+  sort_key: "Canon-ShutterCurtainHack",
+};
+
+#[cfg(feature = "exif")]
+const CANON_WB_RGGB_LEVELS: CompositeDef = CompositeDef {
+  name: "WB_RGGBLevels",
+  // 0 = Canon:WhiteBalance (Require); 1..=10 = the WB-level Desires (the
+  // ExifTool index-9 gap dropped — `canon_wb_rggb_levels` maps WhiteBalance to
+  // the compact position).
+  inputs: &[
+    req(&["Canon"], "WhiteBalance"),
+    bare_des("WB_RGGBLevelsAsShot"),
+    bare_des("WB_RGGBLevelsAuto"),
+    bare_des("WB_RGGBLevelsDaylight"),
+    bare_des("WB_RGGBLevelsCloudy"),
+    bare_des("WB_RGGBLevelsTungsten"),
+    bare_des("WB_RGGBLevelsFluorescent"),
+    bare_des("WB_RGGBLevelsFlash"),
+    bare_des("WB_RGGBLevelsCustom"),
+    bare_des("WB_RGGBLevelsShade"),
+    bare_des("WB_RGGBLevelsKelvin"),
+  ],
+  derive: canon_wb_rggb_levels,
+  print_conv: CompositePrintConv::CanonWbRggbLevels,
+  sub_doc: SubDoc::No,
+  priority: 1,
+  // Sorts before `Exif-RedBalance`/`Exif-BlueBalance` (which Desire the bare-name
+  // `WB_RGGBLevels` with NO dependency deferral), so it builds first.
+  sort_key: "Canon-WB_RGGBLevels",
+};
+
+#[cfg(feature = "exif")]
+const CANON_ISO: CompositeDef = CompositeDef {
+  name: "ISO",
+  inputs: &[
+    des(&["Canon"], "CameraISO"),
+    des(&["Canon"], "BaseISO"),
+    des(&["Canon"], "AutoISO"),
+  ],
+  derive: canon_iso,
+  print_conv: CompositePrintConv::CanonIso,
+  sub_doc: SubDoc::No,
+  // Canon.pm:10071 `Priority => 0` — lets EXIF:ISO take the bare-name precedence.
+  priority: 0,
+  sort_key: "Canon-ISO",
+};
+
 /// `Composite:AvgBitrate` (QuickTime.pm:8649). `Require`s `QuickTime:
 /// MediaDataSize` + `QuickTime:Duration`. `Priority => 0` (lets the
 /// `QuickTime::AvgBitrate` track tag take precedence when both exist). The
@@ -3243,6 +3789,27 @@ pub(crate) const REGISTRY: &[CompositeDef] = &[
   FOV,
   #[cfg(feature = "exif")]
   LIGHT_VALUE,
+  // %Canon::Composite — the Canon MakerNote-derived camera Composites.
+  #[cfg(feature = "exif")]
+  CANON_DRIVE_MODE,
+  #[cfg(feature = "exif")]
+  CANON_LENS,
+  #[cfg(feature = "exif")]
+  CANON_LENS_35EFL,
+  #[cfg(feature = "exif")]
+  CANON_SHOOTING_MODE,
+  #[cfg(feature = "exif")]
+  CANON_FLASH_TYPE,
+  #[cfg(feature = "exif")]
+  CANON_RED_EYE_REDUCTION,
+  #[cfg(feature = "exif")]
+  CANON_CONDITIONAL_FEC,
+  #[cfg(feature = "exif")]
+  CANON_SHUTTER_CURTAIN_HACK,
+  #[cfg(feature = "exif")]
+  CANON_WB_RGGB_LEVELS,
+  #[cfg(feature = "exif")]
+  CANON_ISO,
   #[cfg(feature = "quicktime")]
   AVG_BITRATE,
   #[cfg(feature = "quicktime")]

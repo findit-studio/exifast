@@ -10617,6 +10617,30 @@ fn canon_eos_7d_conformance() {
     assert!(got.contains(needle), "EOS 7D must emit {needle}: {got}",);
   }
 }
+
+#[test]
+fn canon_eos_r_cr3_conformance() {
+  // The remaining deferred keys (shrunk as the CRX-preview + Track4-niche ports
+  // land). `Composite:LensID` stays deferred (the Canon RF-lens disambiguation —
+  // see `FIXTURE_EXCLUDED_KEYS` in `tests/typed_serde_parity.rs`).
+  const CR3_DEFERRED: &[&str] = &[
+    "Composite:LensID",
+    "Canon:ThumbnailImage",
+    "CanonCustom:ApertureRange",
+    "CanonCustom:ShutterSpeedRange",
+    "QuickTime:PreviewImage",
+    "Track1:JpgFromRaw",
+    "Track1:SampleDuration",
+    "Track1:SampleTime",
+    "Track4:AFPointsSelected",
+    "Track4:PrimaryAFPoint",
+    "Track4:CameraTemperature",
+    "Track4:VignettingCorrVersion",
+  ];
+  check_excluding("CanonEOSR.cr3", "CanonEOSR.cr3.json", true, CR3_DEFERRED);
+  check_excluding("CanonEOSR.cr3", "CanonEOSR.cr3.n.json", false, CR3_DEFERRED);
+}
+
 #[test]
 #[ignore = "DNG_preview_image.dng's full -G1 golden is not byte-exact because \
             `IFD0:DNGVersion` (0xc612) is not yet an emitted leaf (a deferred \
