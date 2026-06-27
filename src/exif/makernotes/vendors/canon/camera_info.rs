@@ -83,6 +83,8 @@ pub fn parse(
     camera_info_40d(data, order, print_conv, canon_lens_type)
   } else if model_is_camera_info_50d(model) {
     camera_info_50d(data, order, print_conv)
+  } else if model_is_camera_info_60d(model) {
+    camera_info_60d(data, order, print_conv, model)
   } else if model_is_camera_info_450d(model) {
     camera_info_450d(data, order, print_conv, canon_lens_type)
   } else if model_is_camera_info_500d(model) {
@@ -108,6 +110,27 @@ pub fn model_is_camera_info_40d(model: Option<&str>) -> bool {
 #[must_use]
 pub fn model_is_camera_info_50d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 50D"))
+}
+
+/// `true` when `model` selects `%Canon::CameraInfo60D` — either the 60D proper
+/// (`Canon.pm:1377`, `$$self{Model} =~ /EOS 60D$/`) or the 1200D alias
+/// (`Canon.pm:1442`, `/\b(1200D|REBEL T5|Kiss X70)\b/`), which share the table.
+#[must_use]
+pub fn model_is_camera_info_60d(model: Option<&str>) -> bool {
+  model_is_60d_proper(model) || model_is_1200d(model)
+}
+
+/// The 60D proper (`/EOS 60D$/`) — gates the 60D-only rows of `%CameraInfo60D`.
+fn model_is_60d_proper(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 60D"))
+}
+
+/// The 1200D alias (`/\b(1200D|REBEL T5|Kiss X70)\b/`) — gates the 1200D-only
+/// rows of `%CameraInfo60D`.
+fn model_is_1200d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| {
+    word_bounded(m, "1200D") || word_bounded(m, "REBEL T5") || word_bounded(m, "Kiss X70")
+  })
 }
 
 /// `true` when `model` selects `%Canon::CameraInfo450D` (`Canon.pm:1391`,
@@ -768,6 +791,92 @@ fn canon_firm_50d(data: &[u8]) -> u8 {
   } else {
     0
   }
+}
+
+/// `%Canon::CameraInfo60D` (`Canon.pm:4719-4815`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Shared by the 60D and 1200D (`Canon.pm`
+/// `0x0d` aliases both onto this table) — several rows carry per-model
+/// `Condition`s: the `CameraOrientation` lives at 0x36 (60D) vs 0x3a (1200D), and
+/// `FocusDistance*`/`ColorTemperature`/`FileIndex`/`DirectoryIndex` are 60D-only.
+/// The `PictureStyleInfo` `IS_SUBDIR` (`%PSInfo2`) is at 0x2f9 (1200D) / 0x321
+/// (60D).
+fn camera_info_60d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let is_60d = model_is_60d_proper(model);
+  let is_1200d = model_is_1200d(model);
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  if is_60d {
+    emit_camera_orientation(data, 0x36, print_conv, &mut push);
+  }
+  if is_1200d {
+    emit_camera_orientation(data, 0x3a, print_conv, &mut push);
+  }
+  if is_60d {
+    emit_focus_distance(
+      data,
+      0x55,
+      "FocusDistanceUpper",
+      order,
+      print_conv,
+      &mut push,
+    );
+    emit_focus_distance(
+      data,
+      0x57,
+      "FocusDistanceLower",
+      order,
+      print_conv,
+      &mut push,
+    );
+    emit_color_temperature(data, 0x7d, order, &mut push);
+  }
+  emit_lens_type(data, 0xe8, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0xea,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0xec,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x199, false, &mut push);
+  if is_60d {
+    emit_file_index(data, 0x1d9, order, &mut push);
+    emit_directory_index(data, 0x1e5, order, true, &mut push);
+  }
+  if is_1200d {
+    ps_info2(data, 0x2f9, order, print_conv, &mut push);
+  }
+  if is_60d {
+    ps_info2(data, 0x321, order, print_conv, &mut push);
+  }
+  out
 }
 
 /// `%Canon::CameraInfo450D` (`Canon.pm:5042-5130`). `FORMAT => 'int8u'`,
@@ -2155,13 +2264,14 @@ mod tests {
     assert!(model_is_camera_info_7d(Some("Canon EOS 7D")));
     assert!(!model_is_camera_info_7d(Some("Canon EOS 7D Mark II")));
     assert!(!model_is_camera_info_7d(Some("Canon EOS 5D")));
-    // A model handled by neither table yields nothing.
+    // A model handled by neither table yields nothing (5D Mark II is not yet
+    // ported; the 60D/etc. are now handled, so a still-unported model is used).
     assert!(
       parse(
         &[0u8; 0x120],
         ByteOrder::Little,
         true,
-        Some("Canon EOS 60D"),
+        Some("Canon EOS 5D Mark II"),
         None
       )
       .is_empty()
@@ -2639,5 +2749,96 @@ mod tests {
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
     assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
+  }
+
+  #[test]
+  fn dispatch_60d_1200d() {
+    assert!(model_is_camera_info_60d(Some("Canon EOS 60D")));
+    assert!(model_is_camera_info_60d(Some("Canon EOS 1200D")));
+    assert!(model_is_camera_info_60d(Some("Canon EOS REBEL T5")));
+    assert!(model_is_camera_info_60d(Some("Canon EOS Kiss X70")));
+    // REBEL T5 (1200D) is distinct from REBEL T5i (700D).
+    assert!(!model_is_camera_info_60d(Some("Canon EOS REBEL T5i")));
+    // /EOS 60D$/ must NOT match the 6D.
+    assert!(!model_is_camera_info_60d(Some("Canon EOS 6D")));
+    // per-model discriminators used inside the table:
+    assert!(model_is_60d_proper(Some("Canon EOS 60D")));
+    assert!(!model_is_60d_proper(Some("Canon EOS 1200D")));
+    assert!(model_is_1200d(Some("Canon EOS 1200D")));
+    assert!(!model_is_1200d(Some("Canon EOS 60D")));
+  }
+
+  /// `%Canon::CameraInfo60D` shared 60D/1200D table: the per-model
+  /// `CameraOrientation` offset (0x36 vs 0x3a), the 60D-only FocusDistance/
+  /// ColorTemperature/File/Dir rows, and the `%PSInfo2` subdir at 0x321 (60D) vs
+  /// 0x2f9 (1200D).
+  #[test]
+  fn camera_info_60d_and_1200d_alias() {
+    let mut b = vec![0u8; 0x420];
+    b[0x06] = 88; // ISO 400
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50
+    b[0x36] = 2; // CameraOrientation 60D -> Rotate 270 CW
+    b[0x3a] = 1; // CameraOrientation 1200D -> Rotate 90 CW
+    b[0x55] = 0x01;
+    b[0x56] = 0xf4; // FocusDistanceUpper 500 -> 5 m (60D only)
+    b[0x57] = 0x01;
+    b[0x58] = 0x2c; // FocusDistanceLower 300 -> 3 m (60D only)
+    b[0x7d] = 0x50;
+    b[0x7e] = 0x14; // ColorTemperature 5200 (60D only)
+    b[0xe8] = 0x00;
+    b[0xe9] = 0x01; // LensType int16uRev = 1 (-n)
+    b[0xea] = 0x00;
+    b[0xeb] = 0x0a; // MinFocalLength 10
+    b[0xec] = 0x00;
+    b[0xed] = 0xc8; // MaxFocalLength 200
+    b[0x199..0x19f].copy_from_slice(b"2.8.1\0"); // FirmwareVersion (no guard, both)
+    b[0x1d9..0x1dd].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101 (60D only)
+    b[0x1e5..0x1e9].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99 (60D only)
+    b[0x2f9..0x2fd].copy_from_slice(&5i32.to_le_bytes()); // PSInfo2(1200D) ContrastStandard
+    b[0x321..0x325].copy_from_slice(&3i32.to_le_bytes()); // PSInfo2(60D) ContrastStandard
+
+    // 60D proper:
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 60D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 270 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("2.8.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(101)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(3))); // from 0x321
+
+    // 1200D alias:
+    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1200D"), None);
+    let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find2("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into())) // 0x3a
+    );
+    assert_eq!(
+      find2("FirmwareVersion"),
+      Some(TagValue::Str("2.8.1".into()))
+    );
+    assert_eq!(find2("ContrastStandard"), Some(TagValue::I64(5))); // from 0x2f9
+    // 60D-only rows are absent for the 1200D.
+    assert!(find2("FocusDistanceUpper").is_none());
+    assert!(find2("FocusDistanceLower").is_none());
+    assert!(find2("ColorTemperature").is_none());
+    assert!(find2("FileIndex").is_none());
+    assert!(find2("DirectoryIndex").is_none());
   }
 }
