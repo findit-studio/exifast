@@ -99,6 +99,7 @@ pub mod tag9401;
 pub mod tag9402;
 pub mod tag9403;
 pub mod tag9404;
+pub mod tag9405;
 pub mod tag9406;
 pub mod tag940a;
 pub mod tag940c;
