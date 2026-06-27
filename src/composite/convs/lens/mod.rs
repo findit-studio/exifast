@@ -26,19 +26,24 @@
 //! `3.14159` (Exif.pm:4932 — a TRUNCATED pi, NOT `std::f64::consts::PI`) is
 //! carried verbatim.
 //!
-//! ## The deferred Canon branch
+//! ## The Canon `CalcSensorDiag` branch
 //!
 //! `CalcScaleFactor35efl` (Exif.pm:5464) has a `Make eq 'Canon'` branch that
-//! refines the sensor diagonal via `Canon::CalcSensorDiag`. [`calc_scale_factor_35efl`]
-//! ports the GENERIC path only and signals the Canon case via
-//! [`ScaleFactorOutcome::CanonBranch`] so the engine can DEFER a Canon fixture's
-//! `ScaleFactor35efl` rather than emit a wrong value. The allow-listed lens
-//! fixtures all take the simplest `$foc35 / $focal` path (they carry BOTH
-//! `FocalLength` and `FocalLengthIn35mmFormat`), so the Canon branch is reached
-//! by no built golden — the only `Make eq 'Canon'` still (`Exif.tif`) has no
-//! `FocalLengthIn35mmFormat`, so bundled ExifTool itself emits NO
-//! `ScaleFactor35efl` for it (its `FocalLength35efl` comes from `FocalLength`
-//! alone).
+//! refines the sensor diagonal via `Canon::CalcSensorDiag` (Canon.pm:10145),
+//! which reads the on-disk `FocalPlaneX/YResolution` RATIONALS (`$$et{TAG_EXTRA}
+//! {…}{Rational}` — the denominator is the sensor dimension). [`canon_sensor_diag`]
+//! ports it: it reads the [`TagValue::Rational`](crate::value::TagValue::Rational)
+//! the EXIF leaf path preserves for those two tags (see `exif::mod::emit_raw` /
+//! `ExifSink::write_rational`). When `CalcSensorDiag` succeeds,
+//! [`calc_scale_factor_35efl`] returns the refined factor (`sqrt(36²+24²) * digz
+//! / diag`), so a Canon body with the FocalPlane rationals (the EOS-R CR3) now
+//! computes `ScaleFactor35efl` byte-exact. It still signals
+//! [`ScaleFactorOutcome::CanonBranch`] (the engine DEFERS) ONLY when the
+//! rationals are absent or collapsed (a non-EXIF source — e.g. the XMP
+//! `ConvertRational` decimal that drops the num/den), where the generic path
+//! would diverge from bundled. The simplest `$foc35 / $focal` path (a body
+//! carrying both `FocalLength` and `FocalLengthIn35mmFormat`) still short-circuits
+//! before the Canon branch.
 
 #[cfg(feature = "alloc")]
 use crate::composite::table::CompositeValue;
@@ -381,17 +386,34 @@ pub(crate) fn calc_scale_factor_35efl(
     return ScaleFactorOutcome::Factor(f35 / fo);
   }
 
-  // The Canon branch refines `$diag` via Canon::CalcSensorDiag; DEFER (the
-  // generic math below would produce a wrong factor for a Canon body).
-  if is_canon {
-    return ScaleFactorOutcome::CanonBranch;
-  }
-
-  // `$digz = shift || 1` — DigitalZoom (Perl-truthy default 1).
+  // `$digz = shift || 1` — DigitalZoom (Perl-truthy default 1). Shifted BEFORE
+  // the Canon branch (Exif.pm:5462), so it scales the Canon `CalcSensorDiag`
+  // result too.
   let digz = match inputs.digital_zoom.and_then(to_float) {
     Some(z) if perl_truthy_f64(z) => z,
     _ => 1.0,
   };
+
+  // `if ($$et{Make} eq 'Canon') { my $canonDiag = CalcSensorDiag($et); $diag =
+  // $canonDiag if $canonDiag; }` (Exif.pm:5466-5470). Canon::CalcSensorDiag
+  // (Canon.pm:10145) computes the sensor diagonal from the RAW FocalPlaneX/Y
+  // Resolution rationals (the denominator is the sensor dimension in inches *
+  // 1000). When it succeeds, `$diag` is set ⇒ the `unless ($diag …)` generic
+  // block is SKIPPED ⇒ `return sqrt(36*36+24*24) * $digz / $diag`.
+  if is_canon {
+    return match canon_sensor_diag(inputs) {
+      Some(d) => ScaleFactorOutcome::Factor(frame_diag_35mm() * digz / d),
+      // `CalcSensorDiag` returned undef. ExifTool then falls through to the
+      // generic `$diag` math — BUT exifast only reaches that with the raw
+      // rationals available (the FocalPlaneX/YResolution emit preserves them ONLY
+      // for the EXIF leaf path). When they are absent or collapsed (a non-EXIF
+      // source — the XMP `ConvertRational` decimal, or no FocalPlane data at all),
+      // the generic path would diverge from bundled (which DID read the rational),
+      // so DEFER, exactly as before this port. The EXIF Canon bodies that DO
+      // carry the rationals reach the `Some(d)` arm.
+      None => ScaleFactorOutcome::CanonBranch,
+    };
+  }
   // `$diag = shift` — FocalPlaneDiagonal; `$sens = shift` — SensorSize (numeric).
   let mut diag = inputs.focal_plane_diagonal.and_then(to_float);
   let sens = inputs.sensor_size.and_then(to_float);
@@ -440,6 +462,75 @@ pub(crate) fn calc_scale_factor_35efl(
     Some(d) => ScaleFactorOutcome::Factor(frame_diag_35mm() * digz / d),
     None => ScaleFactorOutcome::Undef,
   }
+}
+
+/// `Image::ExifTool::Canon::CalcSensorDiag($et)` (Canon.pm:10145) — the sensor
+/// diagonal in mm from the RAW FocalPlaneX/YResolution rationals.
+///
+/// ```perl
+/// return undef unless $$et{TAG_EXTRA}{FocalPlaneXResolution} and
+///                     $$et{TAG_EXTRA}{FocalPlaneYResolution};
+/// my $xres = $$et{TAG_EXTRA}{FocalPlaneXResolution}{Rational};   # "num/den"
+/// my $yres = $$et{TAG_EXTRA}{FocalPlaneYResolution}{Rational};
+/// my @xres = split /[ \/]/, $xres;   # ($num, $den)
+/// my @yres = split /[ \/]/, $yres;
+/// if ($xres[0] % 1000 == 0 and $yres[0] % 1000 == 0 and
+///     $xres[0] >= 640000 and $yres[0] >= 480000 and
+///     $xres[0] < 10000000 and $yres[0] < 10000000 and
+///     $xres[1] >= 61 and $xres[1] < 1500 and
+///     $yres[1] >= 61 and $yres[1] < 1000 and
+///     $xres[1] != $yres[1]) {
+///     return sqrt($xres[1]*$xres[1] + $yres[1]*$yres[1]) * 0.0254;
+/// }
+/// return undef;
+/// ```
+///
+/// ExifTool reads `$$et{TAG_EXTRA}{…}{Rational}` — the original on-disk `num/den`
+/// (numerator = image width/height * 1000, denominator = sensor size in inches *
+/// 1000). exifast supplies the SAME via the FocalPlaneX/YResolution
+/// [`TagValue::Rational`] the EXIF leaf path preserves (see
+/// `exif::mod::emit_raw` / `ExifSink::write_rational`). When the FocalPlane
+/// inputs are absent OR not a raw rational (a non-EXIF source — e.g. the XMP
+/// `ConvertRational` decimal that drops the num/den), this returns `None` and
+/// the caller DEFERS.
+#[cfg(feature = "alloc")]
+fn canon_sensor_diag(inputs: &ScaleFactorInputs<'_>) -> Option<f64> {
+  use crate::value::TagValue;
+  // `$$et{TAG_EXTRA}{FocalPlaneXResolution}{Rational}` — only a raw rational
+  // carries the num/den `CalcSensorDiag` reads; any collapsed/absent value ⇒
+  // `undef` (the `return undef unless …` guard).
+  let rational = |v: Option<&CompositeValue>| -> Option<crate::value::Rational> {
+    match v?.value()? {
+      TagValue::Rational(r) => Some(*r),
+      _ => None,
+    }
+  };
+  let xres = rational(inputs.x_resolution)?;
+  let yres = rational(inputs.y_resolution)?;
+  // `@xres = split /[ \/]/, $xres` ⇒ ($num, $den). A single rational's
+  // numerator/denominator ARE those two split fields.
+  let (xn, xd) = (xres.numerator(), xres.denominator());
+  let (yn, yd) = (yres.numerator(), yres.denominator());
+  // The full validation conjunction (Canon.pm:10161-10170). `%` on a non-positive
+  // numerator can't occur here (image dimensions are positive); guard a zero
+  // denominator implicitly via the `>= 61` bound.
+  if xn % 1000 == 0
+    && yn % 1000 == 0
+    && xn >= 640_000
+    && yn >= 480_000
+    && xn < 10_000_000
+    && yn < 10_000_000
+    && (61..1500).contains(&xd)
+    && (61..1000).contains(&yd)
+    && xd != yd
+  {
+    // `sqrt($xres[1]^2 + $yres[1]^2) * 0.0254` — the denominators (sensor mm via
+    // inches → mm).
+    let xd = xd as f64;
+    let yd = yd as f64;
+    return Some((xd * xd + yd * yd).sqrt() * 0.0254);
+  }
+  None
 }
 
 /// The `unless ($diag)` resolution-derived-diagonal branch outcome.
@@ -775,6 +866,30 @@ pub(crate) fn print_fov(val: &str) -> String {
     s.push_str(&format!(" ({v1:.2} m)"));
   }
   s
+}
+
+/// `Image::ExifTool::Canon::PrintFocalRange($short, $long, $scale)`
+/// (Canon.pm:10498) — the `Composite:Lens` / `Lens35efl` focal-range PrintConv.
+///
+/// ```perl
+/// $scale or $scale = 1;
+/// if ($short == $long) { return sprintf("%.1f mm", $short * $scale); }
+/// else { return sprintf("%.1f - %.1f mm", $short * $scale, $long * $scale); }
+/// ```
+///
+/// `scale` is `0.0` for the no-scale call (`Composite:Lens`, `@val` = (min, max)),
+/// matching Perl's `$scale or $scale = 1` (a `0`/undef scale defaults to `1`); the
+/// `Lens35efl` 35mm-equivalent call passes the `Composite:ScaleFactor35efl`.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub(crate) fn print_focal_range(short: f64, long: f64, scale: f64) -> String {
+  // `$scale or $scale = 1` — a Perl-falsy scale (0) defaults to 1.
+  let scale = if perl_truthy_f64(scale) { scale } else { 1.0 };
+  if short == long {
+    format!("{:.1} mm", short * scale)
+  } else {
+    format!("{:.1} - {:.1} mm", short * scale, long * scale)
+  }
 }
 
 #[cfg(test)]

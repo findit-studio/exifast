@@ -430,8 +430,18 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // evaluated def still allocates its per-def `$val[]`/`$prt[]` scratch pair,
     // so `-j` 195 → 217 and `-n` 213 → 234. Documented engine-overhead scratch
     // (a future perf PR could reuse the scratch Vecs), NOT a redundant clone /
-    // double decode. Ceilings raised to (232, 250).
-    "QuickTime_frea_rexing17b.mov" => (232, 250), // measured (217, 234) — +composite-def scratch
+    // double decode.
+    //
+    // RE-BASELINED for the %Canon::Composite port: the registry grew by 10 Canon
+    // composite defs (DriveMode/Lens/Lens35efl/ShootingMode/FlashType/
+    // RedEyeReduction/ConditionalFEC/ShutterCurtainHack/WB_RGGBLevels/ISO). They
+    // do NOT build for this non-Canon MOV (every `Require` is missing), but the
+    // `BuildCompositeTags` fixpoint still allocates a per-def `$val[]`/`$prt[]`
+    // scratch pair while resolving each before it aborts — so `-j` 217 → 237 and
+    // `-n` 234 → 254. The SAME documented fixpoint-scratch cost #133 PR 3 took
+    // (a future perf PR could reuse the scratch Vecs); NOT a redundant clone.
+    // Ceilings raised to (252, 270).
+    "QuickTime_frea_rexing17b.mov" => (252, 270), // measured (237, 254) — +Canon composite-def scratch
     "Real.ra" => (100, 100),                      // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }

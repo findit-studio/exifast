@@ -97,6 +97,19 @@ const XMP_UUID: [u8; 16] = [
   0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac,
 ];
 
+/// The 16-byte UUID that flags a Canon CR3 `PreviewImage` stored in a top-level
+/// `uuid` box (QuickTime.pm:780-799 `%QuickTime::Main` `uuid` Condition
+/// `$$valPt=~/^\xea\xf4\x2b\x5e\x1c\x98\x4b\x88\xb9\xfb\xb7\xdc\x40\x6e\x4d\x16.{32}/`).
+/// The preview image bytes are `substr($val, 0x30)` of the `uuid` body — the
+/// 16-byte UUID plus a 0x20-byte `PRVW` header prefix stripped.
+const CR3_PREVIEW_UUID: [u8; 16] = [
+  0xea, 0xf4, 0x2b, 0x5e, 0x1c, 0x98, 0x4b, 0x88, 0xb9, 0xfb, 0xb7, 0xdc, 0x40, 0x6e, 0x4d, 0x16,
+];
+
+/// The byte offset within the CR3 PRVW `uuid` body at which the `PreviewImage`
+/// data begins — `substr($val, 0x30)` (QuickTime.pm:798).
+const CR3_PREVIEW_DATA_OFFSET: usize = 0x30;
+
 // ===========================================================================
 // SP2 supplementary conv-less camera-atom map (xtask `--kind quicktime`)
 // ===========================================================================
@@ -7393,6 +7406,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
               }
             }
           }
+          // The Canon CR3 top-level `uuid`-`PRVW` PreviewImage (QuickTime.pm:780-799).
+          // `PreviewImage = substr($val, 0x30)` of the `uuid` body — record its
+          // byte length for the `(Binary data N bytes…)` placeholder.
+          b"uuid"
+            if body.get(..16) == Some(&CR3_PREVIEW_UUID[..])
+              && body.len() > CR3_PREVIEW_DATA_OFFSET =>
+          {
+            qt.set_cr3_preview_image_len(Some((body.len() - CR3_PREVIEW_DATA_OFFSET) as u64));
+          }
           b"mdat" => {
             // QuickTime.pm:10158-10160 — the synthetic `mdat-size`/`mdat-offset`
             // tags: payload byte count + absolute payload file offset.
@@ -10460,6 +10482,43 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── Canon CR3 `CRAW` `JpgFromRaw` preview sample (QuickTimeStream.pl:316) ──
+    // The `vide` track flagged by a `JPEG` stsd child carries ONE preview-JPEG
+    // sample. `FoundSomething` emits its `SampleTime`/`SampleDuration` (the
+    // sample-table timing, `ConvertDuration` at `-j`), then `JpgFromRaw` (the
+    // `(Binary data N bytes…)` placeholder), under the enclosing `Track<N>` at its
+    // `Doc<N>`. Gated on `-ee` (CRX auto-enables it); `-G1` drops the doc axis.
+    if opts.extract_embedded
+      && let Some(jpg) = self.stream.cr3_jpg_from_raw()
+    {
+      let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+      let track = std::format!("Track{}", jpg.track_index());
+      let group = if g3 {
+        Group::with_doc("QuickTime", track.as_str(), jpg.doc())
+      } else {
+        Group::new("QuickTime", track.as_str())
+      };
+      for (secs, name) in [
+        (jpg.sample_time(), "SampleTime"),
+        (jpg.sample_duration(), "SampleDuration"),
+      ] {
+        if let Some(secs) = secs {
+          let value = if print_conv {
+            TagValue::Str(crate::datetime::convert_duration(secs).into())
+          } else {
+            TagValue::F64(secs)
+          };
+          tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+        }
+      }
+      tags.push(EmittedTag::new(
+        group,
+        "JpgFromRaw".into(),
+        TagValue::Str(binary_placeholder(jpg.size())),
+        false,
+      ));
+    }
+
     // ── SP4: Sony rtmd per-sample camera + GPS (Image::ExifTool::Sony) ──
     // `Process_rtmd` (Sony.pm:11569-11602) decodes ONE timed sample per `rtmd`
     // sample-table entry; ExifTool's `ProcessSamples` opens a `Doc<N>` per
@@ -10906,11 +10965,17 @@ impl crate::emit::Taggable for Meta<'_> {
           let t = sample.track_index();
           if t == 0 { 1 } else { t }
         });
-        let group = if g3 {
-          Group::with_doc("QuickTime", track.as_str(), doc_n)
-        } else {
-          Group::new("QuickTime", track.as_str())
-        };
+        // Stamp the per-sample family-3 `Doc<N>` in EVERY mode. At `-G3` the doc
+        // prefixes the rendered key; at `-G1` the serializer DROPS the doc axis
+        // (so the leaf output is byte-identical to a doc-0 group), but the
+        // Composite engine resolves on family-3 — a CTMD sample's degenerate
+        // `Track<N>:FNumber`/`ExposureTime` (`inf`) lives on `Doc<N>` (the
+        // bundled `-G1:3` axis, `Doc2` here), so the Main `Composite:Aperture`/
+        // `ShutterSpeed` resolve the doc-0 `ExifIFD:FNumber`/`ExposureTime` (the
+        // real exposure) instead of collapsing onto the CTMD `inf`. The
+        // cross-sample first-wins collapse below is doc-independent (keyed by
+        // `(family1, name)`), so the surviving leaf set is unchanged.
+        let group = Group::with_doc("QuickTime", track.as_str(), doc_n);
         ctmd_scratch.clear();
         // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
         // `-n`) — the sample-table timing emitted ahead of the decoded payload.
@@ -11007,8 +11072,8 @@ impl crate::emit::Taggable for Meta<'_> {
             info,
             track.as_str(),
             doc_n,
-            g3,
             print_conv,
+            self.cr3().model(),
             &mut ctmd_scratch,
           );
         }
@@ -11682,6 +11747,30 @@ impl crate::emit::Taggable for Meta<'_> {
         Group::new("MakerNotes", "Canon"),
         "CompressorVersion".into(),
         TagValue::Str(cncv.into()),
+        false,
+      ));
+    }
+    // CR3 top-level `uuid`-`PRVW` PreviewImage (QuickTime.pm:780-799) — the
+    // `Binary => 1` `(Binary data N bytes…)` placeholder under `QuickTime`. The
+    // length is the `uuid` body minus the 0x30-byte UUID+PRVW-header prefix.
+    if let Some(len) = self.qt.cr3_preview_image_len() {
+      tags.push(EmittedTag::new(
+        Group::new("QuickTime", "QuickTime"),
+        "PreviewImage".into(),
+        TagValue::Str(binary_placeholder(len)),
+        false,
+      ));
+    }
+    // CR3 Canon `uuid`-`THMB` ThumbnailImage (Canon.pm:9729-9735) — `RawConv =>
+    // substr($val, 16)`, `Binary => 1` ⇒ the `(Binary data N bytes…)` placeholder
+    // (body length minus the 16-byte THMB header) under `MakerNotes`/`Canon`.
+    if let Some(thmb) = self.cr3().thmb()
+      && let Some(len) = thmb.length().checked_sub(16)
+    {
+      tags.push(EmittedTag::new(
+        Group::new("MakerNotes", "Canon"),
+        "ThumbnailImage".into(),
+        TagValue::Str(binary_placeholder(len)),
         false,
       ));
     }
@@ -15582,29 +15671,33 @@ fn canon_ctmd_exposure_time_value(
 ///    `Track<N>`, `Doc<N>` (NO `ExifByteOrder` — the MakerNote re-dispatch does
 ///    not surface it).
 ///
-/// `print_conv` selects `-j` (PrintConv) vs `-n` (ValueConv); `g3` adds the
-/// `Doc<N>` family-3 axis (collapsed at `-G1`, where the across-doc first-wins
-/// dedup in the caller keeps the first sample's value per `family1:name`).
+/// `print_conv` selects `-j` (PrintConv) vs `-n` (ValueConv). The `Doc<N>`
+/// family-3 axis is always stamped (collapsed at `-G1`, where the across-doc
+/// first-wins dedup in the caller keeps the first sample's value per
+/// `family1:name`).
 #[cfg(feature = "alloc")]
 fn emit_ctmd_exif_info(
   info: &crate::metadata::CtmdExifInfo,
   track: &str,
   doc_n: u32,
-  g3: bool,
   print_conv: bool,
+  // The file-walk `$$self{Model}` (CMT1 IFD0 Model) — the fallback when this
+  // CTMD sample's own `0x8769` block (an `ExifIFD`) carried no Model, so
+  // model-conditional Canon sub-tables (AFInfo2 `AFPointsSelected`) resolve
+  // against the body Model exactly as ExifTool's persisted object state does.
+  file_model: Option<&str>,
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::{EmittedTag, Taggable};
   use crate::value::Group;
-  // Build a group on the CTMD sample's family-3 axis: `Doc<N>` when `-G3`, else
-  // collapsed (doc 0) — the caller's first-wins dedup folds the doc axis.
-  let scoped = |family0: &str, family1: &str| -> Group {
-    if g3 {
-      Group::with_doc(family0, family1, doc_n)
-    } else {
-      Group::new(family0, family1)
-    }
-  };
+  // Build a group on the CTMD sample's family-3 axis. The `Doc<N>` is stamped in
+  // EVERY mode: at `-G3` it prefixes the key; at `-G1` the serializer DROPS the
+  // doc (leaf output unchanged), but the Composite engine resolves on family-3,
+  // so the CTMD `Track<N>:*` exposure leaves stay on their `Doc<N>` (NOT doc 0),
+  // keeping the Main `Composite:Aperture`/`ShutterSpeed` off the degenerate CTMD
+  // `inf`. The caller's first-wins dedup (keyed by `(family1, name)`) is
+  // doc-independent, so the surviving leaf set is unchanged.
+  let scoped = |family0: &str, family1: &str| -> Group { Group::with_doc(family0, family1, doc_n) };
   match info.tag() {
     crate::metadata::CtmdExifTag::ExifIfd => {
       // The embedded TIFF is self-contained (base 0); `ProcessExifInfo`'s
@@ -15663,7 +15756,9 @@ fn emit_ctmd_exif_info(
       let emissions = crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(
         info.tiff(),
         print_conv,
-        info.model(),
+        // The CTMD sample's own `0x8769` Model, else the file-walk CMT1 Model
+        // (ExifTool's persisted `$$self{Model}`).
+        info.model().or(file_model),
       );
       let group = scoped("MakerNotes", track);
       for e in emissions {

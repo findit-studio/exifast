@@ -994,6 +994,81 @@ pub struct QuickTimeStreamMeta {
   /// per-`Doc<N>` emission, and consumes the doc ordinal so a following VALID
   /// sample is renumbered to the next `Doc<N>`. See [`GpmdTimingOnly`].
   gpmd_timing_only: Vec<GpmdTimingOnly>,
+  /// The Canon CR3 `CRAW` `vide` track's single `JpgFromRaw` preview sample
+  /// (QuickTimeStream.pl:316 `JPEG => { Name => 'JpgFromRaw' }`, reached when the
+  /// `vide` track's `stsd` carries a `JPEG` child box — `%eeBox` `vide => { JPEG
+  /// => 'stsd' }`, QuickTime.pm:525). `None` for any non-CR3 file (or a CR3 whose
+  /// `CRAW` track has no `JPEG` stsd flag — e.g. Track2/3, the dual-pixel/full RAW).
+  cr3_jpg_from_raw: Option<Cr3JpgFromRaw>,
+}
+
+/// The Canon CR3 `CRAW`-track `JpgFromRaw` preview sample (QuickTimeStream.pl:316).
+/// Carries the sample's `Track<N>` index + `Doc<N>` ordinal and the timing
+/// `ProcessSamples`' `FoundSomething` emits ahead of it, plus the byte size for
+/// the `(Binary data N bytes…)` placeholder (the image bytes are not retained).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cr3JpgFromRaw {
+  track_index: u32,
+  doc: u32,
+  size: u64,
+  sample_time: Option<f64>,
+  sample_duration: Option<f64>,
+}
+
+impl Cr3JpgFromRaw {
+  /// Construct a `JpgFromRaw` sample record.
+  #[inline(always)]
+  #[must_use]
+  pub const fn new(
+    track_index: u32,
+    doc: u32,
+    size: u64,
+    sample_time: Option<f64>,
+    sample_duration: Option<f64>,
+  ) -> Self {
+    Self {
+      track_index,
+      doc,
+      size,
+      sample_time,
+      sample_duration,
+    }
+  }
+
+  /// The 1-based moov `Track<N>` index this preview sample belongs to.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> u32 {
+    self.track_index
+  }
+
+  /// The global `Doc<N>` ordinal (`FoundSomething` consumed).
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc(&self) -> u32 {
+    self.doc
+  }
+
+  /// The `JpgFromRaw` byte size (for the binary placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn size(&self) -> u64 {
+    self.size
+  }
+
+  /// The sample decoding time in seconds (`SampleTime`), if known.
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_time(&self) -> Option<f64> {
+    self.sample_time
+  }
+
+  /// The sample duration in seconds (`SampleDuration`), if known.
+  #[inline(always)]
+  #[must_use]
+  pub const fn sample_duration(&self) -> Option<f64> {
+    self.sample_duration
+  }
 }
 
 impl QuickTimeStreamMeta {
@@ -1008,6 +1083,7 @@ impl QuickTimeStreamMeta {
       magic_box_truncated_no_ee: false,
       doc_counter: 0,
       gpmd_timing_only: Vec::new(),
+      cr3_jpg_from_raw: None,
     }
   }
 
@@ -1053,6 +1129,21 @@ impl QuickTimeStreamMeta {
   #[inline(always)]
   pub fn push_mebx_sample(&mut self, sample: MebxSample) -> &mut Self {
     self.mebx_samples.push(sample);
+    self
+  }
+
+  /// The Canon CR3 `CRAW`-track `JpgFromRaw` preview sample, if one was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn cr3_jpg_from_raw(&self) -> Option<&Cr3JpgFromRaw> {
+    self.cr3_jpg_from_raw.as_ref()
+  }
+
+  /// Record the Canon CR3 `CRAW`-track `JpgFromRaw` preview sample (last-wins;
+  /// only one `JPEG`-flagged `CRAW` track exists per CR3).
+  #[inline(always)]
+  pub fn set_cr3_jpg_from_raw(&mut self, sample: Cr3JpgFromRaw) -> &mut Self {
+    self.cr3_jpg_from_raw = Some(sample);
     self
   }
 

@@ -3788,6 +3788,13 @@ pub struct QuickTimeMeta {
   /// as the `(Binary data N bytes, use -b option to extract)` placeholder; the
   /// bytes are not retained. `None` when no SkipInfo `thma` was decoded.
   skip_thumbnail_len: Option<u64>,
+  /// The Canon CR3 top-level `uuid`-`PRVW` preview-image payload byte length
+  /// (QuickTime.pm:780-799, the `\xea\xf4\x2b\x5e…` UUID → `PreviewImage`,
+  /// `Binary => 1`, group2 `Preview`). The image bytes are `substr($val, 0x30)`
+  /// of the `uuid` body (the 0x30-byte UUID + header prefix stripped), rendered
+  /// as the `(Binary data N bytes, use -b option to extract)` placeholder. `None`
+  /// when no CR3 PRVW `uuid` was decoded.
+  cr3_preview_image_len: Option<u64>,
   /// The top-level `frea` atom's `Image::ExifTool::Kodak::frea` tags
   /// (Kodak PixPro / Rexing — Kodak.pm:2977-2990). Empty for the common case
   /// (no `frea` atom). See [`KodakFrea`].
@@ -3863,6 +3870,7 @@ impl QuickTimeMeta {
       media_data_offset: None,
       skip_version: None,
       skip_thumbnail_len: None,
+      cr3_preview_image_len: None,
       kodak_frea: KodakFrea::new(),
       pittasoft: Pittasoft::new(),
       tracks: Vec::new(),
@@ -4000,6 +4008,14 @@ impl QuickTimeMeta {
   #[must_use]
   pub const fn skip_thumbnail_len(&self) -> Option<u64> {
     self.skip_thumbnail_len
+  }
+
+  /// The Canon CR3 top-level `uuid`-`PRVW` `PreviewImage` payload byte length
+  /// (for the binary placeholder); `None` when no PRVW `uuid` was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn cr3_preview_image_len(&self) -> Option<u64> {
+    self.cr3_preview_image_len
   }
 
   /// The top-level `frea` atom's [`KodakFrea`] tags (Kodak PixPro / Rexing).
@@ -4247,6 +4263,13 @@ impl QuickTimeMeta {
   #[inline(always)]
   pub const fn set_skip_thumbnail_len(&mut self, v: Option<u64>) -> &mut Self {
     self.skip_thumbnail_len = v;
+    self
+  }
+
+  /// Record the Canon CR3 top-level `uuid`-`PRVW` `PreviewImage` payload length.
+  #[inline(always)]
+  pub const fn set_cr3_preview_image_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.cr3_preview_image_len = v;
     self
   }
 
