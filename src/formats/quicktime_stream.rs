@@ -2793,6 +2793,64 @@ fn for_each_atom(data: &[u8], start: usize, end: usize, mut f: impl FnMut(&[u8; 
   }
 }
 
+/// QuickTime.pm:9659 `ProcessHybrid` — locate where the child-atom chain begins
+/// inside a "hybrid" SampleDescription entry (codec/binary fields immediately
+/// followed by child atoms). `entry` is the WHOLE entry slice
+/// (`[size:4][type:4]` + binary header + child atoms). Returns the
+/// entry-relative offset of the first child atom, or `None` when the entry holds
+/// no trailing child-atom chain (pure binary).
+///
+/// The binary-header size varies by codec, so ExifTool does NOT assume a fixed
+/// offset: it brute-forces from entry offset 8 (past `[size][type]`) for the
+/// smallest position at which a run of well-behaved atoms — each with a
+/// printable `[A-Za-z0-9_ ]` type (`$tag =~ /[^\w ]/`) and `size >= 8` — ends
+/// EXACTLY at the entry boundary. (The Canon `CRAW` entry carries 4 extra bytes
+/// — `00 03 00 00` — after the standard 86-byte `VisualSampleEntry`, so its
+/// `JPEG`/`free` child chain begins at offset 90; a fixed-offset walk from 86
+/// would misread those bytes as a bogus `0x00030000` atom size.)
+fn hybrid_child_pos(entry: &[u8]) -> Option<usize> {
+  let end = entry.len();
+  // ExifTool's `$pos = $dirStart + 8` (the candidate chain start) and
+  // `$try = $pos` (the cursor walking forward through the candidate chain).
+  let mut pos = 8usize;
+  let mut cursor = pos;
+  while pos + 8 <= end {
+    // `$tag = substr(.., $try+4, 4)`: a candidate atom's 4-byte type. ExifTool
+    // only chains well-behaved tags (`/[^\w ]/` rejects any non-`[A-Za-z0-9_ ]`
+    // byte). The `entry.get` is `Some` for every reachable cursor (a valid chain
+    // step keeps `cursor + 8 <= end`); a miss simply abandons the candidate.
+    let tag_ok = entry.get(cursor + 4..cursor + 8).is_some_and(|tag| {
+      tag
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b' ')
+    });
+    if !tag_ok {
+      pos += 1;
+      cursor = pos;
+      continue;
+    }
+    let Some(size) = be_u32(entry, cursor).map(|s| s as usize) else {
+      pos += 1;
+      cursor = pos;
+      continue;
+    };
+    match cursor.checked_add(size) {
+      // `$size + $try == $end`: the chain ends exactly at the entry boundary —
+      // `$pos` is the start of the child atoms.
+      Some(atom_end) if atom_end == end => return Some(pos),
+      // `else` (not the `$size < 8 or $size + $try > $end - 8` fail): this atom
+      // fits with room for another behind it — `$try += $size`, chain forward.
+      Some(atom_end) if size >= 8 && atom_end <= end - 8 => cursor = atom_end,
+      // `$try = ++$pos`: candidate failed, advance the chain start by one byte.
+      _ => {
+        pos += 1;
+        cursor = pos;
+      }
+    }
+  }
+  None
+}
+
 /// Walk one `stbl` box, filling `track.ee` (sample tables) and — for an
 /// `OtherSampleDesc`/`MetaSampleDesc` `stsd` — `track.meta_format` /
 /// `track.meta_keys`.
@@ -2889,25 +2947,26 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
         }
       });
     }
-    // A `vide` sample entry's child atoms follow the VisualSampleEntry header
-    // (>= 86 bytes: the 16-byte base SampleEntry + the 70-byte visual fields,
-    // sometimes a few extra codec bytes — the Canon CRAW entry has 4). A `JPEG`
-    // child there is the `%eeBox` `vide => { JPEG => 'stsd' }` flag
-    // (QuickTime.pm:525) marking the CR3 `CRAW` track as the `JpgFromRaw`
-    // preview stream. The header size varies by codec, so locate the `JPEG` 4cc
-    // by signature (past offset 86, beyond the 32-byte compressorname) rather
-    // than at a fixed offset.
+    // A `vide` SampleDescription is "hybrid" binary data + child atoms
+    // (QuickTime.pm:9659 `ProcessHybrid`). A `JPEG` child atom there is the
+    // `%eeBox` `vide => { JPEG => 'stsd' }` flag (QuickTime.pm:525) marking the
+    // CR3 `CRAW` track as the `JpgFromRaw` preview stream. We locate the child
+    // chain exactly as ExifTool does (`hybrid_child_pos` — the run of
+    // well-behaved atoms ending precisely at the entry boundary; the Canon
+    // `CRAW` entry has 4 extra codec bytes, so its chain begins at offset 90),
+    // then walk that chain on REAL atom boundaries. `has_jpeg` is therefore set
+    // ONLY for a genuine `JPEG` child box — never a `JPEG` byte run buried inside
+    // codec data (avcC etc.), which a positional signature scan would wrongly
+    // promote, routing a real video track into `ProcessSamples`.
     if &track.handler == b"vide"
       && let Some(entry) = data.get(pos..entry_end)
+      && let Some(child_pos) = hybrid_child_pos(entry)
     {
-      let mut k = 86usize;
-      while k + 8 <= entry.len() {
-        if entry.get(k + 4..k + 8) == Some(&b"JPEG"[..]) {
+      for_each_atom(data, pos + child_pos, entry_end, |t, _| {
+        if t == b"JPEG" {
           track.has_jpeg = true;
-          break;
         }
-        k += 1;
-      }
+      });
     }
     pos = entry_end;
   }
@@ -5446,6 +5505,150 @@ mod tests {
       .first()
       .expect("drone P1 must decode (not the ARCore-TLV path)");
     assert!((g.latitude().expect("lat") - 47.6062).abs() < 1e-5);
+  }
+
+  /// Build a single-entry `vide` `stsd` body: `[version+flags:4][count:4=1]`
+  /// then `entry`.
+  fn wrap_single_stsd(entry: &[u8]) -> Vec<u8> {
+    let mut stsd = alloc::vec![0u8; 8];
+    wr(&mut stsd, 4, &1u32.to_be_bytes());
+    stsd.extend_from_slice(entry);
+    stsd
+  }
+
+  /// Build a `vide` sample entry: `[size:4][codec:4]` + an 8-byte SampleEntry
+  /// base + a 70-byte (zeroed) `VisualSampleEntry` header + `tail` (the
+  /// codec/child-atom region that begins at entry offset 86, mirroring the real
+  /// CRX layout). The declared `size` always matches the byte length.
+  fn vide_entry(codec: &[u8; 4], tail: &[u8]) -> Vec<u8> {
+    let size = 8 + 8 + 70 + tail.len();
+    let mut entry = (size as u32).to_be_bytes().to_vec();
+    entry.extend_from_slice(codec);
+    entry.extend_from_slice(&[0u8; 8]); // reserved[6] + data_reference_index[2]
+    entry.extend_from_slice(&[0u8; 70]); // VisualSampleEntry fields
+    entry.extend_from_slice(tail);
+    entry
+  }
+
+  /// **Codex [high]** — the `vide` `stsd` `JpgFromRaw` detector walks the
+  /// SampleDescription child-atom chain on REAL atom boundaries (ExifTool
+  /// `ProcessHybrid`, QuickTime.pm:9659), NOT a positional scan for a
+  /// `[size]['JPEG']` signature. A `[size]['JPEG']` byte run buried inside codec
+  /// private data (here an `avcC` configuration box body) must NOT promote the
+  /// track: the planted pattern is INSIDE the `avcC` box, not a sibling atom, so
+  /// `hybrid_child_pos` locks onto the `avcC` chain (which ends exactly at the
+  /// entry boundary) and the boundary walk steps over the body. Were `has_jpeg`
+  /// wrongly set, `walk_moov` would route this ordinary video track through
+  /// sample processing → a bogus `TrackN:JpgFromRaw` + a consumed global `Doc<N>`
+  /// ordinal (shifting later timed-metadata first-wins). The pre-fix bytewise
+  /// scan WOULD have matched the planted bytes.
+  #[test]
+  fn vide_stsd_jpeg_pattern_in_codec_data_not_promoted() {
+    // An `avcC` box that ends exactly at the entry boundary, whose BODY contains
+    // a planted `[00 00 00 0c]['JPEG'][00 00 00 00]` run — a `[size]['JPEG']`
+    // pattern inside codec data, not an atom on a boundary.
+    let mut avcc_body = alloc::vec![0x01, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0x00, 0x05];
+    avcc_body.extend_from_slice(&12u32.to_be_bytes()); // bogus inner "size"
+    avcc_body.extend_from_slice(b"JPEG"); // the planted signature
+    avcc_body.extend_from_slice(&[0u8; 4]); // bogus inner "body"
+    avcc_body.extend_from_slice(&[0x68, 0xee, 0x3c, 0x80, 0, 0, 0, 0]); // trailing codec bytes
+    let mut tail = (8 + avcc_body.len() as u32).to_be_bytes().to_vec();
+    tail.extend_from_slice(b"avcC");
+    tail.extend_from_slice(&avcc_body);
+
+    let entry = vide_entry(b"avc1", &tail);
+    // The child chain begins at the `avcC` box (entry offset 86), NOT the
+    // planted `JPEG` run inside its body.
+    assert_eq!(hybrid_child_pos(&entry), Some(86));
+
+    let stsd = wrap_single_stsd(&entry);
+    let mut track = StreamTrack {
+      handler: *b"vide",
+      ..StreamTrack::default()
+    };
+    walk_stsd(&stsd, &mut track);
+    assert!(
+      !track.has_jpeg,
+      "a `[size]['JPEG']` run inside codec data must NOT promote the vide track"
+    );
+  }
+
+  /// **Codex [high]** — the genuine Canon `CRAW` `JpgFromRaw` `JPEG` child box is
+  /// STILL detected. The `CRAW` entry carries 4 extra codec bytes
+  /// (`00 03 00 00`) after the standard 86-byte `VisualSampleEntry`, so its
+  /// `JPEG`/`free` child chain begins at offset 90 (verified against the real
+  /// `CanonEOSR.cr3`). `hybrid_child_pos` finds that boundary (the chain ends
+  /// exactly at the entry end) and the atom walk promotes the track — the
+  /// byte-exact CR3 JpgFromRaw path. A fixed-offset walk from 86 would misread
+  /// `00 03 00 00` as a `0x00030000` size and miss the box.
+  #[test]
+  fn vide_stsd_real_craw_jpeg_child_box_promoted() {
+    // The exact real-CRAW tail: 4 extra bytes, then JPEG(12) + free(10) ending
+    // precisely at the entry boundary (entry size 112, as in CanonEOSR.cr3).
+    let mut tail = alloc::vec![0x00, 0x03, 0x00, 0x00]; // 4 extra codec bytes
+    tail.extend_from_slice(&12u32.to_be_bytes());
+    tail.extend_from_slice(b"JPEG");
+    tail.extend_from_slice(&[0u8; 4]); // JPEG box body (4 bytes all zero)
+    tail.extend_from_slice(&10u32.to_be_bytes());
+    tail.extend_from_slice(b"free");
+    tail.extend_from_slice(&[0u8; 2]); // free box body
+
+    let entry = vide_entry(b"CRAW", &tail);
+    assert_eq!(
+      entry.len(),
+      112,
+      "mirrors the real CanonEOSR.cr3 CRAW entry"
+    );
+    assert_eq!(
+      hybrid_child_pos(&entry),
+      Some(90),
+      "the CRAW child chain begins at offset 90 (4 extra bytes after the 86-byte header)"
+    );
+
+    let stsd = wrap_single_stsd(&entry);
+    let mut track = StreamTrack {
+      handler: *b"vide",
+      ..StreamTrack::default()
+    };
+    walk_stsd(&stsd, &mut track);
+    assert!(
+      track.has_jpeg,
+      "the genuine CRAW JPEG child box must promote the track (JpgFromRaw stream)"
+    );
+  }
+
+  /// **Codex [high]** — the child-atom walk is bounded on a truncated or
+  /// malformed `vide` entry (no OOB read / panic). A `JPEG` box claiming size 12
+  /// with only 9 bytes present forms no boundary-ending chain (`None`); the
+  /// empty, sub-16-byte and overflowing-`[size]` edge cases all terminate
+  /// cleanly.
+  #[test]
+  fn vide_stsd_truncated_child_chain_is_bounded() {
+    // A JPEG box header claiming size 12 but with only 1 body byte present — the
+    // box overruns the entry, so there is no chain ending at the boundary.
+    let mut tail = 12u32.to_be_bytes().to_vec();
+    tail.extend_from_slice(b"JPEG");
+    tail.push(0);
+    let entry = vide_entry(b"CRAW", &tail);
+    assert_eq!(hybrid_child_pos(&entry), None);
+
+    let stsd = wrap_single_stsd(&entry);
+    let mut track = StreamTrack {
+      handler: *b"vide",
+      ..StreamTrack::default()
+    };
+    walk_stsd(&stsd, &mut track); // must not panic
+    assert!(!track.has_jpeg);
+
+    // Direct edge cases on the boundary finder: nothing past the header, a
+    // sub-16-byte slice, and an overflowing `[size]` all return `None` without
+    // panicking (the overflowing add is `checked`).
+    assert_eq!(hybrid_child_pos(&[]), None);
+    assert_eq!(hybrid_child_pos(&[0u8; 15]), None);
+    let mut overflow = vide_entry(b"CRAW", &[]);
+    overflow.extend_from_slice(&u32::MAX.to_be_bytes()); // size = 0xFFFFFFFF
+    overflow.extend_from_slice(b"JPEG");
+    assert_eq!(hybrid_child_pos(&overflow), None);
   }
 
   /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box

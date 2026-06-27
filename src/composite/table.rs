@@ -3383,12 +3383,12 @@ fn canon_shutter_curtain_hack(
   Some(CompositeRaw::Num(sync.unwrap_or(0.0)))
 }
 
-/// `Composite:WB_RGGBLevels` ValueConv `$val[1] ? $val[1] : $val[($val[0] || 0)
-/// + 2]` (Canon.pm:10058). `$val[0]`=Canon:WhiteBalance (Require), `$val[1]`=
-/// WB_RGGBLevelsAsShot; absent an AsShot the WhiteBalance value indexes the
-/// per-preset WB level (Canon.pm's `Canon:WhiteBalance + 2` mapping, with the
-/// index-9 gap — WhiteBalance 7 has no preset). The selected WB-level STRING is
-/// carried verbatim (identity PrintConv).
+/// `Composite:WB_RGGBLevels` ValueConv (Canon.pm:10058) — `$val[1] ? $val[1] :
+/// $val[($val[0] || 0) + 2]`. `$val[0]`=Canon:WhiteBalance (Require),
+/// `$val[1]`=WB_RGGBLevelsAsShot; absent an AsShot the WhiteBalance value indexes
+/// the per-preset WB level (Canon.pm's `Canon:WhiteBalance + 2` mapping, whose
+/// index-9 gap means WhiteBalance 7 has no preset). The selected WB-level STRING
+/// is carried verbatim (identity PrintConv).
 #[cfg(feature = "exif")]
 fn canon_wb_rggb_levels(
   v: &[CompositeValue],
