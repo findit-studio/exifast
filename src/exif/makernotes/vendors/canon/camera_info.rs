@@ -58,6 +58,26 @@ pub fn model_is_camera_info_6d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 6D"))
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo1D` (`Canon.pm:1312`,
+/// `$$self{Model} =~ /\b1DS?$/` — the original 1D or 1DS, case-sensitive `S`).
+/// The dispatch `Condition` also assigns `$$self{CameraInfoCount} = $count`
+/// (the record byte length, since `FORMAT => 'int8u'`) — a side-effect read only
+/// by the deferred count-keyed tables (5DmkII / PowerShot / Unknown).
+#[must_use]
+pub fn model_is_camera_info_1d(model: Option<&str>) -> bool {
+  model_is_1d_proper(model) || model_is_1ds(model)
+}
+
+/// The 1D proper (`/\b1D$/`) — gates the 1D-only rows of `%CameraInfo1D`.
+fn model_is_1d_proper(model: Option<&str>) -> bool {
+  model_ends_with(model, "1D")
+}
+
+/// The 1DS (`/\b1DS$/`) — gates the 1DS-only rows of `%CameraInfo1D`.
+fn model_is_1ds(model: Option<&str>) -> bool {
+  model_ends_with(model, "1DS")
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
@@ -73,7 +93,9 @@ pub fn parse(
   model: Option<&str>,
   canon_lens_type: Option<u16>,
 ) -> Vec<(SmolStr, TagValue)> {
-  if model_is_camera_info_5d(model) {
+  if model_is_camera_info_1d(model) {
+    camera_info_1d(data, order, print_conv, model)
+  } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_6d(model) {
     camera_info_6d(data, order, print_conv)
@@ -229,6 +251,78 @@ pub fn model_is_camera_info_1000d(model: Option<&str>) -> bool {
 #[must_use]
 pub fn model_is_camera_info_7d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 7D"))
+}
+
+/// `%Canon::CameraInfo1D` (`Canon.pm:3158-3283`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`, NO firmware `Hook`. Shared by the
+/// original 1D and 1DS, which carry several leaves at DIFFERENT offsets gated by
+/// per-model `Condition`s (`/\b1D$/` vs `/\b1DS$/`). The focal-length leaves are
+/// PLAIN `int16u` here (not the `int16uRev` of the shared `%ci*` defs), and the
+/// `WhiteBalance` leaves are 1-byte `int8u` (no `Format` override).
+fn camera_info_1d(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let is_1d = model_is_1d_proper(model);
+  let is_1ds = model_is_1ds(model);
+  // 0x04 ExposureTime (%ciExposureTime, int8u, drop-0).
+  emit_ci_exposure_time(data, 0x04, print_conv, &mut push);
+  // 0x0a FocalLength — PLAIN int16u (file order, NOT int16uRev), RawConv drop-0.
+  if let Some(v) = u16(data, 0x0a, order)
+    && v != 0
+  {
+    push("FocalLength", mm_value(v, print_conv));
+  }
+  // 0x0d LensType (int16uRev, RawConv drop-0, %canonLensTypes). Overlaps the
+  // 0x0e MinFocalLength leaf by one byte (faithful to the table key layout).
+  if let Some(v) = u16_rev(data, 0x0d, order)
+    && v != 0
+  {
+    push("LensType", lens_type_value(v, print_conv));
+  }
+  // 0x0e MinFocalLength / 0x10 MaxFocalLength — PLAIN int16u (file order).
+  if let Some(v) = u16(data, 0x0e, order) {
+    push("MinFocalLength", mm_value(v, print_conv));
+  }
+  if let Some(v) = u16(data, 0x10, order) {
+    push("MaxFocalLength", mm_value(v, print_conv));
+  }
+  // The 1D-only block (`Condition => /\b1D$/`), emitted in table-key order.
+  if is_1d {
+    if let Some(v) = i8u(data, 0x41) {
+      push(
+        "SharpnessFrequency",
+        enum8(v, print_conv, sharpness_frequency_label),
+      );
+    }
+    if let Some(v) = i8s(data, 0x42) {
+      push("Sharpness", TagValue::I64(v));
+    }
+    emit_white_balance_int8u(data, 0x44, print_conv, &mut push);
+    emit_color_temperature(data, 0x48, order, &mut push);
+    emit_picture_style(data, 0x4b, print_conv, &mut push);
+  }
+  // The 1DS-only block (`Condition => /\b1DS$/`): 0x48 is `Sharpness` here (it is
+  // `ColorTemperature` for the 1D), and ColorTemperature moves to 0x4e.
+  if is_1ds {
+    if let Some(v) = i8u(data, 0x47) {
+      push(
+        "SharpnessFrequency",
+        enum8(v, print_conv, sharpness_frequency_label),
+      );
+    }
+    if let Some(v) = i8s(data, 0x48) {
+      push("Sharpness", TagValue::I64(v));
+    }
+    emit_white_balance_int8u(data, 0x4a, print_conv, &mut push);
+    emit_color_temperature(data, 0x4e, order, &mut push);
+    emit_picture_style(data, 0x51, print_conv, &mut push);
+  }
+  out
 }
 
 /// `%Canon::CameraInfo5D` (`Canon.pm:3777-3964`).
@@ -1429,20 +1523,33 @@ fn emit_exposure_triple<F: FnMut(&'static str, TagValue)>(
     let vc = ((raw as f64 - 8.0) / 16.0 * std::f64::consts::LN_2).exp();
     push("FNumber", value_or_print(print_conv, vc, format_g2(vc)));
   }
-  if let Some(raw) = i8u(data, 0x04)
+  emit_ci_exposure_time(data, 0x04, print_conv, push);
+  if let Some(raw) = i8u(data, 0x06) {
+    let vc = 100.0 * ((raw as f64 / 8.0 - 9.0) * std::f64::consts::LN_2).exp();
+    push(
+      "ISO",
+      value_or_print(print_conv, vc, std::format!("{vc:.0}")),
+    );
+  }
+}
+
+/// `%ciExposureTime` (`Canon.pm:3097-3106`, int8u, drop-0,
+/// `exp(4*ln2*(1-CanonEv(val-24)))`, `PrintExposureTime`). The lone exposure
+/// leaf for the 1-series tables (`%CameraInfo1D`/`1DmkII`/`1DmkIIN`), which carry
+/// no `%ciFNumber`/`%ciISO`.
+fn emit_ci_exposure_time<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i8u(data, off)
     && raw != 0
   {
     let vc = (4.0 * std::f64::consts::LN_2 * (1.0 - canon_ev(raw - 24))).exp();
     push(
       "ExposureTime",
       value_or_print(print_conv, vc, print_exposure_time(vc)),
-    );
-  }
-  if let Some(raw) = i8u(data, 0x06) {
-    let vc = 100.0 * ((raw as f64 / 8.0 - 9.0) * std::f64::consts::LN_2).exp();
-    push(
-      "ISO",
-      value_or_print(print_conv, vc, std::format!("{vc:.0}")),
     );
   }
 }
@@ -1572,6 +1679,27 @@ fn emit_color_temperature<F: FnMut(&'static str, TagValue)>(
 ) {
   if let Some(v) = u16(data, off, order) {
     push("ColorTemperature", TagValue::I64(v));
+  }
+}
+
+/// `WhiteBalance` as a 1-byte `int8u` (`%canonWhiteBalance`). The 1D / 1DmkII /
+/// 1DmkIIN rows have no `Format` override, so they read a single byte (unlike the
+/// `int16u` `WhiteBalance` of the later tables).
+fn emit_white_balance_int8u<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(v) = i8u(data, off) {
+    push(
+      "WhiteBalance",
+      if print_conv {
+        hash16(v, white_balance_label(v))
+      } else {
+        TagValue::I64(v)
+      },
+    );
   }
 }
 
@@ -1793,6 +1921,23 @@ fn firmware_prefix_at(data: &[u8], off: usize) -> bool {
   data
     .get(off..off + 6)
     .is_some_and(|b| version_prefix_len(b).is_some())
+}
+
+/// Perl `\w` byte — `[0-9A-Za-z_]`.
+fn is_word_byte(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `\bTOKEN$` against the trailing-whitespace-trimmed model: `token` is a suffix
+/// (the `$`, which also tolerates trailing whitespace) preceded by a non-word
+/// byte or the string start (the `\b`). The 1-series `0x0d` `Condition`s are
+/// end-anchored (`/\b1DS?$/`, `/\b1Ds? Mark II$/`, …), so a plain substring or
+/// the both-sided `word_bounded` test would mis-handle e.g. "1D Mark II".
+fn model_ends_with(model: Option<&str>, token: &str) -> bool {
+  model.is_some_and(|m| match m.trim_end().strip_suffix(token) {
+    Some(prefix) => prefix.as_bytes().last().is_none_or(|&b| !is_word_byte(b)),
+    None => false,
+  })
 }
 
 /// `/^\d+\.\d+\.\d+\s*$/` — the `0x1ac FirmwareVersion` RawConv (`Canon.pm:4469`):
@@ -2071,6 +2216,20 @@ fn flash_metering_mode_label(v: i64) -> Option<&'static str> {
     4 => "External Auto",
     5 => "External Manual",
     6 => "Off",
+    _ => return None,
+  })
+}
+
+/// `SharpnessFrequency` PrintConv (`Canon.pm:3206-3213`) — the `%CameraInfo1D`
+/// "PatternSharpness?" leaf.
+fn sharpness_frequency_label(v: i64) -> Option<&'static str> {
+  Some(match v {
+    0 => "n/a",
+    1 => "Lowest",
+    2 => "Low",
+    3 => "Standard",
+    4 => "High",
+    5 => "Highest",
     _ => return None,
   })
 }
@@ -3397,5 +3556,110 @@ mod tests {
     assert_eq!(find2("ContrastStandard"), Some(TagValue::I64(7))); // shared PSInfo2
     // The 650D-location leaves are not read for the 700D (and vice versa).
     assert_eq!(find2("FocalLength"), Some(TagValue::Str("50 mm".into())));
+  }
+
+  #[test]
+  fn dispatch_1d_1ds() {
+    assert!(model_is_camera_info_1d(Some("Canon EOS-1D")));
+    assert!(model_is_camera_info_1d(Some("Canon EOS-1DS")));
+    // lowercase "1Ds" does NOT match the case-sensitive /\b1DS?$/.
+    assert!(!model_is_camera_info_1d(Some("Canon EOS-1Ds")));
+    // the mk-series and the longer model numbers must not match the bare 1D.
+    assert!(!model_is_camera_info_1d(Some("Canon EOS-1D Mark II")));
+    assert!(!model_is_camera_info_1d(Some("Canon EOS-1D Mark III")));
+    assert!(!model_is_camera_info_1d(Some("Canon EOS 1000D")));
+    assert!(!model_is_camera_info_1d(Some("Canon EOS 100D")));
+    // per-model discriminators used inside the table:
+    assert!(model_is_1d_proper(Some("Canon EOS-1D")));
+    assert!(!model_is_1d_proper(Some("Canon EOS-1DS")));
+    assert!(model_is_1ds(Some("Canon EOS-1DS")));
+    assert!(!model_is_1ds(Some("Canon EOS-1D")));
+  }
+
+  /// `%Canon::CameraInfo1D` 1D-proper: the PLAIN int16u focal lengths, the
+  /// drop-zero int16uRev LensType (overlapping MinFocalLength by a byte), the
+  /// 1-byte int8u WhiteBalance, and the 1D-only offsets (0x41/0x42/0x44/0x48/0x4b).
+  #[test]
+  fn camera_info_1d_proper_fields() {
+    let mut b = vec![0u8; 0x60];
+    b[0x04] = 0x20; // ExposureTime raw (non-zero ⇒ emitted)
+    b[0x0a] = 0x32;
+    b[0x0b] = 0x00; // FocalLength int16u plain = 50
+    b[0x0d] = 0x00;
+    b[0x0e] = 0x0a; // LensType int16uRev = BE(00 0a) = 10; also MinFocalLength low byte
+    b[0x0f] = 0x00; // MinFocalLength int16u plain = 0x000a = 10
+    b[0x10] = 0xc8;
+    b[0x11] = 0x00; // MaxFocalLength int16u plain = 200
+    b[0x41] = 3; // SharpnessFrequency Standard
+    b[0x42] = 0xfe; // Sharpness int8s = -2
+    b[0x44] = 1; // WhiteBalance int8u Daylight
+    b[0x48] = 0x50;
+    b[0x49] = 0x14; // ColorTemperature int16u = 5200
+    b[0x4b] = 0x81; // PictureStyle Standard
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert!(find("ExposureTime").is_some());
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(
+      find("SharpnessFrequency"),
+      Some(TagValue::Str("Standard".into()))
+    );
+    assert_eq!(find("Sharpness"), Some(TagValue::I64(-2)));
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Daylight".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    // -n view: LensType renders the bare int16uRev value (10).
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS-1D"), None);
+    assert_eq!(
+      emn
+        .iter()
+        .find(|(k, _)| k == "LensType")
+        .map(|(_, v)| v.clone()),
+      Some(TagValue::I64(10))
+    );
+  }
+
+  /// `%Canon::CameraInfo1D` 1DS-proper: the 1DS-only offsets — note 0x48 is
+  /// `Sharpness` (int8s) here, not `ColorTemperature`, which moves to 0x4e.
+  #[test]
+  fn camera_info_1ds_proper_fields() {
+    let mut b = vec![0u8; 0x60];
+    b[0x04] = 0x20; // ExposureTime (non-zero)
+    b[0x0a] = 0x32;
+    b[0x0b] = 0x00; // FocalLength = 50
+    b[0x47] = 4; // SharpnessFrequency High
+    b[0x48] = 0x03; // Sharpness int8s = 3 (1DS interpretation of 0x48)
+    b[0x4a] = 2; // WhiteBalance int8u Cloudy
+    b[0x4e] = 0x88;
+    b[0x4f] = 0x13; // ColorTemperature int16u = 5000
+    b[0x51] = 0x82; // PictureStyle Portrait
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1DS"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("SharpnessFrequency"),
+      Some(TagValue::Str("High".into()))
+    );
+    assert_eq!(find("Sharpness"), Some(TagValue::I64(3)));
+    assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Cloudy".into())));
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5000)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Portrait".into())));
+  }
+
+  /// Per-field availability: a blob ending before the later leaves emits only the
+  /// in-range tags (each leaf gated on `data.get(off..off+size)`).
+  #[test]
+  fn camera_info_1d_truncated_per_field() {
+    let mut b = vec![0u8; 0x05];
+    b[0x04] = 0x20; // ExposureTime (in range)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert!(find("ExposureTime").is_some());
+    assert!(find("FocalLength").is_none());
+    assert!(find("LensType").is_none());
+    assert!(find("MinFocalLength").is_none());
+    assert!(find("WhiteBalance").is_none());
   }
 }
