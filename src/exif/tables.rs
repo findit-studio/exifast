@@ -1849,6 +1849,29 @@ pub const fn format_override(id: u16) -> Option<crate::exif::ifd::Format> {
     // `undef` bytes so the `WindowsXp` UCS-2(LE) `Decode` ValueConv sees the
     // exact byte string (not a NUL-trimmed/space-joined re-encode).
     0x9c9c | 0x9c9e => Some(crate::exif::ifd::Format::Undef),
+    // `GeoTiffDirectory` (0x87af) / `GeoTiffDoubleParams` (0x87b0) /
+    // `GeoTiffAsciiParams` (0x87b1) all carry `Format => 'undef'`
+    // (`Exif.pm:2061`/`:2083`/`:2101`, `Binary => 1`). ExifTool applies this
+    // READ override (`Exif.pm:6733`) so `$formatStr` becomes `'undef'` BEFORE the
+    // excessive-count guard, whose `$formatStr !~ /^(undef|string|binary)$/`
+    // exclusion (`Exif.pm:6760`) then EXEMPTS these blocks from the `count >
+    // 100000` skip. Without the override a crafted GeoKey directory stored as
+    // SHORT with `count > 100000` (a `~25k`-key `GeoTiffDirectory`) keeps its
+    // on-disk `int16u` format, trips [`walk_entry`](crate::exif)'s generic
+    // excessive-count guard, and is `Step::Skip`ped BEFORE that walker's GeoTiff
+    // block-capture fast-path runs — so [`crate::exif::geotiff::process`] never
+    // sees it and its `MAX_GEOKEY_ELEMENTS` `DirectoryTooLarge` budget isn't
+    // reached (a crafted-only faithfulness gap, #429). With the `undef` override
+    // the guard is skipped and `walk_entry`'s fast-path captures the raw block
+    // ONCE (it returns BEFORE the generic `read_value`/`emit`, so the block is
+    // never double-materialized), routing an oversized directory to GeoTiff's OWN
+    // budget. The leaf itself stays UNEMITTED either way (these ids are absent
+    // from the emittable leaf table), so a well-formed GeoTiff (`count < 500`) is
+    // byte-identical — the captured bytes are the same value pointer + on-disk
+    // byte length, which are resolved BEFORE this override, unchanged. (The three
+    // ids are consecutive — `GeoTiffDirectory` 0x87af, `GeoTiffDoubleParams`
+    // 0x87b0, `GeoTiffAsciiParams` 0x87b1 — so the range is exactly that trio.)
+    0x87af..=0x87b1 => Some(crate::exif::ifd::Format::Undef),
     _ => None,
   }
 }

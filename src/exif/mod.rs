@@ -6290,6 +6290,83 @@ impl Walker<'_, '_> {
       }
     }
 
+    // ---- GeoTiff block tags — capture the raw block ONCE, drop the leaf ----
+    // The three `Binary => 1` IFD0 GeoTiff block tags — `GeoTiffDirectory`
+    // (0x87af) / `GeoTiffDoubleParams` (0x87b0) / `GeoTiffAsciiParams` (0x87b1),
+    // `Exif.pm:2059`/`:2081`/`:2099` — are NEVER emitted as leaves: ExifTool's
+    // `RawConv => '$val . GetByteOrder()'` saves the raw block for the post-IFD0
+    // `ProcessGeoTiff` pass (`GeoTiff.pm:2136`) and then DELETES the tag from the
+    // default output, and the port has no request mechanism, so it captures the
+    // raw bytes and surfaces nothing. [`format_override`](tables::format_override)
+    // forced these ids to `undef`, so the excessive-count guard above was skipped
+    // (`$formatStr !~ /^(undef|string|binary)$/`, `Exif.pm:6760`) and we arrive
+    // here with the value pointer + on-disk byte length already resolved AND
+    // range-checked (`value_offset + read_len <= data.len()`, the out-of-line
+    // `value_end` test / the inline `entry+12` bound above).
+    //
+    // Capture the block bytes ONCE into the FIRST-wins `geotiff_*` slot (scoped
+    // to `%Exif::Main` AND the `InteropIFD` that reuses it — the SAME
+    // `TableRef::Exif | TableRef::Interop` scope the `undef`
+    // [`format_override`](tables::format_override) is applied under above; a
+    // GPS/vendor leaf whose id collides must not capture) and RETURN — do NOT
+    // fall through to the generic
+    // `read_value` below, which would materialize the (crafted-huge, in-bounds)
+    // `undef[read_len]` payload into a THROWAWAY `RawValue::Bytes` that
+    // [`emit`](Self::emit) would then COPY AGAIN into this same slot (the
+    // double-materialization the BigTIFF path avoids via [`read_value_byte_len`]).
+    // The single copy is bounded by the actual in-file `read_len`, NOT by the
+    // decoded element count and NOT by [`geotiff::process`]'s own
+    // `MAX_GEOKEY_ELEMENTS` budget — that budget bounds the GeoKey DIRECTORY
+    // decode (`process` returns early on an absent/empty 0x87af), so a huge
+    // `0x87b0`/`0x87b1` params block with no usable directory has no GeoKey budget
+    // and MUST be bounded here at capture time. The on-disk `self.order` is
+    // threaded to `process` separately, so NO 2-byte order suffix is appended.
+    // The leaf is unported (absent from the emittable table → `emit` would drop
+    // it), so skip building its `RawValue`/`ExifEntry` entirely: [`Step::Keep`]
+    // (the entry was handled by a faithful no-emit capture, not skipped).
+    //
+    // The gate MUST track the [`format_override`](tables::format_override) scope
+    // (`TableRef::Exif | TableRef::Interop`), NOT `Exif` alone: the `InteropIFD`
+    // reuses `%Exif::Main` (the `InteropOffset` SubDirectory carries no
+    // `TagTable`, `Exif.pm:2725`), so `ProcessExif` resolves these ids'
+    // `Format => 'undef'` on the Interop walk too and SKIPS the excessive-count
+    // guard there exactly as on IFD0. Gating the capture to `Exif` alone would
+    // let a crafted InteropIFD `0x87af`/`0x87b0`/`0x87b1` skip the guard (via the
+    // override) yet MISS this capture and fall through to the generic
+    // `read_value` — the unbounded materialization this fast-path exists to
+    // avoid. Ground-truthed vs bundled ExifTool 13.59: an `InteropIFD`
+    // `GeoTiffDirectory` emits the `GeoTiff:*` GeoKeys byte-identically to IFD0
+    // (`ProcessGeoTiff` fires off the IFD-agnostic `GeoTiffDirectory` DataMember,
+    // `ExifTool.pm:8740`), and an oversized Interop `0x87b0` reads as `undef`
+    // with NO excessive-count warning. (The `-validate`-only "Wrong IFD" note,
+    // `Validate.pm:454`, is unmodelled.) Capture is LAST-wins (DataMember
+    // overwrite — see below).
+    if matches!(self.active_table, TableRef::Exif | TableRef::Interop)
+      && matches!(
+        tag_id,
+        tables::TAG_GEOTIFF_DIRECTORY
+          | tables::TAG_GEOTIFF_DOUBLE_PARAMS
+          | tables::TAG_GEOTIFF_ASCII_PARAMS
+      )
+    {
+      let slot = match tag_id {
+        tables::TAG_GEOTIFF_DIRECTORY => &mut self.geotiff_directory,
+        tables::TAG_GEOTIFF_DOUBLE_PARAMS => &mut self.geotiff_double_params,
+        _ => &mut self.geotiff_ascii_params,
+      };
+      // LAST-wins (DataMember overwrite, ExifTool FoundTag semantics): a later
+      // same-id capture in walk order replaces an earlier one. IFD0's own
+      // `0x87af` (tag 0x87af) is walked AFTER the InteropIFD (dispatched at the
+      // earlier `ExifOffset` 0x8769), so this lets a real IFD0 GeoTiffDirectory
+      // overwrite a crafted Interop dup — matching bundled ExifTool 13.59, which
+      // emits the IFD0 value. Each occurrence still captures once (bounded by
+      // `read_len`); a single-occurrence real file is unaffected.
+      if let Some(bytes) = data.get(value_offset..value_offset.saturating_add(read_len)) {
+        *slot = Some(bytes.to_vec());
+      }
+      return Step::Keep;
+    }
+
     // ---- Leaf tag — decode the value ------------------------------------
     // `$formatStr = 'int8u' if $format == 7 and $count == 1` (Exif.pm:6644)
     // — "treat single unknown byte as int8u". So a 1-element `undef` tag
@@ -8382,44 +8459,15 @@ impl Walker<'_, '_> {
       self.dng_version = raw.is_perl_truthy();
     }
 
-    // GeoTiff block-tag capture — the three `Binary => 1` IFD0 tags
-    // `GeoTiffDirectory` (0x87af) / `GeoTiffDoubleParams` (0x87b0) /
-    // `GeoTiffAsciiParams` (0x87b1) (`Exif.pm:2059`/`:2081`/`:2099`). ExifTool's
-    // `RawConv => '$val . GetByteOrder()'` (`Exif.pm:2070`/`:2087`) saves these
-    // raw blocks for the post-IFD `ProcessGeoTiff` pass, then DELETES the tags
-    // from default output unless explicitly requested (`GeoTiff.pm:2215-2220`) —
-    // the port has no `RequestAll`/request mechanism, so it captures the raw
-    // bytes here (BELOW the leaf table, so it runs even though these tags are
-    // NOT in the port's [`tables`] table → the unknown-tag `next` below drops the
-    // emit) and never surfaces them. The bytes are taken DIRECTLY from the value
-    // slice (the `$val` undef bytes the RawConv operates on), independent of the
-    // on-disk format the walker decoded; the real `self.order` is threaded to
-    // `ProcessGeoTiff` separately, so NO 2-byte order suffix is appended. Like
-    // the other core RawConv DataMember taps, scoped to the CORE Exif IFD
-    // (`%Exif::Main`); a GPS/vendor leaf whose id collides must not capture.
-    // FIRST-wins (the directory pointer in IFD0 is reached once; a crafted
-    // duplicate keeps the first, mirroring `ProcessGeoTiff`'s single pass).
-    if matches!(self.active_table, TableRef::Exif)
-      && matches!(
-        tag_id,
-        tables::TAG_GEOTIFF_DIRECTORY
-          | tables::TAG_GEOTIFF_DOUBLE_PARAMS
-          | tables::TAG_GEOTIFF_ASCII_PARAMS
-      )
-    {
-      let slot = match tag_id {
-        tables::TAG_GEOTIFF_DIRECTORY => &mut self.geotiff_directory,
-        tables::TAG_GEOTIFF_DOUBLE_PARAMS => &mut self.geotiff_double_params,
-        _ => &mut self.geotiff_ascii_params,
-      };
-      if slot.is_none()
-        && let Some(bytes) = self
-          .data
-          .get(value_offset..value_offset.saturating_add(value_size))
-      {
-        *slot = Some(bytes.to_vec());
-      }
-    }
+    // GeoTiff block-tag capture (`GeoTiffDirectory` 0x87af / `GeoTiffDoubleParams`
+    // 0x87b0 / `GeoTiffAsciiParams` 0x87b1, the `Binary => 1` blocks whose
+    // `RawConv => '$val . GetByteOrder()'` saves them for `ProcessGeoTiff`) does
+    // NOT run here, unlike the sibling RawConv DataMember taps above: it lives in
+    // [`walk_entry`](Self::walk_entry)'s GeoTiff fast-path, which captures the raw
+    // block ONCE before this `emit` is ever reached for those ids and returns —
+    // so the crafted-huge `undef` payload is never materialized into a throwaway
+    // `RawValue` that this tap would then copy a SECOND time. See that fast-path
+    // for the capture semantics + the `format_override`/excessive-count interplay.
 
     // `#### eval IsOffset ($val, $et) … $val += $offsetBase` (Exif.pm:7156-
     // 7170): convert an `IsOffset` tag's value(s) to ABSOLUTE file offsets by
@@ -16353,6 +16401,455 @@ mod tests {
   fn rejects_ifd0_offset_below_8() {
     // Valid MM marker but IFD0 offset = 4 (< 8 ⇒ DoProcessTIFF return 0).
     assert!(parse_exif_block(b"MM\0\x2a\0\0\0\x04").is_none());
+  }
+
+  /// #429 — a crafted classic TIFF whose IFD0 `GeoTiffDirectory` (0x87af) is
+  /// stored on-disk as SHORT with an element `count > 100000` must reach
+  /// `geotiff::process` and be bounded by ITS oversized-directory budget
+  /// (`MAX_GEOKEY_ELEMENTS` → `Oversized GeoTIFF directory`), NOT the generic
+  /// classic-TIFF excessive-count guard.
+  ///
+  /// The three GeoTiff block tags carry `Format => 'undef'` (`Exif.pm:2061`/
+  /// `:2083`/`:2101`), which [`tables::format_override`] now applies. ExifTool
+  /// reads that override BEFORE the excessive-count guard, whose `$formatStr !~
+  /// /^(undef|string|binary)$/` exclusion (`Exif.pm:6760`) then exempts the tag.
+  /// Without the override the SHORT on-disk format made `walk_entry`'s
+  /// `count > 100000` guard FIRE — a generic "Ignoring IFD0 tag 0x87af with
+  /// excessive count" warning + `Step::Skip` — BEFORE `emit`'s GeoTiff raw-block
+  /// capture tap ran, so `geotiff::process` never saw the directory and its
+  /// `DirectoryTooLarge` budget was unreachable. With the override `$formatStr`
+  /// is `undef`, the guard is skipped, the capture runs, and the oversized
+  /// directory hits GeoTiff's bound: EXACTLY ONE `Oversized GeoTIFF directory`
+  /// and NO generic excessive-count warning. (Crafted-only — both paths are
+  /// already heap-bounded; this only re-routes which budget/warning applies.)
+  #[test]
+  fn geotiff_short_count_over_100000_routes_to_directory_too_large() {
+    use crate::diagnostics::Diagnose;
+
+    // The GeoKey directory (the 0x87af value): a 4-word header declaring 25_000
+    // entries, each a real int16u GeoKey (GTModelType 1024) re-reading the
+    // directory itself (loc 0x87af) with the maximum count 65535 from offset 0.
+    // The per-key element charge (65535) crosses MAX_GEOKEY_ELEMENTS (1 << 20)
+    // after 17 entries, so `geotiff::process` STOPS + raises ONE
+    // `DirectoryTooLarge` rather than materializing all 25_000. The directory is
+    // 8 + 25_000 * 8 = 200_008 bytes = 100_004 int16u elements, so the IFD-level
+    // SHORT count (100_004) clears the generic guard's 100_000 threshold — the
+    // exact shape the bug skipped before reaching the GeoTiff capture.
+    const NUM_ENTRIES: u16 = 25_000;
+    let mut dir: Vec<u8> = Vec::with_capacity(8 + NUM_ENTRIES as usize * 8);
+    dir.extend_from_slice(&1u16.to_le_bytes()); // version
+    dir.extend_from_slice(&0u16.to_le_bytes()); // revision
+    dir.extend_from_slice(&0u16.to_le_bytes()); // minorRev
+    dir.extend_from_slice(&NUM_ENTRIES.to_le_bytes()); // numEntries
+    for _ in 0..NUM_ENTRIES {
+      dir.extend_from_slice(&1024u16.to_le_bytes()); // GTModelType (a known GeoKey)
+      dir.extend_from_slice(&0x87afu16.to_le_bytes()); // loc = int16u from the dir
+      dir.extend_from_slice(&u16::MAX.to_le_bytes()); // count = 65535
+      dir.extend_from_slice(&0u16.to_le_bytes()); // offset = 0
+    }
+    let count_shorts = u32::try_from(dir.len() / 2).expect("fits u32"); // 100_004
+    assert!(
+      count_shorts > 100_000,
+      "the IFD SHORT count must clear the guard"
+    );
+
+    // Little-endian TIFF: II, magic 0x002a, IFD0 @ 8. ONE IFD0 entry (0x87af,
+    // SHORT, count = count_shorts) whose value is out-of-line at offset 26 (the
+    // byte right after the next-IFD pointer).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // numEntries = 1
+    t.extend_from_slice(&0x87afu16.to_le_bytes()); // tag = GeoTiffDirectory
+    t.extend_from_slice(&3u16.to_le_bytes()); // format = SHORT (int16u)
+    t.extend_from_slice(&count_shorts.to_le_bytes()); // count > 100000
+    t.extend_from_slice(&26u32.to_le_bytes()); // out-of-line value offset
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    assert_eq!(t.len(), 26, "the value must start exactly at offset 26");
+    t.extend_from_slice(&dir); // the GeoKey directory value (in bounds)
+
+    let meta = parse_borrowed(&t).expect("the crafted TIFF parses");
+    let diags = meta.diagnostics();
+    let messages: Vec<&str> = diags.iter().map(|d| d.message()).collect();
+
+    // EXACTLY ONE GeoTiff-specific bound — the oversized directory reached
+    // `geotiff::process` and was truncated by its own budget.
+    assert_eq!(
+      messages
+        .iter()
+        .filter(|m| **m == "Oversized GeoTIFF directory")
+        .count(),
+      1,
+      "expected exactly one GeoTiff DirectoryTooLarge in {messages:?}"
+    );
+    // and NOT the generic classic-TIFF excessive-count guard (the pre-#429 skip
+    // that pre-empted the GeoTiff capture).
+    assert!(
+      !messages.iter().any(|m| m.contains("excessive count")),
+      "a GeoTiff block tag must NOT trip the generic excessive-count guard: {messages:?}"
+    );
+  }
+
+  /// #429 — a crafted classic TIFF with an OVER-LARGE `GeoTiffDoubleParams`
+  /// (0x87b0) block but NO `GeoTiffDirectory` (0x87af) must be CAPTURED ONCE
+  /// (bounded by its on-disk `read_len`) and then DROPPED — never decoded, and
+  /// NOT relying on `geotiff::process` to bound it.
+  ///
+  /// The double/ASCII params blocks (0x87b0/0x87b1) are pure GeoKey value pools
+  /// indexed BY the directory; with no directory `geotiff::process` returns early
+  /// (`$et->GetValue('GeoTiffDirectory') or return`, `GeoTiff.pm:2136`), so its
+  /// `MAX_GEOKEY_ELEMENTS` budget NEVER runs on them — the ONLY bound is
+  /// `walk_entry`'s GeoTiff fast-path, whose single `read_len`-sized capture
+  /// returns BEFORE the generic `read_value`/`emit` (so the over-large `undef`
+  /// payload is materialized AT MOST once; the `alloc_budget` integration test
+  /// pins the single-copy byte bound).
+  ///
+  /// Asserts the parse SUCCEEDS and raises NEITHER any GeoTiff diagnostic (no
+  /// directory ⇒ `geotiff::process` produced nothing — no `Oversized GeoTIFF
+  /// directory`, no `Bad GeoTIFF directory`, no `Missing … data`) NOR the generic
+  /// excessive-count guard (the `undef` `format_override` exempts the block). A
+  /// regression that fell back to `geotiff::process` for bounding, or that
+  /// re-introduced the leaf decode, would surface one of these.
+  #[test]
+  fn geotiff_double_params_without_directory_is_captured_not_decoded() {
+    use crate::diagnostics::Diagnose;
+
+    // A 300_000-byte `GeoTiffDoubleParams` block — "over-large" (well past the
+    // 100_000 excessive-count threshold), in-bounds, on-disk `undef`. NO 0x87af
+    // entry, so there is no GeoKey directory to index into it.
+    const BLOCK: usize = 300_000;
+
+    // Little-endian TIFF: II, magic 0x002a, IFD0 @ 8. ONE IFD0 entry (0x87b0,
+    // UNDEF, count = BLOCK) whose value is out-of-line at offset 26 (the byte
+    // right after the next-IFD pointer).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // numEntries = 1
+    t.extend_from_slice(&0x87b0u16.to_le_bytes()); // tag = GeoTiffDoubleParams
+    t.extend_from_slice(&7u16.to_le_bytes()); // format = UNDEF (1-byte element)
+    t.extend_from_slice(&u32::try_from(BLOCK).expect("fits u32").to_le_bytes()); // count
+    t.extend_from_slice(&26u32.to_le_bytes()); // out-of-line value offset
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    assert_eq!(t.len(), 26, "the value must start exactly at offset 26");
+    t.resize(26 + BLOCK, 0x5a); // the in-bounds params block (no 0x87af directory)
+
+    let meta = parse_borrowed(&t).expect("the crafted TIFF parses");
+    let diags = meta.diagnostics();
+    let messages: Vec<&str> = diags.iter().map(|d| d.message()).collect();
+
+    // No directory ⇒ `geotiff::process` returned None ⇒ NO GeoTiff diagnostic of
+    // any kind (it never decoded the captured params, so its budget never ran).
+    assert!(
+      !messages.iter().any(|m| m.contains("GeoTIFF")),
+      "an over-large params block with no directory must not be processed by \
+       geotiff::process (no GeoTiff diagnostic): {messages:?}"
+    );
+    // And the `undef` format_override keeps it off the generic excessive-count
+    // guard (mirroring the directory case above).
+    assert!(
+      !messages.iter().any(|m| m.contains("excessive count")),
+      "the undef format_override exempts 0x87b0 from the excessive-count guard: {messages:?}"
+    );
+  }
+
+  /// #429 — a `GeoTiffDirectory` (0x87af) located in the `InteropIFD` (which
+  /// reuses `%Exif::Main`) must be captured + decoded into the SAME `GeoTiff:*`
+  /// GeoKeys as one in IFD0. Bundled ExifTool 13.59's `ProcessGeoTiff` fires off
+  /// the IFD-agnostic `GeoTiffDirectory` DataMember (`ExifTool.pm:8740`)
+  /// regardless of which IFD extracted it — oracle-verified: an `InteropIFD`
+  /// `GeoTiffDirectory` emits `GeoTiff:GTModelType` byte-identically to IFD0. The
+  /// capture fast-path is therefore co-scoped with the `undef`
+  /// [`tables::format_override`] (`TableRef::Exif | TableRef::Interop`); gating it
+  /// to `Exif` alone would DROP these Interop GeoKeys (and leak the block to the
+  /// generic `read_value`), so the gate tracks the override scope, not `Exif`
+  /// alone.
+  #[test]
+  fn geotiff_directory_in_interop_ifd_emits_geokeys_like_ifd0() {
+    // A minimal valid GeoKey directory: header (version 1, revision 1.0,
+    // numKeys 1) + one key GTModelType (1024), loc 0 (inline), count 1, value 2
+    // (ModelTypeGeographic). 8 int16u = 16 bytes.
+    fn geokey_dir() -> Vec<u8> {
+      let mut d = Vec::new();
+      for w in [1u16, 1, 0, 1, /* key: */ 1024, 0, 1, 2] {
+        d.extend_from_slice(&w.to_le_bytes());
+      }
+      d
+    }
+    let dir = geokey_dir();
+    let nshort = u32::try_from(dir.len() / 2).expect("fits u32");
+
+    // GeoTiffDirectory (0x87af) as IFD0's sole out-of-line entry @ 26.
+    let ifd0_tiff = {
+      let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      t.extend_from_slice(&1u16.to_le_bytes()); // IFD0 numEntries = 1
+      t.extend_from_slice(&0x87afu16.to_le_bytes()); // GeoTiffDirectory
+      t.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&26u32.to_le_bytes()); // value @ 26
+      t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+      assert_eq!(
+        t.len(),
+        26,
+        "the IFD0 directory value must start at offset 26"
+      );
+      t.extend_from_slice(&dir);
+      t
+    };
+
+    // The SAME GeoTiffDirectory reached via IFD0 -> ExifIFD (0x8769) ->
+    // InteropIFD (0xa005), as the InteropIFD's sole entry @ 62.
+    let interop_tiff = {
+      let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      // IFD0 @ 8: ExifOffset (0x8769) LONG -> ExifIFD @ 26.
+      t.extend_from_slice(&1u16.to_le_bytes());
+      t.extend_from_slice(&0x8769u16.to_le_bytes());
+      t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&26u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      // ExifIFD @ 26: InteropOffset (0xa005) LONG -> InteropIFD @ 44.
+      t.extend_from_slice(&1u16.to_le_bytes());
+      t.extend_from_slice(&0xa005u16.to_le_bytes());
+      t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&44u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      // InteropIFD @ 44: GeoTiffDirectory (0x87af) SHORT -> value @ 62.
+      t.extend_from_slice(&1u16.to_le_bytes());
+      t.extend_from_slice(&0x87afu16.to_le_bytes());
+      t.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&62u32.to_le_bytes()); // value @ 62
+      t.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(
+        t.len(),
+        62,
+        "the Interop directory value must start at offset 62"
+      );
+      t.extend_from_slice(&dir);
+      t
+    };
+
+    let geokey_names = |tiff: &[u8]| -> Vec<std::string::String> {
+      use std::string::ToString;
+      let meta = parse_borrowed(tiff).expect("the crafted TIFF parses");
+      let mut out = std::vec::Vec::new();
+      meta.push_geotiff_tags(true, &mut out);
+      for t in &out {
+        // Every decoded GeoKey rides the family-1 `GeoTiff` group.
+        assert_eq!(
+          t.tag().group_ref().family1(),
+          "GeoTiff",
+          "GeoKey {} must be in the GeoTiff group",
+          t.tag().name()
+        );
+      }
+      out.iter().map(|t| t.tag().name().to_string()).collect()
+    };
+
+    let ifd0_keys = geokey_names(&ifd0_tiff);
+    let interop_keys = geokey_names(&interop_tiff);
+
+    // The InteropIFD directory WAS captured (fast-path now co-scoped to Interop)
+    // and ProcessGeoTiff'd: GeoKeys emit.
+    assert!(
+      interop_keys.iter().any(|n| n == "GTModelType"),
+      "an InteropIFD GeoTiffDirectory must emit GeoTiff:GTModelType: {interop_keys:?}"
+    );
+    // ...byte-identically to the IFD0 directory (same keys, same order) — the
+    // InteropIFD is treated as `%Exif::Main`, exactly as bundled ExifTool does.
+    assert_eq!(
+      interop_keys, ifd0_keys,
+      "InteropIFD GeoKeys must match the IFD0 GeoKeys"
+    );
+  }
+
+  /// #429 — DataMember LAST-wins: when a `GeoTiffDirectory` (0x87af) appears in
+  /// BOTH the `InteropIFD` and IFD0, the IFD0 directory wins. IFD0 entries walk
+  /// in tag-id order, so `ExifOffset` (0x8769) — which dispatches the
+  /// `ExifIFD` -> `InteropIFD` immediately — is hit BEFORE IFD0's own `0x87af`
+  /// (tag 0x87af); the LAST capture in walk order is therefore IFD0's, which
+  /// overwrites the earlier Interop one. Oracle (bundled ExifTool 13.59): a dup
+  /// with Interop `GTModelType=2` + IFD0 `GTModelType=1` emits
+  /// `GeoTiff:GTModelType = 1` (the IFD0 value). FIRST-wins would wrongly keep
+  /// the Interop `2`.
+  #[test]
+  fn geotiff_directory_ifd0_wins_over_interop_dup_last_wins() {
+    // A minimal GeoKey directory carrying a single `GTModelType` (1024) = `model`.
+    fn geokey_dir(model: u16) -> std::vec::Vec<u8> {
+      let mut d = std::vec::Vec::new();
+      for w in [1u16, 1, 0, 1, /* key: */ 1024, 0, 1, model] {
+        d.extend_from_slice(&w.to_le_bytes());
+      }
+      d
+    }
+    let nshort = u32::try_from(geokey_dir(1).len() / 2).expect("fits u32");
+
+    // The emitted (raw, `-n`) `GTModelType` value for a crafted TIFF.
+    let gtmodeltype = |tiff: &[u8]| {
+      let meta = parse_borrowed(tiff).expect("the crafted TIFF parses");
+      let mut out = std::vec::Vec::new();
+      meta.push_geotiff_tags(false, &mut out);
+      out
+        .iter()
+        .find(|e| e.tag().name() == "GTModelType")
+        .expect("GTModelType emitted")
+        .tag()
+        .value_ref()
+        .clone()
+    };
+
+    // IFD0-only directory (GTModelType=1) @ 26.
+    let ifd0_only = {
+      let mut t: std::vec::Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      t.extend_from_slice(&1u16.to_le_bytes());
+      t.extend_from_slice(&0x87afu16.to_le_bytes());
+      t.extend_from_slice(&3u16.to_le_bytes());
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&26u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(t.len(), 26);
+      t.extend_from_slice(&geokey_dir(1));
+      t
+    };
+
+    // Interop-only directory (GTModelType=2) @ 62.
+    let interop_only = {
+      let mut t: std::vec::Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      t.extend_from_slice(&1u16.to_le_bytes()); // IFD0: ExifOffset -> 26
+      t.extend_from_slice(&0x8769u16.to_le_bytes());
+      t.extend_from_slice(&4u16.to_le_bytes());
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&26u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      t.extend_from_slice(&1u16.to_le_bytes()); // ExifIFD @26: InteropOffset -> 44
+      t.extend_from_slice(&0xa005u16.to_le_bytes());
+      t.extend_from_slice(&4u16.to_le_bytes());
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&44u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      t.extend_from_slice(&1u16.to_le_bytes()); // InteropIFD @44: 0x87af -> 62
+      t.extend_from_slice(&0x87afu16.to_le_bytes());
+      t.extend_from_slice(&3u16.to_le_bytes());
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&62u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(t.len(), 62);
+      t.extend_from_slice(&geokey_dir(2));
+      t
+    };
+
+    // The DUP: IFD0 has BOTH ExifOffset(0x8769)->Interop(0x87af=dir2, @90) AND
+    // its own 0x87af(=dir1, @74). 0x8769 < 0x87af so the InteropIFD is walked
+    // first; IFD0's 0x87af overwrites it (last-wins).
+    let dup = {
+      let mut t: std::vec::Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+      t.extend_from_slice(&2u16.to_le_bytes()); // IFD0: 2 entries
+      t.extend_from_slice(&0x8769u16.to_le_bytes()); // ExifOffset -> ExifIFD @38
+      t.extend_from_slice(&4u16.to_le_bytes());
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&38u32.to_le_bytes());
+      t.extend_from_slice(&0x87afu16.to_le_bytes()); // IFD0's own GeoTiffDirectory -> @74
+      t.extend_from_slice(&3u16.to_le_bytes());
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&74u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+      assert_eq!(t.len(), 38, "ExifIFD starts at 38");
+      t.extend_from_slice(&1u16.to_le_bytes()); // ExifIFD @38: InteropOffset -> 56
+      t.extend_from_slice(&0xa005u16.to_le_bytes());
+      t.extend_from_slice(&4u16.to_le_bytes());
+      t.extend_from_slice(&1u32.to_le_bytes());
+      t.extend_from_slice(&56u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(t.len(), 56, "InteropIFD starts at 56");
+      t.extend_from_slice(&1u16.to_le_bytes()); // InteropIFD @56: 0x87af -> 90
+      t.extend_from_slice(&0x87afu16.to_le_bytes());
+      t.extend_from_slice(&3u16.to_le_bytes());
+      t.extend_from_slice(&nshort.to_le_bytes());
+      t.extend_from_slice(&90u32.to_le_bytes());
+      t.extend_from_slice(&0u32.to_le_bytes());
+      assert_eq!(t.len(), 74, "IFD0 dir starts at 74");
+      t.extend_from_slice(&geokey_dir(1)); // IFD0 dir @74 (GTModelType=1)
+      assert_eq!(t.len(), 90, "Interop dir starts at 90");
+      t.extend_from_slice(&geokey_dir(2)); // Interop dir @90 (GTModelType=2)
+      t
+    };
+
+    let dup_gtm = gtmodeltype(&dup);
+    // IFD0 (the later walk-order capture) wins — matches bundled ExifTool.
+    assert_eq!(
+      dup_gtm,
+      gtmodeltype(&ifd0_only),
+      "the IFD0 GeoTiffDirectory must win the dup (last-wins / DataMember overwrite)"
+    );
+    assert_ne!(
+      dup_gtm,
+      gtmodeltype(&interop_only),
+      "the earlier Interop GeoTiffDirectory must NOT win the dup"
+    );
+  }
+
+  /// #429 — a crafted `GeoTiffDoubleParams` (0x87b0) in the `InteropIFD`, stored
+  /// as SHORT with `count > 100000` and NO `GeoTiffDirectory`, takes the SAME
+  /// `undef`-override + bounded-capture path as IFD0: it must NOT trip the
+  /// generic excessive-count guard. The `InteropIFD` reuses `%Exif::Main`, so
+  /// bundled ExifTool 13.59 applies `Format => 'undef'` there too (oracle:
+  /// "int16u[100004] read as undef[200008]", NO excessive-count warning); the
+  /// capture fast-path is co-scoped with the override
+  /// (`TableRef::Exif | TableRef::Interop`), so the over-large block is captured
+  /// ONCE and the leaf dropped, never reaching the generic `read_value`. With no
+  /// directory `geotiff::process` returns early — no `GeoTiff:*` keys, no diag.
+  ///
+  /// Were the capture gated to `Exif` alone, the override would still skip the
+  /// guard on the Interop walk but the block would MISS the capture and fall
+  /// through to `read_value` (a full unbounded materialization) — the regression
+  /// this pins. (An `Exif`-only override scope would instead make the guard FIRE
+  /// here, emitting an excessive-count warning bundled ExifTool does not.)
+  #[test]
+  fn geotiff_oversized_double_params_in_interop_ifd_skips_guard_bounded() {
+    use crate::diagnostics::Diagnose;
+
+    const COUNT: u32 = 100_004; // > 100000 SHORT elements -> 200_008 bytes
+    let block_bytes = COUNT as usize * 2;
+
+    // II TIFF: IFD0 @8 -> ExifIFD @26 (0x8769) -> InteropIFD @44 (0xa005);
+    // the InteropIFD's sole entry is 0x87b0 SHORT[COUNT] out-of-line @ 62.
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes());
+    t.extend_from_slice(&0x8769u16.to_le_bytes()); // ExifOffset
+    t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    t.extend_from_slice(&1u32.to_le_bytes());
+    t.extend_from_slice(&26u32.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes());
+    t.extend_from_slice(&1u16.to_le_bytes());
+    t.extend_from_slice(&0xa005u16.to_le_bytes()); // InteropOffset
+    t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    t.extend_from_slice(&1u32.to_le_bytes());
+    t.extend_from_slice(&44u32.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes());
+    t.extend_from_slice(&1u16.to_le_bytes());
+    t.extend_from_slice(&0x87b0u16.to_le_bytes()); // GeoTiffDoubleParams
+    t.extend_from_slice(&3u16.to_le_bytes()); // SHORT (would trip the guard if kept)
+    t.extend_from_slice(&COUNT.to_le_bytes());
+    t.extend_from_slice(&62u32.to_le_bytes()); // value @ 62
+    t.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(t.len(), 62, "the params value must start at offset 62");
+    t.resize(62 + block_bytes, 0x5a); // in-bounds params block, NO directory
+
+    let meta = parse_borrowed(&t).expect("the crafted TIFF parses");
+    let diags = meta.diagnostics();
+    let messages: Vec<&str> = diags.iter().map(|d| d.message()).collect();
+
+    // The `undef` override applies on the Interop walk (it reuses %Exif::Main),
+    // so the SHORT count>100000 does NOT trip the excessive-count guard —
+    // matching bundled ExifTool (which reads it as undef[200008], no warning).
+    assert!(
+      !messages.iter().any(|m| m.contains("excessive count")),
+      "an InteropIFD GeoTiff block tag must NOT trip the excessive-count guard \
+       (the undef override applies there too): {messages:?}"
+    );
+    // No directory ⇒ geotiff::process produced nothing (no GeoKeys, no diag).
+    assert!(
+      !messages.iter().any(|m| m.contains("GeoTIFF")),
+      "no GeoTiffDirectory ⇒ no GeoTiff processing/diagnostic: {messages:?}"
+    );
   }
 
   /// `parse_gps_block` walks a GPS-ONLY top-level TIFF block (a Canon CR3 `CMT4`
