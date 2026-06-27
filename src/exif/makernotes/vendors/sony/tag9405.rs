@@ -94,14 +94,16 @@ pub fn selects_tag9405b(raw: &[u8]) -> bool {
 // --- model `Condition` predicates --------------------------------------------
 
 /// `$$self{Model} =~ /^(DSC-|Stellar)/` — the `Tag9405a` exclusion class
-/// (`Sony.pm:8902` etc.): a `None` model does NOT match.
-fn model_is_dsc_or_stellar(model: Option<&str>) -> bool {
+/// (`Sony.pm:8902` etc.): a `None` model does NOT match. Shared with the
+/// `Tag2010e` lens / distortion-correction `Condition`s (`Sony.pm:6812` etc.).
+pub(crate) fn model_is_dsc_or_stellar(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.starts_with("DSC-") || m.starts_with("Stellar"))
 }
 
 /// `$$self{Model} =~ /^DSC-/` — the `Tag9405b` exclusion class (`Sony.pm:9046`
-/// etc.).
-fn model_is_dsc(model: Option<&str>) -> bool {
+/// etc.). Shared with the `Tag2010e`/`g`/`h`/`i` lens / distortion-correction
+/// `Condition`s (`Sony.pm:6862`/`7054` etc.).
+pub(crate) fn model_is_dsc(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.starts_with("DSC-"))
 }
 
@@ -114,8 +116,10 @@ fn model_is_dsc_or_zv(model: Option<&str>) -> bool {
 /// `model` starts with any `stem`, then a Perl `\b` word boundary (the next
 /// char is NOT `[A-Za-z0-9_]`, or end-of-string). Used for the `…\b`-anchored
 /// `VignettingCorrParams`/`ChromaticAberrationCorrParams` conditions, where a
-/// bare `ILCE-7` must NOT swallow `ILCE-7M2`/`ILCE-7RM2`/…
-fn starts_with_word_boundary(model: Option<&str>, stems: &[&str]) -> bool {
+/// bare `ILCE-7` must NOT swallow `ILCE-7M2`/`ILCE-7RM2`/… Shared with the
+/// `Tag2010g`/`h`/`i` dispatch `Condition`s and the `Tag2010e` per-leaf
+/// SonyISO / FocalLength / AspectRatio `\b`-anchored `Condition`s.
+pub(crate) fn starts_with_word_boundary(model: Option<&str>, stems: &[&str]) -> bool {
   let Some(m) = model else { return false };
   stems.iter().any(|stem| {
     m.strip_prefix(stem).is_some_and(|rest| {
@@ -293,8 +297,8 @@ fn model_cacp_0x03b8(model: Option<&str>) -> bool {
 // --- PrintConv hashes --------------------------------------------------------
 
 /// `{ 0 => 'No', 1 => 'Yes' }` — `DistortionCorrParamsPresent`
-/// (`Sony.pm:8889`/`9046`).
-fn print_no_yes(v: u8) -> Option<&'static str> {
+/// (`Sony.pm:8889`/`9046`). Shared with `Tag2010e`/`g`/`h`/`i`.
+pub(crate) fn print_no_yes(v: u8) -> Option<&'static str> {
   Some(match v {
     0 => "No",
     1 => "Yes",
@@ -313,8 +317,8 @@ fn print_distortion_correction(v: u8) -> Option<&'static str> {
 }
 
 /// `{ 0 => 'Unknown', 1 => 'APS-C', 2 => 'Full-frame' }` — `LensFormat`
-/// (`Sony.pm:8908`/`9062`).
-fn print_lens_format(v: u8) -> Option<&'static str> {
+/// (`Sony.pm:8908`/`9062`). Shared with `Tag2010e`/`g`/`h`/`i`.
+pub(crate) fn print_lens_format(v: u8) -> Option<&'static str> {
   Some(match v {
     0 => "Unknown",
     1 => "APS-C",
@@ -324,8 +328,8 @@ fn print_lens_format(v: u8) -> Option<&'static str> {
 }
 
 /// `{ 0 => 'Unknown', 1 => 'A-mount', 2 => 'E-mount' }` — `LensMount`
-/// (`Sony.pm:8923`/`9079`).
-fn print_lens_mount(v: u8) -> Option<&'static str> {
+/// (`Sony.pm:8923`/`9079`). Shared with `Tag2010e`/`g`/`h`/`i`.
+pub(crate) fn print_lens_mount(v: u8) -> Option<&'static str> {
   Some(match v {
     0 => "Unknown",
     1 => "A-mount",
