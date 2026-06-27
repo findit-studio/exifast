@@ -50,6 +50,14 @@ pub fn model_is_camera_info_5d(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 5D"))
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo6D` (`Canon.pm:1357`,
+/// `$$self{Model} =~ /EOS 6D$/` — anchored, so the original 6D only, NOT
+/// "6D Mark II").
+#[must_use]
+pub fn model_is_camera_info_6d(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS 6D"))
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D / 500D /
@@ -67,6 +75,8 @@ pub fn parse(
 ) -> Vec<(SmolStr, TagValue)> {
   if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
+  } else if model_is_camera_info_6d(model) {
+    camera_info_6d(data, order, print_conv)
   } else if model_is_camera_info_7d(model) {
     camera_info_7d(data, order, print_conv)
   } else if model_is_camera_info_40d(model) {
@@ -299,6 +309,71 @@ fn camera_info_5d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolS
       TagValue::Str(SmolStr::from(convert_unix_time(v))),
     );
   }
+  out
+}
+
+/// `%Canon::CameraInfo6D` (`Canon.pm:4261-4339`). `FORMAT => 'int8u'`,
+/// `PRIORITY => 0`, no firmware `Hook`. Carries `WhiteBalance` (0xc2) and a
+/// PictureStyle leaf; `FirmwareVersion` (0x256) has NO `RawConv` guard. The
+/// `0x3c6 PictureStyleInfo` `IS_SUBDIR` walks the nested `%Canon::PSInfo2` table
+/// (the 60D-group variant with the extra `*Auto` style block).
+fn camera_info_6d(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x23,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x83, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x92,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focus_distance(
+    data,
+    0x94,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_white_balance(data, 0xc2, order, print_conv, &mut push);
+  emit_color_temperature(data, 0xc6, order, &mut push);
+  emit_picture_style(data, 0xfa, print_conv, &mut push);
+  emit_lens_type(data, 0x161, order, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x163,
+    "MinFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_focal_mm(
+    data,
+    0x165,
+    "MaxFocalLength",
+    false,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_firmware_version(data, 0x256, false, &mut push);
+  emit_file_index(data, 0x2aa, order, &mut push);
+  emit_directory_index(data, 0x2b6, order, true, &mut push);
+  ps_info2(data, 0x3c6, order, print_conv, &mut push);
   out
 }
 
@@ -1432,6 +1507,59 @@ fn ps_info<F: FnMut(&'static str, TagValue)>(
   }
 }
 
+/// `%Canon::PSInfo2` (`Canon.pm:6178-6356`) — the 60D-group nested subdir
+/// (5DmkIII / 60D / 600D / 1100D etc.). Identical to `%PSInfo` but with an extra
+/// `*Auto` picture-style block inserted at 0x90 (Contrast/Sharpness/Saturation/
+/// ColorTone + Filter/ToningEffectAuto), which shifts the three UserDef blocks
+/// +0x18 and moves the int16u `UserDef{1,2,3}PictureStyle` leaves to
+/// 0xf0/0xf2/0xf4. Same `%psInfo` suppression of the `Unknown => 1` rows.
+fn ps_info2<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  start: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  // The plain int32s scalars (`%psConv`: 0xdeadbeef ⇒ "n/a", else passthrough).
+  for &(off, name) in PS_SCALARS2 {
+    if let Some(v) = i32s(data, start + off, order) {
+      push(name, ps_scalar_value(v, print_conv));
+    }
+  }
+  // FilterEffect/ToningEffect (Monochrome + Auto + the three UserDefs) —
+  // explicit PrintConv hashes (with 0xdeadbeef ⇒ "n/a").
+  for &(off, name, toning) in PS_EFFECTS2 {
+    if let Some(v) = i32s(data, start + off, order) {
+      let label = if toning {
+        ps_toning_effect_label(v)
+      } else {
+        ps_filter_effect_label(v)
+      };
+      push(name, ps_effect_value(v, print_conv, label));
+    }
+  }
+  // UserDef{1,2,3}PictureStyle (int16u, %userDefStyles). As with `%PSInfo`, the
+  // entries carry NO `PrintHex` (`Canon.pm:6336-6353`), so an unresolved value
+  // renders the DECIMAL `Unknown (N)` fallback.
+  for &(off, name) in &[
+    (0xf0usize, "UserDef1PictureStyle"),
+    (0xf2, "UserDef2PictureStyle"),
+    (0xf4, "UserDef3PictureStyle"),
+  ] {
+    if let Some(v) = u16(data, start + off, order) {
+      let value = if print_conv {
+        match user_def_style_label(v) {
+          Some(l) => TagValue::Str(SmolStr::new_static(l)),
+          None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+        }
+      } else {
+        TagValue::I64(v)
+      };
+      push(name, value);
+    }
+  }
+}
+
 /// The plain `%psInfo` scalars emitted for the 7D (`Canon.pm:6025-6130`, minus
 /// the `Unknown => 1` FilterEffect/ToningEffect Standard..Faithful + Saturation/
 /// ColorTone Monochrome rows).
@@ -1483,6 +1611,66 @@ const PS_EFFECTS: &[(usize, &str, bool)] = &[
   (0xbc, "ToningEffectUserDef2", true),
   (0xd0, "FilterEffectUserDef3", false),
   (0xd4, "ToningEffectUserDef3", true),
+];
+
+/// `%Canon::PSInfo2` plain int32s scalars (`Canon.pm:6185-6314`, minus the
+/// `Unknown => 1` rows). Differs from `PS_SCALARS` by the `*Auto` block at
+/// 0x90-0x9c and the +0x18 shift of every UserDef scalar.
+const PS_SCALARS2: &[(usize, &str)] = &[
+  (0x00, "ContrastStandard"),
+  (0x04, "SharpnessStandard"),
+  (0x08, "SaturationStandard"),
+  (0x0c, "ColorToneStandard"),
+  (0x18, "ContrastPortrait"),
+  (0x1c, "SharpnessPortrait"),
+  (0x20, "SaturationPortrait"),
+  (0x24, "ColorTonePortrait"),
+  (0x30, "ContrastLandscape"),
+  (0x34, "SharpnessLandscape"),
+  (0x38, "SaturationLandscape"),
+  (0x3c, "ColorToneLandscape"),
+  (0x48, "ContrastNeutral"),
+  (0x4c, "SharpnessNeutral"),
+  (0x50, "SaturationNeutral"),
+  (0x54, "ColorToneNeutral"),
+  (0x60, "ContrastFaithful"),
+  (0x64, "SharpnessFaithful"),
+  (0x68, "SaturationFaithful"),
+  (0x6c, "ColorToneFaithful"),
+  (0x78, "ContrastMonochrome"),
+  (0x7c, "SharpnessMonochrome"),
+  (0x90, "ContrastAuto"),
+  (0x94, "SharpnessAuto"),
+  (0x98, "SaturationAuto"),
+  (0x9c, "ColorToneAuto"),
+  (0xa8, "ContrastUserDef1"),
+  (0xac, "SharpnessUserDef1"),
+  (0xb0, "SaturationUserDef1"),
+  (0xb4, "ColorToneUserDef1"),
+  (0xc0, "ContrastUserDef2"),
+  (0xc4, "SharpnessUserDef2"),
+  (0xc8, "SaturationUserDef2"),
+  (0xcc, "ColorToneUserDef2"),
+  (0xd8, "ContrastUserDef3"),
+  (0xdc, "SharpnessUserDef3"),
+  (0xe0, "SaturationUserDef3"),
+  (0xe4, "ColorToneUserDef3"),
+];
+
+/// The `%Canon::PSInfo2` FilterEffect/ToningEffect entries with an explicit
+/// PrintConv (`Canon.pm:6219-6333`): `(offset, name, is_toning)`. Adds the
+/// `*Auto` pair (0xa0/0xa4) and shifts the UserDef pairs +0x18 vs `PS_EFFECTS`.
+const PS_EFFECTS2: &[(usize, &str, bool)] = &[
+  (0x88, "FilterEffectMonochrome", false),
+  (0x8c, "ToningEffectMonochrome", true),
+  (0xa0, "FilterEffectAuto", false),
+  (0xa4, "ToningEffectAuto", true),
+  (0xb8, "FilterEffectUserDef1", false),
+  (0xbc, "ToningEffectUserDef1", true),
+  (0xd0, "FilterEffectUserDef2", false),
+  (0xd4, "ToningEffectUserDef2", true),
+  (0xe8, "FilterEffectUserDef3", false),
+  (0xec, "ToningEffectUserDef3", true),
 ];
 
 /// `%offOn` (`Canon.pm:1218`).
@@ -2333,5 +2521,123 @@ mod tests {
         .map(|(_, v)| v.clone()),
       Some(TagValue::Str("Unknown (127)".into()))
     );
+  }
+
+  #[test]
+  fn dispatch_anchored_6d() {
+    assert!(model_is_camera_info_6d(Some("Canon EOS 6D")));
+    assert!(!model_is_camera_info_6d(Some("Canon EOS 6D Mark II")));
+    // /EOS 6D$/ must NOT match the 60D (which ends "60D", not "6D").
+    assert!(!model_is_camera_info_6d(Some("Canon EOS 60D")));
+  }
+
+  /// `%Canon::PSInfo2` descent: the inserted `*Auto` block at 0x90/0xa0 and the
+  /// +0x18-shifted UserDef blocks + the 0xf0 `UserDef1PictureStyle` leaf.
+  #[test]
+  fn ps_info2_auto_block() {
+    let mut b = vec![0u8; 0x100];
+    b[0x00..0x04].copy_from_slice(&5i32.to_le_bytes()); // ContrastStandard
+    b[0x04..0x08].copy_from_slice(&(-559_038_737i32).to_le_bytes()); // Sharpness n/a
+    b[0x90..0x94].copy_from_slice(&7i32.to_le_bytes()); // ContrastAuto (PSInfo2 only)
+    b[0xa0..0xa4].copy_from_slice(&1i32.to_le_bytes()); // FilterEffectAuto -> Yellow
+    b[0xa8..0xac].copy_from_slice(&9i32.to_le_bytes()); // ContrastUserDef1 (shifted +0x18)
+    b[0xe4..0xe8].copy_from_slice(&3i32.to_le_bytes()); // ColorToneUserDef3
+    b[0xf0..0xf2].copy_from_slice(&0x82u16.to_le_bytes()); // UserDef1PictureStyle -> Portrait
+    let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+    let mut push = |n: &'static str, v: TagValue| out.push((SmolStr::new_static(n), v));
+    ps_info2(&b, 0, ByteOrder::Little, true, &mut push);
+    let find = |n: &str| out.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(5)));
+    assert_eq!(find("SharpnessStandard"), Some(TagValue::Str("n/a".into())));
+    assert_eq!(find("ContrastAuto"), Some(TagValue::I64(7)));
+    assert_eq!(
+      find("FilterEffectAuto"),
+      Some(TagValue::Str("Yellow".into()))
+    );
+    assert_eq!(find("ContrastUserDef1"), Some(TagValue::I64(9)));
+    assert_eq!(find("ColorToneUserDef3"), Some(TagValue::I64(3)));
+    assert_eq!(
+      find("UserDef1PictureStyle"),
+      Some(TagValue::Str("Portrait".into()))
+    );
+    // 0x9c is the Auto block's ColorTone slot in PSInfo2 (it is ColorToneUserDef1
+    // in plain PSInfo) — confirm the PSInfo2 mapping is used.
+    assert_eq!(find("ColorToneAuto"), Some(TagValue::I64(0)));
+  }
+
+  /// `%Canon::CameraInfo6D` print values + the nested `%PSInfo2` subdir.
+  #[test]
+  fn camera_info_6d_fields() {
+    let mut b = vec![0u8; 0x4c0];
+    b[0x06] = 88; // ISO 400
+    b[0x1b] = 148; // CameraTemperature 20 C
+    b[0x23] = 0x00;
+    b[0x24] = 0x32; // FocalLength int16uRev = 50
+    b[0x83] = 1; // CameraOrientation Rotate 90 CW
+    b[0x92] = 0x01;
+    b[0x93] = 0xf4; // FocusDistanceUpper 500 -> 5 m
+    b[0x94] = 0x01;
+    b[0x95] = 0x2c; // FocusDistanceLower 300 -> 3 m
+    b[0xc2] = 0x02; // WhiteBalance raw 2 (checked in -n)
+    b[0xc6] = 0x50;
+    b[0xc7] = 0x14; // ColorTemperature 5200
+    b[0xfa] = 0x81; // PictureStyle Standard
+    b[0x161] = 0x00;
+    b[0x162] = 0x01; // LensType int16uRev = 1 (checked in -n)
+    b[0x163] = 0x00;
+    b[0x164] = 0x0a; // MinFocalLength 10
+    b[0x165] = 0x00;
+    b[0x166] = 0xc8; // MaxFocalLength 200
+    b[0x256..0x25c].copy_from_slice(b"1.1.6\0"); // FirmwareVersion (no guard)
+    b[0x2aa..0x2ae].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
+    b[0x2b6..0x2ba].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex - 1 = 199
+    // nested PSInfo2 at 0x3c6:
+    b[0x3c6..0x3ca].copy_from_slice(&3i32.to_le_bytes()); // ContrastStandard
+    b[0x456..0x45a].copy_from_slice(&2i32.to_le_bytes()); // ContrastAuto (0x3c6+0x90)
+    b[0x466..0x46a].copy_from_slice(&1i32.to_le_bytes()); // FilterEffectAuto (0x3c6+0xa0)
+    b[0x4b6..0x4b8].copy_from_slice(&0x81u16.to_le_bytes()); // UserDef1PictureStyle (0x3c6+0xf0)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 6D"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceUpper"),
+      Some(TagValue::Str("5 m".into()))
+    );
+    assert_eq!(
+      find("FocusDistanceLower"),
+      Some(TagValue::Str("3 m".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("10 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("200 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.1.6".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    // nested PSInfo2 tags:
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(3)));
+    assert_eq!(find("ContrastAuto"), Some(TagValue::I64(2)));
+    assert_eq!(
+      find("FilterEffectAuto"),
+      Some(TagValue::Str("Yellow".into()))
+    );
+    assert_eq!(
+      find("UserDef1PictureStyle"),
+      Some(TagValue::Str("Standard".into()))
+    );
+    // -n view: WhiteBalance / LensType render as bare masked integers.
+    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 6D"), None);
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
+    assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
   }
 }
