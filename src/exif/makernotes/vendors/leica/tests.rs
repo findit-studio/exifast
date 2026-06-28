@@ -229,3 +229,48 @@ fn populate_typed_lens_and_serial() {
   assert_eq!(t.lens_name(), Some("Summicron-M 50mm f/2 (IV, V)"));
   assert_eq!(t.serial_number(), Some("0001234"));
 }
+
+/// The #105 binary `ProcessBinaryData` SubDirectory rows resolve with their
+/// `sub_table` marker (so the capture loop descends them), the extended tables
+/// stay sorted (the binary-search invariant), and `decode_leica_subdir` routes
+/// each marker to its decoder.
+#[test]
+fn binary_subdir_rows_present_and_routed() {
+  // The SubDirectory pointers carry the right marker.
+  assert_eq!(
+    lookup(LeicaVariant::Leica3, 0x0b).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::SerialInfo)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Leica5, 0x040a).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::FocusInfo)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Leica5, 0x0410).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::ShotInfo)
+  );
+  // The extended tables stay strictly sorted (binary-search-ready).
+  for tags in [LEICA3_TAGS, LEICA5_TAGS] {
+    let mut prev: i64 = -1;
+    for t in tags {
+      assert!(
+        i64::from(t.id) > prev,
+        "LEICA table unsorted at {:#x}",
+        t.id
+      );
+      prev = i64::from(t.id);
+    }
+  }
+  // The dispatcher routes each marker to its decoder.
+  let shot = decode_leica_subdir(
+    LeicaSubTable::ShotInfo,
+    &1234u16.to_le_bytes(),
+    crate::exif::ifd::ByteOrder::Little,
+    true,
+  );
+  assert_eq!(shot.first().map(|(k, _)| k.as_str()), Some("FileIndex"));
+  assert_eq!(
+    shot.first().map(|(_, v)| v.clone()),
+    Some(TagValue::I64(1234))
+  );
+}

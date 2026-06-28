@@ -11287,6 +11287,13 @@ fn emit_leica_value<S: ExifSink>(
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   use makernotes::vendors::leica::tags::LeicaCondition;
+  // A SubDirectory row's PARENT pointer emits nothing here (#105). The production
+  // capture loop runs the child `ProcessBinaryData` walk (`decode_leica_subdir`)
+  // BEFORE this is reached; this guard covers the defensive `emit_entry`
+  // fallback (no child walk there).
+  if leica_tag.sub_table().is_some() {
+    return Ok(());
+  }
   // Row `Condition` gate. A failing Condition ⇒ `GetTagInfo` returns no tag ⇒
   // emit NOTHING and populate NO typed field (the absent-tag behaviour).
   if let Some(cond) = leica_tag.condition() {
@@ -14676,6 +14683,17 @@ pub(in crate::exif) fn leica_makernote_isolated(
   // Capture the walked `ResolvedConv::Leica` leaves into the vendor-emission
   // `Vec`; build the typed `MakerNotesLeica` from the SAME gate-passing entries.
   let g1 = vendor_group1_of(TableRef::Leica(variant)).unwrap_or("Leica");
+  // The byte order the Leica variant IFD was actually walked under — the probed
+  // order for `ByteOrder => Unknown` (resolved exactly as `process_subdir` does),
+  // else the fixed rule. The binary sub-tables (#105) inherit it for their
+  // int16u reads.
+  let subdir_order = match byte_order_rule {
+    ByteOrderRule::Fixed(o) => o,
+    ByteOrderRule::Unknown => {
+      makernotes::fixbase::detect_unknown_byte_order(data, ifd_offset, parent_order)
+        .unwrap_or(parent_order)
+    }
+  };
   let mut emissions = std::vec::Vec::new();
   let mut typed = MakerNotesLeica::new();
   {
@@ -14686,6 +14704,22 @@ pub(in crate::exif) fn leica_makernote_isolated(
       let ResolvedConv::Leica(entry_variant, leica_tag) = entry.conv else {
         continue;
       };
+      // A WALKED ProcessBinaryData SubDirectory (SerialInfo 0x0b / FocusInfo
+      // 0x040a / ShotInfo 0x0410, #105): re-slice the verbatim `$$valPt` span and
+      // emit each position under the `Leica` family-1 group, reproducing
+      // ExifTool's descend-then-`next` (the parent pointer is never emitted).
+      // Every binary position is an explicit entry ⇒ `unknown = false`.
+      if let Some(sub) = leica_tag.sub_table() {
+        let blob = data
+          .get(entry.value_offset()..entry.value_offset().saturating_add(entry.value_size()))
+          .unwrap_or(&[]);
+        for (name, value) in
+          makernotes::vendors::leica::decode_leica_subdir(sub, blob, subdir_order, print_conv)
+        {
+          let Ok(()) = sink.write_vendor_value("MakerNotes", g1, name.as_str(), value, false);
+        }
+        continue;
+      }
       let Ok(()) = emit_leica_value(
         g1,
         entry,

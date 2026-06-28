@@ -16,20 +16,19 @@
 //! `Walker` as the payload of
 //! [`TableRef::Leica`](crate::exif::makernotes::subdir::TableRef::Leica).
 //!
-//! ## Phase scope (the plain camera-indexing leaves)
+//! ## Scope (plain leaves + the binary sub-tables)
 //!
-//! Mirroring the Samsung/Pentax ports, this ports the PLAIN scalar/enum/string/
-//! lookup LEAVES of each table. The binary `ProcessBinaryData` sub-tables and
-//! the chained IFD SubDirectories are DEFERRED — their tag IDs are simply ABSENT
-//! from the tables, so the shared `Walker` drops them (unknown-tag skip):
+//! This ports the PLAIN scalar/enum/string/lookup LEAVES of each table PLUS the
+//! `ProcessBinaryData` SubDirectory pointers (a [`LeicaTag::sub_table`] marker,
+//! decoded at capture time via [`super::decode_leica_subdir`], #105):
 //!
-//! - **Leica3** `0x0b SerialInfo` (`%Panasonic::SerialInfo` binary) — deferred;
-//!   only `0x0d WB_RGBLevels` is a plain leaf.
+//! - **Leica3** `0x0b SerialInfo` (`%Panasonic::SerialInfo`) descends to its
+//!   binary block; `0x0d WB_RGBLevels` is the plain leaf.
 //! - **Leica4** — every row is a SubDirectory into `%Panasonic::Subdir` (which
-//!   chains into `Data1`/`Data2`); deferred. Leica4 therefore emits no plain
-//!   leaf of its own (it routes correctly + emits nothing, not spurious tags).
-//! - **Leica5** `0x040a FocusInfo` / `0x0410 ShotInfo` (binary) + `0x05ff
-//!   CameraIFD` (a nested TIFF) — deferred.
+//!   chains into `Data1`/`Data2`); deferred. Leica4 carries no plain leaf.
+//! - **Leica5** `0x040a FocusInfo` / `0x0410 ShotInfo` descend into their binary
+//!   sub-tables; the `0x05ff CameraIFD` nested TIFF (`PanasonicRaw::CameraIFD`,
+//!   raw-only) is out of scope.
 //! - **Leica6** `0x300 PreviewImage` (a `RawConv` preview blob) + `0x301
 //!   UnknownBlock` (`Unknown`+`Binary`+`Drop`) — deferred.
 
@@ -75,8 +74,25 @@ impl LeicaVariant {
   }
 }
 
-/// One Leica variant-table IFD tag (a plain LEAF — the deferred SubDirectory /
-/// binary rows are absent from the tables).
+/// A Leica `ProcessBinaryData` SubDirectory target reached from a Leica variant
+/// IFD row (#105). The binary block is decoded at capture time (the verbatim
+/// `$$valPt` span) and its positions emit under the `Leica` family-1 group via
+/// [`super::decode_leica_subdir`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeicaSubTable {
+  /// `%Panasonic::SerialInfo` — Leica3 0x0b (`Panasonic.pm:1724`).
+  SerialInfo,
+  /// `%Panasonic::FocusInfo` — Leica5 0x040a (`Panasonic.pm:2084`).
+  FocusInfo,
+  /// `%Panasonic::ShotInfo` — Leica5 0x0410 (`Panasonic.pm:2069`).
+  ShotInfo,
+}
+
+/// One Leica variant-table IFD tag — a plain LEAF, or (when [`sub_table`] is
+/// `Some`) a `ProcessBinaryData` SubDirectory pointer descended at capture time.
+///
+/// [`sub_table`]: LeicaTag::sub_table
 #[derive(Debug, Clone, Copy)]
 pub struct LeicaTag {
   /// Tag ID (the `Panasonic.pm` Leica hash key).
@@ -92,6 +108,9 @@ pub struct LeicaTag {
   /// `Some(condition)` when the row carries a `Condition` that gates emission
   /// (the Leica5 0x0303 `$format eq "string"`, the Leica6 Typ-006 rows).
   pub condition: Option<LeicaCondition>,
+  /// `Some(sub)` when the row is a `ProcessBinaryData` SubDirectory pointer
+  /// descended at capture time (#105); `None` for a plain leaf.
+  pub sub_table: Option<LeicaSubTable>,
 }
 
 impl LeicaTag {
@@ -114,6 +133,13 @@ impl LeicaTag {
   #[inline(always)]
   pub const fn condition(&self) -> Option<LeicaCondition> {
     self.condition
+  }
+
+  /// The row's `ProcessBinaryData` SubDirectory target, if any (#105).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sub_table(&self) -> Option<LeicaSubTable> {
+    self.sub_table
   }
 }
 
@@ -141,6 +167,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Quality,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x302 UserProfile (Panasonic.pm:1617) — int32u label hash.
   LeicaTag {
@@ -149,6 +176,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::UserProfile2,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x303 SerialNumber (Panasonic.pm:1628) — int32u, sprintf("%.7d",$val).
   LeicaTag {
@@ -157,6 +185,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::SerialNumber7,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x304 WhiteBalance (Panasonic.pm:1631) — int16u label hash + Kelvin OTHER.
   LeicaTag {
@@ -165,6 +194,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::WhiteBalance2,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x310 LensType (Panasonic.pm:1649) — int32u, %leicaLensTypes.
   LeicaTag {
@@ -173,6 +203,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::LensType,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x311 ExternalSensorBrightnessValue (Panasonic.pm:1657) — Format rational64s, sprintf("%.2f").
   LeicaTag {
@@ -181,6 +212,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: None,
+    sub_table: None,
   },
   // 0x312 MeasuredLV (Panasonic.pm:1663) — Format rational64s, sprintf("%.2f").
   LeicaTag {
@@ -189,6 +221,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: None,
+    sub_table: None,
   },
   // 0x313 ApproximateFNumber (Panasonic.pm:1669) — rational64u, sprintf("%.1f").
   LeicaTag {
@@ -197,6 +230,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf1f,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x320 CameraTemperature (Panasonic.pm:1679) — int32s, "$val C".
   LeicaTag {
@@ -205,6 +239,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::CameraTemperatureC,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x321 ColorTemperature (Panasonic.pm:1658) — int32u, raw.
   LeicaTag {
@@ -213,6 +248,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x322 WBRedLevel (Panasonic.pm:1659) — rational64u, raw.
   LeicaTag {
@@ -221,6 +257,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x323 WBGreenLevel (Panasonic.pm:1660) — rational64u, raw.
   LeicaTag {
@@ -229,6 +266,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x324 WBBlueLevel (Panasonic.pm:1661) — rational64u, raw.
   LeicaTag {
@@ -237,6 +275,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x325 UV-IRFilterCorrection (Panasonic.pm:1689) — int32u, 0=>Not Active 1=>Active.
   LeicaTag {
@@ -245,6 +284,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::UvIrFilterCorrection,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x330 CCDVersion (Panasonic.pm:1671) — int32u, raw.
   LeicaTag {
@@ -253,6 +293,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x331 CCDBoardVersion (Panasonic.pm:1672) — int32u, raw.
   LeicaTag {
@@ -261,6 +302,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x332 ControllerBoardVersion (Panasonic.pm:1673) — int32u, raw.
   LeicaTag {
@@ -269,6 +311,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x333 M16CVersion (Panasonic.pm:1674) — int32u, raw.
   LeicaTag {
@@ -277,6 +320,7 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x340 ImageIDNumber (Panasonic.pm:1702) — int32u, raw.
   LeicaTag {
@@ -285,13 +329,23 @@ pub const LEICA2_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
 ];
 
-/// `%Panasonic::Leica3` (`Panasonic.pm:1706-1721`) — the R8/R9 backs. The
-/// `0x0b SerialInfo` binary SubDirectory is deferred; `0x0d WB_RGBLevels` is the
-/// only plain leaf.
+/// `%Panasonic::Leica3` (`Panasonic.pm:1706-1721`) — the R8/R9 backs. `0x0b`
+/// descends into the `%Panasonic::SerialInfo` binary sub-table (#105); `0x0d
+/// WB_RGBLevels` is the plain leaf.
 pub const LEICA3_TAGS: &[LeicaTag] = &[
+  // 0x0b SerialInfo (Panasonic.pm:1712) — ProcessBinaryData SubDirectory.
+  LeicaTag {
+    id: 0x0b,
+    name: "SerialInfo",
+    conv: LeicaPrintConv::None,
+    format: None,
+    condition: None,
+    sub_table: Some(LeicaSubTable::SerialInfo),
+  },
   // 0x0d WB_RGBLevels (Panasonic.pm:1719) — int16u Count 3, space-joined.
   LeicaTag {
     id: 0x0d,
@@ -299,6 +353,7 @@ pub const LEICA3_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
 ];
 
@@ -308,9 +363,10 @@ pub const LEICA3_TAGS: &[LeicaTag] = &[
 pub const LEICA4_TAGS: &[LeicaTag] = &[];
 
 /// `%Panasonic::Leica5` (`Panasonic.pm:1997-2066`) — X1/X2/X-VARIO/T/X-U +
-/// (via Leica8) Q/SL/CL. `PRIORITY => 0` at the table level. The `0x040a
-/// FocusInfo` / `0x0410 ShotInfo` binary SubDirectories + `0x05ff CameraIFD`
-/// nested TIFF are deferred.
+/// (via Leica8) Q/SL/CL. `PRIORITY => 0` at the table level. `0x040a FocusInfo`
+/// / `0x0410 ShotInfo` descend into their binary sub-tables (#105); the `0x05ff
+/// CameraIFD` nested TIFF (a `PanasonicRaw::CameraIFD` / raw-only directory) is
+/// out of scope.
 pub const LEICA5_TAGS: &[LeicaTag] = &[
   // 0x0303 LensType (Panasonic.pm:2004) — string, Condition $format eq "string" (Leica T only).
   LeicaTag {
@@ -319,6 +375,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: Some(LeicaCondition::FormatIsString),
+    sub_table: None,
   },
   // 0x0305 SerialNumber (Panasonic.pm:2014) — int32u, raw.
   LeicaTag {
@@ -327,6 +384,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x0407 OriginalFileName (Panasonic.pm:2023) — string.
   LeicaTag {
@@ -335,6 +393,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x0408 OriginalDirectory (Panasonic.pm:2024) — string.
   LeicaTag {
@@ -343,6 +402,16 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
+  },
+  // 0x040a FocusInfo (Panasonic.pm:2021) — ProcessBinaryData SubDirectory.
+  LeicaTag {
+    id: 0x040a,
+    name: "FocusInfo",
+    conv: LeicaPrintConv::None,
+    format: None,
+    condition: None,
+    sub_table: Some(LeicaSubTable::FocusInfo),
   },
   // 0x040d ExposureMode (Panasonic.pm:2047) — Format int8u[4], PrintConv hash.
   LeicaTag {
@@ -351,6 +420,16 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::ExposureMode5,
     format: Some(FormatOverride::new(Format::Int8u, Some(4))),
     condition: None,
+    sub_table: None,
+  },
+  // 0x0410 ShotInfo (Panasonic.pm:2039) — ProcessBinaryData SubDirectory.
+  LeicaTag {
+    id: 0x0410,
+    name: "ShotInfo",
+    conv: LeicaPrintConv::None,
+    format: None,
+    condition: None,
+    sub_table: Some(LeicaSubTable::ShotInfo),
   },
   // 0x0412 FilmMode (Panasonic.pm:2065) — string.
   LeicaTag {
@@ -359,6 +438,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x0413 WB_RGBLevels (Panasonic.pm:2066) — rational64u Count 3, space-joined.
   LeicaTag {
@@ -367,6 +447,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x0500 InternalSerialNumber (Panasonic.pm:2047) — undef, date-encoded PrintConv.
   LeicaTag {
@@ -375,6 +456,7 @@ pub const LEICA5_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::InternalSerialNumber,
     format: None,
     condition: None,
+    sub_table: None,
   },
 ];
 
@@ -390,6 +472,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::LensTypeTrim,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x304 FocusDistance (Panasonic.pm:2154) — int32u, raw.
   LeicaTag {
@@ -398,6 +481,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x311 ExternalSensorBrightnessValue (Panasonic.pm:2153) — Format rational64s, Condition Typ 006, sprintf("%.2f").
   LeicaTag {
@@ -406,6 +490,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: Some(LeicaCondition::ModelTyp006),
+    sub_table: None,
   },
   // 0x312 MeasuredLV (Panasonic.pm:2160) — Format rational64s, Condition Typ 006, sprintf("%.2f").
   LeicaTag {
@@ -414,6 +499,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: Some(LeicaCondition::ModelTyp006),
+    sub_table: None,
   },
   // 0x320 FirmwareVersion (Panasonic.pm:2171) — int8u Count 4, Condition Typ 006, $val=~tr/ /./.
   LeicaTag {
@@ -422,6 +508,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::FirmwareVersionDots,
     format: None,
     condition: Some(LeicaCondition::ModelTyp006),
+    sub_table: None,
   },
   // 0x321 LensSerialNumber (Panasonic.pm:2179) — int32u, Condition Typ 006, sprintf("%.10d").
   LeicaTag {
@@ -430,6 +517,7 @@ pub const LEICA6_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf10d,
     format: None,
     condition: Some(LeicaCondition::ModelTyp006),
+    sub_table: None,
   },
 ];
 
@@ -443,6 +531,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x311 ExternalSensorBrightnessValue (Panasonic.pm:2203) — Format rational64s, sprintf("%.2f").
   LeicaTag {
@@ -451,6 +540,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: None,
+    sub_table: None,
   },
   // 0x312 MeasuredLV (Panasonic.pm:2208) — Format rational64s, sprintf("%.2f").
   LeicaTag {
@@ -459,6 +549,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Sprintf2f,
     format: Some(FormatOverride::new(Format::Rational64s, None)),
     condition: None,
+    sub_table: None,
   },
   // 0x34c UserProfile (Panasonic.pm:2218) — string.
   LeicaTag {
@@ -467,6 +558,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x359 ISOSelected (Panasonic.pm:2223) — int32s, 0=>Auto + identity OTHER.
   LeicaTag {
@@ -475,6 +567,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::IsoSelected,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x35a FNumber (Panasonic.pm:2231) — int32s, ValueConv /1000, sprintf("%.1f").
   LeicaTag {
@@ -483,6 +576,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::Div1000Sprintf1f,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x35b CorrelatedColorTemp (Panasonic.pm:2233) — int16u, raw.
   LeicaTag {
@@ -491,6 +585,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x35c ColorTint (Panasonic.pm:2234) — int16s, raw.
   LeicaTag {
@@ -499,6 +594,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x35d WhitePoint (Panasonic.pm:2235) — rational64u Count 2, space-joined.
   LeicaTag {
@@ -507,6 +603,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
   // 0x370 LensProfileName (Panasonic.pm:2238) — string.
   LeicaTag {
@@ -515,6 +612,7 @@ pub const LEICA9_TAGS: &[LeicaTag] = &[
     conv: LeicaPrintConv::None,
     format: None,
     condition: None,
+    sub_table: None,
   },
 ];
 
