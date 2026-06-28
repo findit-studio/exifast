@@ -650,21 +650,32 @@ fn convert(
   conv: Conv,
   byte_order: ByteOrder,
 ) -> Option<(TagValue, TagValue)> {
+  // MISB.pm:360-364 `ReadValue($dataPt, $pos, $format, undef, $len)` — every
+  // value decode is bounded to the DECLARED KLV length `$len`. Take that
+  // `data[pos..pos+len]` slice ONCE (the bound is guaranteed in-range by the
+  // `process_klv` BER guard, `len <= dir_end - pos <= data.len() - pos`;
+  // `.get(..).unwrap_or(&[])` keeps it panic-free regardless) and decode EVERY
+  // tag's value from it, so a too-short record can never read past `$len` into
+  // the next local tag / next top-level KLV record.
+  let value = pos
+    .checked_add(len)
+    .and_then(|end| data.get(pos..end))
+    .unwrap_or(&[]);
   match conv {
     Conv::Sub(_) => None, // handled by the caller
     Conv::Raw(fmt) => {
-      let v = read_fmt(data, pos, len, fmt, byte_order)?;
+      let v = read_fmt(value, fmt, byte_order)?;
       Some((v.clone(), v))
     }
     Conv::Scale { fmt, mul, div, off } => {
-      let n = read_num(data, pos, fmt, byte_order)?;
+      let n = read_num(value, fmt, byte_order)?;
       // Faithful operation order: `$val * mul / div + off` (multiply THEN
       // divide), matching ExifTool's Perl double-precision evaluation.
       let scaled = TagValue::F64(n * mul / div + off);
       Some((scaled.clone(), scaled))
     }
     Conv::Lat => {
-      let n = read_num(data, pos, Fmt::I32, byte_order)?;
+      let n = read_num(value, Fmt::I32, byte_order)?;
       let deg = n * 90.0 / LAT_DIV;
       Some((
         TagValue::F64(deg),
@@ -672,7 +683,7 @@ fn convert(
       ))
     }
     Conv::Lon => {
-      let n = read_num(data, pos, Fmt::I32, byte_order)?;
+      let n = read_num(value, Fmt::I32, byte_order)?;
       let deg = n * 180.0 / LON_DIV;
       Some((
         TagValue::F64(deg),
@@ -680,7 +691,7 @@ fn convert(
       ))
     }
     Conv::Alt => {
-      let n = read_num(data, pos, Fmt::U16, byte_order)?;
+      let n = read_num(value, Fmt::U16, byte_order)?;
       let m = n * 19_900.0 / U16_MAX_F - 900.0;
       Some((
         TagValue::F64(m),
@@ -689,7 +700,7 @@ fn convert(
       ))
     }
     Conv::Time => {
-      let n = read_num(data, pos, Fmt::U64, byte_order)?;
+      let n = read_num(value, Fmt::U64, byte_order)?;
       // MISB.pm:26 `ConvertUnixTime($val/1e6, 0, 6) . "Z"` (VC), then
       // `ConvertDateTime` (PC, identity under default options).
       let s = std::format!(
@@ -700,29 +711,29 @@ fn convert(
       Some((TagValue::Str(s.into()), v))
     }
     Conv::Suffix(fmt, suffix) => {
-      let v = read_fmt(data, pos, len, fmt, byte_order)?;
+      let v = read_fmt(value, fmt, byte_order)?;
       let print = TagValue::Str(std::format!("{}{suffix}", scalar_text(&v)).into());
       Some((v, print))
     }
     Conv::Hex4(fmt) => {
-      let n = read_num(data, pos, fmt, byte_order)?;
-      let raw = read_fmt(data, pos, len, fmt, byte_order)?;
+      let n = read_num(value, fmt, byte_order)?;
+      let raw = read_fmt(value, fmt, byte_order)?;
       Some((
         raw,
         TagValue::Str(std::format!("0x{:04x}", n as u64).into()),
       ))
     }
     Conv::Hex2(fmt) => {
-      let n = read_num(data, pos, fmt, byte_order)?;
-      let raw = read_fmt(data, pos, len, fmt, byte_order)?;
+      let n = read_num(value, fmt, byte_order)?;
+      let raw = read_fmt(value, fmt, byte_order)?;
       Some((
         raw,
         TagValue::Str(std::format!("0x{:02x}", n as u64).into()),
       ))
     }
     Conv::Hash(fmt, table) => {
-      let raw = read_fmt(data, pos, len, fmt, byte_order)?;
-      let key = read_num(data, pos, fmt, byte_order)? as i64;
+      let raw = read_fmt(value, fmt, byte_order)?;
+      let key = read_num(value, fmt, byte_order)? as i64;
       let print = match table.iter().find(|(k, _)| *k == key) {
         // MISB.pm hash PrintConv hit ⇒ the label.
         Some((_, label)) => TagValue::Str(SmolStr::new(*label)),
@@ -732,67 +743,83 @@ fn convert(
       Some((raw, print))
     }
     Conv::Bitmask(table) => {
-      let raw = read_fmt(data, pos, len, Fmt::U8, byte_order)?;
-      let n = read_num(data, pos, Fmt::U8, byte_order)? as i64;
+      let raw = read_fmt(value, Fmt::U8, byte_order)?;
+      let n = read_num(value, Fmt::U8, byte_order)? as i64;
       // MISB.pm BITMASK ⇒ `DecodeBits($val, …, BitsPerWord)`; no `BitsPerWord`
       // ⇒ the 32-bit default (memory: BITMASK = DecodeBits, not raw).
       let print = crate::convert::decode_bits(&std::format!("{n}"), Some(table), 32);
       Some((raw, TagValue::Str(print.into())))
     }
     Conv::StripSlashesPc => {
-      let v = read_fmt(data, pos, len, Fmt::Str, byte_order)?;
+      let v = read_fmt(value, Fmt::Str, byte_order)?;
       let s = scalar_text(&v);
       // MISB.pm:250 `$val =~ s(^//)()` (PrintConv) — strip a single leading `//`.
       let stripped = s.strip_prefix("//").unwrap_or(&s);
       Some((v.clone(), TagValue::Str(SmolStr::new(stripped))))
     }
     Conv::DashColonVc => {
-      let v = read_fmt(data, pos, len, Fmt::Str, byte_order)?;
+      let v = read_fmt(value, Fmt::Str, byte_order)?;
       // MISB.pm:288 `$val=~tr/-/:/` (ValueConv) — applied in BOTH modes.
       let s = scalar_text(&v).replace('-', ":");
       let out = TagValue::Str(s.into());
       Some((out.clone(), out))
     }
     Conv::DeclassDateVc => {
-      let v = read_fmt(data, pos, len, Fmt::Str, byte_order)?;
+      let v = read_fmt(value, Fmt::Str, byte_order)?;
       // MISB.pm:261 `s/(\d{4})(\d{2})(\d{2})/$1:$2:$3/` (ValueConv) — both modes.
       let out = TagValue::Str(declassify_date(&scalar_text(&v)).into());
       Some((out.clone(), out))
     }
     Conv::SecVersion => {
-      let raw = read_fmt(data, pos, len, Fmt::U16, byte_order)?;
-      let n = read_num(data, pos, Fmt::U16, byte_order)? as u64;
+      let raw = read_fmt(value, Fmt::U16, byte_order)?;
+      let n = read_num(value, Fmt::U16, byte_order)? as u64;
       // MISB.pm:283 `PrintConv => '"0102.$val"'`.
       Some((raw, TagValue::Str(std::format!("0102.{n}").into())))
     }
   }
 }
 
-/// Read a value via the faithful `ReadValue` semantics for `fmt` over a
-/// `len`-byte record (count = `int(len / format_size)`, MISB.pm:362-364
-/// `ReadValue(…, undef, $len)`). For `string`/`undef` the record is one scalar.
-fn read_fmt(
-  data: &[u8],
-  pos: usize,
-  len: usize,
-  fmt: Fmt,
-  byte_order: ByteOrder,
-) -> Option<TagValue> {
+/// Read a value via the faithful `ReadValue` semantics for `fmt` over the
+/// `len`-bounded record `value` (count = `int(len / format_size)`,
+/// MISB.pm:360-364 `ReadValue($dataPt, $pos, $format, undef, $len)`). `value` is
+/// the declared-KLV-length slice (`data[pos..pos+len]`), so passing offset `0`
+/// makes `read_value`'s implicit `$size = length($value)` equal to the KLV
+/// `$len` — the read CANNOT spill past the record into the next local tag / next
+/// top-level KLV (the explicit-`$len` bound ExifTool's `ReadValue` enforces). A
+/// recognized tag whose `len < fmt` width yields ExifTool's `''` (count
+/// shortened to 0 ⇒ the empty-string scalar), NOT bytes from the following
+/// record. For `string`/`undef` the whole slice is one scalar.
+fn read_fmt(value: &[u8], fmt: Fmt, byte_order: ByteOrder) -> Option<TagValue> {
   let count = match fmt {
-    Fmt::Str | Fmt::Undef => len,
-    _ => len / fmt.size(),
+    Fmt::Str | Fmt::Undef => value.len(),
+    _ => value.len() / fmt.size(),
   };
-  crate::convert::read_value(data, pos, fmt.as_str(), count, byte_order)
+  crate::convert::read_value(value, 0, fmt.as_str(), count, byte_order)
 }
 
-/// Read the FIRST element of `fmt` as an `f64` (the numeric a ValueConv/PrintConv
-/// operates on; MISB scale/hash/etc. tags are single-element in practice).
-fn read_num(data: &[u8], pos: usize, fmt: Fmt, byte_order: ByteOrder) -> Option<f64> {
-  match crate::convert::read_value(data, pos, fmt.as_str(), 1, byte_order)? {
-    TagValue::I64(i) => Some(i as f64),
-    TagValue::U64(u) => Some(u as f64),
-    TagValue::F64(f) => Some(f),
-    _ => None,
+/// Read the FIRST element of `fmt` as an `f64` — the numeric a
+/// ValueConv/PrintConv operates on (MISB scale/hash/etc. tags are single-element
+/// in practice). Bounded to the declared-KLV-length slice `value`, so a too-short
+/// record can never read `fmt`-width bytes past `len` into the next record.
+///
+/// When `len < fmt` width, ExifTool's `ReadValue($dataPt, $pos, $format, undef,
+/// $len)` returns the empty string `''` (ExifTool.pm:6294-6295 `return '' …
+/// $size < $len`); a numeric ValueConv/PrintConv then evaluates it in numeric
+/// context, where Perl coerces `''` to `0` (verified: an `int32s` `SensorLatitude`
+/// with `len=1` emits GPS Latitude `0`, a `int64u` `UNIXTimeStamp` with `len=2`
+/// emits `0000:00:00 00:00:00Z`, a `int16u` `WeaponLoad` with `len=1` emits
+/// `0x0000`). Mirror that with `Some(0.0)` so the tag is emitted with the faithful
+/// degenerate value rather than dropped — and, crucially, the following record
+/// still decodes from its own bytes.
+fn read_num(value: &[u8], fmt: Fmt, byte_order: ByteOrder) -> Option<f64> {
+  match crate::convert::read_value(value, 0, fmt.as_str(), 1, byte_order) {
+    Some(TagValue::I64(i)) => Some(i as f64),
+    Some(TagValue::U64(u)) => Some(u as f64),
+    Some(TagValue::F64(f)) => Some(f),
+    // `len < fmt` width ⇒ `read_value` shortens the count to 0 and returns
+    // `None`; ExifTool's `''` numeric-coerces to `0`.
+    None => Some(0.0),
+    Some(_) => None,
   }
 }
 
@@ -805,6 +832,14 @@ fn unknown_value(
   len: usize,
   byte_order: ByteOrder,
 ) -> (TagValue, TagValue) {
+  // The declared-KLV-length slice (MISB.pm:367 `substr($$dataPt, $pos, $len)`),
+  // shared by the default-format read and the string/binary fallback so neither
+  // path can read past `$len`. `checked_add`/`unwrap_or(&[])` keep it panic-free
+  // even on an untrusted `len`.
+  let bytes = pos
+    .checked_add(len)
+    .and_then(|end| data.get(pos..end))
+    .unwrap_or(&[]);
   let fmt = match len {
     1 => Some(Fmt::U8),
     2 => Some(Fmt::U16),
@@ -813,16 +848,11 @@ fn unknown_value(
     _ => None,
   };
   if let Some(fmt) = fmt
-    && let Some(v) = read_fmt(data, pos, len, fmt, byte_order)
+    && let Some(v) = read_fmt(bytes, fmt, byte_order)
   {
     return (v.clone(), v);
   }
   // No default format ⇒ string if printable, else binary (MISB.pm:367-371).
-  // `checked_add` keeps the slice range panic-free even on an untrusted `len`.
-  let bytes = pos
-    .checked_add(len)
-    .and_then(|end| data.get(pos..end))
-    .unwrap_or(&[]);
   if bytes
     .iter()
     .all(|&b| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
@@ -1071,5 +1101,120 @@ mod tests {
     body.extend_from_slice(&uas_ls_version_record());
     let leaves = decode(&payload(&body));
     assert_single_uas_version(&leaves);
+  }
+
+  /// Wrap a UAS local-set `inner` body in one top-level KLV ([`UAS_KEY`] + a
+  /// short-form BER length spanning exactly `inner`) and decode it.
+  fn decode_uas_local_set(inner: &[u8]) -> Vec<MisbLeaf> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.push(u8::try_from(inner.len()).expect("inner fits a short-form BER"));
+    body.extend_from_slice(inner);
+    decode(&payload(&body))
+  }
+
+  /// Find the decoded leaf named `name`.
+  fn leaf<'a>(leaves: &'a [MisbLeaf], name: &str) -> &'a MisbLeaf {
+    leaves
+      .iter()
+      .find(|l| l.name.as_str() == name)
+      .unwrap_or_else(|| panic!("missing leaf {name}; got {:?}", names(leaves)))
+  }
+
+  /// The decoded leaf names, for assertion messages.
+  fn names(leaves: &[MisbLeaf]) -> Vec<&str> {
+    leaves.iter().map(|l| l.name.as_str()).collect()
+  }
+
+  /// A recognized NUMERIC tag whose declared BER length is SHORTER than its
+  /// format width must NOT read `fmt`-width bytes from the following local tag
+  /// (the #130 cross-boundary over-read). ExifTool's `ReadValue($dataPt, $pos,
+  /// $format, undef, $len)` stays inside `data[pos..pos+len]`: a too-short read
+  /// yields the empty string (numeric-coerced to `0` by any ValueConv), never
+  /// the next record's bytes. Here `GPSLatitude` (int32s, `%latInfo`) declares
+  /// `len=1` but is immediately followed by a valid `UAS_LSVersionNumber=11`;
+  /// the latter MUST still decode from its own bytes.
+  #[test]
+  fn short_numeric_tag_does_not_over_read_into_next_record() {
+    // [tag 13 GPSLatitude][BER len 1][0x7f]  [tag 65 = 11]
+    let mut inner = vec![13, 0x01, 0x7f];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    // The following record was NOT consumed by an int32s over-read — it decodes.
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    // The short latitude is the faithful degenerate value (`'' * 90/0x7fffffff`
+    // = 0, ExifTool `-n` GPS Latitude `0`), NOT a value fabricated from the
+    // next record's `[65, 0x01, 0x0b]` bytes.
+    assert_eq!(leaf(&leaves, "GPSLatitude").value_n, TagValue::F64(0.0));
+    // Exactly the two records were decoded — the short one consumed exactly its
+    // declared 1 byte (a fabricated cross-boundary read would shift the walk and
+    // change the leaf set).
+    assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
+  }
+
+  /// The same bound on a `Raw` numeric (no ValueConv): a `Checksum` (int16u)
+  /// with `len=1` must yield ExifTool's empty-string `ReadValue` result (`''`),
+  /// not an `int16u` read that pulls the high byte from the next tag.
+  #[test]
+  fn short_raw_numeric_tag_yields_empty_not_over_read() {
+    // [tag 1 Checksum int16u][BER len 1][0x7f]  [tag 65 = 11]
+    let mut inner = vec![1, 0x01, 0x7f];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    // `ReadValue(.., undef, 1)` over a 2-byte format ⇒ `''` (ExifTool `-n`
+    // Checksum `[]`), in BOTH modes (no ValueConv/PrintConv).
+    let chk = leaf(&leaves, "Checksum");
+    assert_eq!(chk.value_n, TagValue::Str("".into()));
+    assert_eq!(chk.value_print, TagValue::Str("".into()));
+    assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
+  }
+
+  /// A `Hex4` numeric (separate raw + `sprintf("0x%.4x")` print): a `WeaponLoad`
+  /// (int16u) with `len=1` must print `0x0000` (ExifTool) and carry the
+  /// empty-string raw — without over-reading the following record.
+  #[test]
+  fn short_hex4_tag_prints_zero_and_does_not_over_read() {
+    // [tag 60 WeaponLoad int16u][BER len 1][0x05]  [tag 65 = 11]
+    let mut inner = vec![60, 0x01, 0x05];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    let wl = leaf(&leaves, "WeaponLoad");
+    // ExifTool: `sprintf("0x%.4x", '')` ⇒ `0x0000`; raw `-n` ⇒ `''`.
+    assert_eq!(wl.value_print, TagValue::Str("0x0000".into()));
+    assert_eq!(wl.value_n, TagValue::Str("".into()));
+    assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
+  }
+
+  /// A string-valued tag is likewise bounded to its declared length and never
+  /// reads into the next record. A `TailNumber` (string) with `len=2` over a
+  /// 4-byte payload must decode EXACTLY its 2 bytes, leaving the trailing
+  /// `UAS_LSVersionNumber` record intact.
+  #[test]
+  fn short_string_tag_is_length_bounded() {
+    // [tag 4 TailNumber string][BER len 2]["AB"]  [tag 65 = 11]
+    let mut inner = vec![4, 0x02, b'A', b'B'];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    // Exactly the two declared bytes — NOT "AB" plus the next record's tag byte.
+    assert_eq!(
+      leaf(&leaves, "TailNumber").value_n,
+      TagValue::Str("AB".into())
+    );
+    assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
   }
 }
