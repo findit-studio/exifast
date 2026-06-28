@@ -1127,7 +1127,7 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   },
   SonyLensType {
     id: 61763,
-    name: "Viltrox 85mm F1.4 FE PRO",
+    name: "Viltrox 85mm F1.4 FE Pro",
   },
   SonyLensType {
     id: 61766,
@@ -1135,7 +1135,7 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   },
   SonyLensType {
     id: 61767,
-    name: "Viltrox 50mm F2.0 FE AIR",
+    name: "Viltrox 50mm F2.0 FE Air",
   },
   SonyLensType {
     id: 61768,
@@ -1143,7 +1143,7 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   },
   SonyLensType {
     id: 61776,
-    name: "Viltrox 50mm F1.4 FE PRO",
+    name: "Viltrox 50mm F1.4 FE Pro",
   },
   SonyLensType {
     id: 61777,
@@ -1460,6 +1460,24 @@ mod tests {
   fn lookup_zeiss_otus_ml_50mm() {
     let name = lookup_name(51072).expect("51072 should be present");
     assert!(name.contains("ZEISS Otus ML 50mm F1.4"));
+  }
+
+  #[test]
+  fn lookup_viltrox_fe_pro_air_case_faithful() {
+    // #472: ExifTool 13.59 %sonyLensTypes2 spells these "FE Pro"/"FE Air"
+    // (not the all-caps "FE PRO"/"FE AIR" the table had drifted to).
+    assert_eq!(
+      lookup_name(61763).as_deref(),
+      Some("Viltrox 85mm F1.4 FE Pro")
+    );
+    assert_eq!(
+      lookup_name(61767).as_deref(),
+      Some("Viltrox 50mm F2.0 FE Air")
+    );
+    assert_eq!(
+      lookup_name(61776).as_deref(),
+      Some("Viltrox 50mm F1.4 FE Pro")
+    );
   }
 
   #[test]
