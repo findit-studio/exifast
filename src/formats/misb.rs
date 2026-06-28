@@ -506,16 +506,17 @@ impl MisbMeta {
 fn parse_misb(data: &[u8], doc: u32, out: &mut Vec<MisbLeaf>) {
   let end = data.len();
   // MISB.pm:406 `for ($pos = 5; $pos + 16 < $end; )` — skip the 5-byte header.
+  // The guard is written subtraction-first so a `pos` at (or, defensively, past)
+  // `end` can never overflow the `pos + 16` add on a crafted record.
   let mut pos = 5usize;
-  while pos + 16 < end {
+  while end.saturating_sub(pos) > 16 {
     // MISB.pm:407 `$key = unpack('H*', substr($$dataPt, $pos, 16))` (lowercase).
-    // The loop guard (`pos + 16 < end`) keeps this in-bounds; `.get` keeps it
-    // panic-free regardless.
-    let Some(key_bytes) = data.get(pos..pos + 16) else {
+    // The loop guard keeps this in-bounds; `.get` keeps it panic-free regardless.
+    let Some(key_bytes) = data.get(pos..pos.saturating_add(16)) else {
       return;
     };
     let key_hex = hex_lower(key_bytes);
-    pos += 16;
+    pos = pos.saturating_add(16);
     // MISB.pm:409-416 — BER length (short form, or long form when bit 0x80 set).
     let Some((len, next)) = read_ber(data, pos, end) else {
       return; // MISB.pm:414 `return if $pos + $n > $end`
@@ -530,12 +531,24 @@ fn parse_misb(data: &[u8], doc: u32, out: &mut Vec<MisbLeaf>) {
     // are all `Unknown`, suppressed from default output, matching the
     // `$verbose or $unknown` gate).
     let table = table.unwrap_or(Table::Unknown);
-    // MISB.pm:430-433 — clamp a record that runs past the buffer.
+    // MISB.pm:430-433 — a record that runs past the buffer is clamped to the
+    // bytes actually available (`$len = $end - $pos`), then the walk advances by
+    // that SAME clamped length (`$pos += $len`, MISB.pm:444) ⇒ `pos` lands on
+    // `end` and the loop terminates. A declared `len` larger than `avail` (e.g.
+    // a saturated long-form BER length) therefore must NOT advance `pos` by the
+    // untrusted `len` — that would set `pos` to a huge value and overflow the
+    // next loop guard. Advance by the clamped `rec_len` instead.
     let avail = end.saturating_sub(pos);
     let rec_len = len.min(avail);
     // MISB.pm:434-442 — process the sub-table local set under its byte order.
     process_klv(data, pos, rec_len, table, table.byte_order(), doc, out);
-    pos = pos.saturating_add(len); // MISB.pm:444 `$pos += $len`
+    pos = pos.saturating_add(rec_len); // MISB.pm:444 `$pos += $len` (clamped)
+    // A clamped (truncated) record consumes the rest of the buffer; ExifTool's
+    // `$pos + 16 < $end` guard then ends the walk. Make that explicit so a future
+    // change to the guard can never re-enter on a degenerate record.
+    if rec_len < len {
+      break;
+    }
   }
 }
 
@@ -554,24 +567,30 @@ fn process_klv(
 ) {
   let dir_end = start.saturating_add(dir_len).min(data.len());
   // MISB.pm:349 `for ($pos=$dirStart; $pos<$dirEnd-1; )` — need a tag + len byte.
+  // Subtraction-first guard so a `pos` at/over `dir_end` can't overflow `pos + 1`.
   let mut pos = start;
-  while pos + 1 < dir_end {
-    // The loop guard (`pos + 1 < dir_end <= data.len()`) keeps this in-bounds.
+  while dir_end.saturating_sub(pos) > 1 {
+    // The loop guard keeps `pos` in-bounds; `.get` keeps it panic-free regardless.
     let Some(&tag) = data.get(pos) else {
       return;
     };
-    pos += 1;
+    pos = pos.saturating_add(1);
     // MISB.pm:351-357 — BER length.
     let Some((len, next)) = read_ber(data, pos, dir_end) else {
       return; // MISB.pm:354 `last if $pos + $n > $dirEnd`
     };
     pos = next;
-    // MISB.pm:358 `last if $pos + $len > $dirEnd`.
-    if pos + len > dir_end {
+    // MISB.pm:358 `last if $pos + $len > $dirEnd` — a record (incl. a saturated
+    // long-form BER length) declaring more than the bytes left in this local set
+    // ENDS the walk (no partial decode). Compare via subtraction so the untrusted
+    // `len` can never overflow a `pos + len` add.
+    if len > dir_end.saturating_sub(pos) {
       return;
     }
+    // `len <= dir_end - pos <= data.len() - pos` ⇒ `pos + len` is in-bounds; the
+    // `decode_tag` value slices below cannot panic or read OOB.
     decode_tag(data, pos, len, tag, table, byte_order, doc, out);
-    pos += len; // MISB.pm:379 `$pos += $len`
+    pos = pos.saturating_add(len); // MISB.pm:379 `$pos += $len`
   }
 }
 
@@ -799,7 +818,11 @@ fn unknown_value(
     return (v.clone(), v);
   }
   // No default format ⇒ string if printable, else binary (MISB.pm:367-371).
-  let bytes = data.get(pos..pos + len).unwrap_or(&[]);
+  // `checked_add` keeps the slice range panic-free even on an untrusted `len`.
+  let bytes = pos
+    .checked_add(len)
+    .and_then(|end| data.get(pos..end))
+    .unwrap_or(&[]);
   if bytes
     .iter()
     .all(|&b| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
@@ -823,21 +846,27 @@ fn unknown_name(tag: u8) -> SmolStr {
 /// form runs past `end`.
 fn read_ber(data: &[u8], pos: usize, end: usize) -> Option<(usize, usize)> {
   let first = *data.get(pos)?;
+  // `data.get(pos)` succeeded ⇒ `pos < data.len()` ⇒ `pos + 1` cannot overflow.
   if first & 0x80 == 0 {
     return Some((first as usize, pos + 1));
   }
   let n = (first & 0x7f) as usize;
   let mut p = pos + 1;
   // MISB.pm:354/414 — `last`/`return` if the `n` length bytes run past `end`.
-  if p + n > end {
+  // Subtraction-first so the bounded `n` (≤ 127) can never overflow a `p + n` add.
+  if n > end.saturating_sub(p) {
     return None;
   }
+  // The accumulated length is `saturating_*` so a long-form BER field declaring a
+  // huge length saturates to `usize::MAX` rather than wrapping; the callers clamp
+  // it to the bytes actually available (`parse_misb`) or terminate the walk
+  // (`process_klv`), matching ExifTool's truncated-record handling.
   let mut len = 0usize;
   for _ in 0..n {
     len = len
       .saturating_mul(256)
       .saturating_add(*data.get(p)? as usize);
-    p += 1;
+    p = p.saturating_add(1);
   }
   Some((len, p))
 }
@@ -888,5 +917,159 @@ fn scalar_text(v: &TagValue) -> String {
     TagValue::F64(f) => crate::value::format_g(*f, 15),
     TagValue::Str(s) => s.to_string(),
     other => std::format!("{other:?}"),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The 16-byte ST 0601.11 UAS Datalink universal key ([`MAIN_KEYS`]) — a
+  /// crafted top-level KLV with this key dispatches to [`UAS_DATALINK`].
+  const UAS_KEY: [u8; 16] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x02, 0x0b, 0x01, 0x01, 0x0e, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00,
+  ];
+
+  /// Build a MISB PES payload: a 5-byte service header (skipped by
+  /// [`parse_misb`]) followed by `body`.
+  fn payload(body: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x00, 0x01, 0x0f, 0x00, 0x00];
+    v.extend_from_slice(body);
+    v
+  }
+
+  /// A valid UAS local-set record for tag 65 `UAS_LSVersionNumber` (int8u): the
+  /// 1-byte tag id, a short-form BER length of 1, and the value `11`.
+  fn uas_ls_version_record() -> [u8; 3] {
+    [65, 0x01, 0x0b]
+  }
+
+  /// Decode one crafted packet and return the extracted leaves.
+  fn decode(payload: &[u8]) -> Vec<MisbLeaf> {
+    let mut out = Vec::new();
+    parse_misb(payload, 1, &mut out);
+    out
+  }
+
+  /// Assert the decode yielded exactly the one valid `UAS_LSVersionNumber = 11`
+  /// leaf (the prefix surviving a malformed record). `.first()` keeps the helper
+  /// panic-free / index-free.
+  fn assert_single_uas_version(leaves: &[MisbLeaf]) {
+    assert_eq!(leaves.len(), 1);
+    let leaf = leaves.first().expect("exactly one leaf");
+    assert_eq!(leaf.name.as_str(), "UAS_LSVersionNumber");
+    assert_eq!(leaf.value_n, TagValue::I64(11));
+  }
+
+  /// A top-level long-form BER length that declares far more bytes than the
+  /// packet actually carries must NOT advance `pos` by the untrusted length
+  /// (which would overflow the next loop guard): the record is clamped to the
+  /// bytes available, the valid local-set tags inside are still decoded, and the
+  /// walk then terminates. Run under debug overflow-checks ⇒ proves no panic.
+  #[test]
+  fn top_level_oversized_ber_length_terminates_bounded_and_emits_prefix() {
+    // [UAS key][BER 0x81 0xff = "255 bytes"][only a 3-byte valid record follows]
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.extend_from_slice(&[0x81, 0xff]); // long-form BER: declares 255 bytes
+    body.extend_from_slice(&uas_ls_version_record()); // 3 bytes actually present
+    let leaves = decode(&payload(&body));
+    // The clamped record is walked: the valid UAS_LSVersionNumber leaf surfaces.
+    assert_single_uas_version(&leaves);
+  }
+
+  /// A long-form BER length whose magnitude saturates `usize` (eight `0xff`
+  /// length bytes) must saturate (not wrap) and be clamped to the available
+  /// bytes — no panic, no OOB, the valid prefix still decodes.
+  #[test]
+  fn top_level_saturating_ber_length_is_clamped_no_panic() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    // 0x88 ⇒ 8 length bytes; all 0xff ⇒ accumulates to a saturated usize::MAX.
+    body.push(0x88);
+    body.extend_from_slice(&[0xff; 8]);
+    body.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode(&payload(&body));
+    assert_single_uas_version(&leaves);
+  }
+
+  /// A nested/local-set record whose BER length runs past the local set ends the
+  /// inner walk (ExifTool `last if $pos + $len > $dirEnd`): tags before it are
+  /// decoded, the oversized one is dropped, and there is no panic/OOB.
+  #[test]
+  fn nested_oversized_ber_length_terminates_inner_walk_no_panic() {
+    // Inner local set: [valid tag 65 = 11][tag 1 with an oversized inner BER len].
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&uas_ls_version_record()); // valid prefix tag
+    inner.push(1); // tag 1 (Checksum)
+    inner.extend_from_slice(&[0x81, 0xff]); // inner long-form BER: 255 bytes
+    inner.push(0x00); // only 1 byte actually present (< 255)
+    // Wrap it in a top-level record whose own length exactly spans `inner`.
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.push(u8::try_from(inner.len()).expect("inner fits a short-form BER"));
+    body.extend_from_slice(&inner);
+    let leaves = decode(&payload(&body));
+    // Only the valid prefix tag survives; the oversized inner record is dropped.
+    assert_single_uas_version(&leaves);
+  }
+
+  /// A nested long-form BER length that saturates `usize` is likewise bounded —
+  /// the inner walk terminates without panic or wrap.
+  #[test]
+  fn nested_saturating_ber_length_terminates_inner_walk_no_panic() {
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&uas_ls_version_record());
+    inner.push(1); // tag 1
+    inner.push(0x88); // 8 length bytes
+    inner.extend_from_slice(&[0xff; 8]); // saturates to usize::MAX
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.push(u8::try_from(inner.len()).expect("inner fits a short-form BER"));
+    body.extend_from_slice(&inner);
+    let leaves = decode(&payload(&body));
+    assert_single_uas_version(&leaves);
+  }
+
+  /// The precise Codex #130 scenario: a MISB prefix whose top-level long-form
+  /// BER length saturates and is followed by NO further bytes. The buggy code
+  /// advanced `pos` to `usize::MAX` and overflowed `pos + 16` on the next guard;
+  /// the fix clamps the advance to the available bytes and terminates. No panic.
+  #[test]
+  fn oversized_ber_with_no_value_bytes_does_not_overflow_loop_guard() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.push(0x88); // 8 length bytes …
+    body.extend_from_slice(&[0xff; 8]); // … saturating to usize::MAX, no value
+    let leaves = decode(&payload(&body));
+    // Nothing decodable, but crucially: no panic and a bounded, empty result.
+    assert!(leaves.is_empty());
+  }
+
+  /// `read_ber` saturates a long-form length rather than wrapping, and a
+  /// truncated long-form field (the declared count of length bytes runs past
+  /// `end`) returns `None`.
+  #[test]
+  fn read_ber_saturates_and_rejects_truncated_long_form() {
+    // 8 length bytes of 0xff ⇒ usize::MAX (saturated, not wrapped).
+    let buf = [0x88u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    assert_eq!(read_ber(&buf, 0, buf.len()), Some((usize::MAX, buf.len())));
+    // Declares 4 length bytes but only 2 are present ⇒ rejected.
+    let trunc = [0x84u8, 0x00, 0x00];
+    assert_eq!(read_ber(&trunc, 0, trunc.len()), None);
+    // Short form passes through unchanged.
+    assert_eq!(read_ber(&[0x05u8], 0, 1), Some((5, 1)));
+  }
+
+  /// The valid happy-path still decodes: a well-formed UAS record yields its
+  /// leaf (guards the malformed-BER fixes against over-rejecting good input).
+  #[test]
+  fn valid_record_still_decodes() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&UAS_KEY);
+    body.push(u8::try_from(uas_ls_version_record().len()).expect("fits"));
+    body.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode(&payload(&body));
+    assert_single_uas_version(&leaves);
   }
 }
