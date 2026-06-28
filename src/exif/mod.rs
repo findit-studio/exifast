@@ -11499,8 +11499,12 @@ fn emit_nikon_value<S: ExifSink>(
 ///
 /// 1. **SubDirectory skip** — a row with a `sub_table` (FaceDetInfo 0x4e /
 ///    FaceRecInfo 0x61 / PrintIM 0x0e00 / TimeInfo 0x2003) DESCENDS into a child
-///    table and never emits the parent pointer as a value; Phase 3 defers the
-///    child walk, so NEITHER parent nor children emit (`Exif.pm:7103-7104`).
+///    table and never emits the PARENT pointer as a value (`Exif.pm:7103-7104`).
+///    The CHILD `ProcessBinaryData` walk for the three binary sub-tables runs in
+///    the capture loop (`panasonic::decode_main_subdir`, #105) BEFORE this leaf
+///    emit is reached; this function only guarantees the parent pointer itself
+///    emits nothing (the defensive `emit_entry` fallback, which does not run the
+///    child walk, also relies on this skip).
 /// 2. **Single-HASH `Condition` suppression** — the `$format`-gated LensType rows
 ///    0xc4/0xc5/0xe4 are dropped when `$format ne "int16u"` (and 0xc4 also drops
 ///    the `0xffff` `$$valPt` sentinel), read off [`ExifEntry::on_disk_format`].
@@ -11546,7 +11550,10 @@ fn emit_panasonic_value<S: ExifSink>(
   use makernotes::vendors::panasonic::{PanasonicPrintConv, populate_typed};
   let tag_id = entry.tag_id;
   let raw = entry.value.raw();
-  // Step 1 — deferred SubDirectory row: emit NEITHER parent nor children.
+  // Step 1 — SubDirectory row: the PARENT pointer emits nothing here. The
+  // production capture loop runs the child `ProcessBinaryData` walk
+  // (`decode_main_subdir`) BEFORE this is reached; this guard covers the
+  // defensive `emit_entry` fallback (no child walk there).
   if panasonic_tag.sub_table.is_some() {
     return Ok(());
   }
@@ -13233,6 +13240,25 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
       // (never produced under `TableRef::Panasonic`) is skipped —
       // `emit_panasonic_value` needs the `PanasonicTag`.
       if let ResolvedConv::Panasonic(panasonic_tag) = entry.conv {
+        // A WALKED ProcessBinaryData SubDirectory (FaceDetInfo 0x4e / FaceRecInfo
+        // 0x61 / TimeInfo 0x2003, #105) is decoded HERE: re-slice the verbatim
+        // `$$valPt` value span and emit each position under the `Panasonic`
+        // family-1 group, reproducing ExifTool's descend-then-`next` (the parent
+        // pointer is NEVER emitted, `Exif.pm:7103-7104`). PrintIM (0x0e00) returns
+        // `None` and falls through to `emit_panasonic_value` (which skips it — the
+        // shared PrintIM module handles it). Every binary position is an explicit
+        // entry ⇒ `unknown = false`.
+        if let Some(sub) = panasonic_tag.sub_table {
+          let blob = data
+            .get(entry.value_offset()..entry.value_offset().saturating_add(entry.value_size()))
+            .unwrap_or(&[]);
+          if let Some(pairs) = panasonic::decode_main_subdir(sub, blob, order, print_conv) {
+            for (name, value) in pairs {
+              let Ok(()) = sink.write_vendor_value("MakerNotes", g1, name.as_str(), value, false);
+            }
+            continue;
+          }
+        }
         let Ok(()) = emit_panasonic_value(
           g1,
           entry,
