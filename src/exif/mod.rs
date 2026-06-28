@@ -11813,11 +11813,14 @@ fn emit_canon_subtable<S: ExifSink>(
     SubTable::Processing => processing::parse(&blob, order, print_conv, model),
     SubTable::MeasuredColor => measured_color::parse(&blob, order, print_conv),
     // CameraInfo (0x0d) — model-conditional list (`Canon.pm:1308-1494`); the
-    // ported variants are 5D / 7D and the xxxD DSLR batch (40D / 50D / 450D /
-    // 500D / 550D / 1000D), all `PRIORITY => 0` (threaded via `tag_priority`).
-    // `canon_lens_type` is the pre-scanned `$$self{LensType}` gating the
-    // `MacroMagnification` leaf. AFMicroAdj (0x4013).
-    SubTable::CameraInfo => camera_info::parse(&blob, order, print_conv, model, canon_lens_type),
+    // ported variants are 5D / 7D, the xxxD DSLR batch, the pro multi-Hook bodies,
+    // and the mirrorless R6 / R6m2 / R6m3 / G5XII, all `PRIORITY => 0` (threaded
+    // via `tag_priority`). `canon_lens_type` is the pre-scanned `$$self{LensType}`
+    // gating the `MacroMagnification` leaf; `file_type` is `$$self{FileType}`
+    // gating the G5XII JPEG/CR3 rows. AFMicroAdj (0x4013).
+    SubTable::CameraInfo => {
+      camera_info::parse(&blob, order, print_conv, model, file_type, canon_lens_type)
+    }
     // AFMicroAdj is `FORMAT => 'int32s'` — its IFD entry is read as `int32u[N]`,
     // so the value words must be widened back to 4 bytes each (the shared `blob`
     // above truncates every word to `int16`, which would shift every leaf).

@@ -160,25 +160,59 @@ pub fn model_is_camera_info_5dmkiii(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 5D Mark III"))
 }
 
+/// `true` when `model` selects `%Canon::CameraInfoR6` (`Canon.pm:1448`,
+/// `$$self{Model} =~ /\bEOS R[56]$/` — the mirrorless EOS R5 or R6, end-anchored
+/// so NOT the "R6 Mark II/III").
+#[must_use]
+pub fn model_is_camera_info_r6(model: Option<&str>) -> bool {
+  model_ends_with(model, "EOS R5") || model_ends_with(model, "EOS R6")
+}
+
+/// `true` when `model` selects `%Canon::CameraInfoR6m2` (`Canon.pm:1453`,
+/// `$$self{Model} =~ /\bEOS (R6m2|R8|R50)$/` — the EOS R6 Mark II / R8 / R50).
+#[must_use]
+pub fn model_is_camera_info_r6m2(model: Option<&str>) -> bool {
+  model_ends_with(model, "EOS R6m2")
+    || model_ends_with(model, "EOS R8")
+    || model_ends_with(model, "EOS R50")
+}
+
+/// `true` when `model` selects `%Canon::CameraInfoR6m3` (`Canon.pm:1458`,
+/// `$$self{Model} =~ /\bEOS R6 Mark III$/`).
+#[must_use]
+pub fn model_is_camera_info_r6m3(model: Option<&str>) -> bool {
+  model_ends_with(model, "EOS R6 Mark III")
+}
+
+/// `true` when `model` selects `%Canon::CameraInfoG5XII` (`Canon.pm:1463`,
+/// `$$self{Model} =~ /\bG5 X Mark II$/` — the PowerShot G5 X Mark II).
+#[must_use]
+pub fn model_is_camera_info_g5xii(model: Option<&str>) -> bool {
+  model_ends_with(model, "G5 X Mark II")
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: the 1-series no-Hook bodies (1D / 1DS / 1DmkII / 1DmkIIN /
 /// 1DmkIII), the 5D / 6D / 7D, and the xxxD DSLR batch (40D / 50D / 60D / 70D /
 /// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
 /// 1100D / 1200D aliases), and the pro multi-Hook bodies 5DmkII (1 Hook),
-/// 1DmkIV (2 Hooks), 1DX (3 Hooks) and 5DmkIII (4 Hooks); any other model yields
-/// nothing (deferred). The mirrorless (EOS R6 / R6m2 / R6m3 / G5XII) and
-/// PowerShot count-keyed CameraInfo tables remain deferred. `print_conv`
-/// selects the
+/// 1DmkIV (2 Hooks), 1DX (3 Hooks) and 5DmkIII (4 Hooks); the mirrorless bodies
+/// EOS R6 (R5/R6), R6m2 (R6m2/R8/R50), R6m3 and the PowerShot G5XII; any other
+/// model yields nothing (deferred). The count-keyed PowerShot CameraInfo tables
+/// remain deferred. `print_conv` selects the
 /// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
+/// `file_type` is the container `$$self{FileType}` (`File:FileType`) gating the
+/// `%CameraInfoG5XII` JPEG/CR3 rows (`Canon.pm:4876`/`:4886`).
 #[must_use]
 pub fn parse(
   data: &[u8],
   order: ByteOrder,
   print_conv: bool,
   model: Option<&str>,
+  file_type: Option<&str>,
   canon_lens_type: Option<u16>,
 ) -> Vec<(SmolStr, TagValue)> {
   if model_is_camera_info_1d(model) {
@@ -227,6 +261,14 @@ pub fn parse(
     camera_info_750d(data, order, print_conv)
   } else if model_is_camera_info_1000d(model) {
     camera_info_1000d(data, order, print_conv, canon_lens_type)
+  } else if model_is_camera_info_r6(model) {
+    camera_info_r6(data, order, print_conv)
+  } else if model_is_camera_info_r6m2(model) {
+    camera_info_r6m2(data, order)
+  } else if model_is_camera_info_r6m3(model) {
+    camera_info_r6m3(data, order)
+  } else if model_is_camera_info_g5xii(model) {
+    camera_info_g5xii(data, order, file_type)
   } else {
     Vec::new()
   }
@@ -2571,6 +2613,77 @@ fn camera_info_1000d(
   out
 }
 
+/// `%Canon::CameraInfoR6` (`Canon.pm:4817-4840`). The mirrorless EOS R5/R6
+/// `CameraInfo` (`%binaryDataAttrs` ⇒ `FORMAT => 'int8u'`, `FIRST_ENTRY => 0`,
+/// `PRIORITY => 0`), keyed by byte offset like the DSLR `int8u` tables; emitted
+/// by ascending offset (CameraTemperature 0x09da, ShutterCount 0x0af1).
+fn camera_info_r6(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  // 0x09da CameraTemperature (`Canon.pm:4825`, int8u, `$val-128`, "$val C").
+  emit_camera_temperature(data, 0x09da, print_conv, &mut push);
+  // 0x0af1 ShutterCount (`Canon.pm:4832`, `Format => 'int32u'`, no conv).
+  emit_int32_index(data, 0x0af1, order, "ShutterCount", 0, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfoR6m2` (`Canon.pm:4842-4853`). The EOS R6 Mark II / R8 / R50
+/// `CameraInfo` (int8u, byte-keyed): a single `Format => 'int32u'` ShutterCount
+/// (`Canon.pm:4848`). No PrintConv ⇒ identical in both views.
+fn camera_info_r6m2(data: &[u8], order: ByteOrder) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  // 0x0d29 ShutterCount (`Canon.pm:4848`, `Format => 'int32u'`).
+  emit_int32_index(data, 0x0d29, order, "ShutterCount", 0, &mut push);
+  out
+}
+
+/// `%Canon::CameraInfoR6m3` (`Canon.pm:4855-4866`). The EOS R6 Mark III
+/// `CameraInfo` (int8u, byte-keyed): a single `Format => 'int16u'` ImageCount
+/// (`Canon.pm:4861`, resets to 0 when the SD card is formatted).
+fn camera_info_r6m3(data: &[u8], order: ByteOrder) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  // 0x086d ImageCount (`Canon.pm:4861`, `Format => 'int16u'`, no conv).
+  if let Some(v) = u16(data, 0x086d, order) {
+    push("ImageCount", TagValue::I64(v));
+  }
+  out
+}
+
+/// `%Canon::CameraInfoG5XII` (`Canon.pm:4868-4904`). The PowerShot G5 X Mark II
+/// `CameraInfo` (int8u, byte-keyed). Every leaf is `$$self{FileType}`-gated: the
+/// JPEG rows (ShutterCount 0x0293, DirectoryIndex 0x0b21, FileIndex 0x0b2d) and
+/// the CR3 row (ShutterCount 0x0a95). No PrintConv ⇒ identical in both views.
+/// Emitted by ascending offset, exactly as `ProcessBinaryData` walks the indices.
+fn camera_info_g5xii(
+  data: &[u8],
+  order: ByteOrder,
+  file_type: Option<&str>,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let is_jpeg = file_type == Some("JPEG");
+  let is_cr3 = file_type == Some("CR3");
+  // 0x0293 ShutterCount (`Canon.pm:4871`, `Format => 'int32u'`) — JPEG only.
+  if is_jpeg {
+    emit_int32_index(data, 0x0293, order, "ShutterCount", 0, &mut push);
+  }
+  // 0x0a95 ShutterCount (`Canon.pm:4885`, `Format => 'int32u'`) — CR3 only.
+  if is_cr3 {
+    emit_int32_index(data, 0x0a95, order, "ShutterCount", 0, &mut push);
+  }
+  // 0x0b21 DirectoryIndex (`Canon.pm:4891`, `Format => 'int32u'`, no conv) — JPEG.
+  if is_jpeg {
+    emit_directory_index(data, 0x0b21, order, false, &mut push);
+  }
+  // 0x0b2d FileIndex (`Canon.pm:4897`, `Format => 'int32u'`, `$val + 1`) — JPEG.
+  if is_jpeg {
+    emit_file_index(data, 0x0b2d, order, &mut push);
+  }
+  out
+}
+
 // ─── shared per-field emitters for the int8u xxxD `CameraInfo` tables ─────────
 // Each reads at the byte offset the caller already resolved (applying any
 // firmware `Hook` shift) and pushes the rendered leaf, reusing the same value
@@ -3790,6 +3903,19 @@ fn read_string(data: &[u8], off: usize, len: usize) -> Option<String> {
 mod tests {
   use super::*;
 
+  /// The pre-mirrorless `parse` arity (no `$$self{FileType}`/PowerShot context)
+  /// the per-model unit tests drive. `file_type` defaults to `None` — every
+  /// model-table row these tests exercise is `FileType`-independent.
+  fn parse_model(
+    data: &[u8],
+    order: ByteOrder,
+    print_conv: bool,
+    model: Option<&str>,
+    canon_lens_type: Option<u16>,
+  ) -> Vec<(SmolStr, TagValue)> {
+    super::parse(data, order, print_conv, model, None, canon_lens_type)
+  }
+
   /// Build a CameraInfo5D blob with the named bytes set (the rest zero).
   fn blob() -> Vec<u8> {
     let mut b = vec![0u8; 0x120];
@@ -3815,7 +3941,7 @@ mod tests {
   #[test]
   fn camera_info_5d_print_values() {
     let data = blob();
-    let em = parse(&data, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
+    let em = parse_model(&data, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -3851,7 +3977,7 @@ mod tests {
   #[test]
   fn camera_info_5d_numeric_iso() {
     let data = blob();
-    let em = parse(&data, ByteOrder::Little, false, Some("Canon EOS 5D"), None);
+    let em = parse_model(&data, ByteOrder::Little, false, Some("Canon EOS 5D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::I64(400)));
     assert_eq!(find("FileIndex"), Some(TagValue::I64(1428)));
@@ -3873,7 +3999,7 @@ mod tests {
     // A model handled by no table yields nothing (the mirrorless R-series
     // CameraInfo tables remain deferred to a later chunk).
     assert!(
-      parse(
+      parse_model(
         &[0u8; 0x120],
         ByteOrder::Little,
         true,
@@ -3914,7 +4040,7 @@ mod tests {
     b[0x133..0x137].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
     b[0x13f..0x143].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
     b[0x92b..0x934].copy_from_slice(b"EF24-70mm"); // LensModel string[64]
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -3944,10 +4070,10 @@ mod tests {
     assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(99)));
     assert_eq!(find("LensModel"), Some(TagValue::Str("EF24-70mm".into())));
     // MacroMagnification is gated on the pre-scanned LensType == 124.
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), Some(50));
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), Some(50));
     assert!(em2.iter().all(|(k, _)| k != "MacroMagnification"));
     // -n view: ISO / FileIndex render as bare integers.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 40D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 40D"), None);
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("ISO"), Some(TagValue::I64(400)));
     assert_eq!(findn("FileIndex"), Some(TagValue::I64(101)));
@@ -3959,7 +4085,7 @@ mod tests {
   fn camera_info_40d_truncated_per_field() {
     let mut b = vec![0u8; 0x80];
     b[0x06] = 88; // ISO 400 (in range)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 40D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert!(find("FirmwareVersion").is_none());
@@ -3987,7 +4113,7 @@ mod tests {
     b[0x15a..0x160].copy_from_slice(b"2.6.1\0"); // version prefix at 0x15a ⇒ CanonFirm 1
     b[0x197..0x19b].copy_from_slice(&200u32.to_le_bytes()); // FileIndex @ 0x19b-4
     b[0x1a3..0x1a7].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex @ 0x1a7-4
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -4024,7 +4150,7 @@ mod tests {
     b[0x15e..0x164].copy_from_slice(b"1.0.3\0"); // version prefix at 0x15e ⇒ CanonFirm 2
     b[0x19b..0x19f].copy_from_slice(&200u32.to_le_bytes()); // FileIndex @ 0x19b
     b[0x1a7..0x1ab].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex @ 0x1a7
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 50D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("100 mm".into())));
     assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.3".into())));
@@ -4038,7 +4164,7 @@ mod tests {
   fn dispatch_anchored_5dmkii() {
     let mut b = vec![0u8; 0x400];
     b[0x17e..0x184].copy_from_slice(b"1.0.6\0"); // CanonFirm 2
-    let mk2 = parse(
+    let mk2 = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4046,7 +4172,7 @@ mod tests {
       None,
     );
     assert!(mk2.iter().any(|(k, _)| k == "FirmwareVersion"));
-    let plain = parse(&b, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
+    let plain = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 5D"), None);
     assert!(plain.iter().all(|(k, _)| k != "FirmwareVersion"));
   }
 
@@ -4077,7 +4203,7 @@ mod tests {
     b[0x1bb..0x1bf].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ +1 = 201
     b[0x1c7..0x1cb].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ -1 = 199
     b[0x2f7..0x2fb].copy_from_slice(&5i32.to_le_bytes()); // PSInfo ContrastStandard = 5
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4143,7 +4269,7 @@ mod tests {
     b[0x197..0x19b].copy_from_slice(&500u32.to_le_bytes());
     b[0x1a3..0x1a7].copy_from_slice(&500u32.to_le_bytes());
     b[0x2d3..0x2d7].copy_from_slice(&7i32.to_le_bytes());
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4171,7 +4297,7 @@ mod tests {
     b[0xeb] = 0x69; // MaxFocalLength 105 (Hook entry, still emitted)
     b[0x17e..0x184].copy_from_slice(b"badfw\0"); // not a version ⇒ CanonFirm 0
     b[0x1bb..0x1bf].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4194,7 +4320,7 @@ mod tests {
     let mut b = vec![0u8; 0x400];
     b[0x1b] = 75; // 75 ⇒ 1.0x
     b[0x17e..0x184].copy_from_slice(b"1.0.6\0"); // CanonFirm 2
-    let with = parse(
+    let with = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4208,7 +4334,7 @@ mod tests {
         .map(|(_, v)| v.clone()),
       Some(TagValue::Str("1.0x".into()))
     );
-    let without = parse(
+    let without = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4252,7 +4378,7 @@ mod tests {
     b[0x22c..0x230].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ 201
     b[0x238..0x23c].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ 199
     b[0x368..0x36c].copy_from_slice(&5i32.to_le_bytes()); // PSInfo ContrastStandard
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4304,7 +4430,7 @@ mod tests {
     b[0x227..0x22b].copy_from_slice(&500u32.to_le_bytes());
     b[0x233..0x237].copy_from_slice(&500u32.to_le_bytes());
     b[0x363..0x367].copy_from_slice(&7i32.to_le_bytes());
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4331,7 +4457,7 @@ mod tests {
     b[0x56] = 0x00;
     b[0x57] = 0x64; // FocusDistanceLower at 0x56 (Hook entry, still emitted)
     b[0x22c..0x230].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4379,7 +4505,7 @@ mod tests {
     b[0x2d0..0x2d4].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ 201
     b[0x2dc..0x2e0].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ 199
     b[0x3f4..0x3f8].copy_from_slice(&5i32.to_le_bytes()); // PSInfo2 ContrastStandard
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -4417,7 +4543,7 @@ mod tests {
     b[0x2c1..0x2c5].copy_from_slice(&500u32.to_le_bytes()); // FileIndex 0x2d0 ⇒ 0x2c1 (-15)
     b[0x2cd..0x2d1].copy_from_slice(&500u32.to_le_bytes()); // DirectoryIndex 0x2dc ⇒ 0x2cd (-15)
     b[0x3e5..0x3e9].copy_from_slice(&7i32.to_le_bytes()); // PSInfo2 0x3f4 ⇒ 0x3e5 (-15)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -4442,7 +4568,7 @@ mod tests {
     b[0x1af] = 0x18; // MinFocalLength 0x1a9 ⇒ 0x1ae (+5)
     b[0x1b0] = 0x00;
     b[0x1b1] = 0x69; // MaxFocalLength 0x1ab ⇒ 0x1b0 (+5)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -4464,7 +4590,7 @@ mod tests {
     b[0x1a4] = 0x00;
     b[0x1a5] = 0x69; // MaxFocalLength 0x1ab ⇒ 0x1a4 (-7, still emits)
     b[0x2d0..0x2d4].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -4516,7 +4642,7 @@ mod tests {
     b[0x298..0x29c].copy_from_slice(&300u32.to_le_bytes()); // DirectoryIndex ⇒ 299
     b[0x29c..0x2a0].copy_from_slice(&400u32.to_le_bytes()); // DirectoryIndex2 ⇒ 399
     b[0x3b0..0x3b4].copy_from_slice(&5i32.to_le_bytes()); // PSInfo2 ContrastStandard
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4569,7 +4695,7 @@ mod tests {
     b[0x154..0x159].copy_from_slice(&[0xab, 0xcd, 0xef, 0x12, 0x34]); // LensSerial 0x164 ⇒ 0x154 (-16)
     b[0x27c..0x280].copy_from_slice(&500u32.to_le_bytes()); // FileIndex 0x28c ⇒ 0x27c (-16)
     b[0x3a0..0x3a4].copy_from_slice(&7i32.to_le_bytes()); // PSInfo2 0x3b0 ⇒ 0x3a0 (-16)
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4611,7 +4737,7 @@ mod tests {
     b[0x162] = 0x00;
     b[0x163] = 0x69; // MaxFocalLength 0x157 ⇒ 0x162 (+11)
     b[0x16f..0x174].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]); // LensSerial 0x164 ⇒ 0x16f (+11)
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4646,7 +4772,7 @@ mod tests {
     b[0x23] = 0x00;
     b[0x24] = 0x32; // FocalLength nominal (shifted out)
     b[0x23c..0x240].copy_from_slice(&200u32.to_le_bytes()); // nominal FW region (no version)
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4695,7 +4821,7 @@ mod tests {
     b[0x133..0x137].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex PLAIN = 200
     b[0x13f..0x143].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
     b[0x933..0x93e].copy_from_slice(b"EF-S18-55mm"); // LensModel
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 450D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 450D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -4730,7 +4856,7 @@ mod tests {
     b[0x190..0x196].copy_from_slice(b"1.1.1\0"); // FirmwareVersion (valid)
     b[0x1d3..0x1d7].copy_from_slice(&200u32.to_le_bytes()); // FileIndex 201
     b[0x1df..0x1e3].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex 199
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find("HighlightTonePriority"),
@@ -4752,7 +4878,7 @@ mod tests {
     assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
     // The RawConv drops a non-version FirmwareVersion string.
     b[0x190..0x196].copy_from_slice(b"BADVER");
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 500D"), None);
     assert!(em2.iter().all(|(k, _)| k != "FirmwareVersion"));
   }
 
@@ -4775,7 +4901,7 @@ mod tests {
     b[0x1a4..0x1aa].copy_from_slice(b"2.0.0\0"); // FirmwareVersion (valid)
     b[0x1e4..0x1e8].copy_from_slice(&200u32.to_le_bytes()); // FileIndex 201
     b[0x1f0..0x1f4].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex 199
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 550D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 550D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find("HighlightTonePriority"),
@@ -4825,7 +4951,7 @@ mod tests {
     b[0x137..0x13b].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex PLAIN = 200
     b[0x143..0x147].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
     b[0x937..0x943].copy_from_slice(b"EF-S55-250mm"); // LensModel
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -4857,12 +4983,12 @@ mod tests {
       Some(TagValue::Str("EF-S55-250mm".into()))
     );
     // -n view: FlashModel renders the masked raw integer.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 1000D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 1000D"), None);
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("FlashModel"), Some(TagValue::I64(17)));
     // A FlashModel value absent from %flashModel ⇒ decimal "Unknown (N)".
     b[0x13] = 0x7f; // 127 (not in the hash)
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1000D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 1000D"), None);
     assert_eq!(
       em2
         .iter()
@@ -4945,7 +5071,7 @@ mod tests {
     b[0x456..0x45a].copy_from_slice(&2i32.to_le_bytes()); // ContrastAuto (0x3c6+0x90)
     b[0x466..0x46a].copy_from_slice(&1i32.to_le_bytes()); // FilterEffectAuto (0x3c6+0xa0)
     b[0x4b6..0x4b8].copy_from_slice(&0x81u16.to_le_bytes()); // UserDef1PictureStyle (0x3c6+0xf0)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 6D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 6D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -4984,7 +5110,7 @@ mod tests {
       Some(TagValue::Str("Standard".into()))
     );
     // -n view: WhiteBalance / LensType render as bare masked integers.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 6D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 6D"), None);
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
     assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
@@ -5039,7 +5165,7 @@ mod tests {
     b[0x321..0x325].copy_from_slice(&3i32.to_le_bytes()); // PSInfo2(60D) ContrastStandard
 
     // 60D proper:
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 60D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 60D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -5062,7 +5188,7 @@ mod tests {
     assert_eq!(find("ContrastStandard"), Some(TagValue::I64(3))); // from 0x321
 
     // 1200D alias:
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1200D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 1200D"), None);
     let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find2("CameraOrientation"),
@@ -5117,7 +5243,7 @@ mod tests {
     b[0x3cf..0x3d3].copy_from_slice(&4i32.to_le_bytes()); // PSInfo2 ContrastStandard
     b[0x45f..0x463].copy_from_slice(&2i32.to_le_bytes()); // PSInfo2 ContrastAuto (0x3cf+0x90)
     b[0x4bf..0x4c1].copy_from_slice(&0x86u16.to_le_bytes()); // UserDef1PictureStyle (0x3cf+0xf0)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 70D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 70D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -5152,7 +5278,7 @@ mod tests {
     // The 70D table has no WhiteBalance row.
     assert!(find("WhiteBalance").is_none());
     // -n view: LensType renders the bare integer.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 70D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 70D"), None);
     assert_eq!(
       emn
         .iter()
@@ -5208,7 +5334,7 @@ mod tests {
     b[0x2fb..0x2ff].copy_from_slice(&6i32.to_le_bytes()); // PSInfo2 ContrastStandard
     b[0x39b..0x39f].copy_from_slice(&1i32.to_le_bytes()); // PSInfo2 FilterEffectAuto (0x2fb+0xa0)
     b[0x3eb..0x3ed].copy_from_slice(&0x83u16.to_le_bytes()); // UserDef1PictureStyle (0x2fb+0xf0)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find("HighlightTonePriority"),
@@ -5252,7 +5378,7 @@ mod tests {
       Some(TagValue::Str("Landscape".into()))
     );
     // 1100D alias yields the identical table.
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 1100D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 1100D"), None);
     let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find2("FirmwareVersion"),
@@ -5261,10 +5387,10 @@ mod tests {
     assert_eq!(find2("ContrastStandard"), Some(TagValue::I64(6)));
     // The RawConv guard drops a non-version FirmwareVersion string.
     b[0x19b..0x1a1].copy_from_slice(b"BADVER");
-    let em3 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
+    let em3 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 600D"), None);
     assert!(em3.iter().all(|(k, _)| k != "FirmwareVersion"));
     // -n view: WhiteBalance / LensType render as bare integers.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 600D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 600D"), None);
     let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(findn("WhiteBalance"), Some(TagValue::I64(2)));
     assert_eq!(findn("LensType"), Some(TagValue::I64(1)));
@@ -5323,7 +5449,7 @@ mod tests {
     b[0x21b..0x221].copy_from_slice(b"1.0.1\0");
     b[0x270..0x274].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
     b[0x27c..0x280].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 650D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 650D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -5353,7 +5479,7 @@ mod tests {
     b2[0x220..0x226].copy_from_slice(b"2.1.1\0");
     b2[0x274..0x278].copy_from_slice(&200u32.to_le_bytes()); // FileIndex + 1 = 201
     b2[0x280..0x284].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex - 1 = 199
-    let em2 = parse(&b2, ByteOrder::Little, true, Some("Canon EOS 700D"), None);
+    let em2 = parse_model(&b2, ByteOrder::Little, true, Some("Canon EOS 700D"), None);
     let find2 = |n: &str| em2.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(
       find2("FirmwareVersion"),
@@ -5404,7 +5530,7 @@ mod tests {
     b[0x48] = 0x50;
     b[0x49] = 0x14; // ColorTemperature int16u = 5200
     b[0x4b] = 0x81; // PictureStyle Standard
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert!(find("ExposureTime").is_some());
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -5419,7 +5545,7 @@ mod tests {
     assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
     assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
     // -n view: LensType renders the bare int16uRev value (10).
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS-1D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS-1D"), None);
     assert_eq!(
       emn
         .iter()
@@ -5443,7 +5569,7 @@ mod tests {
     b[0x4e] = 0x88;
     b[0x4f] = 0x13; // ColorTemperature int16u = 5000
     b[0x51] = 0x82; // PictureStyle Portrait
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1DS"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1DS"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
     assert_eq!(
@@ -5462,7 +5588,7 @@ mod tests {
   fn camera_info_1d_truncated_per_field() {
     let mut b = vec![0u8; 0x05];
     b[0x04] = 0x20; // ExposureTime (in range)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS-1D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert!(find("ExposureTime").is_some());
     assert!(find("FocalLength").is_none());
@@ -5509,7 +5635,7 @@ mod tests {
     b[0x72] = 0x03; // Sharpness plain int8s = 3
     b[0x73] = 0x00; // Contrast Normal
     b[0x75..0x78].copy_from_slice(b"100"); // ISO string[5]
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -5536,7 +5662,7 @@ mod tests {
     assert_eq!(find("Contrast"), Some(TagValue::Str("Normal".into())));
     assert_eq!(find("ISO"), Some(TagValue::Str("100".into())));
     // -n view: LensType / CanonImageSize / Saturation render as bare values.
-    let emn = parse(
+    let emn = parse_model(
       &b,
       ByteOrder::Little,
       false,
@@ -5569,7 +5695,7 @@ mod tests {
     b[0x76] = 0xfd; // Saturation -3
     b[0x77] = 0x00; // ColorTone Normal
     b[0x79..0x7c].copy_from_slice(b"200"); // ISO string[5]
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -5636,7 +5762,7 @@ mod tests {
     b[0x2aa..0x2ae].copy_from_slice(&3i32.to_le_bytes()); // PSInfo ContrastStandard
     b[0x45a..0x45e].copy_from_slice(&1_370_690_080u32.to_le_bytes()); // TimeStamp1
     b[0x45e..0x462].copy_from_slice(&1_370_690_080u32.to_le_bytes()); // TimeStamp
-    let em = parse(
+    let em = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -5682,7 +5808,7 @@ mod tests {
       Some(TagValue::Str("2013:06:08 11:14:40".into()))
     );
     // -n view: LensType renders the bare int16uRev value.
-    let emn = parse(
+    let emn = parse_model(
       &b,
       ByteOrder::Little,
       false,
@@ -5697,7 +5823,7 @@ mod tests {
       Some(TagValue::I64(1))
     );
     // The 1DSmkIII shares the table but has NO TimeStamp1 leaf.
-    let ems = parse(
+    let ems = parse_model(
       &b,
       ByteOrder::Little,
       true,
@@ -5752,7 +5878,7 @@ mod tests {
     b[0x45a..0x460].copy_from_slice(b"1.0.1\0"); // FirmwareVersion (no guard)
     b[0x4ae..0x4b2].copy_from_slice(&100u32.to_le_bytes()); // FileIndex + 1 = 101
     b[0x4ba..0x4be].copy_from_slice(&100u32.to_le_bytes()); // DirectoryIndex - 1 = 99
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(
@@ -5783,7 +5909,7 @@ mod tests {
     assert!(find("PictureStyle").is_none());
     // FirmwareVersion (0x45a) has NO RawConv guard — a non-version string emits.
     b[0x45a..0x460].copy_from_slice(b"BADVER");
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 80D"), None);
     assert_eq!(
       em2
         .iter()
@@ -5792,7 +5918,7 @@ mod tests {
       Some(TagValue::Str("BADVER".into()))
     );
     // -n view: LensType renders the bare int16uRev value.
-    let emn = parse(&b, ByteOrder::Little, false, Some("Canon EOS 80D"), None);
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS 80D"), None);
     assert_eq!(
       emn
         .iter()
@@ -5822,7 +5948,7 @@ mod tests {
     b[0x187] = 0x0a; // MinFocalLength int16uRev = 10
     b[0x189] = 0xc8; // MaxFocalLength int16uRev = 200
     b[0x449..0x44f].copy_from_slice(b"6.7.2\0"); // FirmwareVersion @ 0x449 (valid)
-    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
     let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
     assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
@@ -5841,7 +5967,7 @@ mod tests {
     // Only the 0x449 location holds a valid version (0x43d is zeroed).
     assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("6.7.2".into())));
     // 760D alias yields the identical table.
-    let em2 = parse(&b, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
+    let em2 = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
     assert_eq!(
       em2
         .iter()
@@ -5853,7 +5979,7 @@ mod tests {
     let mut b3 = b.clone();
     b3[0x449..0x44f].copy_from_slice(b"\0\0\0\0\0\0");
     b3[0x43d..0x443].copy_from_slice(b"1.2.3\0");
-    let em3 = parse(&b3, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
+    let em3 = parse_model(&b3, ByteOrder::Little, true, Some("Canon EOS 760D"), None);
     assert_eq!(
       em3
         .iter()
@@ -5864,7 +5990,164 @@ mod tests {
     // The RawConv guard drops a non-version string at either location.
     let mut b4 = b.clone();
     b4[0x449..0x44f].copy_from_slice(b"BADVER");
-    let em4 = parse(&b4, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
+    let em4 = parse_model(&b4, ByteOrder::Little, true, Some("Canon EOS 750D"), None);
     assert!(em4.iter().all(|(k, _)| k != "FirmwareVersion"));
+  }
+
+  // ─── mirrorless CameraInfo tables (R6 / R6m2 / R6m3 / G5XII) ────────────────
+
+  #[test]
+  fn camera_info_r6_dispatch_and_leaves() {
+    // `/\bEOS R[56]$/` — the EOS R5/R6 only, NOT the R6m2 nor the R6 Mark III.
+    assert!(model_is_camera_info_r6(Some("Canon EOS R5")));
+    assert!(model_is_camera_info_r6(Some("Canon EOS R6")));
+    assert!(!model_is_camera_info_r6(Some("Canon EOS R6m2")));
+    assert!(!model_is_camera_info_r6(Some("Canon EOS R6 Mark III")));
+    assert!(!model_is_camera_info_r6(Some("Canon EOS R7")));
+
+    let mut b = vec![0u8; 0x0b00];
+    b[0x09da] = 200; // CameraTemperature raw ⇒ 200 - 128 = 72
+    b[0x0af1..0x0af5].copy_from_slice(&74_565u32.to_le_bytes()); // ShutterCount int32u
+    // Emission walks ascending offset: CameraTemperature (0x09da), ShutterCount (0x0af1).
+    let em = parse_model(&b, ByteOrder::Little, true, Some("Canon EOS R6"), None);
+    assert_eq!(
+      em.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+      ["CameraTemperature", "ShutterCount"]
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("72 C".into()))
+    );
+    assert_eq!(find("ShutterCount"), Some(TagValue::I64(74_565)));
+    // -n view: the temperature renders as the bare ValueConv integer.
+    let emn = parse_model(&b, ByteOrder::Little, false, Some("Canon EOS R5"), None);
+    let findn = |n: &str| emn.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(findn("CameraTemperature"), Some(TagValue::I64(72)));
+    assert_eq!(findn("ShutterCount"), Some(TagValue::I64(74_565)));
+    // A blob too short for ShutterCount emits only the in-range leaf (no panic).
+    let short = parse_model(
+      &b[..0x0a00],
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS R6"),
+      None,
+    );
+    assert_eq!(
+      short.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+      ["CameraTemperature"]
+    );
+  }
+
+  #[test]
+  fn camera_info_r6m2_shutter_count() {
+    // `/\bEOS (R6m2|R8|R50)$/`.
+    assert!(model_is_camera_info_r6m2(Some("Canon EOS R6m2")));
+    assert!(model_is_camera_info_r6m2(Some("Canon EOS R8")));
+    assert!(model_is_camera_info_r6m2(Some("Canon EOS R50")));
+    assert!(!model_is_camera_info_r6m2(Some("Canon EOS R6")));
+    assert!(!model_is_camera_info_r6m2(Some("Canon EOS R5")));
+
+    let mut b = vec![0u8; 0x0d40];
+    b[0x0d29..0x0d2d].copy_from_slice(&1_000_000u32.to_le_bytes());
+    // No PrintConv ⇒ identical in both views.
+    for pc in [true, false] {
+      let em = parse_model(&b, ByteOrder::Little, pc, Some("Canon EOS R8"), None);
+      assert_eq!(
+        em.iter()
+          .map(|(k, v)| (k.as_str(), v.clone()))
+          .collect::<Vec<_>>(),
+        vec![("ShutterCount", TagValue::I64(1_000_000))]
+      );
+    }
+  }
+
+  #[test]
+  fn camera_info_r6m3_image_count_int16u() {
+    assert!(model_is_camera_info_r6m3(Some("Canon EOS R6 Mark III")));
+    assert!(!model_is_camera_info_r6m3(Some("Canon EOS R6")));
+    assert!(!model_is_camera_info_r6m3(Some("Canon EOS R6m2")));
+
+    let mut b = vec![0u8; 0x0900];
+    b[0x086d..0x086f].copy_from_slice(&0x1234u16.to_le_bytes()); // 4660
+    let em = parse_model(
+      &b,
+      ByteOrder::Big,
+      true,
+      Some("Canon EOS R6 Mark III"),
+      None,
+    );
+    // Big-endian read of the LE-written bytes ⇒ 0x3412 = 13330.
+    assert_eq!(
+      em.iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect::<Vec<_>>(),
+      vec![("ImageCount", TagValue::I64(0x3412))]
+    );
+    let le = parse_model(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS R6 Mark III"),
+      None,
+    );
+    assert_eq!(
+      le.first().map(|(_, v)| v.clone()),
+      Some(TagValue::I64(0x1234))
+    );
+  }
+
+  #[test]
+  fn camera_info_g5xii_filetype_gated() {
+    // `/\bG5 X Mark II$/` — the PowerShot G5 X Mark II.
+    assert!(model_is_camera_info_g5xii(Some(
+      "Canon PowerShot G5 X Mark II"
+    )));
+    assert!(!model_is_camera_info_g5xii(Some("Canon PowerShot G5 X")));
+
+    let mut b = vec![0u8; 0x0b40];
+    b[0x0293..0x0297].copy_from_slice(&111u32.to_le_bytes()); // ShutterCount (JPEG)
+    b[0x0a95..0x0a99].copy_from_slice(&222u32.to_le_bytes()); // ShutterCount (CR3)
+    b[0x0b21..0x0b25].copy_from_slice(&50u32.to_le_bytes()); // DirectoryIndex (JPEG)
+    b[0x0b2d..0x0b31].copy_from_slice(&1_427u32.to_le_bytes()); // FileIndex ⇒ +1 = 1428
+
+    // JPEG: ShutterCount(0x0293), DirectoryIndex(0x0b21), FileIndex(0x0b2d)+1.
+    let jpeg = camera_info_g5xii(&b, ByteOrder::Little, Some("JPEG"));
+    assert_eq!(
+      jpeg.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+      ["ShutterCount", "DirectoryIndex", "FileIndex"]
+    );
+    let jf = |n: &str| jpeg.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(jf("ShutterCount"), Some(TagValue::I64(111)));
+    assert_eq!(jf("DirectoryIndex"), Some(TagValue::I64(50)));
+    assert_eq!(jf("FileIndex"), Some(TagValue::I64(1_428)));
+
+    // CR3: only the 0x0a95 ShutterCount.
+    let cr3 = camera_info_g5xii(&b, ByteOrder::Little, Some("CR3"));
+    assert_eq!(
+      cr3
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect::<Vec<_>>(),
+      vec![("ShutterCount", TagValue::I64(222))]
+    );
+
+    // Any other / unknown FileType ⇒ nothing (every row is FileType-gated).
+    assert!(camera_info_g5xii(&b, ByteOrder::Little, Some("MP4")).is_empty());
+    assert!(camera_info_g5xii(&b, ByteOrder::Little, None).is_empty());
+
+    // Routed through the 0x0d dispatch with the container `$$self{FileType}`.
+    let routed = super::parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon PowerShot G5 X Mark II"),
+      Some("JPEG"),
+      None,
+    );
+    assert_eq!(
+      routed.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+      ["ShutterCount", "DirectoryIndex", "FileIndex"]
+    );
   }
 }
