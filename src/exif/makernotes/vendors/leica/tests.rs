@@ -274,3 +274,127 @@ fn binary_subdir_rows_present_and_routed() {
     Some(TagValue::I64(1234))
   );
 }
+
+/// The `%Panasonic::Subdir` table (#105, the Leica M9 sub-IFD): the plain leaves
+/// resolve, the `0x3901`/`0x3902` rows carry the `Data1`/`Data2` markers, and the
+/// table is strictly sorted (binary-search-ready).
+#[test]
+fn subdir_table_leaves_and_markers() {
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x300a).map(LeicaTag::name),
+    Some("Contrast")
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3405).map(LeicaTag::name),
+    Some("LensType")
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3901).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::Data1)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3902).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::Data2)
+  );
+  let mut prev: i64 = -1;
+  for t in SUBDIR_TAGS {
+    assert!(
+      i64::from(t.id) > prev,
+      "SUBDIR_TAGS unsorted at {:#x}",
+      t.id
+    );
+    prev = i64::from(t.id);
+  }
+  // Data2 is an empty table ⇒ descends but emits nothing.
+  assert!(
+    decode_leica_subdir(
+      LeicaSubTable::Data2,
+      &[1, 2, 3, 4],
+      crate::exif::ifd::ByteOrder::Little,
+      true
+    )
+    .is_empty()
+  );
+}
+
+/// END-TO-END: a crafted Leica4 (M9) MakerNote descends Leica4 → `%Subdir` →
+/// `%Data1`. The four Leica4 `0x3000`/… rows are IFD SubDirectories into
+/// `%Panasonic::Subdir` (`ByteOrder => Unknown`); a Subdir `0x3901` row descends
+/// into the `%Panasonic::Data1` binary block. Proves the in-walk descent emits
+/// the Subdir LEAVES (Contrast, LensType) AND the Data1 LensType, with the parent
+/// pointers never emitted.
+#[test]
+fn leica4_descends_into_subdir_and_data1() {
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::vendors::VendorEmission;
+  use crate::exif::makernotes::{BaseRule, ChildByteOrder, DetectedMakerNote, Vendor};
+
+  fn push_entry(buf: &mut std::vec::Vec<u8>, tag: u16, format: u16, count: u32, value: u32) {
+    buf.extend_from_slice(&tag.to_le_bytes());
+    buf.extend_from_slice(&format.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+  }
+
+  // mn_offset 0 + Leica4 `Base => $start - 8` (RelativeToStart(-8)) ⇒
+  // value_offset_base = (0 + 8) - 8 = 0, so every offset below is buffer-relative.
+  let mut buf = std::vec::Vec::new();
+  buf.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature
+  // Leica4 IFD @ 8: one entry 0x3000 -> Subdir IFD @ 26.
+  buf.extend_from_slice(&1u16.to_le_bytes());
+  push_entry(&mut buf, 0x3000, 4, 1, 26); // LONG, value = Subdir IFD offset
+  buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(buf.len(), 26);
+  // Subdir IFD @ 26: Contrast=2 ("Normal"), LensType=20 (id 5), Data1 @ 68.
+  buf.extend_from_slice(&3u16.to_le_bytes());
+  push_entry(&mut buf, 0x300a, 4, 1, 2); // Contrast int32u inline
+  push_entry(&mut buf, 0x3405, 4, 1, 20); // LensType int32u inline (id 5)
+  push_entry(&mut buf, 0x3901, 7, 26, 68); // Data1 undef[26] out-of-line @ 68
+  buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(buf.len(), 68);
+  // Data1 block @ 68: LensType int32u @ byte 22 = 24 (id 6).
+  let mut data1 = std::vec![0u8; 26];
+  data1[22..26].copy_from_slice(&24u32.to_le_bytes());
+  buf.extend_from_slice(&data1);
+
+  let detected = DetectedMakerNote::new(
+    Vendor::Leica,
+    8,
+    BaseRule::RelativeToStart(-8),
+    ChildByteOrder::Unknown,
+    false,
+  );
+  let (em, _typed) = crate::exif::leica_makernote_isolated(
+    &buf,
+    0,
+    buf.len(),
+    LeicaVariant::Leica4,
+    detected,
+    ByteOrder::Little,
+    0,
+    None,
+    true,
+  )
+  .expect("Leica4 walk");
+  let has = |name: &str, val: &str| {
+    em.iter()
+      .any(|e: &VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+  };
+  let names: std::vec::Vec<&str> = em.iter().map(VendorEmission::name).collect();
+  // Subdir leaves (descended Leica4 -> Subdir).
+  assert!(has("Contrast", "Normal"), "Subdir Contrast; got {names:?}");
+  assert!(
+    has("LensType", "Summilux-M 50mm f/1.4 (II)"),
+    "Subdir 0x3405 LensType; got {names:?}"
+  );
+  // Data1 descent (Subdir 0x3901 -> Data1 LensType, the &0xffff variant, id 6).
+  assert!(
+    has("LensType", "Summilux-M 35mm f/1.4"),
+    "Data1 LensType; got {names:?}"
+  );
+  // The parent SubDirectory pointers are never emitted as values.
+  assert!(
+    !names.contains(&"Subdir3000") && !names.contains(&"Data1"),
+    "parent pointers must not emit; got {names:?}"
+  );
+}

@@ -52,6 +52,7 @@
 
 #![deny(clippy::indexing_slicing)]
 
+pub mod data1;
 pub mod focus_info;
 pub mod lens_types;
 pub mod printconv;
@@ -68,7 +69,7 @@ pub use lens_types::{LEICA_LENS_TYPES, LeicaLensType};
 pub use printconv::LeicaPrintConv;
 pub use tags::{
   LEICA2_TAGS, LEICA3_TAGS, LEICA4_TAGS, LEICA5_TAGS, LEICA6_TAGS, LEICA9_TAGS, LeicaCondition,
-  LeicaSubTable, LeicaTag, LeicaVariant, format_override, lookup,
+  LeicaSubTable, LeicaTag, LeicaVariant, SUBDIR_TAGS, format_override, lookup,
 };
 
 /// Decoded Leica MakerNotes data — populated by
@@ -184,6 +185,10 @@ pub fn decode_leica_subdir(
     LeicaSubTable::SerialInfo => serial_info::parse(blob, print_conv),
     LeicaSubTable::FocusInfo => focus_info::parse(blob, order, print_conv),
     LeicaSubTable::ShotInfo => shot_info::parse(blob, order, print_conv),
+    LeicaSubTable::Data1 => data1::parse(blob, order, print_conv),
+    // `%Panasonic::Data2` is an EMPTY table (no named positions) — descends
+    // but emits nothing.
+    LeicaSubTable::Data2 => Vec::new(),
   }
 }
 

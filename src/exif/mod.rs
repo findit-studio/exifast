@@ -8603,6 +8603,34 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Samsung(t)),
         None => return,
       },
+      // `%Panasonic::Leica4` (M9, #105) — every row is an IFD SubDirectory into
+      // `%Panasonic::Subdir` (`Panasonic.pm:1742-1769`, `0x3000`/`0x3100`/`0x3400`/
+      // `0x3900`), walked under `ByteOrder => Unknown`. Descend IN-WALK here (like
+      // the Samsung `PreviewIfd` descent below): the child IFD starts at `$val +
+      // value_offset_base` (the default `Start => '$val'`, the inherited base), and
+      // its leaves resolve under `active_table == Leica(Subdir)`. The parent
+      // pointer is NEVER emitted (`return`), matching ExifTool's descend-then-`next`
+      // (`Exif.pm:7103-7104`); a non-SubDirectory Leica4 id is unknown ⇒ skipped.
+      // Leica4 carries no plain leaf, so this arm handles every Leica4 entry.
+      TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Leica4) => {
+        if matches!(tag_id, 0x3000 | 0x3100 | 0x3400 | 0x3900)
+          && let Some(off) = first_uint(&raw)
+          && let Some(start) = i64::try_from(off)
+            .ok()
+            .map(|d| d.saturating_add(self.value_offset_base))
+            .and_then(|a| usize::try_from(a).ok())
+        {
+          self.process_subdir(
+            start,
+            kind,
+            TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Subdir),
+            ByteOrderRule::Unknown,
+            FixBaseMode::No,
+            ProcessProc::Exif,
+          );
+        }
+        return;
+      }
       // `%Panasonic::Leica2`..`Leica9` (#259). The resolved [`LeicaTag`] rides in
       // `ResolvedConv::Leica` WITH its variant so the emit ([`emit_leica_value`])
       // reapplies its `LeicaPrintConv` + evaluates the row `Condition`. An unknown
