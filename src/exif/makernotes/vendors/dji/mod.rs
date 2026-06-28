@@ -38,8 +38,11 @@
 //!   Speed{X,Y,Z}) is XMP-side data. The XMP namespace port lives under
 //!   PR #37; out of scope for the MakerNote-IFD port.
 //! - **DJI Glamour beauty-settings** — `%DJI::Glamour` (`DJI.pm:213-232`).
-//!   Beauty-mode metadata from QuickTime UserData (`ProcessSettings`);
-//!   QuickTime-chain, NOT 0x927C MakerNote. Out of scope.
+//!   Beauty-mode metadata from the QuickTime UserData `btec` atom
+//!   (`ProcessSettings`, `DJI.pm:944-954`); QuickTime-chain, NOT a 0x927C
+//!   MakerNote. PORTED in the QuickTime format layer (the `btec` arm of
+//!   `crate::formats::quicktime`'s `walk_udta`, emitted under `QuickTime:DJI`),
+//!   not here — this module covers only the 0x927C MakerNote IFD.
 //! - **DJI Protobuf telemetry** — `%DJI::Protobuf` (`DJI.pm:235-859`).
 //!   This is a HUGE table (~700 lines) of protobuf-typed tags for the
 //!   `djmd` + `dbgi` QuickTime timed-metadata stream (Osmo Action 4/5/6,

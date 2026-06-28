@@ -4593,6 +4593,16 @@ fn walk_udta(
       b"MUID" => {
         ud.set_media_uid(Some(unpack_h_star(body)));
       }
+      // `btec` GlamourSettings (QuickTime.pm:2161-2164, DJI beauty mode): a
+      // `SubDirectory` to `%Image::ExifTool::DJI::Glamour`, processed by
+      // `ProcessSettings` (DJI.pm:944-954). The `;`-separated `key=value` body
+      // emits family-1 `DJI` (family-2 `Image`) string tags — NOT
+      // `QuickTime:UserData` — so it routes to the separate `glamour` sink, not
+      // the conv-less map. The whole atom body is the settings string (the
+      // SubDirectory has no `Start`/`Format`).
+      b"btec" => {
+        process_glamour_settings(body, ud);
+      }
       // Any OTHER plain 4-cc atom: consult the generated conv-less map (`GoPr`
       // GoProType, `LENS` LensSerialNumber, `FOV\0` FieldOfView — bare `'Name'`
       // plain-string atoms, QuickTime.pm:2117/2119/2131). Emitted verbatim
@@ -4653,6 +4663,216 @@ fn decode_manu_modl(body: &[u8]) -> String {
   let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
   let s = rest.get(..end).unwrap_or_default();
   String::from_utf8_lossy(s).into_owned()
+}
+
+/// Port of `Image::ExifTool::DJI::ProcessSettings` (DJI.pm:944-954) driving the
+/// `%Image::ExifTool::DJI::Glamour` table (DJI.pm:213-232): the `btec`
+/// GlamourSettings body is a `;`-separated list of `key=value` beauty settings.
+/// Each pair is recorded into `ud`'s glamour sink as a `(Name, raw-value)` pair,
+/// emitted later under `QuickTime:DJI` (the table's `GROUPS => { 1 => 'DJI' }`).
+///
+/// Faithful to the Perl `split` semantics:
+///   - `foreach (split /;/, $data)` — list context, so trailing empty pieces
+///     are dropped; an empty / `=`-less piece is skipped below regardless, so a
+///     plain `;` split is behaviorally identical.
+///   - `my ($tag, $val) = split /=/` — a list assignment to TWO scalars, so
+///     Perl applies LIMIT = 3 (vars + 1). Consequences: a piece with NO `=`
+///     yields `$val` undef ⇒ `next` (skip); `"foo="` yields `$val` = ""
+///     (defined ⇒ emitted, empty); `"a=b=c"` yields `$val` = "b" (only the
+///     segment between the 1st and 2nd `=`).
+///
+/// A known key uses its `%DJI::Glamour` Name; an unknown key derives a Name via
+/// [`make_glamour_tag_name`] (`HandleTag`'s `MakeTagInfo`). `%DJI::Glamour`
+/// declares no PrintConv/ValueConv, so the raw setting bytes reach `HandleTag`
+/// directly and are rendered through ExifTool's full `EscapeJSON` classify
+/// ([`crate::convert::escape_json_raw_bytes_classified`]): a clean number/boolean
+/// stays a BARE token (`1` / `50` / `1.5` / `true`), a non-UTF8 byte (`0xff`)
+/// becomes a quoted `?`, and a NUL-split value (`c2 00 a9`) reassembles to `©`
+/// after the NUL deletion + `FixUTF8` — none of which `from_utf8_lossy` does
+/// faithfully (it maps `0xff` to U+FFFD and cannot rejoin across a deleted NUL).
+///
+/// Duplicate keys follow ExifTool's tag-dedup: the LAST-extracted instance wins,
+/// both its value AND its file-order position. The dedup is GLOBAL across the
+/// whole `udta` walk (one shared tag store), so a key repeated WITHIN one body
+/// OR ACROSS two `btec` atoms collapses to a single entry — ground-truthed
+/// against ExifTool 13.59: within-atom
+/// `smoother=3;beauty_enable=1;smoother=4;whitening=9;beauty_enable=2` ⇒
+/// `Smoother=4, Whitening=9, BeautyEnable=2`, and cross-atom
+/// (`beauty_enable=1;smoother=2;` then `beauty_enable=3;whitening=4;`) ⇒
+/// `Smoother=2, BeautyEnable=3, Whitening=4`. This function does no buffering of
+/// its own; [`crate::metadata::QuickTimeUserData::push_glamour`] is the single
+/// dedup point, bounding the sink to ≤ distinct Names so a crafted `k=1;k=2;…` /
+/// `=;=;…` body cannot accumulate one entry per `;`-piece.
+fn process_glamour_settings(body: &[u8], ud: &mut crate::metadata::QuickTimeUserData) {
+  for piece in body.split(|&b| b == b';') {
+    // `my ($tag, $val) = split /=/` — no `=` ⇒ `$val` undef ⇒ skip.
+    let Some(eq) = piece.iter().position(|&b| b == b'=') else {
+      continue;
+    };
+    let tag = piece.get(..eq).unwrap_or_default();
+    let rest = piece.get(eq.saturating_add(1)..).unwrap_or_default();
+    // `$val` = the second field = the bytes between the 1st and 2nd `=`, or to
+    // the end when there is no 2nd `=` (LIMIT 3 keeps a trailing "").
+    let val = match rest.iter().position(|&b| b == b'=') {
+      Some(eq2) => rest.get(..eq2).unwrap_or_default(),
+      None => rest,
+    };
+    // `MakeTagInfo`'s `tr/-_a-zA-Z0-9//dc` runs on raw BYTES; for the ASCII keys
+    // real DJI firmware emits, `from_utf8_lossy` is byte-identical (a non-UTF8
+    // unknown KEY is a crafted-only edge — the flagged real issue is the VALUE).
+    let tag_str = String::from_utf8_lossy(tag);
+    let name: smol_str::SmolStr = match glamour_tag_name(&tag_str) {
+      Some(known) => smol_str::SmolStr::new_static(known),
+      None => smol_str::SmolStr::new(make_glamour_tag_name(&tag_str)),
+    };
+    // Classify the raw VALUE bytes exactly as ExifTool's `EscapeJSON` does (see
+    // the fn doc): `Bare` ⇒ a `Str` the serializer re-renders as a bare
+    // number/boolean; `Quoted` ⇒ a `JsonStr` it never re-coerces.
+    let value = match crate::convert::escape_json_raw_bytes_classified(val, false) {
+      crate::convert::EscapedJson::Bare(s) => crate::value::TagValue::Str(s),
+      crate::convert::EscapedJson::Quoted(s) => crate::value::TagValue::JsonStr(s),
+    };
+    // The GLOBAL glamour sink dedups by Name across the ENTIRE udta walk
+    // (within-atom AND cross-atom), keeping the LAST value at its LAST position.
+    ud.push_glamour(name, value);
+  }
+}
+
+/// The `%Image::ExifTool::DJI::Glamour` known-key → tag-Name map (DJI.pm:213-232,
+/// 15 entries). A key NOT in this table is an unknown setting whose Name is
+/// derived via [`make_glamour_tag_name`] (`MakeTagInfo`). Note the non-obvious
+/// mappings `mouth_beautify` ⇒ `MouthModify` and `acne_spot_removal` ⇒
+/// `AcneSpotRemoval`.
+fn glamour_tag_name(key: &str) -> Option<&'static str> {
+  Some(match key {
+    "beauty_enable" => "BeautyEnable",
+    "smoother" => "Smoother",
+    "whitening" => "Whitening",
+    "face_slimming" => "FaceSlimming",
+    "eye_enlarge" => "EyeEnlarge",
+    "nose_slimming" => "NoseSlimming",
+    "mouth_beautify" => "MouthModify",
+    "teeth_whitening" => "TeethWhitening",
+    "leg_longer" => "LegLonger",
+    "head_shrinking" => "HeadShrinking",
+    "lipstick" => "Lipstick",
+    "blush" => "Blush",
+    "dark_circle" => "DarkCircle",
+    "acne_spot_removal" => "AcneSpotRemoval",
+    "eyebrows" => "Eyebrows",
+    _ => return None,
+  })
+}
+
+/// `Image::ExifTool::HandleTag`'s `MakeTagInfo` name derivation
+/// (ExifTool.pm:9310-9318): turn an unknown `%DJI::Glamour` key into a tag Name.
+/// Faithful 5-step port (ground-truthed against ExifTool 13.59 — e.g.
+/// `custom_thing` ⇒ `Custom_Thing`, `2x` ⇒ `Tag2X`, `a` ⇒ `Taga`):
+///
+/// 1. `s/([A-Z]) ([A-Z][ A-Z])/${1}_$2/g` — underline between acronyms.
+/// 2. `s/([^A-Za-z])([a-z])/$1\u$2/g` — capitalize a lowercase letter following
+///    a non-letter.
+/// 3. `tr/-_a-zA-Z0-9//dc` — delete every char NOT in `[-_a-zA-Z0-9]`.
+/// 4. Prepend `Tag` when the result is shorter than 2 OR starts with `-`/digit.
+/// 5. `ucfirst` — uppercase the first character.
+fn make_glamour_tag_name(tag: &str) -> String {
+  let chars: Vec<char> = tag.chars().collect();
+  let chars = glamour_underline_acronyms(&chars);
+  let chars = glamour_capitalize_after_nonletter(&chars);
+  // Step 3: `tr/-_a-zA-Z0-9//dc` — keep only `[-_a-zA-Z0-9]` (a non-ASCII char
+  // is non-alnum, so it is dropped — exactly the byte-wise `tr///dc`).
+  let mut name: String = chars
+    .into_iter()
+    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+    .collect();
+  // Step 4: `$name = "Tag$name" if length($name) < 2 or $name =~ /^[-0-9]/`.
+  let needs_prefix = name.chars().count() < 2
+    || name
+      .chars()
+      .next()
+      .is_some_and(|c| c == '-' || c.is_ascii_digit());
+  if needs_prefix {
+    name.insert_str(0, "Tag");
+  }
+  // Step 5: `ucfirst($name)`.
+  ucfirst_ascii(&name)
+}
+
+/// Step 1 of [`make_glamour_tag_name`]: the global `s/([A-Z]) ([A-Z][ A-Z])/
+/// ${1}_$2/g` — between two acronym capitals separated by a space, replace the
+/// space with `_`. Non-overlapping, left-to-right (Perl `/g`).
+fn glamour_underline_acronyms(chars: &[char]) -> Vec<char> {
+  let mut out = Vec::with_capacity(chars.len());
+  let mut i = 0usize;
+  while let Some(&c) = chars.get(i) {
+    let matches = c.is_ascii_uppercase()
+      && chars.get(i.saturating_add(1)) == Some(&' ')
+      && chars
+        .get(i.saturating_add(2))
+        .is_some_and(|x| x.is_ascii_uppercase())
+      && chars
+        .get(i.saturating_add(3))
+        .is_some_and(|x| *x == ' ' || x.is_ascii_uppercase());
+    if matches {
+      // `${1}_$2`: keep $1 (`c`), the space becomes `_`, then $2 (the two chars
+      // at i+2 / i+3). All four are consumed (`/g` resumes after $2).
+      out.push(c);
+      out.push('_');
+      if let Some(&c2) = chars.get(i.saturating_add(2)) {
+        out.push(c2);
+      }
+      if let Some(&c3) = chars.get(i.saturating_add(3)) {
+        out.push(c3);
+      }
+      i = i.saturating_add(4);
+    } else {
+      out.push(c);
+      i = i.saturating_add(1);
+    }
+  }
+  out
+}
+
+/// Step 2 of [`make_glamour_tag_name`]: the global `s/([^A-Za-z])([a-z])/
+/// $1\u$2/g` — a lowercase letter that immediately follows a non-letter is
+/// upper-cased (the non-letter is kept). Non-overlapping, left-to-right.
+fn glamour_capitalize_after_nonletter(chars: &[char]) -> Vec<char> {
+  let mut out = Vec::with_capacity(chars.len());
+  let mut i = 0usize;
+  while let Some(&c) = chars.get(i) {
+    // `[^A-Za-z]` = any char that is NOT an ASCII letter (digits, `_`, `-`,
+    // punctuation, and non-ASCII all qualify).
+    let nonletter_then_lower = !c.is_ascii_alphabetic()
+      && chars
+        .get(i.saturating_add(1))
+        .is_some_and(char::is_ascii_lowercase);
+    if nonletter_then_lower {
+      out.push(c);
+      if let Some(&next) = chars.get(i.saturating_add(1)) {
+        out.push(next.to_ascii_uppercase());
+      }
+      i = i.saturating_add(2);
+    } else {
+      out.push(c);
+      i = i.saturating_add(1);
+    }
+  }
+  out
+}
+
+/// Perl `ucfirst` — upper-case the first character (ASCII; the input is already
+/// filtered to `[-_a-zA-Z0-9]`, so non-letters are unchanged), the rest verbatim.
+fn ucfirst_ascii(s: &str) -> String {
+  let mut chars = s.chars();
+  match chars.next() {
+    Some(first) => {
+      let mut out = String::with_capacity(s.len());
+      out.push(first.to_ascii_uppercase());
+      out.push_str(chars.as_str());
+      out
+    }
+    None => String::new(),
+  }
 }
 
 /// Strip a leading NUL-terminated string off `data`, returning `(decoded,
@@ -11589,6 +11809,18 @@ impl crate::emit::Taggable for Meta<'_> {
           TagValue::Str(loc.into()),
           false,
         ));
+      }
+      // The `btec` GlamourSettings (QuickTime.pm:2161-2164 → `%DJI::Glamour`,
+      // ProcessSettings DJI.pm:944-954). UNLIKE every other `udta` atom above,
+      // the `%DJI::Glamour` table declares `GROUPS => { 0 => 'QuickTime', 1 =>
+      // 'DJI', 2 => 'Image' }`, so these emit under `QuickTime:DJI` (family-1
+      // `DJI`), NOT `QuickTime:UserData`. Each value is the raw setting string
+      // (mode-invariant — no Conv); every entry has a Name (known table Name or
+      // the `MakeTagInfo`-derived Name), never an Unknown flag ⇒ `unknown:
+      // false`.
+      let dji_group = || Group::new("QuickTime", "DJI");
+      for (name, value) in ud.glamour() {
+        tags.push(EmittedTag::new(dji_group(), name, value, false));
       }
     }
 
@@ -25556,6 +25788,189 @@ mod tests {
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(meta2.is_empty());
+  }
+
+  /// `make_glamour_tag_name` reproduces ExifTool's `HandleTag`/`MakeTagInfo`
+  /// derivation (ExifTool.pm:9310-9318) byte-for-byte — ground-truthed against
+  /// ExifTool 13.59's Perl. `custom_thing` ⇒ `Custom_Thing` (the `_thing`
+  /// lowercase `t` follows the non-letter `_`, so step 2 upper-cases it) and
+  /// `2x` ⇒ `Tag2X` (starts-with-digit Tag-prefix + the `2x` step-2 capitalize)
+  /// are the cases a casual reading gets wrong.
+  #[test]
+  fn glamour_make_tag_name_matches_exiftool() {
+    assert_eq!(make_glamour_tag_name("custom_thing"), "Custom_Thing");
+    assert_eq!(make_glamour_tag_name("foo_bar"), "Foo_Bar");
+    assert_eq!(make_glamour_tag_name("2x"), "Tag2X");
+    assert_eq!(make_glamour_tag_name("a"), "Taga"); // length < 2 ⇒ Tag prefix
+    assert_eq!(make_glamour_tag_name("9lives"), "Tag9Lives");
+    assert_eq!(make_glamour_tag_name("hello world"), "HelloWorld");
+    assert_eq!(make_glamour_tag_name(""), "Tag"); // empty ⇒ Tag
+  }
+
+  /// `process_glamour_settings` ports `ProcessSettings` (DJI.pm:944-954) with
+  /// the exact Perl `split` semantics: a known key uses its `%DJI::Glamour`
+  /// Name, an unknown key the `MakeTagInfo`-derived Name, a piece with no `=` is
+  /// skipped, `key=` emits an EMPTY value (the LIMIT-3 list-assign keeps the
+  /// trailing field), `a=b=c` keeps only the segment between the 1st and 2nd
+  /// `=`, and a trailing `;` produces no extra tag.
+  #[test]
+  fn glamour_process_settings_split_semantics() {
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(
+      b"mouth_beautify=10;custom_thing=9;skipme;empty=;multi=a=b=c;",
+      &mut ud,
+    );
+    let glam = ud.glamour();
+    let got: Vec<(&str, &str)> = glam
+      .iter()
+      .map(|(n, v)| {
+        (
+          n.as_str(),
+          match v {
+            // A clean number/boolean classifies BARE (`Str`); a non-numeric or
+            // empty value classifies QUOTED (`JsonStr`).
+            crate::value::TagValue::Str(s) | crate::value::TagValue::JsonStr(s) => s.as_str(),
+            _ => "<non-str>",
+          },
+        )
+      })
+      .collect();
+    assert_eq!(
+      got,
+      std::vec![
+        ("MouthModify", "10"), // known, non-obvious Name
+        ("Custom_Thing", "9"), // unknown ⇒ MakeTagInfo
+        // "skipme" has no `=` ⇒ skipped (no entry)
+        ("Empty", ""), // `empty=` ⇒ defined-but-empty value
+        ("Multi", "a"), // `multi=a=b=c` ⇒ val between 1st / 2nd `=`
+                       // trailing `;` ⇒ no extra entry
+      ]
+    );
+  }
+
+  /// `process_glamour_settings` renders each raw VALUE through ExifTool's full
+  /// `EscapeJSON` classify (DJI.pm `%Glamour` has no Conv, so the bytes reach
+  /// `HandleTag` raw): a clean number / boolean stays a BARE [`TagValue::Str`]
+  /// (the serializer re-renders it as a number / bool), a non-UTF8 `0xff` becomes
+  /// a quoted `?` [`TagValue::JsonStr`], a NUL-split `c2 00 a9` reassembles to `©`
+  /// after the NUL delete + `FixUTF8`, and a leading-zero `007` fails the number
+  /// gate ⇒ quoted. All ground-truthed against ExifTool 13.59.
+  #[test]
+  fn glamour_value_escape_json_classified() {
+    use crate::value::TagValue;
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(
+      b"beauty_enable=1;smoother=\xff;whitening=\xc2\x00\xa9;blush=true;lipstick=007;",
+      &mut ud,
+    );
+    assert_eq!(
+      ud.glamour(),
+      [
+        ("BeautyEnable".into(), TagValue::Str("1".into())), // numeric ⇒ bare
+        ("Smoother".into(), TagValue::JsonStr("?".into())), // 0xff ⇒ quoted `?`
+        ("Whitening".into(), TagValue::JsonStr("©".into())), // c2 00 a9 ⇒ ©
+        ("Blush".into(), TagValue::Str("true".into())),     // bare bool
+        ("Lipstick".into(), TagValue::JsonStr("007".into())), // leading-zero ⇒ quoted
+      ]
+    );
+  }
+
+  /// Repeated keys dedup to ONE entry per Name with ExifTool's last-extracted-
+  /// wins tag-dedup: the LAST value AND the LAST file-order position survive
+  /// (ground-truthed against ExifTool 13.59). The dedup is GLOBAL across the
+  /// whole `udta` walk, so a key repeated ACROSS two `btec` atoms (two
+  /// `process_glamour_settings` calls on one sink) collapses the SAME way — the
+  /// survivor moves to its LAST-atom position. Deduping by Name also bounds the
+  /// sink to ≤ distinct Names, so a crafted `k=1;k=2;…` body cannot accumulate
+  /// one entry per `;`-piece.
+  #[test]
+  fn glamour_repeated_keys_dedup_last_wins() {
+    use crate::value::TagValue;
+    // last value wins; distinct Names keep file order.
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(
+      b"beauty_enable=1;beauty_enable=2;smoother=3;smoother=4;",
+      &mut ud,
+    );
+    assert_eq!(
+      ud.glamour(),
+      [
+        ("BeautyEnable".into(), TagValue::Str("2".into())),
+        ("Smoother".into(), TagValue::Str("4".into())),
+      ]
+    );
+    // the surviving instance sits at its LAST-occurrence position.
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(
+      b"smoother=3;beauty_enable=1;smoother=4;whitening=9;beauty_enable=2;",
+      &mut ud,
+    );
+    assert_eq!(
+      ud.glamour(),
+      [
+        ("Smoother".into(), TagValue::Str("4".into())),
+        ("Whitening".into(), TagValue::Str("9".into())),
+        ("BeautyEnable".into(), TagValue::Str("2".into())),
+      ]
+    );
+    // CROSS-ATOM dedup (the #111 R2 structural fix): two `btec` atoms in one
+    // udta are two `process_glamour_settings` calls on ONE sink. A key repeated
+    // in the SECOND atom overwrites the first value AND moves the survivor to
+    // its second-atom position — ground-truthed against ExifTool 13.59:
+    // atom1 `beauty_enable=1;smoother=2;` then atom2 `beauty_enable=3;whitening=4;`
+    // ⇒ Smoother=2, BeautyEnable=3, Whitening=4 (NOT BeautyEnable first).
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(b"beauty_enable=1;smoother=2;", &mut ud);
+    process_glamour_settings(b"beauty_enable=3;whitening=4;", &mut ud);
+    assert_eq!(
+      ud.glamour(),
+      [
+        ("Smoother".into(), TagValue::Str("2".into())),
+        ("BeautyEnable".into(), TagValue::Str("3".into())),
+        ("Whitening".into(), TagValue::Str("4".into())),
+      ]
+    );
+    // Many repeats of one key collapse to a single bounded sink entry.
+    let mut body = Vec::new();
+    for _ in 0..100_000 {
+      body.extend_from_slice(b"beauty_enable=5;");
+    }
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    process_glamour_settings(&body, &mut ud);
+    assert_eq!(ud.glamour().len(), 1);
+    assert_eq!(
+      ud.glamour()[0],
+      ("BeautyEnable".into(), TagValue::Str("5".into()))
+    );
+  }
+
+  /// Tens of thousands of DISTINCT keys dedup in sub-quadratic time: keying the
+  /// glamour sink by Name makes each push O(log n) rather than an O(n) list
+  /// scan, so a crafted `btec` body that expands to `Tag000000=…;Tag000001=…;…`
+  /// cannot make metadata extraction hang. Pushing N distinct Names yields N
+  /// entries in monotonic push (== last-occurrence) order; the test completing
+  /// promptly is the proof the per-push dedup is no longer quadratic.
+  #[test]
+  fn glamour_distinct_keys_dedup_is_linear() {
+    use crate::value::TagValue;
+    let mut ud = crate::metadata::QuickTimeUserData::new();
+    for i in 0..50_000u32 {
+      ud.push_glamour(
+        std::format!("Tag{i:06}"),
+        TagValue::Str(std::format!("{i}").into()),
+      );
+    }
+    let glam = ud.glamour();
+    assert_eq!(glam.len(), 50_000);
+    // Monotonic ordinals ⇒ the ordinal sort reproduces push order.
+    assert_eq!(
+      glam.first(),
+      Some(&("Tag000000".into(), TagValue::Str("0".into())))
+    );
+    assert_eq!(
+      glam.last(),
+      Some(&("Tag049999".into(), TagValue::Str("49999".into())))
+    );
   }
 
   // ===========================================================================

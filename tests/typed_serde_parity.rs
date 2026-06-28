@@ -1793,7 +1793,26 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// + trailer `Trailer:*` 300/400/1), `PNG_cicp_vpag_truncated.png` (a full then
 /// a runt cICP/vpAg in the main region — the omitted fields survive,
 /// present-only). Oracle-verified vs bundled ExifTool 13.59.
-const EXPECTED_ACTIVE_FIXTURES: usize = 648;
+///
+/// `648 → 649`: `QuickTime_dji_glamour.mov` (#111) — the `moov/udta` `btec`
+/// GlamourSettings atom (QuickTime.pm:2161-2164) → `%DJI::Glamour`
+/// (DJI.pm:213-232) via `ProcessSettings` (DJI.pm:944-954): all 15 known beauty
+/// keys + one unknown key (`MakeTagInfo`-derived `Custom_Thing`), emitted under
+/// `QuickTime:DJI`. Oracle-verified vs bundled ExifTool 13.59.
+///
+/// `649 → 650`: `QuickTime_dji_glamour_edge.mov` (#111 R2) — the byte-faithful
+/// `btec` edges (`tools/gen_dji_glamour_edge_fixture.py`): a non-UTF8 `0xff`
+/// value ⇒ quoted `?`, a NUL-split `c2 00 a9` ⇒ `©` (NUL deleted before
+/// `FixUTF8`), and repeated keys deduping to the LAST value at the LAST
+/// file-order position. Oracle-verified vs bundled ExifTool 13.59.
+///
+/// `650 → 651`: `QuickTime_dji_glamour_multi.mov` (#111 R3) — the GLOBAL
+/// (cross-`btec`-atom) tag-dedup (`tools/gen_dji_glamour_multi_fixture.py`): two
+/// `btec` atoms (`beauty_enable=1;smoother=2;` then
+/// `beauty_enable=3;whitening=4;`), so `beauty_enable` survives with its atom-2
+/// value 3 at its atom-2 position ⇒ `DJI:Smoother 2, DJI:BeautyEnable 3,
+/// DJI:Whitening 4`. Oracle-verified vs bundled ExifTool 13.59.
+const EXPECTED_ACTIVE_FIXTURES: usize = 651;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
