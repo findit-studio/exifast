@@ -138,15 +138,22 @@ pub fn model_is_camera_info_5dmkii(model: Option<&str>) -> bool {
   model.is_some_and(|m| m.trim_end().ends_with("EOS 5D Mark II"))
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo1DmkIV` (`Canon.pm:1332`,
+/// `$$self{Model} =~ /\b1D Mark IV$/` — word-anchored before `1D`, end-anchored).
+#[must_use]
+pub fn model_is_camera_info_1dmkiv(model: Option<&str>) -> bool {
+  model_ends_with(model, "1D Mark IV")
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: the 1-series no-Hook bodies (1D / 1DS / 1DmkII / 1DmkIIN /
 /// 1DmkIII), the 5D / 6D / 7D, and the xxxD DSLR batch (40D / 50D / 60D / 70D /
 /// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
-/// 1100D / 1200D aliases), and the single-Hook pro 5DmkII; any other model
-/// yields nothing (deferred). The remaining multi-Hook pro bodies (1DmkIV / 1DX
-/// / 5DmkIII), the mirrorless and PowerShot count-keyed tables remain deferred.
-/// `print_conv` selects the
+/// 1100D / 1200D aliases), and the pro multi-Hook bodies 5DmkII (1 Hook) and
+/// 1DmkIV (2 Hooks); any other model yields nothing (deferred). The remaining
+/// pro multi-Hook bodies (1DX / 5DmkIII), the mirrorless and PowerShot
+/// count-keyed tables remain deferred. `print_conv` selects the
 /// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
@@ -166,6 +173,8 @@ pub fn parse(
     camera_info_1dmkii(data, order, print_conv)
   } else if model_is_camera_info_1dmkiii(model) {
     camera_info_1dmkiii(data, order, print_conv, model, canon_lens_type)
+  } else if model_is_camera_info_1dmkiv(model) {
+    camera_info_1dmkiv(data, order, print_conv)
   } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_5dmkii(model) {
@@ -1496,6 +1505,153 @@ fn canon_firm_5dmkii(data: &[u8]) -> u8 {
   if firmware_prefix_at(data, 0x15a) {
     1
   } else if firmware_prefix_at(data, 0x17e) {
+    2
+  } else {
+    0
+  }
+}
+
+/// A `MeasuredEV*` leaf (int8u, `RawConv => '$val ? $val : undef'`, `ValueConv =>
+/// '$val / 8 - 6'`, NO PrintConv ⇒ a bare number in both views).
+fn emit_measured_ev<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  off: usize,
+  name: &'static str,
+  push: &mut F,
+) {
+  if let Some(raw) = i8u(data, off)
+    && raw != 0
+  {
+    push(name, ev_value(raw as f64 / 8.0 - 6.0));
+  }
+}
+
+/// `%Canon::CameraInfo1DmkIV` (`Canon.pm:3541-3662`). Default `FORMAT` (int8u),
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`. TWO firmware Hooks — 0x56
+/// (FocusDistanceLower) and 0x153 (MaxFocalLength) — whose `varSize` shifts
+/// accumulate over every later leaf. The `0x00 FirmwareVersionLookAhead` probes
+/// 0x1e8 (CanonFirm 1) then 0x1ed (CanonFirm 2). `0x368 PictureStyleInfo` walks
+/// `%Canon::PSInfo`.
+fn camera_info_1dmkiv(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let canon_firm = canon_firm_1dmkiv(data);
+  let hooks: [(usize, i64); 2] = [
+    (0x56, hook_1dmkiv_56(canon_firm)),
+    (0x153, hook_1dmkiv_153(canon_firm)),
+  ];
+  let at = |off: usize| shifted_at(off, &hooks);
+
+  // Leaves at/before the first Hook (0x56) read at their nominal offsets.
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_highlight_tone_priority(data, 0x07, print_conv, &mut push);
+  emit_measured_ev(data, 0x08, "MeasuredEV2", &mut push);
+  emit_measured_ev(data, 0x09, "MeasuredEV3", &mut push);
+  emit_flash_metering_mode(data, 0x15, print_conv, &mut push);
+  emit_camera_temperature(data, 0x19, print_conv, &mut push);
+  emit_focal_mm(
+    data,
+    0x1e,
+    "FocalLength",
+    true,
+    order,
+    print_conv,
+    &mut push,
+  );
+  emit_camera_orientation(data, 0x35, print_conv, &mut push);
+  emit_focus_distance(
+    data,
+    0x54,
+    "FocusDistanceUpper",
+    order,
+    print_conv,
+    &mut push,
+  );
+  // 0x56 FocusDistanceLower — the first Hook entry, read at the UNSHIFTED 0x56.
+  emit_focus_distance(
+    data,
+    0x56,
+    "FocusDistanceLower",
+    order,
+    print_conv,
+    &mut push,
+  );
+  // Leaves after 0x56 take the 0x56 Hook; leaves after 0x153 add the 0x153 Hook.
+  if let Some(o) = at(0x78) {
+    emit_white_balance(data, o, order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x7c) {
+    emit_color_temperature(data, o, order, &mut push);
+  }
+  if let Some(o) = at(0x14f) {
+    emit_lens_type(data, o, order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x151) {
+    emit_focal_mm(
+      data,
+      o,
+      "MinFocalLength",
+      false,
+      order,
+      print_conv,
+      &mut push,
+    );
+  }
+  // 0x153 MaxFocalLength — the second Hook entry, read at 0x153 + the 0x56 Hook.
+  if let Some(o) = at(0x153) {
+    emit_focal_mm(
+      data,
+      o,
+      "MaxFocalLength",
+      false,
+      order,
+      print_conv,
+      &mut push,
+    );
+  }
+  // 0x1ed FirmwareVersion (string[6], NO RawConv guard).
+  if let Some(o) = at(0x1ed) {
+    emit_firmware_version(data, o, false, &mut push);
+  }
+  if let Some(o) = at(0x22c) {
+    emit_file_index(data, o, order, &mut push);
+  }
+  if let Some(o) = at(0x238) {
+    emit_directory_index(data, o, order, true, &mut push);
+  }
+  if let Some(ps_start) = at(0x368) {
+    ps_info(data, ps_start, order, print_conv, &mut push);
+  }
+  out
+}
+
+/// `%Canon::CameraInfo1DmkIV` 0x56 (FocusDistanceLower) `Hook` delta
+/// (`Canon.pm:3615`, `$varSize += ($$self{CanonFirm} ? -1 : 0x10000) if
+/// $$self{CanonFirm} < 2`): `-1` for firmware 1 (4.2.1), `+0x10000` (out-of-range
+/// abort) for an unrecognized firmware, `0` for firmware 2 (1.0.4).
+fn hook_1dmkiv_56(canon_firm: u8) -> i64 {
+  if canon_firm < 2 {
+    if canon_firm != 0 { -1 } else { 0x1_0000 }
+  } else {
+    0
+  }
+}
+
+/// `%Canon::CameraInfo1DmkIV` 0x153 (MaxFocalLength) `Hook` delta
+/// (`Canon.pm:3637`, `$varSize -= 4 if $$self{CanonFirm} < 2`): `-4` for firmware
+/// 0/1, `0` for firmware 2.
+fn hook_1dmkiv_153(canon_firm: u8) -> i64 {
+  if canon_firm < 2 { -4 } else { 0 }
+}
+
+/// `%Canon::CameraInfo1DmkIV` `0x00 FirmwareVersionLookAhead` RawConv
+/// (`Canon.pm:3557-3564`): `CanonFirm = 1` if a `D.D.D` prefix sits at 0x1e8,
+/// else `2` if at 0x1ed, else `0` (ExifTool warns then the Hooks shift later
+/// leaves out of range).
+fn canon_firm_1dmkiv(data: &[u8]) -> u8 {
+  if firmware_prefix_at(data, 0x1e8) {
+    1
+  } else if firmware_prefix_at(data, 0x1ed) {
     2
   } else {
     0
@@ -3709,6 +3865,136 @@ mod tests {
       None,
     );
     assert!(without.iter().all(|(k, _)| k != "MacroMagnification"));
+  }
+
+  /// `/\b1D Mark IV$/` routes to the 1DmkIV table and is not swallowed by the
+  /// 1D / 1DmkII / 1DmkIII arms nor matched by the Mark II/III.
+  #[test]
+  fn dispatch_anchored_1dmkiv() {
+    assert!(model_is_camera_info_1dmkiv(Some("Canon EOS-1D Mark IV")));
+    assert!(!model_is_camera_info_1dmkiv(Some("Canon EOS-1D Mark III")));
+    assert!(!model_is_camera_info_1dmkiv(Some("Canon EOS-1D Mark II")));
+    assert!(!model_is_camera_info_1d(Some("Canon EOS-1D Mark IV")));
+    assert!(!model_is_camera_info_1dmkiii(Some("Canon EOS-1D Mark IV")));
+  }
+
+  /// `%Canon::CameraInfo1DmkIV` firmware-2 (`CanonFirm == 2`): no `varSize` shift.
+  #[test]
+  fn camera_info_1dmkiv_firmware2_fields() {
+    let mut b = vec![0u8; 0x460];
+    b[0x06] = 88; // ISO 400
+    b[0x07] = 1; // HighlightTonePriority On
+    b[0x08] = 80; // MeasuredEV2 = 80/8-6 = 4
+    b[0x09] = 72; // MeasuredEV3 = 72/8-6 = 3
+    b[0x15] = 3; // FlashMeteringMode TTL
+    b[0x19] = 148; // CameraTemperature 20 C
+    b[0x1e] = 0x00;
+    b[0x1f] = 0x32; // FocalLength 50 mm
+    b[0x35] = 2; // CameraOrientation Rotate 270 CW
+    b[0x7c] = 0x50;
+    b[0x7d] = 0x14; // ColorTemperature int16u LE 5200
+    b[0x151] = 0x00;
+    b[0x152] = 0x18; // MinFocalLength 24 mm
+    b[0x153] = 0x00;
+    b[0x154] = 0x69; // MaxFocalLength 105 mm (second Hook entry)
+    b[0x1ed..0x1f3].copy_from_slice(b"1.0.4\0"); // version at 0x1ed ⇒ CanonFirm 2
+    b[0x22c..0x230].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ 201
+    b[0x238..0x23c].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ 199
+    b[0x368..0x36c].copy_from_slice(&5i32.to_le_bytes()); // PSInfo ContrastStandard
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark IV"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("HighlightTonePriority"),
+      Some(TagValue::Str("On".into()))
+    );
+    assert_eq!(find("MeasuredEV2"), Some(TagValue::I64(4)));
+    assert_eq!(find("MeasuredEV3"), Some(TagValue::I64(3)));
+    assert_eq!(find("FlashMeteringMode"), Some(TagValue::Str("TTL".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 270 CW".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.4".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(5)));
+  }
+
+  /// `%Canon::CameraInfo1DmkIV` firmware-1 (`CanonFirm == 1`): the CUMULATIVE
+  /// shift — leaves between the two Hooks take only the 0x56 Hook (`-1`), while
+  /// leaves after 0x153 take both (`-1` + `-4` = `-5`).
+  #[test]
+  fn camera_info_1dmkiv_firmware1_cumulative_shift() {
+    let mut b = vec![0u8; 0x460];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0x1e8..0x1ee].copy_from_slice(b"4.2.1\0"); // prefix at 0x1e8 ⇒ CanonFirm 1
+    // -1 (0x56 Hook only): MinFocalLength 0x151 ⇒ 0x150, MaxFocalLength 0x153 ⇒ 0x152.
+    b[0x150] = 0x00;
+    b[0x151] = 0x18; // MinFocalLength 24 mm
+    b[0x152] = 0x00;
+    b[0x153] = 0x69; // MaxFocalLength 105 mm
+    // -5 (both Hooks): FirmwareVersion 0x1ed ⇒ 0x1e8 (reuses the version string),
+    // FileIndex 0x22c ⇒ 0x227, DirectoryIndex 0x238 ⇒ 0x233, PSInfo 0x368 ⇒ 0x363.
+    b[0x227..0x22b].copy_from_slice(&500u32.to_le_bytes());
+    b[0x233..0x237].copy_from_slice(&500u32.to_le_bytes());
+    b[0x363..0x367].copy_from_slice(&7i32.to_le_bytes());
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark IV"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("4.2.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(501)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(499)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(7)));
+  }
+
+  /// `%Canon::CameraInfo1DmkIV` unrecognized firmware (`CanonFirm == 0`): the
+  /// 0x56 Hook adds `+0x10000`, dropping every leaf after 0x56; the leaves up to
+  /// and including the 0x56 Hook entry still emit.
+  #[test]
+  fn camera_info_1dmkiv_unrecognized_firmware() {
+    let mut b = vec![0u8; 0x460];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0x56] = 0x00;
+    b[0x57] = 0x64; // FocusDistanceLower at 0x56 (Hook entry, still emitted)
+    b[0x22c..0x230].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
+    let em = parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS-1D Mark IV"),
+      None,
+    );
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert!(em.iter().any(|(k, _)| k == "FocusDistanceLower"));
+    assert_eq!(find("MinFocalLength"), None);
+    assert_eq!(find("MaxFocalLength"), None);
+    assert_eq!(find("FirmwareVersion"), None);
+    assert_eq!(find("FileIndex"), None);
+    assert!(em.iter().all(|(k, _)| k != "ContrastStandard"));
   }
 
   #[test]
