@@ -1780,7 +1780,11 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// (`CICodePoints`, `PNG.pm:471-541`), a 4-byte `ProcessBinaryData` table:
 /// ColorPrimaries / TransferCharacteristics / MatrixCoefficients (PrintConv) +
 /// VideoFullRangeFlag (raw), family-1 `PNG-cICP`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 644;
+///
+/// `645`: `PNG_vpag.png` (#142) — the crafted `vpAg` ImageMagick virtual-page
+/// chunk (`VirtualPage`, `PNG.pm:561-573`): VirtualImageWidth/Height (int32u) +
+/// VirtualPageUnits (int8u), all raw, default family-1 `PNG`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 645;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

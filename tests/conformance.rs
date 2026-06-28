@@ -12603,6 +12603,21 @@ fn png_cicp_conformance() {
 
 #[test]
 #[cfg(feature = "png")]
+fn png_vpag_conformance() {
+  // #142 — the `vpAg` ImageMagick private virtual-page chunk (`VirtualPage`,
+  // `PNG.pm:290-293`, sub-table `:561-573`). A `ProcessBinaryData` table:
+  // VirtualImageWidth / VirtualImageHeight (int32u) + VirtualPageUnits (int8u),
+  // all raw (no conv), default family-1 group `PNG` (the table sets only
+  // `GROUPS{2} => 'Image'`). Crafted minimal 1x1 RGB fixture whose only vendor
+  // chunk is `vpAg` (width 100, height 200, units 0). PNG is in the Composite
+  // allow-list, so the ported `Composite:ImageSize`/`Megapixels` are compared
+  // too (a PLAIN `check`). Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_vpag.png", "PNG_vpag.png.json", true);
+  check("PNG_vpag.png", "PNG_vpag.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
 fn png_idot_main_trailer_conformance() {
   // #142 (Codex [medium]) — the per-group `iDOT` fix. A PNG can carry the
   // `Binary => 1` `iDOT` chunk BOTH before `IEND` (stored under the `PNG`
