@@ -61,8 +61,9 @@ pub fn model_is_camera_info_6d(model: Option<&str>) -> bool {
 /// `true` when `model` selects `%Canon::CameraInfo1D` (`Canon.pm:1312`,
 /// `$$self{Model} =~ /\b1DS?$/` — the original 1D or 1DS, case-sensitive `S`).
 /// The dispatch `Condition` also assigns `$$self{CameraInfoCount} = $count`
-/// (the record byte length, since `FORMAT => 'int8u'`) — a side-effect read only
-/// by the deferred count-keyed tables (5DmkII / PowerShot / Unknown).
+/// (`Canon.pm:1312`) — a side-effect read by the count-keyed tables that follow
+/// the model rows: the ported `CameraInfoPowerShot`/`PowerShot2` (their
+/// `CameraTemperature` row) and the still-deferred `CameraInfoUnknown*`.
 #[must_use]
 pub fn model_is_camera_info_1d(model: Option<&str>) -> bool {
   model_is_1d_proper(model) || model_is_1ds(model)
@@ -198,15 +199,22 @@ pub fn model_is_camera_info_g5xii(model: Option<&str>) -> bool {
 /// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
 /// 1100D / 1200D aliases), and the pro multi-Hook bodies 5DmkII (1 Hook),
 /// 1DmkIV (2 Hooks), 1DX (3 Hooks) and 5DmkIII (4 Hooks); the mirrorless bodies
-/// EOS R6 (R5/R6), R6m2 (R6m2/R8/R50), R6m3 and the PowerShot G5XII; any other
-/// model yields nothing (deferred). The count-keyed PowerShot CameraInfo tables
-/// remain deferred. `print_conv` selects the
+/// EOS R6 (R5/R6), R6m2 (R6m2/R8/R50), R6m3 and the PowerShot G5XII; then — after
+/// the model-conditional rows, keyed by the `0x0d` entry's `$count` + `$format`
+/// (`Canon.pm:1466-1479`) rather than the model — the `int32u`
+/// CameraInfoPowerShot (count 138/148) and CameraInfoPowerShot2 (count
+/// 156/162/167/171/264) tables. Only the `CameraInfoUnknown*` catch-alls
+/// (`Canon.pm:1480-1494`) stay deferred; any other model/count yields nothing.
+/// `print_conv` selects the
 /// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
 /// `file_type` is the container `$$self{FileType}` (`File:FileType`) gating the
-/// `%CameraInfoG5XII` JPEG/CR3 rows (`Canon.pm:4876`/`:4886`).
+/// `%CameraInfoG5XII` JPEG/CR3 rows (`Canon.pm:4876`/`:4886`). `count` and
+/// `is_int32u` are the `0x0d` entry's `$count` and `$format eq "int32u"` — the
+/// PowerShot `Condition` keys (`Canon.pm:1468`/`:1475`).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn parse(
   data: &[u8],
   order: ByteOrder,
@@ -214,6 +222,8 @@ pub fn parse(
   model: Option<&str>,
   file_type: Option<&str>,
   canon_lens_type: Option<u16>,
+  count: usize,
+  is_int32u: bool,
 ) -> Vec<(SmolStr, TagValue)> {
   if model_is_camera_info_1d(model) {
     camera_info_1d(data, order, print_conv, model)
@@ -269,7 +279,20 @@ pub fn parse(
     camera_info_r6m3(data, order)
   } else if model_is_camera_info_g5xii(model) {
     camera_info_g5xii(data, order, file_type)
+  } else if is_int32u && (count == 138 || count == 148) {
+    // `%Canon::CameraInfoPowerShot` (`Canon.pm:1466-1469`): the model-conditional
+    // rows above all failed, so ExifTool keys on the `0x0d` entry's `$format eq
+    // "int32u"` and `$count` (138/148) instead of the model. `count` IS
+    // `$$self{CameraInfoCount}` (set by the 1D row's side-effecting `Condition`,
+    // `Canon.pm:1312`), which the in-table `CameraTemperature` row also reads.
+    parse_camera_info_powershot(data, order, print_conv, count)
+  } else if is_int32u && matches!(count, 156 | 162 | 167 | 171 | 264) {
+    // `%Canon::CameraInfoPowerShot2` (`Canon.pm:1471-1479`), counts
+    // 156/162/167/171/264 — same int32u gate.
+    parse_camera_info_powershot2(data, order, print_conv, count)
   } else {
+    // The `CameraInfoUnknown32`/`Unknown16`/`Unknown` catch-alls
+    // (`Canon.pm:1480-1494`) stay deferred (#85).
     Vec::new()
   }
 }
@@ -2684,6 +2707,159 @@ fn camera_info_g5xii(
   out
 }
 
+// ─── count-selected PowerShot `CameraInfo` tables (Canon.pm:5711-5847) ────────
+// Dispatched (`Canon.pm:1466-1479`) AFTER the model-conditional rows, by the
+// `0x0d` entry's `$format eq "int32u"` + `$count`, NOT the model. Unlike the
+// model tables (`undef`-format, byte-keyed), these are `FORMAT => 'int32s'`,
+// `FIRST_ENTRY => 0`, `PRIORITY => 0`: a `ProcessBinaryData` index `i` reads an
+// `int32s` at byte offset `i * 4` (`ExifTool.pm:9957`, `$entry = int($index) *
+// $formatSize{int32s}`). The on-disk value is read as `int32u[$count]`, so the
+// caller widens each word back to 4 bytes (`reserialize_int32_array`); the int16
+// blob the model tables use would truncate every word. The shared leaf set
+// (ISO/FNumber/ExposureTime/Rotation/CameraTemperature) carries NO `RawConv`
+// guard, so every in-range field emits.
+
+/// `%Canon::CameraInfoPowerShot` (`Canon.pm:5711-5768`) — counts 138/148. The
+/// `CameraTemperature` leaf sits at index `CameraInfoCount - 3` (135 for 138, 145
+/// for 148), each gated on its exact count (`Canon.pm:5751`/`:5758`).
+fn parse_camera_info_powershot(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  count: usize,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_powershot_iso(data, 0x00, order, print_conv, &mut push);
+  emit_powershot_fnumber(data, 0x05, order, print_conv, &mut push);
+  emit_powershot_exposure_time(data, 0x06, order, print_conv, &mut push);
+  emit_powershot_rotation(data, 0x17, order, &mut push);
+  // CameraTemperature at index `count - 3` (135 for count 138, 145 for 148).
+  if count == 138 {
+    emit_powershot_camera_temperature(data, 135, order, print_conv, &mut push);
+  } else if count == 148 {
+    emit_powershot_camera_temperature(data, 145, order, print_conv, &mut push);
+  }
+  out
+}
+
+/// `%Canon::CameraInfoPowerShot2` (`Canon.pm:5771-5847`) — counts
+/// 156/162/167/171/264. The `CameraTemperature` leaf sits at index
+/// `CameraInfoCount - 3` (153/159/164/168/261), each gated on its exact count
+/// (`Canon.pm:5809`-`:5846`).
+fn parse_camera_info_powershot2(
+  data: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  count: usize,
+) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  emit_powershot_iso(data, 0x01, order, print_conv, &mut push);
+  emit_powershot_fnumber(data, 0x06, order, print_conv, &mut push);
+  emit_powershot_exposure_time(data, 0x07, order, print_conv, &mut push);
+  emit_powershot_rotation(data, 0x18, order, &mut push);
+  // CameraTemperature at index `count - 3`.
+  let temp_index = match count {
+    156 => 153,
+    162 => 159,
+    167 => 164,
+    171 => 168,
+    264 => 261,
+    _ => return out,
+  };
+  emit_powershot_camera_temperature(data, temp_index, order, print_conv, &mut push);
+  out
+}
+
+// The PowerShot `int32s` leaf emitters. Each takes the `ProcessBinaryData` index
+// (the table key) and reads at byte offset `index * 4` (the `int32s` stride).
+
+/// `ISO` (`Canon.pm:5722`/`:5784`) — `100*exp((($val-411)/96)*log(2))`, PrintConv
+/// `sprintf("%.0f")`. No `RawConv`.
+fn emit_powershot_iso<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  index: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i32s(data, index * 4, order) {
+    let vc = 100.0 * (((raw as f64 - 411.0) / 96.0) * std::f64::consts::LN_2).exp();
+    push(
+      "ISO",
+      value_or_print(print_conv, vc, std::format!("{vc:.0}")),
+    );
+  }
+}
+
+/// `FNumber` (`Canon.pm:5730`/`:5792`) — `exp($val/192*log(2))`, PrintConv
+/// `sprintf("%.2g")`. No `RawConv`.
+fn emit_powershot_fnumber<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  index: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i32s(data, index * 4, order) {
+    let vc = (raw as f64 / 192.0 * std::f64::consts::LN_2).exp();
+    push("FNumber", value_or_print(print_conv, vc, format_g2(vc)));
+  }
+}
+
+/// `ExposureTime` (`Canon.pm:5738`/`:5800`) — `exp(-$val/96*log(2))`, PrintConv
+/// `PrintExposureTime`. No `RawConv`.
+fn emit_powershot_exposure_time<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  index: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i32s(data, index * 4, order) {
+    let vc = (-(raw as f64) / 96.0 * std::f64::consts::LN_2).exp();
+    push(
+      "ExposureTime",
+      value_or_print(print_conv, vc, print_exposure_time(vc)),
+    );
+  }
+}
+
+/// `Rotation` (`Canon.pm:5746`/`:5808`) — plain `int32s`, no conv (identical in
+/// both views).
+fn emit_powershot_rotation<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  index: usize,
+  order: ByteOrder,
+  push: &mut F,
+) {
+  if let Some(raw) = i32s(data, index * 4, order) {
+    push("Rotation", TagValue::I64(raw));
+  }
+}
+
+/// `CameraTemperature` (`Canon.pm:5751`+/`:5809`+) — raw `int32s`, PrintConv
+/// `"$val C"` (no ValueConv).
+fn emit_powershot_camera_temperature<F: FnMut(&'static str, TagValue)>(
+  data: &[u8],
+  index: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  push: &mut F,
+) {
+  if let Some(raw) = i32s(data, index * 4, order) {
+    push(
+      "CameraTemperature",
+      if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{raw} C")))
+      } else {
+        TagValue::I64(raw)
+      },
+    );
+  }
+}
+
 // ─── shared per-field emitters for the int8u xxxD `CameraInfo` tables ─────────
 // Each reads at the byte offset the caller already resolved (applying any
 // firmware `Hook` shift) and pushes the rendered leaf, reusing the same value
@@ -3903,9 +4079,10 @@ fn read_string(data: &[u8], off: usize, len: usize) -> Option<String> {
 mod tests {
   use super::*;
 
-  /// The pre-mirrorless `parse` arity (no `$$self{FileType}`/PowerShot context)
-  /// the per-model unit tests drive. `file_type` defaults to `None` — every
-  /// model-table row these tests exercise is `FileType`-independent.
+  /// The model-table `parse` arity the per-model unit tests drive. `file_type`
+  /// defaults to `None` (every model-table row these tests exercise is
+  /// `FileType`-independent); `count`/`is_int32u` are `0`/`false`, so the
+  /// count-keyed PowerShot arms never fire — these tests reach a table by MODEL.
   fn parse_model(
     data: &[u8],
     order: ByteOrder,
@@ -3913,7 +4090,16 @@ mod tests {
     model: Option<&str>,
     canon_lens_type: Option<u16>,
   ) -> Vec<(SmolStr, TagValue)> {
-    super::parse(data, order, print_conv, model, None, canon_lens_type)
+    super::parse(
+      data,
+      order,
+      print_conv,
+      model,
+      None,
+      canon_lens_type,
+      0,
+      false,
+    )
   }
 
   /// Build a CameraInfo5D blob with the named bytes set (the rest zero).
@@ -3996,8 +4182,8 @@ mod tests {
     assert!(model_is_camera_info_5dmkii(Some("Canon EOS 5D Mark II")));
     assert!(!model_is_camera_info_5dmkii(Some("Canon EOS 5D")));
     assert!(!model_is_camera_info_5dmkii(Some("Canon EOS 5D Mark III")));
-    // A model handled by no table yields nothing (the mirrorless R-series
-    // CameraInfo tables remain deferred to a later chunk).
+    // A short blob yields nothing even for a ported table: the R6 leaves sit at
+    // 0x09da+ (CameraTemperature) / 0x0af1 (ShutterCount), past this 0x120 blob.
     assert!(
       parse_model(
         &[0u8; 0x120],
@@ -6137,6 +6323,7 @@ mod tests {
     assert!(camera_info_g5xii(&b, ByteOrder::Little, None).is_empty());
 
     // Routed through the 0x0d dispatch with the container `$$self{FileType}`.
+    // G5XII is reached by MODEL, so the count/format keys are inert here.
     let routed = super::parse(
       &b,
       ByteOrder::Little,
@@ -6144,10 +6331,195 @@ mod tests {
       Some("Canon PowerShot G5 X Mark II"),
       Some("JPEG"),
       None,
+      0,
+      false,
     );
     assert_eq!(
       routed.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
       ["ShutterCount", "DirectoryIndex", "FileIndex"]
     );
+  }
+
+  /// Build an `int32s` PowerShot blob of `count` elements (little-endian) with the
+  /// named `(index, value)` words set; every other word is zero. Mirrors how the
+  /// dispatch widens the on-disk `int32u[$count]` value to its byte blob.
+  fn ps_blob(count: usize, words: &[(usize, i32)]) -> Vec<u8> {
+    let mut b = vec![0u8; count * 4];
+    for &(idx, v) in words {
+      b[idx * 4..idx * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+  }
+
+  /// `%CameraInfoPowerShot` (`Canon.pm:5711`) — the model rows fail, so the
+  /// int32u + count(138/148) gate selects it; `CameraTemperature` tracks the count
+  /// (index 135 for 138, 145 for 148).
+  #[test]
+  fn camera_info_powershot_count_138_and_148() {
+    // ISO 507 ⇒ 200; FNumber 192 ⇒ f/2; ExposureTime 384 ⇒ 1/16; Rotation plain.
+    let b138 = ps_blob(
+      138,
+      &[(0x00, 507), (0x05, 192), (0x06, 384), (0x17, 6), (135, 35)],
+    );
+    let out = super::parse(
+      &b138,
+      ByteOrder::Little,
+      true,
+      Some("Canon PowerShot A450"),
+      None,
+      None,
+      138,
+      true,
+    );
+    let get = |n: &str| out.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(get("ISO"), Some(TagValue::Str("200".into())));
+    assert_eq!(get("FNumber"), Some(TagValue::Str("2".into())));
+    assert_eq!(get("ExposureTime"), Some(TagValue::Str("1/16".into())));
+    assert_eq!(get("Rotation"), Some(TagValue::I64(6)));
+    assert_eq!(get("CameraTemperature"), Some(TagValue::Str("35 C".into())));
+
+    // count 148: CameraTemperature reads index 145, NOT 135 (the 138 row's index).
+    let b148 = ps_blob(148, &[(135, 99), (145, 40)]);
+    let out = super::parse(&b148, ByteOrder::Little, true, None, None, None, 148, true);
+    let temp = out
+      .iter()
+      .find(|(k, _)| k == "CameraTemperature")
+      .map(|(_, v)| v.clone());
+    assert_eq!(temp, Some(TagValue::Str("40 C".into())));
+  }
+
+  /// `%CameraInfoPowerShot2` (`Canon.pm:5771`) — each count selects its own
+  /// `CameraTemperature` index (`Canon.pm:5809`-`:5846`).
+  #[test]
+  fn camera_info_powershot2_all_counts() {
+    for &(count, temp_idx) in &[
+      (156usize, 153usize),
+      (162, 159),
+      (167, 164),
+      (171, 168),
+      (264, 261),
+    ] {
+      let b = ps_blob(
+        count,
+        &[
+          (0x01, 507),
+          (0x06, 192),
+          (0x07, 96),
+          (0x18, 3),
+          (temp_idx, 22),
+        ],
+      );
+      let out = super::parse(&b, ByteOrder::Little, true, None, None, None, count, true);
+      let get = |n: &str| out.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+      assert_eq!(
+        get("ISO"),
+        Some(TagValue::Str("200".into())),
+        "count {count}"
+      );
+      assert_eq!(
+        get("FNumber"),
+        Some(TagValue::Str("2".into())),
+        "count {count}"
+      );
+      assert_eq!(
+        get("ExposureTime"),
+        Some(TagValue::Str("0.5".into())),
+        "count {count}"
+      );
+      assert_eq!(get("Rotation"), Some(TagValue::I64(3)), "count {count}");
+      assert_eq!(
+        get("CameraTemperature"),
+        Some(TagValue::Str("22 C".into())),
+        "count {count}"
+      );
+    }
+  }
+
+  /// The `$format eq "int32u"` gate AND the model-first dispatch order
+  /// (`Canon.pm:1466`-`:1479`, evaluated after every model row).
+  #[test]
+  fn camera_info_powershot_format_and_model_gates() {
+    let b = ps_blob(138, &[(0x00, 507), (135, 35)]);
+    // Right count, but `$format` is not int32u ⇒ the PowerShot rows never fire.
+    assert!(super::parse(&b, ByteOrder::Little, true, None, None, None, 138, false).is_empty());
+    // int32u but an UNLISTED count ⇒ nothing (the deferred `CameraInfoUnknown*`).
+    assert!(
+      super::parse(
+        &ps_blob(100, &[(0x00, 507)]),
+        ByteOrder::Little,
+        true,
+        None,
+        None,
+        None,
+        100,
+        true,
+      )
+      .is_empty()
+    );
+    // A matching MODEL precedes the count keys: a G5 X Mark II at int32u/138 routes
+    // to G5XII, so the PowerShot ISO/CameraTemperature leaves are NOT emitted.
+    let routed = super::parse(
+      &b,
+      ByteOrder::Little,
+      true,
+      Some("Canon PowerShot G5 X Mark II"),
+      Some("JPEG"),
+      None,
+      138,
+      true,
+    );
+    assert!(
+      routed
+        .iter()
+        .all(|(k, _)| k != "ISO" && k != "CameraTemperature")
+    );
+  }
+
+  /// The numeric (`-n`) view: the ValueConv floats render bare-int / `F64` exactly
+  /// like the model tables (`value_or_print`).
+  #[test]
+  fn camera_info_powershot_numeric_view() {
+    let b = ps_blob(138, &[(0x00, 507), (0x05, 192), (0x06, 96), (135, 35)]);
+    let out = super::parse(&b, ByteOrder::Little, false, None, None, None, 138, true);
+    let get = |n: &str| out.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(get("ISO"), Some(TagValue::I64(200)));
+    assert_eq!(get("FNumber"), Some(TagValue::I64(2)));
+    assert_eq!(get("ExposureTime"), Some(TagValue::F64(0.5)));
+    assert_eq!(get("CameraTemperature"), Some(TagValue::I64(35)));
+  }
+
+  /// `int32s` signed decode + per-field availability (a truncated blob drops the
+  /// out-of-range leaves while the in-range ones still emit).
+  #[test]
+  fn camera_info_powershot_signed_and_truncation() {
+    let mut b = ps_blob(138, &[(0x17, -1)]);
+    b[135 * 4..135 * 4 + 4].copy_from_slice(&(-5i32).to_le_bytes());
+    let out = super::parse(&b, ByteOrder::Little, true, None, None, None, 138, true);
+    let get = |n: &str| out.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(get("Rotation"), Some(TagValue::I64(-1)));
+    assert_eq!(get("CameraTemperature"), Some(TagValue::Str("-5 C".into())));
+
+    // Truncate to 28 bytes: indices 0/5/6 (bytes 0..28) survive; Rotation (index
+    // 23 ⇒ byte 92) and CameraTemperature (index 135) fall out of range.
+    let full = ps_blob(
+      138,
+      &[(0x00, 507), (0x05, 192), (0x06, 96), (0x17, 6), (135, 35)],
+    );
+    let out = super::parse(
+      &full[..28],
+      ByteOrder::Little,
+      true,
+      None,
+      None,
+      None,
+      138,
+      true,
+    );
+    let names: Vec<_> = out.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(names.contains(&"ISO"));
+    assert!(names.contains(&"FNumber"));
+    assert!(names.contains(&"ExposureTime"));
+    assert!(!names.contains(&"Rotation"));
+    assert!(!names.contains(&"CameraTemperature"));
   }
 }

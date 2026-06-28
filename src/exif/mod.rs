@@ -10892,6 +10892,12 @@ fn emit_entry<S: ExifSink>(
           canon_focal_units,
           canon_lens_type,
           canon_focal_length_blob,
+          // `$count`/`$format` — the `0x0d` IFD entry's element count (`value_size
+          // / format size`) and on-disk format, the PowerShot `Condition` keys
+          // (`Canon.pm:1466`-`:1479`). `byte_size().max(1)` guards the `Unknown(_)`
+          // zero size; every non-CameraInfo sub-table ignores both.
+          entry.value_size() / entry.on_disk_format().byte_size().max(1),
+          entry.on_disk_format(),
           out,
         ),
         // A STILL-DEFERRED SubDirectory (`is_walked() == false` — CameraInfo /
@@ -11749,6 +11755,12 @@ fn emit_canon_subtable<S: ExifSink>(
   // readable 0x02 exists; the FocalLength arm then emits nothing (the oracle's
   // `if let Some(ref bytes) = focal_length_data` is likewise a no-op).
   canon_focal_length_blob: Option<&[u8]>,
+  // The `0x0d` CameraInfo entry's `$count` and `$format` (the IFD entry's
+  // count + on-disk format), the keys ExifTool's count-selected PowerShot
+  // `Condition`s read (`Canon.pm:1466`-`:1479`) AFTER the model rows. Consumed
+  // ONLY by the `CameraInfo` arm; every other sub-table ignores them.
+  entry_count: usize,
+  entry_format: Format,
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   use makernotes::vendors::canon::tags::SubTable;
@@ -11814,12 +11826,34 @@ fn emit_canon_subtable<S: ExifSink>(
     SubTable::MeasuredColor => measured_color::parse(&blob, order, print_conv),
     // CameraInfo (0x0d) — model-conditional list (`Canon.pm:1308-1494`); the
     // ported variants are 5D / 7D, the xxxD DSLR batch, the pro multi-Hook bodies,
-    // and the mirrorless R6 / R6m2 / R6m3 / G5XII, all `PRIORITY => 0` (threaded
-    // via `tag_priority`). `canon_lens_type` is the pre-scanned `$$self{LensType}`
-    // gating the `MacroMagnification` leaf; `file_type` is `$$self{FileType}`
-    // gating the G5XII JPEG/CR3 rows. AFMicroAdj (0x4013).
+    // the mirrorless R6 / R6m2 / R6m3 / G5XII, and the count-selected PowerShot /
+    // PowerShot2 tables, all `PRIORITY => 0` (threaded via `tag_priority`).
+    // `canon_lens_type` is the pre-scanned `$$self{LensType}` gating the
+    // `MacroMagnification` leaf; `file_type` is `$$self{FileType}` gating the
+    // G5XII JPEG/CR3 rows. The model tables are `undef`-format (read as verbatim
+    // `Bytes` ⇒ the int16 `blob` equals them); the PowerShot tables are the only
+    // `int32u`-format variant (`$format eq "int32u"`, `Canon.pm:1468`), whose
+    // int32 words the int16 `blob` would truncate — so widen each word to 4 bytes
+    // (`reserialize_int32_array`, the AFMicroAdj treatment) for that case.
     SubTable::CameraInfo => {
-      camera_info::parse(&blob, order, print_conv, model, file_type, canon_lens_type)
+      let is_int32u = entry_format == Format::Int32u;
+      let ci_blob32;
+      let ci_data: &[u8] = if is_int32u {
+        ci_blob32 = makernotes::vendors::canon::reserialize_int32_array(raw, order);
+        &ci_blob32
+      } else {
+        &blob
+      };
+      camera_info::parse(
+        ci_data,
+        order,
+        print_conv,
+        model,
+        file_type,
+        canon_lens_type,
+        entry_count,
+        is_int32u,
+      )
     }
     // AFMicroAdj is `FORMAT => 'int32s'` — its IFD entry is read as `int32u[N]`,
     // so the value words must be widened back to 4 bytes each (the shared `blob`
@@ -24522,6 +24556,8 @@ mod tests {
         /* canon_focal_units */ Some(10),
         /* canon_lens_type */ Some(124),
         /* canon_focal_length_blob */ Some(focal_length.as_slice()),
+        /* entry_count */ 0,
+        /* entry_format */ Format::Undef,
         &mut sink,
       );
     }
@@ -24547,6 +24583,8 @@ mod tests {
         /* canon_focal_units */ None,
         None,
         /* canon_focal_length_blob */ Some(focal_length.as_slice()),
+        /* entry_count */ 0,
+        /* entry_format */ Format::Undef,
         &mut sink,
       );
     }

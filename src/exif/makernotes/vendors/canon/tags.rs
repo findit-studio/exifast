@@ -35,8 +35,10 @@
 //!   invariant test guards the whole set. The child leaves stay Phase-2
 //!   deferred (see the #62 umbrella).
 //! - Model-specific `CanonCameraInfoXXX` conditional sub-directories at
-//!   tag 0x0d (`Canon.pm:1307-1494`) are DEFERRED — each model has its
-//!   own micro-table.
+//!   tag 0x0d (`Canon.pm:1307-1494`) are WALKED (issue #85): the per-model
+//!   micro-tables plus the count-selected PowerShot / PowerShot2 tables (see
+//!   [`super::camera_info`]); only the `CameraInfoUnknown*` catch-alls remain
+//!   deferred.
 //! - `CustomFunctionsXXX` at tag 0x0f (`Canon.pm:1500-1582`) are
 //!   DEFERRED — each model has its own micro-table.
 //! - `ColorData1..12` (`Canon.pm:7435-8941`) are decoded in `colordata.rs`
@@ -162,8 +164,10 @@ pub enum SubTable {
   ColorBalance,
   /// `CanonCameraInfo` conditional SubDirectory list — Main tag 0x0d
   /// (`Canon.pm:1308-1494`). Per-model `Canon::CameraInfo<Model>` micro-tables.
-  /// DEFERRED (children unported, issue #85): `is_walked() == false` so the
-  /// parent pointer is suppressed (no bogus raw value).
+  /// WALKED (`is_walked() == true`, issue #85): the dispatch decodes the
+  /// model-conditional bodies and the count-selected PowerShot / PowerShot2
+  /// tables (see [`super::camera_info`]); only the `CameraInfoUnknown*`
+  /// catch-alls (`Canon.pm:1480-1494`) stay deferred.
   CameraInfo,
   /// `%Canon::CropInfo` (`Canon.pm:1880-1882`) — Main tag 0x98. DEFERRED.
   CropInfo,
@@ -340,13 +344,15 @@ impl SubTable {
   /// Faithful to the `Priority => 0` rows of the sub-tables this port WALKS
   /// (`is_walked`): `Canon::ShotInfo` `BaseISO` (`Canon.pm:2789`), `FNumber`
   /// (`:2959`), `ExposureTime` (`:2973`/`:2986` — both conditional-list
-  /// branches); `Canon::FocalLength` `FocalLength` (`:2710`). The other walked
-  /// tables (`CameraSettings`/`FileInfo`/`AFInfo`/`AFInfo2`/`AFInfo3`/
-  /// `SensorInfo`/`ColorBalance`) carry NO `Priority => 0` row. The NON-walked
-  /// tables that DO (`CameraInfo*` `OwnerName`/`LensSerialNumber`, `Processing`
-  /// `Sharpness`, `LensInfo` `LensSerialNumber`, `Composite` `ISO`) never reach
-  /// here — their parent pointer is suppressed (`is_walked() == false`) so no
-  /// leaf is emitted.
+  /// branches); `Canon::FocalLength` `FocalLength` (`:2710`); EVERY
+  /// `Canon::CameraInfo*` leaf (the tables are `PRIORITY => 0`, `Canon.pm:3781`
+  /// etc., the count-selected PowerShot tables included); `Canon::Processing`
+  /// `Sharpness` (`:7220`); and `Canon::LensInfo` `LensSerialNumber` (`:9143`) —
+  /// all WALKED. The other walked tables (`CameraSettings`/`FileInfo`/`AFInfo`/
+  /// `AFInfo2`/`AFInfo3`/`SensorInfo`/`ColorBalance`) carry NO `Priority => 0`
+  /// row. A still-deferred table that DOES (e.g. `Composite` `ISO`) never reaches
+  /// here — its parent pointer is suppressed (`is_walked() == false`) so no leaf
+  /// is emitted.
   ///
   /// A `Priority => 0` Canon leaf NEVER overrides an earlier same-`(doc,
   /// family1, name)` duplicate (`ExifTool.pm:9544-9560`): this matters for the
