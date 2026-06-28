@@ -783,11 +783,20 @@ impl CompositePrintConv {
           ConvMode::ValueConv => v.clone(),
           ConvMode::PrintConv => {
             let idx = lens_id_print_index(vals);
-            prts
-              .get(idx)
-              .and_then(Option::as_ref)
-              .cloned()
-              .unwrap_or_else(|| v.clone())
+            let selected = prts.get(idx).and_then(Option::as_ref);
+            // The unambiguous case renders `$prt[idx]` verbatim; an ambiguous
+            // `" or "` / placeholder name renders the full `PrintLensID`
+            // disambiguation (matching the [`lens_id`] build decision).
+            let resolved = selected.map(crate::composite::value_text);
+            match resolved {
+              Some(name) if !lens_name_is_resolved(&name) => {
+                match sony_lens_id_disambiguate(vals, prts) {
+                  Some(lens) => TagValue::Str(lens.into()),
+                  None => selected.cloned().unwrap_or_else(|| v.clone()),
+                }
+              }
+              _ => selected.cloned().unwrap_or_else(|| v.clone()),
+            }
           }
         }
       }
@@ -1807,6 +1816,22 @@ fn composite_flash(
 /// Sony LensType2 that fails the `0x8000`/`0` mask) does NOT defer — the
 /// unambiguous Pentax/Samsung path (those ingredients absent/inactive) still
 /// emits byte-identically.
+/// The COMPACT [`LENS_ID`] ingredient indices (NOT ExifTool's numbered slots).
+#[cfg(feature = "exif")]
+mod lens_id_in {
+  pub(super) const LENS_TYPE: usize = 0;
+  pub(super) const FOCAL_LENGTH: usize = 1;
+  pub(super) const MAX_APERTURE: usize = 6;
+  pub(super) const MAX_APERTURE_VALUE: usize = 7;
+  pub(super) const MIN_FOCAL_LENGTH: usize = 8;
+  pub(super) const MAX_FOCAL_LENGTH: usize = 9;
+  pub(super) const LENS_MODEL: usize = 10;
+  pub(super) const LENS_FOCAL_RANGE: usize = 11;
+  pub(super) const LENS_SPEC: usize = 12;
+  pub(super) const MAKE: usize = 13;
+  pub(super) const MODEL: usize = 14;
+}
+
 #[cfg(feature = "exif")]
 fn lens_id(
   v: &[CompositeValue],
@@ -1833,15 +1858,97 @@ fn lens_id(
   // candidate). Absent ⇒ no build (no name to emit under `-j`).
   let name = prts.get(idx).and_then(Option::as_ref)?;
   let name_text = crate::composite::value_text(name);
-  // Confirmed resolved lens name: carries a focal-length / aperture token
-  // (`PrintLensID`'s lens-name shape) AND is not an ambiguity placeholder.
+  // A CONFIRMED resolved single-lens name (a focal/aperture token, no `" or "`)
+  // is the unambiguous passthrough — `PrintLensID` returns `$$printConv{$lensType}`
+  // verbatim. Otherwise the name is an ambiguous `" or "` / placeholder LensType:
+  // run the full Sony/Minolta `PrintLensID` lens-DB disambiguation and BUILD iff
+  // it resolves to a name (else DEFER — a non-Sony / unported-DB case).
   if !lens_name_is_resolved(&name_text) {
-    return None;
+    sony_lens_id_disambiguate(v, prts)?;
   }
   // ValueConv `$val` = `$val[0]` (the PLAIN raw LensType) carried verbatim; the
-  // PrintConv renders `$prt[idx]` (= `name`), selected by the SAME
-  // [`lens_id_print_index`].
+  // PrintConv renders the resolved name (= `$prt[idx]` for the unambiguous case,
+  // the [`sony_lens_id_disambiguate`] result for the ambiguous one).
   Some(CompositeRaw::Scalar(raw_lens_type))
+}
+
+/// `Image::ExifTool::Exif::PrintLensID($self, $prt[idx], $pcv, $prt[8], @val)`
+/// (Exif.pm:5353) for an AMBIGUOUS Sony/Minolta LensType — maps the
+/// [`LENS_ID`] ingredients into a
+/// [`PrintLensIdInputs`](crate::composite::convs::lens::sony_lens_id::PrintLensIdInputs)
+/// and runs the faithful disambiguator. Returns the resolved lens name, or
+/// `None` to DEFER.
+///
+/// The GATE `table.lookup_name(lensType) == $prt[idx]` confirms the resolved
+/// name IS this Sony table's own `$$printConv{$lensType}` — a NON-Sony ambiguous
+/// LensType (a `%pentaxLensTypes` `"Sigma or Tamron Lens (N N)"`) does not match,
+/// so it defers (exifast has no Pentax / other variant tables).
+#[cfg(feature = "exif")]
+fn sony_lens_id_disambiguate(
+  v: &[CompositeValue],
+  prts: &[Option<TagValue>],
+) -> Option<std::string::String> {
+  use crate::composite::convs::lens::sony_lens_id::{
+    PrintLensIdInputs, SonyLensTable, print_lens_id,
+  };
+  use lens_id_in as ix;
+
+  // The effective `$lensType` (= `$val[idx]`) + its PrintConv name (`$prt[idx]`).
+  let idx = lens_id_print_index(v);
+  let lens_type = v.get(idx)?.coerce_numeric()? as i64;
+  let name = crate::composite::value_text(prts.get(idx).and_then(Option::as_ref)?).into_owned();
+  // The PrintConv table: A-mount `%sonyLensTypes` for the plain LensType (idx 0),
+  // E-mount `%sonyLensTypes2` for a substituted LensType2/LensType3 (idx 2/3).
+  let table = if idx == ix::LENS_TYPE {
+    SonyLensTable::AMount
+  } else {
+    SonyLensTable::EMount
+  };
+  // GATE: the name must be this table's `$$printConv{$lensType}` (a Sony lens).
+  let id = u32::try_from(lens_type).ok()?;
+  if table.lookup_name(id).as_deref() != Some(name.as_str()) {
+    return None;
+  }
+
+  // Bind the `Cow`/text ingredients to locals so the `&str` inputs outlive the
+  // `print_lens_id` call.
+  let make = v.get(ix::MAKE).and_then(CompositeValue::as_text);
+  let model = v.get(ix::MODEL).and_then(CompositeValue::as_text);
+  let lens_model = v.get(ix::LENS_MODEL).and_then(CompositeValue::as_text);
+  let lens_focal_range = v
+    .get(ix::LENS_FOCAL_RANGE)
+    .and_then(CompositeValue::as_text);
+  let lens_spec_prt = prts
+    .get(ix::LENS_SPEC)
+    .and_then(Option::as_ref)
+    .map(crate::composite::value_text);
+
+  let inputs = PrintLensIdInputs {
+    is_sony: make.as_deref() == Some("SONY"),
+    model: model.as_deref(),
+    lens_type_prt: &name,
+    lens_spec_prt: lens_spec_prt.as_deref(),
+    lens_type,
+    focal_length: v
+      .get(ix::FOCAL_LENGTH)
+      .and_then(CompositeValue::coerce_numeric),
+    max_aperture: v
+      .get(ix::MAX_APERTURE)
+      .and_then(CompositeValue::coerce_numeric),
+    max_aperture_value: v
+      .get(ix::MAX_APERTURE_VALUE)
+      .and_then(CompositeValue::coerce_numeric),
+    short_focal: v
+      .get(ix::MIN_FOCAL_LENGTH)
+      .and_then(CompositeValue::coerce_numeric),
+    long_focal: v
+      .get(ix::MAX_FOCAL_LENGTH)
+      .and_then(CompositeValue::coerce_numeric),
+    lens_model: lens_model.as_deref(),
+    lens_focal_range: lens_focal_range.as_deref(),
+    table,
+  };
+  print_lens_id(&inputs)
 }
 
 /// Does Canon RFLensType (`$val[12]`, Exif.pm:5348) or the Pentax converter
@@ -2880,28 +2987,34 @@ const FLASH: CompositeDef = CompositeDef {
 /// = the raw LensType `$val[0]`).
 ///
 /// The ExifTool `Desire`s 1-12 (FocalLength/MaxAperture/LensType2/RFLensType/…)
-/// drive `PrintLensID`'s disambiguation / vendor-DB branches. exifast ports only
-/// the plain-LensType case, but it MUST KNOW when a vendor disambiguator is
-/// present so it can DEFER (return `None`) instead of mis-emitting a stale
-/// LensType name (a Canon RFLensType / Sony LensType2 file would otherwise emit
-/// the wrong lens). So the inputs carry the disambiguators the PrintConv
-/// branches on, in a COMPACT internal layout (`lens_id` reads them by THESE
-/// indices, not ExifTool's numbered slots): `[0]`=LensType (Require),
-/// `[1]`=FocalLength, `[2]`=LensType2, `[3]`=LensType3, `[4]`=LensFocalLength,
-/// `[5]`=RFLensType (all Desire). The remaining ExifTool Desires
-/// (MaxAperture/MaxApertureValue/MinFocalLength/MaxFocalLength/LensModel/
-/// LensFocalRange/LensSpec) only feed `PrintLensID`'s lens-DB lookup that this
-/// subset defers wholesale, so they are still omitted.
+/// drive `PrintLensID`'s disambiguation / vendor-DB branches. The inputs carry
+/// them in a COMPACT internal layout (`lens_id` reads them by THE [`LensIdIn`]
+/// indices, not ExifTool's numbered slots): the disambiguators the PrintConv
+/// branches on (`LensType2`/`LensType3`/`RFLensType`/`LensFocalLength`) so a
+/// Canon-RFLensType / Pentax-converter case can DEFER, AND the Sony/Minolta
+/// `PrintLensID` lens-DB ingredients (`MaxAperture`/`MaxApertureValue`/
+/// `MinFocalLength`/`MaxFocalLength`/`LensModel`/`LensFocalRange`/`LensSpec` +
+/// the `Make`/`Model` `$$et` reads) that resolve an ambiguous `" or "` LensType
+/// to a single lens (see [`sony_lens_id_disambiguate`]).
 #[cfg(feature = "exif")]
 const LENS_ID: CompositeDef = CompositeDef {
   name: "LensID",
   inputs: &[
-    bare_req("LensType"),
-    bare_des("FocalLength"),
-    bare_des("LensType2"),
-    bare_des("LensType3"),
-    bare_des("LensFocalLength"),
-    bare_des("RFLensType"),
+    bare_req("LensType"),         // 0 LensIdIn::LensType
+    bare_des("FocalLength"),      // 1 LensIdIn::FocalLength
+    bare_des("LensType2"),        // 2 LensIdIn::LensType2
+    bare_des("LensType3"),        // 3 LensIdIn::LensType3
+    bare_des("LensFocalLength"),  // 4 LensIdIn::LensFocalLength
+    bare_des("RFLensType"),       // 5 LensIdIn::RfLensType
+    bare_des("MaxAperture"),      // 6 LensIdIn::MaxAperture
+    bare_des("MaxApertureValue"), // 7 LensIdIn::MaxApertureValue
+    bare_des("MinFocalLength"),   // 8 LensIdIn::MinFocalLength
+    bare_des("MaxFocalLength"),   // 9 LensIdIn::MaxFocalLength
+    bare_des("LensModel"),        // 10 LensIdIn::LensModel
+    bare_des("LensFocalRange"),   // 11 LensIdIn::LensFocalRange
+    bare_des("LensSpec"),         // 12 LensIdIn::LensSpec
+    bare_des("Make"),             // 13 LensIdIn::Make ($$et{Make})
+    bare_des("Model"),            // 14 LensIdIn::Model ($$et{Model})
   ],
   derive: lens_id,
   print_conv: CompositePrintConv::LensId,
