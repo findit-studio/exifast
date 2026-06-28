@@ -4,6 +4,11 @@
 //! Unit tests for the Leica typed surface, the per-variant tag tables, and the
 //! `LeicaPrintConv` conversions (`%Panasonic::Leica2`..`Leica9`).
 
+// Crafted-byte fixtures index into fixed-size scratch buffers (e.g. the Data1
+// block's `data1[22..26]`); the parent module's `#![deny(clippy::indexing_slicing)]`
+// is not meant for this test code, matching the sibling inline test modules.
+#![allow(clippy::indexing_slicing)]
+
 use super::*;
 use crate::exif::ifd::RawValue;
 use crate::value::TagValue;
@@ -268,11 +273,13 @@ fn binary_subdir_rows_present_and_routed() {
     crate::exif::ifd::ByteOrder::Little,
     true,
   );
-  assert_eq!(shot.first().map(|(k, _)| k.as_str()), Some("FileIndex"));
+  assert_eq!(shot.first().map(|(k, ..)| k.as_str()), Some("FileIndex"));
   assert_eq!(
-    shot.first().map(|(_, v)| v.clone()),
+    shot.first().map(|(_, v, _)| v.clone()),
     Some(TagValue::I64(1234))
   );
+  // The default `Priority => 1` (ShotInfo `FileIndex` has no `Priority` directive).
+  assert_eq!(shot.first().map(|(.., p)| *p), Some(1u8));
 }
 
 /// The `%Panasonic::Subdir` table (#105, the Leica M9 sub-IFD): the plain leaves
@@ -396,5 +403,24 @@ fn leica4_descends_into_subdir_and_data1() {
   assert!(
     !names.contains(&"Subdir3000") && !names.contains(&"Data1"),
     "parent pointers must not emit; got {names:?}"
+  );
+  // #105 Codex [high]: BOTH LensType leaves are emitted, but the Subdir `0x3405`
+  // leaf keeps its default `Priority => 1` while the Data1 leaf carries
+  // `Priority => 0` (`Panasonic.pm:1981`) — so the shared de-dup keeps the
+  // higher-priority `0x3405` value and the later Data1 value never overrides it.
+  let prio = |name: &str, val: &str| -> Option<u8> {
+    em.iter()
+      .find(|e: &&VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+      .map(VendorEmission::priority)
+  };
+  assert_eq!(
+    prio("LensType", "Summilux-M 50mm f/1.4 (II)"),
+    Some(1),
+    "Subdir 0x3405 LensType default Priority => 1; got {names:?}"
+  );
+  assert_eq!(
+    prio("LensType", "Summilux-M 35mm f/1.4"),
+    Some(0),
+    "Data1 LensType Priority => 0 (Panasonic.pm:1981); got {names:?}"
   );
 }

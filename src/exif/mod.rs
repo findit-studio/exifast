@@ -14741,10 +14741,22 @@ pub(in crate::exif) fn leica_makernote_isolated(
         let blob = data
           .get(entry.value_offset()..entry.value_offset().saturating_add(entry.value_size()))
           .unwrap_or(&[]);
-        for (name, value) in
+        for (name, value, priority) in
           makernotes::vendors::leica::decode_leica_subdir(sub, blob, subdir_order, print_conv)
         {
-          let Ok(()) = sink.write_vendor_value("MakerNotes", g1, name.as_str(), value, false);
+          // Each decoded position carries its ExifTool `Priority => N` (default 1;
+          // `0` for Data1 `LensType` / FocusInfo `FocalLength`), so a `Priority =>
+          // 0` leaf never overrides a higher-priority same-`(group, name)` sibling
+          // (e.g. a later Data1 `LensType` must NOT replace the Subdir `0x3405
+          // LensType`) in the shared de-dup (`ExifTool.pm:9544-9560`).
+          let Ok(()) = sink.write_vendor_value_with_priority(
+            "MakerNotes",
+            g1,
+            name.as_str(),
+            value,
+            false,
+            priority,
+          );
         }
         continue;
       }

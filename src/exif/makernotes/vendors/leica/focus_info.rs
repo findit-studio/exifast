@@ -21,8 +21,9 @@
 //!
 //! `-n` carries the ValueConv number (`$val / 1000`); `-j` the PrintConv string.
 //!
-//! D8: a pure decoder (no public fields); returns the `(Name, TagValue)`
-//! emission pairs the dispatch site wraps in the `Leica` family-1 group.
+//! D8: a pure decoder (no public fields); returns the `(Name, TagValue,
+//! Priority)` emission triples the dispatch site wraps in the `Leica` family-1
+//! group.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -32,15 +33,18 @@ use smol_str::SmolStr;
 use std::vec::Vec;
 
 /// Decode the `Panasonic::FocusInfo` binary block (`Panasonic.pm:2084-2109`)
-/// into the `(Name, TagValue)` emission pairs.
+/// into the `(Name, TagValue, Priority)` emission triples.
 ///
 /// `data` is the raw `$$valPt` block; `order` the inherited parent Leica byte
 /// order. Per-field availability: each position is emitted only when its int16u
 /// is in range (FocalLength additionally drops a zero raw via its `RawConv`).
+/// `FocusDistance` takes the default `Priority => 1`; `FocalLength` carries
+/// `Priority => 0` (`Panasonic.pm:2102`) as the triple's third element, so the
+/// capture loop emits it with priority `0`.
 #[must_use]
-pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
-  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
-  // key 0 (byte 0) FocusDistance int16u.
+pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue, u8)> {
+  let mut out: Vec<(SmolStr, TagValue, u8)> = Vec::new();
+  // key 0 (byte 0) FocusDistance int16u — default `Priority => 1`.
   if let Some(raw) = get_u16(data, 0, order) {
     let v = f64::from(raw) / 1000.0;
     let value = if print_conv {
@@ -53,9 +57,9 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
     } else {
       TagValue::F64(v)
     };
-    out.push((SmolStr::new_static("FocusDistance"), value));
+    out.push((SmolStr::new_static("FocusDistance"), value, 1));
   }
-  // key 1 (byte 2) FocalLength int16u — RawConv drops a zero raw.
+  // key 1 (byte 2) FocalLength int16u — RawConv drops a zero raw; `Priority => 0`.
   if let Some(raw) = get_u16(data, 2, order) {
     // `RawConv => '$val ? $val : undef'`.
     if raw != 0 {
@@ -65,7 +69,8 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
       } else {
         TagValue::F64(v)
       };
-      out.push((SmolStr::new_static("FocalLength"), value));
+      // `Priority => 0` (Panasonic.pm:2102).
+      out.push((SmolStr::new_static("FocalLength"), value, 0));
     }
   }
   out
@@ -88,8 +93,14 @@ fn fmt_milli(v: f64) -> String {
 mod tests {
   use super::*;
 
-  fn find(em: &[(SmolStr, TagValue)], name: &str) -> Option<TagValue> {
-    em.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+  fn find(em: &[(SmolStr, TagValue, u8)], name: &str) -> Option<TagValue> {
+    em.iter()
+      .find(|(k, ..)| k == name)
+      .map(|(_, v, _)| v.clone())
+  }
+
+  fn priority(em: &[(SmolStr, TagValue, u8)], name: &str) -> Option<u8> {
+    em.iter().find(|(k, ..)| k == name).map(|(.., p)| *p)
   }
 
   /// FocusDistance + FocalLength. Oracle: FocusDistance raw 5500 ⇒ ValueConv 5.5
@@ -109,6 +120,10 @@ mod tests {
       find(&j, "FocalLength"),
       Some(TagValue::Str("50.0 mm".into()))
     );
+    // `FocusDistance` default `Priority => 1`; `FocalLength` `Priority => 0`
+    // (Panasonic.pm:2102).
+    assert_eq!(priority(&j, "FocusDistance"), Some(1u8));
+    assert_eq!(priority(&j, "FocalLength"), Some(0u8));
     let n = parse(&blob, ByteOrder::Little, false);
     assert_eq!(find(&n, "FocusDistance"), Some(TagValue::F64(5.5)));
     assert_eq!(find(&n, "FocalLength"), Some(TagValue::F64(50.0)));

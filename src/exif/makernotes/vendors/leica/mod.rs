@@ -166,11 +166,20 @@ pub(crate) fn populate_typed(
 }
 
 /// Decode a WALKED Leica `ProcessBinaryData` SubDirectory blob into its
-/// `(Name, TagValue)` emission pairs — the faithful descent for the Leica
-/// binary sub-tables (#105): `SerialInfo` (Leica3 0x0b), `FocusInfo` (Leica5
-/// 0x040a), `ShotInfo` (Leica5 0x0410). All emit under the `Leica` family-1
-/// group (`Panasonic.pm` declares `GROUPS => { 1 => 'Leica' }` for these
-/// tables).
+/// `(Name, TagValue, Priority)` emission triples — the faithful descent for the
+/// Leica binary sub-tables (#105): `SerialInfo` (Leica3 0x0b), `FocusInfo`
+/// (Leica5 0x040a), `ShotInfo` (Leica5 0x0410), `Data1` (Subdir 0x3901). All
+/// emit under the `Leica` family-1 group (`Panasonic.pm` declares `GROUPS => { 1
+/// => 'Leica' }` for these tables).
+///
+/// The third triple element is the row's ExifTool `Priority => N` for duplicate
+/// handling — the default `1` for most rows, but `0` for the two `Priority => 0`
+/// rows reachable here: `Data1` `LensType` (`Panasonic.pm:1981`) and `FocusInfo`
+/// `FocalLength` (`Panasonic.pm:2102`). The capture loop emits each via
+/// [`write_vendor_value_with_priority`](crate::exif) so a `Priority => 0` leaf
+/// never overrides a higher-priority same-`(group, name)` sibling — e.g. a later
+/// `Data1` `LensType` must NOT replace the Subdir `0x3405 LensType` in the shared
+/// de-dup (`ExifTool.pm:9544-9560`).
 ///
 /// `blob` is the verbatim `$$valPt` value span; `order` the byte order the
 /// parent Leica IFD was walked under.
@@ -180,7 +189,7 @@ pub fn decode_leica_subdir(
   blob: &[u8],
   order: ByteOrder,
   print_conv: bool,
-) -> Vec<(SmolStr, TagValue)> {
+) -> Vec<(SmolStr, TagValue, u8)> {
   match sub {
     LeicaSubTable::SerialInfo => serial_info::parse(blob, print_conv),
     LeicaSubTable::FocusInfo => focus_info::parse(blob, order, print_conv),

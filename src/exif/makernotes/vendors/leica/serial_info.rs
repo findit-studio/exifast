@@ -15,8 +15,9 @@
 //!   `s/\0.*//s`) then run through `FixUTF8`. No `PrintConv`/`ValueConv`, so
 //!   `-j` and `-n` are identical.
 //!
-//! D8: a pure decoder (no public fields); returns the `(Name, TagValue)`
-//! emission pairs the dispatch site wraps in the `Leica` family-1 group.
+//! D8: a pure decoder (no public fields); returns the `(Name, TagValue,
+//! Priority)` emission triples the dispatch site wraps in the `Leica` family-1
+//! group.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -25,15 +26,17 @@ use smol_str::SmolStr;
 use std::vec::Vec;
 
 /// Decode the `Panasonic::SerialInfo` binary block (`Panasonic.pm:1724-1733`)
-/// into the `(Name, TagValue)` emission pairs. `print_conv` is accepted for a
-/// uniform sub-table signature; there is no `PrintConv` here.
+/// into the `(Name, TagValue, Priority)` emission triples. `print_conv` is
+/// accepted for a uniform sub-table signature; there is no `PrintConv` here.
+/// `SerialNumber` carries no `Priority` directive, so it takes the default
+/// `Priority => 1`.
 #[must_use]
-pub fn parse(data: &[u8], print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+pub fn parse(data: &[u8], print_conv: bool) -> Vec<(SmolStr, TagValue, u8)> {
   let _ = print_conv;
-  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
-  // byte 4 SerialNumber string[8].
+  let mut out: Vec<(SmolStr, TagValue, u8)> = Vec::new();
+  // byte 4 SerialNumber string[8] — default `Priority => 1`.
   if let Some(v) = read_string(data, 4, 8) {
-    out.push((SmolStr::new_static("SerialNumber"), v));
+    out.push((SmolStr::new_static("SerialNumber"), v, 1));
   }
   out
 }
@@ -61,8 +64,10 @@ fn read_string(data: &[u8], off: usize, len: usize) -> Option<TagValue> {
 mod tests {
   use super::*;
 
-  fn find(em: &[(SmolStr, TagValue)], name: &str) -> Option<TagValue> {
-    em.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+  fn find(em: &[(SmolStr, TagValue, u8)], name: &str) -> Option<TagValue> {
+    em.iter()
+      .find(|(k, ..)| k == name)
+      .map(|(_, v, _)| v.clone())
   }
 
   /// `SerialNumber` is a `string[8]` at byte 4. Oracle: a block whose bytes 4..12
@@ -76,6 +81,8 @@ mod tests {
       find(&em, "SerialNumber"),
       Some(TagValue::Str("1234567".into()))
     );
+    // No `Priority` directive ⇒ the default `Priority => 1`.
+    assert_eq!(em.first().map(|(.., p)| *p), Some(1u8));
     assert_eq!(em.len(), 1);
     // No PrintConv ⇒ `-n` identical.
     assert_eq!(parse(&blob, false), em);

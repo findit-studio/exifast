@@ -18,11 +18,14 @@
 //!   fallback). `-n` keeps the `"id bits"` ValueConv string.
 //!
 //! `Priority => 0` makes this LensType NOT override a higher-priority sibling
-//! (e.g. the Subdir `0x3405 LensType`) in ExifTool's de-dup; exifast emits the
-//! faithful VALUE and leaves de-dup ordering to the emission engine.
+//! (e.g. the Subdir `0x3405 LensType`) in ExifTool's de-dup: [`parse`] rides the
+//! `0` out as the emission triple's priority, which the capture loop emits via
+//! `write_vendor_value_with_priority(.., 0)`, so the shared de-dup keeps the
+//! higher-priority `0x3405` value when both are present (`ExifTool.pm:9544-9560`).
 //!
-//! D8: a pure decoder (no public fields); returns the `(Name, TagValue)`
-//! emission pairs the dispatch site wraps in the `Leica` family-1 group.
+//! D8: a pure decoder (no public fields); returns the `(Name, TagValue,
+//! Priority)` emission triples the dispatch site wraps in the `Leica` family-1
+//! group.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -33,17 +36,23 @@ use smol_str::SmolStr;
 use std::vec::Vec;
 
 /// Decode the `Panasonic::Data1` binary block (`Panasonic.pm:1970-1987`) into
-/// the `(Name, TagValue)` emission pairs.
+/// the `(Name, TagValue, Priority)` emission triples.
 ///
 /// `data` is the raw `$$valPt` block; `order` the inherited Subdir byte order
 /// (consumed by the int32u read). Per-field availability: `LensType` is emitted
-/// only when its int32u (bytes 22..26) is in range.
+/// only when its int32u (bytes 22..26) is in range. Its `Priority => 0`
+/// (`Panasonic.pm:1981`) is the triple's third element, so the capture loop emits
+/// it with priority `0` and it never overrides a higher-priority sibling.
 #[must_use]
-pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
-  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
-  // byte 22 LensType int32u.
+pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue, u8)> {
+  let mut out: Vec<(SmolStr, TagValue, u8)> = Vec::new();
+  // byte 22 LensType int32u, `Priority => 0` (Panasonic.pm:1981).
   if let Some(raw) = get_u32(data, 22, order) {
-    out.push((SmolStr::new_static("LensType"), lens_type(raw, print_conv)));
+    out.push((
+      SmolStr::new_static("LensType"),
+      lens_type(raw, print_conv),
+      0,
+    ));
   }
   out
 }
@@ -75,8 +84,10 @@ fn lens_type(raw: u32, print_conv: bool) -> TagValue {
 mod tests {
   use super::*;
 
-  fn find(em: &[(SmolStr, TagValue)], name: &str) -> Option<TagValue> {
-    em.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+  fn find(em: &[(SmolStr, TagValue, u8)], name: &str) -> Option<TagValue> {
+    em.iter()
+      .find(|(k, ..)| k == name)
+      .map(|(_, v, _)| v.clone())
   }
 
   /// `LensType` at byte 22. Oracle: int32u `(5 << 2) = 20` ⇒ id 5 bits 0 ⇒
@@ -92,6 +103,15 @@ mod tests {
     assert_eq!(
       find(&parse(&blob, ByteOrder::Little, false), "LensType"),
       Some(TagValue::Str("5 0".into()))
+    );
+    // `Priority => 0` (Panasonic.pm:1981) rides out as the emission triple's
+    // third element.
+    assert_eq!(
+      parse(&blob, ByteOrder::Little, true)
+        .iter()
+        .find(|(k, ..)| k == "LensType")
+        .map(|(.., p)| *p),
+      Some(0u8)
     );
   }
 

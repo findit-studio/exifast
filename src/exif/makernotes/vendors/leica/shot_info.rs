@@ -14,8 +14,9 @@
 //! - byte 0 `FileIndex`, `int16u` — no `PrintConv`/`ValueConv`, so `-j` and `-n`
 //!   are identical (the bare integer).
 //!
-//! D8: a pure decoder (no public fields); returns the `(Name, TagValue)`
-//! emission pairs the dispatch site wraps in the `Leica` family-1 group.
+//! D8: a pure decoder (no public fields); returns the `(Name, TagValue,
+//! Priority)` emission triples the dispatch site wraps in the `Leica` family-1
+//! group.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -25,17 +26,19 @@ use smol_str::SmolStr;
 use std::vec::Vec;
 
 /// Decode the `Panasonic::ShotInfo` binary block (`Panasonic.pm:2069-2081`) into
-/// the `(Name, TagValue)` emission pairs. `print_conv` is accepted for a uniform
-/// sub-table signature; there is no `PrintConv` here.
+/// the `(Name, TagValue, Priority)` emission triples. `print_conv` is accepted
+/// for a uniform sub-table signature; there is no `PrintConv` here. `FileIndex`
+/// carries no `Priority` directive, so it takes the default `Priority => 1`.
 #[must_use]
-pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue, u8)> {
   let _ = print_conv;
-  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
-  // byte 0 FileIndex int16u.
+  let mut out: Vec<(SmolStr, TagValue, u8)> = Vec::new();
+  // byte 0 FileIndex int16u — default `Priority => 1`.
   if let Some(n) = get_u16(data, 0, order) {
     out.push((
       SmolStr::new_static("FileIndex"),
       TagValue::I64(i64::from(n)),
+      1,
     ));
   }
   out
@@ -46,8 +49,10 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
 mod tests {
   use super::*;
 
-  fn find(em: &[(SmolStr, TagValue)], name: &str) -> Option<TagValue> {
-    em.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+  fn find(em: &[(SmolStr, TagValue, u8)], name: &str) -> Option<TagValue> {
+    em.iter()
+      .find(|(k, ..)| k == name)
+      .map(|(_, v, _)| v.clone())
   }
 
   /// `FileIndex` is an `int16u` at byte 0. Oracle: bytes `D2 04` (LE) ⇒
@@ -56,6 +61,8 @@ mod tests {
   fn file_index_at_offset_0() {
     let em = parse(&1234u16.to_le_bytes(), ByteOrder::Little, true);
     assert_eq!(find(&em, "FileIndex"), Some(TagValue::I64(1234)));
+    // No `Priority` directive ⇒ the default `Priority => 1`.
+    assert_eq!(em.first().map(|(.., p)| *p), Some(1u8));
     assert_eq!(em.len(), 1);
     // No PrintConv ⇒ `-n` identical.
     assert_eq!(parse(&1234u16.to_le_bytes(), ByteOrder::Little, false), em);
