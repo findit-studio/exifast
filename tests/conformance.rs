@@ -13474,6 +13474,20 @@ fn mpeg2_ts_misb_klv_conformance() {
   check("MPEG2_TS_misb_klv.ts", "MPEG2_TS_misb_klv.ts.n.json", false);
 }
 
+// #130 — crafted single-packet MISB (STANAG-4609 KLV) MPEG-TS. The `0x15`
+// packetized-metadata PES carries the SMPTE universal label (`06 0e 2b 34`), so
+// `MISB::ParseMISB` (M2TS.pm:355-364) decodes the ST 0601.11 UAS Datalink + the
+// ST 0102.11 Security tags. Unlike a moov-level GPS source, MISB is NOT
+// `-ee`-gated: bundled extracts the first reached `0x15` packet in the MAIN pass
+// (the H.264 force-full-scan keeps the walk alive), so the 18 `MISB:*` tags
+// surface in DEFAULT mode too (byte-exact, both `-j` PrintConv and `-n`). The
+// matching `-ee` goldens are pinned in `timed_metadata_conformance.rs`.
+#[test]
+fn mpeg2_ts_misb_uas_conformance() {
+  check("MPEG2_TS_misb_uas.ts", "MPEG2_TS_misb_uas.ts.json", true);
+  check("MPEG2_TS_misb_uas.ts", "MPEG2_TS_misb_uas.ts.n.json", false);
+}
+
 // #128 — MPEG-2 video + AC3 audio in MPEG-TS (stream types 0x02, 0x81). The
 // teammate fixture (#408) re-added the (now-active, see below) Pentax PEF test
 // stubs from a pre-#393 base; those duplicates are dropped here — #393's

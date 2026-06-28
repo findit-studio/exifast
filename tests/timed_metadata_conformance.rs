@@ -5077,3 +5077,35 @@ fn parrot_arcore_multi_tlv_ordering_ee_byte_exact() {
     "QuickTime_parrot_arcore_trunc_overflow.mp4.ee.n.json",
   );
 }
+
+// #130 — crafted single-packet MISB (STANAG-4609 KLV) MPEG-TS (the lone non-
+// QuickTime fixture in this suite; the shared `check_ee*` helpers are container-
+// agnostic — they only thread `-ee`/`-G3`/`-n` into `extract_info_with_options`).
+// The `0x15` packetized-metadata PES carries the SMPTE universal label, so
+// `MISB::ParseMISB` (M2TS.pm:355-364) decodes the ST 0601.11 UAS Datalink + the
+// ST 0102.11 Security tags into `MISB:*` leaves, each opening one `Doc<N>`
+// (MISB.pm:398). Unlike a moov-level GPS source, MISB is NOT `-ee`-gated:
+// bundled extracts the first reached packet in the MAIN pass too, so the `-ee`
+// output equals the default output — the same 18 tags. These goldens pin the
+// `-ee` axis (the doc-collapsed `-G1`, the per-`Doc<N>` `-G3:1`, and the `-n`
+// raw-scalar form), byte-exact; the matching default goldens live in
+// `conformance.rs` (`mpeg2_ts_misb_uas_conformance`).
+#[test]
+fn mpeg2_ts_misb_uas_ee_byte_exact() {
+  // `-ee -G1`: the single packet's 18 `MISB:*` tags, doc axis collapsed.
+  check_ee(
+    "MPEG2_TS_misb_uas.ts",
+    "MPEG2_TS_misb_uas.ts.ee.json",
+    false,
+  );
+  // `-ee -G3:1`: the same tags under their `Doc1:MISB:…` document prefix.
+  check_ee(
+    "MPEG2_TS_misb_uas.ts",
+    "MPEG2_TS_misb_uas.ts.ee.g3.json",
+    true,
+  );
+  // `-ee -n`: the raw post-ValueConv scalars (e.g. `GPSLatitude` 22.5°, not the
+  // `ToDMS` string; `IcingDetected` 2, not "Yes"; `WeaponLoad` 4660, not the
+  // `0x1234` hex), which the `-j` goldens above cannot catch.
+  check_ee_n("MPEG2_TS_misb_uas.ts", "MPEG2_TS_misb_uas.ts.ee.n.json");
+}

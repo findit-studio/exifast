@@ -460,6 +460,11 @@ pub struct Meta<'a> {
   /// `M2TS.mts`). Emitted under the family-1 `LIGO` group through the shared
   /// QuickTime `Stream` emitter and projected into [`crate::metadata::MediaMetadata::gps`].
   ligogps: crate::metadata::LigoGpsMeta,
+  /// Decoded MISB (STANAG-4609 KLV) metadata (`0x15` packetized-metadata stream,
+  /// M2TS.pm:355-364 → `MISB::ParseMISB`). One leaf per extracted KLV tag, each
+  /// stamped with its `Doc<N>` (MISB.pm:398). `is_empty()` for a stream with no
+  /// MISB-coded `0x15` PES. Emitted under the family-1 `MISB` group.
+  misb: crate::formats::misb::MisbMeta,
 }
 
 /// The discriminator that drives `FileType` finalization (M2TS.pm:617).
@@ -859,6 +864,16 @@ struct Walker<'a> {
   /// `Doc<N>` in file (walk) order. Used to stamp [`Self::ligogps`] via
   /// [`crate::metadata::LigoGpsMeta::stamp_doc_from`].
   ligo_doc_counter: u32,
+  /// Decoded MISB (STANAG-4609 KLV) metadata — the `0x15` packetized-metadata
+  /// arm (M2TS.pm:355-364 → `MISB::ParseMISB`). Each `0x15` PES whose payload
+  /// carries the MISB code is decoded into [`crate::formats::misb::MisbMeta`].
+  misb: crate::formats::misb::MisbMeta,
+  /// The global document counter for the MISB arm (`$$et{DOC_COUNT}`,
+  /// MISB.pm:398). Each `ParseMISB` packet that yields ≥1 tag opens one
+  /// `Doc<N>`; a barren packet gives the count back (MISB.pm:448). A private
+  /// counter like [`Self::ligo_doc_counter`] (no fixture combines MISB with the
+  /// dashcam-GPS / H.264-MDPM `Doc<N>` producers).
+  misb_doc_counter: u32,
   /// Latch — the LIGOGPSINFO walker's own `$et->Warn` (`LIGOGPSINFO format
   /// error` / `LIGOGPSINFO coordinates out of range`, LigoGPS.pm:235/254) has
   /// been pushed into [`Self::warnings`] AT ITS PES WALK POSITION. The warning
@@ -948,6 +963,8 @@ impl<'a> Walker<'a> {
       ligogps: crate::metadata::LigoGpsMeta::new(),
       ligo_doc_counter: 0,
       ligo_warning_pushed: false,
+      misb: crate::formats::misb::MisbMeta::new(),
+      misb_doc_counter: 0,
       extract_embedded,
     }
   }
@@ -1842,10 +1859,37 @@ impl<'a> Walker<'a> {
         }
         ParseOutcome::Done
       }
-      // M2TS.pm:355-364 — packetized metadata (MISB). Deferred; bundled
-      // leaves `$more = 0` when the MISB code is absent (which is always,
-      // here — the MISB decoder isn't ported).
-      0x15 => ParseOutcome::Done,
+      // M2TS.pm:355-364 — packetized metadata (MISB). The PES payload (after the
+      // 5-byte service header) carries a `06 0e 2b 34` SMPTE key prefix
+      // (M2TS.pm:357 `/^.{5}\x06\x0e\x2b\x34/s`); `MISB::ParseMISB` then walks
+      // the KLV records into [`crate::formats::misb::MisbMeta`], each packet
+      // opening one `Doc<N>` (MISB.pm:398). Unlike the LIGOGPS arm, MISB is NOT
+      // decode-gated on `-ee`: bundled runs `ParseMISB` whenever the walk reaches
+      // this packet (M2TS.pm:357), in default OR `-ee` mode; `-ee` only governs
+      // whether the walk reaches LATER packets (the `$more` below). The walk
+      // reaches a `0x15` PES only when it stays alive — via an H.264 force-`More`
+      // full scan, an `ExtractEmbedded > 2` whole-file scan, or (for a PES that
+      // precedes its PMT) the end-of-scan in-flight flush (M2TS.pm:1009-1013),
+      // where this return value is ignored.
+      0x15 => {
+        if crate::formats::misb::MisbMeta::has_misb_code(payload) {
+          let before = self.misb_doc_counter;
+          self.misb_doc_counter = self.misb.parse_packet(payload, before);
+          let extracted = self.misb_doc_counter != before;
+          // M2TS.pm:359-363 — `$more`: no-`ee` ⇒ 0 (only the first packet);
+          // `-ee` ⇒ `ParseMISB`'s return (1 when this packet extracted a tag, so
+          // the walk keeps reading subsequent `0x15` packets). exifast exposes no
+          // `ExtractEmbedded > 2` level (the `%gpsPID` whole-file unroll).
+          if self.extract_embedded && extracted {
+            ParseOutcome::More
+          } else {
+            ParseOutcome::Done
+          }
+        } else {
+          // M2TS.pm:357 false ⇒ `$more` stays 0 (not a MISB packet).
+          ParseOutcome::Done
+        }
+      }
       // M2TS.pm:308-318 — LIGOGPSINFO dashcam GPS on `type == 6 and $pid ==
       // 0x0300`. The PES private stream (stream_id 0xbf, `%noSyntax`) carries a
       // `LIGOGPSINFO\0`-prefixed block which the bundled routes to
@@ -2029,6 +2073,7 @@ impl<'a> Walker<'a> {
       h264: self.h264,
       warnings: self.warnings,
       ligogps: self.ligogps,
+      misb: self.misb,
     }
   }
 }
@@ -2402,6 +2447,16 @@ impl crate::emit::Taggable for Meta<'_> {
         crate::formats::quicktime::LigoSelect::All,
         &mut tags,
       );
+    }
+
+    // MISB (STANAG-4609 KLV) — the `0x15` packetized-metadata stream
+    // (M2TS.pm:355-364). Emitted under the family-1 `MISB` group with each
+    // leaf's `Doc<N>` (collapsed at `-G1`, `Doc<N>:`-prefixed at `-G3`). Unlike
+    // LIGOGPS this is NOT `-ee`-gated (bundled extracts the first reached packet
+    // in default mode too); the `Doc<N>` stamps were assigned at decode (walk)
+    // time, so emission is a pure render.
+    if !self.misb.is_empty() {
+      self.misb.emit(opts, &mut tags);
     }
 
     tags.into_iter()
