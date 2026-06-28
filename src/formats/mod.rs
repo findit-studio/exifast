@@ -44,8 +44,12 @@ pub mod id3;
 // AVCHD-encoded video carries (`H264::ParseH264Video`, M2TS.pm:343-345).
 #[cfg(feature = "m2ts")]
 pub mod m2ts;
+// MISB (STANAG-4609 KLV) timed metadata in M2TS `0x15` packetized-metadata
+// streams; a sub-module of the M2TS port (MISB.pm → M2TS.pm:355-364).
 #[cfg(feature = "matroska")]
 pub mod matroska;
+#[cfg(feature = "m2ts")]
+pub mod misb;
 #[cfg(feature = "moi")]
 pub mod moi;
 #[cfg(feature = "mpc")]

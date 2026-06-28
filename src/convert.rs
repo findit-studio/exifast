@@ -1670,12 +1670,15 @@ pub fn read_value(
   }
 }
 
-/// ExifTool `%formatSize` (`ExifTool.pm:6199-6231`), Red.pm subset.
+/// ExifTool `%formatSize` (`ExifTool.pm:6199-6231`), Red.pm subset plus the
+/// `int16s` / `int64u` / `double` widths MISB's KLV reader needs (the "first
+/// consumer" arms the original docstring deferred).
 fn format_size(format: &str) -> Option<usize> {
   Some(match format {
     "int8u" | "int8s" | "string" | "undef" => 1, // ExifTool.pm:6200-6201,6224,6226
-    "int16u" => 2,                               // ExifTool.pm:6203
+    "int16u" | "int16s" => 2,                    // ExifTool.pm:6203-6204
     "int32u" | "int32s" | "rational32u" | "float" => 4, // ExifTool.pm:6205-6211,6219
+    "int64u" | "double" => 8,                    // ExifTool.pm:6216,6213
     _ => return None,
   })
 }
@@ -1749,6 +1752,50 @@ fn read_one(data: &[u8], offset: usize, format: &str, byte_order: ByteOrder) -> 
         i64::from(num),
         i64::from(den),
       )))
+    }
+    "int16s" => {
+      // ExifTool.pm:6070 `Get16s` (signed 16-bit).
+      let b: [u8; 2] = [data[offset], data[offset + 1]];
+      Some(TagValue::I64(i64::from(match byte_order {
+        ByteOrder::Mm => i16::from_be_bytes(b),
+        ByteOrder::Ii => i16::from_le_bytes(b),
+      })))
+    }
+    "int64u" => {
+      // ExifTool.pm:6075 `Get64u` ⇒ unpack `Q`/8-byte. The full 64-bit range
+      // does not fit `i64`, so it is carried as `TagValue::U64` (MISB's
+      // `GPSDateTime`/`EventStartTime` microsecond epochs, well under 2^53).
+      let b: [u8; 8] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+      ];
+      Some(TagValue::U64(match byte_order {
+        ByteOrder::Mm => u64::from_be_bytes(b),
+        ByteOrder::Ii => u64::from_le_bytes(b),
+      }))
+    }
+    "double" => {
+      // ExifTool.pm:6080 `GetDouble` ⇒ unpack `d` (IEEE-754 double precision).
+      let b: [u8; 8] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+      ];
+      Some(TagValue::F64(match byte_order {
+        ByteOrder::Mm => f64::from_be_bytes(b),
+        ByteOrder::Ii => f64::from_le_bytes(b),
+      }))
     }
     _ => None,
   }
@@ -3493,9 +3540,11 @@ mod tests {
     // $len=1. We return None instead — the caller (Red.pm:282 unknown
     // format-code path) emits its own Warning and aborts the directory walk,
     // so the engine never reaches a fake $len=1 read. Same incremental-
-    // derivation discipline: future formats add their own arms as needed.
+    // derivation discipline: future formats add their own arms as needed (e.g.
+    // `int16s`/`int64u`/`double` are now implemented for MISB's KLV reader, so
+    // the still-unimplemented `int64s` stands in for the unknown-format case).
     let buf = [0u8; 16];
-    assert_eq!(read_value(&buf, 0, "double", 1, ByteOrder::Mm), None);
+    assert_eq!(read_value(&buf, 0, "int64s", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "binary", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "garbage", 1, ByteOrder::Mm), None);
   }

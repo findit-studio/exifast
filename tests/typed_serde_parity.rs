@@ -1768,7 +1768,14 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// and the EOS-R CustomFunctions `ApertureRange`/`ShutterSpeedRange` all byte-exact;
 /// a `FIXTURE_EXCLUDED_KEYS` entry drops the two niche residuals
 /// (`Composite:LensID` + `Track4:VignettingCorrVersion`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 642;
+///
+/// `643`: `MPEG2_TS_misb_uas.ts` (#130) — the crafted single-packet MISB
+/// (STANAG-4609 KLV) MPEG-TS. Its `0x15` packetized-metadata PES carries the
+/// SMPTE universal label (`06 0e 2b 34`), so `MISB::ParseMISB` decodes the
+/// ST 0601.11 UAS Datalink + ST 0102.11 Security tags; bundled extracts them in
+/// the MAIN pass (default mode) too, not only under `-ee`, so the default
+/// goldens carry the 18 `MISB:*` tags and the fixture is active.
+const EXPECTED_ACTIVE_FIXTURES: usize = 643;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
