@@ -145,15 +145,24 @@ pub fn model_is_camera_info_1dmkiv(model: Option<&str>) -> bool {
   model_ends_with(model, "1D Mark IV")
 }
 
+/// `true` when `model` selects `%Canon::CameraInfo1DX` (`Canon.pm:1337`,
+/// `$$self{Model} =~ /EOS-1D X$/` — end-anchored, so the "1D X", NOT the
+/// "1D X Mark II/III" (which end with `II`/`III`, never `X$`)).
+#[must_use]
+pub fn model_is_camera_info_1dx(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.trim_end().ends_with("EOS-1D X"))
+}
+
 /// Decode the `Canon::CameraInfo` block for the parent `model` via the `0x0d`
 /// model-conditional list (`Canon.pm:1308-1494`), evaluated in ExifTool's order.
 /// Ported variants: the 1-series no-Hook bodies (1D / 1DS / 1DmkII / 1DmkIIN /
 /// 1DmkIII), the 5D / 6D / 7D, and the xxxD DSLR batch (40D / 50D / 60D / 70D /
 /// 80D / 450D / 500D / 550D / 600D / 650D / 700D / 750D / 760D / 1000D, plus the
-/// 1100D / 1200D aliases), and the pro multi-Hook bodies 5DmkII (1 Hook) and
-/// 1DmkIV (2 Hooks); any other model yields nothing (deferred). The remaining
-/// pro multi-Hook bodies (1DX / 5DmkIII), the mirrorless and PowerShot
-/// count-keyed tables remain deferred. `print_conv` selects the
+/// 1100D / 1200D aliases), and the pro multi-Hook bodies 5DmkII (1 Hook),
+/// 1DmkIV (2 Hooks) and 1DX (3 Hooks); any other model yields nothing
+/// (deferred). The remaining pro multi-Hook body 5DmkIII (4 Hooks), the
+/// mirrorless and PowerShot count-keyed tables remain deferred. `print_conv`
+/// selects the
 /// PrintConv vs ValueConv view; `canon_lens_type` is the pre-scanned
 /// `$$self{LensType}` (the CameraSettings DataMember) that gates the
 /// `MacroMagnification` leaf (`%ciMacroMagnification`, `Canon.pm:3124-3133`).
@@ -175,6 +184,8 @@ pub fn parse(
     camera_info_1dmkiii(data, order, print_conv, model, canon_lens_type)
   } else if model_is_camera_info_1dmkiv(model) {
     camera_info_1dmkiv(data, order, print_conv)
+  } else if model_is_camera_info_1dx(model) {
+    camera_info_1dx(data, order, print_conv)
   } else if model_is_camera_info_5d(model) {
     camera_info_5d(data, order, print_conv)
   } else if model_is_camera_info_5dmkii(model) {
@@ -1653,6 +1664,142 @@ fn canon_firm_1dmkiv(data: &[u8]) -> u8 {
     1
   } else if firmware_prefix_at(data, 0x1ed) {
     2
+  } else {
+    0
+  }
+}
+
+/// `%Canon::CameraInfo1DX` (`Canon.pm:3665-3773`). `FORMAT => 'int8u'`,
+/// `FIRST_ENTRY => 0`, `PRIORITY => 0`. THREE firmware Hooks — 0x1b
+/// (CameraTemperature), 0x8e (FocusDistanceLower) and 0x1ab (MaxFocalLength).
+/// The `0x00 FirmwareVersionLookAhead` probes 0x271/0x279/0x280/0x285
+/// (CanonFirm 1..4). `0x3f4 PictureStyleInfo` walks `%Canon::PSInfo2`. Note the
+/// `+0x10000` abort lives on the THIRD Hook (0x1ab), so an unrecognized firmware
+/// still emits the leaves up to 0x1a9 (each `-3`/`-7` shifted) before the rest
+/// fall out of range.
+fn camera_info_1dx(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut push = |name: &'static str, v: TagValue| out.push((SmolStr::new_static(name), v));
+  let canon_firm = canon_firm_1dx(data);
+  let hooks: [(usize, i64); 3] = [
+    (0x1b, hook_1dx_1b(canon_firm)),
+    (0x8e, hook_1dx_8e(canon_firm)),
+    (0x1ab, hook_1dx_1ab(canon_firm)),
+  ];
+  let at = |off: usize| shifted_at(off, &hooks);
+
+  // 0x03/0x04/0x06 and the 0x1b Hook entry read at their nominal offsets.
+  emit_exposure_triple(data, print_conv, &mut push);
+  emit_camera_temperature(data, 0x1b, print_conv, &mut push);
+  // Every leaf after 0x1b takes the 0x1b Hook; after 0x8e adds the 0x8e Hook;
+  // after 0x1ab adds the 0x1ab Hook.
+  if let Some(o) = at(0x23) {
+    emit_focal_mm(data, o, "FocalLength", true, order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x7d) {
+    emit_camera_orientation(data, o, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x8c) {
+    emit_focus_distance(data, o, "FocusDistanceUpper", order, print_conv, &mut push);
+  }
+  // 0x8e FocusDistanceLower — the second Hook entry, read at 0x8e + the 0x1b Hook.
+  if let Some(o) = at(0x8e) {
+    emit_focus_distance(data, o, "FocusDistanceLower", order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0xbc) {
+    emit_white_balance(data, o, order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0xc0) {
+    emit_color_temperature(data, o, order, &mut push);
+  }
+  if let Some(o) = at(0xf4) {
+    emit_picture_style(data, o, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x1a7) {
+    emit_lens_type(data, o, order, print_conv, &mut push);
+  }
+  if let Some(o) = at(0x1a9) {
+    emit_focal_mm(
+      data,
+      o,
+      "MinFocalLength",
+      false,
+      order,
+      print_conv,
+      &mut push,
+    );
+  }
+  // 0x1ab MaxFocalLength — the third Hook entry, read at 0x1ab + the 0x1b/0x8e Hooks.
+  if let Some(o) = at(0x1ab) {
+    emit_focal_mm(
+      data,
+      o,
+      "MaxFocalLength",
+      false,
+      order,
+      print_conv,
+      &mut push,
+    );
+  }
+  // 0x280 FirmwareVersion (string[6], NO RawConv guard).
+  if let Some(o) = at(0x280) {
+    emit_firmware_version(data, o, false, &mut push);
+  }
+  if let Some(o) = at(0x2d0) {
+    emit_file_index(data, o, order, &mut push);
+  }
+  if let Some(o) = at(0x2dc) {
+    emit_directory_index(data, o, order, true, &mut push);
+  }
+  if let Some(ps_start) = at(0x3f4) {
+    ps_info2(data, ps_start, order, print_conv, &mut push);
+  }
+  out
+}
+
+/// `%Canon::CameraInfo1DX` 0x1b (CameraTemperature) `Hook` delta
+/// (`Canon.pm:3700`, `$varSize -= 3 if $$self{CanonFirm} < 3`): `-3` for firmware
+/// 0/1/2, `0` for firmware 3/4. (Unlike the other tables, the 1DX `0x1b` Hook
+/// carries NO `0x10000` abort for an unrecognized firmware.)
+fn hook_1dx_1b(canon_firm: u8) -> i64 {
+  if canon_firm < 3 { -3 } else { 0 }
+}
+
+/// `%Canon::CameraInfo1DX` 0x8e (FocusDistanceLower) `Hook` delta
+/// (`Canon.pm:3718`, `$varSize -= 4 if $$self{CanonFirm} < 3; $varSize += 5 if
+/// $$self{CanonFirm} == 4`): `-4` for firmware 0/1/2, `+5` for firmware 4, `0`
+/// for firmware 3.
+fn hook_1dx_8e(canon_firm: u8) -> i64 {
+  let lt3 = if canon_firm < 3 { -4 } else { 0 };
+  let eq4 = if canon_firm == 4 { 5 } else { 0 };
+  lt3 + eq4
+}
+
+/// `%Canon::CameraInfo1DX` 0x1ab (MaxFocalLength) `Hook` delta (`Canon.pm:3748`,
+/// `$varSize += ($$self{CanonFirm} ? -8 : 0x10000) if $$self{CanonFirm} < 2`):
+/// `-8` for firmware 1, `+0x10000` (out-of-range abort) for an unrecognized
+/// firmware, `0` for firmware 2/3/4.
+fn hook_1dx_1ab(canon_firm: u8) -> i64 {
+  if canon_firm < 2 {
+    if canon_firm != 0 { -8 } else { 0x1_0000 }
+  } else {
+    0
+  }
+}
+
+/// `%Canon::CameraInfo1DX` `0x00 FirmwareVersionLookAhead` RawConv
+/// (`Canon.pm:3682-3693`): `CanonFirm = 1` if a `D.D.D` prefix sits at 0x271,
+/// else `2` at 0x279, `3` at 0x280, `4` at 0x285, else `0` (ExifTool warns then
+/// the 0x1ab Hook shifts the post-MaxFocal leaves out of range).
+fn canon_firm_1dx(data: &[u8]) -> u8 {
+  if firmware_prefix_at(data, 0x271) {
+    1
+  } else if firmware_prefix_at(data, 0x279) {
+    2
+  } else if firmware_prefix_at(data, 0x280) {
+    3
+  } else if firmware_prefix_at(data, 0x285) {
+    4
   } else {
     0
   }
@@ -3992,6 +4139,137 @@ mod tests {
     assert!(em.iter().any(|(k, _)| k == "FocusDistanceLower"));
     assert_eq!(find("MinFocalLength"), None);
     assert_eq!(find("MaxFocalLength"), None);
+    assert_eq!(find("FirmwareVersion"), None);
+    assert_eq!(find("FileIndex"), None);
+    assert!(em.iter().all(|(k, _)| k != "ContrastStandard"));
+  }
+
+  /// `/EOS-1D X$/` routes to the 1DX table; the "1D X Mark II/III" do not match
+  /// the `X$` anchor, and the generic 1D arm does not swallow it.
+  #[test]
+  fn dispatch_anchored_1dx() {
+    assert!(model_is_camera_info_1dx(Some("Canon EOS-1D X")));
+    assert!(!model_is_camera_info_1dx(Some("Canon EOS-1D X Mark II")));
+    assert!(!model_is_camera_info_1dx(Some("Canon EOS-1D X Mark III")));
+    assert!(!model_is_camera_info_1d(Some("Canon EOS-1D X")));
+  }
+
+  /// `%Canon::CameraInfo1DX` firmware-3 (`CanonFirm == 3`, the table's nominal
+  /// 1.0.2 layout): all three Hooks contribute `0`, so no `varSize` shift.
+  #[test]
+  fn camera_info_1dx_firmware3_fields() {
+    let mut b = vec![0u8; 0x500];
+    b[0x06] = 88; // ISO 400
+    b[0x1b] = 148; // CameraTemperature 20 C (first Hook entry)
+    b[0x23] = 0x00;
+    b[0x24] = 0x32; // FocalLength 50 mm
+    b[0x7d] = 1; // CameraOrientation Rotate 90 CW
+    b[0xc0] = 0x50;
+    b[0xc1] = 0x14; // ColorTemperature int16u LE 5200
+    b[0xf4] = 0x81; // PictureStyle 0x81 Standard
+    b[0x1a9] = 0x00;
+    b[0x1aa] = 0x18; // MinFocalLength 24 mm
+    b[0x1ab] = 0x00;
+    b[0x1ac] = 0x69; // MaxFocalLength 105 mm (third Hook entry)
+    b[0x280..0x286].copy_from_slice(b"1.0.2\0"); // version at 0x280 ⇒ CanonFirm 3
+    b[0x2d0..0x2d4].copy_from_slice(&200u32.to_le_bytes()); // FileIndex ⇒ 201
+    b[0x2dc..0x2e0].copy_from_slice(&200u32.to_le_bytes()); // DirectoryIndex ⇒ 199
+    b[0x3f4..0x3f8].copy_from_slice(&5i32.to_le_bytes()); // PSInfo2 ContrastStandard
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(
+      find("CameraOrientation"),
+      Some(TagValue::Str("Rotate 90 CW".into()))
+    );
+    assert_eq!(find("ColorTemperature"), Some(TagValue::I64(5200)));
+    assert_eq!(find("PictureStyle"), Some(TagValue::Str("Standard".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("1.0.2".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(201)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(199)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(5)));
+  }
+
+  /// `%Canon::CameraInfo1DX` firmware-1 (`CanonFirm == 1`): the three-Hook
+  /// CUMULATIVE shift — `-3` after 0x1b, `-7` after 0x8e, `-15` after 0x1ab.
+  #[test]
+  fn camera_info_1dx_firmware1_cumulative_shift() {
+    let mut b = vec![0u8; 0x500];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0x271..0x277].copy_from_slice(b"5.7.1\0"); // prefix at 0x271 ⇒ CanonFirm 1
+    b[0x20] = 0x00;
+    b[0x21] = 0x32; // FocalLength 0x23 ⇒ 0x20 (-3)
+    b[0x1a2] = 0x00;
+    b[0x1a3] = 0x18; // MinFocalLength 0x1a9 ⇒ 0x1a2 (-7)
+    b[0x1a4] = 0x00;
+    b[0x1a5] = 0x69; // MaxFocalLength 0x1ab ⇒ 0x1a4 (-7)
+    b[0x2c1..0x2c5].copy_from_slice(&500u32.to_le_bytes()); // FileIndex 0x2d0 ⇒ 0x2c1 (-15)
+    b[0x2cd..0x2d1].copy_from_slice(&500u32.to_le_bytes()); // DirectoryIndex 0x2dc ⇒ 0x2cd (-15)
+    b[0x3e5..0x3e9].copy_from_slice(&7i32.to_le_bytes()); // PSInfo2 0x3f4 ⇒ 0x3e5 (-15)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("5.7.1".into())));
+    assert_eq!(find("FileIndex"), Some(TagValue::I64(501)));
+    assert_eq!(find("DirectoryIndex"), Some(TagValue::I64(499)));
+    assert_eq!(find("ContrastStandard"), Some(TagValue::I64(7)));
+  }
+
+  /// `%Canon::CameraInfo1DX` firmware-4 (`CanonFirm == 4`): the 0x8e Hook is the
+  /// only POSITIVE-shift case (`+5`), leaving 0x1b/0x1ab at `0`.
+  #[test]
+  fn camera_info_1dx_firmware4_positive_shift() {
+    let mut b = vec![0u8; 0x500];
+    b[0x06] = 88; // ISO 400
+    b[0x285..0x28b].copy_from_slice(b"2.1.0\0"); // prefix only at 0x285 ⇒ CanonFirm 4
+    b[0x23] = 0x00;
+    b[0x24] = 0x32; // FocalLength 0x23 (0 shift)
+    b[0x1ae] = 0x00;
+    b[0x1af] = 0x18; // MinFocalLength 0x1a9 ⇒ 0x1ae (+5)
+    b[0x1b0] = 0x00;
+    b[0x1b1] = 0x69; // MaxFocalLength 0x1ab ⇒ 0x1b0 (+5)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MinFocalLength"), Some(TagValue::Str("24 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    assert_eq!(find("FirmwareVersion"), Some(TagValue::Str("2.1.0".into())));
+  }
+
+  /// `%Canon::CameraInfo1DX` unrecognized firmware (`CanonFirm == 0`): the
+  /// `+0x10000` abort lives on the THIRD Hook (0x1ab), so the leaves up to 0x1a9
+  /// still emit (each `-3`/`-7` shifted) while the post-0x1ab leaves drop out.
+  #[test]
+  fn camera_info_1dx_unrecognized_firmware_partial() {
+    let mut b = vec![0u8; 0x500];
+    b[0x06] = 88; // ISO 400 (pre-Hook)
+    b[0x1b] = 148; // CameraTemperature 20 C (first Hook entry, emits)
+    b[0x20] = 0x00;
+    b[0x21] = 0x32; // FocalLength 0x23 ⇒ 0x20 (-3, still emits)
+    b[0x1a4] = 0x00;
+    b[0x1a5] = 0x69; // MaxFocalLength 0x1ab ⇒ 0x1a4 (-7, still emits)
+    b[0x2d0..0x2d4].copy_from_slice(&200u32.to_le_bytes()); // nominal FileIndex (dropped)
+    let em = parse(&b, ByteOrder::Little, true, Some("Canon EOS-1D X"), None);
+    let find = |n: &str| em.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(find("ISO"), Some(TagValue::Str("400".into())));
+    assert_eq!(
+      find("CameraTemperature"),
+      Some(TagValue::Str("20 C".into()))
+    );
+    assert_eq!(find("FocalLength"), Some(TagValue::Str("50 mm".into())));
+    assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("105 mm".into())));
+    // Everything after the 0x1ab Hook is pushed out of range.
     assert_eq!(find("FirmwareVersion"), None);
     assert_eq!(find("FileIndex"), None);
     assert!(em.iter().all(|(k, _)| k != "ContrastStandard"));
