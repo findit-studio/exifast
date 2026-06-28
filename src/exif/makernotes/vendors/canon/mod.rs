@@ -366,13 +366,17 @@ impl MakerNotesCanon {
 /// the IFD0 `Model` of a preceding in-sample `0x8769` `ExifIFD` block
 /// (Canon.pm:10739-10751), used to evaluate model-conditional Canon sub-tables
 /// (`Canon::ShotInfo` `CameraTemperature`, `Canon::FileInfo` position 1); `None`
-/// when no preceding `0x8769` set one. `file_type` is `None` (a `.mov`/`.cr3`
-/// container is never "CRW", so the ShotInfo CRW clause stays off).
+/// when no preceding `0x8769` set one. `file_type` is the container's
+/// `$$self{FileType}` (the CNCV `OverrideFileType` `"CR3"`/`"CRM"`/`"MP4"`,
+/// `Canon.pm:9669`) — it gates the model-conditional `%CameraInfoG5XII` CR3
+/// ShutterCount row (`$$self{FileType} eq "CR3"`, `Canon.pm:4885`) while leaving
+/// the ShotInfo position-22 CRW clause off (no CR3/CRM/MP4 container is "CRW").
 #[must_use]
 pub fn redispatch_ctmd_makernote(
   tiff_block: &[u8],
   print_conv: bool,
   model: Option<&str>,
+  file_type: Option<&str>,
 ) -> Vec<VendorEmission> {
   // TIFF header: `[II/MM][0x2a][ifd0_offset:u32]` (8 bytes). Bail on a short /
   // unrecognized header (ExifTool's `ProcessTIFF` would `return 0`).
@@ -397,17 +401,20 @@ pub fn redispatch_ctmd_makernote(
   // Route through the SAME isolated shared-`Walker` helper the static-file
   // `-j`/`-n` dispatch uses (`exif::canon_makernote_isolated`) — byte-identical
   // to the retired `parse_in_tiff` oracle for this self-contained TIFF block
-  // (base 0, the Canon Main IFD at `ifd0_offset`). A `.cr3`/`.mov` container is
-  // never "CRW", so `file_type` is `None` (the ShotInfo CRW clause stays off);
-  // only the emissions are needed here (the typed slot is `-j`-only and is
-  // discarded).
+  // (base 0, the Canon Main IFD at `ifd0_offset`). The container `file_type`
+  // (`$$self{FileType}`) is THREADED through so the model-conditional
+  // `%CameraInfoG5XII` CR3 ShutterCount row (`$$self{FileType} eq "CR3"`,
+  // `Canon.pm:4885`) fires on a real PowerShot G5 X Mark II `.cr3`; no
+  // CR3/CRM/MP4 container is "CRW", so the ShotInfo position-22 CRW clause stays
+  // off regardless. Only the emissions are needed here (the typed slot is
+  // `-j`-only and is discarded).
   let (emissions, _typed) = crate::exif::canon_makernote_isolated(
     tiff_block,
     ifd0_offset,
     mn_len,
     order,
     model,
-    /* file_type */ None,
+    file_type,
     print_conv,
   );
   emissions

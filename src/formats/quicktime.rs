@@ -11074,6 +11074,9 @@ impl crate::emit::Taggable for Meta<'_> {
             doc_n,
             print_conv,
             self.cr3().model(),
+            // `$$self{FileType}` (the CNCV `OverrideFileType`) for the G5XII CR3
+            // gate on the CTMD `MakerNoteCanon` re-dispatch.
+            self.cr3().override_file_type(),
             &mut ctmd_scratch,
           );
         }
@@ -15686,6 +15689,11 @@ fn emit_ctmd_exif_info(
   // model-conditional Canon sub-tables (AFInfo2 `AFPointsSelected`) resolve
   // against the body Model exactly as ExifTool's persisted object state does.
   file_model: Option<&str>,
+  // The container `$$self{FileType}` (the CNCV `OverrideFileType`, `Canon.pm:9669`
+  // — `"CR3"`/`"CRM"`/`"MP4"`), threaded into the `MakerNoteCanon` re-dispatch so
+  // the `%CameraInfoG5XII` CR3 ShutterCount row (`$$self{FileType} eq "CR3"`,
+  // `Canon.pm:4885`) gates faithfully on the CTMD path too.
+  file_type: Option<&str>,
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
   use crate::emit::{EmittedTag, Taggable};
@@ -15759,6 +15767,7 @@ fn emit_ctmd_exif_info(
         // The CTMD sample's own `0x8769` Model, else the file-walk CMT1 Model
         // (ExifTool's persisted `$$self{Model}`).
         info.model().or(file_model),
+        file_type,
       );
       let group = scoped("MakerNotes", track);
       for e in emissions {
