@@ -19,8 +19,8 @@ use smol_str::SmolStr;
 
 use super::subtables::{
   SubEmission, drive_mode, exposure_comp_value, exposure_program2, hash_hex_value,
-  model_is_a4xx_exact, model_is_a4xx_prefix, model_is_nex, read_u32, signed_setting_value,
-  white_balance_setting,
+  model_is_a4xx_exact, model_is_a4xx_prefix, model_is_nex, read_u16, read_u32,
+  signed_setting_value, white_balance_setting,
 };
 
 /// Render a plain (non-hex) hash-PrintConv leaf (`-j` label/`Unknown (N)`, `-n`
@@ -184,10 +184,12 @@ fn face_detection(v: u8) -> Option<&'static str> {
 /// Walk the `CameraSettings3` block and emit the settings leaves for the model.
 ///
 /// `buf` is the verbatim (un-enciphered) `0x0114` block; `model` is
-/// `$$self{Model}`; `print_conv` selects `-j` vs `-n`. The 9-point DSLR-A4xx
-/// bodies use a different masked-tag layout (0x283.. / 0x30c..) — this port
-/// targets the "other models" (SLT / A560 / A580 / NEX) branches the A33 needs
-/// plus the shared leaves; the A4xx-only conditional leaves stay deferred.
+/// `$$self{Model}`; `print_conv` selects `-j` vs `-n`. The model-conditional
+/// leaves fall into families: the shared leaves; the "other models" (SLT / A560
+/// / A580 / NEX) branches; the A4xx-only branch (`=~ /^DSLR-(A450|A500|A550)$/`),
+/// whose 12 leaves sit at the `+0x200`-shifted masked layout (0x283.. / 0x30c.. /
+/// 0x400..); and the NEX-only branch (`=~ /^NEX-/`), the 0x3f0/0x3f3/0x3f7
+/// `LensE-mountVersion`/`LensFirmwareVersion`/`LensType2` lens leaves.
 #[must_use]
 pub fn parse_camera_settings3(
   buf: &[u8],
@@ -445,10 +447,7 @@ pub fn parse_camera_settings3(
     );
   }
   // 0x36 LiveViewAFSetting — `!~ /^(NEX-|DSLR-(A450|A500|A550)$)/` (NEX prefix +
-  // A4xx $-exact, Sony.pm:5506). 0x38 PanoramaSize3D is `!~
-  // /^DSLR-(A450|A500|A550)$/` ($-exact only, Sony.pm:5519); its `!nex` gate is a
-  // pre-existing over-exclusion outside this A4xx-anchor fix, kept so real NEX
-  // bodies stay byte-identical.
+  // A4xx $-exact, Sony.pm:5505).
   if !a4xx_exact && !nex {
     push_hash(
       buf,
@@ -458,6 +457,10 @@ pub fn parse_camera_settings3(
       print_conv,
       &mut out,
     );
+  }
+  // 0x38 PanoramaSize3D — `!~ /^DSLR-(A450|A500|A550)$/` (A4xx $-exact ONLY; its
+  // Condition does NOT exclude NEX, Sony.pm:5519).
+  if !a4xx_exact {
     push_hash(
       buf,
       0x38,
@@ -568,6 +571,137 @@ pub fn parse_camera_settings3(
       name: "ShotNumberSincePowerUp2",
       value: TagValue::I64(i64::from(v)),
     });
+  }
+
+  // --- A4xx-only family (`=~ /^DSLR-(A450|A500|A550)$/`, $-anchored EXACT,
+  // Sony.pm:5668-5802) — the 12 leaves the A4xx bodies place at the +0x200-shifted
+  // masked layout in place of the SLT/"other models" 0x83.. / 0x10c.. block.
+  if a4xx_exact {
+    push_hash(
+      buf,
+      0x283,
+      "AFButtonPressed",
+      af_button_pressed,
+      print_conv,
+      &mut out,
+    );
+    push_hash(
+      buf,
+      0x284,
+      "LiveViewMetering",
+      live_view_metering,
+      print_conv,
+      &mut out,
+    );
+    push_hash(
+      buf,
+      0x285,
+      "ViewingMode2",
+      viewing_mode2,
+      print_conv,
+      &mut out,
+    );
+    push_hash(buf, 0x286, "AELock", ae_lock, print_conv, &mut out);
+    push_hash(
+      buf,
+      0x287,
+      "FlashStatusBuilt-in",
+      flash_status_builtin,
+      print_conv,
+      &mut out,
+    );
+    push_hash(
+      buf,
+      0x288,
+      "FlashStatusExternal",
+      flash_status_external,
+      print_conv,
+      &mut out,
+    );
+    push_hash(
+      buf,
+      0x28b,
+      "LiveViewFocusMode",
+      live_view_focus_mode,
+      print_conv,
+      &mut out,
+    );
+    // 0x30c SequenceNumber — int8u, {0=>Single,255=>n/a,OTHER passthrough}
+    // (Sony.pm:5733-5743).
+    if let Some(&raw) = buf.get(0x30c) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "SequenceNumber",
+        value: sequence_number_value(raw, print_conv),
+      });
+    }
+    // 0x314 ImageNumber — int16u, Mask 0x3fff, `sprintf("%.4d")` (Sony.pm:5744).
+    if let Some(v) = read_u16(buf, 0x314) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "ImageNumber",
+        value: masked_count_value(u32::from(v & 0x3fff), 4, print_conv),
+      });
+    }
+    // 0x316 FolderNumber — int16u, Mask 0x03ff, `sprintf("%.3d")` (Sony.pm:5753).
+    if let Some(v) = read_u16(buf, 0x316) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "FolderNumber",
+        value: masked_count_value(u32::from(v & 0x03ff), 3, print_conv),
+      });
+    }
+    // 0x400 ImageNumber — int16u, Mask 0x3fff, `sprintf("%.4d")` (Sony.pm:5785).
+    if let Some(v) = read_u16(buf, 0x400) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "ImageNumber",
+        value: masked_count_value(u32::from(v & 0x3fff), 4, print_conv),
+      });
+    }
+    // 0x402 FolderNumber — int16u, Mask 0x03ff, `sprintf("%.3d")` (Sony.pm:5794).
+    if let Some(v) = read_u16(buf, 0x402) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "FolderNumber",
+        value: masked_count_value(u32::from(v & 0x03ff), 3, print_conv),
+      });
+    }
+  }
+
+  // --- NEX-only family (`=~ /^NEX-/`, Sony.pm:5762-5784) — the E-mount lens
+  // leaves. 0x3f7 `LensType2` also gates on the 0x99 `LensMount` DataMember
+  // (`$$self{LensMount} != 1`); the raw int8u at 0x99 is the latched member.
+  if nex {
+    // 0x3f0 LensE-mountVersion — int16u, `sprintf("%x.%.2x",$val>>8,$val&0xff)`.
+    if let Some(v) = read_u16(buf, 0x3f0) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "LensE-mountVersion",
+        value: lens_e_mount_version(v, print_conv),
+      });
+    }
+    // 0x3f3 LensFirmwareVersion — int16u,
+    // `sprintf("Ver.%.2x.%.3d",$val>>8,$val&0xff)`.
+    if let Some(v) = read_u16(buf, 0x3f3) {
+      out.push(SubEmission {
+        priority: 1,
+        name: "LensFirmwareVersion",
+        value: lens_firmware_version(v, print_conv),
+      });
+    }
+    // 0x3f7 LensType2 — int16u, %sonyLensTypes2 (E-mount), gated on the latched
+    // 0x99 LensMount `!= 1`. Perl's `$$self{LensMount} != 1` numifies an unset
+    // member to 0 (`!= 1` true), matching `None != Some(1)`.
+    if buf.get(0x99).copied() != Some(1)
+      && let Some(v) = read_u16(buf, 0x3f7)
+    {
+      out.push(SubEmission {
+        priority: 1,
+        name: "LensType2",
+        value: lens_type2_value(v, print_conv),
+      });
+    }
   }
 
   // `%CameraSettings3` is `PRIORITY => 0` (Sony.pm:5139): every leaf here is a
@@ -961,6 +1095,47 @@ fn sequence_number_value(raw: u8, print_conv: bool) -> TagValue {
     0 => TagValue::Str("Single".into()),
     255 => TagValue::Str("n/a".into()),
     n => TagValue::I64(i64::from(n)),
+  }
+}
+
+/// `LensE-mountVersion` value (`Sony.pm:5762-5768`): PrintConv
+/// `sprintf("%x.%.2x", $val>>8, $val&0xff)`; the raw `int16u` in `-n`.
+fn lens_e_mount_version(raw: u16, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::I64(i64::from(raw));
+  }
+  TagValue::Str(SmolStr::new(std::format!(
+    "{:x}.{:02x}",
+    raw >> 8,
+    raw & 0xff
+  )))
+}
+
+/// `LensFirmwareVersion` value (`Sony.pm:5771-5776`): PrintConv
+/// `sprintf("Ver.%.2x.%.3d", $val>>8, $val&0xff)`; the raw `int16u` in `-n`.
+fn lens_firmware_version(raw: u16, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::I64(i64::from(raw));
+  }
+  TagValue::Str(SmolStr::new(std::format!(
+    "Ver.{:02x}.{:03}",
+    raw >> 8,
+    raw & 0xff
+  )))
+}
+
+/// `LensType2` (E-mount `%sonyLensTypes2`) value (`Sony.pm:5777-5784`): the hash
+/// label (`-j`), or `Unknown ($val)` on a miss (the shared
+/// [`lens_types::lookup_name`](super::lens_types::lookup_name) renderer Tag9405a
+/// 0x0605 uses); the raw `int16u` in `-n`. `PrintInt => 1` is a
+/// `BuildTagLookup`-only doc flag, not a runtime directive.
+fn lens_type2_value(raw: u16, print_conv: bool) -> TagValue {
+  if !print_conv {
+    return TagValue::I64(i64::from(raw));
+  }
+  match super::lens_types::lookup_name(u32::from(raw)) {
+    Some(label) => TagValue::Str(label),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({raw})"))),
   }
 }
 
