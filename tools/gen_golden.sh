@@ -150,6 +150,18 @@ case "$FIX" in
   # so no exclusion is needed (the ported `Composite:ImageSize`/`Megapixels`
   # are kept). Listed for documentation.
   PNG_idot_trailer.png|PNG_gdat_trailer.png) : ;;
+  # The PNG per-region cICP/vpAg fixtures (#142 Codex [medium]): the `cICP`
+  # (`CICodePoints`) / `vpAg` (`VirtualPage`) `ProcessBinaryData` sub-tables
+  # stored PER-FIELD + PER-REGION. `PNG_cicp_trailer.png` / `PNG_vpag_trailer.png`
+  # carry the chunk BOTH pre-`IEND` (→ `PNG-cICP:*` / `PNG:*`) AND as a post-`IEND`
+  # trailer (→ `Trailer:*`, PNG.pm:1484), so bundled emits BOTH groups' fields +
+  # the document-level minor `Trailer data after PNG IEND chunk` warning;
+  # `PNG_cicp_vpag_truncated.png` carries a FULL then a TRUNCATED same-region
+  # chunk, so bundled keeps the omitted fields (present-only update) — no trailer
+  # warning. PNG is in the Composite allow-list, so the ported
+  # `Composite:ImageSize`/`Megapixels` are compared too (a PLAIN `check`).
+  # Listed for documentation.
+  PNG_cicp_trailer.png|PNG_vpag_trailer.png|PNG_cicp_vpag_truncated.png) : ;;
   # ── #133 PR 5 video/container Composite arms ─────────────────────────────────
   # The full-video-activation fixtures keep their ported Composites
   # (ImageSize/Megapixels/AvgBitrate/Rotation/Duration + the GPS-group SubDoc

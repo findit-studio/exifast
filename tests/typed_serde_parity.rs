@@ -1784,7 +1784,16 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `645`: `PNG_vpag.png` (#142) — the crafted `vpAg` ImageMagick virtual-page
 /// chunk (`VirtualPage`, `PNG.pm:561-573`): VirtualImageWidth/Height (int32u) +
 /// VirtualPageUnits (int8u), all raw, default family-1 `PNG`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 645;
+///
+/// `645 → 648`: the #142 Codex [medium] per-region/per-field cICP/vpAg storage
+/// fix — 3 crafted fixtures pinning that a post-`IEND` TRAILER chunk and a
+/// TRUNCATED same-region chunk neither clobber nor re-group the earlier fields:
+/// `PNG_cicp_trailer.png` (main `PNG-cICP:*` 9/16/9/1 + trailer `Trailer:*`
+/// 1/13/0/0 — BOTH groups emit), `PNG_vpag_trailer.png` (main `PNG:*` 100/200/0
+/// + trailer `Trailer:*` 300/400/1), `PNG_cicp_vpag_truncated.png` (a full then
+/// a runt cICP/vpAg in the main region — the omitted fields survive,
+/// present-only). Oracle-verified vs bundled ExifTool 13.59.
+const EXPECTED_ACTIVE_FIXTURES: usize = 648;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

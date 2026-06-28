@@ -2467,12 +2467,13 @@ impl crate::emit::Taggable for PngMeta<'_> {
         Group::new(GROUP_PNG, GROUP_PNG_CICP)
       }
     };
-    // Per-structural-chunk trailing flags (cheap; computed once).
+    // Per-structural-chunk trailing flags (cheap; computed once). cICP/vpAg are
+    // PER-FIELD+PER-REGION ([`RegionValue`], like acTL/iDOT/gdAT): each field's
+    // own main/trailer slot decides its group at the emission site below, so no
+    // single `cicp_t`/`vpag_t` flag is computed.
     let ihdr_t = self.ihdr_is_trailing();
     let bkgd_t = self.bkgd_is_trailing();
     let phys_t = self.phys_is_trailing();
-    let cicp_t = self.cicp_is_trailing();
-    let vpag_t = self.vpag_is_trailing();
     let time_t = self.time_is_trailing();
     let iccp_t = self.iccp_is_trailing();
 
@@ -2779,7 +2780,17 @@ impl crate::emit::Taggable for PngMeta<'_> {
     // VideoFullRangeFlag. The first three have a named-code-point PrintConv
     // (`-j`); an unmapped code falls through to the raw number (PrintConv-miss).
     // VideoFullRangeFlag has no PrintConv (raw flag). `-n` always emits the raw
-    // byte. family-1 group `PNG-cICP` (`Trailer` for a post-`IEND` chunk).
+    // byte.
+    //
+    // PER-FIELD+PER-REGION ([`RegionValue`], the iDOT/gdAT/acTL pattern): each
+    // field carries its own pre-`IEND` (`PNG-cICP:`) and post-`IEND` trailer
+    // (`Trailer:`, `PNG.pm:1484`) occurrence. A PNG may carry `cICP` in BOTH
+    // regions; bundled emits each occurrence's PRESENT fields under its OWN
+    // family-1 group, leaving the other region's fields intact (oracle-verified
+    // vs 13.59 — a main `cICP` + a trailer `cICP` emits `PNG-cICP:*` AND
+    // `Trailer:*`). A TRUNCATED later same-region chunk updates only its present
+    // field slots, so a field it omits keeps the earlier value. Emitted in
+    // chunk-walk order: the main fields (offset order) then the trailer fields.
     let push_cicp = |group: Group,
                      name: &'static str,
                      v: u8,
@@ -2801,67 +2812,121 @@ impl crate::emit::Taggable for PngMeta<'_> {
         ));
       }
     };
-    if let Some(v) = self.color_primaries() {
+    // No PrintConv (`PNG.pm:540`) — `VideoFullRangeFlag` is the raw flag in both
+    // modes.
+    let push_vfr = |group: Group, v: u8, tags: &mut Vec<EmittedTag>| {
+      tags.push(EmittedTag::new(
+        group,
+        "VideoFullRangeFlag".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
+    };
+    // ── main (pre-`IEND`) cICP → `PNG-cICP:` ──
+    if let Some(v) = self.color_primaries_main() {
       push_cicp(
-        cicp_group(cicp_t),
+        cicp_group(false),
         "ColorPrimaries",
         v,
         cicp_color_primaries,
         &mut tags,
       );
     }
-    if let Some(v) = self.transfer_characteristics() {
+    if let Some(v) = self.transfer_characteristics_main() {
       push_cicp(
-        cicp_group(cicp_t),
+        cicp_group(false),
         "TransferCharacteristics",
         v,
         cicp_transfer_characteristics,
         &mut tags,
       );
     }
-    if let Some(v) = self.matrix_coefficients() {
+    if let Some(v) = self.matrix_coefficients_main() {
       push_cicp(
-        cicp_group(cicp_t),
+        cicp_group(false),
         "MatrixCoefficients",
         v,
         cicp_matrix_coefficients,
         &mut tags,
       );
     }
-    if let Some(v) = self.video_full_range_flag() {
-      // No PrintConv (`PNG.pm:540`) — raw flag in both modes.
-      tags.push(EmittedTag::new(
-        cicp_group(cicp_t),
-        "VideoFullRangeFlag".into(),
-        TagValue::U64(u64::from(v)),
-        false,
-      ));
+    if let Some(v) = self.video_full_range_flag_main() {
+      push_vfr(cicp_group(false), v, &mut tags);
+    }
+    // ── trailer (post-`IEND`) cICP → `Trailer:` ──
+    if let Some(v) = self.color_primaries_trailer() {
+      push_cicp(
+        cicp_group(true),
+        "ColorPrimaries",
+        v,
+        cicp_color_primaries,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.transfer_characteristics_trailer() {
+      push_cicp(
+        cicp_group(true),
+        "TransferCharacteristics",
+        v,
+        cicp_transfer_characteristics,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.matrix_coefficients_trailer() {
+      push_cicp(
+        cicp_group(true),
+        "MatrixCoefficients",
+        v,
+        cicp_matrix_coefficients,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.video_full_range_flag_trailer() {
+      push_vfr(cicp_group(true), v, &mut tags);
     }
 
     // ---- vpAg (PNG.pm:561-573) -------------------------------------
     // `VirtualPage` (`ProcessBinaryData`, `FORMAT => 'int32u'`) emits in offset
     // order: VirtualImageWidth, VirtualImageHeight, VirtualPageUnits. All three
     // are raw numbers (no conv, the table even asks "what is the conversion?").
-    // family-1 group is the default `PNG` (`Trailer` for a post-`IEND` chunk).
-    if let Some(w) = self.virtual_image_width() {
+    // family-1 group is the default `PNG`. PER-FIELD+PER-REGION ([`RegionValue`],
+    // the iDOT/gdAT/acTL pattern): a pre-`IEND` `vpAg` (→ `PNG:*`) and a
+    // post-`IEND` trailer `vpAg` (→ `Trailer:*`, `PNG.pm:1484`) BOTH emit their
+    // present fields under their distinct groups; a truncated later same-region
+    // chunk keeps the omitted fields. Chunk-walk order: main then trailer.
+    let push_vpag_u32 = |group: Group, name: &'static str, v: u32, tags: &mut Vec<EmittedTag>| {
       tags.push(EmittedTag::new(
-        png_group(vpag_t),
-        "VirtualImageWidth".into(),
-        TagValue::U64(u64::from(w)),
+        group,
+        name.into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
+    };
+    // ── main (pre-`IEND`) vpAg → `PNG:` ──
+    if let Some(w) = self.virtual_image_width_main() {
+      push_vpag_u32(png_group(false), "VirtualImageWidth", w, &mut tags);
+    }
+    if let Some(h) = self.virtual_image_height_main() {
+      push_vpag_u32(png_group(false), "VirtualImageHeight", h, &mut tags);
+    }
+    if let Some(u) = self.virtual_page_units_main() {
+      tags.push(EmittedTag::new(
+        png_group(false),
+        "VirtualPageUnits".into(),
+        TagValue::U64(u64::from(u)),
         false,
       ));
     }
-    if let Some(h) = self.virtual_image_height() {
-      tags.push(EmittedTag::new(
-        png_group(vpag_t),
-        "VirtualImageHeight".into(),
-        TagValue::U64(u64::from(h)),
-        false,
-      ));
+    // ── trailer (post-`IEND`) vpAg → `Trailer:` ──
+    if let Some(w) = self.virtual_image_width_trailer() {
+      push_vpag_u32(png_group(true), "VirtualImageWidth", w, &mut tags);
     }
-    if let Some(u) = self.virtual_page_units() {
+    if let Some(h) = self.virtual_image_height_trailer() {
+      push_vpag_u32(png_group(true), "VirtualImageHeight", h, &mut tags);
+    }
+    if let Some(u) = self.virtual_page_units_trailer() {
       tags.push(EmittedTag::new(
-        png_group(vpag_t),
+        png_group(true),
         "VirtualPageUnits".into(),
         TagValue::U64(u64::from(u)),
         false,
@@ -4495,10 +4560,13 @@ mod tests {
     // group `PNG-cICP`.
     let png = png_with_chunk(b"cICP", &[9, 16, 9, 1]);
     let meta = parse_borrowed(&png).expect("png parses");
-    assert_eq!(meta.color_primaries(), Some(9));
-    assert_eq!(meta.transfer_characteristics(), Some(16));
-    assert_eq!(meta.matrix_coefficients(), Some(9));
-    assert_eq!(meta.video_full_range_flag(), Some(1));
+    assert_eq!(meta.color_primaries_main(), Some(9));
+    assert_eq!(meta.transfer_characteristics_main(), Some(16));
+    assert_eq!(meta.matrix_coefficients_main(), Some(9));
+    assert_eq!(meta.video_full_range_flag_main(), Some(1));
+    // A single pre-`IEND` `cICP` populates only the main slots (no trailer).
+    assert_eq!(meta.color_primaries_trailer(), None);
+    assert_eq!(meta.video_full_range_flag_trailer(), None);
     assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
     let pj: Vec<_> = crate::emit::Taggable::tags(
       &meta,
@@ -4550,14 +4618,14 @@ mod tests {
     // supplies none. Bounded — no panic, no out-of-range read.
     let two = png_with_chunk(b"cICP", &[9, 16]);
     let meta = parse_borrowed(&two).expect("png parses");
-    assert_eq!(meta.color_primaries(), Some(9));
-    assert_eq!(meta.transfer_characteristics(), Some(16));
-    assert_eq!(meta.matrix_coefficients(), None);
-    assert_eq!(meta.video_full_range_flag(), None);
+    assert_eq!(meta.color_primaries_main(), Some(9));
+    assert_eq!(meta.transfer_characteristics_main(), Some(16));
+    assert_eq!(meta.matrix_coefficients_main(), None);
+    assert_eq!(meta.video_full_range_flag_main(), None);
     let zero = png_with_chunk(b"cICP", &[]);
     let empty = parse_borrowed(&zero).expect("png parses");
-    assert_eq!(empty.color_primaries(), None);
-    assert_eq!(empty.video_full_range_flag(), None);
+    assert_eq!(empty.color_primaries_main(), None);
+    assert_eq!(empty.video_full_range_flag_main(), None);
   }
 
   #[test]
@@ -4588,9 +4656,9 @@ mod tests {
     full.push(0);
     let full_png = png_with_chunk(b"vpAg", &full);
     let meta = parse_borrowed(&full_png).expect("png parses");
-    assert_eq!(meta.virtual_image_width(), Some(100));
-    assert_eq!(meta.virtual_image_height(), Some(200));
-    assert_eq!(meta.virtual_page_units(), Some(0));
+    assert_eq!(meta.virtual_image_width_main(), Some(100));
+    assert_eq!(meta.virtual_image_height_main(), Some(200));
+    assert_eq!(meta.virtual_page_units_main(), Some(0));
     let pj: Vec<_> = crate::emit::Taggable::tags(
       &meta,
       crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
@@ -4606,16 +4674,176 @@ mod tests {
     // only; 3-byte → nothing. Bounded.
     let p8 = png_with_chunk(b"vpAg", &full[..8]);
     let m8 = parse_borrowed(&p8).expect("png parses");
-    assert_eq!(m8.virtual_image_width(), Some(100));
-    assert_eq!(m8.virtual_image_height(), Some(200));
-    assert_eq!(m8.virtual_page_units(), None);
+    assert_eq!(m8.virtual_image_width_main(), Some(100));
+    assert_eq!(m8.virtual_image_height_main(), Some(200));
+    assert_eq!(m8.virtual_page_units_main(), None);
     let p4 = png_with_chunk(b"vpAg", &full[..4]);
     let m4 = parse_borrowed(&p4).expect("png parses");
-    assert_eq!(m4.virtual_image_width(), Some(100));
-    assert_eq!(m4.virtual_image_height(), None);
+    assert_eq!(m4.virtual_image_width_main(), Some(100));
+    assert_eq!(m4.virtual_image_height_main(), None);
     let p3 = png_with_chunk(b"vpAg", &full[..3]);
     let m3 = parse_borrowed(&p3).expect("png parses");
-    assert_eq!(m3.virtual_image_width(), None);
+    assert_eq!(m3.virtual_image_width_main(), None);
+  }
+
+  /// A 1x1 RGB PNG carrying `main` chunks before `IEND` and `trailer` chunks
+  /// after it. `IDAT` matches the existing `PNG_cicp.png` fixture so the walk
+  /// behaves like a real PNG (the trailer-entry warning fires on the post-`IEND`
+  /// bytes).
+  fn png_main_then_trailer(main: &[Vec<u8>], trailer: &[Vec<u8>]) -> Vec<u8> {
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.push(8); // bit depth
+    ihdr.push(2); // color type RGB
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    let mut chunks = vec![chunk(b"IHDR", &ihdr)];
+    chunks.extend(main.iter().cloned());
+    // The deflated 1x1 RGB scanline from the PNG_cicp.png fixture.
+    chunks.push(chunk(
+      b"IDAT",
+      &[0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0, 0, 0, 0x04, 0, 0x01],
+    ));
+    chunks.push(chunk(b"IEND", &[]));
+    chunks.extend(trailer.iter().cloned());
+    synthetic_png(&chunks)
+  }
+
+  #[test]
+  fn cicp_vpag_main_and_trailer_kept_separately() {
+    // #142 Codex [medium]: a PNG with a MAIN cICP/vpAg + a post-`IEND` TRAILER
+    // cICP/vpAg. ExifTool emits BOTH the `PNG-cICP:`/`PNG:` (main) AND the
+    // `Trailer:` (post-`IEND`) fields — the trailer chunk must NOT overwrite the
+    // main values nor re-group them. main cICP 9/16/9/1 + vpAg 100/200/0;
+    // trailer cICP 1/13/0/0 + vpAg 300/400/1 (oracle-verified vs bundled 13.59).
+    let mut vpag_main = Vec::new();
+    vpag_main.extend_from_slice(&100u32.to_be_bytes());
+    vpag_main.extend_from_slice(&200u32.to_be_bytes());
+    vpag_main.push(0);
+    let mut vpag_trailer = Vec::new();
+    vpag_trailer.extend_from_slice(&300u32.to_be_bytes());
+    vpag_trailer.extend_from_slice(&400u32.to_be_bytes());
+    vpag_trailer.push(1);
+    let png = png_main_then_trailer(
+      &[chunk(b"cICP", &[9, 16, 9, 1]), chunk(b"vpAg", &vpag_main)],
+      &[
+        chunk(b"cICP", &[1, 13, 0, 0]),
+        chunk(b"vpAg", &vpag_trailer),
+      ],
+    );
+    let meta = parse_borrowed(&png).expect("png parses");
+    // cICP: main slots keep 9/16/9/1; trailer slots hold 1/13/0/0.
+    assert_eq!(meta.color_primaries_main(), Some(9));
+    assert_eq!(meta.transfer_characteristics_main(), Some(16));
+    assert_eq!(meta.matrix_coefficients_main(), Some(9));
+    assert_eq!(meta.video_full_range_flag_main(), Some(1));
+    assert_eq!(meta.color_primaries_trailer(), Some(1));
+    assert_eq!(meta.transfer_characteristics_trailer(), Some(13));
+    assert_eq!(meta.matrix_coefficients_trailer(), Some(0));
+    assert_eq!(meta.video_full_range_flag_trailer(), Some(0));
+    // vpAg: main 100/200/0; trailer 300/400/1.
+    assert_eq!(meta.virtual_image_width_main(), Some(100));
+    assert_eq!(meta.virtual_image_height_main(), Some(200));
+    assert_eq!(meta.virtual_page_units_main(), Some(0));
+    assert_eq!(meta.virtual_image_width_trailer(), Some(300));
+    assert_eq!(meta.virtual_image_height_trailer(), Some(400));
+    assert_eq!(meta.virtual_page_units_trailer(), Some(1));
+
+    // Emission: BOTH groups are present with the correct family-1 prefix.
+    let pj: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::ValueConv, false),
+    )
+    .collect();
+    let group_val = |name: &str, fam1: &str| {
+      pj.iter()
+        .find(|t| t.tag().name() == name && t.tag().group_ref().family1() == fam1)
+        .map(|t| t.tag().value_ref().clone())
+    };
+    assert_eq!(
+      group_val("ColorPrimaries", "PNG-cICP"),
+      Some(crate::value::TagValue::U64(9))
+    );
+    assert_eq!(
+      group_val("ColorPrimaries", "Trailer"),
+      Some(crate::value::TagValue::U64(1))
+    );
+    assert_eq!(
+      group_val("VideoFullRangeFlag", "Trailer"),
+      Some(crate::value::TagValue::U64(0))
+    );
+    assert_eq!(
+      group_val("VirtualImageWidth", "PNG"),
+      Some(crate::value::TagValue::U64(100))
+    );
+    assert_eq!(
+      group_val("VirtualImageWidth", "Trailer"),
+      Some(crate::value::TagValue::U64(300))
+    );
+    assert_eq!(
+      group_val("VirtualPageUnits", "Trailer"),
+      Some(crate::value::TagValue::U64(1))
+    );
+  }
+
+  #[test]
+  fn cicp_vpag_truncated_keeps_earlier_present_only() {
+    // #142 Codex [medium]: a full cICP/vpAg then a TRUNCATED same-region chunk.
+    // ExifTool's ProcessBinaryData updates only the PRESENT field slots and
+    // never clears an earlier value — so the omitted fields SURVIVE while the
+    // present fields are overwritten (last-wins). full cICP 9/16/9/1 then a
+    // 2-byte cICP 5/8 → MatrixCoefficients/VideoFullRangeFlag KEEP 9/1,
+    // ColorPrimaries/TransferCharacteristics become 5/8 (oracle-verified vs
+    // bundled 13.59). full vpAg 100/200/0 then a 4-byte vpAg 999 → width 999,
+    // height 200, units 0 survive.
+    let mut vpag_full = Vec::new();
+    vpag_full.extend_from_slice(&100u32.to_be_bytes());
+    vpag_full.extend_from_slice(&200u32.to_be_bytes());
+    vpag_full.push(0);
+    let png = png_main_then_trailer(
+      &[
+        chunk(b"cICP", &[9, 16, 9, 1]),
+        chunk(b"vpAg", &vpag_full),
+        chunk(b"cICP", &[5, 8]),
+        chunk(b"vpAg", &999u32.to_be_bytes()),
+      ],
+      &[],
+    );
+    let meta = parse_borrowed(&png).expect("png parses");
+    // cICP: present fields updated, absent fields preserved — all MAIN region.
+    assert_eq!(meta.color_primaries_main(), Some(5));
+    assert_eq!(meta.transfer_characteristics_main(), Some(8));
+    assert_eq!(meta.matrix_coefficients_main(), Some(9));
+    assert_eq!(meta.video_full_range_flag_main(), Some(1));
+    // The truncated chunks were pre-`IEND`, so nothing lands in a trailer slot.
+    assert_eq!(meta.color_primaries_trailer(), None);
+    assert_eq!(meta.matrix_coefficients_trailer(), None);
+    // vpAg: width updated to 999, height/units preserved.
+    assert_eq!(meta.virtual_image_width_main(), Some(999));
+    assert_eq!(meta.virtual_image_height_main(), Some(200));
+    assert_eq!(meta.virtual_page_units_main(), Some(0));
+    assert_eq!(meta.virtual_image_width_trailer(), None);
+  }
+
+  #[test]
+  fn cicp_repeated_same_region_last_wins() {
+    // A repeated full cICP within the SAME region overwrites (last-wins, the
+    // singleton TagMap-key behaviour). 9/16/9/1 then 1/13/5/0 → 1/13/5/0
+    // (oracle-verified vs bundled 13.59).
+    let png = png_main_then_trailer(
+      &[
+        chunk(b"cICP", &[9, 16, 9, 1]),
+        chunk(b"cICP", &[1, 13, 5, 0]),
+      ],
+      &[],
+    );
+    let meta = parse_borrowed(&png).expect("png parses");
+    assert_eq!(meta.color_primaries_main(), Some(1));
+    assert_eq!(meta.transfer_characteristics_main(), Some(13));
+    assert_eq!(meta.matrix_coefficients_main(), Some(5));
+    assert_eq!(meta.video_full_range_flag_main(), Some(0));
   }
 
   #[test]

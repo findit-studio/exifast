@@ -723,33 +723,47 @@ pub struct PngMeta<'a> {
   /// renders the named primaries (`9` → `BT.2020, BT.2100`), falling through
   /// to the raw number for an unmapped code. Each cICP field is INDEPENDENTLY
   /// available (`ProcessBinaryData` per-offset), so a runt 1-to-3-byte cICP
-  /// supplies only the leading fields.
-  color_primaries: Option<u8>,
+  /// supplies only the leading fields. PER-GROUP ([`RegionValue`]): a pre-`IEND`
+  /// `cICP` (→ `PNG-cICP:ColorPrimaries`) and a post-`IEND` trailer `cICP`
+  /// (→ `Trailer:ColorPrimaries`, `PNG.pm:1484`) are kept SEPARATELY so a
+  /// trailer chunk does not overwrite the main fields nor re-group them; both
+  /// emit under their OWN family-1 group (oracle-verified vs 13.59). A TRUNCATED
+  /// later same-region chunk that omits this field leaves the earlier value
+  /// intact (present-only update). All-`None` when no `cICP` supplied byte 0.
+  color_primaries: RegionValue<u8>,
   /// `cICP.TransferCharacteristics` (`CICodePoints` tag 1, `int8u`,
   /// `PNG.pm:496-519`). PrintConv renders the named transfer function (`16` →
   /// `SMPTE ST 2084, ITU BT.2100 PQ`), raw number otherwise. Needs byte 1.
-  transfer_characteristics: Option<u8>,
+  /// PER-GROUP ([`RegionValue`]): independent main/trailer slots, present-only.
+  transfer_characteristics: RegionValue<u8>,
   /// `cICP.MatrixCoefficients` (`CICodePoints` tag 2, `int8u`,
   /// `PNG.pm:520-539`). PrintConv renders the named matrix (`9` → `BT.2020
   /// non-constant luminance, BT.2100 YCbCr`), raw number otherwise. Needs
-  /// byte 2.
-  matrix_coefficients: Option<u8>,
+  /// byte 2. PER-GROUP ([`RegionValue`]): independent main/trailer slots,
+  /// present-only — a 2-byte later `cICP` that omits byte 2 keeps this value.
+  matrix_coefficients: RegionValue<u8>,
   /// `cICP.VideoFullRangeFlag` (`CICodePoints` tag 3, `int8u`, `PNG.pm:540`).
-  /// No PrintConv — the raw flag (`0`/`1`). Needs byte 3.
-  video_full_range_flag: Option<u8>,
+  /// No PrintConv — the raw flag (`0`/`1`). Needs byte 3. PER-GROUP
+  /// ([`RegionValue`]): independent main/trailer slots, present-only.
+  video_full_range_flag: RegionValue<u8>,
   // ----- vpAg (PNG.pm:290-293, sub-table PNG.pm:561-573) ----------------
   /// `vpAg.VirtualImageWidth` (`VirtualPage` tag 0, `int32u`, `PNG.pm:566`) —
   /// ImageMagick's private virtual-page chunk. Raw number (no conv). Needs
-  /// bytes `0..4`.
-  virtual_image_width: Option<u32>,
+  /// bytes `0..4`. PER-GROUP ([`RegionValue`]): a pre-`IEND` `vpAg`
+  /// (→ `PNG:VirtualImageWidth`) and a post-`IEND` trailer `vpAg`
+  /// (→ `Trailer:VirtualImageWidth`, `PNG.pm:1484`) kept SEPARATELY; both emit;
+  /// a truncated later same-region chunk omitting this leaves it intact.
+  virtual_image_width: RegionValue<u32>,
   /// `vpAg.VirtualImageHeight` (`VirtualPage` tag 1, `int32u`, `PNG.pm:567`).
   /// Raw number. Needs bytes `4..8` (INDEPENDENT of the width — an 8-byte
-  /// vpAg supplies width+height but not the units byte).
-  virtual_image_height: Option<u32>,
+  /// vpAg supplies width+height but not the units byte). PER-GROUP
+  /// ([`RegionValue`]): independent main/trailer slots, present-only.
+  virtual_image_height: RegionValue<u32>,
   /// `vpAg.VirtualPageUnits` (`VirtualPage` tag 2, `int8u`, `PNG.pm:568-572`).
   /// Raw number (the table notes "what is the conversion for this?" — none).
-  /// Needs byte 8.
-  virtual_page_units: Option<u8>,
+  /// Needs byte 8. PER-GROUP ([`RegionValue`]): independent main/trailer slots,
+  /// present-only — a 5-or-8-byte later `vpAg` omitting byte 8 keeps this value.
+  virtual_page_units: RegionValue<u8>,
   // ----- iCCP (PNG.pm:171-181) -----------------------------------------
   /// `iCCP-name` — the ICC profile NAME (`PNG.pm:182-190` + 1304). The
   /// profile body bytes are NOT parsed (Phase-2 sub-port deferred).
@@ -1080,6 +1094,92 @@ impl ActlValues {
   }
 }
 
+/// One `ProcessBinaryData` sub-table FIELD split BY FAMILY-1 GROUP — a pre-`IEND`
+/// occurrence (`main`) and a post-`IEND` TRAILER occurrence (`trailer`,
+/// `PNG.pm:1484` `SET_GROUP1 = 'Trailer'`). The SAME per-field-provenance shape
+/// as [`ActlValues`] (acTL) and [`BinaryChunkLengths`] (iDOT/gdAT), generalised
+/// over the field's value type so it serves the `cICP` `CICodePoints`
+/// (`int8u`) and `vpAg` `VirtualPage` (`int32u` / `int8u`) sub-tables.
+///
+/// `ProcessBinaryData` extracts EACH field of a chunk INDEPENDENTLY (a field
+/// emits iff its `offset + size` is within the chunk length) and NEVER clears a
+/// previously-emitted tag (`ExifTool.pm` writes each into the tag hash as it is
+/// read). So the per-field slot is the faithful storage: a TRUNCATED later
+/// chunk that omits a field passes `None` for it ([`Self::set`] is simply not
+/// called), leaving the earlier value intact; a field the later chunk DOES carry
+/// overwrites the slot (last-wins WITHIN the region — oracle-verified vs ExifTool
+/// 13.59: a full `cICP` then a 2-byte `cICP` keeps the earlier
+/// MatrixCoefficients/VideoFullRangeFlag and updates the present
+/// ColorPrimaries/TransferCharacteristics). Splitting main from trailer keeps a
+/// post-`IEND` chunk from clobbering the pre-`IEND` values AND from re-grouping
+/// the surviving main tags to `Trailer`: bundled emits the main fields under
+/// `PNG-cICP`/`PNG` and the post-`IEND` fields under `Trailer`, BOTH at once.
+/// `main == trailer == None` when the field was never extracted in that region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionValue<T: Copy> {
+  /// Value of the pre-`IEND` occurrence — emitted under the chunk's default
+  /// family-1 group (`PNG-cICP` for cICP, `PNG` for vpAg). Last-wins on a
+  /// repeated pre-`IEND` chunk.
+  main: Option<T>,
+  /// Value of the post-`IEND` TRAILER occurrence — emitted under the `Trailer`
+  /// family-1 group (`PNG.pm:1484`). Last-wins on a repeated post-`IEND` chunk.
+  trailer: Option<T>,
+}
+
+impl<T: Copy> RegionValue<T> {
+  /// An empty pair — neither a pre- nor a post-`IEND` occurrence of this field
+  /// seen.
+  #[inline(always)]
+  #[must_use]
+  const fn new() -> Self {
+    Self {
+      main: None,
+      trailer: None,
+    }
+  }
+
+  /// Record one occurrence's `value`, routed to the `trailer` slot when the
+  /// chunk was parsed in post-`IEND` TRAILER mode (`trailing == true`,
+  /// `PNG.pm:1484`) and the `main` slot otherwise. Last-wins within the slot. A
+  /// field the chunk does NOT carry is never passed here, so its slot keeps any
+  /// earlier value (present-only update).
+  #[inline(always)]
+  fn set(&mut self, value: T, trailing: bool) {
+    if trailing {
+      self.trailer = Some(value);
+    } else {
+      self.main = Some(value);
+    }
+  }
+
+  /// The pre-`IEND` occurrence value, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn main(&self) -> Option<T>
+  where
+    T: Copy,
+  {
+    self.main
+  }
+
+  /// The post-`IEND` (`Trailer:`-group) occurrence value, if any.
+  #[inline(always)]
+  #[must_use]
+  const fn trailer(&self) -> Option<T>
+  where
+    T: Copy,
+  {
+    self.trailer
+  }
+}
+
+impl<T: Copy> Default for RegionValue<T> {
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// Which structural single-value PNG chunks (the [`PngMeta`] singleton fields)
 /// were last set from a post-`IEND` TRAILER chunk and so carry the `Trailer`
 /// family-1 group override. All-`false` for a standard (IEND-last) PNG.
@@ -1090,16 +1190,6 @@ struct StructuralTrailing {
   ihdr: bool,
   /// `pHYs` sub-table (PixelsPerUnitX/Y, PixelUnits) came from a trailer chunk.
   phys: bool,
-  /// `cICP` sub-table (ColorPrimaries/TransferCharacteristics/
-  /// MatrixCoefficients/VideoFullRangeFlag) came from a trailer chunk — so the
-  /// explicit `PNG-cICP` family-1 group is overridden to `Trailer`
-  /// (`PNG.pm:1484`; oracle-confirmed a post-`IEND` cICP emits
-  /// `Trailer:ColorPrimaries`).
-  cicp: bool,
-  /// `vpAg` sub-table (VirtualImageWidth/Height, VirtualPageUnits) came from a
-  /// trailer chunk — so its default `PNG` family-1 group is overridden to
-  /// `Trailer`.
-  vpag: bool,
   /// `iCCP-name` (ProfileName) came from a trailer chunk.
   iccp: bool,
   /// `bKGD` (BackgroundColor) came from a trailer chunk.
@@ -1136,13 +1226,13 @@ impl PngMeta<'_> {
       pixels_per_unit_x: None,
       pixels_per_unit_y: None,
       pixel_units: None,
-      color_primaries: None,
-      transfer_characteristics: None,
-      matrix_coefficients: None,
-      video_full_range_flag: None,
-      virtual_image_width: None,
-      virtual_image_height: None,
-      virtual_page_units: None,
+      color_primaries: RegionValue::new(),
+      transfer_characteristics: RegionValue::new(),
+      matrix_coefficients: RegionValue::new(),
+      video_full_range_flag: RegionValue::new(),
+      virtual_image_width: RegionValue::new(),
+      virtual_image_height: RegionValue::new(),
+      virtual_page_units: RegionValue::new(),
       icc_profile_name: None,
       background_color: None,
       modify_date: None,
@@ -1161,8 +1251,6 @@ impl PngMeta<'_> {
       structural_trailing: StructuralTrailing {
         ihdr: false,
         phys: false,
-        cicp: false,
-        vpag: false,
         iccp: false,
         bkgd: false,
         time: false,
@@ -1320,55 +1408,122 @@ impl PngMeta<'_> {
 
   // ===== cICP accessors =================================================
 
-  /// `cICP.ColorPrimaries` (`PNG.pm:479-495`).
+  /// `cICP.ColorPrimaries` from the MAIN (pre-`IEND`) `cICP` chunk
+  /// (`PNG-cICP:ColorPrimaries`, `PNG.pm:479-495`). `None` when no pre-`IEND`
+  /// `cICP` supplied byte 0.
   #[inline(always)]
   #[must_use]
-  pub const fn color_primaries(&self) -> Option<u8> {
-    self.color_primaries
+  pub const fn color_primaries_main(&self) -> Option<u8> {
+    self.color_primaries.main()
   }
 
-  /// `cICP.TransferCharacteristics` (`PNG.pm:496-519`).
+  /// `cICP.ColorPrimaries` from the post-`IEND` TRAILER `cICP` chunk
+  /// (`Trailer:ColorPrimaries`, parsed while `SET_GROUP1 = 'Trailer'`,
+  /// `PNG.pm:1484`). `None` when no post-`IEND` `cICP` supplied byte 0.
   #[inline(always)]
   #[must_use]
-  pub const fn transfer_characteristics(&self) -> Option<u8> {
-    self.transfer_characteristics
+  pub const fn color_primaries_trailer(&self) -> Option<u8> {
+    self.color_primaries.trailer()
   }
 
-  /// `cICP.MatrixCoefficients` (`PNG.pm:520-539`).
+  /// `cICP.TransferCharacteristics` from the MAIN (pre-`IEND`) `cICP` chunk
+  /// (`PNG.pm:496-519`). `None` when no pre-`IEND` `cICP` supplied byte 1.
   #[inline(always)]
   #[must_use]
-  pub const fn matrix_coefficients(&self) -> Option<u8> {
-    self.matrix_coefficients
+  pub const fn transfer_characteristics_main(&self) -> Option<u8> {
+    self.transfer_characteristics.main()
   }
 
-  /// `cICP.VideoFullRangeFlag` (`PNG.pm:540`).
+  /// `cICP.TransferCharacteristics` from the post-`IEND` TRAILER `cICP` chunk
+  /// (`PNG.pm:1484`). `None` when no post-`IEND` `cICP` supplied byte 1.
   #[inline(always)]
   #[must_use]
-  pub const fn video_full_range_flag(&self) -> Option<u8> {
-    self.video_full_range_flag
+  pub const fn transfer_characteristics_trailer(&self) -> Option<u8> {
+    self.transfer_characteristics.trailer()
+  }
+
+  /// `cICP.MatrixCoefficients` from the MAIN (pre-`IEND`) `cICP` chunk
+  /// (`PNG.pm:520-539`). `None` when no pre-`IEND` `cICP` supplied byte 2.
+  #[inline(always)]
+  #[must_use]
+  pub const fn matrix_coefficients_main(&self) -> Option<u8> {
+    self.matrix_coefficients.main()
+  }
+
+  /// `cICP.MatrixCoefficients` from the post-`IEND` TRAILER `cICP` chunk
+  /// (`PNG.pm:1484`). `None` when no post-`IEND` `cICP` supplied byte 2.
+  #[inline(always)]
+  #[must_use]
+  pub const fn matrix_coefficients_trailer(&self) -> Option<u8> {
+    self.matrix_coefficients.trailer()
+  }
+
+  /// `cICP.VideoFullRangeFlag` from the MAIN (pre-`IEND`) `cICP` chunk
+  /// (`PNG.pm:540`). `None` when no pre-`IEND` `cICP` supplied byte 3.
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_full_range_flag_main(&self) -> Option<u8> {
+    self.video_full_range_flag.main()
+  }
+
+  /// `cICP.VideoFullRangeFlag` from the post-`IEND` TRAILER `cICP` chunk
+  /// (`PNG.pm:1484`). `None` when no post-`IEND` `cICP` supplied byte 3.
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_full_range_flag_trailer(&self) -> Option<u8> {
+    self.video_full_range_flag.trailer()
   }
 
   // ===== vpAg accessors =================================================
 
-  /// `vpAg.VirtualImageWidth` (`PNG.pm:566`).
+  /// `vpAg.VirtualImageWidth` from the MAIN (pre-`IEND`) `vpAg` chunk
+  /// (`PNG:VirtualImageWidth`, `PNG.pm:566`). `None` when no pre-`IEND` `vpAg`
+  /// supplied bytes `0..4`.
   #[inline(always)]
   #[must_use]
-  pub const fn virtual_image_width(&self) -> Option<u32> {
-    self.virtual_image_width
+  pub const fn virtual_image_width_main(&self) -> Option<u32> {
+    self.virtual_image_width.main()
   }
 
-  /// `vpAg.VirtualImageHeight` (`PNG.pm:567`).
+  /// `vpAg.VirtualImageWidth` from the post-`IEND` TRAILER `vpAg` chunk
+  /// (`Trailer:VirtualImageWidth`, `PNG.pm:1484`). `None` when no post-`IEND`
+  /// `vpAg` supplied bytes `0..4`.
   #[inline(always)]
   #[must_use]
-  pub const fn virtual_image_height(&self) -> Option<u32> {
-    self.virtual_image_height
+  pub const fn virtual_image_width_trailer(&self) -> Option<u32> {
+    self.virtual_image_width.trailer()
   }
 
-  /// `vpAg.VirtualPageUnits` (`PNG.pm:568-572`).
+  /// `vpAg.VirtualImageHeight` from the MAIN (pre-`IEND`) `vpAg` chunk
+  /// (`PNG.pm:567`). `None` when no pre-`IEND` `vpAg` supplied bytes `4..8`.
   #[inline(always)]
   #[must_use]
-  pub const fn virtual_page_units(&self) -> Option<u8> {
-    self.virtual_page_units
+  pub const fn virtual_image_height_main(&self) -> Option<u32> {
+    self.virtual_image_height.main()
+  }
+
+  /// `vpAg.VirtualImageHeight` from the post-`IEND` TRAILER `vpAg` chunk
+  /// (`PNG.pm:1484`). `None` when no post-`IEND` `vpAg` supplied bytes `4..8`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_image_height_trailer(&self) -> Option<u32> {
+    self.virtual_image_height.trailer()
+  }
+
+  /// `vpAg.VirtualPageUnits` from the MAIN (pre-`IEND`) `vpAg` chunk
+  /// (`PNG.pm:568-572`). `None` when no pre-`IEND` `vpAg` supplied byte 8.
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_page_units_main(&self) -> Option<u8> {
+    self.virtual_page_units.main()
+  }
+
+  /// `vpAg.VirtualPageUnits` from the post-`IEND` TRAILER `vpAg` chunk
+  /// (`PNG.pm:1484`). `None` when no post-`IEND` `vpAg` supplied byte 8.
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_page_units_trailer(&self) -> Option<u8> {
+    self.virtual_page_units.trailer()
   }
 
   /// Helper: DPI as `(x, y)` derived from `pHYs`. PNG stores pixels per
@@ -1553,11 +1708,16 @@ impl PngMeta<'_> {
   }
 
   /// Record the `cICP` HDR code-point fields (`CICodePoints`, `PNG.pm:471-541`)
-  /// per-field. Each argument is `Some` IFF the chunk held that field's int8u
-  /// byte (`ProcessBinaryData` per-offset availability, `PNG.pm:472`), so a
-  /// runt cICP supplies only the leading fields. The four fields share one
-  /// `cICP`-trailer flag (a single chunk produced them all). Last-wins per
-  /// region.
+  /// per-field AND per-region. Each argument is `Some` IFF the chunk held that
+  /// field's int8u byte (`ProcessBinaryData` per-offset availability,
+  /// `PNG.pm:472`), so a runt cICP supplies only the leading fields. Each
+  /// PRESENT field is routed to the pre-`IEND` (`PNG-cICP:`) or post-`IEND`
+  /// (`Trailer:`) slot per the current [`Self::begin_trailer`] state
+  /// (`PNG.pm:1484`); an ABSENT field's `None` is NOT stored, so an earlier
+  /// same-region value SURVIVES (`ProcessBinaryData` never clears a previously
+  /// emitted tag). A post-`IEND` `cICP` therefore neither overwrites the main
+  /// fields nor re-groups them — both regions emit under their own family-1
+  /// group (oracle-verified vs ExifTool 13.59). Last-wins WITHIN each region.
   pub(crate) fn set_cicp(
     &mut self,
     color_primaries: Option<u8>,
@@ -1565,23 +1725,39 @@ impl PngMeta<'_> {
     matrix_coefficients: Option<u8>,
     video_full_range_flag: Option<u8>,
   ) {
-    self.color_primaries = color_primaries;
-    self.transfer_characteristics = transfer_characteristics;
-    self.matrix_coefficients = matrix_coefficients;
-    self.video_full_range_flag = video_full_range_flag;
-    self.structural_trailing.cicp = self.in_trailer;
+    if let Some(v) = color_primaries {
+      self.color_primaries.set(v, self.in_trailer);
+    }
+    if let Some(v) = transfer_characteristics {
+      self.transfer_characteristics.set(v, self.in_trailer);
+    }
+    if let Some(v) = matrix_coefficients {
+      self.matrix_coefficients.set(v, self.in_trailer);
+    }
+    if let Some(v) = video_full_range_flag {
+      self.video_full_range_flag.set(v, self.in_trailer);
+    }
   }
 
   /// Record the `vpAg` ImageMagick virtual-page fields (`VirtualPage`,
-  /// `PNG.pm:561-573`) per-field. `width`/`height` are `Some` IFF their
-  /// `int32u` bytes (`0..4` / `4..8`) were present; `units` IFF byte 8 was
-  /// present — each INDEPENDENT (`ProcessBinaryData` per-offset). The three
-  /// share one `vpAg`-trailer flag. Last-wins per region.
+  /// `PNG.pm:561-573`) per-field AND per-region. `width`/`height` are `Some` IFF
+  /// their `int32u` bytes (`0..4` / `4..8`) were present; `units` IFF byte 8 was
+  /// present — each INDEPENDENT (`ProcessBinaryData` per-offset). Each PRESENT
+  /// field is routed to the pre-`IEND` (`PNG:`) or post-`IEND` (`Trailer:`) slot
+  /// per the current [`Self::begin_trailer`] state (`PNG.pm:1484`); an ABSENT
+  /// field's `None` is NOT stored, so an earlier same-region value SURVIVES.
+  /// A post-`IEND` `vpAg` neither overwrites the main fields nor re-groups them.
+  /// Last-wins WITHIN each region.
   pub(crate) fn set_vpag(&mut self, width: Option<u32>, height: Option<u32>, units: Option<u8>) {
-    self.virtual_image_width = width;
-    self.virtual_image_height = height;
-    self.virtual_page_units = units;
-    self.structural_trailing.vpag = self.in_trailer;
+    if let Some(v) = width {
+      self.virtual_image_width.set(v, self.in_trailer);
+    }
+    if let Some(v) = height {
+      self.virtual_image_height.set(v, self.in_trailer);
+    }
+    if let Some(v) = units {
+      self.virtual_page_units.set(v, self.in_trailer);
+    }
   }
 
   /// Set the acTL `AnimationFrames` value — `AnimationControl` tag 0
@@ -1889,20 +2065,6 @@ impl PngMeta<'_> {
   #[must_use]
   pub(crate) const fn phys_is_trailing(&self) -> bool {
     self.structural_trailing.phys
-  }
-
-  /// Whether the `cICP` sub-table tags came from a TRAILER chunk.
-  #[inline(always)]
-  #[must_use]
-  pub(crate) const fn cicp_is_trailing(&self) -> bool {
-    self.structural_trailing.cicp
-  }
-
-  /// Whether the `vpAg` sub-table tags came from a TRAILER chunk.
-  #[inline(always)]
-  #[must_use]
-  pub(crate) const fn vpag_is_trailing(&self) -> bool {
-    self.structural_trailing.vpag
   }
 
   /// Whether the `iCCP-name` (ProfileName) tag came from a TRAILER chunk.
