@@ -1656,7 +1656,11 @@ fn render_exif_block(
 /// Render a CMT3 Canon-MakerNote block (a self-contained TIFF whose IFD0 IS the
 /// Canon MakerNote) into `MakerNotes:Canon` [`EmittedTag`]s for the requested
 /// mode, threading `model` (`$$self{Model}` of the most-recent PRECEDING CMT1)
-/// into `Canon::Main` for its model-conditional sub-tables. Routes through
+/// into `Canon::Main` for its model-conditional sub-tables. `file_type` is the
+/// container `$$self{FileType}` (the CNCV `OverrideFileType`, `Canon.pm:9669` —
+/// `"CR3"`/`"CRM"`/`"MP4"`), threaded so the `%CameraInfoG5XII` CR3 ShutterCount
+/// row (`$$self{FileType} eq "CR3"`, `Canon.pm:4885`) fires on a real PowerShot
+/// G5 X Mark II `.cr3`. Routes through
 /// [`redispatch_ctmd_makernote`](crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote)
 /// (the SAME `ProcessTIFF`-under-`Canon::Main` machinery CTMD's `0x927c` uses).
 #[cfg(feature = "alloc")]
@@ -1664,33 +1668,36 @@ fn render_cmt3_block(
   body: &[u8],
   print_conv: bool,
   model: Option<&str>,
+  file_type: Option<&str>,
 ) -> Vec<crate::emit::EmittedTag> {
   use crate::emit::EmittedTag;
   use crate::value::Group;
-  crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(body, print_conv, model)
-    .into_iter()
-    .map(|e| {
-      // Preserve each emission's family-1 group OVERRIDE (the
-      // `CanonCustom::Functions2` 0x0099 leaves group under `CanonCustom`,
-      // `CanonCustom.pm:229`, NOT the parent `Canon`); the default is `Canon`.
-      let group1 = e.group1_override().unwrap_or("Canon");
-      // Carry the emission's ExifTool `Priority => N` too — `0` for the
-      // `Canon::ShotInfo` FNumber/ExposureTime/BaseISO, `Canon::FocalLength`
-      // FocalLength, `Canon::LensInfo` LensSerialNumber and every
-      // `%Canon::CameraInfo*` leaf (`tags::tag_priority`, `ExifTool.pm:9544-9560`).
-      // A `Priority => 0` CMT3 leaf must NEVER override an earlier same-`(doc,
-      // family1, name)` value, so the sink's priority-aware dedup needs the REAL
-      // priority, not the `EmittedTag::new` default `1` (which would let a later
-      // priority-0 duplicate wrongly win).
-      EmittedTag::new_with_priority(
-        Group::new("MakerNotes", group1),
-        smol_str::SmolStr::new(e.name()),
-        e.value().clone(),
-        e.unknown(),
-        e.priority(),
-      )
-    })
-    .collect()
+  crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(
+    body, print_conv, model, file_type,
+  )
+  .into_iter()
+  .map(|e| {
+    // Preserve each emission's family-1 group OVERRIDE (the
+    // `CanonCustom::Functions2` 0x0099 leaves group under `CanonCustom`,
+    // `CanonCustom.pm:229`, NOT the parent `Canon`); the default is `Canon`.
+    let group1 = e.group1_override().unwrap_or("Canon");
+    // Carry the emission's ExifTool `Priority => N` too — `0` for the
+    // `Canon::ShotInfo` FNumber/ExposureTime/BaseISO, `Canon::FocalLength`
+    // FocalLength, `Canon::LensInfo` LensSerialNumber and every
+    // `%Canon::CameraInfo*` leaf (`tags::tag_priority`, `ExifTool.pm:9544-9560`).
+    // A `Priority => 0` CMT3 leaf must NEVER override an earlier same-`(doc,
+    // family1, name)` value, so the sink's priority-aware dedup needs the REAL
+    // priority, not the `EmittedTag::new` default `1` (which would let a later
+    // priority-0 duplicate wrongly win).
+    EmittedTag::new_with_priority(
+      Group::new("MakerNotes", group1),
+      smol_str::SmolStr::new(e.name()),
+      e.value().clone(),
+      e.unknown(),
+      e.priority(),
+    )
+  })
+  .collect()
 }
 
 /// Render a CMT4 GPS block (walked top-level against the GPS table) into
@@ -1844,8 +1851,20 @@ pub fn walk_canon_uuid_with_state(
           Cr3CmtKind::Cmt3,
           Cr3Block::at(h.body_abs_start, h.body.len() as u64),
         );
-        let print = render_cmt3_block(h.body, true, current_model.as_deref());
-        let value = render_cmt3_block(h.body, false, current_model.as_deref());
+        // `$$self{FileType}` for the `%CameraInfoG5XII` CR3 gate (Canon.pm:4885):
+        // the CNCV `OverrideFileType` (`"CR3"`/`"CRM"`/`"MP4"`), set by the
+        // PRECEDING CNCV box in this SAME Canon `uuid` walk (file order), exactly
+        // as ExifTool's sequential `$$self{FileType}` is set before CMT3's
+        // SubDirectory runs. Captured OWNED to release the `&out` borrow before
+        // the `&mut out` push below.
+        let file_type = out.override_file_type().map(SmolStr::from);
+        let print = render_cmt3_block(h.body, true, current_model.as_deref(), file_type.as_deref());
+        let value = render_cmt3_block(
+          h.body,
+          false,
+          current_model.as_deref(),
+          file_type.as_deref(),
+        );
         out.push_cmt_tags(print, value);
       }
       // CMT4 — GPS (`GPS::Main`).
@@ -3850,14 +3869,14 @@ mod tests {
   fn render_cmt3_block_preserves_canon_priority_zero() {
     let body = cmt3_shotinfo_body();
     let emissions =
-      crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(&body, true, None);
+      crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(&body, true, None, None);
     // The block DOES yield a `Priority => 0` emission (BaseISO) — else the test
     // could not tell the fix apart from the bug.
     assert!(
       emissions.iter().any(|e| e.priority() == 0),
       "the ShotInfo body must yield a Priority => 0 emission: {emissions:?}"
     );
-    let rendered = render_cmt3_block(&body, true, None);
+    let rendered = render_cmt3_block(&body, true, None, None);
     assert_eq!(
       rendered.len(),
       emissions.len(),
@@ -3887,6 +3906,70 @@ mod tests {
     assert!(
       !crate::tagmap::dedup_override(base.priority(), 1),
       "a Priority => 0 CMT3 leaf must not override an earlier value"
+    );
+  }
+
+  /// A CMT3 Canon-MakerNote TIFF block whose IFD0 has ONE entry: a `CameraInfo`
+  /// (0x0d) SubDirectory read as `undef[0x0b40]` (verbatim bytes — the format the
+  /// model-keyed `%Canon::CameraInfo*` tables use), with the `%CameraInfoG5XII`
+  /// CR3 `ShutterCount` (0x0a95, `int32u`, `Canon.pm:4885`) set. (LE: header 8 +
+  /// IFD 18 + the 2880-byte value at offset 26.)
+  fn cmt3_g5xii_camerainfo_body() -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // 1 IFD0 entry
+    t.extend_from_slice(&0x000du16.to_le_bytes()); // tag 0x0d CanonCameraInfo
+    t.extend_from_slice(&7u16.to_le_bytes()); // format undef (verbatim bytes)
+    t.extend_from_slice(&0x0b40u32.to_le_bytes()); // count 2880 bytes
+    t.extend_from_slice(&26u32.to_le_bytes()); // out-of-line value pointer
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    // 2880-byte `undef` value: zeros up to 0x0a95, the CR3 ShutterCount int32u,
+    // then zero-pad to 0x0b40. Built by extension (no panicking index).
+    let mut blob: Vec<u8> = std::vec![0u8; 0x0a95];
+    blob.extend_from_slice(&7_654_321u32.to_le_bytes()); // CR3 ShutterCount (0x0a95)
+    blob.resize(0x0b40, 0u8);
+    t.extend_from_slice(&blob);
+    t
+  }
+
+  /// INTEGRATED CMT3 path: a G5 X Mark II `CameraInfo` routed through the REAL
+  /// `render_cmt3_block` → `redispatch_ctmd_makernote` → `canon_makernote_isolated`
+  /// chain (NOT the direct `camera_info::parse`). The `%CameraInfoG5XII` CR3
+  /// `ShutterCount` row is `$$self{FileType} eq "CR3"`-gated (`Canon.pm:4885`), so
+  /// it fires ONLY when the container `file_type` THREADS through — proving the
+  /// CR3 `FileType` reaches the gate. (The bug hard-coded `file_type = None` in
+  /// `redispatch_ctmd_makernote`, dropping the row on a real CR3.)
+  #[test]
+  fn render_cmt3_block_threads_g5xii_cr3_file_type() {
+    use crate::value::TagValue;
+    fn shutter_count(tags: &[crate::emit::EmittedTag]) -> Option<&crate::emit::EmittedTag> {
+      tags.iter().find(|t| t.tag().name() == "ShutterCount")
+    }
+    let body = cmt3_g5xii_camerainfo_body();
+    let model = Some("Canon PowerShot G5 X Mark II");
+
+    // CR3 container ($$self{FileType} eq "CR3") → the 0x0a95 ShutterCount FIRES,
+    // under `MakerNotes:Canon`.
+    let cr3 = render_cmt3_block(&body, true, model, Some("CR3"));
+    let sc = shutter_count(&cr3)
+      .unwrap_or_else(|| panic!("CR3 FileType must thread through to emit the G5XII row: {cr3:?}"));
+    assert_eq!(sc.tag().value_ref(), &TagValue::I64(7_654_321));
+    assert_eq!(sc.tag().group_ref().family0(), "MakerNotes");
+    assert_eq!(sc.tag().group_ref().family1(), "Canon");
+
+    // The OLD hard-coded `None` → the CR3 row is DROPPED (the bug); this is the
+    // input the fix has to repair, so without it the test could not tell them apart.
+    let none = render_cmt3_block(&body, true, model, None);
+    assert!(
+      shutter_count(&none).is_none(),
+      "with no FileType the CR3-gated ShutterCount must NOT emit (the pre-fix bug): {none:?}"
+    );
+
+    // A non-CR3 Canon container (e.g. a G5 X Mark II `.mp4`, CNCV "CanonMP4") is
+    // also dropped: the gate is an EXACT `eq "CR3"`, NOT `ne "JPEG"`.
+    let mp4 = render_cmt3_block(&body, true, model, Some("MP4"));
+    assert!(
+      shutter_count(&mp4).is_none(),
+      "the G5XII CR3 row is exact-`eq \"CR3\"`-gated, so MP4 must not emit it: {mp4:?}"
     );
   }
 
