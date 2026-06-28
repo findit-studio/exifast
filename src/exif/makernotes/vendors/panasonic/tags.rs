@@ -14,10 +14,11 @@
 //!   `RecognizedFaceFlags` is `Unknown => 1`, `Panasonic.pm:1025`), and a
 //!   [`PanasonicPrintConv`] strategy.
 //! - SubDirectory pointers (`FaceDetInfo` 0x4e, `FaceRecInfo` 0x61,
-//!   `PrintIM` 0x0e00, `TimeInfo` 0x2003) are recorded as [`SubTable`]
-//!   so the dispatcher can surface the raw blob; the dedicated walkers are
-//!   deferred follow-ups (see the deferral issues linked from #62). They
-//!   are the ONLY four SubDirectory entries in the Main hash.
+//!   `PrintIM` 0x0e00, `TimeInfo` 0x2003) are recorded as [`SubTable`]. The
+//!   three `ProcessBinaryData` sub-tables are walked natively (#105) via
+//!   [`decode_main_subdir`](super::decode_main_subdir); `PrintIM` is handled by
+//!   the shared PrintIM module. They are the ONLY four SubDirectory entries in
+//!   the Main hash.
 //! - Conditional ARRAY rows (`0x0f` AFAreaMode FZ10 vs other; `0x2c`
 //!   ContrastMode 4-way per-model) collapse to the bundled NON-model-gated
 //!   ("other models" / final) branch, exactly as the Apple/Canon ports do
@@ -101,21 +102,24 @@ impl PanasonicTag {
 }
 
 /// Panasonic Main SubDirectory targets. The Main hash has exactly four
-/// SubDirectory entries; Phase 3 doesn't walk any of them natively (the
-/// camera-indexing data is all in the LEAF tags), so each SubDirectory
-/// blob is surfaced as a raw value (presence + size) and the dedicated
-/// walker is deferred per follow-up issue.
+/// SubDirectory entries. Three are `ProcessBinaryData` sub-tables walked
+/// natively (#105) — their positions emit under the `Panasonic` family-1 group
+/// via [`decode_main_subdir`](super::decode_main_subdir); the fourth (PrintIM)
+/// is handled by the shared PrintIM module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SubTable {
-  /// `%Panasonic::FaceDetInfo` at 0x4e (`Panasonic.pm:936-942`). Deferred.
+  /// `%Panasonic::FaceDetInfo` at 0x4e (`Panasonic.pm:936-942`) — walked
+  /// (`super::face_det_info`).
   FaceDetInfo,
-  /// `%Panasonic::FaceRecInfo` at 0x61 (`Panasonic.pm:1007-1012`). Deferred.
+  /// `%Panasonic::FaceRecInfo` at 0x61 (`Panasonic.pm:1007-1012`) — walked
+  /// (`super::face_rec_info`).
   FaceRecInfo,
-  /// `%Panasonic::TimeInfo` at 0x2003 (`Panasonic.pm:1524-1527`). Deferred.
+  /// `%Panasonic::TimeInfo` at 0x2003 (`Panasonic.pm:1524-1527`) — walked
+  /// (`super::time_info`).
   TimeInfo,
-  /// `PrintIM::Main` at 0x0e00 (`Panasonic.pm:1518-1523`) — handled by a
-  /// separate module. Surfaced raw.
+  /// `PrintIM::Main` at 0x0e00 (`Panasonic.pm:1518-1523`) — handled by the
+  /// shared PrintIM module.
   PrintIm,
 }
 

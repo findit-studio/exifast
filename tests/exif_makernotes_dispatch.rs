@@ -4788,6 +4788,130 @@ fn leica7_embedded_app1_nonzero_base_matches_bundled_exiftool() {
   let _ = std::fs::remove_file(&path);
 }
 
+/// #105 Codex [high]: the Leica4 → `%Subdir` → `%Data1` `LensType` `Priority`
+/// collision, END-TO-END through the full `extract_info` pipeline (walk + shared
+/// de-dup).
+///
+/// A Leica4 (M9) MakerNote carrying BOTH the Subdir `0x3405 LensType` (default
+/// `Priority => 1`) AND the `0x3901 Data1` `LensType` (`Priority => 0`,
+/// `Panasonic.pm:1981`) must keep the HIGHER-priority `0x3405` value in the final
+/// de-dup: the `Data1` leaf is walked AFTER `0x3405` (since `0x3901 > 0x3405`),
+/// but its `Priority => 0` means it NEVER overrides (`ExifTool.pm:9544-9560`).
+/// Before the fix the `Data1` leaf emitted at the default priority and wrongly
+/// REPLACED the `0x3405` value. The unit test
+/// `leica4_descends_into_subdir_and_data1` asserts both leaves emit with the
+/// right per-leaf priorities (1 vs 0); this proves the downstream de-dup keeps
+/// the winner. Asserted in BOTH `-j` (the looked-up lens name) and `-n` (the
+/// ValueConv `"id bits"` string) modes.
+///
+/// (No `perl exiftool` cross-check: exifast's Leica4 `0x3000` SubDirectory
+/// descent reads the entry value as an integer offset (an inline `int32u` count-1
+/// pointer, `src/exif/mod.rs` `first_uint`), whereas ExifTool descends the value
+/// as OUT-OF-LINE sub-IFD bytes (`$valuePtr = base + offset`), so no single
+/// crafted fixture is walked by both engines — a pre-existing #105 descent-model
+/// question orthogonal to this priority fix. ExifTool's de-dup outcome was
+/// ground-truthed separately on an out-of-line fixture it can read: it likewise
+/// keeps the `0x3405` value over the `Priority => 0` Data1 one.)
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica4_data1_lenstype_priority0_does_not_override_subdir_0x3405() {
+  fn entry(buf: &mut Vec<u8>, tag: u16, fmt: u16, count: u32, value: u32) {
+    buf.extend_from_slice(&tag.to_le_bytes());
+    buf.extend_from_slice(&fmt.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+  }
+
+  // The Leica4 MakerNote value — the proven layout the
+  // `leica4_descends_into_subdir_and_data1` unit test walks. Offsets are
+  // blob-relative; Leica4 `Base => $start - 8` makes `value_offset_base ==
+  // mn_offset`, so a blob-relative offset `P` resolves at `data[P + mn_offset] =
+  // blob[P]` regardless of where the blob lands in the file.
+  let mut mn = Vec::new();
+  mn.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature (byte 5 = '0')
+  // Leica4 IFD @ 8: one entry 0x3000 -> Subdir IFD @ 26.
+  mn.extend_from_slice(&1u16.to_le_bytes());
+  entry(&mut mn, 0x3000, 4, 1, 26);
+  mn.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(mn.len(), 26);
+  // Subdir IFD @ 26: Contrast=2, 0x3405 LensType=20 (id 5, Priority => 1),
+  // 0x3901 Data1 @ 68.
+  mn.extend_from_slice(&3u16.to_le_bytes());
+  entry(&mut mn, 0x300a, 4, 1, 2); // Contrast int32u inline
+  entry(&mut mn, 0x3405, 4, 1, 20); // LensType int32u inline (id 5)
+  entry(&mut mn, 0x3901, 7, 26, 68); // Data1 undef[26] out-of-line @ 68
+  mn.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(mn.len(), 68);
+  // Data1 block @ 68: LensType int32u @ byte 22 = 24 (id 6, Priority => 0).
+  let mut data1 = std::vec![0u8; 22];
+  data1.extend_from_slice(&24u32.to_le_bytes());
+  mn.extend_from_slice(&data1);
+  assert_eq!(mn.len(), 94);
+
+  // Wrap in a standalone little-endian TIFF: IFD0(Make, Model, ExifIFD) ->
+  // ExifIFD(MakerNote 0x927c @ the blob). Leica4 dispatch needs Make
+  // `^Leica Camera AG` + the `LEICA0` signature.
+  let make = b"Leica Camera AG\x00"; // 16 bytes
+  let hdr = 8usize;
+  let ifd0_size = 2 + 12 * 3 + 4; // 42
+  let make_off = hdr + ifd0_size; // 50
+  let exif_off = make_off + make.len(); // 66
+  let exif_size = 2 + 12 + 4; // 18
+  let mn_off = exif_off + exif_size; // 84
+  let mut tiff = Vec::new();
+  tiff.extend_from_slice(b"II");
+  tiff.extend_from_slice(&42u16.to_le_bytes());
+  tiff.extend_from_slice(&(hdr as u32).to_le_bytes()); // IFD0 @ 8
+  tiff.extend_from_slice(&3u16.to_le_bytes());
+  entry(&mut tiff, 0x010f, 2, make.len() as u32, make_off as u32); // Make
+  entry(&mut tiff, 0x0110, 2, 3, u32::from_le_bytes(*b"M9\x00\x00")); // Model "M9" inline
+  entry(&mut tiff, 0x8769, 4, 1, exif_off as u32); // ExifIFD pointer
+  tiff.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(tiff.len(), make_off);
+  tiff.extend_from_slice(make);
+  assert_eq!(tiff.len(), exif_off);
+  tiff.extend_from_slice(&1u16.to_le_bytes());
+  entry(&mut tiff, 0x927c, 7, mn.len() as u32, mn_off as u32); // MakerNote
+  tiff.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(tiff.len(), mn_off);
+  tiff.extend_from_slice(&mn);
+
+  // (print_on, winner = 0x3405 value, loser = Data1 value).
+  for (print_on, winner, loser) in [
+    (true, "Summilux-M 50mm f/1.4 (II)", "Summilux-M 35mm f/1.4"),
+    (false, "5 0", "6 0"),
+  ] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("leica4_collision.tif", &tiff, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("{mode}: invalid JSON ({e})"));
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("{mode}: doc is [{{…}}]"));
+    let lens = obj.get("Leica:LensType").and_then(|v| v.as_str());
+    assert_eq!(
+      lens,
+      Some(winner),
+      "{mode}: Leica:LensType must stay the higher-priority 0x3405 value, NOT the \
+       Priority => 0 Data1 value (keys: {:?})",
+      obj.keys().collect::<Vec<_>>()
+    );
+    assert_ne!(
+      lens,
+      Some(loser),
+      "{mode}: the Priority => 0 Data1 LensType must not override 0x3405"
+    );
+    // The Subdir walk reached its leaves (proves the descent ran).
+    assert!(
+      obj.contains_key("Leica:Contrast"),
+      "{mode}: Subdir Contrast leaf present (keys: {:?})",
+      obj.keys().collect::<Vec<_>>()
+    );
+  }
+}
+
 // ===========================================================================
 // MakerNote directory-size SALVAGE clamp (Exif.pm:6384-6388, #248)
 // ===========================================================================

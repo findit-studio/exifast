@@ -33,14 +33,15 @@
 //!   parsed fields — body identity (Lens model/serial, internal serial,
 //!   firmware, ImageStabilization, FilmMode, PhotoStyle, Roll/PitchAngle).
 //!
-//! ## Deferred (Phase 3+1 follow-up)
+//! ## Main SubDirectory pointers
 //!
-//! The Main hash has exactly four SubDirectory pointers; the dedicated
-//! walkers are deferred (each blob is surfaced raw):
+//! The Main hash has exactly four SubDirectory pointers. Three are
+//! `ProcessBinaryData` sub-tables walked natively (#105) — their positions emit
+//! under the `Panasonic` family-1 group via [`decode_main_subdir`]:
 //!
-//! - `Panasonic::FaceDetInfo` at 0x4e (`Panasonic.pm:936-942`).
-//! - `Panasonic::FaceRecInfo` at 0x61 (`Panasonic.pm:1007-1012`).
-//! - `Panasonic::TimeInfo` at 0x2003 (`Panasonic.pm:1524-1527`).
+//! - `Panasonic::FaceDetInfo` at 0x4e (`Panasonic.pm:936-942`) — [`face_det_info`].
+//! - `Panasonic::FaceRecInfo` at 0x61 (`Panasonic.pm:1007-1012`) — [`face_rec_info`].
+//! - `Panasonic::TimeInfo` at 0x2003 (`Panasonic.pm:1524-1527`) — [`time_info`].
 //! - `PrintIM::Main` at 0x0e00 (`Panasonic.pm:1518-1523`) — handled by the
 //!   shared PrintIM module.
 //!
@@ -62,8 +63,11 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod body;
+pub mod face_det_info;
+pub mod face_rec_info;
 pub mod printconv;
 pub mod tags;
+pub mod time_info;
 
 use crate::exif::makernotes::detected::BaseRule;
 use crate::exif::makernotes::vendors::VendorEmission;
@@ -656,6 +660,35 @@ fn first_i64(raw: &RawValue) -> Option<i64> {
   }
 }
 
+/// Decode a WALKED `%Panasonic::Main` ProcessBinaryData SubDirectory blob into
+/// its `(Name, TagValue)` emission pairs — the faithful descent for the three
+/// binary sub-tables `%Panasonic::Main` references: `FaceDetInfo` (0x4e,
+/// `Panasonic.pm:2279`), `FaceRecInfo` (0x61, `:2332`), `TimeInfo` (0x2003,
+/// `:1939`). All three emit under the `Panasonic` family-1 group (the module
+/// default the source tables inherit).
+///
+/// `blob` is the verbatim `$$valPt` value span (`data[value_offset ..
+/// value_offset + value_size]`); `order` the inherited parent Panasonic byte
+/// order (none of the three SubDirectory refs carry a `ByteOrder` override).
+/// Returns `None` for [`SubTable::PrintIm`] — the `PrintIM::Main` SubDirectory
+/// (0x0e00) is handled by the shared PrintIM module, not this descent — so the
+/// caller falls through to its existing (no-emit) handling.
+#[must_use]
+pub fn decode_main_subdir(
+  sub: SubTable,
+  blob: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Option<Vec<(SmolStr, TagValue)>> {
+  match sub {
+    SubTable::FaceDetInfo => Some(face_det_info::parse(blob, order)),
+    SubTable::FaceRecInfo => Some(face_rec_info::parse(blob, order)),
+    SubTable::TimeInfo => Some(time_info::parse(blob, order, print_conv)),
+    // `PrintIM::Main` is handled by the shared PrintIM module, not here.
+    SubTable::PrintIm => None,
+  }
+}
+
 #[cfg(test)]
 // The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
 // contract (Phase C S2); the test-builder helpers index fixed-layout buffers
@@ -1102,53 +1135,60 @@ mod tests {
     );
   }
 
-  /// SubDirectory rows are DESCENDED-INTO, never emitted as a parent value.
-  /// A `%Panasonic::Main` body carrying 0x4e FaceDetInfo
-  /// (`Panasonic.pm:936-942`, SubDirectory → `Panasonic::FaceDetInfo`) and
-  /// 0x2003 TimeInfo (`:1524-1527`, SubDirectory → `Panasonic::TimeInfo`)
-  /// must emit NEITHER `FaceDetInfo` NOR `TimeInfo` — ExifTool's
-  /// `if ($subdir)` block descends + `next`s before `FoundTag`
-  /// (`Exif.pm:6919,7103-7104,7180`), and Phase 3 defers the child walk. A
-  /// sibling leaf (0x01 ImageQuality) IS still emitted, proving the
-  /// suppression is targeted at the SubDirectory rows, not a blanket drop.
+  /// SubDirectory rows DESCEND into their child `ProcessBinaryData` table (#105):
+  /// the PARENT pointer (`FaceDetInfo`/`TimeInfo`) is NEVER emitted as a value
+  /// (ExifTool's `if ($subdir)` descends + `next`s before `FoundTag`,
+  /// `Exif.pm:6919,7103-7104,7180`), but the CHILD positions ARE emitted under
+  /// the `Panasonic` group. A sibling leaf (0x01 ImageQuality) is still emitted,
+  /// proving the descent is targeted, not a blanket drop. End-to-end through the
+  /// shared-`Walker` capture loop.
   #[test]
-  fn subdir_facedetinfo_timeinfo_not_emitted() {
+  fn subdir_facedetinfo_timeinfo_descend_to_children() {
+    // 0x4e FaceDetInfo undef[10]: NumFacePositions=1, Face1Position=160 120 50 50.
+    let mut face = std::vec![0u8; 10];
+    face[0..2].copy_from_slice(&1u16.to_le_bytes());
+    for (k, v) in [160u16, 120, 50, 50].iter().enumerate() {
+      face[2 + k * 2..4 + k * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    // 0x2003 TimeInfo undef[20]: PanasonicDateTime + TimeLapseShotNumber=9.
+    let mut time = std::vec![0u8; 20];
+    time[0..8].copy_from_slice(&[0x20, 0x21, 0x06, 0x28, 0x14, 0x30, 0x00, 0x55]);
+    time[16..20].copy_from_slice(&9u32.to_le_bytes());
     // Entries MUST be tag-id sorted: 0x01, 0x4e, 0x2003.
     let blob = build_blob(&[
       (0x01, 0x03, 1, std::vec![0x02, 0x00, 0, 0]), // ImageQuality int16u = 2 ("High")
-      (0x4e, 0x07, 4, std::vec![0x01, 0x02, 0x03, 0x04]), // FaceDetInfo undef[4]
-      (0x2003, 0x07, 4, std::vec![0x05, 0x06, 0x07, 0x08]), // TimeInfo undef[4]
+      (0x4e, 0x07, 10, face),
+      (0x2003, 0x07, 20, time),
     ]);
     for print_conv in [true, false] {
       let (_t, em) = parse_with_print_conv(&blob, ByteOrder::Little, print_conv);
+      // The PARENT SubDirectory pointers are never emitted as values.
+      assert_eq!(emit_value(&em, "FaceDetInfo"), None);
+      assert_eq!(emit_value(&em, "TimeInfo"), None);
+      // The CHILD positions ARE emitted (the #105 descent), identical in both modes.
+      assert_eq!(emit_value(&em, "NumFacePositions"), Some(TagValue::I64(1)));
       assert_eq!(
-        emit_value(&em, "FaceDetInfo"),
-        None,
-        "Panasonic:FaceDetInfo (0x4e SubDirectory) must NOT be emitted \
-         (print_conv={print_conv})"
+        emit_value(&em, "Face1Position"),
+        Some(TagValue::Str("160 120 50 50".into()))
       );
       assert_eq!(
-        emit_value(&em, "TimeInfo"),
-        None,
-        "Panasonic:TimeInfo (0x2003 SubDirectory) must NOT be emitted \
-         (print_conv={print_conv})"
+        emit_value(&em, "PanasonicDateTime"),
+        Some(TagValue::Str("2021:06:28 14:30:00.55".into()))
       );
-      // The sibling leaf is retained (value form differs by mode: "High" in
-      // print-conv, raw 2 in value-conv — only presence matters here).
-      assert!(
-        emit_value(&em, "ImageQuality").is_some(),
-        "sibling leaf ImageQuality must still be emitted (print_conv={print_conv})"
+      assert_eq!(
+        emit_value(&em, "TimeLapseShotNumber"),
+        Some(TagValue::I64(9))
       );
     }
-    // In print-conv mode the leaf renders via PrintConv (`Panasonic.pm:281`).
+    // In print-conv mode the sibling leaf renders via PrintConv (`Panasonic.pm:281`).
     let (_tp, emp) = parse_with_print_conv(&blob, ByteOrder::Little, true);
     assert_eq!(
       emit_value(&emp, "ImageQuality"),
       Some(TagValue::Str("High".into()))
     );
 
-    // Also assert through the Metadata sink: no `Panasonic:FaceDetInfo` /
-    // `Panasonic:TimeInfo` key, mirroring the bundled default `-G1 -j` output.
+    // Through the Metadata sink: child keys present, parent keys absent, all
+    // under the `Panasonic` family-1 group (the source tables' module default).
     let mut md = Metadata::new("test.rw2");
     parse_into_metadata(&blob, ByteOrder::Little, true, &mut md);
     let names: Vec<&str> = md.tags_slice().iter().map(|t| t.name()).collect();
@@ -1157,9 +1197,19 @@ mod tests {
       "no SubDirectory parent may reach the Metadata sink, got {names:?}"
     );
     assert!(
-      names.contains(&"ImageQuality"),
-      "ImageQuality must reach the sink, got {names:?}"
+      names.contains(&"NumFacePositions")
+        && names.contains(&"PanasonicDateTime")
+        && names.contains(&"ImageQuality"),
+      "child + sibling tags must reach the sink, got {names:?}"
     );
+    for t in md.tags_slice() {
+      assert_eq!(
+        t.group_ref().family1(),
+        "Panasonic",
+        "tag {:?} must emit under the Panasonic group",
+        t.name()
+      );
+    }
   }
 
   /// `$format`-gated single-HASH `Condition` suppression for the LensType

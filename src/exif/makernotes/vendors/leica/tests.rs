@@ -4,6 +4,11 @@
 //! Unit tests for the Leica typed surface, the per-variant tag tables, and the
 //! `LeicaPrintConv` conversions (`%Panasonic::Leica2`..`Leica9`).
 
+// Crafted-byte fixtures index into fixed-size scratch buffers (e.g. the Data1
+// block's `data1[22..26]`); the parent module's `#![deny(clippy::indexing_slicing)]`
+// is not meant for this test code, matching the sibling inline test modules.
+#![allow(clippy::indexing_slicing)]
+
 use super::*;
 use crate::exif::ifd::RawValue;
 use crate::value::TagValue;
@@ -228,4 +233,310 @@ fn populate_typed_lens_and_serial() {
   );
   assert_eq!(t.lens_name(), Some("Summicron-M 50mm f/2 (IV, V)"));
   assert_eq!(t.serial_number(), Some("0001234"));
+}
+
+/// The #105 binary `ProcessBinaryData` SubDirectory rows resolve with their
+/// `sub_table` marker (so the capture loop descends them), the extended tables
+/// stay sorted (the binary-search invariant), and `decode_leica_subdir` routes
+/// each marker to its decoder.
+#[test]
+fn binary_subdir_rows_present_and_routed() {
+  // The SubDirectory pointers carry the right marker.
+  assert_eq!(
+    lookup(LeicaVariant::Leica3, 0x0b).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::SerialInfo)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Leica5, 0x040a).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::FocusInfo)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Leica5, 0x0410).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::ShotInfo)
+  );
+  // The extended tables stay strictly sorted (binary-search-ready).
+  for tags in [LEICA3_TAGS, LEICA5_TAGS] {
+    let mut prev: i64 = -1;
+    for t in tags {
+      assert!(
+        i64::from(t.id) > prev,
+        "LEICA table unsorted at {:#x}",
+        t.id
+      );
+      prev = i64::from(t.id);
+    }
+  }
+  // The dispatcher routes each marker to its decoder.
+  let shot = decode_leica_subdir(
+    LeicaSubTable::ShotInfo,
+    &1234u16.to_le_bytes(),
+    crate::exif::ifd::ByteOrder::Little,
+    true,
+  );
+  assert_eq!(shot.first().map(|(k, ..)| k.as_str()), Some("FileIndex"));
+  assert_eq!(
+    shot.first().map(|(_, v, _)| v.clone()),
+    Some(TagValue::I64(1234))
+  );
+  // The default `Priority => 1` (ShotInfo `FileIndex` has no `Priority` directive).
+  assert_eq!(shot.first().map(|(.., p)| *p), Some(1u8));
+}
+
+/// The `%Panasonic::Subdir` table (#105, the Leica M9 sub-IFD): the plain leaves
+/// resolve, the `0x3901`/`0x3902` rows carry the `Data1`/`Data2` markers, and the
+/// table is strictly sorted (binary-search-ready).
+#[test]
+fn subdir_table_leaves_and_markers() {
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x300a).map(LeicaTag::name),
+    Some("Contrast")
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3405).map(LeicaTag::name),
+    Some("LensType")
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3901).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::Data1)
+  );
+  assert_eq!(
+    lookup(LeicaVariant::Subdir, 0x3902).and_then(LeicaTag::sub_table),
+    Some(LeicaSubTable::Data2)
+  );
+  let mut prev: i64 = -1;
+  for t in SUBDIR_TAGS {
+    assert!(
+      i64::from(t.id) > prev,
+      "SUBDIR_TAGS unsorted at {:#x}",
+      t.id
+    );
+    prev = i64::from(t.id);
+  }
+  // Data2 is an empty table ⇒ descends but emits nothing.
+  assert!(
+    decode_leica_subdir(
+      LeicaSubTable::Data2,
+      &[1, 2, 3, 4],
+      crate::exif::ifd::ByteOrder::Little,
+      true
+    )
+    .is_empty()
+  );
+}
+
+/// END-TO-END: a crafted Leica4 (M9) MakerNote descends Leica4 → `%Subdir` →
+/// `%Data1`. The four Leica4 `0x3000`/… rows are IFD SubDirectories into
+/// `%Panasonic::Subdir` (`ByteOrder => Unknown`); a Subdir `0x3901` row descends
+/// into the `%Panasonic::Data1` binary block. Proves the in-walk descent emits
+/// the Subdir LEAVES (Contrast, LensType) AND the Data1 LensType, with the parent
+/// pointers never emitted.
+#[test]
+fn leica4_descends_into_subdir_and_data1() {
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::vendors::VendorEmission;
+  use crate::exif::makernotes::{BaseRule, ChildByteOrder, DetectedMakerNote, Vendor};
+
+  fn push_entry(buf: &mut std::vec::Vec<u8>, tag: u16, format: u16, count: u32, value: u32) {
+    buf.extend_from_slice(&tag.to_le_bytes());
+    buf.extend_from_slice(&format.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+  }
+
+  // mn_offset 0 + Leica4 `Base => $start - 8` (RelativeToStart(-8)) ⇒
+  // value_offset_base = (0 + 8) - 8 = 0, so every offset below is buffer-relative.
+  let mut buf = std::vec::Vec::new();
+  buf.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature
+  // Leica4 IFD @ 8: one entry 0x3000 -> Subdir IFD @ 26.
+  buf.extend_from_slice(&1u16.to_le_bytes());
+  push_entry(&mut buf, 0x3000, 4, 1, 26); // LONG, value = Subdir IFD offset
+  buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(buf.len(), 26);
+  // Subdir IFD @ 26: Contrast=2 ("Normal"), LensType=20 (id 5), Data1 @ 68.
+  buf.extend_from_slice(&3u16.to_le_bytes());
+  push_entry(&mut buf, 0x300a, 4, 1, 2); // Contrast int32u inline
+  push_entry(&mut buf, 0x3405, 4, 1, 20); // LensType int32u inline (id 5)
+  push_entry(&mut buf, 0x3901, 7, 26, 68); // Data1 undef[26] out-of-line @ 68
+  buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(buf.len(), 68);
+  // Data1 block @ 68: LensType int32u @ byte 22 = 24 (id 6).
+  let mut data1 = std::vec![0u8; 26];
+  data1[22..26].copy_from_slice(&24u32.to_le_bytes());
+  buf.extend_from_slice(&data1);
+
+  let detected = DetectedMakerNote::new(
+    Vendor::Leica,
+    8,
+    BaseRule::RelativeToStart(-8),
+    ChildByteOrder::Unknown,
+    false,
+  );
+  let (em, _typed) = crate::exif::leica_makernote_isolated(
+    &buf,
+    0,
+    buf.len(),
+    LeicaVariant::Leica4,
+    detected,
+    ByteOrder::Little,
+    0,
+    None,
+    true,
+  )
+  .expect("Leica4 walk");
+  let has = |name: &str, val: &str| {
+    em.iter()
+      .any(|e: &VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+  };
+  let names: std::vec::Vec<&str> = em.iter().map(VendorEmission::name).collect();
+  // Subdir leaves (descended Leica4 -> Subdir).
+  assert!(has("Contrast", "Normal"), "Subdir Contrast; got {names:?}");
+  assert!(
+    has("LensType", "Summilux-M 50mm f/1.4 (II)"),
+    "Subdir 0x3405 LensType; got {names:?}"
+  );
+  // Data1 descent (Subdir 0x3901 -> Data1 LensType, the &0xffff variant, id 6).
+  assert!(
+    has("LensType", "Summilux-M 35mm f/1.4"),
+    "Data1 LensType; got {names:?}"
+  );
+  // The parent SubDirectory pointers are never emitted as values.
+  assert!(
+    !names.contains(&"Subdir3000") && !names.contains(&"Data1"),
+    "parent pointers must not emit; got {names:?}"
+  );
+  // #105 Codex [high]: BOTH LensType leaves are emitted, but the Subdir `0x3405`
+  // leaf keeps its default `Priority => 1` while the Data1 leaf carries
+  // `Priority => 0` (`Panasonic.pm:1981`) — so the shared de-dup keeps the
+  // higher-priority `0x3405` value and the later Data1 value never overrides it.
+  let prio = |name: &str, val: &str| -> Option<u8> {
+    em.iter()
+      .find(|e: &&VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+      .map(VendorEmission::priority)
+  };
+  assert_eq!(
+    prio("LensType", "Summilux-M 50mm f/1.4 (II)"),
+    Some(1),
+    "Subdir 0x3405 LensType default Priority => 1; got {names:?}"
+  );
+  assert_eq!(
+    prio("LensType", "Summilux-M 35mm f/1.4"),
+    Some(0),
+    "Data1 LensType Priority => 0 (Panasonic.pm:1981); got {names:?}"
+  );
+}
+
+/// MIXED-ENDIAN (#105): a crafted Leica4 (M9) whose OUTER IFD is little-endian
+/// but whose `%Subdir` child IFD (`ByteOrder => Unknown`) probes to BIG-endian.
+/// The Subdir `0x3901` `Data1` block carries an int32u `LensType` written
+/// BIG-endian; it MUST decode under the CHILD IFD's resolved order (BIG), not the
+/// outer MakerNote IFD's (LITTLE). Under the outer order the bytes byte-swap to a
+/// different lens id — the regression this guards. The plain Subdir leaves
+/// (Contrast / `0x3405` LensType), decoded inline during the child walk, already
+/// used the child order; this proves the binary sub-table re-slice now does too
+/// (each block decodes under [`ExifEntry::ifd_order`](crate::exif)).
+#[test]
+fn leica4_subdir_child_decodes_under_its_own_byte_order() {
+  use crate::exif::ifd::ByteOrder;
+  use crate::exif::makernotes::vendors::VendorEmission;
+  use crate::exif::makernotes::{BaseRule, ChildByteOrder, DetectedMakerNote, Vendor};
+
+  fn push_entry_le(buf: &mut std::vec::Vec<u8>, tag: u16, format: u16, count: u32, value: u32) {
+    buf.extend_from_slice(&tag.to_le_bytes());
+    buf.extend_from_slice(&format.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+  }
+  fn push_entry_be(buf: &mut std::vec::Vec<u8>, tag: u16, format: u16, count: u32, value: u32) {
+    buf.extend_from_slice(&tag.to_be_bytes());
+    buf.extend_from_slice(&format.to_be_bytes());
+    buf.extend_from_slice(&count.to_be_bytes());
+    buf.extend_from_slice(&value.to_be_bytes());
+  }
+
+  // mn_offset 0 + Leica4 `Base => $start - 8` (RelativeToStart(-8)) ⇒
+  // value_offset_base = (0 + 8) - 8 = 0, so every offset below is buffer-relative.
+  let mut buf = std::vec::Vec::new();
+  buf.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature
+  // OUTER Leica4 IFD @ 8 (LITTLE): the count word [0x01,0x00] read under the
+  // parent order (Little) = 1 ⇒ no toggle ⇒ the outer IFD stays LITTLE. One entry
+  // 0x3000 -> Subdir IFD @ 26.
+  buf.extend_from_slice(&1u16.to_le_bytes());
+  push_entry_le(&mut buf, 0x3000, 4, 1, 26); // LONG, value = Subdir IFD offset
+  buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
+  assert_eq!(buf.len(), 26);
+  // CHILD Subdir IFD @ 26 (BIG): the count word [0x00,0x03] read under the parent
+  // order (Little) = 0x0300 ⇒ (num>>8)=3 > (num&0xff)=0 ⇒ TOGGLE ⇒ the child walks
+  // BIG. Three BIG-endian entries: Contrast=2 ("Normal"), LensType=20 (id 5),
+  // Data1 @ 68.
+  buf.extend_from_slice(&3u16.to_be_bytes());
+  push_entry_be(&mut buf, 0x300a, 4, 1, 2); // Contrast int32u inline
+  push_entry_be(&mut buf, 0x3405, 4, 1, 20); // LensType int32u inline (id 5)
+  push_entry_be(&mut buf, 0x3901, 7, 26, 68); // Data1 undef[26] out-of-line @ 68
+  buf.extend_from_slice(&0u32.to_be_bytes()); // next-IFD
+  assert_eq!(buf.len(), 68);
+  // Data1 block @ 68: LensType int32u @ byte 22 = 24 (id 6), written BIG-endian.
+  // Decoded under the child order (BIG) ⇒ 24 ⇒ id 6 "Summilux-M 35mm f/1.4";
+  // under the outer order (LITTLE) the bytes [00,00,00,18] byte-swap to
+  // 0x18000000 ⇒ id 0 "Uncoded lens" — the bug.
+  let mut data1 = std::vec![0u8; 26];
+  data1[22..26].copy_from_slice(&24u32.to_be_bytes());
+  buf.extend_from_slice(&data1);
+
+  let detected = DetectedMakerNote::new(
+    Vendor::Leica,
+    8,
+    BaseRule::RelativeToStart(-8),
+    ChildByteOrder::Unknown,
+    false,
+  );
+  let (em, _typed) = crate::exif::leica_makernote_isolated(
+    &buf,
+    0,
+    buf.len(),
+    LeicaVariant::Leica4,
+    detected,
+    ByteOrder::Little, // the OUTER/parent order
+    0,
+    None,
+    true,
+  )
+  .expect("Leica4 walk");
+  let has = |name: &str, val: &str| {
+    em.iter()
+      .any(|e: &VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+  };
+  let names: std::vec::Vec<&str> = em.iter().map(VendorEmission::name).collect();
+  // The BIG-endian child IFD's plain leaves decode under the child order.
+  assert!(
+    has("Contrast", "Normal"),
+    "Subdir Contrast (child BIG); got {names:?}"
+  );
+  assert!(
+    has("LensType", "Summilux-M 50mm f/1.4 (II)"),
+    "Subdir 0x3405 LensType (child BIG); got {names:?}"
+  );
+  // THE FIX: the Data1 binary sub-table decodes under the CHILD IFD's order (BIG)
+  // ⇒ id 6, not the byte-swapped outer-order value.
+  assert!(
+    has("LensType", "Summilux-M 35mm f/1.4"),
+    "Data1 LensType must decode under the child IFD order (BIG); got {names:?}"
+  );
+  // The byte-swapped (buggy outer-order) decode would be id 0 "Uncoded lens" —
+  // assert it is ABSENT so a regression to the outer order is unambiguous.
+  assert!(
+    !has("LensType", "Uncoded lens"),
+    "Data1 must NOT decode under the outer order (byte-swapped to id 0); got {names:?}"
+  );
+  // The byte-order fix leaves the `Priority => 0` (`Panasonic.pm:1981`) ride
+  // intact for the Data1 LensType.
+  let prio = |name: &str, val: &str| -> Option<u8> {
+    em.iter()
+      .find(|e: &&VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+      .map(VendorEmission::priority)
+  };
+  assert_eq!(
+    prio("LensType", "Summilux-M 35mm f/1.4"),
+    Some(0),
+    "Data1 LensType Priority => 0; got {names:?}"
+  );
 }

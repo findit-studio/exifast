@@ -906,6 +906,19 @@ pub struct ExifEntry {
   /// standalone TIFF) for an IFD0 leaf; never serialized (an emission-ordering
   /// aid only — VALUES stay byte-identical).
   own_ifd_start: usize,
+  /// The RESOLVED byte order the IFD body this entry was walked under was read in
+  /// — `self.order` at push time, i.e. the order
+  /// [`process_subdir`](Walker::process_subdir) resolved for THIS directory. For a
+  /// `ByteOrder => Unknown` child (the Leica4 `%Subdir` IFDs) the probe can pick a
+  /// DIFFERENT order than the parent MakerNote IFD, so it is recorded PER entry,
+  /// alongside [`own_ifd_start`](Self::own_ifd_start): together they identify the
+  /// directory AND the order its values decode under. Consumed by the Leica binary
+  /// sub-table re-slice (#105) so a `Data1`/`FocusInfo`/`ShotInfo` block decodes
+  /// its ints with ITS containing IFD's order — a mixed-endian Leica4 `%Subdir`
+  /// child would otherwise byte-swap the `Data1` `int32u LensType`. A synthetic /
+  /// placeholder push (no walked IFD) carries the walker's active order and never
+  /// has it read. Never serialized (VALUES stay byte-identical).
+  ifd_order: ByteOrder,
   /// The SOURCE-BLOCK ordinal — the index of the independent TIFF block this
   /// entry was extracted from when several are MERGED into one [`ExifMeta`]
   /// (a multi-`APP1` JPEG: each independent `APP1` Exif segment is its own
@@ -999,6 +1012,17 @@ impl ExifEntry {
   #[inline(always)]
   pub(crate) const fn own_ifd_start(&self) -> usize {
     self.own_ifd_start
+  }
+
+  /// The resolved byte order of this entry's OWN containing IFD body
+  /// ([`process_subdir`](Walker::process_subdir)'s `resolved_order` for that
+  /// directory). Consumed by the Leica binary sub-table decode (#105) to re-slice
+  /// each block under its containing IFD's order, not the outer MakerNote IFD's;
+  /// never serialized.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn ifd_order(&self) -> ByteOrder {
+    self.ifd_order
   }
 
   /// The source-block ordinal (the merged `APP1` Exif block this entry came
@@ -6031,6 +6055,9 @@ impl Walker<'_, '_> {
               value_offset: 0,
               value_size: 0,
               own_ifd_start: 0,
+              // The walker's active order; a MinoltaRaw leaf is never a Leica
+              // sub-table parent, so the Leica re-slice never reads it.
+              ifd_order: self.order,
               source_block: 0,
               conv: ResolvedConv::Exif(leaf.tag),
             });
@@ -8305,6 +8332,9 @@ impl Walker<'_, '_> {
       value_offset: 0,
       value_size: 0,
       own_ifd_start: 0,
+      // The walker's active order; a synthetic Binary placeholder is never a Leica
+      // sub-table parent, so the Leica re-slice never reads it.
+      ifd_order: self.order,
       source_block: 0,
       conv: ResolvedConv::Exif(&SYNTHETIC_DATA_TAG),
     });
@@ -8603,6 +8633,34 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Samsung(t)),
         None => return,
       },
+      // `%Panasonic::Leica4` (M9, #105) — every row is an IFD SubDirectory into
+      // `%Panasonic::Subdir` (`Panasonic.pm:1742-1769`, `0x3000`/`0x3100`/`0x3400`/
+      // `0x3900`), walked under `ByteOrder => Unknown`. Descend IN-WALK here (like
+      // the Samsung `PreviewIfd` descent below): the child IFD starts at `$val +
+      // value_offset_base` (the default `Start => '$val'`, the inherited base), and
+      // its leaves resolve under `active_table == Leica(Subdir)`. The parent
+      // pointer is NEVER emitted (`return`), matching ExifTool's descend-then-`next`
+      // (`Exif.pm:7103-7104`); a non-SubDirectory Leica4 id is unknown ⇒ skipped.
+      // Leica4 carries no plain leaf, so this arm handles every Leica4 entry.
+      TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Leica4) => {
+        if matches!(tag_id, 0x3000 | 0x3100 | 0x3400 | 0x3900)
+          && let Some(off) = first_uint(&raw)
+          && let Some(start) = i64::try_from(off)
+            .ok()
+            .map(|d| d.saturating_add(self.value_offset_base))
+            .and_then(|a| usize::try_from(a).ok())
+        {
+          self.process_subdir(
+            start,
+            kind,
+            TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Subdir),
+            ByteOrderRule::Unknown,
+            FixBaseMode::No,
+            ProcessProc::Exif,
+          );
+        }
+        return;
+      }
       // `%Panasonic::Leica2`..`Leica9` (#259). The resolved [`LeicaTag`] rides in
       // `ResolvedConv::Leica` WITH its variant so the emit ([`emit_leica_value`])
       // reapplies its `LeicaPrintConv` + evaluates the row `Condition`. An unknown
@@ -8880,6 +8938,11 @@ impl Walker<'_, '_> {
       // ExifIFD leaf, the InteropIFD body for an inline `0xa005` leaf) — the
       // MakerNote splice anchors on it (`push_exif_tags`).
       own_ifd_start: ifd_start,
+      // The order THIS directory was resolved + walked under (`self.order` is the
+      // `process_subdir`-resolved order for `ifd_start`). A `ByteOrder => Unknown`
+      // child can differ from its parent, so the Leica binary sub-table re-slice
+      // (#105) decodes each block under THIS, not the outer MakerNote IFD's order.
+      ifd_order: self.order,
       // Single walk = the first/only source block (`0`); the JPEG merge
       // re-stamps later `APP1` blocks' entries (`set_source_block`).
       source_block: 0,
@@ -9090,6 +9153,9 @@ impl Walker<'_, '_> {
         // The synthetic DataTag image trails its OWN IFD's leaves (the same
         // emitted-directory `ifd_start` the pair was collected under).
         own_ifd_start: pair.ifd_start,
+        // The walker's active order; a synthetic DataTag image is never a Leica
+        // sub-table parent, so the Leica re-slice never reads it.
+        ifd_order: self.order,
         // The synthetic DataTag image trails its IFD's leaves in the SAME
         // source block; `finalize_data_tags` runs per-block before any merge
         // (re-stamped with the block ordinal in `merge_exif_block`).
@@ -11287,6 +11353,13 @@ fn emit_leica_value<S: ExifSink>(
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   use makernotes::vendors::leica::tags::LeicaCondition;
+  // A SubDirectory row's PARENT pointer emits nothing here (#105). The production
+  // capture loop runs the child `ProcessBinaryData` walk (`decode_leica_subdir`)
+  // BEFORE this is reached; this guard covers the defensive `emit_entry`
+  // fallback (no child walk there).
+  if leica_tag.sub_table().is_some() {
+    return Ok(());
+  }
   // Row `Condition` gate. A failing Condition ⇒ `GetTagInfo` returns no tag ⇒
   // emit NOTHING and populate NO typed field (the absent-tag behaviour).
   if let Some(cond) = leica_tag.condition() {
@@ -11499,8 +11572,12 @@ fn emit_nikon_value<S: ExifSink>(
 ///
 /// 1. **SubDirectory skip** — a row with a `sub_table` (FaceDetInfo 0x4e /
 ///    FaceRecInfo 0x61 / PrintIM 0x0e00 / TimeInfo 0x2003) DESCENDS into a child
-///    table and never emits the parent pointer as a value; Phase 3 defers the
-///    child walk, so NEITHER parent nor children emit (`Exif.pm:7103-7104`).
+///    table and never emits the PARENT pointer as a value (`Exif.pm:7103-7104`).
+///    The CHILD `ProcessBinaryData` walk for the three binary sub-tables runs in
+///    the capture loop (`panasonic::decode_main_subdir`, #105) BEFORE this leaf
+///    emit is reached; this function only guarantees the parent pointer itself
+///    emits nothing (the defensive `emit_entry` fallback, which does not run the
+///    child walk, also relies on this skip).
 /// 2. **Single-HASH `Condition` suppression** — the `$format`-gated LensType rows
 ///    0xc4/0xc5/0xe4 are dropped when `$format ne "int16u"` (and 0xc4 also drops
 ///    the `0xffff` `$$valPt` sentinel), read off [`ExifEntry::on_disk_format`].
@@ -11546,7 +11623,10 @@ fn emit_panasonic_value<S: ExifSink>(
   use makernotes::vendors::panasonic::{PanasonicPrintConv, populate_typed};
   let tag_id = entry.tag_id;
   let raw = entry.value.raw();
-  // Step 1 — deferred SubDirectory row: emit NEITHER parent nor children.
+  // Step 1 — SubDirectory row: the PARENT pointer emits nothing here. The
+  // production capture loop runs the child `ProcessBinaryData` walk
+  // (`decode_main_subdir`) BEFORE this is reached; this guard covers the
+  // defensive `emit_entry` fallback (no child walk there).
   if panasonic_tag.sub_table.is_some() {
     return Ok(());
   }
@@ -13233,6 +13313,25 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
       // (never produced under `TableRef::Panasonic`) is skipped —
       // `emit_panasonic_value` needs the `PanasonicTag`.
       if let ResolvedConv::Panasonic(panasonic_tag) = entry.conv {
+        // A WALKED ProcessBinaryData SubDirectory (FaceDetInfo 0x4e / FaceRecInfo
+        // 0x61 / TimeInfo 0x2003, #105) is decoded HERE: re-slice the verbatim
+        // `$$valPt` value span and emit each position under the `Panasonic`
+        // family-1 group, reproducing ExifTool's descend-then-`next` (the parent
+        // pointer is NEVER emitted, `Exif.pm:7103-7104`). PrintIM (0x0e00) returns
+        // `None` and falls through to `emit_panasonic_value` (which skips it — the
+        // shared PrintIM module handles it). Every binary position is an explicit
+        // entry ⇒ `unknown = false`.
+        if let Some(sub) = panasonic_tag.sub_table {
+          let blob = data
+            .get(entry.value_offset()..entry.value_offset().saturating_add(entry.value_size()))
+            .unwrap_or(&[]);
+          if let Some(pairs) = panasonic::decode_main_subdir(sub, blob, order, print_conv) {
+            for (name, value) in pairs {
+              let Ok(()) = sink.write_vendor_value("MakerNotes", g1, name.as_str(), value, false);
+            }
+            continue;
+          }
+        }
         let Ok(()) = emit_panasonic_value(
           g1,
           entry,
@@ -14660,6 +14759,40 @@ pub(in crate::exif) fn leica_makernote_isolated(
       let ResolvedConv::Leica(entry_variant, leica_tag) = entry.conv else {
         continue;
       };
+      // A WALKED ProcessBinaryData SubDirectory (SerialInfo 0x0b / FocusInfo
+      // 0x040a / ShotInfo 0x0410, Data1 0x3901, #105): re-slice the verbatim
+      // `$$valPt` span and emit each position under the `Leica` family-1 group,
+      // reproducing ExifTool's descend-then-`next` (the parent pointer is never
+      // emitted). Decode under [`ifd_order`](ExifEntry::ifd_order) — the order of
+      // the IFD THAT ACTUALLY CONTAINED this entry: a top-level Leica5
+      // SerialInfo/FocusInfo/ShotInfo inherits the outer Leica IFD's order, while a
+      // Leica4 Data1 reached via a `ByteOrder => Unknown` `%Subdir` child decodes
+      // under the CHILD's probed order (which can differ from the outer MakerNote
+      // IFD's — a mixed-endian M9 would otherwise byte-swap the int32u `LensType`).
+      // Every binary position is an explicit entry ⇒ `unknown = false`.
+      if let Some(sub) = leica_tag.sub_table() {
+        let blob = data
+          .get(entry.value_offset()..entry.value_offset().saturating_add(entry.value_size()))
+          .unwrap_or(&[]);
+        for (name, value, priority) in
+          makernotes::vendors::leica::decode_leica_subdir(sub, blob, entry.ifd_order(), print_conv)
+        {
+          // Each decoded position carries its ExifTool `Priority => N` (default 1;
+          // `0` for Data1 `LensType` / FocusInfo `FocalLength`), so a `Priority =>
+          // 0` leaf never overrides a higher-priority same-`(group, name)` sibling
+          // (e.g. a later Data1 `LensType` must NOT replace the Subdir `0x3405
+          // LensType`) in the shared de-dup (`ExifTool.pm:9544-9560`).
+          let Ok(()) = sink.write_vendor_value_with_priority(
+            "MakerNotes",
+            g1,
+            name.as_str(),
+            value,
+            false,
+            priority,
+          );
+        }
+        continue;
+      }
       let Ok(()) = emit_leica_value(
         g1,
         entry,

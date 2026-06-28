@@ -52,18 +52,24 @@
 
 #![deny(clippy::indexing_slicing)]
 
+pub mod data1;
+pub mod focus_info;
 pub mod lens_types;
 pub mod printconv;
+pub mod serial_info;
+pub mod shot_info;
 pub mod tags;
 
-use crate::exif::ifd::RawValue;
+use crate::exif::ifd::{ByteOrder, RawValue};
+use crate::value::TagValue;
 use smol_str::SmolStr;
+use std::vec::Vec;
 
 pub use lens_types::{LEICA_LENS_TYPES, LeicaLensType};
 pub use printconv::LeicaPrintConv;
 pub use tags::{
   LEICA2_TAGS, LEICA3_TAGS, LEICA4_TAGS, LEICA5_TAGS, LEICA6_TAGS, LEICA9_TAGS, LeicaCondition,
-  LeicaTag, LeicaVariant, format_override, lookup,
+  LeicaSubTable, LeicaTag, LeicaVariant, SUBDIR_TAGS, format_override, lookup,
 };
 
 /// Decoded Leica MakerNotes data — populated by
@@ -156,6 +162,42 @@ pub(crate) fn populate_typed(
         }
       }
     }
+  }
+}
+
+/// Decode a WALKED Leica `ProcessBinaryData` SubDirectory blob into its
+/// `(Name, TagValue, Priority)` emission triples — the faithful descent for the
+/// Leica binary sub-tables (#105): `SerialInfo` (Leica3 0x0b), `FocusInfo`
+/// (Leica5 0x040a), `ShotInfo` (Leica5 0x0410), `Data1` (Subdir 0x3901). All
+/// emit under the `Leica` family-1 group (`Panasonic.pm` declares `GROUPS => { 1
+/// => 'Leica' }` for these tables).
+///
+/// The third triple element is the row's ExifTool `Priority => N` for duplicate
+/// handling — the default `1` for most rows, but `0` for the two `Priority => 0`
+/// rows reachable here: `Data1` `LensType` (`Panasonic.pm:1981`) and `FocusInfo`
+/// `FocalLength` (`Panasonic.pm:2102`). The capture loop emits each via
+/// [`write_vendor_value_with_priority`](crate::exif) so a `Priority => 0` leaf
+/// never overrides a higher-priority same-`(group, name)` sibling — e.g. a later
+/// `Data1` `LensType` must NOT replace the Subdir `0x3405 LensType` in the shared
+/// de-dup (`ExifTool.pm:9544-9560`).
+///
+/// `blob` is the verbatim `$$valPt` value span; `order` the byte order the
+/// parent Leica IFD was walked under.
+#[must_use]
+pub fn decode_leica_subdir(
+  sub: LeicaSubTable,
+  blob: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+) -> Vec<(SmolStr, TagValue, u8)> {
+  match sub {
+    LeicaSubTable::SerialInfo => serial_info::parse(blob, print_conv),
+    LeicaSubTable::FocusInfo => focus_info::parse(blob, order, print_conv),
+    LeicaSubTable::ShotInfo => shot_info::parse(blob, order, print_conv),
+    LeicaSubTable::Data1 => data1::parse(blob, order, print_conv),
+    // `%Panasonic::Data2` is an EMPTY table (no named positions) — descends
+    // but emits nothing.
+    LeicaSubTable::Data2 => Vec::new(),
   }
 }
 
