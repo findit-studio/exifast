@@ -260,10 +260,10 @@ const NOT_ACTIVE: &[&str] = &[
   // `CameraSettings3`, `ExtraInfo3` and the enciphered `Tag900b` emit every
   // remaining `Sony:*` exposure/AF/battery/settings leaf, and the dependent
   // `Composite:*` (BlueBalance/RedBalance/CFAPattern/FocalLength35efl/
-  // FocusDistance2) now compute byte-exact. A33 carries a per-fixture
-  // `FIXTURE_EXCLUDED_KEYS` entry for the lone `Composite:LensID` (the ambiguous
-  // `Sony:LensType` 55 needs the unported `Exif::PrintLensID` disambiguator —
-  // see `FIXTURE_EXCLUDED_KEYS`).
+  // FocusDistance2) now compute byte-exact — AND (since #103 part 3) the ambiguous
+  // `Sony:LensType` 55 resolves through the ported `Exif::PrintLensID` lens-DB
+  // disambiguation, so `Composite:LensID` = `Sony DT 18-55mm F3.5-5.6 SAM
+  // (SAL1855)` is byte-exact: A33 has NO excluded keys.
   //
   // The `Sony_DSLR-A200_real.ARW` raw is now ACTIVE: on top of chunk 1's
   // `%MinoltaRaw::Main` MRW port (the `%Sony::SR2Private` `MRWInfo` 0x7250 →
@@ -273,10 +273,12 @@ const NOT_ACTIVE: &[&str] = &[
   // FocusPosition/TiffMeteringImage), and `CameraSettings` (0x0114, BigEndian
   // `int16u`, the exposure/aperture/flash/WB/AF/battery leaves) — so every
   // `Sony:*` leaf emits byte-exact, and the dependent `Composite:FocusDistance`
-  // (= `inf`, via the new `Sony:FocusPosition` = 128) computes. A200 carries a
-  // `FIXTURE_EXCLUDED_KEYS` entry for `Composite:ImageSize`/`Megapixels` (#436,
-  // the bare-name Composite priority residual) + the ambiguous `Composite:LensID`
-  // (the A33-style `Exif::PrintLensID` lens-DB disambiguation).
+  // (= `inf`, via the new `Sony:FocusPosition` = 128) computes, and (since #103
+  // part 3) the ambiguous `Sony:LensType` 129 resolves to `Composite:LensID` =
+  // `Tamron 70-300mm F4-5.6 LD` via the ported `Exif::PrintLensID` FocalLength/
+  // MaxAperture branch. A200's remaining `FIXTURE_EXCLUDED_KEYS` entry is just
+  // `Composite:ImageSize`/`Megapixels` (#436, the bare-name Composite priority
+  // residual).
   //
   // (`Canon_EOS-5D_real.CR2` was added to the both-goldens set with this chunk
   // and is ACTIVE — the deep Canon MakerNote sub-tables ColorData3 / CameraInfo5D
@@ -520,40 +522,24 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // IS emitted. Mirrors `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s
   // `FX3_DEFERRED`.
   ("Sony_ILME-FX3_real.ARW", &["XMP-xmp:Rating"]),
-  // The `Sony_SLT-A33_real.ARW` raw is now active (its OLDER plain-
-  // `ProcessBinaryData` sub-table tower — `CameraInfo3`/`MoreInfo`/
-  // `CameraSettings3`/`ExtraInfo3`/`Tag900b` — is fully ported, see the
-  // `NOT_ACTIVE` note). The lone residual is `Composite:LensID`: the A33's
-  // `Sony:LensType` (= 55) PrintConv is the multi-candidate `Sony DT 18-55mm
-  // F3.5-5.6 SAM (SAL1855) or SAM II`, and ExifTool's `Composite:LensID`
-  // disambiguates it to the single `SAL1855` via the full `Exif::PrintLensID`
-  // lens-DB matcher (LensSpec + FocalLength + MaxAperture). exifast's composite
-  // post-pass ports only the unambiguous-LensType case (it defers any `" or "`
-  // placeholder), so this composite is dropped from BOTH sides; the ambiguous
-  // `Sony:LensType` MakerNote leaf IS emitted. Mirrors
-  // `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s `A33_DEFERRED`.
-  ("Sony_SLT-A33_real.ARW", &["Composite:LensID"]),
+  // `Sony_SLT-A33_real.ARW` is fully byte-exact (no excluded keys): its OLDER
+  // `ProcessBinaryData` tower is ported AND `Composite:LensID` now resolves the
+  // ambiguous `Sony:LensType` 55 via `Exif::PrintLensID` (#103 part 3), so the
+  // fixture no longer needs an exclusion entry.
   // The `Sony_DSLR-A200_real.ARW` raw is now active (its OLDER `%Sony::Main`
   // sub-table tower — `CameraInfo2`/`FocusInfo`/`CameraSettings` — is fully
-  // ported, see the `NOT_ACTIVE` note). Three composite residuals are dropped:
-  // `Composite:ImageSize`/`Megapixels` (#436 — bundled resolves the bare-name
-  // `Composite:ImageSize` from `MinoltaRaw:ImageWidth` `Priority => 1` over
-  // `SubIFD:ImageWidth` `Priority => 0`; exifast's bare-name Composite resolver
-  // is emission-order-first, picking the padded `SubIFD` 3880x2600 → 10.1 MP,
-  // not the SR2-corrected 3872x2592 → 10.0 MP — a shared-resolver change tracked
-  // in owner-deferred #436), and `Composite:LensID` (the A33-style ambiguous
-  // `Sony:LensType` 129 = `Tamron Lens (129)`, needing the unported
-  // `Exif::PrintLensID` disambiguator). All three are dropped from BOTH sides;
-  // every `Sony:*` MakerNote leaf + the `Composite:FocusDistance` IS byte-exact.
-  // Mirrors `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s
-  // `A200_DEFERRED`.
+  // ported, see the `NOT_ACTIVE` note). The residuals are `Composite:ImageSize`/
+  // `Megapixels` (#436 — bundled resolves the bare-name `Composite:ImageSize`
+  // from `MinoltaRaw:ImageWidth` `Priority => 1` over `SubIFD:ImageWidth`
+  // `Priority => 0`; exifast's bare-name Composite resolver is emission-order-
+  // first, picking the padded `SubIFD` 3880x2600 → 10.1 MP, not the SR2-corrected
+  // 3872x2592 → 10.0 MP — a shared-resolver change tracked in owner-deferred
+  // #436). `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) is now ACTIVE via
+  // the `Exif::PrintLensID` FocalLength/MaxAperture branch (#103 part 3). Mirrors
+  // `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s `A200_DEFERRED`.
   (
     "Sony_DSLR-A200_real.ARW",
-    &[
-      "Composite:ImageSize",
-      "Composite:Megapixels",
-      "Composite:LensID",
-    ],
+    &["Composite:ImageSize", "Composite:Megapixels"],
   ),
   // `Canon_EOS-5D_real.CR2` — the deep Canon MakerNote sub-table activation
   // (#84/#85/#87). The newly-ported ColorData3 (0x4001 count 796) / CameraInfo5D

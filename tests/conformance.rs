@@ -10250,10 +10250,12 @@ fn arw_preview_image_conformance() {
 /// `AFStatus15` grid, `MoreInfo`→`MoreSettings`/`FaceInfo`/`MoreInfo0201`/
 /// `MoreInfo0401`, `CameraSettings3`, `ExtraInfo3`, the enciphered `Tag900b`).
 /// Each fixture's `Sony:*` exposure/AF/lens/battery/settings leaves and the
-/// dependent `Composite:*` are now byte-exact; the SOLE per-fixture exclusion is
-/// one niche composite each (FX3 `XMP-xmp:Rating`, A33 `Composite:LensID`), kept
-/// in sync with the `FIXTURE_EXCLUDED_KEYS` deferrals in
-/// `tests/typed_serde_parity.rs`.
+/// dependent `Composite:*` are now byte-exact — including `Composite:LensID`,
+/// which (since #103 part 3) resolves the A33's / A200's AMBIGUOUS `Sony:LensType`
+/// through the ported `Exif::PrintLensID` lens-DB disambiguation. The remaining
+/// per-fixture exclusions are FX3's `XMP-xmp:Rating` and A200's
+/// `Composite:ImageSize`/`Megapixels` (#436), kept in sync with the
+/// `FIXTURE_EXCLUDED_KEYS` deferrals in `tests/typed_serde_parity.rs`.
 #[test]
 fn sony_arw_real_sr2_and_subifd_conformance() {
   // The deferred `%Sony::Main` sub-table leaves (+ extra/divergent Sony Main
@@ -10282,25 +10284,12 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
   // A33 (older SLT body): the `CameraInfo3` (incl. the `AFStatus15` AF grid),
   // `MoreInfo` (→ `MoreSettings`/`FaceInfo`/`MoreInfo0201`/`MoreInfo0401` +
   // `TiffMeteringImage`), `CameraSettings3`, `ExtraInfo3` and `Tag900b`
-  // SubDirectories are now FULLY PORTED — every `Sony:*` exposure/AF/battery/
-  // settings leaf emits byte-exact, and the dependent `Composite:*`
-  // (BlueBalance/RedBalance/CFAPattern/FocalLength35efl/FocusDistance2) now
-  // compute. The SOLE residual is one composite:
-  const A33_DEFERRED: &[&str] = &[
-    // `Composite:LensID` (= `Sony DT 18-55mm F3.5-5.6 SAM (SAL1855)`). The A33's
-    // `Sony:LensType` (= 55) is AMBIGUOUS — its PrintConv is the multi-candidate
-    // `Sony DT 18-55mm F3.5-5.6 SAM (SAL1855) or SAM II`. ExifTool's
-    // `Composite:LensID` disambiguates to the single SAL1855 via the full
-    // `Exif::PrintLensID` lens-DB matcher (`Exif.pm:5881` — uses `LensSpec` +
-    // `FocalLength` + `MaxAperture` to pick among the `" or "` candidates).
-    // exifast's composite post-pass ports only the UNAMBIGUOUS-LensType case
-    // (`composite/table.rs` `lens_id`, which defers any `" or "` placeholder);
-    // the focal/aperture/LensSpec disambiguation is a separate cross-cutting
-    // subsystem (it would re-key every vendor's ambiguous LensType) NOT part of
-    // this Sony deep-table port. This is the lone niche exclusion; the
-    // `Sony:LensType` (the ambiguous MakerNote leaf) IS emitted byte-exact.
-    "Composite:LensID",
-  ];
+  // SubDirectories are FULLY PORTED, and (since #103 part 3) the `Exif::PrintLensID`
+  // lens-DB disambiguation is wired into `Composite:LensID`: the A33's AMBIGUOUS
+  // `Sony:LensType` 55 (`Sony DT 18-55mm F3.5-5.6 SAM (SAL1855) or SAM II`) now
+  // resolves byte-exact to the single `(SAL1855)` via the LensSpec exact-suffix
+  // match (`Exif.pm:5991`). NO residuals — the body is fully byte-exact.
+  const A33_DEFERRED: &[&str] = &[];
   // A200 (2008 Minolta-derived body): the OLDER `%Sony::Main` sub-table tower —
   // `CameraInfo2` (0x0010, LittleEndian), `FocusInfo` (0x0020), `CameraSettings`
   // (0x0114, BigEndian `int16u`) — is now FULLY PORTED on top of chunk 1's
@@ -10319,15 +10308,10 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
     // scope here. Both diverging composites are dropped from BOTH sides.
     "Composite:ImageSize",
     "Composite:Megapixels",
-    // `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`). The A200's
-    // `Sony:LensType` (= 129) is AMBIGUOUS — its PrintConv is the generic
-    // `Tamron Lens (129)` placeholder; ExifTool's `Composite:LensID`
-    // disambiguates to the single lens via the full `Exif::PrintLensID` lens-DB
-    // matcher (`FocalLength` + `MaxAperture`). Same deferral as the A33's
-    // SAL1855 — exifast's composite post-pass ports only the unambiguous-LensType
-    // case, so this is dropped from BOTH sides; the `Sony:LensType` MakerNote
-    // leaf IS emitted byte-exact.
-    "Composite:LensID",
+    // `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) is now ACTIVE (#103
+    // part 3): the A200's AMBIGUOUS `Sony:LensType` 129 (`Tamron Lens (129)`)
+    // resolves byte-exact to the 129.2 variant via the `Exif::PrintLensID`
+    // FocalLength (80) + MaxApertureValue (4.5002…) branch (`Exif.pm:6001`).
   ];
   check_excluding(
     "Sony_ILME-FX3_real.ARW",

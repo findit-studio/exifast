@@ -48,6 +48,12 @@
 #[cfg(feature = "alloc")]
 use crate::composite::table::CompositeValue;
 
+/// `Image::ExifTool::Exif::PrintLensID` (Exif.pm:5881) — the Sony/Minolta
+/// lens-DB disambiguation wired into `Composite:LensID`. Needs the Sony lens
+/// tables (`feature = "exif"`).
+#[cfg(feature = "exif")]
+pub(crate) mod sony_lens_id;
+
 /// `Image::ExifTool::ToFloat($val)` (ExifTool.pm:5969) on a resolved Composite
 /// input: the leading float the value matches (`$1 + 0`), or `None` (Perl
 /// `undef`) if it matches no float.
