@@ -2257,7 +2257,10 @@ const GROUP_PNG_CICP: &str = "PNG-cICP";
 
 /// `cICP.ColorPrimaries` PrintConv (`PNG.pm:481-494`) — the named HDR color
 /// primaries for a code point, or `None` (raw-number fallthrough) for an
-/// unmapped code. Same code points as `QuickTime::ColorRep` (`PNG.pm:478`).
+/// unmapped code. ExifTool keeps `PNG::CICodePoints` as its own hash
+/// (`PNG.pm:471`, "same as tags in QuickTime::ColorRep") separate from
+/// `QuickTime::ColorRep`; the two intentionally diverge at code 10 — see the
+/// note there — so this table is transcribed from PNG.pm, not shared.
 const fn cicp_color_primaries(v: u8) -> Option<&'static str> {
   Some(match v {
     1 => "BT.709",
@@ -2268,6 +2271,10 @@ const fn cicp_color_primaries(v: u8) -> Option<&'static str> {
     7 => "SMPTE 240",
     8 => "Generic film (color filters using illuminant C)",
     9 => "BT.2020, BT.2100",
+    // PNG.pm:490 reads "CIE 1921 XYZ" — an ExifTool typo (the standard is the
+    // CIE 1931 XYZ space, which QuickTime.pm:3123 spells correctly). A
+    // byte-faithful port reproduces PNG.pm's text verbatim, so this stays
+    // "1921" and deliberately differs from `QuickTime::ColorRep`.
     10 => "SMPTE 428 (CIE 1921 XYZ)",
     11 => "SMPTE RP 431-2",
     12 => "SMPTE EG 432-1",
@@ -4644,6 +4651,31 @@ mod tests {
       .find(|t| t.tag().name() == "ColorPrimaries")
       .expect("ColorPrimaries emitted");
     assert_eq!(cp.tag().value_ref(), &crate::value::TagValue::U64(200));
+  }
+
+  #[test]
+  fn cicp_color_primaries_code10_preserves_pngpm_1921_typo() {
+    // PNG.pm:490 spells SMPTE 428 as "CIE 1921 XYZ" — an ExifTool typo (the
+    // standard is CIE 1931 XYZ, which QuickTime.pm:3123 spells correctly). A
+    // byte-faithful port reproduces PNG.pm verbatim, so PNG cICP code 10 stays
+    // "1921" and deliberately differs from `QuickTime::ColorRep`. Locks the
+    // value so the PNG-vs-QuickTime divergence is never "corrected" into a real
+    // ExifTool conformance break.
+    let png = png_with_chunk(b"cICP", &[10, 0, 0, 0]);
+    let meta = parse_borrowed(&png).expect("png parses");
+    let pj: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let cp = pj
+      .iter()
+      .find(|t| t.tag().name() == "ColorPrimaries")
+      .expect("ColorPrimaries emitted");
+    assert_eq!(
+      cp.tag().value_ref(),
+      &crate::value::TagValue::Str("SMPTE 428 (CIE 1921 XYZ)".into())
+    );
   }
 
   #[test]
