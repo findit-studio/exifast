@@ -1030,6 +1030,85 @@ fn quicktime_sp2_gopro_conformance() {
 }
 
 #[test]
+fn quicktime_dji_glamour_conformance() {
+  // DJI Glamour beauty-settings (#111) — the `moov/udta` `btec` GlamourSettings
+  // atom (QuickTime.pm:2161-2164) is a `SubDirectory` to
+  // `%Image::ExifTool::DJI::Glamour` (DJI.pm:213-232), processed by
+  // `ProcessSettings` (DJI.pm:944-954): a `;`-separated `key=value` body.
+  // `tests/fixtures/QuickTime_dji_glamour.mov` (crafted by
+  // `tools/gen_dji_glamour_fixture.py`) exercises all 15 known keys (incl. the
+  // non-obvious `mouth_beautify` ⇒ MouthModify, `acne_spot_removal` ⇒
+  // AcneSpotRemoval), a trailing `;` (Perl `split` drops the trailing empty),
+  // and ONE unknown key (`custom_thing`) driving HandleTag's `MakeTagInfo`
+  // (ExifTool.pm:9310-9318) ⇒ `DJI:Custom_Thing`. The `%DJI::Glamour` table's
+  // `GROUPS => { 1 => 'DJI' }` emit these under `QuickTime:DJI` (NOT
+  // `QuickTime:UserData`). Conv-less, so the `-j` and `-n` goldens are identical
+  // (the raw integer-string values render as bare JSON numbers via the in-gate
+  // numeric-string EscapeJSON path). Verified vs bundled ExifTool 13.59.
+  check(
+    "QuickTime_dji_glamour.mov",
+    "QuickTime_dji_glamour.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_dji_glamour.mov",
+    "QuickTime_dji_glamour.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_dji_glamour_edge_conformance() {
+  // DJI Glamour `btec` EDGE cases (#111 R2) — the byte-faithful corners of
+  // `ProcessSettings`, in one body (`tools/gen_dji_glamour_edge_fixture.py`):
+  //   - `beauty_enable=\xff` ⇒ a lone non-UTF8 byte ⇒ ExifTool's `EscapeJSON`
+  //     + `FixUTF8` ⇒ quoted `"?"` (NOT `from_utf8_lossy`'s U+FFFD).
+  //   - `smoother=\xc2\x00\xa9` / `custom_thing=\xc2\x00\xa9` ⇒ the NUL is
+  //     DELETED first, so `c2 a9` rejoins ⇒ `"©"` (a value `from_utf8_lossy`
+  //     cannot reassemble across the NUL; `custom_thing` also drives the unknown
+  //     `MakeTagInfo` Name `Custom_Thing`).
+  //   - `whitening=1;eye_enlarge=10;whitening=2` ⇒ ExifTool's tag-dedup keeps the
+  //     LAST value AT its file-order position ⇒ `Whitening=2` AFTER `EyeEnlarge`
+  //     (the sink dedups by Name, bounding it to ≤ distinct Names).
+  // Conv-less, so `-j` and `-n` are identical. Verified vs bundled ExifTool 13.59
+  // (`DJI:BeautyEnable "?", DJI:Smoother "©", DJI:EyeEnlarge 10, DJI:Whitening 2,
+  // DJI:Custom_Thing "©"`).
+  check(
+    "QuickTime_dji_glamour_edge.mov",
+    "QuickTime_dji_glamour_edge.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_dji_glamour_edge.mov",
+    "QuickTime_dji_glamour_edge.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_dji_glamour_multi_conformance() {
+  // DJI Glamour MULTI-`btec` (#111 R3) — ExifTool's tag-dedup is GLOBAL across
+  // the whole `moov/udta` walk, NOT per-`btec`-atom. The fixture
+  // (`tools/gen_dji_glamour_multi_fixture.py`) carries TWO `btec` atoms:
+  //   - atom 1: `beauty_enable=1;smoother=2;`
+  //   - atom 2: `beauty_enable=3;whitening=4;`
+  // `beauty_enable` recurs in atom 2, so the survivor keeps the LAST value (3)
+  // AND moves to its atom-2 position ⇒ emitted order `DJI:Smoother 2,
+  // DJI:BeautyEnable 3, DJI:Whitening 4` (NOT BeautyEnable first). Conv-less, so
+  // `-j` and `-n` are identical. Verified vs bundled ExifTool 13.59.
+  check(
+    "QuickTime_dji_glamour_multi.mov",
+    "QuickTime_dji_glamour_multi.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_dji_glamour_multi.mov",
+    "QuickTime_dji_glamour_multi.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_sp2_keys_direction_conformance() {
   // QuickTime SP2 Part-2 — the conv-less `%QuickTime::Keys` atoms (generated
   // `key → Name` map) PLUS the two code-valued Keys atoms hand-ported in the

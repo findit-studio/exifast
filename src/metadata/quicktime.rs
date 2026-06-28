@@ -2989,6 +2989,34 @@ pub struct QuickTimeUserData {
   /// faithfully be a number or binary placeholder — QuickTime.pm:10396-10416);
   /// keeping one value type across both keeps the emit path uniform.
   convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
+  /// The `btec` GlamourSettings beauty-mode atom (QuickTime.pm:2161-2164) →
+  /// `%Image::ExifTool::DJI::Glamour` (DJI.pm:213-232, `ProcessSettings`
+  /// DJI.pm:944-954): the `;`-separated `key=value` settings as `(Name, value)`
+  /// pairs. A SEPARATE sink from [`Self::convless`] because the `%DJI::Glamour`
+  /// table's `GROUPS => { 0 => QuickTime, 1 => DJI, 2 => Image }` emit these
+  /// under `QuickTime:DJI` (family-1 `DJI`), NOT `QuickTime:UserData`.
+  ///
+  /// This is a GLOBAL order-preserving dedup sink — ExifTool's tag store is one
+  /// shared map for the whole `udta` walk, so a key repeated WITHIN one `btec`
+  /// body OR ACROSS two `btec` atoms collapses to a SINGLE entry per Name, the
+  /// survivor keeping the LAST value AND its LAST file-order position. Keying the
+  /// map by Name (rather than scanning a list on every push) lets
+  /// [`Self::push_glamour`] dedup in sub-quadratic time and bounds the sink to
+  /// ≤ one entry per distinct Name, so a crafted many-distinct-key or repeated
+  /// `k=1;k=2;…` body cannot accumulate one entry per `;`-piece or make
+  /// extraction hang. Each entry stores its value plus the monotonic
+  /// `glamour_ordinal` of its LAST push; [`Self::glamour`] emits sorted by that
+  /// ordinal, reproducing the last-occurrence walk order the emission `TagMap`
+  /// would otherwise have to preserve. The value is
+  /// [`crate::value::TagValue::Str`] for a clean numeric/boolean setting and
+  /// [`crate::value::TagValue::JsonStr`] for a quoted one (`%DJI::Glamour` has
+  /// no Conv, so the raw bytes reach ExifTool's `EscapeJSON` classify directly).
+  glamour_map: std::collections::BTreeMap<smol_str::SmolStr, (crate::value::TagValue, u32)>,
+  /// Monotonic push counter for [`Self::glamour_map`]: every [`Self::push_glamour`]
+  /// stamps the current value with this ordinal then post-increments, so an
+  /// overwriting push records the LATEST ordinal and [`Self::glamour`]'s ordinal
+  /// sort places each surviving Name at its LAST-occurrence position.
+  glamour_ordinal: u32,
 }
 
 impl QuickTimeUserData {
@@ -3014,6 +3042,8 @@ impl QuickTimeUserData {
       serial_number_hash: None,
       media_uid: None,
       convless: Vec::new(),
+      glamour_map: std::collections::BTreeMap::new(),
+      glamour_ordinal: 0,
     }
   }
 
@@ -3139,6 +3169,27 @@ impl QuickTimeUserData {
     &self.convless
   }
 
+  /// The `btec` GlamourSettings entries decoded by `ProcessSettings`, deduped by
+  /// Name and ordered by LAST file-order occurrence — materialized from
+  /// [`Self::push_glamour`]'s keyed sink by sorting on each entry's stored push
+  /// ordinal, so the returned order reproduces ExifTool's last-extracted-wins
+  /// `udta` walk. Emitted under `QuickTime:DJI`. Each value is
+  /// [`crate::value::TagValue::Str`] (clean numeric/boolean) or
+  /// [`crate::value::TagValue::JsonStr`] (quoted).
+  #[must_use]
+  pub fn glamour(&self) -> Vec<(smol_str::SmolStr, crate::value::TagValue)> {
+    let mut ordered: Vec<(&smol_str::SmolStr, &crate::value::TagValue, u32)> = self
+      .glamour_map
+      .iter()
+      .map(|(name, (value, ordinal))| (name, value, *ordinal))
+      .collect();
+    ordered.sort_unstable_by_key(|&(_, _, ordinal)| ordinal);
+    ordered
+      .into_iter()
+      .map(|(name, value, _)| (name.clone(), value.clone()))
+      .collect()
+  }
+
   /// `true` when no atom was decoded.
   #[inline(always)]
   #[must_use]
@@ -3160,6 +3211,7 @@ impl QuickTimeUserData {
       && self.serial_number_hash.is_none()
       && self.media_uid.is_none()
       && self.convless.is_empty()
+      && self.glamour_map.is_empty()
   }
 
   /// Merge a value into a multi-source [`PriorityValue`] slot per ExifTool's
@@ -3317,6 +3369,30 @@ impl QuickTimeUserData {
     value: crate::value::TagValue,
   ) -> &mut Self {
     self.convless.push((name.into(), value));
+    self
+  }
+
+  /// Record a `btec` GlamourSettings entry (`ProcessSettings`) by its resolved
+  /// tag NAME and value, applying ExifTool's GLOBAL tag-dedup across the whole
+  /// `udta` walk: keying [`Self::glamour`]'s sink by NAME means a repeat (from an
+  /// earlier `btec` atom OR an earlier piece of the same atom) overwrites the
+  /// stored value AND its last-seen ordinal, so the survivor keeps the LAST value
+  /// AND — once [`Self::glamour`] sorts by ordinal — its LAST file-order
+  /// position. The sink therefore holds ≤ one entry per distinct NAME, in
+  /// last-occurrence order, exactly what bundled ExifTool emits under
+  /// `QuickTime:DJI`. The keyed insert is sub-quadratic (no per-push list scan)
+  /// and bounds the sink to ≤ distinct Names, so a crafted many-distinct-key
+  /// `k1=…;k2=…;…` or repeated `k=1;k=2;…` body (single OR multi atom) can
+  /// neither accumulate one entry per `;`-piece nor make extraction hang.
+  #[inline]
+  pub fn push_glamour(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    value: crate::value::TagValue,
+  ) -> &mut Self {
+    let ordinal = self.glamour_ordinal;
+    self.glamour_ordinal += 1;
+    self.glamour_map.insert(name.into(), (value, ordinal));
     self
   }
 }
