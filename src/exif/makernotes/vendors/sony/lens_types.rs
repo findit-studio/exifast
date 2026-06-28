@@ -3,21 +3,22 @@
 
 //! Sony E-mount lens-type lookup table — `%sonyLensTypes2` (`Sony.pm:56-387`).
 //!
-//! Bundled has FLOAT-keyed ambiguity entries (e.g. `0.1 => 'Sigma 19mm F2.8'`,
-//! `0.2 => 'Sigma 30mm F2.8'`) that disambiguate via LensSpec when multiple
-//! lenses share an ID. Phase 3 ports the INTEGER keys only — the primary
-//! lens name per ID. Float-keyed disambiguation is a deferred follow-up
-//! (file an issue against #62 — "Sony lens disambiguation via LensSpec").
+//! [`SONY_LENS_TYPES`] holds the INTEGER keys — the primary lens name per ID.
+//! These are the lens IDs used by `Sony::CameraSettings` and the AF-info
+//! sub-tables, and back the `LensType` `PrintConv`.
 //!
-//! The integer keys ARE the lens IDs used by `Sony::CameraSettings` and the
-//! AF-info sub-tables; the float entries are bundled-only secondary names
-//! shown when the primary doesn't match LensSpec.
+//! Bundled also carries FLOAT-keyed ambiguity entries (e.g. `0.1 => 'Sigma
+//! 19mm F2.8 [EX] DN'`, `49473.1 => 'Tokina atx-m 85mm F1.8 FE'`): secondary
+//! names appended after the primary when several lenses share an ID. They are
+//! ported in [`SONY_LENS_VARIANTS`] / [`lens_variants`], keyed by the integer
+//! ID plus the fractional suffix taken as an integer "variant" (`0.13` →
+//! variant 13). `PrintLensID` (`Exif.pm:5881`) consumes them — together with
+//! [`super::lens_info::get_lens_info`] over `LensSpec` — to pick the actual
+//! lens. That wiring lands in a later chunk, so the variant table is inert
+//! here.
 //!
-//! Phase 3 also doesn't port `%sonyLensTypes` (the A-mount adapter table)
-//! — that's filled at runtime in bundled (`Sony.pm:10963` `%sonyLensTypes =
-//! %$minoltaTypes`) from `%Image::ExifTool::Minolta::minoltaLensTypes`.
-//! A-mount decoding is a deferred long-tail item; only E-mount IDs are
-//! ported here.
+//! The A-mount (Minolta-backed) `%sonyLensTypes` is ported separately in
+//! [`super::amount_lens_types`].
 
 #![deny(clippy::indexing_slicing)]
 
@@ -28,6 +29,20 @@ use smol_str::SmolStr;
 pub struct SonyLensType {
   /// The integer lens-type ID (the key in bundled).
   pub id: u32,
+  /// The lens model name.
+  pub name: &'static str,
+}
+
+/// One FLOAT-keyed disambiguation entry of `%sonyLensTypes2` — a secondary
+/// lens name `PrintLensID` considers after the primary [`SonyLensType`] when
+/// several lenses share the integer `id`.
+#[derive(Debug, Clone, Copy)]
+pub struct SonyLensVariant {
+  /// The integer part of the bundled float key (the shared lens-type ID).
+  pub id: u32,
+  /// The fractional suffix taken as an integer (`49473.1` → 1, `0.13` → 13).
+  /// `PrintLensID` scans `id.1`, `id.2`, … in ascending order.
+  pub variant: u8,
   /// The lens model name.
   pub name: &'static str,
 }
@@ -85,6 +100,10 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   SonyLensType {
     id: 22,
     name: "Samyang AF 24-60mm F2.8",
+  },
+  SonyLensType {
+    id: 24,
+    name: "Samyang AF 85mm F1.8 P FE",
   },
   SonyLensType {
     id: 44,
@@ -439,6 +458,10 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
     name: "Sony FE 100mm F2.8 Macro GM OSS",
   },
   SonyLensType {
+    id: 32895,
+    name: "Sony FE 100-400mm F4.5 GM OSS",
+  },
+  SonyLensType {
     id: 33072,
     name: "Sony FE 70-200mm F2.8 GM OSS + 1.4X Teleconverter",
   },
@@ -521,6 +544,14 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   SonyLensType {
     id: 33094,
     name: "Sony FE 100mm F2.8 Macro GM OSS + 2X Teleconverter",
+  },
+  SonyLensType {
+    id: 33095,
+    name: "Sony FE 100-400mm F4.5 GM OSS + 1.4X Teleconverter",
+  },
+  SonyLensType {
+    id: 33096,
+    name: "Sony FE 100-400mm F4.5 GM OSS + 2X Teleconverter",
   },
   SonyLensType {
     id: 49201,
@@ -939,6 +970,14 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
     name: "Sigma 135mm F1.4 DG | A",
   },
   SonyLensType {
+    id: 50563,
+    name: "Sigma 35mm F1.4 DG II | A",
+  },
+  SonyLensType {
+    id: 50564,
+    name: "Sigma 15mm F1.4 DC | C",
+  },
+  SonyLensType {
     id: 50992,
     name: "Voigtlander SUPER WIDE-HELIAR 15mm F4.5 III",
   },
@@ -1001,6 +1040,10 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
   SonyLensType {
     id: 51009,
     name: "Voigtlander NOKTON 28mm F1.5 Aspherical",
+  },
+  SonyLensType {
+    id: 51011,
+    name: "Voigtlander APO-LANTHAR 28mm F2 Aspherical",
   },
   SonyLensType {
     id: 51072,
@@ -1067,6 +1110,10 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
     name: "LAOWA FFII 12mm F2.8 C&D Dreamer",
   },
   SonyLensType {
+    id: 61600,
+    name: "Thypoch AF 24-50mm F2.8 FE",
+  },
+  SonyLensType {
     id: 61760,
     name: "Viltrox 135mm F1.8 FE LAB",
   },
@@ -1083,16 +1130,48 @@ pub const SONY_LENS_TYPES: &[SonyLensType] = &[
     name: "Viltrox 85mm F1.4 FE PRO",
   },
   SonyLensType {
+    id: 61766,
+    name: "Viltrox 40mm F2.5 FE Air",
+  },
+  SonyLensType {
     id: 61767,
     name: "Viltrox 50mm F2.0 FE AIR",
+  },
+  SonyLensType {
+    id: 61768,
+    name: "Viltrox 25mm F1.7 E Air",
   },
   SonyLensType {
     id: 61776,
     name: "Viltrox 50mm F1.4 FE PRO",
   },
   SonyLensType {
+    id: 61777,
+    name: "Viltrox 9mm F2.8 E Air",
+  },
+  SonyLensType {
+    id: 61778,
+    name: "Viltrox 14mm F4.0 FE Air",
+  },
+  SonyLensType {
+    id: 61779,
+    name: "Viltrox 56mm F1.2 E Pro",
+  },
+  SonyLensType {
     id: 61780,
     name: "Viltrox 85mm F2.0 FE EVO",
+  },
+  SonyLensType {
+    id: 61781,
+    name: "Viltrox 55mm F1.8 FE EVO",
+  },
+  SonyLensType {
+    id: 61783,
+    name: "Viltrox 15mm F1.7 E Air",
+  },
+  SonyLensType {
+    id: 61789,
+    name: "Viltrox 35mm F1.8 II FE EVO",
   },
 ];
 
@@ -1107,6 +1186,224 @@ pub fn lookup_name(id: u32) -> Option<SmolStr> {
     Ok(i) => SONY_LENS_TYPES.get(i).map(|t| SmolStr::from(t.name)),
     Err(_) => None,
   }
+}
+
+/// FLOAT-keyed disambiguation entries of `%sonyLensTypes2`, sorted by
+/// `(id, variant)`. Each shares its `id` with a primary [`SONY_LENS_TYPES`]
+/// row; `PrintLensID` appends [`lens_variants`]`(id)` after that primary.
+/// Inert until the `PrintLensID` wiring lands.
+pub const SONY_LENS_VARIANTS: &[SonyLensVariant] = &[
+  SonyLensVariant {
+    id: 0,
+    variant: 1,
+    name: "Sigma 19mm F2.8 [EX] DN",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 2,
+    name: "Sigma 30mm F2.8 [EX] DN",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 3,
+    name: "Sigma 60mm F2.8 DN",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 4,
+    name: "Sony E 18-200mm F3.5-6.3 OSS LE",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 5,
+    name: "Tamron 18-200mm F3.5-6.3 Di III VC",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 6,
+    name: "Tokina FiRIN 20mm F2 FE AF",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 7,
+    name: "Tokina FiRIN 20mm F2 FE MF",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 8,
+    name: "Zeiss Touit 12mm F2.8",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 9,
+    name: "Zeiss Touit 32mm F1.8",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 10,
+    name: "Zeiss Touit 50mm F2.8 Macro",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 11,
+    name: "Zeiss Loxia 50mm F2",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 12,
+    name: "Zeiss Loxia 35mm F2",
+  },
+  SonyLensVariant {
+    id: 0,
+    variant: 13,
+    name: "Viltrox 85mm F1.8",
+  },
+  SonyLensVariant {
+    id: 32789,
+    variant: 1,
+    name: "Samyang AF 50mm F1.4",
+  },
+  SonyLensVariant {
+    id: 32790,
+    variant: 1,
+    name: "Samyang AF 14mm F2.8",
+  },
+  SonyLensVariant {
+    id: 32794,
+    variant: 1,
+    name: "Samyang AF 24mm F2.8",
+  },
+  SonyLensVariant {
+    id: 32794,
+    variant: 2,
+    name: "Samyang AF 35mm F2.8",
+  },
+  SonyLensVariant {
+    id: 32796,
+    variant: 1,
+    name: "Viltrox PFU RBMH 85mm F1.8",
+  },
+  SonyLensVariant {
+    id: 32823,
+    variant: 1,
+    name: "Samyang AF 85mm F1.4",
+  },
+  SonyLensVariant {
+    id: 49201,
+    variant: 1,
+    name: "Zeiss Touit 32mm F1.8",
+  },
+  SonyLensVariant {
+    id: 49201,
+    variant: 2,
+    name: "Zeiss Touit 50mm F2.8",
+  },
+  SonyLensVariant {
+    id: 49473,
+    variant: 1,
+    name: "Tokina atx-m 85mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49473,
+    variant: 2,
+    name: "Viltrox 23mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 49473,
+    variant: 3,
+    name: "Viltrox 56mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 49473,
+    variant: 4,
+    name: "Viltrox 85mm F1.8 II FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 1,
+    name: "Viltrox 13mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 2,
+    name: "Viltrox 16mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 3,
+    name: "Viltrox 23mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 4,
+    name: "Viltrox 24mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 5,
+    name: "Viltrox 28mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 6,
+    name: "Viltrox 33mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 7,
+    name: "Viltrox 35mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 8,
+    name: "Viltrox 50mm F1.8 FE",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 9,
+    name: "Viltrox 75mm F1.2 E Pro",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 10,
+    name: "Viltrox 20mm F2.8 FE Air",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 11,
+    name: "Viltrox 135mm F1.8 FE LAB",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 12,
+    name: "Viltrox 27mm F1.2 E Pro",
+  },
+  SonyLensVariant {
+    id: 49474,
+    variant: 13,
+    name: "Viltrox 56mm F1.4 E",
+  },
+  SonyLensVariant {
+    id: 51505,
+    variant: 1,
+    name: "Samyang AF 35mm F2.8",
+  },
+  SonyLensVariant {
+    id: 51510,
+    variant: 1,
+    name: "Samyang AF 35mm F1.8",
+  },
+];
+
+/// The `id.1`, `id.2`, … secondary names for `id`, in ascending `variant`
+/// order — the order `PrintLensID` (`Exif.pm:5969`) scans them. Empty when
+/// `id` has no float-keyed variants.
+#[must_use]
+pub fn lens_variants(id: u32) -> &'static [SonyLensVariant] {
+  let lo = SONY_LENS_VARIANTS.partition_point(|v| v.id < id);
+  let hi = SONY_LENS_VARIANTS.partition_point(|v| v.id <= id);
+  // `partition_point` guarantees `lo <= hi <= len`, so the slice is in range.
+  SONY_LENS_VARIANTS.get(lo..hi).unwrap_or(&[])
 }
 
 #[cfg(test)]
@@ -1168,5 +1465,86 @@ mod tests {
   #[test]
   fn lookup_unknown_id_returns_none() {
     assert!(lookup_name(987654).is_none());
+  }
+
+  #[test]
+  fn variants_sorted_and_contiguous_from_one() {
+    // Sorted by `(id, variant)`; within an id the variants run `1..=N` with no
+    // gap, because `PrintLensID` stops scanning at the first missing `id.i`.
+    let mut prev_id: Option<u32> = None;
+    let mut expect_var: u8 = 1;
+    for v in SONY_LENS_VARIANTS {
+      if prev_id == Some(v.id) {
+        assert_eq!(
+          v.variant, expect_var,
+          "non-contiguous variant for id {}",
+          v.id
+        );
+        expect_var += 1;
+      } else {
+        if let Some(p) = prev_id {
+          assert!(
+            v.id > p,
+            "SONY_LENS_VARIANTS not sorted by id: {} after {p}",
+            v.id
+          );
+        }
+        assert_eq!(v.variant, 1, "first variant for id {} must be 1", v.id);
+        expect_var = 2;
+        prev_id = Some(v.id);
+      }
+    }
+  }
+
+  #[test]
+  fn lens_variants_49473_tamron_tokina_viltrox_in_order() {
+    let names: Vec<&str> = lens_variants(49473).iter().map(|v| v.name).collect();
+    assert_eq!(
+      names,
+      [
+        "Tokina atx-m 85mm F1.8 FE",
+        "Viltrox 23mm F1.4 E",
+        "Viltrox 56mm F1.4 E",
+        "Viltrox 85mm F1.8 II FE",
+      ]
+    );
+  }
+
+  #[test]
+  fn lens_variants_zero_has_thirteen_in_order() {
+    let vs = lens_variants(0);
+    assert_eq!(vs.len(), 13);
+    assert_eq!(vs.first().map(|v| v.name), Some("Sigma 19mm F2.8 [EX] DN"));
+    assert_eq!(vs.last().map(|v| v.name), Some("Viltrox 85mm F1.8"));
+  }
+
+  #[test]
+  fn lens_variants_absent_is_empty() {
+    // 1 (LA-EA1) is a primary with no float entries; 999_999 is unknown.
+    assert!(lens_variants(1).is_empty());
+    assert!(lens_variants(999_999).is_empty());
+  }
+
+  #[test]
+  fn refreshed_integer_ids_resolve_via_lookup() {
+    // The 16 IDs added in this chunk all resolve through the unchanged lookup.
+    for id in [
+      24u32, 32895, 33095, 33096, 50563, 50564, 51011, 61600, 61766, 61768, 61777, 61778, 61779,
+      61781, 61783, 61789,
+    ] {
+      assert!(lookup_name(id).is_some(), "missing refreshed id {id}");
+    }
+    assert_eq!(
+      lookup_name(24).as_deref(),
+      Some("Samyang AF 85mm F1.8 P FE")
+    );
+    assert_eq!(
+      lookup_name(32895).as_deref(),
+      Some("Sony FE 100-400mm F4.5 GM OSS")
+    );
+    assert_eq!(
+      lookup_name(61789).as_deref(),
+      Some("Viltrox 35mm F1.8 II FE EVO")
+    );
   }
 }

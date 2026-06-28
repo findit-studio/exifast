@@ -20,12 +20,16 @@
 //! bundled module so the table matches what `PrintConv => \%sonyLensTypes`
 //! resolves against at runtime, byte-for-byte.
 //!
+//! The FLOAT-keyed disambiguation entries (e.g. `7.1`, `129.2`, `65535.1`):
+//! secondary names appended after the primary when several lenses share an ID,
+//! keyed by the integer ID plus the fractional suffix taken as an integer
+//! "variant". They live in [`SONY_LENS_VARIANTS_AMOUNT`] / [`lens_variants`];
+//! `PrintLensID` (`Exif.pm:5881`) consumes them via
+//! [`super::lens_info::get_lens_info`] over `LensSpec`. That wiring lands in a
+//! later chunk, so the variant table is inert here.
+//!
 //! ## Deferred (faithful gaps, documented)
 //!
-//! - **Float-keyed disambiguation** (e.g. `7.1`, `65535.1`): the bundled
-//!   secondary names shown when the primary doesn't match `LensSpec`. Same
-//!   deferral as `%sonyLensTypes2` — only the primary (integer-key) name is
-//!   ported; LensSpec disambiguation is a follow-up (#62).
 //! - **The `OTHER => sub` adapter cross-reference** (`Minolta.pm:186-205`):
 //!   for high-byte adapter IDs it combines Metabones (Canon `%canonLensTypes`)
 //!   / Sigma MC-11 (`%sigmaLensTypes`) lens names. That requires the Canon +
@@ -43,6 +47,20 @@ use smol_str::SmolStr;
 pub struct SonyLensType {
   /// The integer lens-type ID (the key in the filled `%sonyLensTypes`).
   pub id: u32,
+  /// The lens model name.
+  pub name: &'static str,
+}
+
+/// One FLOAT-keyed disambiguation entry of the A-mount `%sonyLensTypes` — a
+/// secondary lens name `PrintLensID` considers after the primary
+/// [`SonyLensType`] when several lenses share the integer `id`.
+#[derive(Debug, Clone, Copy)]
+pub struct SonyLensVariant {
+  /// The integer part of the bundled float key (the shared lens-type ID).
+  pub id: u32,
+  /// The fractional suffix taken as an integer (`129.2` → 2, `128.27` → 27).
+  /// `PrintLensID` scans `id.1`, `id.2`, … in ascending order.
+  pub variant: u8,
   /// The lens model name.
   pub name: &'static str,
 }
@@ -1032,6 +1050,969 @@ pub fn lookup_name(id: u32) -> Option<SmolStr> {
   }
 }
 
+/// FLOAT-keyed disambiguation entries of the A-mount `%sonyLensTypes`, sorted
+/// by `(id, variant)`. Each shares its `id` with a primary
+/// [`SONY_LENS_TYPES_AMOUNT`] row; `PrintLensID` appends [`lens_variants`]`(id)`
+/// after that primary. Inert until the `PrintLensID` wiring lands.
+pub const SONY_LENS_VARIANTS_AMOUNT: &[SonyLensVariant] = &[
+  SonyLensVariant {
+    id: 7,
+    variant: 1,
+    name: "Minolta AF 100-400mm F4.5-6.7 APO",
+  },
+  SonyLensVariant {
+    id: 7,
+    variant: 2,
+    name: "Sigma AF 100-300mm F4 EX DG IF",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 1,
+    name: "Sigma 18-50mm F2.8",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 2,
+    name: "Sigma 17-70mm F2.8-4.5 DC Macro",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 3,
+    name: "Sigma 20-40mm F2.8 EX DG Aspherical IF",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 4,
+    name: "Sigma 18-200mm F3.5-6.3 DC",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 5,
+    name: "Sigma DC 18-125mm F4-5,6 D",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 6,
+    name: "Tamron SP AF 28-75mm F2.8 XR Di LD Aspherical [IF] Macro",
+  },
+  SonyLensVariant {
+    id: 24,
+    variant: 7,
+    name: "Sigma 15-30mm F3.5-4.5 EX DG Aspherical",
+  },
+  SonyLensVariant {
+    id: 25,
+    variant: 1,
+    name: "Sigma 100-300mm F4 EX (APO (D) or D IF)",
+  },
+  SonyLensVariant {
+    id: 25,
+    variant: 2,
+    name: "Sigma 70mm F2.8 EX DG Macro",
+  },
+  SonyLensVariant {
+    id: 25,
+    variant: 3,
+    name: "Sigma 20mm F1.8 EX DG Aspherical RF",
+  },
+  SonyLensVariant {
+    id: 25,
+    variant: 4,
+    name: "Sigma 30mm F1.4 EX DC",
+  },
+  SonyLensVariant {
+    id: 25,
+    variant: 5,
+    name: "Sigma 24mm F1.8 EX DG ASP Macro",
+  },
+  SonyLensVariant {
+    id: 28,
+    variant: 1,
+    name: "Tamron SP AF 90mm F2.8 Di Macro",
+  },
+  SonyLensVariant {
+    id: 28,
+    variant: 2,
+    name: "Tamron SP AF 180mm F3.5 Di LD [IF] Macro",
+  },
+  SonyLensVariant {
+    id: 30,
+    variant: 1,
+    name: "Sigma AF 10-20mm F4-5.6 EX DC",
+  },
+  SonyLensVariant {
+    id: 30,
+    variant: 2,
+    name: "Sigma AF 12-24mm F4.5-5.6 EX DG",
+  },
+  SonyLensVariant {
+    id: 30,
+    variant: 3,
+    name: "Sigma 28-70mm EX DG F2.8",
+  },
+  SonyLensVariant {
+    id: 30,
+    variant: 4,
+    name: "Sigma 55-200mm F4-5.6 DC",
+  },
+  SonyLensVariant {
+    id: 31,
+    variant: 1,
+    name: "Minolta/Sony AF 50mm F3.5 Macro",
+  },
+  SonyLensVariant {
+    id: 41,
+    variant: 1,
+    name: "Tamron SP AF 11-18mm F4.5-5.6 Di II LD Aspherical IF",
+  },
+  SonyLensVariant {
+    id: 48,
+    variant: 1,
+    name: "Carl Zeiss Vario-Sonnar T* 24-70mm F2.8 ZA SSM II (SAL2470Z2)",
+  },
+  SonyLensVariant {
+    id: 48,
+    variant: 2,
+    name: "Tamron SP 24-70mm F2.8 Di USD",
+  },
+  SonyLensVariant {
+    id: 52,
+    variant: 1,
+    name: "Sony 70-300mm F4.5-5.6 G SSM II (SAL70300G2)",
+  },
+  SonyLensVariant {
+    id: 52,
+    variant: 2,
+    name: "Tamron SP 70-300mm F4-5.6 Di USD",
+  },
+  SonyLensVariant {
+    id: 54,
+    variant: 1,
+    name: "Carl Zeiss Vario-Sonnar T* 16-35mm F2.8 ZA SSM II (SAL1635Z2)",
+  },
+  SonyLensVariant {
+    id: 55,
+    variant: 1,
+    name: "Sony DT 18-55mm F3.5-5.6 SAM II (SAL18552)",
+  },
+  SonyLensVariant {
+    id: 57,
+    variant: 1,
+    name: "Tamron SP AF 60mm F2 Di II LD [IF] Macro 1:1",
+  },
+  SonyLensVariant {
+    id: 57,
+    variant: 2,
+    name: "Tamron 18-270mm F3.5-6.3 Di II PZD",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 1,
+    name: "Tamron AF 18-200mm F3.5-6.3 XR Di II LD Aspherical [IF] Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 2,
+    name: "Tamron AF 28-300mm F3.5-6.3 XR Di LD Aspherical [IF] Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 3,
+    name: "Tamron AF 28-200mm F3.8-5.6 XR Di Aspherical [IF] Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 4,
+    name: "Tamron SP AF 17-35mm F2.8-4 Di LD Aspherical IF",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 5,
+    name: "Sigma AF 50-150mm F2.8 EX DC APO HSM II",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 6,
+    name: "Sigma 10-20mm F3.5 EX DC HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 7,
+    name: "Sigma 70-200mm F2.8 II EX DG APO MACRO HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 8,
+    name: "Sigma 10mm F2.8 EX DC HSM Fisheye",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 9,
+    name: "Sigma 50mm F1.4 EX DG HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 10,
+    name: "Sigma 85mm F1.4 EX DG HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 11,
+    name: "Sigma 24-70mm F2.8 IF EX DG HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 12,
+    name: "Sigma 18-250mm F3.5-6.3 DC OS HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 13,
+    name: "Sigma 17-50mm F2.8 EX DC HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 14,
+    name: "Sigma 17-70mm F2.8-4 DC Macro HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 15,
+    name: "Sigma 150mm F2.8 EX DG OS HSM APO Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 16,
+    name: "Sigma 150-500mm F5-6.3 APO DG OS HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 17,
+    name: "Tamron AF 28-105mm F4-5.6 [IF]",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 18,
+    name: "Sigma 35mm F1.4 DG HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 19,
+    name: "Sigma 18-35mm F1.8 DC HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 20,
+    name: "Sigma 50-500mm F4.5-6.3 APO DG OS HSM",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 21,
+    name: "Sigma 24-105mm F4 DG HSM | A",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 22,
+    name: "Sigma 30mm F1.4",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 23,
+    name: "Sigma 35mm F1.4 DG HSM | A",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 24,
+    name: "Sigma 105mm F2.8 EX DG OS HSM Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 25,
+    name: "Sigma 180mm F2.8 EX DG OS HSM APO Macro",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 26,
+    name: "Sigma 18-300mm F3.5-6.3 DC Macro HSM | C",
+  },
+  SonyLensVariant {
+    id: 128,
+    variant: 27,
+    name: "Sigma 18-50mm F2.8-4.5 DC HSM",
+  },
+  SonyLensVariant {
+    id: 129,
+    variant: 1,
+    name: "Tamron 200-400mm F5.6 LD",
+  },
+  SonyLensVariant {
+    id: 129,
+    variant: 2,
+    name: "Tamron 70-300mm F4-5.6 LD",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 1,
+    name: "Tamron SP AF 17-50mm F2.8 XR Di II LD Aspherical",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 2,
+    name: "Tamron AF 18-250mm F3.5-6.3 XR Di II LD",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 3,
+    name: "Tamron AF 55-200mm F4-5.6 Di II LD Macro",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 4,
+    name: "Tamron AF 70-300mm F4-5.6 Di LD Macro 1:2",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 5,
+    name: "Tamron SP AF 200-500mm F5.0-6.3 Di LD IF",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 6,
+    name: "Tamron SP AF 10-24mm F3.5-4.5 Di II LD Aspherical IF",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 7,
+    name: "Tamron SP AF 70-200mm F2.8 Di LD IF Macro",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 8,
+    name: "Tamron SP AF 28-75mm F2.8 XR Di LD Aspherical IF",
+  },
+  SonyLensVariant {
+    id: 255,
+    variant: 9,
+    name: "Tamron AF 90-300mm F4.5-5.6 Telemacro",
+  },
+  SonyLensVariant {
+    id: 2551,
+    variant: 1,
+    name: "Sigma UC AF 28-70mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 2551,
+    variant: 2,
+    name: "Sigma AF 28-70mm F2.8",
+  },
+  SonyLensVariant {
+    id: 2551,
+    variant: 3,
+    name: "Sigma M-AF 70-200mm F2.8 EX Aspherical",
+  },
+  SonyLensVariant {
+    id: 2551,
+    variant: 4,
+    name: "Quantaray M-AF 35-80mm F4-5.6",
+  },
+  SonyLensVariant {
+    id: 2551,
+    variant: 5,
+    name: "Tokina 28-70mm F2.8-4.5 AF",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 1,
+    name: "Tokina 19-35mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 2,
+    name: "Tokina 28-70mm F2.8 AT-X",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 3,
+    name: "Tokina 80-400mm F4.5-5.6 AT-X AF II 840",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 4,
+    name: "Tokina AF PRO 28-80mm F2.8 AT-X 280",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 5,
+    name: "Tokina AT-X PRO [II] AF 28-70mm F2.6-2.8 270",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 6,
+    name: "Tamron AF 19-35mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 7,
+    name: "Angenieux AF 28-70mm F2.6",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 8,
+    name: "Tokina AT-X 17 AF 17mm F3.5",
+  },
+  SonyLensVariant {
+    id: 2552,
+    variant: 9,
+    name: "Tokina 20-35mm F3.5-4.5 II AF",
+  },
+  SonyLensVariant {
+    id: 2553,
+    variant: 1,
+    name: "Sigma ZOOM-alpha 35-135mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 2553,
+    variant: 2,
+    name: "Sigma 28-105mm F2.8-4 Aspherical",
+  },
+  SonyLensVariant {
+    id: 2553,
+    variant: 3,
+    name: "Sigma 28-105mm F4-5.6 UC",
+  },
+  SonyLensVariant {
+    id: 2553,
+    variant: 4,
+    name: "Tokina AT-X 242 AF 24-200mm F3.5-5.6",
+  },
+  SonyLensVariant {
+    id: 2555,
+    variant: 1,
+    name: "Sigma 70-210mm F4-5.6 APO",
+  },
+  SonyLensVariant {
+    id: 2555,
+    variant: 2,
+    name: "Sigma M-AF 70-200mm F2.8 EX APO",
+  },
+  SonyLensVariant {
+    id: 2555,
+    variant: 3,
+    name: "Sigma 75-200mm F2.8-3.5",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 1,
+    name: "Sigma 70-300mm F4-5.6 DL Macro",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 2,
+    name: "Sigma 300mm F4 APO Macro",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 3,
+    name: "Sigma AF 500mm F4.5 APO",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 4,
+    name: "Sigma AF 170-500mm F5-6.3 APO Aspherical",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 5,
+    name: "Tokina AT-X AF 300mm F4",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 6,
+    name: "Tokina AT-X AF 400mm F5.6 SD",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 7,
+    name: "Tokina AF 730 II 75-300mm F4.5-5.6",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 8,
+    name: "Sigma 800mm F5.6 APO",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 9,
+    name: "Sigma AF 400mm F5.6 APO Macro",
+  },
+  SonyLensVariant {
+    id: 2561,
+    variant: 10,
+    name: "Sigma 1000mm F8 APO",
+  },
+  SonyLensVariant {
+    id: 2563,
+    variant: 1,
+    name: "Sigma AF 50-500mm F4-6.3 EX DG APO",
+  },
+  SonyLensVariant {
+    id: 2563,
+    variant: 2,
+    name: "Sigma AF 170-500mm F5-6.3 APO Aspherical",
+  },
+  SonyLensVariant {
+    id: 2563,
+    variant: 3,
+    name: "Sigma AF 500mm F4.5 EX DG APO",
+  },
+  SonyLensVariant {
+    id: 2563,
+    variant: 4,
+    name: "Sigma 400mm F5.6 APO",
+  },
+  SonyLensVariant {
+    id: 2564,
+    variant: 1,
+    name: "Sigma 50mm F2.8 EX Macro",
+  },
+  SonyLensVariant {
+    id: 2566,
+    variant: 1,
+    name: "Sigma 17-35mm F2.8-4 EX Aspherical",
+  },
+  SonyLensVariant {
+    id: 2578,
+    variant: 1,
+    name: "Sigma 8mm F4 EX [DG] Fisheye",
+  },
+  SonyLensVariant {
+    id: 2578,
+    variant: 2,
+    name: "Sigma 14mm F3.5",
+  },
+  SonyLensVariant {
+    id: 2578,
+    variant: 3,
+    name: "Sigma 15mm F2.8 Fisheye",
+  },
+  SonyLensVariant {
+    id: 2579,
+    variant: 1,
+    name: "Tokina AT-X Pro DX 11-16mm F2.8",
+  },
+  SonyLensVariant {
+    id: 2581,
+    variant: 1,
+    name: "Sigma AF 90mm F2.8 Macro",
+  },
+  SonyLensVariant {
+    id: 2581,
+    variant: 2,
+    name: "Sigma AF 105mm F2.8 EX [DG] Macro",
+  },
+  SonyLensVariant {
+    id: 2581,
+    variant: 3,
+    name: "Sigma 180mm F5.6 Macro",
+  },
+  SonyLensVariant {
+    id: 2581,
+    variant: 4,
+    name: "Sigma 180mm F3.5 EX DG Macro",
+  },
+  SonyLensVariant {
+    id: 2581,
+    variant: 5,
+    name: "Tamron 90mm F2.8 Macro",
+  },
+  SonyLensVariant {
+    id: 2585,
+    variant: 1,
+    name: "Beroflex 35-135mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 2585,
+    variant: 2,
+    name: "Tamron 24-135mm F3.5-5.6",
+  },
+  SonyLensVariant {
+    id: 2589,
+    variant: 1,
+    name: "Tokina 80-200mm F2.8",
+  },
+  SonyLensVariant {
+    id: 2590,
+    variant: 1,
+    name: "Minolta AF 600mm F4 HS-APO G + Minolta AF 1.4x APO",
+  },
+  SonyLensVariant {
+    id: 2601,
+    variant: 1,
+    name: "Minolta AF 600mm F4 HS-APO G + Minolta AF 2x APO",
+  },
+  SonyLensVariant {
+    id: 4574,
+    variant: 1,
+    name: "Tamron SP AF 90mm F2.5",
+  },
+  SonyLensVariant {
+    id: 4574,
+    variant: 2,
+    name: "Tokina RF 500mm F8.0 x2",
+  },
+  SonyLensVariant {
+    id: 4574,
+    variant: 3,
+    name: "Tokina 300mm F2.8 x2",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 1,
+    name: "Arax MC 35mm F2.8 Tilt+Shift",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 2,
+    name: "Arax MC 80mm F2.8 Tilt+Shift",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 3,
+    name: "Zenitar MF 16mm F2.8 Fisheye M42",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 4,
+    name: "Samyang 500mm Mirror F8.0",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 5,
+    name: "Pentacon Auto 135mm F2.8",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 6,
+    name: "Pentacon Auto 29mm F2.8",
+  },
+  SonyLensVariant {
+    id: 6553,
+    variant: 7,
+    name: "Helios 44-2 58mm F2.0",
+  },
+  SonyLensVariant {
+    id: 25511,
+    variant: 1,
+    name: "Sigma UC AF 28-70mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 25511,
+    variant: 2,
+    name: "Sigma AF 28-70mm F2.8",
+  },
+  SonyLensVariant {
+    id: 25511,
+    variant: 3,
+    name: "Sigma M-AF 70-200mm F2.8 EX Aspherical",
+  },
+  SonyLensVariant {
+    id: 25511,
+    variant: 4,
+    name: "Quantaray M-AF 35-80mm F4-5.6",
+  },
+  SonyLensVariant {
+    id: 25511,
+    variant: 5,
+    name: "Tokina 28-70mm F2.8-4.5 AF",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 1,
+    name: "Tokina 19-35mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 2,
+    name: "Tokina 28-70mm F2.8 AT-X",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 3,
+    name: "Tokina 80-400mm F4.5-5.6 AT-X AF II 840",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 4,
+    name: "Tokina AF PRO 28-80mm F2.8 AT-X 280",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 5,
+    name: "Tokina AT-X PRO [II] AF 28-70mm F2.6-2.8 270",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 6,
+    name: "Tamron AF 19-35mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 7,
+    name: "Angenieux AF 28-70mm F2.6",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 8,
+    name: "Tokina AT-X 17 AF 17mm F3.5",
+  },
+  SonyLensVariant {
+    id: 25521,
+    variant: 9,
+    name: "Tokina 20-35mm F3.5-4.5 II AF",
+  },
+  SonyLensVariant {
+    id: 25531,
+    variant: 1,
+    name: "Sigma ZOOM-alpha 35-135mm F3.5-4.5",
+  },
+  SonyLensVariant {
+    id: 25531,
+    variant: 2,
+    name: "Sigma 28-105mm F2.8-4 Aspherical",
+  },
+  SonyLensVariant {
+    id: 25531,
+    variant: 3,
+    name: "Sigma 28-105mm F4-5.6 UC",
+  },
+  SonyLensVariant {
+    id: 25531,
+    variant: 4,
+    name: "Tokina AT-X 242 AF 24-200mm F3.5-5.6",
+  },
+  SonyLensVariant {
+    id: 25551,
+    variant: 1,
+    name: "Sigma 70-210mm F4-5.6 APO",
+  },
+  SonyLensVariant {
+    id: 25551,
+    variant: 2,
+    name: "Sigma M-AF 70-200mm F2.8 EX APO",
+  },
+  SonyLensVariant {
+    id: 25551,
+    variant: 3,
+    name: "Sigma 75-200mm F2.8-3.5",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 1,
+    name: "Sigma 70-300mm F4-5.6 DL Macro",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 2,
+    name: "Sigma 300mm F4 APO Macro",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 3,
+    name: "Sigma AF 500mm F4.5 APO",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 4,
+    name: "Sigma AF 170-500mm F5-6.3 APO Aspherical",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 5,
+    name: "Tokina AT-X AF 300mm F4",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 6,
+    name: "Tokina AT-X AF 400mm F5.6 SD",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 7,
+    name: "Tokina AF 730 II 75-300mm F4.5-5.6",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 8,
+    name: "Sigma 800mm F5.6 APO",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 9,
+    name: "Sigma AF 400mm F5.6 APO Macro",
+  },
+  SonyLensVariant {
+    id: 25611,
+    variant: 10,
+    name: "Sigma 1000mm F8 APO",
+  },
+  SonyLensVariant {
+    id: 25631,
+    variant: 1,
+    name: "Sigma AF 50-500mm F4-6.3 EX DG APO",
+  },
+  SonyLensVariant {
+    id: 25631,
+    variant: 2,
+    name: "Sigma AF 170-500mm F5-6.3 APO Aspherical",
+  },
+  SonyLensVariant {
+    id: 25631,
+    variant: 3,
+    name: "Sigma AF 500mm F4.5 EX DG APO",
+  },
+  SonyLensVariant {
+    id: 25631,
+    variant: 4,
+    name: "Sigma 400mm F5.6 APO",
+  },
+  SonyLensVariant {
+    id: 25641,
+    variant: 1,
+    name: "Sigma 50mm F2.8 EX Macro",
+  },
+  SonyLensVariant {
+    id: 25661,
+    variant: 1,
+    name: "Sigma 17-35mm F2.8-4 EX Aspherical",
+  },
+  SonyLensVariant {
+    id: 25781,
+    variant: 1,
+    name: "Sigma 8mm F4 EX [DG] Fisheye",
+  },
+  SonyLensVariant {
+    id: 25781,
+    variant: 2,
+    name: "Sigma 14mm F3.5",
+  },
+  SonyLensVariant {
+    id: 25781,
+    variant: 3,
+    name: "Sigma 15mm F2.8 Fisheye",
+  },
+  SonyLensVariant {
+    id: 25791,
+    variant: 1,
+    name: "Tokina AT-X Pro DX 11-16mm F2.8",
+  },
+  SonyLensVariant {
+    id: 25811,
+    variant: 1,
+    name: "Sigma AF 90mm F2.8 Macro",
+  },
+  SonyLensVariant {
+    id: 25811,
+    variant: 2,
+    name: "Sigma AF 105mm F2.8 EX [DG] Macro",
+  },
+  SonyLensVariant {
+    id: 25811,
+    variant: 3,
+    name: "Sigma 180mm F5.6 Macro",
+  },
+  SonyLensVariant {
+    id: 25811,
+    variant: 4,
+    name: "Sigma 180mm F3.5 EX DG Macro",
+  },
+  SonyLensVariant {
+    id: 25811,
+    variant: 5,
+    name: "Tamron 90mm F2.8 Macro",
+  },
+  SonyLensVariant {
+    id: 25858,
+    variant: 1,
+    name: "Tamron 24-135mm F3.5-5.6",
+  },
+  SonyLensVariant {
+    id: 25891,
+    variant: 1,
+    name: "Tokina 80-200mm F2.8",
+  },
+  SonyLensVariant {
+    id: 25901,
+    variant: 1,
+    name: "Minolta AF 600mm F4 HS-APO G + Minolta AF 1.4x APO",
+  },
+  SonyLensVariant {
+    id: 26011,
+    variant: 1,
+    name: "Minolta AF 600mm F4 HS-APO G + Minolta AF 2x APO",
+  },
+  SonyLensVariant {
+    id: 45741,
+    variant: 1,
+    name: "Tamron SP AF 90mm F2.5",
+  },
+  SonyLensVariant {
+    id: 45741,
+    variant: 2,
+    name: "Tokina RF 500mm F8.0 x2",
+  },
+  SonyLensVariant {
+    id: 45741,
+    variant: 3,
+    name: "Tokina 300mm F2.8 x2",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 1,
+    name: "Arax MC 35mm F2.8 Tilt+Shift",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 2,
+    name: "Arax MC 80mm F2.8 Tilt+Shift",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 3,
+    name: "Zenitar MF 16mm F2.8 Fisheye M42",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 4,
+    name: "Samyang 500mm Mirror F8.0",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 5,
+    name: "Pentacon Auto 135mm F2.8",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 6,
+    name: "Pentacon Auto 29mm F2.8",
+  },
+  SonyLensVariant {
+    id: 65535,
+    variant: 7,
+    name: "Helios 44-2 58mm F2.0",
+  },
+];
+
+/// The `id.1`, `id.2`, … secondary names for `id`, in ascending `variant`
+/// order — the order `PrintLensID` (`Exif.pm:5969`) scans them. Empty when
+/// `id` has no float-keyed variants.
+#[must_use]
+pub fn lens_variants(id: u32) -> &'static [SonyLensVariant] {
+  let lo = SONY_LENS_VARIANTS_AMOUNT.partition_point(|v| v.id < id);
+  let hi = SONY_LENS_VARIANTS_AMOUNT.partition_point(|v| v.id <= id);
+  // `partition_point` guarantees `lo <= hi <= len`, so the slice is in range.
+  SONY_LENS_VARIANTS_AMOUNT.get(lo..hi).unwrap_or(&[])
+}
+
 #[cfg(test)]
 // The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
 // contract (Phase C S2); the test-builder helpers index fixed-layout buffers
@@ -1084,5 +2065,66 @@ mod tests {
   fn unmatched_id_is_none() {
     // 60000 is not a key — caller renders the standard `Unknown (N)`.
     assert!(lookup_name(60000).is_none());
+  }
+
+  #[test]
+  fn variants_sorted_and_contiguous_from_one() {
+    // Sorted by `(id, variant)`; within an id the variants run `1..=N` with no
+    // gap, because `PrintLensID` stops scanning at the first missing `id.i`.
+    let mut prev_id: Option<u32> = None;
+    let mut expect_var: u8 = 1;
+    for v in SONY_LENS_VARIANTS_AMOUNT {
+      if prev_id == Some(v.id) {
+        assert_eq!(
+          v.variant, expect_var,
+          "non-contiguous variant for id {}",
+          v.id
+        );
+        expect_var += 1;
+      } else {
+        if let Some(p) = prev_id {
+          assert!(
+            v.id > p,
+            "SONY_LENS_VARIANTS_AMOUNT not sorted by id: {} after {p}",
+            v.id
+          );
+        }
+        assert_eq!(v.variant, 1, "first variant for id {} must be 1", v.id);
+        expect_var = 2;
+        prev_id = Some(v.id);
+      }
+    }
+  }
+
+  #[test]
+  fn lens_variants_129_tamron_in_order() {
+    let names: Vec<&str> = lens_variants(129).iter().map(|v| v.name).collect();
+    assert_eq!(
+      names,
+      ["Tamron 200-400mm F5.6 LD", "Tamron 70-300mm F4-5.6 LD"]
+    );
+  }
+
+  #[test]
+  fn lens_variants_55_single() {
+    let vs = lens_variants(55);
+    assert_eq!(vs.len(), 1);
+    assert_eq!(
+      vs.first().map(|v| v.name),
+      Some("Sony DT 18-55mm F3.5-5.6 SAM II (SAL18552)")
+    );
+  }
+
+  #[test]
+  fn lens_variants_128_has_twentyseven() {
+    // The largest run in the table (Sigma/Tamron A-mount, `128.1`..`128.27`).
+    assert_eq!(lens_variants(128).len(), 27);
+  }
+
+  #[test]
+  fn lens_variants_absent_is_empty() {
+    // 0 is a primary (Minolta AF 28-85mm) with no float entries; 999_999 unknown.
+    assert!(lens_variants(0).is_empty());
+    assert!(lens_variants(999_999).is_empty());
   }
 }
