@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "PNG_cicp.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG-cICP:ColorPrimaries": "BT.2020, BT.2100",
+  "PNG-cICP:TransferCharacteristics": "SMPTE ST 2084, ITU BT.2100 PQ",
+  "PNG-cICP:MatrixCoefficients": "BT.2020 non-constant luminance, BT.2100 YCbCr",
+  "PNG-cICP:VideoFullRangeFlag": 1,
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

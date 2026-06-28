@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "PNG_cicp_vpag_truncated.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG:VirtualImageHeight": 200,
+  "PNG:VirtualPageUnits": 0,
+  "PNG:VirtualImageWidth": 999,
+  "PNG-cICP:MatrixCoefficients": "BT.2020 non-constant luminance, BT.2100 YCbCr",
+  "PNG-cICP:VideoFullRangeFlag": 1,
+  "PNG-cICP:ColorPrimaries": "BT.470 System B, G (historical)",
+  "PNG-cICP:TransferCharacteristics": "Linear",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

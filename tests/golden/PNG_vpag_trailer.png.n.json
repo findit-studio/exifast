@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "PNG_vpag_trailer.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Trailer data after PNG IEND chunk",
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "PNG",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 2,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "PNG:VirtualImageWidth": 100,
+  "PNG:VirtualImageHeight": 200,
+  "PNG:VirtualPageUnits": 0,
+  "Trailer:VirtualImageWidth": 300,
+  "Trailer:VirtualImageHeight": 400,
+  "Trailer:VirtualPageUnits": 1,
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

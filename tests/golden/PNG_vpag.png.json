@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "PNG_vpag.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "PNG:VirtualImageWidth": 100,
+  "PNG:VirtualImageHeight": 200,
+  "PNG:VirtualPageUnits": 0,
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

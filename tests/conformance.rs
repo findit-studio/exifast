@@ -12585,6 +12585,39 @@ fn png_gdat_conformance() {
 
 #[test]
 #[cfg(feature = "png")]
+fn png_cicp_conformance() {
+  // #142 — the `cICP` HDR "coding-independent code points" chunk
+  // (`CICodePoints`, `PNG.pm:348-353`, sub-table `:471-541`). A 4-byte
+  // `ProcessBinaryData` table of `int8u` code points (same as
+  // `QuickTime::ColorRep`): ColorPrimaries / TransferCharacteristics /
+  // MatrixCoefficients (named-code-point PrintConv) + VideoFullRangeFlag (raw).
+  // family-1 group `PNG-cICP` (`PNG.pm:473`). Crafted minimal 1x1 RGB fixture
+  // whose only vendor chunk is `cICP` carrying the HDR10 signal (BT.2020
+  // primaries `9`, PQ transfer `16`, BT.2020-NCL matrix `9`, full range `1`).
+  // PNG is in the Composite allow-list, so the ported `Composite:ImageSize`/
+  // `Megapixels` are compared too (a PLAIN `check`). Oracle: bundled `perl
+  // exiftool -j -G1 -struct` 13.59.
+  check("PNG_cicp.png", "PNG_cicp.png.json", true);
+  check("PNG_cicp.png", "PNG_cicp.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_vpag_conformance() {
+  // #142 — the `vpAg` ImageMagick private virtual-page chunk (`VirtualPage`,
+  // `PNG.pm:290-293`, sub-table `:561-573`). A `ProcessBinaryData` table:
+  // VirtualImageWidth / VirtualImageHeight (int32u) + VirtualPageUnits (int8u),
+  // all raw (no conv), default family-1 group `PNG` (the table sets only
+  // `GROUPS{2} => 'Image'`). Crafted minimal 1x1 RGB fixture whose only vendor
+  // chunk is `vpAg` (width 100, height 200, units 0). PNG is in the Composite
+  // allow-list, so the ported `Composite:ImageSize`/`Megapixels` are compared
+  // too (a PLAIN `check`). Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_vpag.png", "PNG_vpag.png.json", true);
+  check("PNG_vpag.png", "PNG_vpag.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
 fn png_idot_main_trailer_conformance() {
   // #142 (Codex [medium]) — the per-group `iDOT` fix. A PNG can carry the
   // `Binary => 1` `iDOT` chunk BOTH before `IEND` (stored under the `PNG`
@@ -12619,6 +12652,66 @@ fn png_gdat_main_trailer_conformance() {
   // exiftool -j -G1 -struct` 13.59.
   check("PNG_gdat_trailer.png", "PNG_gdat_trailer.png.json", true);
   check("PNG_gdat_trailer.png", "PNG_gdat_trailer.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_cicp_main_trailer_conformance() {
+  // #142 (Codex [medium]) — the per-field+per-region `cICP` fix. A PNG can carry
+  // the `CICodePoints` (`ProcessBinaryData`) chunk BOTH before `IEND` (stored
+  // under `PNG-cICP`) AND as a post-`IEND` TRAILER chunk (stored under `Trailer`,
+  // `PNG.pm:1479-1484` `SET_GROUP1 = 'Trailer'`). Bundled emits BOTH the main
+  // fields (`PNG-cICP:ColorPrimaries` 9 = "BT.2020, BT.2100", … FullRange 1) AND
+  // the trailer fields (`Trailer:ColorPrimaries` 1 = "BT.709", … FullRange 0)
+  // under their DISTINCT family-1 groups — the trailer chunk does NOT overwrite
+  // or re-group the main fields. The previous singleton model replaced every
+  // field with the trailer chunk's values + flipped the group; the per-field
+  // [`RegionValue`] keeps both regions. The trailer-ENTRY warning `Trailer data
+  // after PNG IEND chunk` (`PNG.pm:1481`) stays the document `[minor]
+  // ExifTool:Warning`. PNG is in the Composite allow-list, so the ported
+  // `Composite:ImageSize`/`Megapixels` are compared too (a PLAIN `check`).
+  // Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_cicp_trailer.png", "PNG_cicp_trailer.png.json", true);
+  check("PNG_cicp_trailer.png", "PNG_cicp_trailer.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_vpag_main_trailer_conformance() {
+  // #142 (Codex [medium]) — the same per-field+per-region fix for `vpAg`
+  // (`VirtualPage`). A pre-`IEND` `vpAg` (→ `PNG:VirtualImageWidth` 100, Height
+  // 200, Units 0) and a post-`IEND` trailer `vpAg` (→ `Trailer:VirtualImageWidth`
+  // 300, Height 400, Units 1) BOTH emit under their distinct family-1 groups. The
+  // document `[minor] ExifTool:Warning` (the trailer-entry warning) is emitted
+  // too. A PLAIN `check`. Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_vpag_trailer.png", "PNG_vpag_trailer.png.json", true);
+  check("PNG_vpag_trailer.png", "PNG_vpag_trailer.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
+fn png_cicp_vpag_truncated_conformance() {
+  // #142 (Codex [medium]) — present-only update. A FULL cICP/vpAg then a
+  // TRUNCATED same-region chunk: `ProcessBinaryData` updates only the PRESENT
+  // field slots and never clears an earlier value, so a runt later chunk's
+  // OMITTED fields survive while its present fields overwrite (last-wins). full
+  // cICP 9/16/9/1 then a 2-byte cICP 5/8 ⇒ `PNG-cICP:MatrixCoefficients` 9 +
+  // `VideoFullRangeFlag` 1 KEPT, `ColorPrimaries`/`TransferCharacteristics` →
+  // 5/8; full vpAg 100/200/0 then a 4-byte vpAg 999 ⇒ `PNG:VirtualImageHeight`
+  // 200 + `VirtualPageUnits` 0 KEPT, `VirtualImageWidth` → 999. The previous
+  // singleton model cleared the omitted fields (the truncated chunk's `None`
+  // overwrote them). No trailer (all pre-`IEND`), so no trailer warning. A PLAIN
+  // `check`. Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check(
+    "PNG_cicp_vpag_truncated.png",
+    "PNG_cicp_vpag_truncated.png.json",
+    true,
+  );
+  check(
+    "PNG_cicp_vpag_truncated.png",
+    "PNG_cicp_vpag_truncated.png.n.json",
+    false,
+  );
 }
 
 #[test]
