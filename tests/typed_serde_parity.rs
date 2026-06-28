@@ -1775,7 +1775,12 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// ST 0601.11 UAS Datalink + ST 0102.11 Security tags; bundled extracts them in
 /// the MAIN pass (default mode) too, not only under `-ee`, so the default
 /// goldens carry the 18 `MISB:*` tags and the fixture is active.
-const EXPECTED_ACTIVE_FIXTURES: usize = 643;
+///
+/// `644`: `PNG_cicp.png` (#142) — the crafted `cICP` HDR code-points chunk
+/// (`CICodePoints`, `PNG.pm:471-541`), a 4-byte `ProcessBinaryData` table:
+/// ColorPrimaries / TransferCharacteristics / MatrixCoefficients (PrintConv) +
+/// VideoFullRangeFlag (raw), family-1 `PNG-cICP`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 644;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

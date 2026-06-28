@@ -12585,6 +12585,24 @@ fn png_gdat_conformance() {
 
 #[test]
 #[cfg(feature = "png")]
+fn png_cicp_conformance() {
+  // #142 — the `cICP` HDR "coding-independent code points" chunk
+  // (`CICodePoints`, `PNG.pm:348-353`, sub-table `:471-541`). A 4-byte
+  // `ProcessBinaryData` table of `int8u` code points (same as
+  // `QuickTime::ColorRep`): ColorPrimaries / TransferCharacteristics /
+  // MatrixCoefficients (named-code-point PrintConv) + VideoFullRangeFlag (raw).
+  // family-1 group `PNG-cICP` (`PNG.pm:473`). Crafted minimal 1x1 RGB fixture
+  // whose only vendor chunk is `cICP` carrying the HDR10 signal (BT.2020
+  // primaries `9`, PQ transfer `16`, BT.2020-NCL matrix `9`, full range `1`).
+  // PNG is in the Composite allow-list, so the ported `Composite:ImageSize`/
+  // `Megapixels` are compared too (a PLAIN `check`). Oracle: bundled `perl
+  // exiftool -j -G1 -struct` 13.59.
+  check("PNG_cicp.png", "PNG_cicp.png.json", true);
+  check("PNG_cicp.png", "PNG_cicp.png.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "png")]
 fn png_idot_main_trailer_conformance() {
   // #142 (Codex [medium]) — the per-group `iDOT` fix. A PNG can carry the
   // `Binary => 1` `iDOT` chunk BOTH before `IEND` (stored under the `PNG`

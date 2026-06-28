@@ -717,6 +717,39 @@ pub struct PngMeta<'a> {
   pixels_per_unit_y: Option<u32>,
   /// `pHYs.PixelUnits` (`PNG.pm:463-467`). `0` = unknown, `1` = meters.
   pixel_units: Option<u8>,
+  // ----- cICP (PNG.pm:348-353, sub-table PNG.pm:471-541) ----------------
+  /// `cICP.ColorPrimaries` (`CICodePoints` tag 0, `int8u`, `PNG.pm:479-495`).
+  /// The HDR color-primaries code point; its PrintConv (`PNG.pm:481-494`)
+  /// renders the named primaries (`9` → `BT.2020, BT.2100`), falling through
+  /// to the raw number for an unmapped code. Each cICP field is INDEPENDENTLY
+  /// available (`ProcessBinaryData` per-offset), so a runt 1-to-3-byte cICP
+  /// supplies only the leading fields.
+  color_primaries: Option<u8>,
+  /// `cICP.TransferCharacteristics` (`CICodePoints` tag 1, `int8u`,
+  /// `PNG.pm:496-519`). PrintConv renders the named transfer function (`16` →
+  /// `SMPTE ST 2084, ITU BT.2100 PQ`), raw number otherwise. Needs byte 1.
+  transfer_characteristics: Option<u8>,
+  /// `cICP.MatrixCoefficients` (`CICodePoints` tag 2, `int8u`,
+  /// `PNG.pm:520-539`). PrintConv renders the named matrix (`9` → `BT.2020
+  /// non-constant luminance, BT.2100 YCbCr`), raw number otherwise. Needs
+  /// byte 2.
+  matrix_coefficients: Option<u8>,
+  /// `cICP.VideoFullRangeFlag` (`CICodePoints` tag 3, `int8u`, `PNG.pm:540`).
+  /// No PrintConv — the raw flag (`0`/`1`). Needs byte 3.
+  video_full_range_flag: Option<u8>,
+  // ----- vpAg (PNG.pm:290-293, sub-table PNG.pm:561-573) ----------------
+  /// `vpAg.VirtualImageWidth` (`VirtualPage` tag 0, `int32u`, `PNG.pm:566`) —
+  /// ImageMagick's private virtual-page chunk. Raw number (no conv). Needs
+  /// bytes `0..4`.
+  virtual_image_width: Option<u32>,
+  /// `vpAg.VirtualImageHeight` (`VirtualPage` tag 1, `int32u`, `PNG.pm:567`).
+  /// Raw number. Needs bytes `4..8` (INDEPENDENT of the width — an 8-byte
+  /// vpAg supplies width+height but not the units byte).
+  virtual_image_height: Option<u32>,
+  /// `vpAg.VirtualPageUnits` (`VirtualPage` tag 2, `int8u`, `PNG.pm:568-572`).
+  /// Raw number (the table notes "what is the conversion for this?" — none).
+  /// Needs byte 8.
+  virtual_page_units: Option<u8>,
   // ----- iCCP (PNG.pm:171-181) -----------------------------------------
   /// `iCCP-name` — the ICC profile NAME (`PNG.pm:182-190` + 1304). The
   /// profile body bytes are NOT parsed (Phase-2 sub-port deferred).
@@ -1057,6 +1090,16 @@ struct StructuralTrailing {
   ihdr: bool,
   /// `pHYs` sub-table (PixelsPerUnitX/Y, PixelUnits) came from a trailer chunk.
   phys: bool,
+  /// `cICP` sub-table (ColorPrimaries/TransferCharacteristics/
+  /// MatrixCoefficients/VideoFullRangeFlag) came from a trailer chunk — so the
+  /// explicit `PNG-cICP` family-1 group is overridden to `Trailer`
+  /// (`PNG.pm:1484`; oracle-confirmed a post-`IEND` cICP emits
+  /// `Trailer:ColorPrimaries`).
+  cicp: bool,
+  /// `vpAg` sub-table (VirtualImageWidth/Height, VirtualPageUnits) came from a
+  /// trailer chunk — so its default `PNG` family-1 group is overridden to
+  /// `Trailer`.
+  vpag: bool,
   /// `iCCP-name` (ProfileName) came from a trailer chunk.
   iccp: bool,
   /// `bKGD` (BackgroundColor) came from a trailer chunk.
@@ -1093,6 +1136,13 @@ impl PngMeta<'_> {
       pixels_per_unit_x: None,
       pixels_per_unit_y: None,
       pixel_units: None,
+      color_primaries: None,
+      transfer_characteristics: None,
+      matrix_coefficients: None,
+      video_full_range_flag: None,
+      virtual_image_width: None,
+      virtual_image_height: None,
+      virtual_page_units: None,
       icc_profile_name: None,
       background_color: None,
       modify_date: None,
@@ -1111,6 +1161,8 @@ impl PngMeta<'_> {
       structural_trailing: StructuralTrailing {
         ihdr: false,
         phys: false,
+        cicp: false,
+        vpag: false,
         iccp: false,
         bkgd: false,
         time: false,
@@ -1264,6 +1316,59 @@ impl PngMeta<'_> {
   #[must_use]
   pub const fn pixel_units(&self) -> Option<u8> {
     self.pixel_units
+  }
+
+  // ===== cICP accessors =================================================
+
+  /// `cICP.ColorPrimaries` (`PNG.pm:479-495`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn color_primaries(&self) -> Option<u8> {
+    self.color_primaries
+  }
+
+  /// `cICP.TransferCharacteristics` (`PNG.pm:496-519`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn transfer_characteristics(&self) -> Option<u8> {
+    self.transfer_characteristics
+  }
+
+  /// `cICP.MatrixCoefficients` (`PNG.pm:520-539`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn matrix_coefficients(&self) -> Option<u8> {
+    self.matrix_coefficients
+  }
+
+  /// `cICP.VideoFullRangeFlag` (`PNG.pm:540`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn video_full_range_flag(&self) -> Option<u8> {
+    self.video_full_range_flag
+  }
+
+  // ===== vpAg accessors =================================================
+
+  /// `vpAg.VirtualImageWidth` (`PNG.pm:566`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_image_width(&self) -> Option<u32> {
+    self.virtual_image_width
+  }
+
+  /// `vpAg.VirtualImageHeight` (`PNG.pm:567`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_image_height(&self) -> Option<u32> {
+    self.virtual_image_height
+  }
+
+  /// `vpAg.VirtualPageUnits` (`PNG.pm:568-572`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn virtual_page_units(&self) -> Option<u8> {
+    self.virtual_page_units
   }
 
   /// Helper: DPI as `(x, y)` derived from `pHYs`. PNG stores pixels per
@@ -1445,6 +1550,38 @@ impl PngMeta<'_> {
     self.pixels_per_unit_y = Some(ppu_y);
     self.pixel_units = Some(units);
     self.structural_trailing.phys = self.in_trailer;
+  }
+
+  /// Record the `cICP` HDR code-point fields (`CICodePoints`, `PNG.pm:471-541`)
+  /// per-field. Each argument is `Some` IFF the chunk held that field's int8u
+  /// byte (`ProcessBinaryData` per-offset availability, `PNG.pm:472`), so a
+  /// runt cICP supplies only the leading fields. The four fields share one
+  /// `cICP`-trailer flag (a single chunk produced them all). Last-wins per
+  /// region.
+  pub(crate) fn set_cicp(
+    &mut self,
+    color_primaries: Option<u8>,
+    transfer_characteristics: Option<u8>,
+    matrix_coefficients: Option<u8>,
+    video_full_range_flag: Option<u8>,
+  ) {
+    self.color_primaries = color_primaries;
+    self.transfer_characteristics = transfer_characteristics;
+    self.matrix_coefficients = matrix_coefficients;
+    self.video_full_range_flag = video_full_range_flag;
+    self.structural_trailing.cicp = self.in_trailer;
+  }
+
+  /// Record the `vpAg` ImageMagick virtual-page fields (`VirtualPage`,
+  /// `PNG.pm:561-573`) per-field. `width`/`height` are `Some` IFF their
+  /// `int32u` bytes (`0..4` / `4..8`) were present; `units` IFF byte 8 was
+  /// present — each INDEPENDENT (`ProcessBinaryData` per-offset). The three
+  /// share one `vpAg`-trailer flag. Last-wins per region.
+  pub(crate) fn set_vpag(&mut self, width: Option<u32>, height: Option<u32>, units: Option<u8>) {
+    self.virtual_image_width = width;
+    self.virtual_image_height = height;
+    self.virtual_page_units = units;
+    self.structural_trailing.vpag = self.in_trailer;
   }
 
   /// Set the acTL `AnimationFrames` value — `AnimationControl` tag 0
@@ -1752,6 +1889,20 @@ impl PngMeta<'_> {
   #[must_use]
   pub(crate) const fn phys_is_trailing(&self) -> bool {
     self.structural_trailing.phys
+  }
+
+  /// Whether the `cICP` sub-table tags came from a TRAILER chunk.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn cicp_is_trailing(&self) -> bool {
+    self.structural_trailing.cicp
+  }
+
+  /// Whether the `vpAg` sub-table tags came from a TRAILER chunk.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn vpag_is_trailing(&self) -> bool {
+    self.structural_trailing.vpag
   }
 
   /// Whether the `iCCP-name` (ProfileName) tag came from a TRAILER chunk.

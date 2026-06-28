@@ -616,6 +616,10 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     b"IHDR" => decode_ihdr(meta, data),
     // ----- pHYs (PNG.pm:216-222, sub-table :441-468) ---------------------
     b"pHYs" => decode_phys(meta, data),
+    // ----- cICP (PNG.pm:348-353, sub-table :471-541) ---------------------
+    b"cICP" => decode_cicp(meta, data),
+    // ----- vpAg (PNG.pm:290-293, sub-table :561-573) ---------------------
+    b"vpAg" => decode_vpag(meta, data),
     // ----- iDOT (PNG.pm:331-342) -----------------------------------------
     b"iDOT" => decode_idot(meta, data),
     // ----- gdAT (PNG.pm:374-378) -----------------------------------------
@@ -739,6 +743,73 @@ fn decode_phys(meta: &mut PngMeta<'_>, data: &[u8]) {
   let ppu_x = u32::from_be_bytes([d0, d1, d2, d3]);
   let ppu_y = u32::from_be_bytes([d4, d5, d6, d7]);
   meta.set_phys(ppu_x, ppu_y, units);
+}
+
+// ===========================================================================
+// cICP decoder — PNG.pm:348-353 + sub-table :471-541
+// ===========================================================================
+
+/// `cICP` decoder — the HDR "coding-independent code points" chunk
+/// (`PNG.pm:348-353`), whose SubDirectory is the `CICodePoints`
+/// `ProcessBinaryData` table (`PNG.pm:471-541`). Four `int8u` fields at
+/// consecutive offsets (same code points as `QuickTime::ColorRep`):
+///
+/// | offset | length | field                  | type  |
+/// |--------|--------|------------------------|-------|
+/// | 0      | 1      | ColorPrimaries         | int8u |
+/// | 1      | 1      | TransferCharacteristics| int8u |
+/// | 2      | 1      | MatrixCoefficients     | int8u |
+/// | 3      | 1      | VideoFullRangeFlag     | int8u |
+///
+/// `ProcessBinaryData` emits each field IFF its byte offset is within the
+/// chunk length (`ExifTool.pm` `last if $more <= 0`), so each is INDEPENDENTLY
+/// available (the #128 MPEG / #149 av1C per-field class) — a runt 1-to-3-byte
+/// cICP supplies only the leading fields (oracle-verified vs bundled 13.59 at
+/// 2-byte). The first three carry a named-code-point PrintConv applied at
+/// emission ([`PngMeta::tags`]); `VideoFullRangeFlag` has none (raw flag). The
+/// `cICP` family-1 group is `PNG-cICP` (`PNG.pm:473`), shifting to `Trailer`
+/// for a post-`IEND` chunk (`PNG.pm:1484`, oracle-confirmed).
+fn decode_cicp(meta: &mut PngMeta<'_>, data: &[u8]) {
+  meta.set_cicp(
+    data.first().copied(),
+    data.get(1).copied(),
+    data.get(2).copied(),
+    data.get(3).copied(),
+  );
+}
+
+// ===========================================================================
+// vpAg decoder — PNG.pm:290-293 + sub-table :561-573
+// ===========================================================================
+
+/// `vpAg` decoder — ImageMagick's private "virtual page" chunk
+/// (`PNG.pm:290-293`), whose SubDirectory is the `VirtualPage`
+/// `ProcessBinaryData` table (`PNG.pm:561-573`, `FORMAT => 'int32u'`):
+///
+/// | offset | length | field            | type   |
+/// |--------|--------|------------------|--------|
+/// | 0      | 4      | VirtualImageWidth | int32u |
+/// | 4      | 4      | VirtualImageHeight| int32u |
+/// | 8      | 1      | VirtualPageUnits  | int8u  |
+///
+/// (`VirtualPageUnits` overrides the table `FORMAT` with its own `int8u`,
+/// `PNG.pm:570`.) Per-field `ProcessBinaryData` availability: `width` needs
+/// bytes `0..4`, `height` bytes `4..8`, `units` byte 8 — each INDEPENDENT
+/// (oracle-verified vs bundled 13.59 at 5-byte → width only, 8-byte →
+/// width+height). All three are raw numbers (no conv). The `vpAg` family-1
+/// group is the default `PNG` (the table sets only `GROUPS{2} => 'Image'`,
+/// `PNG.pm:564`), shifting to `Trailer` for a post-`IEND` chunk.
+fn decode_vpag(meta: &mut PngMeta<'_>, data: &[u8]) {
+  // Per-field `ProcessBinaryData` availability via checked slicing (the `acTL`
+  // pattern): `first_chunk::<4>` for the width (offset 0), `get(4..8) +
+  // try_into` for the height (offset 4), `get(8)` for the units (offset 8).
+  let width = data.first_chunk::<4>().map(|&b| u32::from_be_bytes(b));
+  let height = data
+    .get(4..8)
+    .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    .map(u32::from_be_bytes);
+  let units = data.get(8).copied();
+  meta.set_vpag(width, height, units);
 }
 
 // ===========================================================================
@@ -2180,6 +2251,81 @@ const GROUP_PNG: &str = "PNG";
 /// (only group1 is overridden, not group0).
 const GROUP_PNG_PHYS: &str = "PNG-pHYs";
 
+/// family-1 `"PNG-cICP"` for the cICP sub-table (`PNG.pm:473`
+/// `GROUPS => { 1 => 'PNG-cICP', 2 => 'Image' }`); family-0 stays `"PNG"`.
+const GROUP_PNG_CICP: &str = "PNG-cICP";
+
+/// `cICP.ColorPrimaries` PrintConv (`PNG.pm:481-494`) — the named HDR color
+/// primaries for a code point, or `None` (raw-number fallthrough) for an
+/// unmapped code. Same code points as `QuickTime::ColorRep` (`PNG.pm:478`).
+const fn cicp_color_primaries(v: u8) -> Option<&'static str> {
+  Some(match v {
+    1 => "BT.709",
+    2 => "Unspecified",
+    4 => "BT.470 System M (historical)",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240",
+    8 => "Generic film (color filters using illuminant C)",
+    9 => "BT.2020, BT.2100",
+    10 => "SMPTE 428 (CIE 1921 XYZ)",
+    11 => "SMPTE RP 431-2",
+    12 => "SMPTE EG 432-1",
+    22 => "EBU Tech. 3213-E",
+    _ => return None,
+  })
+}
+
+/// `cICP.TransferCharacteristics` PrintConv (`PNG.pm:498-518`) — the named
+/// transfer function for a code point, or `None` for an unmapped code.
+const fn cicp_transfer_characteristics(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "For future use (0)",
+    1 => "BT.709",
+    2 => "Unspecified",
+    3 => "For future use (3)",
+    4 => "BT.470 System M (historical)",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240 M",
+    8 => "Linear",
+    9 => "Logarithmic (100 : 1 range)",
+    10 => "Logarithmic (100 * Sqrt(10) : 1 range)",
+    11 => "IEC 61966-2-4",
+    12 => "BT.1361",
+    13 => "sRGB or sYCC",
+    14 => "BT.2020 10-bit systems",
+    15 => "BT.2020 12-bit systems",
+    16 => "SMPTE ST 2084, ITU BT.2100 PQ",
+    17 => "SMPTE ST 428",
+    18 => "BT.2100 HLG, ARIB STD-B67",
+    _ => return None,
+  })
+}
+
+/// `cICP.MatrixCoefficients` PrintConv (`PNG.pm:522-538`) — the named matrix
+/// coefficients for a code point, or `None` for an unmapped code.
+const fn cicp_matrix_coefficients(v: u8) -> Option<&'static str> {
+  Some(match v {
+    0 => "Identity matrix",
+    1 => "BT.709",
+    2 => "Unspecified",
+    3 => "For future use (3)",
+    4 => "US FCC 73.628",
+    5 => "BT.470 System B, G (historical)",
+    6 => "BT.601",
+    7 => "SMPTE 240 M",
+    8 => "YCgCo",
+    9 => "BT.2020 non-constant luminance, BT.2100 YCbCr",
+    10 => "BT.2020 constant luminance",
+    11 => "SMPTE ST 2085 YDzDx",
+    12 => "Chromaticity-derived non-constant luminance",
+    13 => "Chromaticity-derived constant luminance",
+    14 => "BT.2100 ICtCp",
+    _ => return None,
+  })
+}
+
 /// The family-1 group override bundled applies to every tag extracted from a
 /// post-`IEND` TRAILER chunk (`PNG.pm:1484` `$$et{SET_GROUP1} = 'Trailer'`).
 const GROUP_TRAILER: &str = "Trailer";
@@ -2314,10 +2460,19 @@ impl crate::emit::Taggable for PngMeta<'_> {
         Group::new(GROUP_PNG, GROUP_PNG_PHYS)
       }
     };
+    let cicp_group = |trailing: bool| {
+      if trailing {
+        Group::new(GROUP_PNG, GROUP_TRAILER)
+      } else {
+        Group::new(GROUP_PNG, GROUP_PNG_CICP)
+      }
+    };
     // Per-structural-chunk trailing flags (cheap; computed once).
     let ihdr_t = self.ihdr_is_trailing();
     let bkgd_t = self.bkgd_is_trailing();
     let phys_t = self.phys_is_trailing();
+    let cicp_t = self.cicp_is_trailing();
+    let vpag_t = self.vpag_is_trailing();
     let time_t = self.time_is_trailing();
     let iccp_t = self.iccp_is_trailing();
 
@@ -2616,6 +2771,101 @@ impl crate::emit::Taggable for PngMeta<'_> {
           false,
         ));
       }
+    }
+
+    // ---- cICP (PNG.pm:471-541) -------------------------------------
+    // `CICodePoints` (`ProcessBinaryData`) emits in offset order:
+    // ColorPrimaries, TransferCharacteristics, MatrixCoefficients,
+    // VideoFullRangeFlag. The first three have a named-code-point PrintConv
+    // (`-j`); an unmapped code falls through to the raw number (PrintConv-miss).
+    // VideoFullRangeFlag has no PrintConv (raw flag). `-n` always emits the raw
+    // byte. family-1 group `PNG-cICP` (`Trailer` for a post-`IEND` chunk).
+    let push_cicp = |group: Group,
+                     name: &'static str,
+                     v: u8,
+                     conv: fn(u8) -> Option<&'static str>,
+                     tags: &mut Vec<EmittedTag>| {
+      if print_conv && let Some(label) = conv(v) {
+        tags.push(EmittedTag::new(
+          group,
+          name.into(),
+          TagValue::Str(label.into()),
+          false,
+        ));
+      } else {
+        tags.push(EmittedTag::new(
+          group,
+          name.into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
+      }
+    };
+    if let Some(v) = self.color_primaries() {
+      push_cicp(
+        cicp_group(cicp_t),
+        "ColorPrimaries",
+        v,
+        cicp_color_primaries,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.transfer_characteristics() {
+      push_cicp(
+        cicp_group(cicp_t),
+        "TransferCharacteristics",
+        v,
+        cicp_transfer_characteristics,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.matrix_coefficients() {
+      push_cicp(
+        cicp_group(cicp_t),
+        "MatrixCoefficients",
+        v,
+        cicp_matrix_coefficients,
+        &mut tags,
+      );
+    }
+    if let Some(v) = self.video_full_range_flag() {
+      // No PrintConv (`PNG.pm:540`) — raw flag in both modes.
+      tags.push(EmittedTag::new(
+        cicp_group(cicp_t),
+        "VideoFullRangeFlag".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
+    }
+
+    // ---- vpAg (PNG.pm:561-573) -------------------------------------
+    // `VirtualPage` (`ProcessBinaryData`, `FORMAT => 'int32u'`) emits in offset
+    // order: VirtualImageWidth, VirtualImageHeight, VirtualPageUnits. All three
+    // are raw numbers (no conv, the table even asks "what is the conversion?").
+    // family-1 group is the default `PNG` (`Trailer` for a post-`IEND` chunk).
+    if let Some(w) = self.virtual_image_width() {
+      tags.push(EmittedTag::new(
+        png_group(vpag_t),
+        "VirtualImageWidth".into(),
+        TagValue::U64(u64::from(w)),
+        false,
+      ));
+    }
+    if let Some(h) = self.virtual_image_height() {
+      tags.push(EmittedTag::new(
+        png_group(vpag_t),
+        "VirtualImageHeight".into(),
+        TagValue::U64(u64::from(h)),
+        false,
+      ));
+    }
+    if let Some(u) = self.virtual_page_units() {
+      tags.push(EmittedTag::new(
+        png_group(vpag_t),
+        "VirtualPageUnits".into(),
+        TagValue::U64(u64::from(u)),
+        false,
+      ));
     }
 
     // ---- tIME (PNG.pm:262-275) -------------------------------------
@@ -4220,6 +4470,152 @@ mod tests {
       gdat_tag.tag().value_ref(),
       &crate::value::TagValue::Str(crate::value::binary_placeholder(20))
     );
+  }
+
+  /// Parse a minimal 1x1 RGB PNG carrying a single vendor `chunk_type` chunk
+  /// directly after IHDR, returning the parsed `PngMeta`.
+  fn png_with_chunk(chunk_type: &[u8; 4], chunk_data: &[u8]) -> Vec<u8> {
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&1u32.to_be_bytes());
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
+    bytes.extend_from_slice(&chunk(chunk_type, chunk_data));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    bytes
+  }
+
+  #[test]
+  fn cicp_full_emits_printconv_and_raw() {
+    // cICP (PNG.pm:471-541): the HDR10 signal — BT.2020 primaries (9), PQ
+    // transfer (16), BT.2020-NCL matrix (9), full range (1). The first three
+    // carry a named PrintConv (`-j`); VideoFullRangeFlag is raw. family-1
+    // group `PNG-cICP`.
+    let png = png_with_chunk(b"cICP", &[9, 16, 9, 1]);
+    let meta = parse_borrowed(&png).expect("png parses");
+    assert_eq!(meta.color_primaries(), Some(9));
+    assert_eq!(meta.transfer_characteristics(), Some(16));
+    assert_eq!(meta.matrix_coefficients(), Some(9));
+    assert_eq!(meta.video_full_range_flag(), Some(1));
+    assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
+    let pj: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let find = |name: &str, tags: &[crate::emit::EmittedTag]| {
+      tags.iter().find(|t| t.tag().name() == name).map(|t| {
+        (
+          t.tag().group_ref().family1().to_string(),
+          t.tag().value_ref().clone(),
+        )
+      })
+    };
+    assert_eq!(
+      find("ColorPrimaries", &pj),
+      Some((
+        "PNG-cICP".to_string(),
+        crate::value::TagValue::Str("BT.2020, BT.2100".into())
+      ))
+    );
+    assert_eq!(
+      find("TransferCharacteristics", &pj),
+      Some((
+        "PNG-cICP".to_string(),
+        crate::value::TagValue::Str("SMPTE ST 2084, ITU BT.2100 PQ".into())
+      ))
+    );
+    assert_eq!(
+      find("VideoFullRangeFlag", &pj),
+      Some(("PNG-cICP".to_string(), crate::value::TagValue::U64(1)))
+    );
+    // `-n` (ValueConv) renders the raw code points.
+    let nv: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::ValueConv, false),
+    )
+    .collect();
+    assert_eq!(
+      find("ColorPrimaries", &nv),
+      Some(("PNG-cICP".to_string(), crate::value::TagValue::U64(9)))
+    );
+  }
+
+  #[test]
+  fn cicp_truncated_emits_per_field_bounded() {
+    // A runt 2-byte cICP supplies only ColorPrimaries + TransferCharacteristics
+    // (ProcessBinaryData per-offset availability, PNG.pm:472); a 0-byte cICP
+    // supplies none. Bounded — no panic, no out-of-range read.
+    let two = png_with_chunk(b"cICP", &[9, 16]);
+    let meta = parse_borrowed(&two).expect("png parses");
+    assert_eq!(meta.color_primaries(), Some(9));
+    assert_eq!(meta.transfer_characteristics(), Some(16));
+    assert_eq!(meta.matrix_coefficients(), None);
+    assert_eq!(meta.video_full_range_flag(), None);
+    let zero = png_with_chunk(b"cICP", &[]);
+    let empty = parse_borrowed(&zero).expect("png parses");
+    assert_eq!(empty.color_primaries(), None);
+    assert_eq!(empty.video_full_range_flag(), None);
+  }
+
+  #[test]
+  fn cicp_unmapped_code_falls_through_to_raw() {
+    // An unmapped PrintConv code point (e.g. ColorPrimaries `200`) falls
+    // through to the raw number even under `-j` (PrintConv-miss, PNG.pm).
+    let bytes = png_with_chunk(b"cICP", &[200, 0, 0, 0]);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    let pj: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let cp = pj
+      .iter()
+      .find(|t| t.tag().name() == "ColorPrimaries")
+      .expect("ColorPrimaries emitted");
+    assert_eq!(cp.tag().value_ref(), &crate::value::TagValue::U64(200));
+  }
+
+  #[test]
+  fn vpag_full_and_truncated_per_field() {
+    // vpAg (PNG.pm:561-573): VirtualImageWidth (int32u @0), VirtualImageHeight
+    // (int32u @4), VirtualPageUnits (int8u @8) — all raw, family-1 `PNG`.
+    let mut full = Vec::new();
+    full.extend_from_slice(&100u32.to_be_bytes());
+    full.extend_from_slice(&200u32.to_be_bytes());
+    full.push(0);
+    let full_png = png_with_chunk(b"vpAg", &full);
+    let meta = parse_borrowed(&full_png).expect("png parses");
+    assert_eq!(meta.virtual_image_width(), Some(100));
+    assert_eq!(meta.virtual_image_height(), Some(200));
+    assert_eq!(meta.virtual_page_units(), Some(0));
+    let pj: Vec<_> = crate::emit::Taggable::tags(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+    )
+    .collect();
+    let w = pj
+      .iter()
+      .find(|t| t.tag().name() == "VirtualImageWidth")
+      .expect("VirtualImageWidth emitted");
+    assert_eq!(w.tag().group_ref().family1(), "PNG");
+    assert_eq!(w.tag().value_ref(), &crate::value::TagValue::U64(100));
+    // 8-byte vpAg → width + height, NO units (byte 8 absent); 4-byte → width
+    // only; 3-byte → nothing. Bounded.
+    let p8 = png_with_chunk(b"vpAg", &full[..8]);
+    let m8 = parse_borrowed(&p8).expect("png parses");
+    assert_eq!(m8.virtual_image_width(), Some(100));
+    assert_eq!(m8.virtual_image_height(), Some(200));
+    assert_eq!(m8.virtual_page_units(), None);
+    let p4 = png_with_chunk(b"vpAg", &full[..4]);
+    let m4 = parse_borrowed(&p4).expect("png parses");
+    assert_eq!(m4.virtual_image_width(), Some(100));
+    assert_eq!(m4.virtual_image_height(), None);
+    let p3 = png_with_chunk(b"vpAg", &full[..3]);
+    let m3 = parse_borrowed(&p3).expect("png parses");
+    assert_eq!(m3.virtual_image_width(), None);
   }
 
   #[test]
