@@ -733,11 +733,18 @@ fn convert(
     }
     Conv::Hash(fmt, table) => {
       let raw = read_fmt(value, fmt, byte_order)?;
-      let key = read_num(value, fmt, byte_order)? as i64;
-      let print = match table.iter().find(|(k, _)| *k == key) {
-        // MISB.pm hash PrintConv hit ⇒ the label.
+      // MISB.pm hash `PrintConv => { k => label }` is a Perl hash lookup on the
+      // RAW scalar `$val`, NOT an arithmetic conversion. Derive the integer key
+      // from the extracted scalar (`I64`/`U64` for a real read); a too-short
+      // value is `''` (empty `read_fmt` scalar) ⇒ `scalar_key` is `None`, the
+      // lookup misses, and ExifTool returns `$val` unchanged (`$h{''}` miss,
+      // verified vs bundled 13.59) — never the `read_num` empty→0 coercion that
+      // would fabricate the key-0 label.
+      let key = scalar_key(&raw);
+      let print = match key.and_then(|k| table.iter().find(|(tk, _)| *tk == k)) {
+        // Hash hit ⇒ the label.
         Some((_, label)) => TagValue::Str(SmolStr::new(*label)),
-        // Hash miss ⇒ ExifTool returns the raw numeric value unchanged.
+        // Hash miss (incl. an empty too-short scalar) ⇒ the raw value unchanged.
         None => raw.clone(),
       };
       Some((raw, print))
@@ -772,9 +779,14 @@ fn convert(
     }
     Conv::SecVersion => {
       let raw = read_fmt(value, Fmt::U16, byte_order)?;
-      let n = read_num(value, Fmt::U16, byte_order)? as u64;
-      // MISB.pm:283 `PrintConv => '"0102.$val"'`.
-      Some((raw, TagValue::Str(std::format!("0102.{n}").into())))
+      // MISB.pm:283 `PrintConv => '"0102.$val"'` — string interpolation of the
+      // RAW scalar, NOT an arithmetic conversion: a too-short `int16u` makes
+      // `ReadValue` return `''` (empty `read_fmt` scalar) and ExifTool emits
+      // `"0102."` (verified vs bundled 13.59 MISB.pm). Derive from the scalar so
+      // the empty stays empty — never the `read_num` empty→0 numeric coercion
+      // (which would fabricate `"0102.0"`).
+      let print = std::format!("0102.{}", scalar_text(&raw));
+      Some((raw, TagValue::Str(print.into())))
     }
   }
 }
@@ -938,6 +950,21 @@ fn hex_lower(bytes: &[u8]) -> String {
   s
 }
 
+/// The integer hash-lookup key a [`Conv::Hash`] `PrintConv` matches `$val`
+/// against, derived from the EXTRACTED raw scalar. A real numeric read yields
+/// `Some(n)`; a too-short value (the empty-string `read_fmt` scalar, ExifTool's
+/// `''`) yields `None` so the hash lookup misses (`$h{''}` is absent) and the
+/// caller returns the raw value unchanged — separating extraction from the
+/// per-conversion interpretation so the empty→0 numeric coercion never applies
+/// to this string-keyed lookup.
+fn scalar_key(v: &TagValue) -> Option<i64> {
+  match v {
+    TagValue::I64(i) => Some(*i),
+    TagValue::U64(u) => i64::try_from(*u).ok(),
+    _ => None,
+  }
+}
+
 /// Scalar text of a [`TagValue`] for the suffix/strip/hash string conversions
 /// (Perl scalar stringification of the raw value).
 fn scalar_text(v: &TagValue) -> String {
@@ -1061,7 +1088,7 @@ mod tests {
     assert_single_uas_version(&leaves);
   }
 
-  /// The precise Codex #130 scenario: a MISB prefix whose top-level long-form
+  /// The precise #130 scenario: a MISB prefix whose top-level long-form
   /// BER length saturates and is followed by NO further bytes. The buggy code
   /// advanced `pos` to `usize::MAX` and overflowed `pos + 16` on the next guard;
   /// the fix clamps the advance to the available bytes and terminates. No panic.
@@ -1216,5 +1243,82 @@ mod tests {
       TagValue::Str("AB".into())
     );
     assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
+  }
+
+  /// Wrap a Security local-set `inner` body in the UAS `SecurityLocalMetadataSet`
+  /// container (UAS tag 48 `Conv::Sub(Table::Security)`) and decode it: the only
+  /// route to the Security table in `process_klv` is through that SubDirectory.
+  fn decode_security_local_set(inner: &[u8]) -> Vec<MisbLeaf> {
+    // [tag 48][BER len = inner.len()][inner Security local set]
+    let mut uas = vec![48, u8::try_from(inner.len()).expect("inner fits BER")];
+    uas.extend_from_slice(inner);
+    decode_uas_local_set(&uas)
+  }
+
+  /// A `SecVersion` string-interpolation `PrintConv` (`"0102.$val"`) over a
+  /// too-short `int16u` (Security tag 22, declared `len=1`) must yield `"0102."`
+  /// — the EMPTY `$val` (ExifTool `ReadValue` returns `''` for a `len < fmt`
+  /// read), NOT `"0102.0"`. The #130 short-value class: the empty→0 numeric
+  /// coercion is correct for ARITHMETIC convs but WRONG for a scalar-PrintConv
+  /// string interpolation, which must derive from the raw scalar. The record is
+  /// followed by a valid `SecurityVersion=11` to also prove no cross-boundary
+  /// over-read of the second record.
+  #[test]
+  fn short_sec_version_interpolates_empty_not_zero() {
+    // [tag 22 SecurityVersion int16u][BER len 1][0x05]  [tag 22][BER len 2][=11]
+    let mut inner = vec![22, 0x01, 0x05];
+    inner.extend_from_slice(&[22, 0x02, 0x00, 0x0b]); // a valid SecurityVersion=11
+    let leaves = decode_security_local_set(&inner);
+    let versions: Vec<&MisbLeaf> = leaves
+      .iter()
+      .filter(|l| l.name.as_str() == "SecurityVersion")
+      .collect();
+    assert_eq!(versions.len(), 2, "leaves: {:?}", names(&leaves));
+    // First (short, len=1): `"0102.$val"` with empty `$val` ⇒ `"0102."` (NOT
+    // `"0102.0"`); the raw `-n` value is the empty-string `ReadValue` result.
+    let short = versions.first().expect("first SecurityVersion");
+    assert_eq!(short.value_print, TagValue::Str("0102.".into()));
+    assert_eq!(short.value_n, TagValue::Str("".into()));
+    // Second (valid, len=2 = 11): still decodes from its OWN bytes ⇒ `"0102.11"`.
+    let valid = versions.get(1).expect("second SecurityVersion");
+    assert_eq!(valid.value_print, TagValue::Str("0102.11".into()));
+    assert_eq!(valid.value_n, TagValue::I64(11));
+  }
+
+  /// A zero-length `Hash` tag whose table DEFINES key `0` (`IcingDetected`,
+  /// int8u, `{ 0 => 'n/a', 1 => 'No', 2 => 'Yes' }`) must NOT fabricate the
+  /// key-0 `"n/a"` label: ExifTool's `ReadValue(.., undef, 0)` is the empty
+  /// string `''`, and the hash lookup `$h{''}` MISSES ⇒ `$val` is returned
+  /// unchanged (empty). The empty→0 numeric coercion (correct for arithmetic
+  /// convs) must NOT apply to this string-keyed PrintConv lookup.
+  #[test]
+  fn zero_length_hash_tag_does_not_fabricate_key_zero_label() {
+    // [tag 34 IcingDetected int8u][BER len 0]  [tag 65 = 11]
+    let mut inner = vec![34, 0x00];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    let icing = leaf(&leaves, "IcingDetected");
+    // Hash MISS on the empty `''` key ⇒ raw value unchanged, NOT the key-0 label.
+    assert_eq!(icing.value_print, TagValue::Str("".into()));
+    assert_eq!(icing.value_n, TagValue::Str("".into()));
+    // The following record decodes from its own bytes (no boundary corruption).
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    assert_eq!(leaves.len(), 2, "leaves: {:?}", names(&leaves));
+  }
+
+  /// The valid `Hash` lens is unaffected: a full-width `IcingDetected = 2`
+  /// resolves the table label `"Yes"` (`-j`) and the raw int (`-n`). Guards the
+  /// scalar-key derivation against breaking the happy path.
+  #[test]
+  fn valid_hash_tag_resolves_label() {
+    // [tag 34 IcingDetected int8u][BER len 1][value 2]
+    let inner = vec![34, 0x01, 0x02];
+    let leaves = decode_uas_local_set(&inner);
+    let icing = leaf(&leaves, "IcingDetected");
+    assert_eq!(icing.value_print, TagValue::Str("Yes".into()));
+    assert_eq!(icing.value_n, TagValue::I64(2));
   }
 }
