@@ -13995,9 +13995,11 @@ fn emit_parrot(
 ///
 /// `SerialNumber2` (`2-2-3-1`, AVATA2 / DJI Neo) is a NAMED, default-extracted
 /// tag (DJI.pm:399/:553) and IS emitted (verbatim string, after `SerialNumber`).
-/// `FrameNumber` (`3-1-1`) and the Accelerometer / model-code / version fields
-/// are intentionally dropped (camera-indexing scope; see the `dji_protobuf`
-/// module docs) — the typed surface never stored them.
+/// `FrameNumber` (`3-1-1`) is likewise a NAMED, default-extracted tag
+/// (DJI.pm:279… `#forum17996`) and IS emitted per `djmd` sample (below). The
+/// Accelerometer / model-code / version fields are intentionally dropped
+/// (`Unknown => 1` non-default extractions; see the `dji_protobuf` module
+/// docs) — the typed surface never stored them.
 ///
 /// AccelerometerX/Y/Z: the typed [`crate::metadata::DjiTelemetrySample`] drops
 /// them (NOT camera/GPS metadata), so they are not emitted here.
