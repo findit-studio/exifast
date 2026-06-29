@@ -1115,6 +1115,15 @@ struct FlatTag {
   /// lang-alt list-rebuild forward item (`tables.rs` module docs).
   #[allow(dead_code)]
   lang: Option<String>,
+  /// The tag's tagInfo is `PRIORITY => 0` — a later same-`(group1, name)`
+  /// duplicate CANNOT displace the established value (`FoundTag`,
+  /// ExifTool.pm:9544-9564), so the FIRST-extracted scalar wins. True for the
+  /// `PRIORITY => 0` namespaces (`tiff`/`exif`/`exifEX`) AND for any
+  /// unknown/generated-default tagInfo (ExifTool gives a generated XMP tag
+  /// `Priority => 0` — e.g. `foo:Bar` in an unported namespace, or an unknown
+  /// FIELD of a known namespace). A default-priority known tag (e.g. `dc`)
+  /// stays `false` ⇒ LAST-wins ([`build_value`], #477).
+  priority0: bool,
 }
 
 /// One level of a structure property path (`GetXMPTagID`'s `structProps`).
@@ -3680,6 +3689,15 @@ impl Walker<'_> {
       last.name = SmolStr::new(std::format!("{}-{l}", last.name));
     }
 
+    // The tag's `PRIORITY => 0` flag drives `build_value`'s same-packet scalar
+    // duplicate handling (#477 F1): a later bare duplicate of a `tiff`/`exif`/
+    // `exifEX` tag OR of an unknown/generated tag (`field` unresolved — ExifTool
+    // gives a generated XMP tagInfo `Priority => 0`) keeps the FIRST value; a
+    // default-priority known tag (e.g. `dc`) keeps the LAST. Intrinsic to the
+    // tag, so all members of one `(group1, name)` group share it; `build_value`
+    // reads `members[0].priority0`.
+    let priority0 = is_priority0_xmp_group(group1.as_str()) || field.is_none();
+
     self.flat.push(FlatTag {
       tag_id: SmolStr::new(&id.tag),
       group1,
@@ -3687,6 +3705,7 @@ impl Walker<'_> {
       value,
       struct_props,
       lang: if lang_alt { lang } else { None },
+      priority0,
     });
     let _ = (is_bag_seq_list, &self.xmp_about);
   }
@@ -3701,6 +3720,9 @@ impl Walker<'_> {
       value: XmpValue::Scalar(XmpScalar::new(value)),
       struct_props: Vec::new(),
       lang: None,
+      // A recognized attribute (`x:xmptk` → XMPToolkit, …) is a plain scalar
+      // singleton — never priority-0 dedup'd (default LAST-wins).
+      priority0: false,
     });
   }
 }
@@ -4521,6 +4543,19 @@ fn uudecode_line(line: &[u8], out: &mut Vec<u8>) {
 // RestoreStruct (XMPStruct.pl:708) — rebuild nested structs from flat tags
 // ===========================================================================
 
+/// The XMP namespaces ExifTool marks `PRIORITY => 0` — `tiff`/`exif`/`exifEX`
+/// ("not as reliable as actual TIFF/EXIF tags", XMP.pm:1900/1992/2462). A later
+/// duplicate of an already-established same-`(family1, name)` tag in one of these
+/// CANNOT displace it (`FoundTag`, ExifTool.pm:9544-9564), so the FIRST-extracted
+/// value wins; a default-priority namespace (e.g. `dc`) stays last-wins. This one
+/// predicate drives BOTH priority-aware collapse points: the emission-layer
+/// same-`(family1, name)` dedup ([`XmpMeta::tags`], #436 — cross-packet /
+/// File-vs-XMP) AND the earlier SAME-packet scalar-duplicate collapse in
+/// [`build_value`] (#477).
+fn is_priority0_xmp_group(group1: &str) -> bool {
+  matches!(group1, "XMP-tiff" | "XMP-exif" | "XMP-exifEX")
+}
+
 /// Rebuild structured (`-struct`) values from the flattened `FoundXMP`
 /// captures — faithful port of `RestoreStruct` (XMPStruct.pl:708) plus the
 /// post-walk `FoundTag` emission. Flat tags whose `struct_props` describe a
@@ -4597,19 +4632,53 @@ fn top_level_name(ft: &FlatTag) -> SmolStr {
 // catches any NEW unchecked indexing added outside these proven helpers.
 #[allow(clippy::indexing_slicing)]
 fn build_value(members: &[FlatTag]) -> XmpValue {
-  // Plain (non-structured) tag: a single member with ≤1 struct level AND no
-  // list index on that level. A single struct-prop carrying a `rdf:li`
-  // index is a one-element `rdf:Bag`/`Seq`/`Alt` — ExifTool keeps it as a
-  // List even with one item (XMP.pm `List` Writable), so it must NOT
-  // collapse to a scalar.
-  if members.len() == 1
-    && members[0].struct_props.len() <= 1
-    && members[0]
-      .struct_props
-      .first()
-      .is_none_or(|p| p.index.is_none())
-  {
+  // A "bare scalar" member: ≤1 struct level AND no `rdf:li` index on that
+  // level. A struct-prop carrying an `rdf:li` index is a one-element
+  // `rdf:Bag`/`Seq`/`Alt` — ExifTool keeps it as a List even with one item
+  // (XMP.pm `List` Writable), so it must NOT collapse to a scalar; a deeper
+  // (`len > 1`) struct_props path is a struct field, not a bare scalar.
+  let is_bare_scalar = |m: &FlatTag| {
+    m.struct_props.len() <= 1 && m.struct_props.first().is_none_or(|p| p.index.is_none())
+  };
+  // Plain (non-structured) tag: a single bare-scalar member yields its value.
+  if members.len() == 1 && is_bare_scalar(&members[0]) {
     return members[0].value.clone();
+  }
+  // SAME-packet duplicate of one BARE property: two-or-more members that are
+  // EACH a bare scalar (NOT struct fields, NOT `rdf:li` list items) — e.g. two
+  // `tiff:ImageWidth`, or two bare `dc:subject`, in one packet. `RestoreStruct`
+  // groups them under one `(group1, name)` key, so the duplicate is resolved
+  // HERE, BEFORE the emission-layer priority-aware dedup (#436) ever sees it.
+  //
+  // exifast emits ExifTool's `-struct` output (the goldens are `tools/
+  // gen_golden.sh` `-j -G1 -struct` — see the nested `XMP-xmp:Thumbnails`
+  // struct goldens). Under `-struct`, a BARE-written property repeated in one
+  // packet is a plain SCALAR duplicate even for a `List => 'Bag'|'Seq'|'Alt'`
+  // tag (e.g. `dc:subject`): ExifTool's structured reader resolves the repeat
+  // by PRIORITY, keeping the FIRST value for a `PRIORITY => 0` tagInfo (the
+  // `tiff`/`exif`/`exifEX` namespaces, OR an unknown/generated tag — `foo:Bar`
+  // in an unported namespace and an unknown FIELD of a known namespace, all
+  // `Priority => 0`, #477 F1) and the LAST otherwise (a default-priority known
+  // tag, e.g. `dc:format` / bare `dc:subject` ⇒ last-wins). It does NOT
+  // accumulate the bare repeats into an array — list accumulation is a
+  // `-struct`-OFF flattening behavior exifast does not emit; an actual list is
+  // written `rdf:Bag`/`Seq`/`Alt` and carries `rdf:li` indices, so it has a
+  // non-bare struct_prop and is rebuilt by `StructNode` below as a List.
+  // (Bundled `-j -G1 -struct` is the oracle: two bare `dc:subject` ⇒ `"bbb"`,
+  // two bare `tiff:BitsPerSample` ⇒ `8` — `XMP_same_packet_list_dup.xmp`.)
+  //
+  // `priority0` is intrinsic to the tag, so every member of the group shares
+  // it and `members[0]` decides. Every OTHER group — structs (`has_substruct`),
+  // `rdf:Bag`/`Seq`/`Alt` lists carrying an `rdf:li` index, lang-alt
+  // (`-<lang>`-suffixed distinct names → distinct keys) — has a non-bare
+  // struct_prop and falls through to the `StructNode` rebuild below UNCHANGED.
+  if members.len() > 1 && members.iter().all(is_bare_scalar) {
+    let keep = if members[0].priority0 {
+      0
+    } else {
+      members.len() - 1
+    };
+    return members[keep].value.clone();
   }
   // Multiple members or nested levels — rebuild the tree from struct_props.
   // The root node IS the tag itself: `struct_props[0]`'s NAME is the tag
@@ -4940,17 +5009,17 @@ impl crate::emit::Taggable for XmpMeta<'_> {
       // (ExifTool.pm:9544-9564 — the same rule that has bundled emit 111 for two
       // `tiff:ImageWidth` 111/222). A default-priority namespace (e.g. `dc`)
       // stays LAST-wins (`1 >= 1` replaces). SCOPE: two same-`(family1, name)`
-      // XMP tags reach the sink only as SEPARATE `XmpTag`s — across packets
+      // XMP tags reach THIS sink only as SEPARATE `XmpTag`s — across packets
       // (`absorb_additional_packet`) or as the Composite resolver's File-vs-XMP
-      // pair; a single packet already collapses same-path duplicates earlier, in
-      // `restore_struct`/`build_value` (last-wins), so the priority is NOT
-      // observable in a one-packet `.xmp` (exifast stays last-wins there — a
-      // separate `restore_struct` matter, NOT changed by this priority).
-      // Locked by the `priority0_xmp_namespaces_emission_dedup_first_wins` test.
-      let priority = u8::from(!matches!(
-        tag.group.as_str(),
-        "XMP-tiff" | "XMP-exif" | "XMP-exifEX"
-      ));
+      // pair. A SINGLE packet resolves same-path duplicates EARLIER, in
+      // `restore_struct`/`build_value`, which is priority-aware too (a
+      // `PRIORITY => 0` tagInfo — incl. an unknown/generated tag — keeps the
+      // FIRST under exifast's `-struct` regime; #477), so a one-packet `.xmp`
+      // duplicate is already faithful before it reaches this sink. Locked by the
+      // `priority0_xmp_namespaces_emission_dedup_first_wins` (cross-packet) +
+      // `same_packet_scalar_dup_collapse_is_priority_aware` /
+      // `same_packet_unknown_dup_first_wins` (#477) tests.
+      let priority = u8::from(!is_priority0_xmp_group(tag.group.as_str()));
       crate::emit::EmittedTag::new_with_priority(
         crate::value::Group::new("XMP", tag.group.as_str()),
         tag.name.clone(),
@@ -6543,5 +6612,141 @@ mod tests {
       survivor(&dc, "XMP-dc", "Format"),
       Some(TagValue::Str("bbb".into())),
     );
+  }
+
+  /// #477: a SAME-packet genuine-scalar duplicate is collapsed PRIORITY-AWARE
+  /// in `restore_struct`/`build_value` — the EARLIER collapse point the
+  /// emission-layer dedup (`priority0_xmp_namespaces_emission_dedup_first_wins`)
+  /// never reaches for a one-packet `.xmp`. Two `tiff:ImageWidth` (111/222) in
+  /// ONE packet (two `rdf:Description` blocks) collapse to the FIRST (111 —
+  /// `tiff` is `PRIORITY => 0`, `is_priority0_xmp_group`); two default-priority
+  /// `dc:format` (aaa/bbb) collapse to the LAST (bbb). Oracle: bundled ExifTool
+  /// 13.59 on `tests/fixtures/XMP_same_packet_dup.xmp` emits
+  /// `XMP-tiff:ImageWidth = 111` + `XMP-dc:Format = "bbb"`.
+  #[test]
+  fn same_packet_scalar_dup_collapse_is_priority_aware() {
+    // ONE packet, two `rdf:Description` blocks per property — the same-packet
+    // duplicate shape `restore_struct` groups under one `(group1, name)` key.
+    let packet = br#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:tiff='http://ns.adobe.com/tiff/1.0/'><tiff:ImageWidth>111</tiff:ImageWidth></rdf:Description>
+<rdf:Description rdf:about='' xmlns:tiff='http://ns.adobe.com/tiff/1.0/'><tiff:ImageWidth>222</tiff:ImageWidth></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:format>aaa</dc:format></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:format>bbb</dc:format></rdf:Description>
+</rdf:RDF></x:xmpmeta><?xpacket end='w'?>"#;
+
+    let meta = super::parse_borrowed(packet).expect("packet parses");
+
+    // The same-packet collapse happens in `restore_struct`, so the survivor is
+    // observable directly on the `XmpTag` stream (not just post-emission).
+    let scalar = |g: &str, n: &str| -> Option<String> {
+      meta
+        .tags_slice()
+        .iter()
+        .find(|t| t.group() == g && t.name() == n)
+        .and_then(|t| t.value_ref().scalar_ref())
+        .map(|s| s.text().to_string())
+    };
+    let count = |g: &str, n: &str| -> usize {
+      meta
+        .tags_slice()
+        .iter()
+        .filter(|t| t.group() == g && t.name() == n)
+        .count()
+    };
+
+    // Exactly one survivor per property (the duplicates collapsed in-packet).
+    assert_eq!(count("XMP-tiff", "ImageWidth"), 1);
+    assert_eq!(count("XMP-dc", "Format"), 1);
+
+    // PRIORITY => 0 `tiff` ⇒ FIRST-wins (111); default-priority `dc` ⇒ LAST-wins
+    // (bbb). Both match bundled ExifTool 13.59.
+    assert_eq!(scalar("XMP-tiff", "ImageWidth").as_deref(), Some("111"));
+    assert_eq!(scalar("XMP-dc", "Format").as_deref(), Some("bbb"));
+  }
+
+  /// #477 F1: the same-packet scalar-dup priority is keyed on the TAG's actual
+  /// priority, NOT the namespace string. ExifTool gives an UNKNOWN/generated
+  /// XMP tagInfo `Priority => 0` (ExifTool.pm:9544-9564), so a later bare
+  /// duplicate cannot displace the established value ⇒ FIRST-wins. Covers BOTH
+  /// generated-tagInfo shapes: `foo:Bar` (an UNPORTED namespace — `lookup_ns_
+  /// table` returns `None`) and `dc:foobar` (an unknown FIELD of the known `dc`
+  /// namespace — the table exists but `resolve_field` returns `None`). Oracle:
+  /// bundled ExifTool 13.59 `-j -G1 -struct` on
+  /// `tests/fixtures/XMP_same_packet_unknown_dup.xmp` ⇒ `XMP-foo:Bar = "AAA"`,
+  /// `XMP-dc:Foobar = "CCC"` (the pre-fix namespace-only rule wrongly LAST-won).
+  #[test]
+  fn same_packet_unknown_dup_first_wins() {
+    let packet = br#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:foo='http://example.com/foo/1.0/'><foo:Bar>AAA</foo:Bar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:foo='http://example.com/foo/1.0/'><foo:Bar>BBB</foo:Bar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:foobar>CCC</dc:foobar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:foobar>DDD</dc:foobar></rdf:Description>
+</rdf:RDF></x:xmpmeta><?xpacket end='w'?>"#;
+
+    let meta = super::parse_borrowed(packet).expect("packet parses");
+    let scalar = |g: &str, n: &str| -> Option<String> {
+      meta
+        .tags_slice()
+        .iter()
+        .find(|t| t.group() == g && t.name() == n)
+        .and_then(|t| t.value_ref().scalar_ref())
+        .map(|s| s.text().to_string())
+    };
+
+    // Both generated tagInfos are `Priority => 0` ⇒ FIRST-extracted survives.
+    assert_eq!(scalar("XMP-foo", "Bar").as_deref(), Some("AAA"));
+    assert_eq!(scalar("XMP-dc", "Foobar").as_deref(), Some("CCC"));
+  }
+
+  /// #477: a `List => 'Bag'|'Seq'|'Alt'` tag written BARE-repeated (NO enclosing
+  /// `rdf:Bag`) in one packet collapses by PRIORITY under exifast's `-struct`
+  /// regime — it does NOT accumulate into an array. (Bare-repeat list
+  /// accumulation — `["aaa","bbb"]` — is a `-struct`-OFF flattening behavior
+  /// exifast does not emit; the goldens are `tools/gen_golden.sh` `-j -G1
+  /// -struct`. An ACTUAL list is written `rdf:Bag`/`Seq`/`Alt` with `rdf:li`
+  /// indices and is rebuilt by `StructNode`.) Two bare `dc:subject`
+  /// (`List => 'Bag'`, default priority) ⇒ LAST (`"bbb"`); two bare
+  /// `tiff:BitsPerSample` (`List => 'Seq'`, `tiff` is `PRIORITY => 0`) ⇒ FIRST
+  /// (`8`). Oracle: bundled ExifTool 13.59 `-j -G1 -struct` on
+  /// `tests/fixtures/XMP_same_packet_list_dup.xmp`.
+  #[test]
+  fn same_packet_listtag_dup_collapses_by_priority() {
+    let packet = br#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:subject>aaa</dc:subject></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:subject>bbb</dc:subject></rdf:Description>
+<rdf:Description rdf:about='' xmlns:tiff='http://ns.adobe.com/tiff/1.0/'><tiff:BitsPerSample>8</tiff:BitsPerSample></rdf:Description>
+<rdf:Description rdf:about='' xmlns:tiff='http://ns.adobe.com/tiff/1.0/'><tiff:BitsPerSample>16</tiff:BitsPerSample></rdf:Description>
+</rdf:RDF></x:xmpmeta><?xpacket end='w'?>"#;
+
+    let meta = super::parse_borrowed(packet).expect("packet parses");
+    let scalar = |g: &str, n: &str| -> Option<String> {
+      meta
+        .tags_slice()
+        .iter()
+        .find(|t| t.group() == g && t.name() == n)
+        .and_then(|t| t.value_ref().scalar_ref())
+        .map(|s| s.text().to_string())
+    };
+    let count = |g: &str, n: &str| -> usize {
+      meta
+        .tags_slice()
+        .iter()
+        .filter(|t| t.group() == g && t.name() == n)
+        .count()
+    };
+
+    // ONE scalar survivor per property — NOT an accumulated list.
+    assert_eq!(count("XMP-dc", "Subject"), 1);
+    assert_eq!(count("XMP-tiff", "BitsPerSample"), 1);
+    assert!(scalar("XMP-dc", "Subject").is_some());
+    assert!(scalar("XMP-tiff", "BitsPerSample").is_some());
+
+    // default-priority `dc:subject` ⇒ LAST (bbb); `PRIORITY => 0`
+    // `tiff:BitsPerSample` ⇒ FIRST (8). Both match bundled `-struct`.
+    assert_eq!(scalar("XMP-dc", "Subject").as_deref(), Some("bbb"));
+    assert_eq!(scalar("XMP-tiff", "BitsPerSample").as_deref(), Some("8"));
   }
 }

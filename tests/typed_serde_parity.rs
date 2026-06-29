@@ -1802,7 +1802,26 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `%Panasonic::Subdir` leaves (Contrast/Sharpening/Saturation/WhiteBalance/
 /// SensorWidth) byte-identically to bundled ExifTool 13.59. Before #466 the
 /// value was misread as an inline offset and the whole Subdir was dropped.
-const EXPECTED_ACTIVE_FIXTURES: usize = 652;
+///
+/// `652 → 653`: `XMP_same_packet_dup.xmp` (#477) — the SAME-packet genuine-scalar
+/// duplicate collapse made PRIORITY-AWARE in `restore_struct`/`build_value`. ONE
+/// packet with two `tiff:ImageWidth` (111/222 — `tiff` is `PRIORITY => 0` ⇒
+/// FIRST-wins ⇒ 111) AND two `dc:format` (aaa/bbb — default priority ⇒ LAST-wins
+/// ⇒ bbb), byte-identical to bundled ExifTool 13.59 (`XMP-tiff:ImageWidth = 111`,
+/// `XMP-dc:Format = "bbb"`).
+///
+/// `653 → 655`: the #477 R1 follow-up — two more same-packet-dup XMP fixtures.
+///   * `XMP_same_packet_unknown_dup.xmp` (#477 F1) — an UNKNOWN tag's duplicate
+///     is FIRST-wins (generated XMP tagInfo `Priority => 0`): two `foo:Bar`
+///     (AAA, unported namespace) + two `dc:foobar` (CCC, unknown field of a
+///     known namespace) ⇒ `XMP-foo:Bar = "AAA"`, `XMP-dc:Foobar = "CCC"`.
+///   * `XMP_same_packet_list_dup.xmp` (#477 F2) — a `List` tag written BARE-
+///     repeated collapses by PRIORITY under the `-struct` golden regime (it does
+///     NOT accumulate; bare-repeat accumulation is `-struct`-OFF flattening
+///     exifast does not emit): two bare `dc:subject` ⇒ `"bbb"` (LAST), two bare
+///     `tiff:BitsPerSample` ⇒ `8` (FIRST). Bundled ExifTool 13.59 `-j -G1
+///     -struct` is the oracle.
+const EXPECTED_ACTIVE_FIXTURES: usize = 655;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
