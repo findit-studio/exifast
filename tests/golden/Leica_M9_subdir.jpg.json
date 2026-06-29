@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "Leica_M9_subdir.jpg",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "JPEG",
+  "File:FileTypeExtension": "jpg",
+  "File:MIMEType": "image/jpeg",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Leica Camera AG",
+  "IFD0:Model": "M9",
+  "Leica:Contrast": "Normal",
+  "Leica:Sharpening": "Low",
+  "Leica:Saturation": "Normal",
+  "Leica:WhiteBalance": "Daylight",
+  "Leica:SensorWidth": 5212
+}]

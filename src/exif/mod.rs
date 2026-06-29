@@ -8635,23 +8635,23 @@ impl Walker<'_, '_> {
       },
       // `%Panasonic::Leica4` (M9, #105) — every row is an IFD SubDirectory into
       // `%Panasonic::Subdir` (`Panasonic.pm:1742-1769`, `0x3000`/`0x3100`/`0x3400`/
-      // `0x3900`), walked under `ByteOrder => Unknown`. Descend IN-WALK here (like
-      // the Samsung `PreviewIfd` descent below): the child IFD starts at `$val +
-      // value_offset_base` (the default `Start => '$val'`, the inherited base), and
-      // its leaves resolve under `active_table == Leica(Subdir)`. The parent
-      // pointer is NEVER emitted (`return`), matching ExifTool's descend-then-`next`
-      // (`Exif.pm:7103-7104`); a non-SubDirectory Leica4 id is unknown ⇒ skipped.
-      // Leica4 carries no plain leaf, so this arm handles every Leica4 entry.
+      // `0x3900`), walked under `ByteOrder => Unknown`. The SubDirectory carries NO
+      // `Start` (nor `Base`), so ExifTool descends at the DEFAULT `$subdirStart =
+      // $valuePtr` (`Exif.pm:6951-6952`) — the value's BYTE POSITION (the M9's
+      // out-of-line `undef[N]` sub-IFD), NOT the interpreted scalar read back as an
+      // offset. Descend IN-WALK at `value_offset` — the already-resolved `$valuePtr`
+      // the walker handed `emit` (for an out-of-line value `= raw_off +
+      // value_offset_base`, `Exif.pm:6546`; for an inline value `= entry + 8`) —
+      // guarded by a non-empty value (`unless ($size) { … next }`, `Exif.pm:6921`).
+      // The child IFD's leaves resolve under `active_table == Leica(Subdir)`. The
+      // parent pointer is NEVER emitted (`return`), matching ExifTool's descend-
+      // then-`next` (`Exif.pm:7103-7104`); a non-SubDirectory Leica4 id is unknown ⇒
+      // skipped. Leica4 carries no plain leaf, so this arm handles every Leica4
+      // entry.
       TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Leica4) => {
-        if matches!(tag_id, 0x3000 | 0x3100 | 0x3400 | 0x3900)
-          && let Some(off) = first_uint(&raw)
-          && let Some(start) = i64::try_from(off)
-            .ok()
-            .map(|d| d.saturating_add(self.value_offset_base))
-            .and_then(|a| usize::try_from(a).ok())
-        {
+        if matches!(tag_id, 0x3000 | 0x3100 | 0x3400 | 0x3900) && value_size != 0 {
           self.process_subdir(
-            start,
+            value_offset,
             kind,
             TableRef::Leica(makernotes::vendors::leica::tags::LeicaVariant::Subdir),
             ByteOrderRule::Unknown,
