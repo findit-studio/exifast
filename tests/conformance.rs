@@ -10320,27 +10320,23 @@ fn sony_arw_real_sr2_and_subifd_conformance() {
   const A33_DEFERRED: &[&str] = &[];
   // A200 (2008 Minolta-derived body): the OLDER `%Sony::Main` sub-table tower —
   // `CameraInfo2` (0x0010, LittleEndian), `FocusInfo` (0x0020), `CameraSettings`
-  // (0x0114, BigEndian `int16u`) — is now FULLY PORTED on top of chunk 1's
+  // (0x0114, BigEndian `int16u`) — is FULLY PORTED on top of chunk 1's
   // `MinoltaRaw` subsystem, so every `Sony:*` AF/exposure/flash/WB/battery leaf
   // emits byte-exact, and the dependent `Composite:FocusDistance` (= `inf`, via
-  // the new `Sony:FocusPosition`) computes. The residuals are three composites:
-  const A200_DEFERRED: &[&str] = &[
-    // `Composite:ImageSize`/`Megapixels` (#436): bundled resolves the bare-name
-    // `Composite:ImageSize` from the `MinoltaRaw:ImageWidth`/`ImageHeight`
-    // (`Priority => 1`, the SR2-corrected 3872x2592) over the `SubIFD:ImageWidth`
-    // (`Priority => 0`, the padded 3880x2600). exifast's bare-name Composite
-    // resolver is emission-order-FIRST (it does NOT yet prefer a higher-priority
-    // ingredient), so it picks the earlier `SubIFD` dims (3880x2600 → 10.1 MP).
-    // The priority-aware bare-name resolution is tracked in #436 (owner-deferred,
-    // low priority); changing the shared `composite/mod.rs` resolver is out of
-    // scope here. Both diverging composites are dropped from BOTH sides.
-    "Composite:ImageSize",
-    "Composite:Megapixels",
-    // `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) is now ACTIVE (#103
-    // part 3): the A200's AMBIGUOUS `Sony:LensType` 129 (`Tamron Lens (129)`)
-    // resolves byte-exact to the 129.2 variant via the `Exif::PrintLensID`
-    // FocalLength (80) + MaxApertureValue (4.5002…) branch (`Exif.pm:6001`).
-  ];
+  // the new `Sony:FocusPosition`) computes. NO residuals — the body is fully
+  // byte-exact:
+  // * `Composite:ImageSize` (`3872x2592`) / `Megapixels` (`10.0`) now resolve
+  //   byte-exact (#436 part 1): the bare-name Composite resolver is PRIORITY-AWARE
+  //   (`composite/mod.rs` — MAX effective priority, first-emission among equals),
+  //   so it prefers the `MinoltaRaw:ImageWidth`/`ImageHeight` (`Priority => 1`,
+  //   the SR2-corrected `3872x2592`) over the earlier-emitted `SubIFD:ImageWidth`
+  //   (the `%Exif::Main` `0x0100` `Priority => 0` leaf, the padded `3880x2600`),
+  //   matching bundled.
+  // * `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) is ACTIVE (#103 part 3):
+  //   the AMBIGUOUS `Sony:LensType` 129 (`Tamron Lens (129)`) resolves byte-exact
+  //   to the 129.2 variant via the `Exif::PrintLensID` FocalLength (80) +
+  //   MaxApertureValue (4.5002…) branch (`Exif.pm:6001`).
+  const A200_DEFERRED: &[&str] = &[];
   check_excluding(
     "Sony_ILME-FX3_real.ARW",
     "Sony_ILME-FX3_real.ARW.json",

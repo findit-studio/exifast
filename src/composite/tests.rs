@@ -2527,12 +2527,12 @@ mod subdoc {
   /// `>=` the stored one; a `Priority => 0` duplicate never overrides). This is
   /// the SAME predicate the `TagMap` sink uses, so feeding the SAME stream into
   /// both lets us assert the two sinks agree across every priority case. The
-  /// post-dedup `Vec` is what the `CompositeSink for Vec<Tag>` impl resolves
-  /// over.
+  /// post-dedup `Vec` is what the `CompositeSink for Vec<(Tag, u8)>` impl
+  /// resolves over — each tag PAIRED with its surviving effective priority.
   #[cfg(feature = "quicktime")]
   fn vec_deduped_g0(
     entries: &[(u32, &str, &str, &str, u8, TagValue)],
-  ) -> std::vec::Vec<crate::value::Tag> {
+  ) -> std::vec::Vec<(crate::value::Tag, u8)> {
     let mut out: std::vec::Vec<(crate::value::Tag, u8)> = std::vec::Vec::new();
     for (doc, g0, g1, n, p, v) in entries {
       let tag =
@@ -2551,7 +2551,7 @@ mod subdoc {
         out.push((tag, effective));
       }
     }
-    out.into_iter().map(|(t, _p)| t).collect()
+    out
   }
 
   /// TWO-SINK PARITY (the #133 finding): a MIXED-family-0 duplicate — same

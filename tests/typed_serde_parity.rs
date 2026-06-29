@@ -526,21 +526,17 @@ const FIXTURE_EXCLUDED_KEYS: &[(&str, &[&str])] = &[
   // `ProcessBinaryData` tower is ported AND `Composite:LensID` now resolves the
   // ambiguous `Sony:LensType` 55 via `Exif::PrintLensID` (#103 part 3), so the
   // fixture no longer needs an exclusion entry.
-  // The `Sony_DSLR-A200_real.ARW` raw is now active (its OLDER `%Sony::Main`
-  // sub-table tower — `CameraInfo2`/`FocusInfo`/`CameraSettings` — is fully
-  // ported, see the `NOT_ACTIVE` note). The residuals are `Composite:ImageSize`/
-  // `Megapixels` (#436 — bundled resolves the bare-name `Composite:ImageSize`
-  // from `MinoltaRaw:ImageWidth` `Priority => 1` over `SubIFD:ImageWidth`
-  // `Priority => 0`; exifast's bare-name Composite resolver is emission-order-
-  // first, picking the padded `SubIFD` 3880x2600 → 10.1 MP, not the SR2-corrected
-  // 3872x2592 → 10.0 MP — a shared-resolver change tracked in owner-deferred
-  // #436). `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) is now ACTIVE via
-  // the `Exif::PrintLensID` FocalLength/MaxAperture branch (#103 part 3). Mirrors
+  // `Sony_DSLR-A200_real.ARW` is fully byte-exact (no excluded keys): its OLDER
+  // `%Sony::Main` sub-table tower (`CameraInfo2`/`FocusInfo`/`CameraSettings`) is
+  // ported, and `Composite:ImageSize` (`3872x2592`) / `Megapixels` (`10.0`) now
+  // resolve byte-exact (#436 part 1) — the bare-name Composite resolver is
+  // PRIORITY-AWARE, preferring `MinoltaRaw:ImageWidth`/`ImageHeight`
+  // (`Priority => 1`, SR2-corrected) over the earlier `SubIFD:ImageWidth`
+  // (`%Exif::Main` `0x0100` `Priority => 0`, the padded 3880x2600). With
+  // `Composite:LensID` (= `Tamron 70-300mm F4-5.6 LD`) also ACTIVE via
+  // `Exif::PrintLensID` (#103 part 3), the fixture no longer needs an exclusion
+  // entry. Mirrors
   // `conformance.rs::sony_arw_real_sr2_and_subifd_conformance`'s `A200_DEFERRED`.
-  (
-    "Sony_DSLR-A200_real.ARW",
-    &["Composite:ImageSize", "Composite:Megapixels"],
-  ),
   // `Canon_EOS-5D_real.CR2` — the deep Canon MakerNote sub-table activation
   // (#84/#85/#87). The newly-ported ColorData3 (0x4001 count 796) / CameraInfo5D
   // (0x0d) / Processing (0xa0) / MeasuredColor (0xaa) / CustomFunctions5D (0x0f →

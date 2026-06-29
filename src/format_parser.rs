@@ -714,7 +714,10 @@ impl AnyMeta<'_> {
   /// first-wins; an ordinary `Priority => 1` tag last-wins (`1 >= 1`).
   /// First-occurrence POSITION is always preserved.
   #[cfg(feature = "alloc")]
-  fn collect_deduped_tags(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::value::Tag> {
+  fn collect_deduped_tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> std::vec::Vec<(crate::value::Tag, u8)> {
     let opts = crate::emit::EmitOptions::g1(mode, false);
     // Each slot carries its surviving entry's EFFECTIVE priority alongside the
     // `Tag`, exactly as [`crate::tagmap::TagMap`] stores it, so a later
@@ -751,7 +754,12 @@ impl AnyMeta<'_> {
         out.push((tag, effective));
       }
     }
-    out.into_iter().map(|(t, _p)| t).collect()
+    // Carry the effective priority OUT (not just for the in-loop dedup): the
+    // bare-name Composite resolver prefers the highest-priority ingredient, so it
+    // needs each surviving tag's priority — the `Vec<(Tag, u8)>` `CompositeSink`
+    // reads it, mirroring the `TagMap` sink's entry.4. Stripped back to plain
+    // `Tag` at the `iter_tags` boundary, so the public API is unchanged.
+    out
   }
 
   /// The format tag stream as [`value::Tag`](crate::value::Tag)s
@@ -787,17 +795,22 @@ impl AnyMeta<'_> {
     // we re-collect the SAME stream in the OPPOSITE mode for the other view.
     let mut other_view = self.collect_deduped_tags(mode.flipped());
     if self.runs_composites() {
-      let doc_count = out.iter().map(|t| t.group_ref().doc()).max().unwrap_or(0);
+      let doc_count = out
+        .iter()
+        .map(|(t, _p)| t.group_ref().doc())
+        .max()
+        .unwrap_or(0);
       let mdat_total = self.composite_media_data_total();
-      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType.
-      let value_view: &std::vec::Vec<crate::value::Tag> = match mode {
+      // The ValueConv view supplies `CalcRotation`'s raw `vide` HandlerType. Each
+      // entry is `(Tag, priority)`; rotation reads only the tag.
+      let value_view: &std::vec::Vec<(crate::value::Tag, u8)> = match mode {
         crate::emit::ConvMode::ValueConv => &out,
         crate::emit::ConvMode::PrintConv => &other_view,
       };
       let rotation = crate::composite::calc_rotation_from(
         value_view
           .iter()
-          .map(|t| (t.group_ref().family1(), t.name(), t.value_ref())),
+          .map(|(t, _p)| (t.group_ref().family1(), t.name(), t.value_ref())),
       );
       let ctx = crate::composite::CompositeContext::new(mdat_total, rotation)
         .with_file_size(self.composite_file_size());
@@ -809,7 +822,8 @@ impl AnyMeta<'_> {
         &ctx,
       );
     }
-    out.into_iter()
+    // Strip the per-tag priority — the public iterator yields plain `Tag`s.
+    out.into_iter().map(|(t, _p)| t)
   }
 
   /// Does this `AnyMeta` RUN the Composite post-pass?

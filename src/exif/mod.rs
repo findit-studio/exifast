@@ -10325,6 +10325,15 @@ trait ExifSink {
     unknown: bool,
     priority: u8,
   ) -> Result<(), core::convert::Infallible>;
+
+  /// Set the ExifTool `Priority => N` for the NEXT scalar leaf written through
+  /// the `write_*` scalars — [`emit_entry`] threads the `%Exif::Main`
+  /// `Priority => 0` for `ImageWidth`/`ImageHeight` (Exif.pm:493/501) so the
+  /// bare-name Composite resolver prefers a higher-priority producer. The default
+  /// is a NO-OP: only the value-storing [`EmittedTagSink`] tracks it (every other
+  /// sink either discards scalar writes or has no priority axis).
+  #[inline(always)]
+  fn set_leaf_priority(&mut self, _priority: u8) {}
 }
 
 /// Test-only sink: each writer delegates to the matching inherent
@@ -10440,6 +10449,14 @@ struct EmittedTagSink<'v> {
   /// IFD entries via this sink, and the MakerNote vendor tags), eliminating the
   /// per-call temp `Vec` the EXIF-entry pass used to allocate + move (P2).
   tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>,
+  /// ExifTool `Priority => N` for the NEXT scalar leaf pushed ([`emit_entry`]
+  /// sets it per entry via [`ExifSink::set_leaf_priority`]). Defaults to `1` (the
+  /// `FoundTag` default); `0` for the `%Exif::Main` `ImageWidth`/`ImageHeight`
+  /// (Exif.pm:493/501, `Priority => 0`) so the bare-name Composite resolver
+  /// prefers a higher-priority producer (the A200's `MinoltaRaw:ImageWidth`).
+  /// [`push`](Self::push) consumes it and resets to `1`, so any writer that does
+  /// not set it gets the default.
+  leaf_priority: u8,
 }
 
 #[cfg(feature = "alloc")]
@@ -10447,24 +10464,35 @@ impl<'v> EmittedTagSink<'v> {
   /// Wrap a destination buffer.
   #[inline(always)]
   fn new(tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>) -> Self {
-    Self { tags }
+    Self {
+      tags,
+      leaf_priority: 1,
+    }
   }
 
   /// Push one rendered [`EmittedTag`] — `Group{family0:"EXIF", family1:group}`,
-  /// `unknown:false` (EXIF tables have no `Unknown=>1`).
+  /// `unknown:false` (EXIF tables have no `Unknown=>1`), at the pending
+  /// [`leaf_priority`](Self::leaf_priority) (then reset to the `1` default).
   #[inline(always)]
   fn push(&mut self, group: &str, name: &str, value: crate::value::TagValue) {
-    self.tags.push(crate::emit::EmittedTag::new(
+    self.tags.push(crate::emit::EmittedTag::new_with_priority(
       crate::value::Group::new("EXIF", group),
       smol_str::SmolStr::new(name),
       value,
       false,
+      self.leaf_priority,
     ));
+    self.leaf_priority = 1;
   }
 }
 
 #[cfg(feature = "alloc")]
 impl ExifSink for EmittedTagSink<'_> {
+  /// Stash the per-entry priority for the next [`push`](EmittedTagSink::push).
+  #[inline(always)]
+  fn set_leaf_priority(&mut self, priority: u8) {
+    self.leaf_priority = priority;
+  }
   #[inline(always)]
   fn write_str(
     &mut self,
@@ -10855,6 +10883,30 @@ impl ExifSink for PreviewIfdSink<'_> {
 // DataMembers, and the sink). Bundling them into a context struct would obscure
 // the 1:1 mapping to `parse_in_tiff`'s collection-time render, not clarify it —
 // the sibling `emit_canon_subtable` carries the same allow for the same reason.
+/// ExifTool's `Priority => N` for an EXIF leaf's BARE-NAME Composite resolution
+/// (`ExifTool.pm:9469`, the tag-table `Priority`). `%Exif::Main`'s `ImageWidth`
+/// (0x0100) and `ImageHeight` (0x0101) carry `Priority => 0` (Exif.pm:493/501,
+/// "so PRIORITY_DIR takes precedence"); every other EXIF/GPS row defaults to `1`.
+///
+/// This threads the tag-table priority ONLY: ExifTool's priority-directory boost
+/// (ExifTool.pm:9554) fires solely for a same-name DUPLICATE in the priority
+/// directory and never promotes the FIRST-stored `ImageWidth`, so the bare key
+/// stays effective-`0` — ground-truthed on the A200, where `$$et{PRIORITY}` for
+/// the `SubIFD` `ImageWidth` is `undef` while the later `MinoltaRaw:ImageWidth`
+/// (`%MinoltaRaw::PRD` has no `Priority` ⇒ `1`) wins. Because that MinoltaRaw
+/// producer emits as a `0x000e` leaf (NOT `0x0100`), this guard leaves it at `1`
+/// and only the `SubIFD:ImageWidth` (`0x0100`) drops to `0`, so the bare
+/// `Composite:ImageSize` resolves to the MinoltaRaw `3872x2592`. A non-Exif
+/// `conv` (a Canon vendor leaf) keeps `1` — its own `Priority` rides its
+/// `VendorEmission`.
+#[cfg(feature = "alloc")]
+fn exif_leaf_priority(entry: &ExifEntry) -> u8 {
+  match entry.conv {
+    ResolvedConv::Exif(tag) if matches!(tag.id(), 0x0100 | 0x0101) => 0,
+    _ => 1,
+  }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "alloc")]
 fn emit_entry<S: ExifSink>(
@@ -10911,6 +10963,12 @@ fn emit_entry<S: ExifSink>(
   // / byte shape, which the golden `convert::apply` runtime — written for the
   // already-rendered `TagValue` — cannot reproduce byte-identically for a
   // multi-element value or preserve in TagValue shape; #243 Codex R1/R2.)
+  //
+  // Thread this leaf's ExifTool `Priority` into the sink (the `EmittedTag` rides
+  // it; the sink resets to `1` after the push) so the bare-name Composite
+  // resolver prefers a higher-priority producer — the A200's `SubIFD:ImageWidth`
+  // (0x0100, `Priority => 0`) loses to `MinoltaRaw:ImageWidth`.
+  out.set_leaf_priority(exif_leaf_priority(entry));
   match entry.conv {
     ResolvedConv::Exif(tag) => {
       emit_exif_value(group, name, raw, tag.conv(), order, print_conv, out)

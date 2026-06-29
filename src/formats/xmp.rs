@@ -345,17 +345,21 @@ impl XmpMeta<'_> {
   /// `XMP::ProcessXMP` running once PER packet and `FoundTag` ACCUMULATING (a
   /// duplicate tag is never dropped — ExifTool.pm:9514-9596), this appends
   /// `other`'s tags AFTER this packet's in file-walk order; the downstream
-  /// last-wins `TagMap`/`iter_tags` dedup then resolves a duplicate same-name
-  /// XMP tag to the later (file-order) packet's value — matching ExifTool's
-  /// equal-priority "later atom owns the bare tag key" resolution.
+  /// `TagMap`/`iter_tags` dedup then resolves a duplicate same-`(family1, name)`
+  /// XMP tag by ExifTool's priority-aware `FoundTag` rule (ExifTool.pm:9544-
+  /// 9564): a default-priority namespace resolves to the LATER (file-order)
+  /// packet's value (last-wins — "later atom owns the bare tag key"), while a
+  /// `PRIORITY => 0` namespace (`tiff`/`exif`/`exifEX`, XMP.pm:1900/1992/2462)
+  /// keeps the EARLIER packet's value (first-wins — the priority-0 duplicate can
+  /// never override an established tag; Codex #436 R1). See `XmpMeta::tags`.
   ///
   /// `Warning` stays FIRST-wins (`FoundTag('Warning')`, Extra.pm Priority 0 ⇒
   /// the earliest-extracted warning is the public one), so an existing warning
   /// is kept; the Nikon-NX-D `OverrideFileType` latch is OR-ed (any packet that
   /// fires it sets it). `LIST_TAGS` does NOT span packets (ExifTool resets it
   /// per `ProcessDirectory`, ExifTool.pm:9076), so cross-packet duplicates go
-  /// through the new-key/last-wins path, never an in-place list append — which
-  /// is exactly what concatenation + last-wins dedup reproduces.
+  /// through the new-key/priority-aware-dedup path, never an in-place list
+  /// append — which is exactly what concatenation + that dedup reproduces.
   ///
   /// Returns `true` when THIS call adopted `other`'s warning — i.e. there was no
   /// earlier warning and `other` carried one. The caller uses that to record the
@@ -4924,11 +4928,35 @@ impl crate::emit::Taggable for XmpMeta<'_> {
     let mode = opts.mode;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     self.tags.iter().map(move |tag| {
-      crate::emit::EmittedTag::new(
+      // ExifTool marks the `tiff`/`exif`/`exifEX` XMP namespaces `PRIORITY => 0`
+      // ("not as reliable as actual TIFF/EXIF tags", XMP.pm:1900/1992/2462), so a
+      // bare-name Composite ingredient prefers the real EXIF/File producer over
+      // the XMP one (a Pentax `File:ImageWidth` `Priority => 1` beats an
+      // `XMP-tiff:ImageWidth`). The SAME `PRIORITY => 0` ALSO makes the
+      // EMISSION-layer same-`(family1, name)` dedup priority-aware (Codex #436
+      // R1): when two of these tags reach the `TagMap`/`collect_deduped_tags`
+      // sink, the later one's `new != 0 && new >= stored` is false ⇒ it cannot
+      // override ⇒ FIRST-wins, faithful to ExifTool's `FoundTag` priority-0 rule
+      // (ExifTool.pm:9544-9564 — the same rule that has bundled emit 111 for two
+      // `tiff:ImageWidth` 111/222). A default-priority namespace (e.g. `dc`)
+      // stays LAST-wins (`1 >= 1` replaces). SCOPE: two same-`(family1, name)`
+      // XMP tags reach the sink only as SEPARATE `XmpTag`s — across packets
+      // (`absorb_additional_packet`) or as the Composite resolver's File-vs-XMP
+      // pair; a single packet already collapses same-path duplicates earlier, in
+      // `restore_struct`/`build_value` (last-wins), so the priority is NOT
+      // observable in a one-packet `.xmp` (exifast stays last-wins there — a
+      // separate `restore_struct` matter, NOT changed by this priority).
+      // Locked by the `priority0_xmp_namespaces_emission_dedup_first_wins` test.
+      let priority = u8::from(!matches!(
+        tag.group.as_str(),
+        "XMP-tiff" | "XMP-exif" | "XMP-exifEX"
+      ));
+      crate::emit::EmittedTag::new_with_priority(
         crate::value::Group::new("XMP", tag.group.as_str()),
         tag.name.clone(),
         tag.value.to_tag_value(print_conv),
         false,
+        priority,
       )
     })
   }
@@ -6374,5 +6402,146 @@ mod tests {
     let clean_b = super::parse_borrowed(&f).expect("clean parses");
     assert!(!clean_a.absorb_additional_packet(clean_b));
     assert_eq!(clean_a.warning(), None);
+  }
+
+  /// Codex #436 R1: the `PRIORITY => 0` `tiff`/`exif`/`exifEX` XMP namespaces
+  /// dedup FIRST-wins at the emission layer, while a default-priority namespace
+  /// (`dc`) stays LAST-wins — the priority-aware `FoundTag` rule
+  /// (`ExifTool.pm:9544-9564`) that [`XmpMeta::tags`] now threads via its per-tag
+  /// `Priority => N` (`0` for `tiff`/`exif`/`exifEX`, `1` otherwise).
+  ///
+  /// Two same-`(family1, name)` XMP tags reach the `TagMap` sink only as
+  /// SEPARATE `XmpTag`s, i.e. ACROSS packets (`absorb_additional_packet`): a
+  /// SINGLE packet collapses same-path duplicates EARLIER, in
+  /// `restore_struct`/`build_value` (last-wins), so this dedup is exercised via
+  /// the cross-packet path here rather than a standalone-`.xmp` conformance
+  /// fixture (which would only ever see the already-collapsed single value).
+  /// Oracle values: bundled ExifTool 13.59 keeps the FIRST of two priority-0
+  /// dups (`tiff:ImageWidth` 111/222 ⇒ 111, `exif:SpectralSensitivity` ⇒
+  /// `exifFIRST`, `exifEX:LensModel` ⇒ `lensFIRST`) and the LAST of two
+  /// default-priority `dc:format` (aaa/bbb ⇒ bbb).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn priority0_xmp_namespaces_emission_dedup_first_wins() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable as _};
+    use crate::value::TagValue;
+
+    // A minimal single-property XMP packet in an arbitrary namespace (modelled
+    // on `one_tag_packet`, which is hard-coded to `foo`).
+    let packet = |prefix: &str, uri: &str, name: &str, value: &str| -> std::vec::Vec<u8> {
+      format!(
+        r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:{prefix}="{uri}">
+   <{prefix}:{name}>{value}</{prefix}:{name}>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="r"?>"#
+      )
+      .into_bytes()
+    };
+
+    let opts = EmitOptions::g1(ConvMode::ValueConv, false);
+    // The value surviving the priority-aware `TagMap` dedup (the JSON/golden
+    // sink) for `(family1, name)`.
+    let survivor = |merged: &super::XmpMeta<'_>, g: &str, n: &str| -> Option<TagValue> {
+      let mut tm = crate::tagmap::TagMap::new();
+      crate::emit::run_emission(merged, opts, &mut tm);
+      tm.entries()
+        .iter()
+        .find(|e| e.2.as_str() == g && e.3.as_str() == n)
+        .map(|e| e.5.clone())
+    };
+
+    // PRIORITY => 0 `tiff`: the priority-0 duplicate cannot override ⇒ the FIRST
+    // packet's value survives (matches bundled's 111).
+    let tiff_uri = "http://ns.adobe.com/tiff/1.0/";
+    let (tiff1_bytes, tiff2_bytes) = (
+      packet("tiff", tiff_uri, "ImageWidth", "111"),
+      packet("tiff", tiff_uri, "ImageWidth", "222"),
+    );
+    let mut tiff = super::parse_borrowed(&tiff1_bytes).expect("tiff 1 parses");
+    let tiff2 = super::parse_borrowed(&tiff2_bytes).expect("tiff 2 parses");
+    tiff.absorb_additional_packet(tiff2);
+    // Both reached the sink as separate tags (the accumulation prerequisite)...
+    assert_eq!(tiff.tags_slice().len(), 2);
+    // ...and `XmpMeta::tags` stamps the priority-0 namespace as `Priority => 0`.
+    assert!(
+      tiff
+        .tags(opts)
+        .all(|e| e.tag().group_ref().family1() == "XMP-tiff" && e.priority() == 0)
+    );
+    // FIRST-wins through the emission dedup.
+    assert_eq!(
+      survivor(&tiff, "XMP-tiff", "ImageWidth"),
+      Some(TagValue::Str("111".into())),
+    );
+
+    // PRIORITY => 0 `exif` (URI `http://ns.adobe.com/exif/1.0/`): the same
+    // first-wins rule via the `SpectralSensitivity` text property — locks the
+    // `XMP-exif` group-string path production hard-codes next to `XMP-tiff`
+    // (matches bundled's `exifFIRST`).
+    let exif_uri = "http://ns.adobe.com/exif/1.0/";
+    let (exif1_bytes, exif2_bytes) = (
+      packet("exif", exif_uri, "SpectralSensitivity", "exifFIRST"),
+      packet("exif", exif_uri, "SpectralSensitivity", "exifSECOND"),
+    );
+    let mut exif = super::parse_borrowed(&exif1_bytes).expect("exif 1 parses");
+    let exif2 = super::parse_borrowed(&exif2_bytes).expect("exif 2 parses");
+    exif.absorb_additional_packet(exif2);
+    assert_eq!(exif.tags_slice().len(), 2);
+    assert!(
+      exif
+        .tags(opts)
+        .all(|e| e.tag().group_ref().family1() == "XMP-exif" && e.priority() == 0)
+    );
+    assert_eq!(
+      survivor(&exif, "XMP-exif", "SpectralSensitivity"),
+      Some(TagValue::Str("exifFIRST".into())),
+    );
+
+    // PRIORITY => 0 `exifEX` (URI `http://cipa.jp/exif/1.0/`): same first-wins
+    // via the `LensModel` text property — locks the `XMP-exifEX` group-string
+    // path production hard-codes (matches bundled's `lensFIRST`).
+    let exifex_uri = "http://cipa.jp/exif/1.0/";
+    let (exifex1_bytes, exifex2_bytes) = (
+      packet("exifEX", exifex_uri, "LensModel", "lensFIRST"),
+      packet("exifEX", exifex_uri, "LensModel", "lensSECOND"),
+    );
+    let mut exifex = super::parse_borrowed(&exifex1_bytes).expect("exifEX 1 parses");
+    let exifex2 = super::parse_borrowed(&exifex2_bytes).expect("exifEX 2 parses");
+    exifex.absorb_additional_packet(exifex2);
+    assert_eq!(exifex.tags_slice().len(), 2);
+    assert!(
+      exifex
+        .tags(opts)
+        .all(|e| e.tag().group_ref().family1() == "XMP-exifEX" && e.priority() == 0)
+    );
+    assert_eq!(
+      survivor(&exifex, "XMP-exifEX", "LensModel"),
+      Some(TagValue::Str("lensFIRST".into())),
+    );
+
+    // Default-priority `dc`: a duplicate overrides (`1 >= 1`) ⇒ the LAST packet's
+    // value survives (matches bundled's bbb).
+    let dc_uri = "http://purl.org/dc/elements/1.1/";
+    let (dc1_bytes, dc2_bytes) = (
+      packet("dc", dc_uri, "format", "aaa"),
+      packet("dc", dc_uri, "format", "bbb"),
+    );
+    let mut dc = super::parse_borrowed(&dc1_bytes).expect("dc 1 parses");
+    let dc2 = super::parse_borrowed(&dc2_bytes).expect("dc 2 parses");
+    dc.absorb_additional_packet(dc2);
+    assert!(
+      dc.tags(opts)
+        .all(|e| e.tag().group_ref().family1() == "XMP-dc" && e.priority() == 1)
+    );
+    // LAST-wins through the emission dedup.
+    assert_eq!(
+      survivor(&dc, "XMP-dc", "Format"),
+      Some(TagValue::Str("bbb".into())),
+    );
   }
 }

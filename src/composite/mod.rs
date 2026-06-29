@@ -185,17 +185,30 @@ impl CompositeSink for crate::tagmap::TagMap {
     // Within a single document, a GROUP-SCOPED input (`groups` non-empty) takes
     // the LAST match within that group set — the duplicate-override precedence
     // (`APE_dup_override`: a later `APE:SampleRate=48000` overrides an earlier
-    // `MAC:SampleRate=44100`). A BARE-NAME input (empty `groups`) takes the FIRST
-    // match across ALL groups — ExifTool's bare-name lookup returns the
-    // PRIORITY-directory value (the main EXIF IFD), which exifast emits BEFORE
-    // the lower-priority MakerNote duplicate; so `Composite:FocalLength35efl`'s
-    // bare `FocalLength` resolves to `ExifIFD:FocalLength` (50.0), NOT a later
-    // `Nikon:FocalLength` (50.4). (Entries are in first-occurrence emission
-    // order: EXIF IFDs precede MakerNote sub-tables, mirroring ExifTool's
-    // `$$self{PRIORITY}` directory.)
+    // `MAC:SampleRate=44100`). A BARE-NAME input (empty `groups`) resolves the
+    // un-suffixed key the way ExifTool's `FoundTag` settles it (ExifTool.pm:9544-
+    // 9560): the HIGHEST effective priority wins. So `Composite:FocalLength35efl`'s
+    // bare `FocalLength` resolves to `ExifIFD:FocalLength` (`Priority => 1`, 50.0)
+    // over a MakerNote `Nikon:FocalLength` (its table `PRIORITY => 0`, 50.4); the
+    // A200's bare `ImageWidth` resolves to `MinoltaRaw:ImageWidth` (`Priority => 1`,
+    // 3872) over the earlier-emitted `SubIFD:ImageWidth` (the `%Exif::Main`
+    // `Priority => 0` tag, 3880); a Pentax `File:ImageWidth` (`Priority => 1`)
+    // beats an `XMP-tiff:ImageWidth` (`%XMP::tiff PRIORITY => 0`). Among EQUAL max
+    // priority we keep the FIRST-emitted (today's tiebreak) — the equal-priority
+    // true file-walk-order recency tiebreak (ExifTool's `$priority >= $oldPriority`
+    // last-wins) is deferred to #474, because exifast's emission order is NOT file
+    // order, so a last-match flip would regress the 6 Pentax composites.
     let find_in = |d: u32| {
       if groups.is_empty() {
-        self.entries().iter().find(pred_in(d))
+        // MAX effective priority, FIRST-emitted among equals (`>` is strict, so a
+        // later equal-priority entry never displaces the first match).
+        self
+          .entries()
+          .iter()
+          .filter(pred_in(d))
+          .map(|e| (e, crate::tagmap::effective_priority(e.3.as_str(), e.4)))
+          .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+          .map(|(e, _)| e)
       } else {
         self.entries().iter().rev().find(pred_in(d))
       }
@@ -243,10 +256,15 @@ impl CompositeSink for crate::tagmap::TagMap {
 }
 
 /// The [`iter_tags`](crate::format_parser::AnyMeta::iter_tags) sink — the
-/// deduped [`Tag`](crate::value::Tag) `Vec`. Appended composites carry the full
-/// `Composite`/`Composite` group (family-0 = family-1), matching the JSON path.
+/// deduped [`Tag`](crate::value::Tag) `Vec`, each tag PAIRED with its surviving
+/// entry's EFFECTIVE priority so the bare-name resolver can prefer the
+/// highest-priority ingredient (exactly as the `TagMap` sink reads entry.4). The
+/// priority is stripped at the [`iter_tags`](crate::format_parser::AnyMeta::iter_tags)
+/// boundary, so the public tag iterator is unchanged. Appended composites carry
+/// the full `Composite`/`Composite` group (family-0 = family-1) and ExifTool's
+/// `Priority`, matching the JSON path.
 #[cfg(feature = "alloc")]
-impl CompositeSink for std::vec::Vec<crate::value::Tag> {
+impl CompositeSink for std::vec::Vec<(crate::value::Tag, u8)> {
   fn resolve(
     &self,
     groups: &[&str],
@@ -262,14 +280,26 @@ impl CompositeSink for std::vec::Vec<crate::value::Tag> {
         && group0.is_none_or(|g0| t.group_ref().family0() == g0)
     };
     let pred_in = |d: u32| {
-      move |t: &&crate::value::Tag| t.group_ref().doc() == d && t.name() == name && group_ok(t)
+      move |item: &&(crate::value::Tag, u8)| {
+        item.0.group_ref().doc() == d && item.0.name() == name && group_ok(&item.0)
+      }
     };
-    // Bare-name (empty `groups`) ⇒ FIRST match (the priority-directory EXIF tag,
-    // emitted before its MakerNote duplicate); group-scoped ⇒ LAST match (the
-    // duplicate-override). See the `TagMap` impl's note.
+    // Bare-name (empty `groups`) ⇒ the HIGHEST effective priority wins, FIRST-
+    // emitted among equals; group-scoped ⇒ LAST match (the duplicate-override).
+    // See the `TagMap` impl's note (equal-priority recency is #474).
     let find_in = |d: u32| {
       if groups.is_empty() {
-        self.iter().find(pred_in(d))
+        self
+          .iter()
+          .filter(pred_in(d))
+          .map(|item| {
+            (
+              item,
+              crate::tagmap::effective_priority(item.0.name(), item.1),
+            )
+          })
+          .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+          .map(|(item, _)| item)
       } else {
         self.iter().rev().find(pred_in(d))
       }
@@ -277,26 +307,30 @@ impl CompositeSink for std::vec::Vec<crate::value::Tag> {
     let found = match doc {
       DocScope::Exact(d) => find_in(d),
       DocScope::Main => find_in(0).or_else(|| {
-        let cross =
-          |t: &&crate::value::Tag| t.group_ref().doc() != 0 && t.name() == name && group_ok(t);
+        let cross = |item: &&(crate::value::Tag, u8)| {
+          item.0.group_ref().doc() != 0 && item.0.name() == name && group_ok(&item.0)
+        };
         self.iter().find(cross)
       }),
     };
     match found {
-      Some(tag) => CompositeValue::Present(t_value(tag).clone()),
+      Some(item) => CompositeValue::Present(t_value(&item.0).clone()),
       None => CompositeValue::Missing,
     }
   }
   fn has_composite(&self, name: &str, doc: u32) -> bool {
-    self.iter().any(|t| {
+    self.iter().any(|(t, _p)| {
       t.group_ref().doc() == doc && t.group_ref().family1() == "Composite" && t.name() == name
     })
   }
-  fn append(&mut self, name: &'static str, _priority: u8, value: TagValue, doc: u32) {
-    self.push(crate::value::Tag::new(
-      crate::value::Group::with_doc("Composite", "Composite", doc),
-      name,
-      value,
+  fn append(&mut self, name: &'static str, priority: u8, value: TagValue, doc: u32) {
+    self.push((
+      crate::value::Tag::new(
+        crate::value::Group::with_doc("Composite", "Composite", doc),
+        name,
+        value,
+      ),
+      priority,
     ));
   }
 }
@@ -419,8 +453,8 @@ pub(crate) fn build_composites(
 /// derivations exactly as for the JSON path.
 #[cfg(feature = "alloc")]
 pub(crate) fn build_composites_into_tags(
-  tags: &mut std::vec::Vec<crate::value::Tag>,
-  other_view: Option<&mut std::vec::Vec<crate::value::Tag>>,
+  tags: &mut std::vec::Vec<(crate::value::Tag, u8)>,
+  other_view: Option<&mut std::vec::Vec<(crate::value::Tag, u8)>>,
   mode: crate::emit::ConvMode,
   doc_count: u32,
   ctx: &table::CompositeContext,
