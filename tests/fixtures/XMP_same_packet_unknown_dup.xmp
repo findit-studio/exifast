@@ -1,0 +1,7 @@
+<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:foo='http://example.com/foo/1.0/'><foo:Bar>AAA</foo:Bar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:foo='http://example.com/foo/1.0/'><foo:Bar>BBB</foo:Bar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:foobar>CCC</dc:foobar></rdf:Description>
+<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:foobar>DDD</dc:foobar></rdf:Description>
+</rdf:RDF></x:xmpmeta><?xpacket end='w'?>

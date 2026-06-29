@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "XMP_same_packet_unknown_dup.xmp",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:Bar": "AAA",
+  "XMP-dc:Foobar": "CCC"
+}]

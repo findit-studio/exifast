@@ -12122,6 +12122,78 @@ fn xmp_thumbnails_struct_base64_image_is_binary_conformance() {
   check("XMP_thumbnail.xmp", "XMP_thumbnail.xmp.n.json", false);
 }
 
+/// #477: a SAME-packet genuine-scalar duplicate is collapsed PRIORITY-AWARE in
+/// `restore_struct`/`build_value` (the earlier collapse point the emission-layer
+/// `FoundTag` dedup never reaches for a one-packet `.xmp`). `XMP_same_packet_dup
+/// .xmp` holds, in ONE packet, two `tiff:ImageWidth` (111/222 — `tiff` is
+/// `PRIORITY => 0` ⇒ a later dup cannot displace the established tag ⇒ FIRST-wins
+/// ⇒ 111) AND two `dc:format` (aaa/bbb — default priority ⇒ LAST-wins ⇒ bbb).
+/// Oracle (bundled ExifTool 13.59 `-j -G1`): `XMP-tiff:ImageWidth = 111`,
+/// `XMP-dc:Format = "bbb"` (no `tiff:ImageHeight`, so no `Composite:ImageSize`).
+#[test]
+fn xmp_same_packet_dup_conformance() {
+  check(
+    "XMP_same_packet_dup.xmp",
+    "XMP_same_packet_dup.xmp.json",
+    true,
+  );
+  check(
+    "XMP_same_packet_dup.xmp",
+    "XMP_same_packet_dup.xmp.n.json",
+    false,
+  );
+}
+
+/// #477 F1: a SAME-packet duplicate of an UNKNOWN tag is FIRST-wins — ExifTool
+/// gives a generated XMP tagInfo `Priority => 0` (ExifTool.pm:9544-9564), so a
+/// later bare duplicate cannot displace it. `XMP_same_packet_unknown_dup.xmp`
+/// holds, in ONE packet, two `foo:Bar` (AAA/BBB — `foo` is an UNPORTED
+/// namespace) AND two `dc:foobar` (CCC/DDD — an unknown FIELD of the known `dc`
+/// namespace); both kinds of generated tagInfo are `Priority => 0`. Oracle
+/// (bundled ExifTool 13.59 `-j -G1 -struct`, the `tools/gen_golden.sh` regime):
+/// `XMP-foo:Bar = "AAA"`, `XMP-dc:Foobar = "CCC"` (both FIRST-extracted). The
+/// pre-fix code inferred priority from the NAMESPACE string alone, so neither
+/// `foo` nor `dc` was treated as priority-0 ⇒ wrongly LAST-wins.
+#[test]
+fn xmp_same_packet_unknown_dup_conformance() {
+  check(
+    "XMP_same_packet_unknown_dup.xmp",
+    "XMP_same_packet_unknown_dup.xmp.json",
+    true,
+  );
+  check(
+    "XMP_same_packet_unknown_dup.xmp",
+    "XMP_same_packet_unknown_dup.xmp.n.json",
+    false,
+  );
+}
+
+/// #477: a `List => 'Bag'|'Seq'|'Alt'` tag written BARE-repeated (NO enclosing
+/// `rdf:Bag`) in one packet collapses by PRIORITY under exifast's `-struct`
+/// regime — it does NOT accumulate into an array. `XMP_same_packet_list_dup.xmp`
+/// holds two bare `dc:subject` (aaa/bbb — `dc:subject` is `List => 'Bag'`) AND
+/// two bare `tiff:BitsPerSample` (8/16 — `List => 'Seq'`, `tiff` is
+/// `PRIORITY => 0`). Oracle (bundled ExifTool 13.59 `-j -G1 -struct`, the
+/// `tools/gen_golden.sh` regime): `XMP-dc:Subject = "bbb"` (default priority ⇒
+/// LAST-wins) and `XMP-tiff:BitsPerSample = 8` (`PRIORITY => 0` ⇒ FIRST-wins) —
+/// NOT the `["aaa","bbb"]` / `[8,16]` arrays that `-struct`-OFF flattening (a
+/// regime exifast does not emit) would produce. An ACTUAL list is written
+/// `rdf:Bag`/`Seq`/`Alt` (carrying `rdf:li` indices) and is rebuilt as a List
+/// by `restore_struct`, exercised by the struct/list goldens (e.g. `XMP.xmp`).
+#[test]
+fn xmp_same_packet_list_dup_conformance() {
+  check(
+    "XMP_same_packet_list_dup.xmp",
+    "XMP_same_packet_list_dup.xmp.json",
+    true,
+  );
+  check(
+    "XMP_same_packet_list_dup.xmp",
+    "XMP_same_packet_list_dup.xmp.n.json",
+    false,
+  );
+}
+
 /// Golden-pattern **L2** projection: an `.xmp` sidecar feeds the normalized
 /// cross-format [`MediaMetadata`](exifast::metadata::MediaMetadata) domain
 /// (XMP is a camera-metadata source per the product scope). Reads the
