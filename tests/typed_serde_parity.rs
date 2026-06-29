@@ -1798,7 +1798,15 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 /// `beauty_enable=3;whitening=4;`), so `beauty_enable` survives with its atom-2
 /// value 3 at its atom-2 position ⇒ `DJI:Smoother 2, DJI:BeautyEnable 3,
 /// DJI:Whitening 4`. Oracle-verified vs bundled ExifTool 13.59.
-const EXPECTED_ACTIVE_FIXTURES: usize = 651;
+///
+/// `651 → 652`: `Leica_M9_subdir.jpg` (#466) — the OUT-OF-LINE Leica4 (M9)
+/// `0x3000` SubDirectory descent. A crafted minimal JPEG whose `LEICA0\x03\0`
+/// MakerNote bears an `undef[N]` `0x3000` sub-IFD (descended at the default
+/// `$subdirStart = $valuePtr`, Exif.pm:6951); exifast emits the five
+/// `%Panasonic::Subdir` leaves (Contrast/Sharpening/Saturation/WhiteBalance/
+/// SensorWidth) byte-identically to bundled ExifTool 13.59. Before #466 the
+/// value was misread as an inline offset and the whole Subdir was dropped.
+const EXPECTED_ACTIVE_FIXTURES: usize = 652;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

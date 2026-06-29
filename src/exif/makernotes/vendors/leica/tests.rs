@@ -347,9 +347,12 @@ fn leica4_descends_into_subdir_and_data1() {
   // value_offset_base = (0 + 8) - 8 = 0, so every offset below is buffer-relative.
   let mut buf = std::vec::Vec::new();
   buf.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature
-  // Leica4 IFD @ 8: one entry 0x3000 -> Subdir IFD @ 26.
+  // Leica4 IFD @ 8: one entry 0x3000, an OUT-OF-LINE SubDirectory. Its `undef[42]`
+  // value (size 42 > 4) lives at the byte offset in the value field (26); ExifTool
+  // descends at the DEFAULT `$subdirStart = $valuePtr` (Exif.pm:6951) — the value's
+  // BYTE POSITION, NOT the scalar read back as an offset. Subdir IFD @ 26.
   buf.extend_from_slice(&1u16.to_le_bytes());
-  push_entry(&mut buf, 0x3000, 4, 1, 26); // LONG, value = Subdir IFD offset
+  push_entry(&mut buf, 0x3000, 7, 42, 26); // undef[42] OUT-OF-LINE: value field = Subdir IFD offset
   buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
   assert_eq!(buf.len(), 26);
   // Subdir IFD @ 26: Contrast=2 ("Normal"), LensType=20 (id 5), Data1 @ 68.
@@ -459,9 +462,11 @@ fn leica4_subdir_child_decodes_under_its_own_byte_order() {
   buf.extend_from_slice(b"LEICA0\x03\x00"); // 8-byte Leica4 signature
   // OUTER Leica4 IFD @ 8 (LITTLE): the count word [0x01,0x00] read under the
   // parent order (Little) = 1 ⇒ no toggle ⇒ the outer IFD stays LITTLE. One entry
-  // 0x3000 -> Subdir IFD @ 26.
+  // 0x3000, an OUT-OF-LINE SubDirectory (`undef[42]`, size 42 > 4) whose value
+  // field (26) is the Subdir IFD offset — descended at the DEFAULT `$subdirStart =
+  // $valuePtr` (Exif.pm:6951). Subdir IFD @ 26.
   buf.extend_from_slice(&1u16.to_le_bytes());
-  push_entry_le(&mut buf, 0x3000, 4, 1, 26); // LONG, value = Subdir IFD offset
+  push_entry_le(&mut buf, 0x3000, 7, 42, 26); // undef[42] OUT-OF-LINE: value field = Subdir IFD offset
   buf.extend_from_slice(&0u32.to_le_bytes()); // next-IFD
   assert_eq!(buf.len(), 26);
   // CHILD Subdir IFD @ 26 (BIG): the count word [0x00,0x03] read under the parent

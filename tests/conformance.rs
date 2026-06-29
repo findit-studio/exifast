@@ -9996,6 +9996,34 @@ fn makernotes_samsung_nx500_conformance() {
   check("SamsungNX500.srw", "SamsungNX500.srw.n.json", false);
 }
 #[test]
+fn makernotes_leica_m9_subdir_conformance() {
+  // Leica_M9_subdir.jpg — the Leica4 (M9) MakerNote conformance backstop for the
+  // #466 fix: the `%Panasonic::Leica4` `0x3000` SubDirectory is descended OUT-OF-
+  // LINE. The `0x927c` MakerNote starts with "LEICA0\x03\0" (so `Make =~ /^Leica
+  // Camera AG/` + `$valPt =~ /^LEICA0/` selects `MakerNoteLeica4`,
+  // MakerNotes.pm:639-647); the Leica4 IFD's `0x3000` row is an `undef[N]` whose
+  // value is a sub-IFD at the value's BYTE POSITION. The Leica4 SubDirectory
+  // carries no `Start` (Panasonic.pm:1742-1748), so ExifTool descends at the
+  // DEFAULT `$subdirStart = $valuePtr` (Exif.pm:6951) — NOT the scalar read back
+  // as an offset. exifast now descends at the resolved value pointer too, so it
+  // emits the `%Panasonic::Subdir` leaves byte-identically to bundled ExifTool
+  // 13.59: `Leica:Contrast` = "Normal" (0x300a=2), `Leica:Sharpening` = "Low"
+  // (0x300b=1), `Leica:Saturation` = "Normal" (0x300d=2), `Leica:WhiteBalance` =
+  // "Daylight" (0x3033=4) and the raw `Leica:SensorWidth` = 5212 (0x312b), plus
+  // the `IFD0:Make`/`Model` ("Leica Camera AG"/"M9") camera identity. Before #466
+  // exifast read the `undef[N]` value as `first_uint` (a `RawValue::Bytes` ⇒
+  // `None`) and dropped the WHOLE Subdir; the out-of-line descent now ACTIVATES
+  // it. All leaves match for BOTH the `-j` PrintConv and `-n` numeric snapshots.
+  //
+  // CRAFTED minimal fixture: the ExifTool 13.59 test set ships no Leica M9 sample
+  // (a real M9 raw is huge), so this is the smallest JPEG bundled decodes as
+  // Leica4 — a single out-of-line `0x3000` sub-IFD with five inline `int32u`
+  // leaves. The goldens are generated on the DEFAULT `gen_golden.sh` path (no
+  // `EXCLUDE` arm): exifast emits every tag bundled does, byte-exact.
+  check("Leica_M9_subdir.jpg", "Leica_M9_subdir.jpg.json", true);
+  check("Leica_M9_subdir.jpg", "Leica_M9_subdir.jpg.n.json", false);
+}
+#[test]
 fn exif_manyifd_conformance() {
   // PR #36 Codex R11 F1 — a multi-page TIFF whose next-IFD chain runs 66
   // IFDs deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi`
