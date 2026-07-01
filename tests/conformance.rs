@@ -13166,6 +13166,51 @@ fn png_cabx_cbor_conformance() {
   check("PNG_cabx_cbor.png", "PNG_cabx_cbor.png.n.json", false);
 }
 
+#[test]
+#[cfg(all(feature = "png", feature = "xmp"))]
+fn png_meta_conformance() {
+  // #142 (bare-XML XMP, meTa) — the PNG `meTa` chunk (`PNG.pm:368-372`): a
+  // UTF-16-BOM XML blob (as written by Picture It!) routed to `ProcessXMP` on
+  // the `%XMP::XML` table (XMP.pm:958) with the outer `<meta>` container
+  // `IgnoreProp`'d (`PNG.pm:371`). Unlike a wrapped XMP packet, this bare
+  // `<?xml …><meta>…` is the `$dataPt`/SubDirectory entry of `ProcessXMP`
+  // (XMP.pm:4302), which SKIPS the strict `<rdf:RDF>`/`<x:xmpmeta>`
+  // file-recognition gate — so exifast's additive `parse_bare_xml` accepts it
+  // (the strict `.xmp` path is unchanged). `%XMP::XML` has
+  // `GROUPS => { 0 => 'XML' }`, so a namespaced property emits under family-0
+  // `XML` / family-1 `XML-<ns>` via `FoundXMP`'s `$xmlGroups` path
+  // (XMP.pm:3713-3715): `<dc:creator>` -> `XML-dc:Creator`, `<dc:title>` ->
+  // `XML-dc:Title` (both plain scalars — bare XML carries no `rdf:Seq`, so the
+  // dc List tags collapse to a scalar). The ported PNG `Composite:ImageSize`/
+  // `Megapixels` are kept (PNG is Composite-allow-listed). Crafted via
+  // `tools/gen_png_meta_seal_fixture.py`. Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("PNG_meta.png", "PNG_meta.png.json", true);
+  check("PNG_meta.png", "PNG_meta.png.n.json", false);
+}
+
+#[test]
+#[cfg(all(feature = "png", feature = "xmp"))]
+fn png_seal_conformance() {
+  // #142 (bare-XML XMP, seAl) — the PNG `seAl` chunk (`PNG.pm:380-382`): a SEAL
+  // (Secure Evidence Attribution Label) content-authentication XML blob routed
+  // to `ProcessSEAL` -> `ProcessXMP` on the flat `%XMP::SEAL` table
+  // (XMP2.pl:1876). `%XMP::SEAL` is NOT a per-namespace table but a plain
+  // property -> tag table (`GROUPS => { 0 => 'XML', 1 => 'SEAL' }`), and
+  // `FoundSEAL` (XMP2.pl:1907) strips the outer `<seal>` container. Its
+  // properties carry no namespace, so `FoundXMP` looks each up directly in the
+  // SEAL table (`$tagID = $tag`, XMP.pm:3461-3463) and the group stays the
+  // static table default (family-0 `XML`, family-1 `SEAL`): `<ka>` ->
+  // `SEAL:KeyAlgorithm`, `<s>` -> `SEAL:Signature`, `<info>` -> `SEAL:SEALComment`,
+  // etc. A nested `<seal>1</seal>` exercises `SEAL:SEALVersion` AND the
+  // "strip only the OUTER container" rule (the inner `seal` still resolves).
+  // `KeyVersion`/`SEALVersion` `1` render as BARE JSON numbers (the shared
+  // value-semantic gate). Crafted via `tools/gen_png_meta_seal_fixture.py`.
+  // Oracle: bundled `perl exiftool -j -G1 -struct` 13.59.
+  check("PNG_seal.png", "PNG_seal.png.json", true);
+  check("PNG_seal.png", "PNG_seal.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

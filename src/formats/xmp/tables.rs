@@ -314,6 +314,78 @@ pub fn lookup_field(table: &NsTable, key: &str) -> Option<&'static Field> {
     .or_else(|| table.generated.iter().find(|f| f.key == key))
 }
 
+/// `%Image::ExifTool::XMP::SEAL` (XMP2.pl:1876) — the flat SEAL (Secure Evidence
+/// Attribution Label) tag table the PNG `seAl` chunk routes to (PNG.pm:380).
+/// Unlike the per-namespace XMP tables, SEAL is a plain property-name → tag table
+/// (`GROUPS => { 0 => 'XML', 1 => 'SEAL', 2 => 'Document' }`, `WRITABLE =>
+/// 'string'`), so it is keyed by the RAW SEAL property (`ka`, `kv`, `s`, …), not
+/// by an XMP namespace. The family-2 group (`Document`, or `Author` for
+/// `copyright`) is emitted only under `-G2`, not the `-G1` golden, so it is not
+/// modeled here. No SEAL tag carries a ValueConv/PrintConv (all plain strings).
+static SEAL_FIELDS: &[Field] = &[
+  Field::make(
+    "seal",
+    Some("SEALVersion"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make(
+    "ka",
+    Some("KeyAlgorithm"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make("kv", Some("KeyVersion"), Writable::Str, PrintConv::Identity),
+  Field::make(
+    "da",
+    Some("DigestAlgorithm"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make("b", Some("ByteRange"), Writable::Str, PrintConv::Identity),
+  Field::make("d", Some("Domain"), Writable::Str, PrintConv::Identity),
+  Field::make(
+    "uid",
+    Some("UniqueIdentifier"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make("id", Some("Identifier"), Writable::Str, PrintConv::Identity),
+  Field::make(
+    "sf",
+    Some("SignatureFormat"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make(
+    "sl",
+    Some("SignatureLength"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make("s", Some("Signature"), Writable::Str, PrintConv::Identity),
+  Field::make(
+    "info",
+    Some("SEALComment"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+  Field::make(
+    "copyright",
+    Some("Copyright"),
+    Writable::Str,
+    PrintConv::Identity,
+  ),
+];
+
+/// Look up a SEAL property key in `%XMP::SEAL` (XMP2.pl:1876). `None` for an
+/// unknown property — `FoundXMP` then generates a default `ucfirst`-named,
+/// `Priority => 0` tagInfo (XMP.pm:3595).
+#[must_use]
+pub fn seal_field(key: &str) -> Option<&'static Field> {
+  SEAL_FIELDS.iter().find(|f| f.key == key)
+}
+
 /// One value-map lookup API shared by the hand-written sorted slices and the
 /// generated `phf::Map`s (the `value_map!`/`lookup_map!` helper of the codegen
 /// plan). Every representation keys by the RAW scalar STRING — the faithful

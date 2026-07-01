@@ -649,6 +649,29 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     // are Phases 2-3). A `caBX` with no recognized boxes decodes to an empty
     // `JumbfMeta` and is dropped (byte-identical PNG output).
     b"caBX" => meta.set_jumbf(crate::exif::jumbf::process(data)),
+    // ----- meTa (PNG.pm:368-372) → %XMP::XML bare-XML XMP ----------------
+    // A UTF-16-BOM XML blob (Picture It!) routed to `ProcessXMP` on the
+    // `%XMP::XML` table with the `<meta>` container `IgnoreProp`'d. Namespaced
+    // properties emit under family-0 `XML` / family-1 `XML-<ns>` (e.g.
+    // `XML-dc:Creator`). Requires the optional `xmp` module (without it the
+    // chunk is skipped — faithful to "no ported XMP module").
+    #[cfg(feature = "xmp")]
+    b"meTa" => {
+      if let Some(m) = crate::formats::xmp::parse_png_meta(data) {
+        meta.push_xml_meta(m);
+      }
+    }
+    // ----- seAl (PNG.pm:380-382) → %XMP::SEAL SEAL content-auth XML -------
+    // SEAL (Secure Evidence Attribution Label) XML routed to `ProcessSEAL` →
+    // `ProcessXMP` on the flat `%XMP::SEAL` table (the `<seal>` container
+    // stripped by `FoundSEAL`, XMP2.pl:1907). Properties emit under family-0
+    // `XML` / family-1 `SEAL` (e.g. `SEAL:KeyAlgorithm`).
+    #[cfg(feature = "xmp")]
+    b"seAl" => {
+      if let Some(m) = crate::formats::xmp::parse_png_seal(data) {
+        meta.push_xml_meta(m);
+      }
+    }
     // Every other chunk MISSED the `%PNG::Main` table. `PNG.pm:1655-1657`: for
     // an MNG/JNG container (`$fileType ne 'PNG'`) the walker then tries the
     // `%MNG::Main` FALLBACK table; for a plain PNG there is no fallback and the
@@ -3171,6 +3194,17 @@ impl crate::emit::Taggable for PngMeta<'_> {
     // `caBX` ⇒ byte-identical PNG output.
     if let Some(jumbf_meta) = self.jumbf() {
       tags.extend(jumbf_meta.tags(opts));
+    }
+
+    // ---- meTa / seAl bare-XML XMP tags — chain each sub-Meta's tag stream --
+    // A `meTa` (`PNG.pm:368` → `%XMP::XML`) / `seAl` (`PNG.pm:380` → `%XMP::SEAL`)
+    // chunk fed its bare-XML blob to `ProcessXMP` during the walk. Splice each
+    // decoded XMP sub-Meta's `Taggable` stream (the `XML-<ns>:*` / `SEAL:*` tags,
+    // family-0 `XML`) AFTER the PNG-level tags, in chunk-walk order. Empty for a
+    // PNG with neither chunk ⇒ byte-identical output.
+    #[cfg(feature = "xmp")]
+    for xml_meta in self.xml_metas() {
+      tags.extend(xml_meta.tags(opts));
     }
 
     tags.into_iter()

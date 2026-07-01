@@ -1,0 +1,22 @@
+[{
+  "SourceFile": "PNG_seal.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "SEAL:SEALVersion": 1,
+  "SEAL:KeyAlgorithm": "ES256",
+  "SEAL:KeyVersion": 1,
+  "SEAL:DigestAlgorithm": "sha256",
+  "SEAL:Signature": "ABCsig123",
+  "SEAL:SEALComment": "hello comment",
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]

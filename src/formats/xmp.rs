@@ -269,7 +269,7 @@ impl XmpStruct {
 /// plus the detected sub-file-type (`XMP` / `SVG` / `XML` / `PLIST` …).
 ///
 /// D8: no public fields; accessors only.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct XmpMeta<'a> {
   tags: Vec<XmpTag>,
   /// First recorded warning (`$self->Warn`, ExifTool.pm:1297).
@@ -385,13 +385,22 @@ impl XmpMeta<'_> {
 /// D8: no public fields; accessors only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct XmpTag {
+  group0: SmolStr,
   group: SmolStr,
   name: SmolStr,
   value: XmpValue,
 }
 
 impl XmpTag {
-  /// Family-1 group (e.g. `"XMP-exif"`, `"XMP-dc"`, `"XMP-x"`).
+  /// Family-0 group — `"XMP"` for a normal packet; `"XML"` for a PNG
+  /// `meTa`/`seAl` bare-XML tag (`%XMP::XML` / `%XMP::SEAL`, GROUPS `0 => XML`).
+  #[must_use]
+  #[inline(always)]
+  pub fn group0(&self) -> &str {
+    self.group0.as_str()
+  }
+  /// Family-1 group (e.g. `"XMP-exif"`, `"XMP-dc"`, `"XMP-x"`; or `"XML-dc"` /
+  /// `"SEAL"` for a PNG bare-XML tag).
   #[must_use]
   #[inline(always)]
   pub fn group(&self) -> &str {
@@ -443,6 +452,103 @@ impl FormatParser for ProcessXmp {
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<XmpMeta<'_>> {
   parse_inner(data)
+}
+
+/// Which XMP-family tag table drives the element walk — the family-0 group and
+/// the container-property ignore differ per table. `ProcessXMP` is shared, but
+/// the PNG `meTa`/`seAl` chunks route it through a DIFFERENT top-level table
+/// than a normal XMP packet, changing how `FoundXMP` assigns groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XmlTable {
+  /// `%XMP::Main` — a normal XMP packet (`rdf:RDF` / `x:xmpmeta`). Family-0
+  /// group `XMP`; family-1 `XMP-<ns>` (XMP.pm:3717).
+  Xmp,
+  /// `%XMP::XML` (XMP.pm:958) — the PNG `meTa` chunk (`PNG.pm:368`, a
+  /// UTF-16-BOM XML blob written by Picture It!). `GROUPS => { 0 => 'XML' }`,
+  /// so `FoundXMP`'s `$xmlGroups` path assigns family-0 `XML` + family-1
+  /// `XML-<ns>` (XMP.pm:3713-3715). The outer `<meta>` container is
+  /// `IgnoreProp`'d (`PNG.pm:371`).
+  Xml,
+  /// `%XMP::SEAL` (XMP2.pl:1876) — the PNG `seAl` chunk (`PNG.pm:380`, a SEAL
+  /// content-authentication XML blob). `GROUPS => { 0 => 'XML', 1 => 'SEAL' }`;
+  /// its properties carry no namespace, so `FoundXMP` looks each up in the flat
+  /// SEAL table (`$tagID = $tag`, XMP.pm:3463) and the group stays the static
+  /// table default (family-0 `XML`, family-1 `SEAL`). `ProcessSEAL`/`FoundSEAL`
+  /// (XMP2.pl:1907-1924) additionally strip the `seal` container property.
+  Seal,
+}
+
+impl XmlTable {
+  /// The family-0 group (`$$tagTablePtr{GROUPS}{0}`) — `XMP` for a normal
+  /// packet, `XML` for the PNG `meTa`/`seAl` XML tables.
+  const fn group0(self) -> &'static str {
+    match self {
+      XmlTable::Xmp => "XMP",
+      XmlTable::Xml | XmlTable::Seal => "XML",
+    }
+  }
+
+  /// The single container property `ProcessXMP` ignores for this table — the
+  /// `meTa` `<meta>` wrapper (`IgnoreProp => { meta => 1 }`, `PNG.pm:371`) and
+  /// the `seAl` `<seal>` wrapper (`FoundSEAL` `shift`, XMP2.pl:1911). `None`
+  /// for a normal packet (`x`/`rdf` containers are dropped by the
+  /// ignored-namespace rule instead).
+  const fn container(self) -> Option<&'static str> {
+    match self {
+      XmlTable::Xmp => None,
+      XmlTable::Xml => Some("meta"),
+      XmlTable::Seal => Some("seal"),
+    }
+  }
+}
+
+/// Run `ProcessXMP` on a bare-XML blob that is NOT a wrapped XMP packet — the
+/// PNG `meTa` (`%XMP::XML`) and `seAl` (`%XMP::SEAL`) chunks (`PNG.pm:368/380`).
+///
+/// This is the `$dataPt` (data-pointer / SubDirectory) entry of `ProcessXMP`
+/// (XMP.pm:4302-4319): unlike the file/RAF entry, it does NOT run the strict
+/// `<rdf:RDF>`/`<x:xmpmeta>` file-recognition gate ([`parse_inner`] ports that
+/// RAF gate), so a plain `<?xml …><meta>…` / `<seal …>` blob is accepted. It
+/// decodes the UTF-8/16/32 (BOM-detected) text via the shared
+/// [`decode_xmp_text`] and runs the same [`Walker`] — only the `table` mode
+/// differs, redirecting `FoundXMP`'s group assignment + container ignore. The
+/// strict `.xmp`/`rdf:RDF` path ([`parse_borrowed`]) is UNCHANGED.
+#[must_use]
+pub(crate) fn parse_bare_xml(data: &[u8], table: XmlTable) -> Option<XmpMeta<'static>> {
+  // The `$dataPt` branch checks a leading BOM before `<?xpacket` (double-
+  // encoded UTF, XMP.pm:4307) and a UTF-16/32 `<?xml ` (XMP.pm:4315). Both
+  // reduce to the shared single-layer BOM decode; `decode_xmp_text` strips a
+  // UTF-8/16/32 BOM and transcodes 16/32 → UTF-8 exactly as the main path.
+  let (text, decode_warning) = decode_xmp_text(data);
+  let mut meta = XmpMeta::default();
+  let mut walker = Walker::new_with_table(&text, table);
+  walker.parse_element(0, text.len(), &mut Vec::new(), None, &BTreeMap::new());
+  walker.process_blank_info_root();
+  walker.finish(&mut meta);
+  if let Some(w) = decode_warning {
+    meta.set_decode_warning(w);
+  }
+  // Nothing extracted (an empty / unrecognized blob) ⇒ no sub-metadata to
+  // splice (byte-identical container output), mirroring `ProcessXMP` returning
+  // with no `FoundTag`.
+  if meta.tags.is_empty() && meta.warning.is_none() {
+    return None;
+  }
+  Some(meta.into_static())
+}
+
+/// The PNG `meTa` chunk (`PNG.pm:368` → `%XMP::XML`) — bare UTF-16-BOM XML whose
+/// namespaced properties emit under family-0 `XML` / family-1 `XML-<ns>`.
+#[must_use]
+pub(crate) fn parse_png_meta(data: &[u8]) -> Option<XmpMeta<'static>> {
+  parse_bare_xml(data, XmlTable::Xml)
+}
+
+/// The PNG `seAl` chunk (`PNG.pm:380` → `%XMP::SEAL`) — SEAL content-auth XML
+/// whose properties emit under family-0 `XML` / family-1 `SEAL`.
+#[must_use]
+pub(crate) fn parse_png_seal(data: &[u8]) -> Option<XmpMeta<'static>> {
+  parse_bare_xml(data, XmlTable::Seal)
 }
 
 // ===========================================================================
@@ -1097,7 +1203,12 @@ struct FlatTag {
   /// today key off `struct_props`); see `tables.rs` module docs.
   #[allow(dead_code)]
   tag_id: SmolStr,
-  /// Family-1 group (`"XMP-<ns>"`).
+  /// Family-0 group (`$$tagTablePtr{GROUPS}{0}` / `SetGroup(…,0)`,
+  /// XMP.pm:3713) — `"XMP"` for a normal packet, `"XML"` for the PNG
+  /// `meTa`/`seAl` XML tables.
+  group0: SmolStr,
+  /// Family-1 group (`"XMP-<ns>"`, or `"XML-<ns>"`/`"SEAL"` for the PNG XML
+  /// tables).
   group1: SmolStr,
   /// The final emitted tag name (after Name remaps).
   name: SmolStr,
@@ -1183,10 +1294,20 @@ struct Walker<'a> {
   /// carried to [`XmpMeta`] so the engine finalizes `File:FileType=NXD`
   /// + `File:MIMEType=application/x-nikon-nxd` instead of generic `XMP`.
   nikon_nxd: bool,
+  /// Which top-level tag table drives `FoundXMP`'s group assignment + the
+  /// container-property ignore ([`XmlTable`]). `Xmp` for a normal packet; the
+  /// PNG `meTa`/`seAl` chunks use `Xml`/`Seal`.
+  table: XmlTable,
 }
 
 impl<'a> Walker<'a> {
   fn new(data: &'a str) -> Self {
+    Self::new_with_table(data, XmlTable::Xmp)
+  }
+
+  /// [`Walker::new`] with an explicit [`XmlTable`] mode — the bare-XML entry
+  /// ([`parse_bare_xml`]) for the PNG `meTa`/`seAl` chunks.
+  fn new_with_table(data: &'a str, table: XmlTable) -> Self {
     Self {
       data,
       flat: Vec::new(),
@@ -1196,6 +1317,7 @@ impl<'a> Walker<'a> {
       blank_info: BlankInfo::default(),
       warning: None,
       nikon_nxd: false,
+      table,
     }
   }
 
@@ -3527,9 +3649,31 @@ impl Walker<'_> {
     lang_attr: Option<&str>,
     datatype: Option<&str>,
   ) {
+    // Drop the ignore-prop container of the PNG XML tables — the outer
+    // `<meta>` (`IgnoreProp => { meta => 1 }`, `PNG.pm:371` + XMP.pm:3026) /
+    // `<seal>` (`FoundSEAL` `shift`, XMP2.pl:1911). It is the root element, so
+    // it sits at `props[0]`; removing it keeps the container out of the tag
+    // path AND its `struct_props`. A normal packet has no container (`None`).
+    let props: &[SmolStr] = match self.table.container() {
+      Some(c) if props.first().is_some_and(|p| p.as_str() == c) => &props[1..],
+      _ => props,
+    };
+
     let id = get_xmp_tag_id(props);
     if id.tag.is_empty() {
       return; // "ignore things that aren't valid tags" (XMP.pm:3441)
+    }
+
+    // `%XMP::SEAL` (seAl): a flat, namespace-less table (XMP2.pl:1876). The
+    // `seal` container is already stripped, so the surviving property carries
+    // no namespace (`$ns=''`); `FoundXMP` then takes `$tagID = $tag` and looks
+    // it up directly in the SEAL table (XMP.pm:3461-3463), leaving the group
+    // the static table default (family-0 `XML`, family-1 `SEAL`). Handle that
+    // whole path here — none of the namespace-table / XMPAutoConv machinery
+    // below applies to SEAL's plain-string tags.
+    if self.table == XmlTable::Seal {
+      self.found_seal(&id, raw_val);
+      return;
     }
 
     // Translate the namespace (XMP.pm:3444 — `$ns = $stdXlatNS{$ns}`).
@@ -3544,10 +3688,17 @@ impl Walker<'_> {
     // value used for the group prefix is `xmpNS{ns}` (the standard XMP
     // prefix, restoring e.g. `iptcExt` → `Iptc4xmpExt`) — but the ExifTool
     // family-1 group uses the SHORT ExifTool ns (`XMP-iptcExt`).
+    // Family-0 is the table's `GROUPS{0}` (XMP.pm:3713 SetGroup). Family-1 is
+    // `<grp0>-<ns>` (XMP.pm:3715/3717): `XMP-<ns>` for a normal packet, and —
+    // via `FoundXMP`'s `$xmlGroups` path for a namespaced property of the
+    // `%XMP::XML` (`meTa`) table — `XML-<ns>`. A namespace-less property of the
+    // XML table (e.g. `lastUpdate`) never reaches the SetGroup, so it keeps the
+    // static table `GROUPS{1}` (`XML`). (Seal already returned above.)
+    let group0 = SmolStr::new(self.table.group0());
     let group1 = if ns.is_empty() {
-      SmolStr::new("XMP")
+      SmolStr::new(self.table.group0())
     } else {
-      SmolStr::new(std::format!("XMP-{ns}"))
+      SmolStr::new(std::format!("{}-{ns}", self.table.group0()))
     };
 
     // ---- Tag-name + conversion via the namespace table ------------------
@@ -3700,6 +3851,7 @@ impl Walker<'_> {
 
     self.flat.push(FlatTag {
       tag_id: SmolStr::new(&id.tag),
+      group0,
       group1,
       name: final_name,
       value,
@@ -3710,11 +3862,49 @@ impl Walker<'_> {
     let _ = (is_bag_seq_list, &self.xmp_about);
   }
 
+  /// `FoundSEAL` (XMP2.pl:1907) + the SEAL leg of `FoundXMP` — record a SEAL
+  /// property. The `seal` container is already stripped, so `id.tag` is the
+  /// bare SEAL property; look it up in the flat `%XMP::SEAL` table (name remap
+  /// only — SEAL tags are plain strings, no ValueConv/PrintConv). The group is
+  /// the static table default: family-0 `XML`, family-1 `SEAL` (XMP2.pl:1877).
+  fn found_seal(&mut self, id: &TagId, raw_val: &str) {
+    let field = tables::seal_field(&id.tag);
+    // A known SEAL tag is `WRITABLE => 'string'` (no XMPAutoConv); an unknown
+    // property gets a generated default tagInfo (`Writable` undef ⇒ XMPAutoConv
+    // gated by `IsDefault`), faithful to `FoundXMP` (XMP.pm:3595/3672).
+    let writable = field.map(tables::Field::writable).unwrap_or(Writable::None);
+    let name = field
+      .and_then(tables::Field::name)
+      .map(SmolStr::new)
+      .unwrap_or_else(|| SmolStr::new(ucfirst(&id.tag)));
+    let value = XmpValue::Scalar(scalar_from_text(
+      unescape_value_with_cdata(raw_val),
+      field,
+      writable,
+    ));
+    self.flat.push(FlatTag {
+      tag_id: SmolStr::new(&id.tag),
+      group0: SmolStr::new("XML"),
+      group1: SmolStr::new("SEAL"),
+      name,
+      value,
+      struct_props: Vec::new(),
+      lang: None,
+      // An unknown SEAL property gets a generated `Priority => 0` tagInfo
+      // (XMP.pm:3595) ⇒ a duplicate keeps the FIRST; a known SEAL tag is
+      // default-priority ⇒ last-wins.
+      priority0: field.is_none(),
+    });
+  }
+
   /// Emit a recognized-attribute tag (`x:xmptk` → XMPToolkit etc.,
   /// XMP.pm:4128-4136). These bypass the namespace-table machinery.
   fn found_recognized(&mut self, group: &str, name: &str, value: &str) {
     self.flat.push(FlatTag {
       tag_id: SmolStr::new(name),
+      // The recognized-attribute groups (`XMP-x`/`XMP-rdf`/`XMP-XML`,
+      // `recognized_attr`) are all family-0 `XMP`.
+      group0: SmolStr::new("XMP"),
       group1: SmolStr::new(group),
       name: SmolStr::new(name),
       value: XmpValue::Scalar(XmpScalar::new(value)),
@@ -4599,6 +4789,7 @@ fn restore_struct(flat: Vec<FlatTag>) -> (Vec<XmpTag>, Option<String>) {
       // Keep every member flat under its own emitted flat name.
       for m in members {
         out.push(XmpTag {
+          group0: m.group0,
           group: m.group1,
           name: m.name,
           value: m.value,
@@ -4606,8 +4797,18 @@ fn restore_struct(flat: Vec<FlatTag>) -> (Vec<XmpTag>, Option<String>) {
       }
       continue;
     }
+    // All members of one `(group1, name)` group share the family-0 group (it
+    // is a per-walk / per-table constant), so read it off the first member.
+    let group0 = members
+      .first()
+      .map_or_else(|| SmolStr::new("XMP"), |m| m.group0.clone());
     let value = build_value(&members);
-    out.push(XmpTag { group, name, value });
+    out.push(XmpTag {
+      group0,
+      group,
+      name,
+      value,
+    });
   }
   (out, warning)
 }
@@ -4981,10 +5182,13 @@ fn process_blank_info(walker: &mut Walker<'_>, blank: &BlankInfo) {
 impl crate::emit::Taggable for XmpMeta<'_> {
   /// Yield the extracted XMP tags in `FoundTag` order (the post-`RestoreStruct`
   /// emission) as the golden [`EmittedTag`](crate::emit::EmittedTag) stream.
-  /// Each XMP tag's family-0 group is the literal `"XMP"` and its family-1
-  /// group is the namespace-derived group (`XMP-exif` / `XMP-dc` / `XMP-tiff`
-  /// / `XMP-x` / …) the walker assigned (verified against bundled
-  /// `exiftool -G0:1`, e.g. `XMP:XMP-exif:ExifVersion`); the value is rendered
+  /// Each XMP tag's family-0/1 groups are the pair the walker assigned
+  /// (verified against bundled `exiftool -G0:1`): a normal packet is family-0
+  /// `"XMP"` + the namespace-derived family-1 (`XMP-exif` / `XMP-dc` /
+  /// `XMP-tiff` / `XMP-x` / …, e.g. `XMP:XMP-exif:ExifVersion`); a PNG
+  /// `meTa`/`seAl` bare-XML tag ([`parse_bare_xml`]) is family-0 `"XML"` +
+  /// family-1 `XML-<ns>` / `SEAL` (e.g. `XML:XML-dc:Creator`,
+  /// `XML:SEAL:KeyAlgorithm`). The value is rendered
   /// for `mode` via [`XmpValue::to_tag_value`]. No XMP tag carries
   /// `Unknown=>1` — XMP tags missing from a namespace table still extract with
   /// their raw value (`FoundXMP`'s default-tagInfo path), so the `unknown` flag
@@ -5021,7 +5225,7 @@ impl crate::emit::Taggable for XmpMeta<'_> {
       // `same_packet_unknown_dup_first_wins` (#477) tests.
       let priority = u8::from(!is_priority0_xmp_group(tag.group.as_str()));
       crate::emit::EmittedTag::new_with_priority(
-        crate::value::Group::new("XMP", tag.group.as_str()),
+        crate::value::Group::new(tag.group0.as_str(), tag.group.as_str()),
         tag.name.clone(),
         tag.value.to_tag_value(print_conv),
         false,
@@ -6748,5 +6952,97 @@ mod tests {
     // `tiff:BitsPerSample` ⇒ FIRST (8). Both match bundled `-struct`.
     assert_eq!(scalar("XMP-dc", "Subject").as_deref(), Some("bbb"));
     assert_eq!(scalar("XMP-tiff", "BitsPerSample").as_deref(), Some("8"));
+  }
+
+  // ----- #142: bare-XML meTa / seAl chunk decoders ------------------------
+
+  /// The bare-XML meTa path (`%XMP::XML`, PNG.pm:368): a UTF-8 `<meta>` blob
+  /// (BOM handling is covered by the shared `decode_xmp_text`) whose namespaced
+  /// properties emit under family-0 `XML` / family-1 `XML-<ns>` (`FoundXMP`
+  /// `$xmlGroups` path). The outer `<meta>` container is IgnoreProp'd.
+  #[test]
+  fn parse_bare_xml_meta_emits_xml_dc_groups() {
+    let xml = br#"<?xml version="1.0"?><meta><dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">TestAuthor</dc:creator></meta>"#;
+    let meta = super::parse_png_meta(xml).expect("meTa extracts a tag");
+    let tag = meta
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "Creator")
+      .expect("Creator tag");
+    // family-0 XML (not XMP), family-1 XML-dc (not XMP-dc).
+    assert_eq!(tag.group0(), "XML");
+    assert_eq!(tag.group(), "XML-dc");
+    assert_eq!(
+      tag.value_ref().scalar_ref().map(super::XmpScalar::text),
+      Some("TestAuthor")
+    );
+  }
+
+  /// The bare-XML seAl path (`%XMP::SEAL`, PNG.pm:380): the `<seal>` container
+  /// is stripped (FoundSEAL) and each namespace-less property is looked up in
+  /// the flat SEAL table, emitting family-0 `XML` / family-1 `SEAL`. A nested
+  /// `<seal>` still resolves to `SEALVersion` (only the OUTER container drops).
+  #[test]
+  fn parse_bare_xml_seal_emits_seal_table_names() {
+    let xml =
+      br#"<?xml version="1.0"?><seal><seal>1</seal><ka>ES256</ka><s>SIG</s><info>note</info></seal>"#;
+    let meta = super::parse_png_seal(xml).expect("seAl extracts tags");
+    let get = |name: &str| {
+      meta
+        .tags_slice()
+        .iter()
+        .find(|t| t.name() == name)
+        .map(|t| {
+          (
+            t.group0(),
+            t.group(),
+            t.value_ref()
+              .scalar_ref()
+              .map(super::XmpScalar::text)
+              .unwrap_or_default(),
+          )
+        })
+    };
+    assert_eq!(get("SEALVersion"), Some(("XML", "SEAL", "1")));
+    assert_eq!(get("KeyAlgorithm"), Some(("XML", "SEAL", "ES256")));
+    assert_eq!(get("Signature"), Some(("XML", "SEAL", "SIG")));
+    assert_eq!(get("SEALComment"), Some(("XML", "SEAL", "note")));
+  }
+
+  /// The `%XMP::SEAL` table (XMP2.pl:1876) maps each SEAL property key to its
+  /// tag name; an unknown key misses (FoundXMP then `ucfirst`-generates one).
+  #[test]
+  fn seal_field_table_maps_all_keys() {
+    use super::tables::{Field, seal_field};
+    let name = |k: &str| seal_field(k).and_then(Field::name);
+    assert_eq!(name("seal"), Some("SEALVersion"));
+    assert_eq!(name("ka"), Some("KeyAlgorithm"));
+    assert_eq!(name("kv"), Some("KeyVersion"));
+    assert_eq!(name("da"), Some("DigestAlgorithm"));
+    assert_eq!(name("b"), Some("ByteRange"));
+    assert_eq!(name("d"), Some("Domain"));
+    assert_eq!(name("uid"), Some("UniqueIdentifier"));
+    assert_eq!(name("id"), Some("Identifier"));
+    assert_eq!(name("sf"), Some("SignatureFormat"));
+    assert_eq!(name("sl"), Some("SignatureLength"));
+    assert_eq!(name("s"), Some("Signature"));
+    assert_eq!(name("info"), Some("SEALComment"));
+    assert_eq!(name("copyright"), Some("Copyright"));
+    assert!(seal_field("nope").is_none());
+  }
+
+  /// The bare-XML entry is ADDITIVE: the strict `parse_borrowed` (real
+  /// `.xmp`/`rdf:RDF` / `x:xmpmeta` recognition) still REJECTS a bare
+  /// `<meta>`/`<seal>` blob (faithful to `ProcessXMP`'s RAF `return 0`), so the
+  /// real sidecar path is unchanged.
+  #[test]
+  fn strict_parse_borrowed_still_rejects_bare_xml() {
+    let meta = br#"<?xml version="1.0"?><meta><dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">X</dc:creator></meta>"#;
+    let seal = br#"<?xml version="1.0"?><seal><ka>ES256</ka></seal>"#;
+    assert!(super::parse_borrowed(meta).is_none());
+    assert!(super::parse_borrowed(seal).is_none());
+    // A genuine wrapped packet is still accepted.
+    let rdf = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" dc:format="image/png"/></rdf:RDF>"#;
+    assert!(super::parse_borrowed(rdf).is_some());
   }
 }

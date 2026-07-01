@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "PNG_meta.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG",
+  "File:FileTypeExtension": "PNG",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": 2,
+  "PNG:Compression": 0,
+  "PNG:Filter": 0,
+  "PNG:Interlace": 0,
+  "XML-dc:Creator": "TestAuthor",
+  "XML-dc:Title": "MyTitle",
+  "Composite:ImageSize": "1 1",
+  "Composite:Megapixels": 1e-06
+}]

@@ -922,6 +922,19 @@ pub struct PngMeta<'a> {
   /// alongside the PNG warnings. The same "sub-Meta hangs off the parent Meta"
   /// shape as `GeoTiffMeta`/`MngMeta`.
   jumbf: Option<crate::exif::jumbf::JumbfMeta>,
+  // ----- meTa / seAl bare-XML XMP subsystem (XMP::XML / XMP::SEAL) --------
+  /// The decoded XMP sub-metadata of the PNG `meTa` (`%XMP::XML`, `PNG.pm:368`,
+  /// a UTF-16-BOM XML blob) and `seAl` (`%XMP::SEAL`, `PNG.pm:380`, SEAL
+  /// content-auth XML) chunks, in chunk-walk order. Each is an independent
+  /// `ProcessXMP` run ([`crate::formats::xmp::parse_bare_xml`]) emitting under
+  /// family-0 `XML` (family-1 `XML-<ns>` for `meTa`, `SEAL` for `seAl`). Empty
+  /// for a PNG with neither chunk (and for a chunk whose XML extracted nothing).
+  /// Spliced AFTER the PNG-level tags in [`crate::formats::png::ProcessPng`]'s
+  /// `tags()`, the same "sub-Meta hangs off the parent Meta" shape as
+  /// [`Self::jumbf`]. Gated on the optional `xmp` module, like
+  /// [`Self::xmp_profiles`].
+  #[cfg(feature = "xmp")]
+  xml_metas: Vec<crate::formats::xmp::XmpMeta<'static>>,
   /// The JUMBF walker warnings of EACH dispatched `caBX` chunk, one inner `Vec`
   /// per `caBX` (in chunk-walk order). [`PngDiagStep::Jumbf`] carries the index
   /// into this list, so each `caBX`'s warnings drain at ITS walk position — the
@@ -1261,6 +1274,8 @@ impl PngMeta<'_> {
       container: PngContainer::Png,
       mng: None,
       jumbf: None,
+      #[cfg(feature = "xmp")]
+      xml_metas: Vec::new(),
       jumbf_diags: Vec::new(),
       _lifetime: core::marker::PhantomData,
     }
@@ -1944,6 +1959,27 @@ impl PngMeta<'_> {
       self.jumbf_diags.push(jumbf.warnings().to_vec());
       self.jumbf = Some(jumbf);
     }
+  }
+
+  /// Record the decoded XMP sub-metadata of a `meTa`/`seAl` bare-XML chunk —
+  /// the chunk-walker hook (`PNG.pm:368`/`:380`). Accumulates in chunk-walk
+  /// order (a PNG may carry more than one such chunk). An extraction that
+  /// yielded nothing is already dropped by
+  /// [`crate::formats::xmp::parse_bare_xml`] returning `None`, so every stored
+  /// entry emits at least one tag.
+  #[cfg(feature = "xmp")]
+  #[inline]
+  pub(crate) fn push_xml_meta(&mut self, meta: crate::formats::xmp::XmpMeta<'static>) {
+    self.xml_metas.push(meta);
+  }
+
+  /// The decoded `meTa`/`seAl` bare-XML XMP sub-Metas, in chunk-walk order.
+  /// Empty for a PNG carrying neither chunk.
+  #[cfg(feature = "xmp")]
+  #[inline]
+  #[must_use]
+  pub(crate) fn xml_metas(&self) -> &[crate::formats::xmp::XmpMeta<'static>] {
+    &self.xml_metas
   }
 
   /// The JUMBF walker warnings recorded for the `caBX` occurrence at `index` (the
