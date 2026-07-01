@@ -76,6 +76,11 @@ use alloc::{string::String, vec::Vec};
 use smol_str::SmolStr;
 
 use crate::metadata::{GpsLocation, MediaMetadata};
+// The file-level LigoGPS cipher-discovery state ($$et{LigoCipher}, LigoGPS.pm:151)
+// lives with the format walker; it is quicktime-gated (m2ts chains quicktime), so
+// the `cipher_state` field + its accessors below are gated to match.
+#[cfg(feature = "quicktime")]
+use crate::formats::ligogps::CipherDiscovery;
 
 // ===========================================================================
 // LigoSource — which ExifTool dispatch path decoded a record
@@ -498,6 +503,16 @@ pub struct LigoGpsMeta {
   /// failure, coordinate out-of-range, …). Bundled emits multiple
   /// `$et->Warn(...)` calls; the camera-indexing surface keeps the first.
   warning: Option<SmolStr>,
+  /// The FILE-level cipher-discovery state (`$$et{LigoCipher}`, LigoGPS.pm:151-154),
+  /// threaded across every `ProcessLigoGPS` walk of ONE file so enciphered records
+  /// split across multiple LigoGPS blocks / trailers accumulate toward the
+  /// 10-transition discovery gate (LigoGPS.pm:176). `None` until the first `####`
+  /// record fails `DecryptLigoGPS` and enters `DecipherLigoGPS`; taken out for the
+  /// duration of each walk by [`Self::take_cipher_state`] and stored back by
+  /// [`Self::set_cipher_state`]; cleared once at file end by
+  /// [`Self::finish_cipher_discovery`] (the `CleanupCipher` mirror, LigoGPS.pm:25-32).
+  #[cfg(feature = "quicktime")]
+  cipher_state: Option<CipherDiscovery>,
 }
 
 impl LigoGpsMeta {
@@ -508,6 +523,8 @@ impl LigoGpsMeta {
     Self {
       samples: Vec::new(),
       warning: None,
+      #[cfg(feature = "quicktime")]
+      cipher_state: None,
     }
   }
 
@@ -638,10 +655,22 @@ impl LigoGpsMeta {
   /// documented udta-before-moov limitation.)
   #[inline]
   pub(crate) fn append(&mut self, other: Self) -> &mut Self {
-    let Self { samples, warning } = other;
+    let Self {
+      samples,
+      warning,
+      #[cfg(feature = "quicktime")]
+      cipher_state,
+    } = other;
     self.samples.extend(samples);
     if self.warning.is_none() {
       self.warning = warning;
+    }
+    // `other` is a same-file source being merged in (only ever the JSON `udta`
+    // holder, whose cipher state is always `None`); keep THIS holder's cipher
+    // state if present, else adopt `other`'s — first-wins, mirroring `warning`.
+    #[cfg(feature = "quicktime")]
+    if self.cipher_state.is_none() {
+      self.cipher_state = cipher_state;
     }
     self
   }
@@ -653,6 +682,48 @@ impl LigoGpsMeta {
   pub fn set_warning(&mut self, w: SmolStr) -> &mut Self {
     if self.warning.is_none() {
       self.warning = Some(w);
+    }
+    self
+  }
+
+  // ── LigoGPS cipher-discovery file-level state (LigoGPS.pm:151-154) ───────────
+
+  /// Take the FILE-level cipher-discovery state out of this holder for the
+  /// duration of one `ProcessLigoGPS` walk, so the walker can borrow it disjointly
+  /// from the sample/warning output (`std::mem::take`). Paired with
+  /// [`Self::set_cipher_state`], which stores the (possibly advanced) state back.
+  #[cfg(feature = "quicktime")]
+  #[inline]
+  pub(crate) fn take_cipher_state(&mut self) -> Option<CipherDiscovery> {
+    self.cipher_state.take()
+  }
+
+  /// Store the cipher-discovery state back after a walk (see
+  /// [`Self::take_cipher_state`]).
+  #[cfg(feature = "quicktime")]
+  #[inline]
+  pub(crate) fn set_cipher_state(&mut self, state: Option<CipherDiscovery>) -> &mut Self {
+    self.cipher_state = state;
+    self
+  }
+
+  /// File-end cipher-discovery cleanup — the typed mirror of `CleanupCipher`
+  /// (LigoGPS.pm:25-32), which ExifTool registers via `AddCleanup` (LigoGPS.pm:154)
+  /// to run ONCE at file end. If a cipher discovery was started across this file's
+  /// `ProcessLigoGPS` walks but never completed (the reverse-cipher table was never
+  /// determined — bundled's `$$et{LigoCipher}{'next'}` is still present), warn.
+  /// Idempotent: takes the state, so a second call is a no-op and the (possibly
+  /// large) record cache is freed. Called by the QuickTime + M2TS drivers after
+  /// ALL of a file's LigoGPS processing completes.
+  #[cfg(feature = "quicktime")]
+  #[inline]
+  pub(crate) fn finish_cipher_discovery(&mut self) -> &mut Self {
+    if let Some(state) = self.cipher_state.take()
+      && state.discovery_incomplete()
+    {
+      self.set_warning(SmolStr::new(
+        "Not enough GPS points to determine cipher for decoding LIGOGPSINFO",
+      ));
     }
     self
   }

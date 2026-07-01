@@ -415,6 +415,35 @@ fn viofo_a119_ligogps_ee_byte_exact() {
   );
 }
 
+// #136 — LigoGPS `DecipherLigoGPS` cipher-discovery fallback (LigoGPS.pm:143-221)
+// + `OrderCipherDigits` (:109-135). The CRAFTED `gpmd`-Kingslim fixture
+// (`tools/gen_ligogps_decipher_fixture.py`) carries 12 ENCIPHERED LigoGPS records:
+// each `####` record's counter is 0 (LE u32 < 4) so `DecryptLigoGPS` fails
+// (LigoGPS.pm:54) and ExifTool falls through to `DecipherLigoGPS` (:312-313), which
+// accumulates the enciphered seconds-unit-digit transitions until all 10 are seen
+// (:176), discovers the cipher at record 11 (`OrderCipherDigits` + the millennium
+// '2' anchor + the lat/lon quadrant), deciphers the 11 cached records, then
+// deciphers record 12 directly (the post-discovery path, :311). All 12 decode to a
+// -31.285065 S / -124.759483 W fix at 2024:06:27 12:34:00..11, GPSSpeed 37.966 km/h
+// (knots * 1.852 — the noFuzz path). Byte-exact vs bundled ExifTool 13.59: `-ee -G1`
+// collapses to the first sample (`Doc2`), `-ee -G3:1` keeps all 12 `Doc2..Doc13:
+// LIGO:GPS…` plus the `Doc1:Track1` gpmd-sample timing. The no-`ee` `.json`/`.n.json`
+// (container + the `[minor]` ExtractEmbedded notice, NO GPS) are pinned by the
+// auto-active `typed_serde_parity` set.
+#[test]
+fn ligogps_decipher_ee_byte_exact() {
+  check_ee(
+    "QuickTime_ligogps_decipher.mov",
+    "QuickTime_ligogps_decipher.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_ligogps_decipher.mov",
+    "QuickTime_ligogps_decipher.mov.ee.g3.json",
+    true,
+  );
+}
+
 // The no-`ee` default path: a `gpmd` trak is `meta`-handler ⇒ fully `-ee` gated,
 // so the only surfaced timed tag is the `Track1:Warning` ([minor] ExtractEmbedded
 // hint, QuickTime.pm `EEWarn`); NO GPS surfaces. Pins that the `gpmd`-variant GPS

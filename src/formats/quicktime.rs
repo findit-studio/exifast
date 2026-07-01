@@ -8141,6 +8141,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     stream.stamp_gps_doc_from(scan_start);
   }
 
+  // LigoGPS.pm:25-32 `CleanupCipher` — ExifTool runs this file-cleanup callback
+  // ONCE at file end (registered by `AddCleanup`, LigoGPS.pm:154). Every LigoGPS
+  // source of this file (freeGPS-embedded blocks in `extract_stream`, the file-end
+  // `&&&&` trailer, the `mdat` `ScanMediaData` freeGPS scan just above) has now
+  // fed `ligogps_meta`, threading the shared file-level cipher state; fire the
+  // not-enough-points warning here iff a discovery was started but never completed.
+  ligogps_meta.finish_cipher_discovery();
+
   // (The Insta360 + LigoGPS file-end trailers were processed in the TRAILER PHASE
   // above — BEFORE this `mdat` `ScanMediaData` scan, mirroring ExifTool's
   // `ProcessMOV` order: the trailer loop THEN `ScanMediaData`,
@@ -21001,30 +21009,38 @@ mod tests {
     );
   }
 
-  /// FINDING 2 — a `####`-prefixed record whose cipher stream is malformed fails
-  /// `DecryptLigoGPS` (LigoGPS.pm:312); the port records the decrypt-failure
-  /// deferral warning (cipher discovery is the deferred LigoGPS.pm:143-221
-  /// `DecipherLigoGPS` fallback). It must surface in the rendered output.
+  /// A `####`-prefixed record whose header fails `DecryptLigoGPS` (LigoGPS.pm:312)
+  /// but whose enciphered date prefix matches the `DecipherLigoGPS` regex
+  /// (LigoGPS.pm:148) is routed into the cipher-discovery fallback (LigoGPS.pm:313
+  /// `... or DecipherLigoGPS(...)`) — the actual #136 port, NOT a "deferred" stub.
+  /// A single such record cannot reach the 10-transition discovery gate
+  /// (LigoGPS.pm:176), so the FILE-END `CleanupCipher` not-enough-points warning
+  /// (LigoGPS.pm:25-32) fires ONCE and surfaces in the QuickTime rendered output as
+  /// a document-level `ExifTool:Warning`. This exercises the #136-R2 file-level
+  /// cipher state + its file-end cleanup end-to-end (a decrypt-failure that does
+  /// NOT match the enciphered regex is silently `next`-ed by ExifTool with no
+  /// warning, so it is not asserted here).
   #[test]
   fn ligogps_decrypt_failure_warning_surfaces_in_rendered_output() {
-    // `####` + LE u32 count(4) + a first input byte 0x20 whose steering bits
-    // (0x20 & 0xe0 = 0x20) hit `DecryptLigoGPS`'s final `else { return undef }`
-    // (LigoGPS.pm:94-96) ⇒ decode fails on the first byte.
-    let mut rec = Vec::new();
-    rec.extend_from_slice(b"####");
-    rec.extend_from_slice(&4u32.to_le_bytes()); // num = 4
-    rec.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]); // first input byte → return None
+    // `####` + LE u32 count(0) (num < 4 ⇒ `DecryptLigoGPS` fails, LigoGPS.pm:54) +
+    // the enciphered date prefix `AAAA/AA/AA AA:AA:AA ` — every enciphered byte is
+    // 0x41 ('A') ∈ 0x30..=0x5f and the two enciphered colons agree, so
+    // `match_enciphered` accepts it and the record enters `DecipherLigoGPS`.
+    let mut rec = vec![b'#', b'#', b'#', b'#'];
+    rec.extend_from_slice(&0u32.to_le_bytes());
+    rec.extend_from_slice(b"AAAA/AA/AA AA:AA:AA ");
+    assert_eq!(rec.len(), 28);
     let data = kingslim_ligogps_mp4_with_record(&rec);
     let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(
       meta.ligogps().warning(),
-      Some("LigoGPS record decryption failed (cipher discovery deferred)")
+      Some("Not enough GPS points to determine cipher for decoding LIGOGPSINFO")
     );
     assert!(
       rendered_warnings(&meta)
         .iter()
-        .any(|w| w == "LigoGPS record decryption failed (cipher discovery deferred)"),
-      "the decrypt-failure warning must surface in the rendered output, got {:?}",
+        .any(|w| w == "Not enough GPS points to determine cipher for decoding LIGOGPSINFO"),
+      "the file-end cipher-cleanup warning must surface in the rendered output, got {:?}",
       rendered_warnings(&meta)
     );
   }
