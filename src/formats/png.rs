@@ -649,6 +649,18 @@ fn dispatch_chunk(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
     // are Phases 2-3). A `caBX` with no recognized boxes decodes to an empty
     // `JumbfMeta` and is dropped (byte-identical PNG output).
     b"caBX" => meta.set_jumbf(crate::exif::jumbf::process(data)),
+    // ----- cpIp (PNG.pm:354-367) → FlashPix OLE compound-document --------
+    // The `cpIp` chunk ("OLE information found in PNG Plus images written by
+    // Picture It!") carries a Windows Compound Binary File routed to
+    // `FlashPix::ProcessFPX` on the `%FlashPix::Main` table. Its `Condition`
+    // (`PNG.pm:355-361`) mutates `File:FileType` from `PNG` to `PNG Plus` on
+    // mere PRESENCE of the chunk (INDEPENDENT of the decode result — a garbage
+    // or empty OLE still promotes, oracle-verified vs 13.59); the promotion is
+    // driven by [`PngMeta::has_cpip`] in `format_parser.rs`. Hand the payload to
+    // the OLE walker → the SummaryInfo/DocumentInfo property tables. An empty
+    // decode is dropped whole (byte-identical PNG output); `set_flashpix` still
+    // records the presence flag.
+    b"cpIp" => meta.set_flashpix(crate::formats::ole::process(data)),
     // ----- meTa (PNG.pm:368-372) → %XMP::XML bare-XML XMP ----------------
     // A UTF-16-BOM XML blob (Picture It!) routed to `ProcessXMP` on the
     // `%XMP::XML` table with the `<meta>` container `IgnoreProp`'d. Namespaced
@@ -3196,6 +3208,16 @@ impl crate::emit::Taggable for PngMeta<'_> {
       tags.extend(jumbf_meta.tags(opts));
     }
 
+    // ---- cpIp FlashPix tags — chain the OLE sub-Meta's tag stream ----------
+    // A `cpIp` chunk (`PNG.pm:354-367`) fed its OLE compound document to
+    // [`crate::formats::ole::process`] during the walk. Splice its `Taggable`
+    // stream (the `FlashPix:*` SummaryInfo/DocumentInfo tags, family-0/1
+    // `FlashPix`) AFTER the PNG-level tags. `None` for a PNG with no `cpIp` (or a
+    // `cpIp` whose OLE recognized nothing) ⇒ byte-identical PNG output.
+    if let Some(flashpix_meta) = self.flashpix() {
+      tags.extend(crate::emit::Taggable::tags(flashpix_meta, opts));
+    }
+
     // ---- meTa / seAl bare-XML XMP tags — chain each sub-Meta's tag stream --
     // A `meTa` (`PNG.pm:368` → `%XMP::XML`) / `seAl` (`PNG.pm:380` → `%XMP::SEAL`)
     // chunk fed its bare-XML blob to `ProcessXMP` during the walk. Splice each
@@ -3407,6 +3429,20 @@ impl crate::diagnostics::Diagnose for PngMeta<'_> {
               warnings
                 .iter()
                 .map(|w| crate::diagnostics::Diagnostic::warn(w.message())),
+            );
+          }
+        }
+        // A `cpIp` chunk's FlashPix sub-Meta (`FlashPix.pm`). Its OLE/`ProcessFPX`
+        // walker warnings (`Truncated FPX properties`, `Bad FPX property section
+        // offset`, `Truncated property list`, …) surface HERE — at the `cpIp`
+        // chunk-walk position recorded in `diag_order` — for the same
+        // walk-position / priority-0 first-wins reasons as the `caBX` JUMBF step.
+        PngDiagStep::FlashPix(idx) => {
+          if let Some(warnings) = self.flashpix_diag(*idx) {
+            out.extend(
+              warnings
+                .iter()
+                .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
             );
           }
         }

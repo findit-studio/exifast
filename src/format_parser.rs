@@ -1776,10 +1776,26 @@ impl AnyMeta<'_> {
       // `PNG`), so the override's pre-`OverrideFileType` base type stays `PNG` —
       // UNCHANGED from before this container-aware split. Bundled applies no
       // other post-walk override for PNG/MNG/JNG.
+      //
+      // A `cpIp` chunk (OLE/FlashPix, `PNG.pm:354`) promotes a PLAIN `PNG` to
+      // `PNG Plus`: the chunk's `Condition` (`PNG.pm:355-361`) raw-replaces
+      // `$$self{VALUE}{FileType}` with `'PNG Plus'` IFF it is currently `"PNG"`,
+      // on mere chunk PRESENCE (independent of the OLE decode — a garbage/empty
+      // `cpIp` still promotes, oracle-verified vs 13.59). This is a VALUE-only
+      // replacement: MIME (`image/png`) and `FileTypeExtension` (`png`) stay the
+      // resolved PNG values, so it maps to [`ExplicitThenLiteral`] `set = "PNG"`,
+      // `literal = "PNG Plus"` (the AIFF-DjVu precedent). The `is_png()` guard
+      // mirrors the `eq "PNG"` condition — an MNG/JNG-signature file (or an APNG,
+      // handled first) is NOT promoted; when both `acTL` and `cpIp` are present
+      // the file resolves to `APNG` in EITHER walk order (the `acTL`
+      // `OverrideFileType` is unconditional, and a later `cpIp` sees `APNG` ≠
+      // `PNG`), matching `is_apng()` taking precedence here.
       #[cfg(feature = "png")]
       AnyMeta::Png(m) => {
         if m.is_apng() {
           FileTypeFinalize::DetectedThenOverrideWithExt(OverrideWithExt::new("APNG", "PNG"))
+        } else if m.has_cpip() && m.container().is_png() {
+          FileTypeFinalize::ExplicitThenLiteral(ExplicitThenLiteral::new("PNG", "PNG Plus"))
         } else {
           FileTypeFinalize::Explicit(m.container().as_file_type())
         }

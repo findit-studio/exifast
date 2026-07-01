@@ -13211,6 +13211,31 @@ fn png_seal_conformance() {
   check("PNG_seal.png", "PNG_seal.png.n.json", false);
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_cpip_conformance() {
+  // #142 (cpIp OLE compound-document → FlashPix) — the PNG `cpIp` chunk
+  // (`PNG.pm:354-367`): "OLE information found in PNG Plus images written by
+  // Picture It!". The chunk payload is a Windows Compound Binary File (an OLE
+  // compound document) routed to `FlashPix::ProcessFPX` on `%FlashPix::Main`,
+  // and its `Condition` (`PNG.pm:355-361`) mutates `File:FileType` from `PNG`
+  // to `PNG Plus` (a VALUE-only replacement — MIME stays `image/png`,
+  // `FileTypeExtension` stays `png`). The OLE walker reads the 512-byte header,
+  // the FAT (via the header DIFAT), the directory, and the mini-FAT, then
+  // dispatches the `\x05SummaryInformation` / `\x05DocumentSummaryInformation`
+  // streams to `ProcessProperties` → the `%FlashPix::SummaryInfo` /
+  // `%FlashPix::DocumentInfo` tables. This crafted minimal OLE exercises
+  // VT_LPSTR (`Title`/`Author`/`RevisionNumber`/`Category`), VT_I4
+  // (`Words`/`Slides`), and VT_FILETIME → date (`CreateDate`). `RevisionNumber`
+  // (VT_LPSTR "1") renders as a BARE JSON number via the shared value gate;
+  // `CreateDate` is identical in `-j`/`-n` (its `ConvertDateTime` PrintConv is
+  // identity on the already-`ConvertUnixTime`'d value). Crafted via
+  // `tools/gen_png_cpip_fixture.py`. Oracle: bundled `perl exiftool -j -G1
+  // -struct` 13.59.
+  check("PNG_cpip.png", "PNG_cpip.png.json", true);
+  check("PNG_cpip.png", "PNG_cpip.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

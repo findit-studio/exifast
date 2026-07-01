@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "PNG_cpip.png",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "PNG Plus",
+  "File:FileTypeExtension": "png",
+  "File:MIMEType": "image/png",
+  "PNG:ImageWidth": 1,
+  "PNG:ImageHeight": 1,
+  "PNG:BitDepth": 8,
+  "PNG:ColorType": "RGB",
+  "PNG:Compression": "Deflate/Inflate",
+  "PNG:Filter": "Adaptive",
+  "PNG:Interlace": "Noninterlaced",
+  "FlashPix:Title": "title",
+  "FlashPix:Author": "author",
+  "FlashPix:RevisionNumber": 1,
+  "FlashPix:CreateDate": "2007:02:09 16:23:23",
+  "FlashPix:Words": 4,
+  "FlashPix:Category": "category",
+  "FlashPix:Slides": 1,
+  "Composite:ImageSize": "1x1",
+  "Composite:Megapixels": 0.000001
+}]
