@@ -1821,7 +1821,16 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///     exifast does not emit): two bare `dc:subject` ⇒ `"bbb"` (LAST), two bare
 ///     `tiff:BitsPerSample` ⇒ `8` (FIRST). Bundled ExifTool 13.59 `-j -G1
 ///     -struct` is the oracle.
-const EXPECTED_ACTIVE_FIXTURES: usize = 655;
+///
+/// `655 -> 656`: the #136 LigoGPS `DecipherLigoGPS` cipher-discovery port —
+///   * `QuickTime_ligogps_decipher.mov` (`tools/gen_ligogps_decipher_fixture.py`)
+///     — a `gpmd`-Kingslim `.mov` carrying 12 ENCIPHERED LigoGPS records
+///     (`DecryptLigoGPS` fails, so `DecipherLigoGPS` accumulates the seconds-digit
+///     transitions, discovers the cipher at record 11, and deciphers all 12). Its
+///     no-`ee` `.json`/`.n.json` carry only the container + the `[minor]
+///     ExtractEmbedded` notice (the deciphered GPS surfaces under `-ee`, pinned in
+///     `timed_metadata_conformance.rs::ligogps_decipher_ee_byte_exact`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 656;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -1975,6 +1975,23 @@ impl<'a> Walker<'a> {
     }
   }
 
+  /// File-end LigoGPS cipher-discovery cleanup (LigoGPS.pm:25-32 `CleanupCipher`,
+  /// run ONCE at file end). Fire the not-enough-points warning if a cipher
+  /// discovery was started across this file's PID-0x0300 PES packets but never
+  /// completed, then surface it in the walk-ordered corpus through the SAME
+  /// single-slot latch as the per-record LigoGPS warnings (so it does not
+  /// double-emit and a later structural warning cannot displace it — bundled's
+  /// priority-0 first-wins `%noDups`).
+  fn finish_ligogps_cipher(&mut self) {
+    self.ligogps.finish_cipher_discovery();
+    if !self.ligo_warning_pushed
+      && let Some(w) = self.ligogps.warning()
+    {
+      self.warnings.push(crate::diagnostics::Diagnostic::warn(w));
+      self.ligo_warning_pushed = true;
+    }
+  }
+
   /// Mark `pid` as `$didPID{$pid} = 1` (M2TS.pm:791/909/975/983) — drop from
   /// the need set and record the entry as [`DidPid::Done`] (defined AND
   /// Perl-true).
@@ -2028,7 +2045,12 @@ impl<'a> Walker<'a> {
       .is_some_and(|s| s.did == Some(DidPid::Done))
   }
 
-  fn finish(self) -> Meta<'a> {
+  fn finish(mut self) -> Meta<'a> {
+    // LigoGPS.pm:25-32 `CleanupCipher` — every PID-0x0300 `LIGOGPSINFO` PES packet
+    // has now fed `self.ligogps` (threading the shared file-level cipher state);
+    // fire the not-enough-points cleanup ONCE here, at the end of the packet walk.
+    self.finish_ligogps_cipher();
+
     // M2TS.pm:987-992 — `Duration = $endTime - $startTime`, kept as the RAW
     // integer 27 MHz PCR tick span. The `$val / 27000000` ValueConv (M2TS.pm:
     // 156) is deferred to emit time as a FULL-PRECISION f64 divide so `-n`

@@ -105,6 +105,7 @@
 #![deny(clippy::indexing_slicing)]
 
 extern crate alloc;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::{string::String, vec::Vec};
 
 use smol_str::SmolStr;
@@ -145,6 +146,34 @@ pub(crate) const GKU_MARKER: &[u8; 16] = b"__V35AX_QVDATA__";
 
 /// Fixed record stride within `ProcessLigoGPS` (LigoGPS.pm:301 `$pos+=0x84`).
 const RECORD_STRIDE: usize = 0x84;
+
+/// DoS cap on the cipher-discovery record cache (`$$cipherInfo{cache}`,
+/// LigoGPS.pm:153). ExifTool holds every decrypt-failed `####` record until the
+/// cipher is discovered; a crafted file whose records never complete discovery
+/// would grow this unboundedly. FAR above any real dashcam's pre-discovery count
+/// (a legitimate advancing-seconds stream reaches the 10-transition gate within
+/// ~11 records) — this only trips on hostile input. On exceed, cipher discovery
+/// is abandoned for the rest of the file (`CipherDiscovery::abandoned`), mirroring
+/// the spirit of bundled's >10-keys bad-data reset (LigoGPS.pm:178-180).
+const MAX_CIPHER_CACHE: usize = 4096;
+
+/// DoS cap on the total `OrderCipherDigits` search steps (LigoGPS.pm:109-135).
+/// The DFS retries on attacker-controlled per-key edge lists and can backtrack
+/// exponentially; this bounds the total recursion entries across ONE ordering
+/// attempt. FAR above any real solve (a clean 10-cycle orders in ~10-20 steps) —
+/// exceeding it abandons discovery for the rest of the file.
+const MAX_CIPHER_STEPS: usize = 200_000;
+
+/// The one-time warning emitted when a DoS cap ([`MAX_CIPHER_CACHE`] /
+/// [`MAX_CIPHER_STEPS`]) is exceeded and cipher discovery is abandoned. Not an
+/// ExifTool string (the caps are an exifast crafted-input safeguard); surfaced
+/// through the same [`LigoGpsMeta::set_warning`] channel as the faithful warnings.
+const CIPHER_ABANDON_WARNING: &str = "LIGOGPSINFO cipher discovery abandoned (input too large)";
+
+/// The count of enciphered byte values `0x30..=0x5f` (`[0-_]`) — the only bytes
+/// the reverse cipher substitutes (LigoGPS.pm:202-203,212). Sizes the
+/// [`DecipherTable`] (one plaintext byte per enciphered byte).
+const CIPHER_RANGE: usize = 0x5f - 0x30 + 1;
 
 /// The header preamble between the `LIGOGPSINFO\0` magic and the start of
 /// records (LigoGPS.pm:293 `$pos = $$dirInfo{DirStart} + 0x14`). The 20-
@@ -345,6 +374,17 @@ pub fn process_ligogps_with_scale(
   if pos >= 8 && matches!(data.get(pos - 8..pos - 4), Some([0, 0, 0, 0x01 | 0x14])) {
     no_fuzz = true;
   }
+  // LigoGPS.pm:151 `$$et{LigoCipher}` — the cipher-discovery state, created
+  // lazily by [`decipher_ligogps`] when the first `####` record fails to
+  // decrypt. ExifTool keeps it FILE-level (persists across every ProcessLigoGPS
+  // call of one file); exifast keeps it on the shared [`LigoGpsMeta`] and TAKES
+  // it out for the duration of this walk (a disjoint borrow from `out`'s sample /
+  // warning output), storing it back at the walk's end. So enciphered records
+  // split across multiple LigoGPS blocks of one file accumulate toward the
+  // 10-transition discovery gate (LigoGPS.pm:176), and the not-enough-points
+  // cleanup fires ONCE at file end via [`LigoGpsMeta::finish_cipher_discovery`]
+  // (the `CleanupCipher` mirror, LigoGPS.pm:25-32), NOT per walk.
+  let mut cipher = out.take_cipher_state();
   // LigoGPS.pm:301 `for (; $pos + 0x84 <= length($$dataPt); $pos += 0x84)`.
   while pos + RECORD_STRIDE <= data.len() {
     // The `while` guard proves `pos + RECORD_STRIDE <= data.len()`, so this
@@ -368,16 +408,22 @@ pub fn process_ligogps_with_scale(
       // (otherwise: bundled `next` — silently skip blank/null records).
       continue;
     }
-    // LigoGPS.pm:311 — bundled would attempt `DecipherLigoGPS` first if a
-    // cipher table is already known. We DEFER cipher discovery (issue
-    // #70 FOLLOW-UP), so the only path is `DecryptLigoGPS`.
+    // LigoGPS.pm:311 — once the cipher table is known, decipher `####` records
+    // directly (skip `DecryptLigoGPS`). `decipher_ligogps` returns `false` only
+    // when the record does not match the enciphered-record regex, in which case
+    // ExifTool's `... and next` does NOT fire and execution falls through to
+    // `DecryptLigoGPS` below.
+    let cipher_known = cipher.as_ref().is_some_and(|c| c.decipher.is_some());
+    if cipher_known && decipher_ligogps(rec, &mut cipher, ligogps_scale, no_fuzz, out) {
+      continue;
+    }
+    // LigoGPS.pm:312 — try `DecryptLigoGPS`.
     let Some(decoded) = decrypt_record(rec) else {
-      // LigoGPS.pm:313 — `defined $str or DecipherLigoGPS(...), next`.
-      // Cipher discovery is deferred; record a one-time warning so the
-      // file's diagnostic is visible.
-      out.set_warning(SmolStr::new(
-        "LigoGPS record decryption failed (cipher discovery deferred)",
-      ));
+      // LigoGPS.pm:313 `defined $str or DecipherLigoGPS($et, $dat, ...), next`.
+      // Decryption failed: accumulate this record toward cipher discovery (and,
+      // once ≥10 unique seconds-digit transitions are seen, discover the cipher
+      // and decipher every cached + subsequent record).
+      decipher_ligogps(rec, &mut cipher, ligogps_scale, no_fuzz, out);
       continue;
     };
     // LigoGPS.pm:315 `ParseLigoGPS($et, $str, $tagTbl, $noFuzz)`.
@@ -387,6 +433,14 @@ pub fn process_ligogps_with_scale(
     let flags = if no_fuzz { 0x01 } else { 0x00 };
     parse_decoded_record(&decoded, flags, ligogps_scale, no_fuzz, out);
   }
+
+  // Store the FILE-level cipher state back onto the shared holder so the NEXT
+  // LigoGPS walk of this file continues accumulating toward the discovery gate.
+  // The `CleanupCipher` not-enough-points warning (LigoGPS.pm:25-32) is NOT fired
+  // here — it fires ONCE at file end (after ALL of this file's LigoGPS walks) in
+  // [`LigoGpsMeta::finish_cipher_discovery`], faithful to ExifTool's file-cleanup
+  // callback (LigoGPS.pm:154 `AddCleanup`).
+  out.set_cipher_state(cipher);
 }
 
 /// Return `true` when the bundled `m(^.{4}\d{4}/\d{2}/\d{2} )s` pattern
@@ -554,6 +608,473 @@ pub(crate) fn decrypt_record(rec: &[u8]) -> Option<Vec<u8>> {
     }
   }
   Some(out)
+}
+
+// ===========================================================================
+// DecipherLigoGPS — cipher-discovery fallback (LigoGPS.pm:101-221)
+// ===========================================================================
+
+/// The reverse-cipher table discovered by [`decipher_ligogps`]. For each
+/// enciphered byte `b` in `0x30..=0x5f` (the only bytes ExifTool's
+/// `s/([0-_])/$$decipher{$1}/g` substitutes, LigoGPS.pm:212), `map[b - 0x30]` is
+/// its plaintext byte — a digit `'0'..='9'`, the time separator `':'`, a
+/// hemisphere letter `'N'/'S'/'E'/'W'`, or the unknown placeholder `'?'`
+/// (LigoGPS.pm:203). Bytes outside `0x30..=0x5f` pass through unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecipherTable {
+  map: [u8; CIPHER_RANGE],
+}
+
+/// The `$$et{LigoCipher}` state (LigoGPS.pm:153) accumulated across the
+/// `####`-enciphered records of a file's `ProcessLigoGPS` walks until the cipher
+/// can be discovered. ExifTool keeps it FILE-level (`$$et{LigoCipher}`, cleaned
+/// up once at file end by `CleanupCipher`); exifast keeps it on the shared
+/// [`crate::metadata::LigoGpsMeta`] (a file-level accumulator) so enciphered
+/// records split across MULTIPLE LigoGPS blocks / trailers of one file combine
+/// toward the 10-transition discovery gate. The walker
+/// ([`process_ligogps_with_scale`]) takes it out for the duration of one walk and
+/// stores it back, threading it as a disjoint borrow from the sample/warning
+/// output.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CipherDiscovery {
+  /// `cache` (LigoGPS.pm:153) — enciphered records held until the cipher is
+  /// known (`push @$cache`, LigoGPS.pm:161). Drained FIFO when discovery
+  /// completes (LigoGPS.pm:205-218). Bounded by [`MAX_CIPHER_CACHE`].
+  cache: Vec<Vec<u8>>,
+  /// `next` (LigoGPS.pm:153) — the seconds-unit-digit adjacency: each enciphered
+  /// "from" digit → the enciphered "to" digits seen following it. A `BTreeMap`
+  /// for deterministic iteration; only the key COUNT and per-key lookup drive
+  /// the algorithm (LigoGPS.pm:169-178), so iteration order is irrelevant to
+  /// fidelity.
+  next: BTreeMap<u8, Vec<u8>>,
+  /// `ch1` (LigoGPS.pm:166) — the previous record's enciphered seconds-unit
+  /// digit.
+  ch1: Option<u8>,
+  /// `decipher` (LigoGPS.pm:156) — the reverse-cipher table once discovered.
+  /// `None` until the 10-transition gate + ordering + millennium-anchor all
+  /// succeed; its `Some`-ness is the "discovery done" signal (mirroring
+  /// ExifTool's `delete $$cipherInfo{'next'}`, LigoGPS.pm:184).
+  decipher: Option<DecipherTable>,
+  /// `true` once a DoS cap ([`MAX_CIPHER_CACHE`] / [`MAX_CIPHER_STEPS`]) was
+  /// exceeded — cipher discovery is then abandoned for the rest of the file (no
+  /// more caching, no more ordering attempts). Not an ExifTool concept; an
+  /// exifast crafted-input safeguard.
+  abandoned: bool,
+}
+
+impl CipherDiscovery {
+  /// A fresh cipher-discovery state (`{ cache => [], 'next' => {} }`,
+  /// LigoGPS.pm:153).
+  fn new() -> Self {
+    Self {
+      cache: Vec::new(),
+      next: BTreeMap::new(),
+      ch1: None,
+      decipher: None,
+      abandoned: false,
+    }
+  }
+
+  /// `true` when a cipher discovery was STARTED but never completed — the mirror
+  /// of bundled's `$$et{LigoCipher}{'next'}` still being present at file cleanup
+  /// (LigoGPS.pm:28-30). Read by [`crate::metadata::LigoGpsMeta::finish_cipher_discovery`]
+  /// to fire the not-enough-points warning once at file end.
+  pub(crate) const fn discovery_incomplete(&self) -> bool {
+    self.decipher.is_none()
+  }
+}
+
+/// Faithful port of `Image::ExifTool::LigoGPS::OrderCipherDigits`
+/// (LigoGPS.pm:109-135). Determines the cyclic ordering of the 10 enciphered
+/// seconds-unit digits from the `next` adjacency by DFS with backtracking:
+/// `order` is the shared path stack and `did` the visited set, COPIED for each
+/// branch exactly as Perl's `my %did = %$did` (so a failed branch cannot leak
+/// its visits into a sibling). `ch` is the starting digit. Returns `true` — with
+/// `order` filled by the 10 digits in advancing order, `order[0] == ch` — when a
+/// complete cycle through all 10 back to the start is found; `false` (give up,
+/// wait for more records) otherwise.
+///
+/// `steps` is a total-recursion-entry counter threaded through the whole search
+/// (a crafted `next` with dense per-key edge lists can backtrack exponentially).
+/// When it exceeds [`MAX_CIPHER_STEPS`] the search bails early (returns `false`);
+/// the caller reads `*steps > MAX_CIPHER_STEPS` to distinguish a DoS-abandon from
+/// a genuinely-unorderable set.
+fn order_cipher_digits(
+  mut ch: u8,
+  next: &BTreeMap<u8, Vec<u8>>,
+  order: &mut Vec<u8>,
+  did: &mut BTreeSet<u8>,
+  steps: &mut usize,
+) -> bool {
+  // DoS bound: cap the total recursion entries across the whole ordering attempt.
+  *steps += 1;
+  if *steps > MAX_CIPHER_STEPS {
+    return false;
+  }
+  // LigoGPS.pm:113 `while ($$next{$ch})`.
+  while let Some(nexts) = next.get(&ch) {
+    // (`next{ch}` is only ever created with ≥1 element, LigoGPS.pm:171/173; an
+    // empty list — never reached — is a dead end, not an out-of-bounds branch.)
+    if nexts.is_empty() {
+      break;
+    }
+    if order.len() < 10 {
+      // LigoGPS.pm:115 `last if $$did{$ch}`.
+      if did.contains(&ch) {
+        break;
+      }
+    } else {
+      // LigoGPS.pm:117-119 — success after a full 10-cycle back to the start.
+      if order.len() == 10 && order.first() == Some(&ch) {
+        return true;
+      }
+      break;
+    }
+    // LigoGPS.pm:121-122.
+    order.push(ch);
+    did.insert(ch);
+    // LigoGPS.pm:124 — a single possibility: continue iteratively (no branch).
+    if let [only] = nexts.as_slice() {
+      ch = *only;
+      continue;
+    }
+    // LigoGPS.pm:126-131 — branch over every possibility, each with a COPY of
+    // `did`; restore `order` to its post-push length after a failed branch
+    // (`$#$order = $n`, LigoGPS.pm:130).
+    let restore_len = order.len();
+    for &cand in nexts {
+      let mut did_branch = did.clone();
+      if order_cipher_digits(cand, next, order, &mut did_branch, steps) {
+        return true;
+      }
+      // Bail the whole branch loop once the step budget is spent (a failed
+      // sub-search that hit the cap must not keep spawning siblings).
+      if *steps > MAX_CIPHER_STEPS {
+        return false;
+      }
+      order.truncate(restore_len);
+    }
+    break;
+  }
+  false // LigoGPS.pm:134
+}
+
+/// Set `decipher{ch} = plain` (LigoGPS.pm:185/188/192). `ch` is an enciphered
+/// byte in `0x30..=0x5f`; index the table by `ch - 0x30`. A later call OVERWRITES
+/// an earlier one (Perl hash assignment) — e.g. a digit at LigoGPS.pm:188 over
+/// the colon seeded at :185 — and marks the slot known so the LigoGPS.pm:203
+/// `'?'` fill skips it.
+fn decipher_set(map: &mut [u8; CIPHER_RANGE], set: &mut [bool; CIPHER_RANGE], ch: u8, plain: u8) {
+  let idx = usize::from(ch.wrapping_sub(0x30));
+  if let (Some(slot), Some(known)) = (map.get_mut(idx), set.get_mut(idx)) {
+    *slot = plain;
+    *known = true;
+  }
+}
+
+/// LigoGPS.pm:148-149 — match the enciphered date/time header
+/// `^####.{4}([0-_])[0-_]{3}/[0-_]{2}/[0-_]{2} ..([0-_])..([0-_]).([0-_]) ` (the
+/// `/s` flag is moot — no `.` placeholder is anchored to a line). The enciphered
+/// characters are all in `0x30..=0x5f` (`[0-_]`); `/` and ` ` pass through
+/// un-enciphered. Returns `(millennium, colon, ch2)` = ($1 enciphered first year
+/// digit, $2 enciphered colon, $4 enciphered seconds-unit digit) once the two
+/// enciphered colons ($2 / $3) agree (LigoGPS.pm:149 `return undef unless $2 eq
+/// $3`).
+fn match_enciphered(rec: &[u8]) -> Option<(u8, u8, u8)> {
+  let &[
+    b'#',
+    b'#',
+    b'#',
+    b'#', // ^####
+    _,
+    _,
+    _,
+    _,   // .{4}  counter
+    mil, // ([0-_])  $1 millennium (year digit 1)
+    y1,
+    y2,
+    y3,   // [0-_]{3}  year digits 2-4
+    b'/', // /
+    mo0,
+    mo1,  // [0-_]{2}  month
+    b'/', // /
+    d0,
+    d1,   // [0-_]{2}  day
+    b' ', // (space)
+    _,
+    _,     // ..  HH
+    colon, // ([0-_])  $2 colon
+    _,
+    _,      // ..  MM
+    colon2, // ([0-_])  $3 colon
+    _,      // .   seconds tens digit
+    ch2,    // ([0-_])  $4 seconds units digit
+    b' ',   // (space)
+  ] = rec.get(..28)?
+  else {
+    return None;
+  };
+  let in_range = |b: u8| (0x30..=0x5f).contains(&b);
+  (in_range(mil)
+    && in_range(y1)
+    && in_range(y2)
+    && in_range(y3)
+    && in_range(mo0)
+    && in_range(mo1)
+    && in_range(d0)
+    && in_range(d1)
+    && in_range(colon)
+    && in_range(colon2)
+    && in_range(ch2)
+    && colon == colon2) // LigoGPS.pm:149
+    .then_some((mil, colon, ch2))
+}
+
+/// LigoGPS.pm:191 — `/ ([0-_])$colon(-?).*? ([0-_])$colon(-?)/` over the whole
+/// enciphered record. Finds the lat then lon `<space><ref><colon><sign?>`
+/// groups; `.*?` is non-greedy and (no `/s`) cannot cross a `\n`. Returns
+/// `(ns_ch, lat_neg, ew_ch, lon_neg)` = ($1 enciphered lat-ref, $2 lat carried a
+/// `-`, $3 enciphered lon-ref, $4 lon carried a `-`).
+fn match_quadrant(rec: &[u8], colon: u8) -> Option<(u8, bool, u8, bool)> {
+  let in_range = |b: u8| (0x30..=0x5f).contains(&b);
+  let at = |k: usize| rec.get(k).copied();
+  let n = rec.len();
+  let mut i = 0;
+  while i < n {
+    // A: ' ' (i) + in-range ref (i+1) + colon (i+2) + optional '-' (i+3).
+    if at(i) == Some(b' ')
+      && let Some(ns_ch) = at(i + 1).filter(|&b| in_range(b))
+      && at(i + 2) == Some(colon)
+    {
+      let lat_neg = at(i + 3) == Some(b'-');
+      let after_a = i + 3 + usize::from(lat_neg);
+      // `.*?` (non-greedy) then B; `.` cannot match `\n` (no `/s` flag).
+      let mut j = after_a;
+      while j < n {
+        if at(j) == Some(b' ')
+          && let Some(ew_ch) = at(j + 1).filter(|&b| in_range(b))
+          && at(j + 2) == Some(colon)
+        {
+          let lon_neg = at(j + 3) == Some(b'-');
+          return Some((ns_ch, lat_neg, ew_ch, lon_neg));
+        }
+        // The byte `.*?` would have to consume to extend past `j` is a newline ⇒
+        // this start `i` cannot complete the match; advance the outer scan.
+        if at(j) == Some(b'\n') {
+          break;
+        }
+        j += 1;
+      }
+    }
+    i += 1;
+  }
+  None
+}
+
+/// LigoGPS.pm:209-217 — the apply-do-while body: drop the 8-byte header + trailing
+/// nulls, reverse-cipher the body, re-prepend the 4-byte counter (`$pre`), and
+/// parse via the shared [`parse_decoded_record`] (`ParseLigoGPS`). `no_fuzz` is
+/// ExifTool's `$noFuzz` 4th arg passed straight to `ParseLigoGPS` as `$flags`
+/// (LigoGPS.pm:217): the 0x01 (not-fuzzed) bit only — the 0x02 (km/h) bit is
+/// unset for enciphered records, so speed uses the 1.85407333 internal scale.
+fn apply_and_parse(
+  cached: &[u8],
+  table: &[u8; CIPHER_RANGE],
+  scale_id: Option<u32>,
+  no_fuzz: bool,
+  out: &mut LigoGpsMeta,
+) {
+  // LigoGPS.pm:210 `$pre = substr($str, 4, 4)` — the 4-byte counter after `####`.
+  let Some(pre) = cached.get(4..8) else {
+    return; // shorter than an 8-byte header — `ParseLigoGPS`'s `.{4}` cannot match.
+  };
+  // LigoGPS.pm:211 `($str = substr($str, 8)) =~ s/\0+$//` — drop the 8-byte
+  // header and trailing null padding.
+  let body = strip_trailing_nulls(cached.get(8..).unwrap_or_default());
+  // LigoGPS.pm:212 `$str =~ s/([0-_])/$$decipher{$1}/g` — reverse-cipher each
+  // 0x30..=0x5f byte (a SINGLE pass; a '?'/digit OUTPUT is never re-substituted).
+  // `table` has exactly `CIPHER_RANGE` entries for bytes 0x30..=0x5f, so
+  // `get(b - 0x30)` (wrapping for b < 0x30) is `Some` iff `b` is enciphered.
+  let mut deciphered = Vec::with_capacity(4 + body.len());
+  deciphered.extend_from_slice(pre);
+  for &b in body {
+    match table.get(usize::from(b.wrapping_sub(0x30))) {
+      Some(&plain) => deciphered.push(plain),
+      None => deciphered.push(b),
+    }
+  }
+  // LigoGPS.pm:216-217 `ParseLigoGPS($et, "$pre$str", $tagTbl, $noFuzz)`.
+  let flags = if no_fuzz { 0x01 } else { 0x00 };
+  parse_decoded_record(&deciphered, flags, scale_id, no_fuzz, out);
+}
+
+/// Faithful port of `Image::ExifTool::LigoGPS::DecipherLigoGPS`
+/// (LigoGPS.pm:143-221) — the fallback ProcessLigoGPS uses when
+/// [`decrypt_record`] (`DecryptLigoGPS`) cannot decode a `####`-prefixed record.
+/// It accumulates the per-record seconds-digit transitions into `cipher` until
+/// it can determine the reverse-cipher table by sequence inversion, then
+/// deciphers every cached + subsequent record and parses each via
+/// [`parse_decoded_record`].
+///
+/// Returns `true` when `rec` matched the enciphered-record regex (LigoGPS.pm:148
+/// — ExifTool's `return 1` from every accumulate / discover / apply path),
+/// `false` when it did not (`return undef`, LigoGPS.pm:148 — the
+/// [`process_ligogps_with_scale`] caller then falls through to
+/// [`decrypt_record`], matching ProcessLigoGPS:311-313).
+fn decipher_ligogps(
+  rec: &[u8],
+  cipher: &mut Option<CipherDiscovery>,
+  scale_id: Option<u32>,
+  no_fuzz: bool,
+  out: &mut LigoGpsMeta,
+) -> bool {
+  // LigoGPS.pm:148-149 — match the enciphered date/time prefix (and require the
+  // two enciphered colons to agree).
+  let Some((millennium, colon, ch2)) = match_enciphered(rec) else {
+    return false; // LigoGPS.pm:148 `return undef`
+  };
+
+  // LigoGPS.pm:151-155 — get-or-create the cipher-discovery state.
+  let cinfo = cipher.get_or_insert_with(CipherDiscovery::new);
+
+  // DoS: a prior record already exceeded a cap ⇒ discovery is abandoned for the
+  // rest of the file. Drop this record (no caching, no ordering) but still report
+  // it as an enciphered match (`return 1`, so the caller does not fall through to
+  // `DecryptLigoGPS`, which already failed on this record class).
+  if cinfo.abandoned {
+    return true;
+  }
+
+  // LigoGPS.pm:160 `unless ($decipher)` — still discovering.
+  if cinfo.decipher.is_none() {
+    // DoS: bound the unbounded record cache. A crafted file whose records never
+    // complete discovery would grow `cache` without limit; on exceed, abandon
+    // discovery for the rest of the file with a one-time warning.
+    if cinfo.cache.len() >= MAX_CIPHER_CACHE {
+      cinfo.abandoned = true;
+      out.set_warning(SmolStr::new(CIPHER_ABANDON_WARNING));
+      return true;
+    }
+    // LigoGPS.pm:161 — cache this record until the cipher is known.
+    cinfo.cache.push(rec.to_vec());
+
+    // LigoGPS.pm:166-168 — record the ch1→ch2 seconds-digit transition. `ch1` is
+    // the OLD stored value (the previous record's digit); `ch1` is updated to
+    // `ch2` BEFORE the duplicate/accumulate logic (LigoGPS.pm:167).
+    let ch1_prev = cinfo.ch1;
+    cinfo.ch1 = Some(ch2);
+    let ch1 = match ch1_prev {
+      // LigoGPS.pm:168 `return 1 if not defined $ch1 or $ch1 eq $ch2` — first
+      // record, or a duplicate sequential seconds digit.
+      None => return true,
+      Some(c) if c == ch2 => return true,
+      Some(c) => c,
+    };
+    // LigoGPS.pm:169-174 — accumulate `ch1 → ch2`, skipping a duplicate edge.
+    match cinfo.next.get_mut(&ch1) {
+      Some(list) => {
+        if list.contains(&ch2) {
+          return true; // LigoGPS.pm:170 `return 1 if grep ... # don't add twice`
+        }
+        list.push(ch2); // LigoGPS.pm:171
+      }
+      None => {
+        cinfo.next.insert(ch1, Vec::from([ch2])); // LigoGPS.pm:173 `[ $ch2 ]`
+      }
+    }
+    // LigoGPS.pm:176 — wait until all 10 digits have an outgoing transition.
+    let nkeys = cinfo.next.len();
+    if nkeys < 10 {
+      return true;
+    }
+    // LigoGPS.pm:178 — >10 distinct "from" digits is impossible for 0-9 ⇒ bad
+    // data; reset `next` and keep waiting.
+    if nkeys > 10 {
+      cinfo.next = BTreeMap::new();
+      return true;
+    }
+
+    // LigoGPS.pm:179-180 — order the 10 enciphered digits, starting at the OLD
+    // `ch1` (the just-added edge's source).
+    let mut order: Vec<u8> = Vec::new();
+    let mut did: BTreeSet<u8> = BTreeSet::new();
+    let mut steps: usize = 0;
+    if !order_cipher_digits(ch1, &cinfo.next, &mut order, &mut did, &mut steps) {
+      // DoS: distinguish a step-budget abort from a genuinely-unorderable set. On
+      // budget exhaustion abandon discovery (a one-time warning); otherwise wait
+      // for more records (LigoGPS.pm:180 `return 1 unless OrderCipherDigits(...)`).
+      if steps > MAX_CIPHER_STEPS {
+        cinfo.abandoned = true;
+        out.set_warning(SmolStr::new(CIPHER_ABANDON_WARNING));
+      }
+      return true;
+    }
+
+    // LigoGPS.pm:181-183 — locate the enciphered "2" (the year millennium) in
+    // the cycle; without it the absolute digit alignment is unknown.
+    let Some(two) = order.iter().position(|&c| c == millennium) else {
+      out.set_warning(SmolStr::new("Problem deciphering LIGOGPSINFO")); // :183
+      return true;
+    };
+
+    // LigoGPS.pm:185-189 — build the reverse-cipher table. (LigoGPS.pm:184
+    // `delete $$cipherInfo{'next'}` is modelled by `decipher` becoming `Some`,
+    // which the cleanup check reads as "discovery done".)
+    let mut map = [0u8; CIPHER_RANGE];
+    let mut set = [false; CIPHER_RANGE];
+    // LigoGPS.pm:185 `my %decipher = ( $colon => ':' )`.
+    decipher_set(&mut map, &mut set, colon, b':');
+    // LigoGPS.pm:186-189 — `$order[($_ + $two - 2 + 10) % 10]` deciphers to digit
+    // `$_` (i.e. `chr($_ + 0x30)`).
+    for d in 0u8..10 {
+      let idx = (usize::from(d) + two + 10 - 2) % 10;
+      if let Some(&ch) = order.get(idx) {
+        decipher_set(&mut map, &mut set, ch, b'0' + d);
+      }
+    }
+
+    // LigoGPS.pm:191-201 — learn the lat/lon quadrant from the coordinate signs.
+    if let Some((ns_ch, lat_neg, ew_ch, lon_neg)) = match_quadrant(rec, colon) {
+      // LigoGPS.pm:192 `@decipher{$1,$3} = ($2 ? 'S' : 'N', $4 ? 'W' : 'E')`.
+      decipher_set(&mut map, &mut set, ns_ch, if lat_neg { b'S' } else { b'N' });
+      decipher_set(&mut map, &mut set, ew_ch, if lon_neg { b'W' } else { b'E' });
+      // LigoGPS.pm:193-200 — both coordinates positive ⇒ the hemisphere is
+      // ambiguous. exifast exposes no `GPSQuadrant` API option, so it always
+      // takes ExifTool's no-option branch: keep the 'N'/'E' default (already set
+      // above) and warn.
+      if !lat_neg && !lon_neg {
+        out.set_warning(SmolStr::new(
+          "May need to set API GPSQuadrant option (eg. \"NW\")",
+        ));
+      }
+    }
+
+    // LigoGPS.pm:203 — fill every still-unknown 0x30..=0x5f entry with '?'.
+    for (slot, known) in map.iter_mut().zip(set.iter()) {
+      if !*known {
+        *slot = b'?';
+      }
+    }
+
+    // LigoGPS.pm:204 — commit the table (so flag discovery complete).
+    let table = map;
+    cinfo.decipher = Some(DecipherTable { map: table });
+
+    // LigoGPS.pm:205-218 — decipher + parse every cached record, oldest first
+    // (the current record is the last cache entry, LigoGPS.pm:161).
+    let cache = core::mem::take(&mut cinfo.cache);
+    for cached in &cache {
+      apply_and_parse(cached, &table, scale_id, no_fuzz, out);
+    }
+    return true;
+  }
+
+  // LigoGPS.pm:208-218 (post-discovery record) — the cipher is already known, so
+  // decipher + parse THIS record directly (the cache was drained at discovery).
+  if let Some(table) = cinfo.decipher.as_ref().map(|t| t.map) {
+    apply_and_parse(rec, &table, scale_id, no_fuzz, out);
+  }
+  true
 }
 
 // ===========================================================================
@@ -1242,6 +1763,275 @@ mod tests {
     }
     let out = decrypt_record(&buf).expect("decrypts");
     assert_eq!(out, b"AAAA");
+  }
+
+  // ── decipher (cipher discovery, #136 — LigoGPS.pm:101-221) ──────────────────
+
+  /// Rotation cipher matching `tools/gen_ligogps_decipher_fixture.py` (K=11): a
+  /// bijection on `0x30..=0x5f`; structural bytes pass through. K=11 keeps
+  /// `E(':')='E'` a non-metacharacter so bundled ExifTool's `$colon`-interpolated
+  /// quadrant regex (LigoGPS.pm:191) agrees with the literal-byte port.
+  fn encipher(text: &[u8]) -> Vec<u8> {
+    text
+      .iter()
+      .map(|&c| {
+        if (0x30..=0x5f).contains(&c) {
+          0x30 + ((c - 0x30 + 11) % 48)
+        } else {
+          c
+        }
+      })
+      .collect()
+  }
+
+  /// One 0x84-byte ENCIPHERED record: `####` + counter 0 (LE u32 < 4 ⇒
+  /// `DecryptLigoGPS` fails, LigoGPS.pm:54) + enciphered(body) + NUL pad.
+  fn enciphered_record(body: &str) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(0x84);
+    rec.extend_from_slice(b"####");
+    rec.extend_from_slice(&0u32.to_le_bytes());
+    rec.extend_from_slice(&encipher(body.as_bytes()));
+    rec.resize(0x84, 0);
+    rec
+  }
+
+  /// A `LIGOGPSINFO\0` block whose records start at `0x14`; preamble bytes
+  /// `0x0c..0x10 = [0,0,0,0x14]` set `ProcessLigoGPS`'s `noFuzz`
+  /// (LigoGPS.pm:299) so the raw coordinates survive + speed scales knots→km/h.
+  fn ligo_block(bodies: &[String]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(HDR_LIGOGPSINFO); // 0x00-0x0b
+    b.extend_from_slice(&[0, 0, 0, 0x14]); // 0x0c-0x0f → noFuzz
+    b.extend_from_slice(&[0, 0, 0, 0]); // 0x10-0x13
+    for body in bodies {
+      b.extend_from_slice(&enciphered_record(body));
+    }
+    b
+  }
+
+  #[test]
+  fn decipher_discovers_and_decodes_full_cycle() {
+    // 12 enciphered records, seconds advancing 00..11 → all 10 unit-digit
+    // transitions seen → discovery at record 11 (the 11 cached records decipher),
+    // record 12 takes the post-discovery direct path. Each decodes to the same
+    // -31.285065 S / -124.759483 W fix; the speed is knots * 1.852 (noFuzz).
+    let bodies: Vec<String> = (0..12)
+      .map(|s| format!("2024/06/27 12:34:{s:02} S:-31.285065 W:-124.759483 20.50"))
+      .collect();
+    let block = ligo_block(&bodies);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert!(
+      out.warning().is_none(),
+      "clean discovery emits no warning: {:?}",
+      out.warning()
+    );
+    assert_eq!(out.samples().len(), 12, "all 12 records decipher + parse");
+    let first = &out.samples()[0];
+    assert_eq!(first.date_time(), Some("2024:06:27 12:34:00"));
+    assert_eq!(first.latitude(), Some(-31.285065));
+    assert_eq!(first.longitude(), Some(-124.759483));
+    // 20.50 knots * 1.852 = 37.966 km/h.
+    assert!((first.speed_kph().unwrap() - 37.966).abs() < 1e-9);
+    // The 12th (post-discovery, direct-decipher) record carries seconds "11".
+    assert_eq!(out.samples()[11].date_time(), Some("2024:06:27 12:34:11"));
+    assert_eq!(out.samples()[11].latitude(), Some(-31.285065));
+  }
+
+  #[test]
+  fn decipher_positive_coords_warn_gps_quadrant() {
+    // Both coordinates POSITIVE (no `-` sign) ⇒ the hemisphere is ambiguous; with
+    // no GPSQuadrant API option exifast takes ExifTool's no-option path: the refs
+    // default to N/E and a `May need to set API GPSQuadrant` warning fires
+    // (LigoGPS.pm:193-200).
+    let bodies: Vec<String> = (0..12)
+      .map(|s| format!("2024/06/27 12:34:{s:02} N:31.285065 E:124.759483 20.50"))
+      .collect();
+    let block = ligo_block(&bodies);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert_eq!(
+      out.warning(),
+      Some("May need to set API GPSQuadrant option (eg. \"NW\")")
+    );
+    assert_eq!(out.samples().len(), 12);
+    // N/E default ⇒ POSITIVE coordinates (the deciphered ref letters are N/E).
+    assert_eq!(out.samples()[0].latitude(), Some(31.285065));
+    assert_eq!(out.samples()[0].longitude(), Some(124.759483));
+  }
+
+  #[test]
+  fn decipher_too_few_points_warns_not_enough() {
+    // Only 3 records (2 transitions) — discovery never reaches the 10-key gate
+    // (LigoGPS.pm:176), so NO record is deciphered. The `CleanupCipher`
+    // not-enough-points warning (LigoGPS.pm:25-30) now fires ONCE at FILE END via
+    // `finish_cipher_discovery`, not at the walk's end (the file-level-state fix),
+    // so the walk leaves the state in place and the cleanup call surfaces it.
+    let bodies: Vec<String> = (0..3)
+      .map(|s| format!("2024/06/27 12:34:{s:02} S:-31.285065 W:-124.759483 20.50"))
+      .collect();
+    let block = ligo_block(&bodies);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert!(out.samples().is_empty(), "no cipher ⇒ no decoded samples");
+    // The walk itself does NOT fire the cleanup any more (it fires at file end).
+    assert!(
+      out.warning().is_none(),
+      "cleanup deferred to file end: {:?}",
+      out.warning()
+    );
+    out.finish_cipher_discovery();
+    assert_eq!(
+      out.warning(),
+      Some("Not enough GPS points to determine cipher for decoding LIGOGPSINFO")
+    );
+  }
+
+  #[test]
+  fn decipher_records_that_decrypt_never_enter_discovery() {
+    // A record whose counter ≥ 4 AND whose body decrypts cleanly stays on the
+    // DecryptLigoGPS path — discovery is never entered, so the not-enough-points
+    // cleanup warning must NOT fire. (Mirror the plain `parse_record` shape: a
+    // `####` record built so DecryptLigoGPS succeeds.) Here a single steering-0x00
+    // round (`0x00 0x41` ⇒ 'A') padded — decrypt yields a non-date body that
+    // ParseLigoGPS rejects, but crucially the cipher state is NEVER created.
+    let mut rec = Vec::with_capacity(0x84);
+    rec.extend_from_slice(b"####");
+    rec.extend_from_slice(&8u32.to_le_bytes()); // num = 8 (≥ 4 ⇒ decrypt proceeds)
+    for _ in 0..4 {
+      rec.push(0x00); // steering 0x00
+      rec.push(0x41); // ⇒ 'A'
+    }
+    rec.resize(0x84, 0);
+    let mut block = Vec::new();
+    block.extend_from_slice(HDR_LIGOGPSINFO);
+    block.extend_from_slice(&[0, 0, 0, 0x14]);
+    block.extend_from_slice(&[0, 0, 0, 0]);
+    block.extend_from_slice(&rec);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+    // Decrypt succeeded → "AAAA" body → ParseLigoGPS format error (not a date),
+    // but NO cipher discovery was started ⇒ no "Not enough GPS points" warning.
+    assert_ne!(
+      out.warning(),
+      Some("Not enough GPS points to determine cipher for decoding LIGOGPSINFO")
+    );
+  }
+
+  #[test]
+  fn order_cipher_digits_finds_simple_cycle() {
+    // next = 0→1→2→…→9→0 (each a single edge). Starting at '0', the order is the
+    // full advancing cycle.
+    let mut next: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    for d in 0u8..10 {
+      next.insert(b'0' + d, Vec::from([b'0' + (d + 1) % 10]));
+    }
+    let mut order = Vec::new();
+    let mut did = BTreeSet::new();
+    let mut steps = 0usize;
+    assert!(order_cipher_digits(
+      b'0', &next, &mut order, &mut did, &mut steps
+    ));
+    assert_eq!(order, (0..10).map(|d| b'0' + d).collect::<Vec<_>>());
+    // A clean 10-cycle orders in far fewer than the DoS budget.
+    assert!(steps < MAX_CIPHER_STEPS);
+  }
+
+  #[test]
+  fn order_cipher_digits_backtracks_past_dead_end() {
+    // A skip puts TWO candidates on digit '1' with the DEAD-END first: 1→[3,2].
+    // Taking 1→3 skips '2' and cannot visit all 10 (fails); the backtracking
+    // (`%did` per-branch copy + `order` truncate) recovers via 1→2 → the natural
+    // cycle 0,1,2,…,9.
+    let mut next: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    next.insert(b'0', Vec::from([b'1']));
+    next.insert(b'1', Vec::from([b'3', b'2'])); // dead-end candidate FIRST
+    next.insert(b'2', Vec::from([b'3']));
+    for d in 3u8..10 {
+      next.insert(b'0' + d, Vec::from([b'0' + (d + 1) % 10]));
+    }
+    let mut order = Vec::new();
+    let mut did = BTreeSet::new();
+    let mut steps = 0usize;
+    assert!(order_cipher_digits(
+      b'0', &next, &mut order, &mut did, &mut steps
+    ));
+    assert_eq!(order, (0..10).map(|d| b'0' + d).collect::<Vec<_>>());
+    assert!(steps < MAX_CIPHER_STEPS);
+  }
+
+  #[test]
+  fn cipher_state_persists_across_two_process_ligogps_calls() {
+    // FINDING 1 — the cipher-discovery state is FILE-level (on the shared
+    // `LigoGpsMeta`), NOT call-local. Split the 12-record advancing-seconds
+    // sequence across TWO LigoGPS blocks processed on ONE `LigoGpsMeta`. Neither
+    // block alone reaches the 10-transition discovery gate (block A contributes 5
+    // transitions, block B the remaining 5), but the file-level state accumulates
+    // across both `process_ligogps` calls, so discovery completes in block B and
+    // ALL 12 records decode. With the old call-local state each walk would reset —
+    // neither block would discover and NO sample would decode.
+    let bodies: Vec<String> = (0..12)
+      .map(|s| format!("2024/06/27 12:34:{s:02} S:-31.285065 W:-124.759483 20.50"))
+      .collect();
+    let block_a = ligo_block(&bodies[0..6]);
+    let block_b = ligo_block(&bodies[6..12]);
+    let mut out = LigoGpsMeta::new();
+
+    process_ligogps(&block_a, 0, &mut out, false);
+    // Block A alone contributes only 5 transitions — below the 10-key gate — so no
+    // record has deciphered yet.
+    assert!(
+      out.samples().is_empty(),
+      "block A alone must not reach the discovery gate"
+    );
+
+    process_ligogps(&block_b, 0, &mut out, false);
+    out.finish_cipher_discovery();
+
+    assert!(
+      out.warning().is_none(),
+      "cross-call discovery completes cleanly: {:?}",
+      out.warning()
+    );
+    assert_eq!(
+      out.samples().len(),
+      12,
+      "all 12 records decode via the file-level cipher state"
+    );
+    assert_eq!(out.samples()[0].date_time(), Some("2024:06:27 12:34:00"));
+    assert_eq!(out.samples()[0].latitude(), Some(-31.285065));
+    assert_eq!(out.samples()[11].date_time(), Some("2024:06:27 12:34:11"));
+  }
+
+  #[test]
+  fn cipher_discovery_abandons_over_cap_input() {
+    // FINDING 2 — a crafted file whose `####` records never complete discovery
+    // must not grow the record cache unboundedly. Feed the SAME enciphered-but-
+    // undecryptable record far past `MAX_CIPHER_CACHE`: the `####`+counter-0 header
+    // fails `DecryptLigoGPS` (num < 4) and the enciphered date prefix matches, so
+    // every record is cached; its single seconds-units digit never accumulates 10
+    // distinct transitions, so discovery never completes. On exceeding the cap the
+    // discovery is abandoned with a one-time warning and further records are
+    // dropped — the loop terminates (no hang) and the cache stays bounded.
+    let rec = enciphered_record("2024/06/27 12:34:00 S:-31.285065 W:-124.759483 20.50");
+    let mut cipher: Option<CipherDiscovery> = None;
+    let mut out = LigoGpsMeta::new();
+    for _ in 0..(MAX_CIPHER_CACHE + 100) {
+      decipher_ligogps(&rec, &mut cipher, None, true, &mut out);
+    }
+
+    assert_eq!(out.warning(), Some(CIPHER_ABANDON_WARNING));
+    let state = cipher.as_ref().expect("cipher state created");
+    assert!(state.abandoned, "discovery abandoned after the cap");
+    assert!(
+      state.cache.len() <= MAX_CIPHER_CACHE,
+      "cache bounded at {} (cap {MAX_CIPHER_CACHE})",
+      state.cache.len(),
+    );
+    assert!(out.samples().is_empty(), "no record ever decodes");
   }
 
   // ── unfuzz ────────────────────────────────────────────────────────────────
