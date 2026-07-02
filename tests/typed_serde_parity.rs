@@ -1830,7 +1830,17 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///     no-`ee` `.json`/`.n.json` carry only the container + the `[minor]
 ///     ExtractEmbedded` notice (the deciphered GPS surfaces under `-ee`, pinned in
 ///     `timed_metadata_conformance.rs::ligogps_decipher_ee_byte_exact`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 656;
+///
+/// `656 -> 658`: the #142 PNG bare-XML XMP chunk decoders (`meTa` + `seAl`) —
+///   * `PNG_meta.png` (`tools/gen_png_meta_seal_fixture.py`) — a `meTa` chunk
+///     (`PNG.pm:368` -> `%XMP::XML`), a UTF-16-BOM `<meta>` XML blob whose
+///     `dc:creator`/`dc:title` emit under family-0 `XML` / family-1 `XML-dc`
+///     (`FoundXMP`'s `$xmlGroups` path, XMP.pm:3713).
+///   * `PNG_seal.png` — a `seAl` chunk (`PNG.pm:380` -> `%XMP::SEAL`), a SEAL
+///     content-auth XML blob whose `seal`/`ka`/`kv`/`da`/`s`/`info` emit under
+///     family-0 `XML` / family-1 `SEAL` (the flat SEAL table, XMP2.pl:1876; the
+///     `<seal>` container stripped by `FoundSEAL`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 659;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

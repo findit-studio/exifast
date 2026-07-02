@@ -922,6 +922,19 @@ pub struct PngMeta<'a> {
   /// alongside the PNG warnings. The same "sub-Meta hangs off the parent Meta"
   /// shape as `GeoTiffMeta`/`MngMeta`.
   jumbf: Option<crate::exif::jumbf::JumbfMeta>,
+  // ----- meTa / seAl bare-XML XMP subsystem (XMP::XML / XMP::SEAL) --------
+  /// The decoded XMP sub-metadata of the PNG `meTa` (`%XMP::XML`, `PNG.pm:368`,
+  /// a UTF-16-BOM XML blob) and `seAl` (`%XMP::SEAL`, `PNG.pm:380`, SEAL
+  /// content-auth XML) chunks, in chunk-walk order. Each is an independent
+  /// `ProcessXMP` run ([`crate::formats::xmp::parse_bare_xml`]) emitting under
+  /// family-0 `XML` (family-1 `XML-<ns>` for `meTa`, `SEAL` for `seAl`). Empty
+  /// for a PNG with neither chunk (and for a chunk whose XML extracted nothing).
+  /// Spliced AFTER the PNG-level tags in [`crate::formats::png::ProcessPng`]'s
+  /// `tags()`, the same "sub-Meta hangs off the parent Meta" shape as
+  /// [`Self::jumbf`]. Gated on the optional `xmp` module, like
+  /// [`Self::xmp_profiles`].
+  #[cfg(feature = "xmp")]
+  xml_metas: Vec<crate::formats::xmp::XmpMeta<'static>>,
   /// The JUMBF walker warnings of EACH dispatched `caBX` chunk, one inner `Vec`
   /// per `caBX` (in chunk-walk order). [`PngDiagStep::Jumbf`] carries the index
   /// into this list, so each `caBX`'s warnings drain at ITS walk position — the
@@ -934,6 +947,27 @@ pub struct PngMeta<'a> {
   /// ([[exifast-warning-priority0-firstwins]]). Only a NON-empty decode pushes an
   /// entry (an empty `caBX` is dropped whole, see [`Self::set_jumbf`]).
   jumbf_diags: Vec<Vec<crate::exif::jumbf::JumbfWarning>>,
+  // ----- cpIp OLE compound-document / FlashPix subsystem (FlashPix.pm) ----
+  /// Whether a `cpIp` chunk was seen (`PNG.pm:354`). Its `Condition`
+  /// (`PNG.pm:355-361`) mutates `File:FileType` from `PNG` to `PNG Plus` on mere
+  /// PRESENCE — INDEPENDENT of whether the OLE decode yielded any tag (a garbage
+  /// or empty `cpIp` still promotes, oracle-verified vs 13.59). So this flag
+  /// (NOT [`Self::flashpix`]) drives the FileType promotion in
+  /// [`crate::format_parser`].
+  has_cpip: bool,
+  /// The decoded FlashPix metadata of the PNG `cpIp` chunk (`PNG.pm:354-367` →
+  /// `FlashPix::ProcessFPX`), produced by [`crate::formats::ole::process`]. `None`
+  /// for a PNG with no `cpIp` (and for a `cpIp` whose OLE recognized nothing).
+  /// Emitted via its [`Taggable`](crate::emit::Taggable) impl under family-0 /
+  /// family-1 `FlashPix`, appended AFTER the PNG-level tags; its diagnostics drain
+  /// alongside the PNG warnings. Same "sub-Meta hangs off the parent Meta" shape
+  /// as [`Self::jumbf`].
+  flashpix: Option<crate::formats::ole::FlashPixMeta>,
+  /// The FlashPix walker warnings of EACH dispatched `cpIp` chunk, one inner
+  /// `Vec` per non-empty `cpIp` (in chunk-walk order). [`PngDiagStep::FlashPix`]
+  /// carries the index into this list so the warnings drain at the `cpIp` walk
+  /// position — the same per-occurrence diagnostic axis as [`Self::jumbf_diags`].
+  flashpix_diags: Vec<Vec<smol_str::SmolStr>>,
   /// Phantom carry of `'a` for future zero-alloc evolution / sub-Meta
   /// embedding.
   _lifetime: core::marker::PhantomData<&'a ()>,
@@ -968,6 +1002,12 @@ pub(crate) enum PngDiagStep {
   /// malformed LATER `caBX` does NOT steal that slot from an earlier-walked
   /// warning, matching ExifTool's walk-position emission.
   Jumbf(usize),
+  /// A `cpIp` chunk's FlashPix sub-Meta — its OLE/`ProcessFPX` walker warnings
+  /// (`Truncated FPX properties`, `Bad FPX property section offset`, …) drain at
+  /// the `cpIp` chunk-walk position. Carries the index into
+  /// [`PngMeta::flashpix_diags`] of THAT `cpIp`'s warnings, mirroring
+  /// [`Self::Jumbf`]'s per-occurrence diagnostic axis.
+  FlashPix(usize),
 }
 
 /// The payload LENGTHS of a `Binary => 1` PNG vendor chunk (`iDOT` /
@@ -1261,7 +1301,12 @@ impl PngMeta<'_> {
       container: PngContainer::Png,
       mng: None,
       jumbf: None,
+      #[cfg(feature = "xmp")]
+      xml_metas: Vec::new(),
       jumbf_diags: Vec::new(),
+      has_cpip: false,
+      flashpix: None,
+      flashpix_diags: Vec::new(),
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -1946,6 +1991,27 @@ impl PngMeta<'_> {
     }
   }
 
+  /// Record the decoded XMP sub-metadata of a `meTa`/`seAl` bare-XML chunk —
+  /// the chunk-walker hook (`PNG.pm:368`/`:380`). Accumulates in chunk-walk
+  /// order (a PNG may carry more than one such chunk). An extraction that
+  /// yielded nothing is already dropped by
+  /// [`crate::formats::xmp::parse_bare_xml`] returning `None`, so every stored
+  /// entry emits at least one tag.
+  #[cfg(feature = "xmp")]
+  #[inline]
+  pub(crate) fn push_xml_meta(&mut self, meta: crate::formats::xmp::XmpMeta<'static>) {
+    self.xml_metas.push(meta);
+  }
+
+  /// The decoded `meTa`/`seAl` bare-XML XMP sub-Metas, in chunk-walk order.
+  /// Empty for a PNG carrying neither chunk.
+  #[cfg(feature = "xmp")]
+  #[inline]
+  #[must_use]
+  pub(crate) fn xml_metas(&self) -> &[crate::formats::xmp::XmpMeta<'static>] {
+    &self.xml_metas
+  }
+
   /// The JUMBF walker warnings recorded for the `caBX` occurrence at `index` (the
   /// index a [`PngDiagStep::Jumbf`] carries) — the per-occurrence diagnostic
   /// drain reads them at the `caBX` walk position. `None` for an out-of-range
@@ -1954,6 +2020,51 @@ impl PngMeta<'_> {
   #[must_use]
   pub(crate) fn jumbf_diag(&self, index: usize) -> Option<&[crate::exif::jumbf::JumbfWarning]> {
     self.jumbf_diags.get(index).map(Vec::as_slice)
+  }
+
+  /// Whether a `cpIp` chunk was seen (`PNG.pm:354`). Drives the `File:FileType` →
+  /// `PNG Plus` promotion (`PNG.pm:355-361`), which fires on mere PRESENCE of the
+  /// chunk, independent of whether the OLE decode yielded any FlashPix tag.
+  #[inline]
+  #[must_use]
+  pub(crate) fn has_cpip(&self) -> bool {
+    self.has_cpip
+  }
+
+  /// Record that a `cpIp` chunk was seen (the chunk-walker hook, `PNG.pm:354`) and
+  /// splice its decoded FlashPix metadata. The PRESENCE flag is set
+  /// unconditionally (it drives the `PNG Plus` FileType promotion); a NON-empty
+  /// decode additionally stores the tag meta and appends a [`PngDiagStep::FlashPix`]
+  /// at this walk position carrying the index of THAT `cpIp`'s warnings (mirroring
+  /// [`Self::set_jumbf`]). An empty decode ([`FlashPixMeta::is_empty`]) is dropped
+  /// whole so the PNG output stays byte-identical.
+  #[inline]
+  pub(crate) fn set_flashpix(&mut self, flashpix: crate::formats::ole::FlashPixMeta) {
+    self.has_cpip = true;
+    if !flashpix.is_empty() {
+      self
+        .diag_order
+        .push(PngDiagStep::FlashPix(self.flashpix_diags.len()));
+      self.flashpix_diags.push(flashpix.warnings().to_vec());
+      self.flashpix = Some(flashpix);
+    }
+  }
+
+  /// The decoded FlashPix metadata of a `cpIp` chunk, if any. `None` for a PNG
+  /// with no `cpIp` (and for a `cpIp` whose OLE recognized nothing).
+  #[inline]
+  #[must_use]
+  pub(crate) fn flashpix(&self) -> Option<&crate::formats::ole::FlashPixMeta> {
+    self.flashpix.as_ref()
+  }
+
+  /// The FlashPix walker warnings recorded for the `cpIp` occurrence at `index`
+  /// (the index a [`PngDiagStep::FlashPix`] carries). `None` for an out-of-range
+  /// index (defensive; the drain only replays recorded steps).
+  #[inline]
+  #[must_use]
+  pub(crate) fn flashpix_diag(&self, index: usize) -> Option<&[smol_str::SmolStr]> {
+    self.flashpix_diags.get(index).map(Vec::as_slice)
   }
 
   /// The WALK-ORDER interleaving of the three document-diagnostic sources (one

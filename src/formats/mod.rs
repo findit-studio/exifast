@@ -64,6 +64,10 @@ pub mod mxf;
 pub mod mpeg;
 #[cfg(feature = "ogg")]
 pub mod ogg;
+// OLE compound-document (Windows Compound Binary File) decoder for the PNG
+// `cpIp` chunk → FlashPix `ProcessFPX` (#142). Gated with `png` (its sole user).
+#[cfg(feature = "png")]
+pub mod ole;
 // PLIST — engine-only per FORMATS.md row 12b. Leaf format (no cross-format
 // chains); ports both the binary (`bplist0…`) and XML plist encodings.
 #[cfg(feature = "plist")]
