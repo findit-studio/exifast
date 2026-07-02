@@ -218,7 +218,7 @@ pub(crate) fn populate_typed_value(typed: &mut MakerNotesPentax, tag_id: u16, ra
 pub(crate) fn emit_lens_rec(
   block: &[u8],
   print_conv: bool,
-  emissions: &mut std::vec::Vec<super::VendorEmission>,
+  emissions: &mut std::vec::Vec<super::VendorEmission<'_>>,
 ) {
   let (Some(&series), Some(&model)) = (block.first(), block.get(1)) else {
     return;
@@ -313,10 +313,10 @@ pub(crate) fn populate_lens_type(typed: &mut MakerNotesPentax, block: &[u8]) {
 /// the RIFF output is the emission stream only.
 #[cfg(feature = "alloc")]
 #[must_use]
-pub fn redispatch_avi_makernote(
+pub fn redispatch_avi_makernote<'e>(
   hymn_payload: &[u8],
   print_conv: bool,
-) -> std::vec::Vec<super::VendorEmission> {
+) -> std::vec::Vec<super::VendorEmission<'e>> {
   use crate::exif::ifd::ByteOrder;
   use crate::exif::makernotes::{BaseRule, ChildByteOrder, DetectedMakerNote, Vendor};
   // `%Pentax::AVI` hymn/mknt SubDirectory directives (`Pentax.pm:6376-6394`):

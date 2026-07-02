@@ -293,7 +293,7 @@ pub(crate) fn emit_af_info(
   sub: &[u8],
   print_conv: bool,
   model: Option<&str>,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // The AFInfo SubDirectory's own byte order (the table-level `ByteOrder`
   // directive). DSLRs → BigEndian; else LittleEndian. The parent IFD's order
@@ -436,7 +436,7 @@ pub(crate) fn emit_color_balance(
   order: ByteOrder,
   print_conv: bool,
   keys: Option<DecryptKeys>,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // `ColorBalanceVersion` = the first 4 ASCII bytes (`Condition => '$$valPt =~
   // /^…/'`). A value shorter than 4 bytes matches no arm.
@@ -515,7 +515,7 @@ pub(crate) fn emit_flash_info(
   sub: &[u8],
   order: ByteOrder,
   print_conv: bool,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // `FlashInfoVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
   let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
@@ -537,16 +537,18 @@ pub(crate) fn emit_flash_info(
   // The shared int8u read + conv push (`FORMAT => 'int8u'` is the table
   // default). A byte past the value length emits nothing; a `None` from a
   // RawConv-undef drop (FlashFocalLength/RepeatingFlashRate 0) is skipped.
-  let push_u8 =
-    |emissions: &mut Vec<VendorEmission>, offset: usize, name: &'static str, conv: NikonConv| {
-      let Some(&byte) = sub.get(offset) else {
-        return;
-      };
-      let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
-      if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
-        emissions.push(VendorEmission::new(name.into(), value, false));
-      }
+  let push_u8 = |emissions: &mut Vec<VendorEmission<'_>>,
+                 offset: usize,
+                 name: &'static str,
+                 conv: NikonConv| {
+    let Some(&byte) = sub.get(offset) else {
+      return;
     };
+    let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
+    if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
+      emissions.push(VendorEmission::new(name.into(), value, false));
+    }
+  };
 
   // offset 4 `FlashSource` (int8u).
   push_u8(emissions, 4, "FlashSource", NikonConv::FlashSource);
@@ -741,7 +743,7 @@ pub(crate) fn emit_shot_info(
   sub: &[u8],
   print_conv: bool,
   keys: Option<DecryptKeys>,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // `ShotInfoVersion` (offset 0, `Format => 'string[4]'`): the first 4 ASCII
   // bytes. Read from the ORIGINAL (cleartext) bytes — the version prefix is
@@ -924,7 +926,7 @@ fn emit_shot_info_u8(
   print_conv: bool,
   conv: NikonConv,
   name: &'static str,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   let Some(&byte) = body.get(offset) else {
     return;
@@ -945,7 +947,7 @@ fn emit_shot_info_int(
   format: Format,
   order: ByteOrder,
   name: &'static str,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // The base ShotInfo counts are `Priority => 0` (`Nikon.pm:6019/6026/6058/6081`):
   // a duplicate must NOT override a higher-priority same-name tag (the Main 0x00a7
@@ -1021,7 +1023,7 @@ fn emit_masked_control_mode(
   name: &'static str,
   print_conv: bool,
   order: ByteOrder,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) -> Option<i64> {
   let &byte = sub.get(offset)?;
   let masked = i64::from(byte & 0x0f);
@@ -1054,7 +1056,7 @@ fn emit_flash_output_or_comp(
   // offset-17/18 `FlashGroup{A,B}Compensation`). The `FlashOutput` arm is never
   // `Priority => 0`.
   comp_priority: u8,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   let Some(&byte) = sub.get(offset) else {
     return;
@@ -1338,7 +1340,7 @@ pub(crate) fn emit_lens_data(
   print_conv: bool,
   keys: Option<DecryptKeys>,
   focus_mode: Option<&str>,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // `LensDataVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
   let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
@@ -1497,7 +1499,7 @@ fn emit_lens_data_0800_new(
   order: ByteOrder,
   print_conv: bool,
   focus_mode: Option<&str>,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   // `0x2f` NewLensData (`undef[17]`): set the flag UNLESS `/^.\0+$/s` (the lead
   // byte is anything and bytes 1..17 are all NUL) — the same forward-look test
@@ -1714,7 +1716,7 @@ fn emit_z_int16u(
   // NEW-block `MaxAperture`/`FNumber`/`FocalLength` rows,
   // `Nikon.pm:5891/5901/5911`; `1` for the firmware/focus members).
   priority: u8,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   let Some(n) = read_z_int16u(body, offset, order) else {
     return;
@@ -1740,7 +1742,7 @@ fn emit_z_int8u(
   conv: NikonConv,
   unknown: bool,
   name: &'static str,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   let Some(&byte) = body.get(offset) else {
     return;
@@ -1785,7 +1787,7 @@ fn emit_z_int32s(
   order: ByteOrder,
   print_conv: bool,
   name: &'static str,
-  emissions: &mut Vec<VendorEmission>,
+  emissions: &mut Vec<VendorEmission<'_>>,
 ) {
   let avail = match body.len().checked_sub(offset) {
     Some(a) => a,
@@ -1883,31 +1885,31 @@ mod tests {
   // layout cannot be resolved (`resolve_layout` fail); the oracle returned empties
   // there, so the shim maps `None` to `(MakerNotesNikon::new(), empty)` to preserve
   // that contract (e.g. the empty-blob test).
-  fn parse(
+  fn parse<'e>(
     blob: &[u8],
     order: ByteOrder,
     model: Option<&str>,
-  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+  ) -> (MakerNotesNikon, Vec<VendorEmission<'e>>) {
     parse_in_tiff(blob, 0, blob.len(), order, true, model)
   }
 
-  fn parse_with_print_conv(
+  fn parse_with_print_conv<'e>(
     blob: &[u8],
     order: ByteOrder,
     print_conv: bool,
     model: Option<&str>,
-  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+  ) -> (MakerNotesNikon, Vec<VendorEmission<'e>>) {
     parse_in_tiff(blob, 0, blob.len(), order, print_conv, model)
   }
 
-  fn parse_in_tiff(
+  fn parse_in_tiff<'e>(
     blob: &[u8],
     mn_offset: usize,
     mn_len: usize,
     order: ByteOrder,
     print_conv: bool,
     model: Option<&str>,
-  ) -> (MakerNotesNikon, Vec<VendorEmission>) {
+  ) -> (MakerNotesNikon, Vec<VendorEmission<'e>>) {
     match crate::exif::nikon_makernote_isolated(blob, mn_offset, mn_len, order, model, print_conv) {
       Some((emissions, typed)) => (typed, emissions),
       None => (MakerNotesNikon::new(), Vec::new()),
@@ -1943,7 +1945,7 @@ mod tests {
     assert!(names.contains(&"Quality"));
     assert!(names.contains(&"LensType"));
     let q = emissions.iter().find(|e| e.name() == "Quality").unwrap();
-    assert_eq!(q.value(), &TagValue::Str(SmolStr::new("Fine")));
+    assert_eq!(q.value().as_ref(), &TagValue::Str(SmolStr::new("Fine")));
   }
 
   /// An ENCRYPTED ShotInfo (`02xx`) with NO decryption keys emits NOTHING — not
@@ -2045,7 +2047,7 @@ mod tests {
       emissions
         .iter()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     assert_eq!(
       get("AFAreaMode"),
@@ -2096,7 +2098,7 @@ mod tests {
       emissions
         .iter()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     assert_eq!(
       get("AFAreaMode"),
@@ -2176,12 +2178,12 @@ mod tests {
       serial: KEY_SERIAL,
       count: KEY_COUNT,
     };
-    let mut em: Vec<VendorEmission> = Vec::new();
+    let mut em: Vec<VendorEmission<'_>> = Vec::new();
     emit_color_balance(&enc, ByteOrder::Big, false, Some(keys), &mut em);
     let wb = em
       .iter()
       .find(|e| e.name() == "WB_RGGBLevels")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(
       wb,
       Some(TagValue::Str(SmolStr::new("562 256 256 537"))),
@@ -2189,7 +2191,7 @@ mod tests {
     );
 
     // Without keys, ProcessNikonEncrypted extracts nothing.
-    let mut em_nokey: Vec<VendorEmission> = Vec::new();
+    let mut em_nokey: Vec<VendorEmission<'_>> = Vec::new();
     emit_color_balance(&enc, ByteOrder::Big, false, None, &mut em_nokey);
     assert!(
       em_nokey.is_empty(),
@@ -2222,12 +2224,12 @@ mod tests {
       serial: KEY_SERIAL,
       count: KEY_COUNT,
     };
-    let mut em: Vec<VendorEmission> = Vec::new();
+    let mut em: Vec<VendorEmission<'_>> = Vec::new();
     emit_color_balance(&enc, ByteOrder::Big, false, Some(keys), &mut em);
     let wb = em
       .iter()
       .find(|e| e.name() == "WB_GRBGLevels")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(
       wb,
       Some(TagValue::Str(SmolStr::new("600 256 256 580"))),
@@ -2341,7 +2343,7 @@ mod tests {
       emissions
         .iter()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     assert_eq!(get("Quality"), Some(TagValue::Str(SmolStr::new("F"))));
     assert!(
@@ -2432,7 +2434,7 @@ mod tests {
       emissions
         .iter()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     // The Type2 names — matching the oracle exactly.
     assert_eq!(get("Quality"), Some(TagValue::Str(SmolStr::new("F"))));
@@ -2472,7 +2474,7 @@ mod tests {
     let dz = emissions
       .iter()
       .find(|e| e.name() == "DigitalZoom")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(
       dz,
       Some(TagValue::I64(2)),
@@ -2676,11 +2678,11 @@ mod tests {
     buf
   }
 
-  fn lens_get(emissions: &[VendorEmission], name: &str) -> Option<TagValue> {
+  fn lens_get(emissions: &[VendorEmission<'_>], name: &str) -> Option<TagValue> {
     emissions
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   }
 
   fn str_val(s: &str) -> TagValue {

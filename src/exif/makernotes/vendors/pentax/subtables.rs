@@ -154,7 +154,7 @@ fn fixed1_print(v: f64) -> TagValue {
 
 /// Push a leaf emission (never `Unknown`).
 #[inline]
-fn push(out: &mut std::vec::Vec<VendorEmission>, name: &'static str, value: TagValue) {
+fn push(out: &mut std::vec::Vec<VendorEmission<'_>>, name: &'static str, value: TagValue) {
   out.push(VendorEmission::new(SmolStr::new_static(name), value, false));
 }
 
@@ -206,7 +206,7 @@ pub(crate) fn emit_camera_settings(
   count: usize,
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `Condition => '$count < 25'` (`Pentax.pm:2788`) — the K10D variant gate.
   if count >= 25 {
@@ -493,7 +493,7 @@ pub(crate) fn emit_aeinfo(
   block: &[u8],
   count: usize,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `Condition => '$count <= 25 and $count != 21'` (`Pentax.pm:2804`). The
   // `$$self{AEInfoSize} = $count` assignment is an always-true side effect; for
@@ -711,7 +711,7 @@ pub(crate) fn emit_lens_info(
   count: usize,
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // The old-`LensInfo` (`%Pentax::LensInfo`) variant gate, which ExifTool tests
   // FIRST — BEFORE the `LensInfo2` `$count` condition (`Pentax.pm:2825-2833`):
@@ -772,7 +772,7 @@ fn emit_lens_data_leaves(
   lens_data: &[u8],
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| lens_data.get(i).copied();
 
@@ -928,7 +928,7 @@ pub(crate) fn emit_flashinfo(
   block: &[u8],
   count: usize,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `Condition => '$count == 27'` (`Pentax.pm:2855`) — the K10D variant gate.
   if count != 27 {
@@ -1100,7 +1100,7 @@ pub(crate) fn emit_camera_info(
   block: &[u8],
   order: ByteOrder,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // offset 0 (byte 0): PentaxModelID — NOT emitted (owned by the 0x0005 leaf).
 
@@ -1139,7 +1139,7 @@ pub(crate) fn emit_sr_info(
   block: &[u8],
   count: usize,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `Condition => '$count == 4'` (`Pentax.pm:2260`) — the SRInfo (vs SRInfo2)
   // variant gate.
@@ -1244,7 +1244,7 @@ fn battery_voltage32(raw: u32, print_conv: bool) -> TagValue {
 fn emit_battery_info_k3iii(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| block.get(i).copied();
   // 0.1: PowerSource (mask 0x0f). 0.2: PowerAvailable (mask 0xf0, BITMASK).
@@ -1323,7 +1323,7 @@ pub(crate) fn emit_battery_info(
   block: &[u8],
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // The exact `$$self{Model}` regexes from the BatteryInfo table, per offset.
   let is_k3iii = is_k3_mark_iii(model);
@@ -1685,7 +1685,7 @@ pub(crate) fn emit_af_info(
   block: &[u8],
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| block.get(i).copied();
 
@@ -1867,7 +1867,7 @@ fn is_af_points_in_focus_excluded(model: Option<&str>) -> bool {
 pub(crate) fn emit_color_info(
   block: &[u8],
   _print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // FORMAT => 'int8s' — read each leaf as a signed byte.
   if let Some(v) = block.get(16) {
@@ -1895,7 +1895,7 @@ pub(crate) fn emit_aeinfo3(
   block: &[u8],
   count: usize,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   if count != 48 && count != 64 {
     return;
@@ -1990,7 +1990,7 @@ pub(crate) fn emit_lens_info5(
   count: usize,
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   if count != 80 && count != 128 {
     return;
@@ -2011,7 +2011,7 @@ pub(crate) fn emit_lens_info5(
 pub(crate) fn emit_kelvin_wb(
   block: &[u8],
   order: ByteOrder,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // (name, element-offset). Element offset N is byte 2N (FORMAT int16u).
   const ENTRIES: &[(&str, usize)] = &[
@@ -2064,7 +2064,7 @@ pub(crate) fn emit_kelvin_wb(
 pub(crate) fn emit_time_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| block.get(i).copied();
   if let Some(v) = b(0) {
@@ -2113,7 +2113,7 @@ fn city(print_conv: bool, n: i64) -> TagValue {
 pub(crate) fn emit_lens_corr(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| block.get(i).copied();
   if let Some(v) = b(0) {
@@ -2156,7 +2156,7 @@ pub(crate) fn emit_lens_corr(
 /// `Pentax.pm:3154-3158`), NOT a 0x0060 variant; that tag is not yet ported (a
 /// deferred follow-up). Adding a model gate here would WRONGLY suppress FaceInfo
 /// for a K-3III body.
-pub(crate) fn emit_face_info(block: &[u8], out: &mut std::vec::Vec<VendorEmission>) {
+pub(crate) fn emit_face_info(block: &[u8], out: &mut std::vec::Vec<VendorEmission<'_>>) {
   if let Some(v) = block.first() {
     push(out, "FacesDetected", int_value(i64::from(*v)));
   }
@@ -2178,7 +2178,7 @@ pub(crate) fn emit_face_info(block: &[u8], out: &mut std::vec::Vec<VendorEmissio
 pub(crate) fn emit_awb_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   if let Some(v) = block.first() {
     push(
@@ -2203,7 +2203,7 @@ pub(crate) fn emit_awb_info(
 pub(crate) fn emit_evstep_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let b = |i: usize| block.get(i).copied();
   if let Some(v) = b(0) {
@@ -2242,7 +2242,7 @@ pub(crate) fn emit_evstep_info(
 pub(crate) fn emit_level_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // int8s — each byte read SIGNED. The mask leaves apply the mask to the raw
   // (unsigned-interpreted) byte; for byte 0 the masks 0x0f / 0xf0 select nibbles.
@@ -2299,7 +2299,7 @@ pub(crate) fn emit_level_info_k3iii(
   block: &[u8],
   order: ByteOrder,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // 1: CameraOrientation (int8s) — direct PrintConv hash.
   if let Some(&b) = block.get(1) {
@@ -2346,7 +2346,7 @@ fn neg_int(raw: i64) -> TagValue {
 pub(crate) fn emit_caf_point_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let Some(v1) = block.get(1).copied().map(i64::from) else {
     return;
@@ -2424,7 +2424,7 @@ pub(crate) fn emit_af_point_info(
   order: ByteOrder,
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // 2: NumAFPoints — `Format => 'int16u'`, `RawConv => '$$self{NumAFPoints} =
   // $val'`. UNCONDITIONAL. Read in the inherited MakerNote order. No PrintConv.
@@ -2542,7 +2542,7 @@ fn decode_af_points(
 pub(crate) fn emit_filter_info(
   block: &[u8],
   make: Option<&str>,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `Make =~ /^RICOH/` ⇒ LittleEndian; otherwise BigEndian (`Pentax.pm:3032-3041`).
   let order = if is_ricoh_make(make) {
@@ -2578,7 +2578,7 @@ pub(crate) fn emit_sr_info2(
   block: &[u8],
   count: usize,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // `$count == 4` is the OLD `%Pentax::SRInfo` (handled by `emit_sr_info`); this
   // SRInfo2 variant is the fall-through (any other count, in practice 2).
@@ -2599,7 +2599,7 @@ pub(crate) fn emit_sr_info2(
 pub(crate) fn emit_pixel_shift_info(
   block: &[u8],
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   if let Some(v) = block.first() {
     push(
@@ -2623,7 +2623,7 @@ pub(crate) fn emit_temp_info(
   order: ByteOrder,
   model: Option<&str>,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   if !is_k3_mark_iii(model) {
     return;
@@ -2658,7 +2658,7 @@ pub(crate) fn emit_temp_info(
 pub(crate) fn emit_face_info_k3iii(
   block: &[u8],
   order: ByteOrder,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   // 0: FaceImageSize — int32u[2] (elements 0..=1 = bytes 0..8), space-joined.
   if let (Some(a), Some(b)) = (read_u32(block, 0, order), read_u32(block, 4, order)) {
@@ -2701,7 +2701,7 @@ pub(crate) fn emit_af_info_k3iii(
   block: &[u8],
   order: ByteOrder,
   print_conv: bool,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let u16_at = |elem: usize| read_u16(block, elem * 2, order);
   // 0.1: AFMode (the `0` whole-structure leaf is Unknown ⇒ skipped).
@@ -2800,7 +2800,7 @@ fn push_int16u_pair_k3iii(
   order: ByteOrder,
   print_conv: bool,
   name: &'static str,
-  out: &mut std::vec::Vec<VendorEmission>,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
 ) {
   let mut vals: std::vec::Vec<u16> = std::vec::Vec::with_capacity(2);
   for k in 0..2 {
@@ -2829,7 +2829,11 @@ fn push_int16u_pair_k3iii(
 /// PrintConv applied); a zero-count run is the raw empty value (`""`). The `(none)`
 /// scalar is purely the PrintConv `return '(none)' unless $val` and so appears only
 /// in PrintConv mode (bundled `-n` of a NumAFPoints==0 record yields `AFAreas=''`).
-fn push_af_areas_k3iii(vals: &[u16], print_conv: bool, out: &mut std::vec::Vec<VendorEmission>) {
+fn push_af_areas_k3iii(
+  vals: &[u16],
+  print_conv: bool,
+  out: &mut std::vec::Vec<VendorEmission<'_>>,
+) {
   if !print_conv {
     // `-n`: no PrintConv — the raw int16u run, space-joined; empty when zero-count.
     let joined = vals

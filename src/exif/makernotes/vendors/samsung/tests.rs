@@ -36,15 +36,18 @@ fn emit_picture_wizard_nx500_members() {
   let members = [0u64, 65535, 0, 0, 0];
   let mut out = Vec::new();
   emit_picture_wizard(&members, true, &mut out);
-  let pairs: Vec<(&str, &TagValue)> = out.iter().map(|e| (e.name(), e.value())).collect();
+  let pairs: Vec<(&str, TagValue)> = out
+    .iter()
+    .map(|e| (e.name(), e.value().into_owned()))
+    .collect();
   assert_eq!(
     pairs,
     std::vec![
-      ("PictureWizardMode", &TagValue::Str("Standard".into())),
-      ("PictureWizardColor", &TagValue::I64(65535)),
-      ("PictureWizardSaturation", &TagValue::I64(-4)),
-      ("PictureWizardSharpness", &TagValue::I64(-4)),
-      ("PictureWizardContrast", &TagValue::I64(-4)),
+      ("PictureWizardMode", TagValue::Str("Standard".into())),
+      ("PictureWizardColor", TagValue::I64(65535)),
+      ("PictureWizardSaturation", TagValue::I64(-4)),
+      ("PictureWizardSharpness", TagValue::I64(-4)),
+      ("PictureWizardContrast", TagValue::I64(-4)),
     ]
   );
 }
@@ -118,12 +121,15 @@ fn emit_crypt_decrypts_under_signed_encoded_key() {
   // Collect (name, value) without indexing (the module `#![deny]`s
   // indexing_slicing) — the same iterate-then-assert pattern the PictureWizard
   // tests use.
-  let pairs: Vec<(&str, &TagValue)> = out.iter().map(|e| (e.name(), e.value())).collect();
+  let pairs: Vec<(&str, TagValue)> = out
+    .iter()
+    .map(|e| (e.name(), e.value().into_owned()))
+    .collect();
   assert_eq!(
     pairs,
     std::vec![(
       "WB_RGGBLevelsUncorrected",
-      &TagValue::Str("6576 4096 4096 8608".into())
+      TagValue::Str("6576 4096 4096 8608".into())
     )],
     "byte-exact NX500 plaintext regardless of the key's TIFF encoding"
   );
@@ -147,10 +153,10 @@ fn emit_crypt_signed_encoded_key_and_value() {
     false,
     &mut out,
   );
-  let values: Vec<&TagValue> = out.iter().map(super::VendorEmission::value).collect();
+  let values: Vec<TagValue> = out.iter().map(|e| e.value().into_owned()).collect();
   assert_eq!(
     values,
-    std::vec![&TagValue::Str("6576 4096 4096 8608".into())]
+    std::vec![TagValue::Str("6576 4096 4096 8608".into())]
   );
 }
 

@@ -372,12 +372,12 @@ impl MakerNotesCanon {
 /// ShutterCount row (`$$self{FileType} eq "CR3"`, `Canon.pm:4885`) while leaving
 /// the ShotInfo position-22 CRW clause off (no CR3/CRM/MP4 container is "CRW").
 #[must_use]
-pub fn redispatch_ctmd_makernote(
+pub fn redispatch_ctmd_makernote<'e>(
   tiff_block: &[u8],
   print_conv: bool,
   model: Option<&str>,
   file_type: Option<&str>,
-) -> Vec<VendorEmission> {
+) -> Vec<VendorEmission<'e>> {
   // TIFF header: `[II/MM][0x2a][ifd0_offset:u32]` (8 bytes). Bail on a short /
   // unrecognized header (ExifTool's `ProcessTIFF` would `return 0`).
   let Some(order) = tiff_block
@@ -1065,11 +1065,11 @@ mod tests {
   // dispatch through the surviving path. The isolated helper installs the typed
   // slot only for `-j` (`print_conv.then(...)`); every `typed`-asserting test
   // below runs `-j`, so the empty `-n` fallback is never observed.
-  fn parse(blob: &[u8], order: ByteOrder) -> (MakerNotesCanon, Vec<VendorEmission>) {
+  fn parse<'e>(blob: &[u8], order: ByteOrder) -> (MakerNotesCanon, Vec<VendorEmission<'e>>) {
     parse_in_tiff(blob, 0, blob.len(), order, true, None, None)
   }
 
-  fn parse_in_tiff(
+  fn parse_in_tiff<'e>(
     tiff_data: &[u8],
     mn_offset: usize,
     mn_len: usize,
@@ -1077,7 +1077,7 @@ mod tests {
     print_conv: bool,
     model: Option<&str>,
     file_type: Option<&str>,
-  ) -> (MakerNotesCanon, Vec<VendorEmission>) {
+  ) -> (MakerNotesCanon, Vec<VendorEmission<'e>>) {
     let (emissions, typed) = crate::exif::canon_makernote_isolated(
       tiff_data, mn_offset, mn_len, order, model, file_type, print_conv,
     );
@@ -1135,7 +1135,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "CanonModelID")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("EOS D30".into()));
   }
@@ -1157,7 +1157,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "SerialNumber")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("0560018150".into()));
   }
@@ -1180,7 +1180,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "SerialNumber")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("500292".into()));
   }
@@ -1193,7 +1193,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "FileNumber")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("118-1861".into()));
   }
@@ -1210,7 +1210,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("ABC123".into()));
   }
@@ -1258,12 +1258,12 @@ mod tests {
     let isn2 = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber2")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(isn2, Some(TagValue::Str("ABC123XYZ".into())));
     let isn = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(isn, Some(TagValue::Str("DEF456".into())));
     // The typed `internal_serial_number` tracks only the model-agnostic
     // SECOND-arm leaf, which an EOS-5D never takes — it stays unset.
@@ -1296,7 +1296,7 @@ mod tests {
     let isn = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(isn, Some(TagValue::Str("DEF456".into())));
   }
 
@@ -1321,7 +1321,7 @@ mod tests {
     let isn2 = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber2")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(isn2, Some(TagValue::Str("WXYZ12ABC".into())));
     // The typed `internal_serial_number` (SECOND-arm) stays unset.
     assert_eq!(typed.internal_serial_number(), None);
@@ -1347,7 +1347,7 @@ mod tests {
     let v = emissions
       .iter()
       .find(|e| e.name() == "InternalSerialNumber")
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
       .unwrap();
     assert_eq!(v, TagValue::Str("ABC123".into()));
   }
@@ -1388,7 +1388,7 @@ mod tests {
     assert_eq!(
       em.iter()
         .find(|e| e.name() == "BatteryType")
-        .map(|e| e.value().clone()),
+        .map(|e| e.value().into_owned()),
       Some(TagValue::Str("LP-E6N".into())),
       "a valid undef[76] BatteryType emits its run"
     );

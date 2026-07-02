@@ -3649,7 +3649,7 @@ impl crate::emit::Taggable for RiffMeta<'_> {
             tags.push(crate::emit::EmittedTag::new_with_priority(
               group.clone(),
               smol_str::SmolStr::new(e.name()),
-              e.value().clone(),
+              e.value().into_owned(),
               e.unknown(),
               e.priority(),
             ));

@@ -53,10 +53,10 @@ const CAMERAINFO_K10D: &[u8] = &[
   0x00, 0x02, 0x05, 0x00,
 ];
 
-fn find<'a>(em: &'a [VendorEmission], name: &str) -> Option<&'a TagValue> {
+fn find(em: &[VendorEmission<'_>], name: &str) -> Option<TagValue> {
   em.iter()
     .find(|e| e.name() == name)
-    .map(VendorEmission::value)
+    .map(|e| e.value().into_owned())
 }
 
 fn s(v: &str) -> TagValue {
@@ -81,38 +81,38 @@ fn camera_settings_k10d_print_conv_byte_exact() {
   let mut em = Vec::new();
   emit_camera_settings(CAMERA_SETTINGS_K10D, 23, Some("PENTAX K10D"), true, &mut em);
 
-  assert_eq!(find(&em, "PictureMode2"), Some(&s("Aperture Priority")));
-  assert_eq!(find(&em, "ProgramLine"), Some(&s("Normal")));
-  assert_eq!(find(&em, "EVSteps"), Some(&s("1/3 EV Steps")));
-  assert_eq!(find(&em, "E-DialInProgram"), Some(&s("Tv or Av")));
-  assert_eq!(find(&em, "ApertureRingUse"), Some(&s("Permitted")));
-  assert_eq!(find(&em, "FlashOptions"), Some(&s("Wireless (Master)")));
-  assert_eq!(find(&em, "MeteringMode2"), Some(&s("Multi-segment")));
-  assert_eq!(find(&em, "AFPointMode"), Some(&s("Select")));
-  assert_eq!(find(&em, "FocusMode2"), Some(&s("AF-S")));
-  assert_eq!(find(&em, "AFPointSelected2"), Some(&s("Center")));
-  assert_eq!(find(&em, "ISOFloor"), Some(&TagValue::I64(100)));
-  assert_eq!(find(&em, "DriveMode2"), Some(&s("Single-frame")));
-  assert_eq!(find(&em, "ExposureBracketStepSize"), Some(&s("0.3")));
-  assert_eq!(find(&em, "BracketShotNumber"), Some(&s("n/a")));
-  assert_eq!(find(&em, "WhiteBalanceSet"), Some(&s("Auto")));
-  assert_eq!(find(&em, "MultipleExposureSet"), Some(&s("Off")));
+  assert_eq!(find(&em, "PictureMode2"), Some(s("Aperture Priority")));
+  assert_eq!(find(&em, "ProgramLine"), Some(s("Normal")));
+  assert_eq!(find(&em, "EVSteps"), Some(s("1/3 EV Steps")));
+  assert_eq!(find(&em, "E-DialInProgram"), Some(s("Tv or Av")));
+  assert_eq!(find(&em, "ApertureRingUse"), Some(s("Permitted")));
+  assert_eq!(find(&em, "FlashOptions"), Some(s("Wireless (Master)")));
+  assert_eq!(find(&em, "MeteringMode2"), Some(s("Multi-segment")));
+  assert_eq!(find(&em, "AFPointMode"), Some(s("Select")));
+  assert_eq!(find(&em, "FocusMode2"), Some(s("AF-S")));
+  assert_eq!(find(&em, "AFPointSelected2"), Some(s("Center")));
+  assert_eq!(find(&em, "ISOFloor"), Some(TagValue::I64(100)));
+  assert_eq!(find(&em, "DriveMode2"), Some(s("Single-frame")));
+  assert_eq!(find(&em, "ExposureBracketStepSize"), Some(s("0.3")));
+  assert_eq!(find(&em, "BracketShotNumber"), Some(s("n/a")));
+  assert_eq!(find(&em, "WhiteBalanceSet"), Some(s("Auto")));
+  assert_eq!(find(&em, "MultipleExposureSet"), Some(s("Off")));
   // K10D-only (offset 13+).
   assert_eq!(
     find(&em, "RawAndJpgRecording"),
-    Some(&s("RAW+JPEG (PEF, Better)"))
+    Some(s("RAW+JPEG (PEF, Better)"))
   );
-  assert_eq!(find(&em, "JpgRecordedPixels"), Some(&s("6 MP")));
-  assert_eq!(find(&em, "FlashOptions2"), Some(&s("Wireless (Master)")));
-  assert_eq!(find(&em, "MeteringMode3"), Some(&s("Multi-segment")));
-  assert_eq!(find(&em, "SRActive"), Some(&s("Yes")));
-  assert_eq!(find(&em, "Rotation"), Some(&s("Rotate 270 CW")));
-  assert_eq!(find(&em, "ISOSetting"), Some(&s("Manual")));
-  assert_eq!(find(&em, "SensitivitySteps"), Some(&s("1 EV Steps")));
-  assert_eq!(find(&em, "TvExposureTimeSetting"), Some(&s("1/203")));
-  assert_eq!(find(&em, "AvApertureSetting"), Some(&s("12.7")));
-  assert_eq!(find(&em, "SvISOSetting"), Some(&TagValue::I64(100)));
-  assert_eq!(find(&em, "BaseExposureCompensation"), Some(&s("+0.7")));
+  assert_eq!(find(&em, "JpgRecordedPixels"), Some(s("6 MP")));
+  assert_eq!(find(&em, "FlashOptions2"), Some(s("Wireless (Master)")));
+  assert_eq!(find(&em, "MeteringMode3"), Some(s("Multi-segment")));
+  assert_eq!(find(&em, "SRActive"), Some(s("Yes")));
+  assert_eq!(find(&em, "Rotation"), Some(s("Rotate 270 CW")));
+  assert_eq!(find(&em, "ISOSetting"), Some(s("Manual")));
+  assert_eq!(find(&em, "SensitivitySteps"), Some(s("1 EV Steps")));
+  assert_eq!(find(&em, "TvExposureTimeSetting"), Some(s("1/203")));
+  assert_eq!(find(&em, "AvApertureSetting"), Some(s("12.7")));
+  assert_eq!(find(&em, "SvISOSetting"), Some(TagValue::I64(100)));
+  assert_eq!(find(&em, "BaseExposureCompensation"), Some(s("+0.7")));
   // 28 leaves total for the K10D variant.
   assert_eq!(em.len(), 28, "K10D CameraSettings emits 28 leaves");
 }
@@ -129,12 +129,12 @@ fn camera_settings_k10d_value_conv_floats() {
     &mut em,
   );
   // ISOFloor / SvISOSetting are integer (int(... + 0.5)).
-  assert_eq!(find(&em, "ISOFloor"), Some(&TagValue::I64(100)));
-  assert_eq!(find(&em, "SvISOSetting"), Some(&TagValue::I64(100)));
+  assert_eq!(find(&em, "ISOFloor"), Some(TagValue::I64(100)));
+  assert_eq!(find(&em, "SvISOSetting"), Some(TagValue::I64(100)));
   // The enum/bitfield leaves are raw ints under -n.
-  assert_eq!(find(&em, "PictureMode2"), Some(&TagValue::I64(5)));
-  assert_eq!(find(&em, "ApertureRingUse"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "AFPointSelected2"), Some(&TagValue::I64(32)));
+  assert_eq!(find(&em, "PictureMode2"), Some(TagValue::I64(5)));
+  assert_eq!(find(&em, "ApertureRingUse"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "AFPointSelected2"), Some(TagValue::I64(32)));
   // The float ValueConv leaves.
   let approx = |name: &str, want: f64| {
     let TagValue::F64(g) = find(&em, name).expect(name) else {
@@ -183,8 +183,8 @@ fn camera_settings_non_k10d_model_skips_offset13_leaves() {
     &mut em,
   );
   // Base leaf present.
-  assert_eq!(find(&em, "PictureMode2"), Some(&s("Aperture Priority")));
-  assert_eq!(find(&em, "ISOFloor"), Some(&TagValue::I64(100)));
+  assert_eq!(find(&em, "PictureMode2"), Some(s("Aperture Priority")));
+  assert_eq!(find(&em, "ISOFloor"), Some(TagValue::I64(100)));
   // K10D-only leaves ABSENT.
   assert!(
     find(&em, "RawAndJpgRecording").is_none(),
@@ -202,26 +202,26 @@ fn camera_settings_non_k10d_model_skips_offset13_leaves() {
     true,
     &mut em_gx,
   );
-  assert_eq!(find(&em_gx, "SRActive"), Some(&s("Yes")));
+  assert_eq!(find(&em_gx, "SRActive"), Some(s("Yes")));
 }
 
 #[test]
 fn aeinfo_k10d_print_conv_byte_exact() {
   let mut em = Vec::new();
   emit_aeinfo(AEINFO_K10D, 16, true, &mut em);
-  assert_eq!(find(&em, "AEExposureTime"), Some(&s("1/101")));
-  assert_eq!(find(&em, "AEAperture"), Some(&s("12.9")));
-  assert_eq!(find(&em, "AE_ISO"), Some(&TagValue::I64(100)));
-  assert_eq!(find(&em, "AEXv"), Some(&TagValue::F64(-0.625)));
-  assert_eq!(find(&em, "AEBXv"), Some(&TagValue::F64(0.0)));
-  assert_eq!(find(&em, "AEMinExposureTime"), Some(&s("1/3862")));
-  assert_eq!(find(&em, "AEProgramMode"), Some(&s("Av, B or X")));
-  assert_eq!(find(&em, "AEApertureSteps"), Some(&TagValue::I64(28)));
-  assert_eq!(find(&em, "AEMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(&em, "AEMaxAperture2"), Some(&s("4.0")));
-  assert_eq!(find(&em, "AEMinAperture"), Some(&s("23")));
-  assert_eq!(find(&em, "AEMeteringMode"), Some(&s("Multi-segment")));
-  assert_eq!(find(&em, "FlashExposureCompSet"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "AEExposureTime"), Some(s("1/101")));
+  assert_eq!(find(&em, "AEAperture"), Some(s("12.9")));
+  assert_eq!(find(&em, "AE_ISO"), Some(TagValue::I64(100)));
+  assert_eq!(find(&em, "AEXv"), Some(TagValue::F64(-0.625)));
+  assert_eq!(find(&em, "AEBXv"), Some(TagValue::F64(0.0)));
+  assert_eq!(find(&em, "AEMinExposureTime"), Some(s("1/3862")));
+  assert_eq!(find(&em, "AEProgramMode"), Some(s("Av, B or X")));
+  assert_eq!(find(&em, "AEApertureSteps"), Some(TagValue::I64(28)));
+  assert_eq!(find(&em, "AEMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(&em, "AEMaxAperture2"), Some(s("4.0")));
+  assert_eq!(find(&em, "AEMinAperture"), Some(s("23")));
+  assert_eq!(find(&em, "AEMeteringMode"), Some(s("Multi-segment")));
+  assert_eq!(find(&em, "FlashExposureCompSet"), Some(TagValue::I64(0)));
   // AEFlags (offset 7) is NEVER emitted (RawConv drops it without -U).
   assert!(find(&em, "AEFlags").is_none());
   assert_eq!(em.len(), 13, "K10D AEInfo emits 13 leaves");
@@ -246,20 +246,20 @@ fn aeinfo_non_k10d_count_does_not_misdecode() {
 fn flashinfo_k10d_print_conv_byte_exact() {
   let mut em = Vec::new();
   emit_flashinfo(FLASHINFO_K10D, 27, true, &mut em);
-  assert_eq!(find(&em, "FlashStatus"), Some(&s("Off")));
+  assert_eq!(find(&em, "FlashStatus"), Some(s("Off")));
   assert_eq!(
     find(&em, "InternalFlashMode"),
-    Some(&s("Did not fire, Wireless (Master)"))
+    Some(s("Did not fire, Wireless (Master)"))
   );
-  assert_eq!(find(&em, "ExternalFlashMode"), Some(&s("Off")));
-  assert_eq!(find(&em, "InternalFlashStrength"), Some(&TagValue::I64(18)));
-  assert_eq!(find(&em, "TTL_DA_AUp"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "TTL_DA_ADown"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "TTL_DA_BUp"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "TTL_DA_BDown"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "ExternalFlashGuideNumber"), Some(&s("n/a")));
-  assert_eq!(find(&em, "ExternalFlashExposureComp"), Some(&s("n/a")));
-  assert_eq!(find(&em, "ExternalFlashBounce"), Some(&s("n/a")));
+  assert_eq!(find(&em, "ExternalFlashMode"), Some(s("Off")));
+  assert_eq!(find(&em, "InternalFlashStrength"), Some(TagValue::I64(18)));
+  assert_eq!(find(&em, "TTL_DA_AUp"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "TTL_DA_ADown"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "TTL_DA_BUp"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "TTL_DA_BDown"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "ExternalFlashGuideNumber"), Some(s("n/a")));
+  assert_eq!(find(&em, "ExternalFlashExposureComp"), Some(s("n/a")));
+  assert_eq!(find(&em, "ExternalFlashBounce"), Some(s("n/a")));
   assert_eq!(em.len(), 11, "K10D FlashInfo emits 11 leaves");
 }
 
@@ -295,8 +295,8 @@ fn truncated_block_skips_out_of_range_leaves() {
     &mut em,
   );
   // Offsets 0-2 decode (PictureMode2, the byte-1 + byte-2 bitfields).
-  assert_eq!(find(&em, "PictureMode2"), Some(&s("Aperture Priority")));
-  assert_eq!(find(&em, "FlashOptions"), Some(&s("Wireless (Master)")));
+  assert_eq!(find(&em, "PictureMode2"), Some(s("Aperture Priority")));
+  assert_eq!(find(&em, "FlashOptions"), Some(s("Wireless (Master)")));
   // Offset 3+ skipped.
   assert!(find(&em, "FocusMode2").is_none());
   assert!(find(&em, "ISOFloor").is_none());
@@ -310,11 +310,11 @@ fn aeinfo_size_over_20_shifts_offsets() {
   let mut em = Vec::new();
   emit_aeinfo(AEINFO_KX, 24, true, &mut em);
   // Offsets 0-7 are unshifted.
-  assert_eq!(find(&em, "AEProgramMode"), Some(&s("Standard"))); // byte 6 = 0x23 = 35
+  assert_eq!(find(&em, "AEProgramMode"), Some(s("Standard"))); // byte 6 = 0x23 = 35
   // Offset 8+ shifted: AEApertureSteps reads byte 9 = 0.
-  assert_eq!(find(&em, "AEApertureSteps"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "AEApertureSteps"), Some(TagValue::I64(0)));
   // FlashExposureCompSet reads byte 15 (= 0xf8 = -8 int8s) ⇒ PentaxEv(-8) = -1.
-  assert_eq!(find(&em, "FlashExposureCompSet"), Some(&s("-1.0")));
+  assert_eq!(find(&em, "FlashExposureCompSet"), Some(s("-1.0")));
   // The size-24-only AEWhiteBalance / AEMeteringMode2 / LevelIndicator are NOT
   // emitted by this Phase-2a port (deferred).
   assert!(find(&em, "AEWhiteBalance").is_none());
@@ -336,15 +336,15 @@ fn aeinfo_aeflags_shift_follows_byte_size_not_count() {
   let mut em = Vec::new();
   emit_aeinfo(AEINFO_KX, 12, true, &mut em);
   // Unshifted leaves (offsets 0-7) decode the same as any in-gate record.
-  assert_eq!(find(&em, "AEProgramMode"), Some(&s("Standard"))); // byte 6 = 0x23 = 35
+  assert_eq!(find(&em, "AEProgramMode"), Some(s("Standard"))); // byte 6 = 0x23 = 35
   // The shift follows byte size: AEApertureSteps reads byte 9 (= 0x00 = 0), NOT
   // byte 8 (= 0xa1 = 161) — i.e. NOT one byte early.
-  assert_eq!(find(&em, "AEApertureSteps"), Some(&TagValue::I64(0)));
-  assert_ne!(find(&em, "AEApertureSteps"), Some(&TagValue::I64(161)));
+  assert_eq!(find(&em, "AEApertureSteps"), Some(TagValue::I64(0)));
+  assert_ne!(find(&em, "AEApertureSteps"), Some(TagValue::I64(161)));
   // The remaining shifted offsets land on the SAME bytes as the undef-24 K-x
   // record (`aeinfo_size_over_20_shifts_offsets`), proving size-keyed parity: e.g.
   // FlashExposureCompSet reads byte 15 (= 0xf8 = -8 int8s) ⇒ PentaxEv(-8) = -1.
-  assert_eq!(find(&em, "FlashExposureCompSet"), Some(&s("-1.0")));
+  assert_eq!(find(&em, "FlashExposureCompSet"), Some(s("-1.0")));
   // A control: with a SMALL byte size (<= 20) the same small count yields NO shift
   // — AEApertureSteps then reads byte 8. The first 20 bytes of the K-x block keep
   // count 12 in-gate but drop the block to 20 bytes (20 > 20 is false ⇒ shift 0),
@@ -352,7 +352,7 @@ fn aeinfo_aeflags_shift_follows_byte_size_not_count() {
   // `block.len()` and not the (unchanged) count.
   let mut em20 = Vec::new();
   emit_aeinfo(&AEINFO_KX[..20], 12, true, &mut em20);
-  assert_eq!(find(&em20, "AEApertureSteps"), Some(&TagValue::I64(161)));
+  assert_eq!(find(&em20, "AEApertureSteps"), Some(TagValue::I64(161)));
 }
 
 #[test]
@@ -361,17 +361,17 @@ fn lens_info2_k10d_print_conv_byte_exact() {
   // set). Values verified against `exiftool -G1 -j Pentax.jpg`.
   let mut em = Vec::new();
   emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), true, &mut em);
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
-  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(s("0.49-0.50 m")));
+  assert_eq!(find(&em, "LensFocalLength"), Some(s("10.0 mm")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(s("23")));
   // The four #173 LensData leaves now emit (verified against `exiftool -G1 -j
   // Pentax.jpg`).
-  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
-  assert_eq!(find(&em, "MinAperture"), Some(&s("22")));
-  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
-  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+  assert_eq!(find(&em, "AutoAperture"), Some(s("On")));
+  assert_eq!(find(&em, "MinAperture"), Some(s("22")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(s("7 (very far)")));
+  assert_eq!(find(&em, "MaxAperture"), Some(s("3.9")));
   // LensType (offset 0-3) is NOT re-emitted here (Phase 1's 0x003f LensRec owns it).
   assert!(
     find(&em, "LensType").is_none(),
@@ -391,11 +391,11 @@ fn lens_info2_k10d_value_conv_floats() {
   // LensFocalLength 10, NominalMaxAperture 4, NominalMinAperture 22.6274…).
   let mut em = Vec::new();
   emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), false, &mut em);
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
   // MinFocusDistance under -n is the raw masked value (no PrintConv hash).
-  assert_eq!(find(&em, "MinFocusDistance"), Some(&TagValue::I64(6)));
-  assert_eq!(find(&em, "LensFocalLength"), Some(&TagValue::F64(10.0)));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&TagValue::F64(4.0)));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(TagValue::I64(6)));
+  assert_eq!(find(&em, "LensFocalLength"), Some(TagValue::F64(10.0)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(TagValue::F64(4.0)));
   let approx = |name: &str, want: f64| {
     let TagValue::F64(g) = find(&em, name).expect(name) else {
       panic!("{name} is not F64");
@@ -432,10 +432,10 @@ fn lens_info2_focal_length_645z_gate() {
     "645Z must not emit LensFocalLength"
   );
   // The other leaves are unaffected.
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
-  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(&em, "AutoAperture"), Some(s("On")));
+  assert_eq!(find(&em, "MaxAperture"), Some(s("3.9")));
   assert_eq!(em.len(), 8, "645Z drops only LensFocalLength");
 }
 
@@ -468,8 +468,8 @@ fn lens_info2_truncated_block_no_panic() {
     true,
     &mut em1,
   );
-  assert_eq!(find(&em1, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em1, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
+  assert_eq!(find(&em1, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em1, "MinFocusDistance"), Some(s("0.49-0.50 m")));
   assert!(
     find(&em1, "LensFocalLength").is_none(),
     "offset-9 leaf skipped when truncated"
@@ -486,8 +486,8 @@ fn lens_info2_truncated_block_no_panic() {
     true,
     &mut em2,
   );
-  assert_eq!(find(&em2, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em2, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert_eq!(find(&em2, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em2, "LensFocalLength"), Some(s("10.0 mm")));
   assert!(
     find(&em2, "NominalMaxAperture").is_none(),
     "offset-10 leaf skipped when truncated"
@@ -511,14 +511,14 @@ const LENSINFO_OLD: &[u8] = &[
 
 /// Assert the nine OLD-format LensData leaves (identical to the K10D `LensInfo2`
 /// values) — the old `%LensInfo` decodes `LensData` from offset 3.
-fn assert_old_lens_info_leaves(em: &[VendorEmission]) {
-  assert_eq!(find(em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
-  assert_eq!(find(em, "LensFocalLength"), Some(&s("10.0 mm")));
-  assert_eq!(find(em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(em, "NominalMinAperture"), Some(&s("23")));
-  assert_eq!(find(em, "AutoAperture"), Some(&s("On")));
-  assert_eq!(find(em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+fn assert_old_lens_info_leaves(em: &[VendorEmission<'_>]) {
+  assert_eq!(find(em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(em, "MinFocusDistance"), Some(s("0.49-0.50 m")));
+  assert_eq!(find(em, "LensFocalLength"), Some(s("10.0 mm")));
+  assert_eq!(find(em, "NominalMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(em, "NominalMinAperture"), Some(s("23")));
+  assert_eq!(find(em, "AutoAperture"), Some(s("On")));
+  assert_eq!(find(em, "FocusRangeIndex"), Some(s("7 (very far)")));
 }
 
 #[test]
@@ -579,13 +579,13 @@ fn lens_info_k100d_not_old_format_falls_through_to_lensinfo2() {
   // Decodes through LensInfo2 — the same nine leaves as the K10D path. Byte 20
   // (LensData offset 16) is not read by any ported leaf (they live at LensData
   // offsets 0/3/9/10/14), so the values match the K10D fixture exactly.
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
-  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
-  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
-  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(s("0.49-0.50 m")));
+  assert_eq!(find(&em, "LensFocalLength"), Some(s("10.0 mm")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(s("23")));
+  assert_eq!(find(&em, "AutoAperture"), Some(s("On")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(s("7 (very far)")));
   assert_eq!(
     em.len(),
     9,
@@ -607,8 +607,8 @@ fn lens_info_old_format_short_block_falls_through() {
     true,
     &mut em,
   );
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em, "LensFocalLength"), Some(&s("10.0 mm")));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em, "LensFocalLength"), Some(s("10.0 mm")));
   assert!(
     find(&em, "NominalMaxAperture").is_none(),
     "short block: offset-10 leaf skipped, but the record still decodes (not old)"
@@ -622,13 +622,13 @@ fn camera_info_k10d_print_conv_byte_exact() {
   // ProductionCode 2.1, InternalSerialNumber 132352.
   let mut em = Vec::new();
   emit_camera_info(CAMERAINFO_K10D, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert_eq!(find(&em, "ManufactureDate"), Some(s("2007:09:13")));
   // ProductionCode is the dotted ValueConv string "2.1" (renders as a JSON number);
   // the "(camera has been serviced)" suffix applies only to an 8.x value.
-  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.1")));
+  assert_eq!(find(&em, "ProductionCode"), Some(s("2.1")));
   assert_eq!(
     find(&em, "InternalSerialNumber"),
-    Some(&TagValue::I64(132352))
+    Some(TagValue::I64(132352))
   );
   // PentaxModelID (offset 0) is NOT re-emitted from this path — Phase 1's 0x0005
   // leaf owns it (the guardrail).
@@ -645,11 +645,11 @@ fn camera_info_k10d_value_conv() {
   // is the bare dotted string, InternalSerialNumber the raw int.
   let mut em = Vec::new();
   emit_camera_info(CAMERAINFO_K10D, ByteOrder::Big, false, &mut em);
-  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2007:09:13")));
-  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.1")));
+  assert_eq!(find(&em, "ManufactureDate"), Some(s("2007:09:13")));
+  assert_eq!(find(&em, "ProductionCode"), Some(s("2.1")));
   assert_eq!(
     find(&em, "InternalSerialNumber"),
-    Some(&TagValue::I64(132352))
+    Some(TagValue::I64(132352))
   );
   assert!(find(&em, "PentaxModelID").is_none());
 }
@@ -666,11 +666,11 @@ fn camera_info_kx_avi_byte_exact() {
   ];
   let mut em = Vec::new();
   emit_camera_info(CAMERAINFO_KX, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "ManufactureDate"), Some(&s("2009:09:04")));
-  assert_eq!(find(&em, "ProductionCode"), Some(&s("2.3")));
+  assert_eq!(find(&em, "ManufactureDate"), Some(s("2009:09:04")));
+  assert_eq!(find(&em, "ProductionCode"), Some(s("2.3")));
   assert_eq!(
     find(&em, "InternalSerialNumber"),
-    Some(&TagValue::I64(8007725))
+    Some(TagValue::I64(8007725))
   );
   assert!(find(&em, "PentaxModelID").is_none());
 }
@@ -691,12 +691,12 @@ fn camera_info_production_code_serviced_suffix() {
   emit_camera_info(block, ByteOrder::Big, true, &mut em);
   assert_eq!(
     find(&em, "ProductionCode"),
-    Some(&s("8.1 (camera has been serviced)"))
+    Some(s("8.1 (camera has been serviced)"))
   );
   // -n: the bare dotted string, no suffix.
   let mut emn = Vec::new();
   emit_camera_info(block, ByteOrder::Big, false, &mut emn);
-  assert_eq!(find(&emn, "ProductionCode"), Some(&s("8.1")));
+  assert_eq!(find(&emn, "ProductionCode"), Some(s("8.1")));
 }
 
 #[test]
@@ -726,7 +726,7 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // bytes 8-15, InternalSerialNumber needs byte 16 — both skipped.
   let mut em8 = Vec::new();
   emit_camera_info(&CAMERAINFO_K10D[..8], ByteOrder::Big, true, &mut em8);
-  assert_eq!(find(&em8, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert_eq!(find(&em8, "ManufactureDate"), Some(s("2007:09:13")));
   assert!(
     find(&em8, "ProductionCode").is_none(),
     "int32u[2] ProductionCode needs bytes 8-15"
@@ -738,7 +738,7 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // 12-15) is out of range ⇒ ProductionCode skipped (both elements required).
   let mut em12 = Vec::new();
   emit_camera_info(&CAMERAINFO_K10D[..12], ByteOrder::Big, true, &mut em12);
-  assert_eq!(find(&em12, "ManufactureDate"), Some(&s("2007:09:13")));
+  assert_eq!(find(&em12, "ManufactureDate"), Some(s("2007:09:13")));
   assert!(
     find(&em12, "ProductionCode").is_none(),
     "the second int32u element (byte 12-15) is out of range"
@@ -749,8 +749,8 @@ fn camera_info_truncated_block_partial_emit_no_panic() {
   // (byte 16) skipped.
   let mut em16 = Vec::new();
   emit_camera_info(&CAMERAINFO_K10D[..16], ByteOrder::Big, true, &mut em16);
-  assert_eq!(find(&em16, "ManufactureDate"), Some(&s("2007:09:13")));
-  assert_eq!(find(&em16, "ProductionCode"), Some(&s("2.1")));
+  assert_eq!(find(&em16, "ManufactureDate"), Some(s("2007:09:13")));
+  assert_eq!(find(&em16, "ProductionCode"), Some(s("2.1")));
   assert!(find(&em16, "InternalSerialNumber").is_none());
   assert_eq!(em16.len(), 2);
 
@@ -808,17 +808,17 @@ fn sr_info_k10d_byte_exact() {
   // -j — verified against `exiftool -G1 -j Pentax.jpg`.
   let mut em = Vec::new();
   emit_sr_info(SRINFO_K10D, 4, true, &mut em);
-  assert_eq!(find(&em, "SRResult"), Some(&s("Stabilized")));
-  assert_eq!(find(&em, "ShakeReduction"), Some(&s("On")));
-  assert_eq!(find(&em, "SRHalfPressTime"), Some(&s("1.53 s")));
-  assert_eq!(find(&em, "SRFocalLength"), Some(&s("10 mm")));
+  assert_eq!(find(&em, "SRResult"), Some(s("Stabilized")));
+  assert_eq!(find(&em, "ShakeReduction"), Some(s("On")));
+  assert_eq!(find(&em, "SRHalfPressTime"), Some(s("1.53 s")));
+  assert_eq!(find(&em, "SRFocalLength"), Some(s("10 mm")));
   assert_eq!(em.len(), 4);
   // -n — the post-ValueConv values.
   let mut emn = Vec::new();
   emit_sr_info(SRINFO_K10D, 4, false, &mut emn);
-  assert_eq!(find(&emn, "SRResult"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&emn, "ShakeReduction"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&emn, "SRFocalLength"), Some(&TagValue::F64(10.0)));
+  assert_eq!(find(&emn, "SRResult"), Some(TagValue::I64(1)));
+  assert_eq!(find(&emn, "ShakeReduction"), Some(TagValue::I64(1)));
+  assert_eq!(find(&emn, "SRFocalLength"), Some(TagValue::F64(10.0)));
 }
 
 #[test]
@@ -834,16 +834,13 @@ fn battery_info_k10d_byte_exact() {
   // -j — verified against `exiftool -G1 -j Pentax.jpg`.
   let mut em = Vec::new();
   emit_battery_info(BATTERYINFO_K10D, Some("PENTAX K10D"), true, &mut em);
-  assert_eq!(find(&em, "PowerSource"), Some(&s("Body Battery")));
-  assert_eq!(find(&em, "BodyBatteryState"), Some(&s("Full")));
-  assert_eq!(find(&em, "GripBatteryState"), Some(&s("Empty or Missing")));
-  assert_eq!(
-    find(&em, "BodyBatteryADNoLoad"),
-    Some(&s("173 (7.6V, 51%)"))
-  );
-  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(&s("168 (7.4V, 47%)")));
-  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(&TagValue::I64(5)));
-  assert_eq!(find(&em, "GripBatteryADLoad"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "PowerSource"), Some(s("Body Battery")));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(s("Full")));
+  assert_eq!(find(&em, "GripBatteryState"), Some(s("Empty or Missing")));
+  assert_eq!(find(&em, "BodyBatteryADNoLoad"), Some(s("173 (7.6V, 51%)")));
+  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(s("168 (7.4V, 47%)")));
+  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(TagValue::I64(5)));
+  assert_eq!(find(&em, "GripBatteryADLoad"), Some(TagValue::I64(1)));
   assert_eq!(em.len(), 7);
 }
 
@@ -853,13 +850,10 @@ fn af_info_k10d_byte_exact() {
   // `Unknown => 1` AFPointsUnknown1/2 are suppressed.
   let mut em = Vec::new();
   emit_af_info(AFINFO_K10D, Some("PENTAX K10D"), true, &mut em);
-  assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
-  assert_eq!(find(&em, "AFDefocus"), Some(&TagValue::I64(2)));
-  assert_eq!(find(&em, "AFIntegrationTime"), Some(&s("0 ms")));
-  assert_eq!(
-    find(&em, "AFPointsInFocus"),
-    Some(&s("Center (horizontal)"))
-  );
+  assert_eq!(find(&em, "AFPredictor"), Some(TagValue::I64(4)));
+  assert_eq!(find(&em, "AFDefocus"), Some(TagValue::I64(2)));
+  assert_eq!(find(&em, "AFIntegrationTime"), Some(s("0 ms")));
+  assert_eq!(find(&em, "AFPointsInFocus"), Some(s("Center (horizontal)")));
   assert!(find(&em, "AFPointsUnknown1").is_none());
   assert!(find(&em, "AFPointsUnknown2").is_none());
   assert_eq!(em.len(), 4);
@@ -870,15 +864,15 @@ fn color_info_k10d_byte_exact() {
   // -j — `FORMAT => 'int8s'`; both WB shifts are 0 in Pentax.jpg.
   let mut em = Vec::new();
   emit_color_info(COLORINFO_K10D, true, &mut em);
-  assert_eq!(find(&em, "WBShiftAB"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "WBShiftGM"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "WBShiftAB"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "WBShiftGM"), Some(TagValue::I64(0)));
   assert_eq!(em.len(), 2);
   // A signed value reads as int8s (e.g. byte 0xff => -1).
   let mut signed = COLORINFO_K10D.to_vec();
   signed[16] = 0xff;
   let mut em2 = Vec::new();
   emit_color_info(&signed, true, &mut em2);
-  assert_eq!(find(&em2, "WBShiftAB"), Some(&TagValue::I64(-1)));
+  assert_eq!(find(&em2, "WBShiftAB"), Some(TagValue::I64(-1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +911,7 @@ fn battery_info_kx_does_not_emit_k10d_ad_layout() {
   assert!(find(&em, "PowerSource").is_some());
   assert_eq!(
     find(&em, "BodyBatteryState"),
-    Some(&TagValue::Str("Close to Full".into()))
+    Some(TagValue::Str("Close to Full".into()))
   );
 }
 
@@ -946,14 +940,14 @@ fn battery_info_k3iii_relayout_byte_exact() {
     true,
     &mut em,
   );
-  assert_eq!(find(&em, "PowerSource"), Some(&s("Body Battery")));
-  assert_eq!(find(&em, "PowerAvailable"), Some(&s("Body Battery")));
-  assert_eq!(find(&em, "BodyBatteryState"), Some(&s("Full")));
-  assert_eq!(find(&em, "BodyBatteryPercent"), Some(&TagValue::I64(100)));
-  assert_eq!(find(&em, "BodyBatteryVoltage"), Some(&s("7.48 V")));
-  assert_eq!(find(&em, "GripBatteryState"), Some(&s("Empty or Missing")));
-  assert_eq!(find(&em, "GripBatteryPercent"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "GripBatteryVoltage"), Some(&s("5.89 V")));
+  assert_eq!(find(&em, "PowerSource"), Some(s("Body Battery")));
+  assert_eq!(find(&em, "PowerAvailable"), Some(s("Body Battery")));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(s("Full")));
+  assert_eq!(find(&em, "BodyBatteryPercent"), Some(TagValue::I64(100)));
+  assert_eq!(find(&em, "BodyBatteryVoltage"), Some(s("7.48 V")));
+  assert_eq!(find(&em, "GripBatteryState"), Some(s("Empty or Missing")));
+  assert_eq!(find(&em, "GripBatteryPercent"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "GripBatteryVoltage"), Some(s("5.89 V")));
   // The non-K-3III K10D AD layout must NOT appear (the K-3III branch is the sole
   // emitter — never a wrong-hash PowerSource or a K10D byte mis-read).
   for wrong in [
@@ -977,19 +971,19 @@ fn battery_info_k3iii_n_mode_raw_values() {
     false,
     &mut em,
   );
-  assert_eq!(find(&em, "PowerSource"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "PowerAvailable"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "BodyBatteryState"), Some(&TagValue::I64(5)));
+  assert_eq!(find(&em, "PowerSource"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "PowerAvailable"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "BodyBatteryState"), Some(TagValue::I64(5)));
   // The raw ValueConv f64 (`$val*4e-8+0.27219`). The serializer's `format_g`
   // renders these to the golden's `7.47863424` / `5.88731624` (10-sig-fig); the
   // stored f64 carries the full IEEE-754 precision.
   assert_eq!(
     find(&em, "BodyBatteryVoltage"),
-    Some(&TagValue::F64(f64::from(180161106u32) * 4e-8 + 0.27219))
+    Some(TagValue::F64(f64::from(180161106u32) * 4e-8 + 0.27219))
   );
   assert_eq!(
     find(&em, "GripBatteryVoltage"),
-    Some(&TagValue::F64(f64::from(140378156u32) * 4e-8 + 0.27219))
+    Some(TagValue::F64(f64::from(140378156u32) * 4e-8 + 0.27219))
   );
 }
 
@@ -1001,10 +995,10 @@ fn battery_info_istd_uses_raw_ad_variant() {
   // variant is selected (not the K10D PrintConv form).
   let mut em = Vec::new();
   emit_battery_info(BATTERYINFO_K10D, Some("PENTAX *ist D"), true, &mut em);
-  assert_eq!(find(&em, "BodyBatteryADNoLoad"), Some(&TagValue::I64(173)));
-  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(&TagValue::I64(168)));
-  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(&TagValue::I64(5)));
-  assert_eq!(find(&em, "GripBatteryADLoad"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "BodyBatteryADNoLoad"), Some(TagValue::I64(173)));
+  assert_eq!(find(&em, "BodyBatteryADLoad"), Some(TagValue::I64(168)));
+  assert_eq!(find(&em, "GripBatteryADNoLoad"), Some(TagValue::I64(5)));
+  assert_eq!(find(&em, "GripBatteryADLoad"), Some(TagValue::I64(1)));
   assert!(find(&em, "GripBatteryState").is_none());
   // A `None` model (defensive — production always threads IFD0's Model) matches
   // ExifTool's `$$self{Model} !~ /K-3 Mark III/` on an undef Model = TRUE, so
@@ -1024,7 +1018,7 @@ fn battery_info_istd_uses_raw_ad_variant() {
   // BodyBatteryState emits — exactly as ExifTool would for an undef Model.
   assert_eq!(
     find(&emn, "BodyBatteryState"),
-    Some(&TagValue::Str("Close to Full".into()))
+    Some(TagValue::Str("Close to Full".into()))
   );
 }
 
@@ -1049,15 +1043,12 @@ fn af_info_excluded_models_drop_af_points_in_focus() {
       "{excluded} must not emit AFPointsInFocus"
     );
     // The unconditional AF leaves still emit (only 0x0b is gated).
-    assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
+    assert_eq!(find(&em, "AFPredictor"), Some(TagValue::I64(4)));
   }
   // A non-excluded model (e.g. the K-5) keeps AFPointsInFocus.
   let mut em = Vec::new();
   emit_af_info(AFINFO_K10D, Some("PENTAX K-5"), true, &mut em);
-  assert_eq!(
-    find(&em, "AFPointsInFocus"),
-    Some(&s("Center (horizontal)"))
-  );
+  assert_eq!(find(&em, "AFPointsInFocus"), Some(s("Center (horizontal)")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,11 +1078,11 @@ fn lens_data_max_aperture_k5_gate_suppresses() {
     "an exactly-\"K-5\" model must suppress MaxAperture (ne \"K-5\")"
   );
   // The gate is leaf-local: the sibling LensData leaves are unaffected.
-  assert_eq!(find(&em, "AutoAperture"), Some(&s("On")));
-  assert_eq!(find(&em, "MinAperture"), Some(&s("22")));
-  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
-  assert_eq!(find(&em, "LensFStops"), Some(&TagValue::F64(8.5)));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
+  assert_eq!(find(&em, "AutoAperture"), Some(s("On")));
+  assert_eq!(find(&em, "MinAperture"), Some(s("22")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(s("7 (very far)")));
+  assert_eq!(find(&em, "LensFStops"), Some(TagValue::F64(8.5)));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(s("4.0")));
   // The K10D fixture-equivalent count emits the OTHER eight leaves (all but
   // MaxAperture).
   assert_eq!(
@@ -1113,7 +1104,7 @@ fn lens_data_max_aperture_emits_for_full_pentax_k5_string() {
   emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K-5"), true, &mut em);
   assert_eq!(
     find(&em, "MaxAperture"),
-    Some(&s("3.9")),
+    Some(s("3.9")),
     "a full \"PENTAX K-5\" model is not exactly \"K-5\" ⇒ MaxAperture still emits"
   );
   assert_eq!(em.len(), 9, "\"PENTAX K-5\" emits all nine LensData leaves");
@@ -1126,7 +1117,7 @@ fn lens_data_max_aperture_emits_for_k10d_fixture() {
   // gate does NOT over-suppress the fixture body.
   let mut em = Vec::new();
   emit_lens_info(LENSINFO2_K10D, 69, Some("PENTAX K10D"), true, &mut em);
-  assert_eq!(find(&em, "MaxAperture"), Some(&s("3.9")));
+  assert_eq!(find(&em, "MaxAperture"), Some(s("3.9")));
 }
 
 #[test]
@@ -1143,9 +1134,9 @@ fn af_info_af_points_in_focus_excluded_model_suppresses() {
     find(&em, "AFPointsInFocus").is_none(),
     "a K-3 (excluded) must suppress AFPointsInFocus"
   );
-  assert_eq!(find(&em, "AFPredictor"), Some(&TagValue::I64(4)));
-  assert_eq!(find(&em, "AFDefocus"), Some(&TagValue::I64(2)));
-  assert_eq!(find(&em, "AFIntegrationTime"), Some(&s("0 ms")));
+  assert_eq!(find(&em, "AFPredictor"), Some(TagValue::I64(4)));
+  assert_eq!(find(&em, "AFDefocus"), Some(TagValue::I64(2)));
+  assert_eq!(find(&em, "AFIntegrationTime"), Some(s("0 ms")));
   assert_eq!(em.len(), 3, "an excluded model drops only AFPointsInFocus");
 }
 
@@ -1174,7 +1165,7 @@ fn battery_info_non_k10d_model_suppresses_ad_layout() {
   // 5-entry hash), so it emits (byte 1 mask 0xf0 = 4 → 'Close to Full', #311).
   assert_eq!(
     find(&em, "BodyBatteryState"),
-    Some(&TagValue::Str("Close to Full".into()))
+    Some(TagValue::Str("Close to Full".into()))
   );
 }
 
@@ -1187,10 +1178,10 @@ fn lens_data_no_comment_only_gate_for_unconditional_leaves() {
   // over-suppress its neighbours.
   let mut em = Vec::new();
   emit_lens_info(LENSINFO2_K10D, 69, Some("K-5"), true, &mut em);
-  assert_eq!(find(&em, "MinFocusDistance"), Some(&s("0.49-0.50 m")));
-  assert_eq!(find(&em, "FocusRangeIndex"), Some(&s("7 (very far)")));
-  assert_eq!(find(&em, "NominalMaxAperture"), Some(&s("4.0")));
-  assert_eq!(find(&em, "NominalMinAperture"), Some(&s("23")));
+  assert_eq!(find(&em, "MinFocusDistance"), Some(s("0.49-0.50 m")));
+  assert_eq!(find(&em, "FocusRangeIndex"), Some(s("7 (very far)")));
+  assert_eq!(find(&em, "NominalMaxAperture"), Some(s("4.0")));
+  assert_eq!(find(&em, "NominalMinAperture"), Some(s("23")));
 }
 
 /// A crafted `%Pentax::FilterInfo` (`0x022a`) block with NON-ZERO
@@ -1219,27 +1210,27 @@ fn filter_info_non_ricoh_body_reads_big_endian() {
   emit_filter_info(FILTERINFO_NONZERO, Some("PENTAX"), &mut em);
   assert_eq!(
     find(&em, "SourceDirectoryIndex"),
-    Some(&TagValue::I64(0x1234)),
+    Some(TagValue::I64(0x1234)),
     "a non-RICOH body must read FilterInfo BigEndian"
   );
   // SourceFileIndex (key 2) is the int16u at BYTE 2 (FORMAT int8u ⇒ key = byte
   // offset), so BE bytes 2-3 (`56 78`) ⇒ 0x5678 — NOT bytes 4-5 (`ab cd`).
   assert_eq!(
     find(&em, "SourceFileIndex"),
-    Some(&TagValue::I64(0x5678)),
+    Some(TagValue::I64(0x5678)),
     "SourceFileIndex must read byte offset 2 (int8u-FORMAT key), not element index 2 (byte 4)"
   );
   // Regression: the pre-fix code read SourceFileIndex from bytes 4-5 (the decoy
   // `ab cd`). No emitted value may equal that BE/LE decoy.
   for e in &em {
     assert_ne!(
-      e.value(),
+      e.value().as_ref(),
       &TagValue::I64(0xabcd),
       "{}: bytes 4-5 (the element-index offset) must be IGNORED",
       e.name()
     );
     assert_ne!(
-      e.value(),
+      e.value().as_ref(),
       &TagValue::I64(0xcdab),
       "{}: bytes 4-5 (the element-index offset) must be IGNORED",
       e.name()
@@ -1262,13 +1253,13 @@ fn filter_info_ricoh_body_reads_little_endian() {
   );
   assert_eq!(
     find(&em, "SourceDirectoryIndex"),
-    Some(&TagValue::I64(0x3412)),
+    Some(TagValue::I64(0x3412)),
     "a RICOH body must read FilterInfo LittleEndian"
   );
   // SourceFileIndex at byte 2, LittleEndian ⇒ LE bytes 2-3 (`56 78`) → 0x7856.
   assert_eq!(
     find(&em, "SourceFileIndex"),
-    Some(&TagValue::I64(0x7856)),
+    Some(TagValue::I64(0x7856)),
     "a RICOH body must read FilterInfo LittleEndian at byte offset 2"
   );
 }
@@ -1297,7 +1288,7 @@ fn filter_info_byte_order_is_make_forced_not_parent_order() {
   emit_filter_info(FILTERINFO_NONZERO, None, &mut none);
   assert_eq!(
     find(&none, "SourceDirectoryIndex"),
-    Some(&TagValue::I64(0x1234)),
+    Some(TagValue::I64(0x1234)),
     "absent Make falls to the non-RICOH BigEndian arm"
   );
 }
@@ -1315,9 +1306,9 @@ fn level_info_k3iii_decodes_orientation_and_int16s_angles() {
   // PrintConv on the angles ⇒ the value is identical for `-j`/`-n`.
   let mut em = Vec::new();
   emit_level_info_k3iii(LEVELINFO_K3III, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "CameraOrientation"), Some(&s("Rotate 90 CW")));
-  assert_eq!(find(&em, "RollAngle"), Some(&TagValue::F64(-8.0)));
-  assert_eq!(find(&em, "PitchAngle"), Some(&TagValue::F64(8.0)));
+  assert_eq!(find(&em, "CameraOrientation"), Some(s("Rotate 90 CW")));
+  assert_eq!(find(&em, "RollAngle"), Some(TagValue::F64(-8.0)));
+  assert_eq!(find(&em, "PitchAngle"), Some(TagValue::F64(8.0)));
   // The K3III table has NO LevelOrientation / CompositionAdjust* leaves — they are
   // the K-5-style `%LevelInfo`'s, and must NOT appear here.
   assert!(find(&em, "LevelOrientation").is_none());
@@ -1331,9 +1322,9 @@ fn level_info_k3iii_int16s_angles_follow_parent_order() {
   // 4096 → -2048.0), proving the order is actually threaded (not hard-coded BE).
   let mut em = Vec::new();
   emit_level_info_k3iii(LEVELINFO_K3III, ByteOrder::Little, true, &mut em);
-  assert_eq!(find(&em, "RollAngle"), Some(&TagValue::F64(-2048.0)));
+  assert_eq!(find(&em, "RollAngle"), Some(TagValue::F64(-2048.0)));
   // PitchAngle bytes `ff f0` LE = `0xf0ff` = -3841 → -(-3841)/2 = 1920.5.
-  assert_eq!(find(&em, "PitchAngle"), Some(&TagValue::F64(1920.5)));
+  assert_eq!(find(&em, "PitchAngle"), Some(TagValue::F64(1920.5)));
 }
 
 #[test]
@@ -1356,8 +1347,8 @@ fn face_info_decodes_faces_detected_and_position() {
   let block: &[u8] = &[0x02, 0x00, 0x32, 0x28, 0x00];
   let mut em = Vec::new();
   emit_face_info(block, &mut em);
-  assert_eq!(find(&em, "FacesDetected"), Some(&TagValue::I64(2)));
-  assert_eq!(find(&em, "FacePosition"), Some(&s("50 40")));
+  assert_eq!(find(&em, "FacesDetected"), Some(TagValue::I64(2)));
+  assert_eq!(find(&em, "FacePosition"), Some(s("50 40")));
 }
 
 #[test]
@@ -1378,8 +1369,8 @@ fn face_info_0x0060_is_unconditional_not_k3iii_gated() {
   // `%FaceInfo` decode is produced (FacesDetected present).
   let mut em = Vec::new();
   emit_face_info(block, &mut em);
-  assert_eq!(find(&em, "FacesDetected"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "FacePosition"), Some(&s("16 32")));
+  assert_eq!(find(&em, "FacesDetected"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "FacePosition"), Some(s("16 32")));
   // Sanity: a body that WOULD match the LevelInfo K3III gate is still a normal
   // FaceInfo producer at 0x0060 — the gate is unrelated to this table.
   assert!(is_k3_mark_iii(Some("PENTAX K-3 Mark III")));
@@ -1448,14 +1439,14 @@ fn af_info_k3iii_complete_record_emits_areas() {
   // path the truncation guard must NOT regress.
   let mut em = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_COMPLETE, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "AFMode"), Some(&s("Phase Detect")));
-  assert_eq!(find(&em, "AFSelectionMode"), Some(&s("Spot")));
-  assert_eq!(find(&em, "MaxNumAFPoints"), Some(&TagValue::I64(101)));
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400")));
+  assert_eq!(find(&em, "AFMode"), Some(s("Phase Detect")));
+  assert_eq!(find(&em, "AFSelectionMode"), Some(s("Spot")));
+  assert_eq!(find(&em, "MaxNumAFPoints"), Some(TagValue::I64(101)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(s("600x400")));
   assert_eq!(
     find(&em, "AFAreas"),
-    Some(&TagValue::List(vec![s(
+    Some(TagValue::List(vec![s(
       "300,200(central,peripheral,in-focus)"
     )]))
   );
@@ -1471,9 +1462,9 @@ fn af_info_k3iii_complete_record_value_conv_run() {
   // the full 7-value run for the single point.
   let mut em = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_COMPLETE, ByteOrder::Big, false, &mut em);
-  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600 400")));
+  assert_eq!(find(&em, "AFFrameSize"), Some(s("600 400")));
   // The single 7-tuple: 600 400 300 200 0 0 20.
-  assert_eq!(find(&em, "AFAreas"), Some(&s("600 400 300 200 0 0 20")));
+  assert_eq!(find(&em, "AFAreas"), Some(s("600 400 300 200 0 0 20")));
 }
 
 #[test]
@@ -1491,7 +1482,7 @@ fn af_info_k3iii_truncated_before_area_skips_afareas() {
     true,
     &mut em,
   );
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
   // AFFrameSize (element 7..=8) and AFAreas (element 7+) are both absent — NOT an
   // empty list, NOT `(none)`.
   assert!(find(&em, "AFFrameSize").is_none());
@@ -1511,7 +1502,7 @@ fn af_info_k3iii_truncated_before_area_value_conv_also_skips() {
     false,
     &mut em,
   );
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
   assert!(find(&em, "AFAreas").is_none());
 }
 
@@ -1530,13 +1521,13 @@ fn af_info_k3iii_partial_area_tuple_keeps_whole_int16u() {
   // present — the row is NOT skipped, only its single tuple is incomplete).
   let mut em = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREA, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400"))); // elements 7,8 present
-  assert_eq!(find(&em, "AFAreas"), Some(&TagValue::List(vec![])));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(s("600x400"))); // elements 7,8 present
+  assert_eq!(find(&em, "AFAreas"), Some(TagValue::List(vec![])));
   // `-n`: the space-joined run of the 3 readable int16u (600 400 300).
   let mut em_n = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREA, ByteOrder::Big, false, &mut em_n);
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600 400 300")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("600 400 300")));
 }
 
 #[test]
@@ -1551,13 +1542,13 @@ fn af_info_k3iii_partial_frame_size_keeps_single_int16u() {
   let block = &AFINFO_K3III_COMPLETE[..16]; // elements 0..=7 (element 7 = 600)
   let mut em = Vec::new();
   emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
-  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600")));
-  assert_eq!(find(&em, "AFAreas"), Some(&TagValue::List(vec![]))); // raw "600" < 7-tuple
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
+  assert_eq!(find(&em, "AFFrameSize"), Some(s("600")));
+  assert_eq!(find(&em, "AFAreas"), Some(TagValue::List(vec![]))); // raw "600" < 7-tuple
   let mut em_n = Vec::new();
   emit_af_info_k3iii(block, ByteOrder::Big, false, &mut em_n);
-  assert_eq!(find(&em_n, "AFFrameSize"), Some(&s("600")));
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600")));
+  assert_eq!(find(&em_n, "AFFrameSize"), Some(s("600")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("600")));
 }
 
 /// A 24-byte contrast-detect record (elements 0..=11): NumAFPoints=1, areaW (element
@@ -1588,8 +1579,8 @@ fn af_info_k3iii_partial_area_size_keeps_single_int16u() {
   // `$$valPt` slice or a both-present guard would have wrongly suppressed it.
   let mut em = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_PARTIAL_AREASIZE, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "AFFrameSize"), Some(&s("600x400")));
-  assert_eq!(find(&em, "AFAreaSize"), Some(&s("64")));
+  assert_eq!(find(&em, "AFFrameSize"), Some(s("600x400")));
+  assert_eq!(find(&em, "AFAreaSize"), Some(s("64")));
   let mut em_n = Vec::new();
   emit_af_info_k3iii(
     AFINFO_K3III_PARTIAL_AREASIZE,
@@ -1597,7 +1588,7 @@ fn af_info_k3iii_partial_area_size_keeps_single_int16u() {
     false,
     &mut em_n,
   );
-  assert_eq!(find(&em_n, "AFAreaSize"), Some(&s("64")));
+  assert_eq!(find(&em_n, "AFAreaSize"), Some(s("64")));
 }
 
 /// A FULL `%AFInfoK3III` record (28 bytes, element 7 = byte 14 readable) with
@@ -1634,8 +1625,8 @@ fn af_info_k3iii_num_af_points_zero_present_record_emits_empty_afareas() {
   // case below, where element 7 is ABSENT and AFAreas is skipped entirely.)
   let mut em = Vec::new();
   emit_af_info_k3iii(AFINFO_K3III_NUM_ZERO_PRESENT, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "AFAreas"), Some(&s("(none)")));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "AFAreas"), Some(s("(none)")));
   assert!(find(&em, "AFFrameSize").is_none());
   assert!(find(&em, "AFAreaSize").is_none());
 
@@ -1647,7 +1638,7 @@ fn af_info_k3iii_num_af_points_zero_present_record_emits_empty_afareas() {
     false,
     &mut em_n,
   );
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("")));
   assert!(find(&em_n, "AFFrameSize").is_none());
   assert!(find(&em_n, "AFAreaSize").is_none());
 }
@@ -1662,7 +1653,7 @@ fn af_info_k3iii_num_af_points_zero_truncated_before_area_skips_afareas() {
   let block = &AFINFO_K3III_NUM_ZERO_PRESENT[..14];
   let mut em = Vec::new();
   emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(0)));
   assert!(find(&em, "AFAreas").is_none());
   assert!(find(&em, "AFFrameSize").is_none());
   assert!(find(&em, "AFAreaSize").is_none());
@@ -1699,8 +1690,8 @@ fn af_info_k3iii_row_start_only_num_zero_emits_empty_afareas() {
     true,
     &mut em,
   );
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(0)));
-  assert_eq!(find(&em, "AFAreas"), Some(&s("(none)")));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(0)));
+  assert_eq!(find(&em, "AFAreas"), Some(s("(none)")));
   // AFFrameSize/AFAreaSize stay suppressed by the NumAFPoints>0 Condition.
   assert!(find(&em, "AFFrameSize").is_none());
   assert!(find(&em, "AFAreaSize").is_none());
@@ -1713,7 +1704,7 @@ fn af_info_k3iii_row_start_only_num_zero_emits_empty_afareas() {
     false,
     &mut em_n,
   );
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("")));
 }
 
 /// Same 15-byte row-start-only record but with NumAFPoints=1 (count = 7*1 = 7).
@@ -1743,7 +1734,7 @@ fn af_info_k3iii_row_start_only_num_one_skips_afareas() {
     true,
     &mut em,
   );
-  assert_eq!(find(&em, "NumAFPoints"), Some(&TagValue::I64(1)));
+  assert_eq!(find(&em, "NumAFPoints"), Some(TagValue::I64(1)));
   assert!(find(&em, "AFAreas").is_none());
   // AFFrameSize (fixed int16u[2] at element 7) also shortens to 0 whole int16u here
   // (only byte 14) ⇒ ReadValue undef ⇒ skipped.
@@ -1786,7 +1777,7 @@ fn af_info_k3iii_contrast_detect_emits_afareasize() {
   ];
   let mut em = Vec::new();
   emit_af_info_k3iii(block, ByteOrder::Big, true, &mut em);
-  assert_eq!(find(&em, "AFAreaSize"), Some(&s("64x48")));
+  assert_eq!(find(&em, "AFAreaSize"), Some(s("64x48")));
 }
 
 #[test]
@@ -1798,10 +1789,10 @@ fn push_af_areas_k3iii_empty_value_render() {
   // (Bundled ExifTool on a NumAFPoints==0 record: `AFAreas=(none)` vs `AFAreas=''`.)
   let mut em_j = Vec::new();
   push_af_areas_k3iii(&[], true, &mut em_j);
-  assert_eq!(find(&em_j, "AFAreas"), Some(&s("(none)")));
+  assert_eq!(find(&em_j, "AFAreas"), Some(s("(none)")));
   let mut em_n = Vec::new();
   push_af_areas_k3iii(&[], false, &mut em_n);
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("")));
 }
 
 #[test]
@@ -1812,8 +1803,8 @@ fn push_af_areas_k3iii_short_nonempty_run_is_empty_list_not_none() {
   // Under `-n` it is the space-joined raw run. Pins the `(none)`-vs-`[]` boundary.
   let mut em_j = Vec::new();
   push_af_areas_k3iii(&[600, 400, 300], true, &mut em_j);
-  assert_eq!(find(&em_j, "AFAreas"), Some(&TagValue::List(vec![])));
+  assert_eq!(find(&em_j, "AFAreas"), Some(TagValue::List(vec![])));
   let mut em_n = Vec::new();
   push_af_areas_k3iii(&[600, 400, 300], false, &mut em_n);
-  assert_eq!(find(&em_n, "AFAreas"), Some(&s("600 400 300")));
+  assert_eq!(find(&em_n, "AFAreas"), Some(s("600 400 300")));
 }

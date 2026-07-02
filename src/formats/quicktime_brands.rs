@@ -1692,7 +1692,7 @@ fn render_cmt3_block(
     EmittedTag::new_with_priority(
       Group::new("MakerNotes", group1),
       smol_str::SmolStr::new(e.name()),
-      e.value().clone(),
+      e.value().into_owned(),
       e.unknown(),
       e.priority(),
     )

@@ -190,6 +190,40 @@ pub enum SubTable {
   PrintIm,
 }
 
+impl SubTable {
+  /// `true` when a `%Sony::Main` row carrying this SubDirectory target is decoded
+  /// by `exif::mod::sony_emit_enciphered_subblock` — the `ProcessEnciphered`/
+  /// `ProcessBinaryData` shot/AF/lens series `Tag2010` (0x2010), the whole
+  /// `Tag9xxx` family, and `AFInfo`/`Tag940e` (0x940e), plus the one PLAIN
+  /// `Tag202a` block that shares that dispatcher.
+  ///
+  /// That dispatcher decodes the block by re-slicing the verbatim on-disk value
+  /// span from the input buffer (`data[value_offset..]`) for BOTH the model/byte-
+  /// matched decode AND the `%unknownCipherData` fallback (its `_ => {}` arm), and
+  /// `exif::mod::emit_sony_value` returns at its Step-2 SubDirectory guard WITHOUT
+  /// reading the value — so the walk's decoded [`RawValue`](crate::exif::ifd::RawValue)
+  /// clone of such a row is DEAD (never read). This is the routing fact the #443
+  /// zero-copy walk guard keys off (via [`super::value_resliced_from_data`]).
+  ///
+  /// `Tag9xxx` alone groups THIRTEEN tag IDs (`0x9050`, `0x9400`-`0x9406`,
+  /// `0x940a`, `0x940c`, `0x9416`, `0x900b`, `0x202a`), so a new enciphered
+  /// dispatcher row added under it is covered here AUTOMATICALLY — the guard needs
+  /// no hand-maintained tag-ID list (superseding the #443 R1/R2 lists that kept
+  /// missing members, #443 R3).
+  ///
+  /// Returns `false` for the older PLAIN binary sub-tables (`CameraInfo`,
+  /// `FocusInfo`, `CameraSettings`, `ExtraInfo`, `ShotInfo`) — those are decoded by
+  /// the SEPARATE `exif::mod::sony_emit_binary_subdir` dispatcher and are left on
+  /// the `read_value` path (this fix is scoped to the enciphered-subblock class;
+  /// they are byte-identical either way) — and for the non-`ProcessBinaryData`
+  /// targets (`Panorama`, `HiddenInfo`, `MinoltaMakerNote`, `PrintIm`).
+  #[must_use]
+  #[inline]
+  pub(crate) const fn dispatched_by_enciphered_subblock(&self) -> bool {
+    matches!(self, Self::Tag2010 | Self::Tag9xxx | Self::AfInfo)
+  }
+}
+
 /// `%Sony::Main` (`Sony.pm:707-2711`). Sorted by tag ID.
 ///
 /// 114 rows — one per numeric key of the bundled hash.
@@ -1352,6 +1386,70 @@ mod tests {
     let t = lookup(0x202a).unwrap();
     assert_eq!(t.name, "Tag202a");
     assert_eq!(t.sub_table, Some(SubTable::Tag9xxx));
+  }
+
+  /// The #443 R3 CLASS-KILLER routing fact: `dispatched_by_enciphered_subblock`
+  /// is true for EXACTLY the three SubDirectory variants
+  /// `sony_emit_enciphered_subblock` handles (`Tag2010`, `Tag9xxx`, `AfInfo`) and
+  /// false for the plain-binary + non-`ProcessBinaryData` variants. This is what
+  /// lets the walk guard cover the whole enciphered class from ONE variant check,
+  /// with no hand-maintained tag-ID list.
+  #[test]
+  fn enciphered_subblock_class_is_variant_derived() {
+    for v in [SubTable::Tag2010, SubTable::Tag9xxx, SubTable::AfInfo] {
+      assert!(
+        v.dispatched_by_enciphered_subblock(),
+        "{v:?} is decoded by sony_emit_enciphered_subblock"
+      );
+    }
+    for v in [
+      SubTable::CameraInfo,
+      SubTable::FocusInfo,
+      SubTable::CameraSettings,
+      SubTable::ExtraInfo,
+      SubTable::ShotInfo,
+      SubTable::Panorama,
+      SubTable::HiddenInfo,
+      SubTable::MinoltaMakerNote,
+      SubTable::PrintIm,
+    ] {
+      assert!(
+        !v.dispatched_by_enciphered_subblock(),
+        "{v:?} is NOT an enciphered-subblock dispatcher (left on the read_value path)"
+      );
+    }
+  }
+
+  /// EVERY tag ID `sony_emit_enciphered_subblock` decodes must resolve — via its
+  /// `SubTable` variant — to the enciphered-subblock class, so the routing-derived
+  /// walk guard confines its walk clone. This pins the exact ID set (incl. the
+  /// members `0x9400`/`0x9402`/`0x9404`/`0x9405`/`0x9406`/`0x9050`/`0x9401`/
+  /// `0x9403`/`0x9416`/`0x202a`/`0x900b` that the R1/R2 hand lists MISSED) so a
+  /// future edit that drops one from `Tag9xxx` — or adds a dispatcher arm without
+  /// wiring its variant — is caught here, not by a fuzzer (#443 R3).
+  #[test]
+  fn every_enciphered_subblock_id_is_in_the_class() {
+    for id in [
+      0x2010u16, 0x9050, 0x9400, 0x9401, 0x9402, 0x9403, 0x9404, 0x9405, 0x9406, 0x940a, 0x940c,
+      0x940e, 0x9416, 0x900b, 0x202a,
+    ] {
+      let sub = lookup(id)
+        .unwrap_or_else(|| panic!("0x{id:04x} is a %Sony::Main row"))
+        .sub_table
+        .unwrap_or_else(|| panic!("0x{id:04x} is a SubDirectory dispatcher"));
+      assert!(
+        sub.dispatched_by_enciphered_subblock(),
+        "0x{id:04x} ({sub:?}) must be in the enciphered-subblock class"
+      );
+    }
+    // The plain binary sub-tables are deliberately OUTSIDE the class.
+    for id in [0x0010u16, 0x0020, 0x0114, 0x0116, 0x3000] {
+      let sub = lookup(id).unwrap().sub_table.unwrap();
+      assert!(
+        !sub.dispatched_by_enciphered_subblock(),
+        "0x{id:04x} ({sub:?}) is a plain binary sub-table, not enciphered-subblock"
+      );
+    }
   }
 
   /// The `%unknownCipherData` rows carry `Unknown => 1` (`Sony.pm:676`).

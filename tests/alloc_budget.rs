@@ -132,6 +132,12 @@ const FIXTURES: &[&str] = &[
   "ID3v2_4_big.mp3",
   "QuickTime_frea_rexing17b.mov",
   "Real.ra",
+  // Real Sony ARWs — the `%Sony::Main` walk (#443 confines its suppressed-Unknown
+  // `0x94xx` cipher-leaf values to a BORROWED span, so their per-leaf value clone
+  // is gone). Pinned so a regression that re-materializes them trips the gate.
+  "Sony_ILME-FX3_real.ARW",
+  "Sony_SLT-A33_real.ARW",
+  "Sony_DSLR-A200_real.ARW",
 ];
 
 /// Measure + report + assert the per-fixture allocation counts for both the
@@ -212,6 +218,9 @@ fn alloc_budget() {
 
   read_value_byte_len_float_rational_is_zero_heap();
   geotiff_block_capture_is_single_copy();
+  sony_cipher_data_is_borrowed_not_amplified();
+  sony_conditional_subdir_fallback_is_borrowed_not_amplified();
+  sony_raw_selector_subdir_fallback_is_borrowed_not_amplified();
 }
 
 /// The placeholder-length path ([`exifast::exif::ifd::read_value_byte_len`]) for
@@ -409,6 +418,344 @@ fn geotiff_block_capture_is_single_copy() {
   );
 }
 
+/// The seven `%Sony::Main` `%unknownCipherData` SUPPRESSED-`Unknown` LEAF tag
+/// IDs (`Sony_0x9407`/`8`/`9`/`b`/`d`/`f` + `0x9411`, `Sony.pm:2055-2114`).
+const SONY_CIPHER_IDS: [u16; 7] = [0x9407, 0x9408, 0x9409, 0x940b, 0x940d, 0x940f, 0x9411];
+
+/// The value offset (TIFF-absolute) where [`sony_cipher_tiff`] places the shared
+/// region — after the 8-byte header, IFD0, ExifIFD, the 12-byte `SONY DSC`
+/// prefix, and the `n` cipher-leaf entries of the Sony Main IFD.
+fn sony_region_off(n: usize) -> usize {
+  // 8 (header) + 18 (IFD0: 1 entry) + 18 (ExifIFD: 1 entry) + 12 ("SONY DSC ..")
+  // = MN body IFD at 56, then 2 (count) + n*12 (entries) + 4 (next-IFD).
+  56 + 2 + n * 12 + 4
+}
+
+/// Craft a MINIMAL little-endian TIFF whose Sony MakerNote is a `%Sony::Main`
+/// IFD of `%unknownCipherData` SUPPRESSED-`Unknown` cipher rows (`ids` — either
+/// the suppressed LEAVES or the conditional-`SubDirectory` dispatchers, and
+/// `ids` MAY repeat a single id), each an out-of-line `undef[span]` value
+/// pointing at a 1-byte-SHIFTED, OVERLAPPING, DISTINCT window of ONE shared
+/// `region`-byte block:
+///
+/// `IFD0(ExifOffset)` → `ExifIFD(MakerNote 0x927c)` → `"SONY DSC \0\0\0"` +
+/// `Sony Main IFD(ids…)` + the shared region.
+///
+/// The Sony Main IFD is `Base => Inherit` (offsets are TIFF-absolute), so every
+/// leaf's value pointer resolves into the shared region. `span` is FIXED
+/// (`region - 16`, independent of `ids.len()`) so scaling the leaf count keeps
+/// the per-leaf window identical; the 16-byte margin keeps up to 16 shifted
+/// windows in-bounds. `span` stays below the 100 000-element excessive-count
+/// gate so the walk raises no warnings.
+fn sony_cipher_tiff(ids: &[u16], region: usize) -> Vec<u8> {
+  assert!(
+    ids.len() <= 16 && region >= 32,
+    "up to 16 shifted windows fit"
+  );
+  let span = u32::try_from(region - 16).expect("span fits u32");
+  assert!(span < 100_000, "keep count below the excessive-count gate");
+  let region_off = sony_region_off(ids.len());
+  let total = region_off + region;
+  const EXIF_OFF: u32 = 26;
+  const MN_OFF: usize = 44;
+
+  let mut t: Vec<u8> = Vec::with_capacity(total);
+  // [0..8] TIFF header — little-endian, IFD0 at offset 8.
+  t.extend_from_slice(&[b'I', b'I', 0x2a, 0x00]);
+  t.extend_from_slice(&8u32.to_le_bytes());
+  // [8] IFD0 — a single ExifOffset (0x8769) pointer.
+  t.extend_from_slice(&1u16.to_le_bytes());
+  t.extend_from_slice(&0x8769u16.to_le_bytes());
+  t.extend_from_slice(&4u16.to_le_bytes()); // LONG
+  t.extend_from_slice(&1u32.to_le_bytes());
+  t.extend_from_slice(&EXIF_OFF.to_le_bytes());
+  t.extend_from_slice(&0u32.to_le_bytes());
+  assert_eq!(t.len(), EXIF_OFF as usize);
+  // [26] ExifIFD — a single MakerNote (0x927c) whose value is the Sony blob.
+  let mn_len = u32::try_from(total - MN_OFF).expect("mn_len fits u32");
+  t.extend_from_slice(&1u16.to_le_bytes());
+  t.extend_from_slice(&0x927cu16.to_le_bytes());
+  t.extend_from_slice(&7u16.to_le_bytes()); // UNDEF
+  t.extend_from_slice(&mn_len.to_le_bytes());
+  t.extend_from_slice(&u32::try_from(MN_OFF).unwrap().to_le_bytes());
+  t.extend_from_slice(&0u32.to_le_bytes());
+  assert_eq!(t.len(), MN_OFF);
+  // [44] `MakerNoteSony` primary signature (Start = $valuePtr + 12).
+  t.extend_from_slice(b"SONY DSC \x00\x00\x00");
+  // [56] Sony Main IFD — the cipher leaves, ASCENDING (a valid sorted IFD).
+  t.extend_from_slice(&u16::try_from(ids.len()).unwrap().to_le_bytes());
+  for (i, &id) in ids.iter().enumerate() {
+    t.extend_from_slice(&id.to_le_bytes());
+    t.extend_from_slice(&7u16.to_le_bytes()); // UNDEF
+    t.extend_from_slice(&span.to_le_bytes()); // count
+    // 1-byte-shifted, overlapping, DISTINCT windows of the shared region.
+    t.extend_from_slice(&u32::try_from(region_off + i).unwrap().to_le_bytes());
+  }
+  t.extend_from_slice(&0u32.to_le_bytes());
+  assert_eq!(t.len(), region_off);
+  // [region_off] the shared region every leaf's window overlaps.
+  t.resize(total, 0x5a);
+  t
+}
+
+/// #443 — the Sony `0x94xx` `%unknownCipherData` suppressed-`Unknown` leaves are
+/// emitted as BORROWED value spans (zero-copy from the input buffer), so a
+/// crafted MakerNote cannot amplify memory: N such leaves over one M-byte region
+/// retain O(N) span descriptors, not the pre-fix O(N·M) (each leaf materialized a
+/// throwaway `RawValue::Bytes` PLUS a cached `TagValue::Bytes`).
+///
+/// Two byte-volume probes prove invariants (iv) [O(N+M), not N·M] and (v)
+/// [overlapping 1-byte-shifted DISTINCT spans share the buffer]:
+///   1. N→2N leaves over the SAME (large) region — the delta must be O(N·span-
+///      descriptor), far below even ONE span copy.
+///   2. small-M vs large-M region (fixed 7 leaves) — the growth must be O(1) in
+///      the region size, not the pre-fix ~2·N·ΔM.
+/// A third probe (invariant ii/vii) reads a suppressed leaf's value through the
+/// PUBLIC accessor and asserts it materializes the EXACT on-disk span bytes.
+///
+/// Called INLINE from the single `alloc_budget` test (the counters are
+/// process-global; see the module doc).
+fn sony_cipher_data_is_borrowed_not_amplified() {
+  use exifast::parse_exif;
+
+  // Overlapping-span windows, all deep enough that the pre-fix copy would be a
+  // clear multiple of the region growth. `span = region - 16` in every build.
+  const SMALL: usize = 8_016; // span 8000
+  const LARGE: usize = 90_016; // span 90000 (< the 100k excessive-count gate)
+
+  // --- (a) N→2N leaves over the SAME large region. ---
+  let tiff_n = sony_cipher_tiff(&SONY_CIPHER_IDS[0..3], LARGE);
+  let tiff_2n = sony_cipher_tiff(&SONY_CIPHER_IDS[0..6], LARGE);
+  // Warm-up OUTSIDE the measured region (lazy statics / first-call init).
+  assert!(parse_exif(&tiff_n).is_some(), "3-leaf Sony TIFF parses");
+  assert!(parse_exif(&tiff_2n).is_some(), "6-leaf Sony TIFF parses");
+  let (_n_ok, bytes_n) = count_alloc_bytes(|| parse_exif(&tiff_n).is_some());
+  let (_2n_ok, bytes_2n) = count_alloc_bytes(|| parse_exif(&tiff_2n).is_some());
+
+  // --- (b) small-M vs large-M region, fixed 7 leaves. ---
+  let tiff_small = sony_cipher_tiff(&SONY_CIPHER_IDS, SMALL);
+  let tiff_large = sony_cipher_tiff(&SONY_CIPHER_IDS, LARGE);
+  assert!(
+    parse_exif(&tiff_small).is_some(),
+    "small-region Sony TIFF parses"
+  );
+  assert!(
+    parse_exif(&tiff_large).is_some(),
+    "large-region Sony TIFF parses"
+  );
+  let (_s_ok, small_bytes) = count_alloc_bytes(|| parse_exif(&tiff_small).is_some());
+  let (_l_ok, large_bytes) = count_alloc_bytes(|| parse_exif(&tiff_large).is_some());
+
+  println!("\n=== alloc_budget: sony 0x94xx cipher-leaf borrow (single-copy) ===");
+  println!("  N=3 leaves={bytes_n}B  N=6 leaves={bytes_2n}B  (same {LARGE}B region)");
+  println!("  M=small({SMALL})={small_bytes}B  M=large({LARGE})={large_bytes}B");
+
+  let span = LARGE - 16; // 90000 — the per-leaf window / pre-fix per-copy volume
+
+  // (a) Doubling the leaf count over the SAME region adds only O(N descriptors)
+  // — FAR below one span copy. The pre-fix path would add 3 leaves × (throwaway
+  // RawValue + cached copy) ≈ 6·span here.
+  let n_delta = bytes_2n.saturating_sub(bytes_n);
+  assert!(
+    n_delta < span,
+    "N→2N cipher leaves grew {n_delta} bytes for the SAME region — a borrowed \
+     span must add O(N descriptors), NOT O(N·M); a growth ≥ one span ({span}) \
+     means a per-leaf value copy regressed back in (#443)."
+  );
+
+  // (b) Growing the region (fixed 7 leaves) must be O(1) — the spans are
+  // borrowed from the input buffer, never copied. The pre-fix path copied each
+  // of the 7 overlapping windows TWICE, so it would grow ~14·ΔM.
+  let region_delta = LARGE - SMALL; // 82000
+  let m_growth = large_bytes.saturating_sub(small_bytes);
+  assert!(
+    m_growth < region_delta,
+    "the 7 cipher leaves grew {m_growth} bytes for a {region_delta}-byte region \
+     increase — a borrowed span must be O(1) in the region size; a growth near \
+     14·ΔM means the overlapping windows are being COPIED (#443)."
+  );
+
+  // --- (c) invariant (ii)/(vii): the PUBLIC accessor materializes the EXACT
+  // on-disk span for a SUPPRESSED leaf (non-empty, correct window). ---
+  let meta = parse_exif(&tiff_small).expect("small Sony TIFF parses");
+  let mn = meta.maker_note().expect("Sony MakerNote captured");
+  let leaf = mn
+    .emissions_print_conv()
+    .iter()
+    .find(|e| e.name() == "Sony_0x9407")
+    .expect("the 0x9407 %unknownCipherData leaf is cached");
+  assert!(
+    leaf.unknown(),
+    "0x9407 is Unknown => 1 (suppressed by default)"
+  );
+  // `Sony_0x9407` is leaf index 0 ⇒ its window starts at the region base.
+  let base = sony_region_off(SONY_CIPHER_IDS.len());
+  let want = &tiff_small[base..base + (SMALL - 16)];
+  assert!(!want.is_empty(), "the on-disk span is non-empty");
+  assert_eq!(
+    leaf.value().as_ref(),
+    &exifast::value::TagValue::Bytes(want.to_vec()),
+    "the suppressed cipher leaf materializes the EXACT on-disk span bytes"
+  );
+}
+
+/// #443 R2 — the Sony CONDITIONAL-`SubDirectory` cipher dispatchers
+/// (`0x2010`/`0x940a`/`0x940c`/`0x940e`) also confine their walk-clone. Each is
+/// a `sub_table: Some(...)` row that decodes a real enciphered sub-table when the
+/// `Model` matches a branch and falls through to `%unknownCipherData` (emitting
+/// NOTHING) when none does. Pre-fix the walk still `read_value`-cloned the
+/// (crafted-huge) `undef[N]` value span onto EACH entry, so N duplicate
+/// dispatcher rows over one shared M-byte region retained O(N·M); the #443 R2
+/// walk-guard extension stores a zero-copy empty `RawValue` for these rows too
+/// (their decode re-slices the span from the input buffer for BOTH the matched
+/// and the fallback path), bounding the retained heap to O(N + M).
+///
+/// This TIFF carries NO `Model`, so every dispatcher's model gate fails and all
+/// N `0x940e` rows fall back (`sony_emit_enciphered_subblock`'s `_ => {}` — no
+/// `process_enciphered`, zero decode allocation), isolating the walk clone the
+/// fix removes. It repeats a SINGLE id (the walker processes every entry with no
+/// ascending/dedup gate) over 1-byte-shifted overlapping windows so N scales
+/// while the shared region stays fixed. Proves invariant (vi) for the fallback
+/// shape (the leaf-ID probe above covers the leaf shape).
+///
+/// Called INLINE from the single `alloc_budget` test (the counters are
+/// process-global; see the module doc).
+fn sony_conditional_subdir_fallback_is_borrowed_not_amplified() {
+  use exifast::parse_exif;
+
+  // The per-row window; `span = region - 16` in the crafted TIFF (< the 100k
+  // excessive-count gate, so the walk raises no warnings + processes every row).
+  const LARGE: usize = 90_016; // span 90000
+
+  // N→2N duplicate `0x940e` dispatcher rows over the SAME large region. With no
+  // Model they all fall back to `%unknownCipherData` (emit nothing); pre-fix each
+  // still retained a `read_value` clone of the 90000-byte window.
+  let ids_n = [0x940e_u16; 4];
+  let ids_2n = [0x940e_u16; 8];
+  let tiff_n = sony_cipher_tiff(&ids_n, LARGE);
+  let tiff_2n = sony_cipher_tiff(&ids_2n, LARGE);
+  // Warm-up OUTSIDE the measured region (lazy statics / first-call init).
+  assert!(
+    parse_exif(&tiff_n).is_some(),
+    "4-dispatcher Sony TIFF parses"
+  );
+  assert!(
+    parse_exif(&tiff_2n).is_some(),
+    "8-dispatcher Sony TIFF parses"
+  );
+  let (_n_ok, bytes_n) = count_alloc_bytes(|| parse_exif(&tiff_n).is_some());
+  let (_2n_ok, bytes_2n) = count_alloc_bytes(|| parse_exif(&tiff_2n).is_some());
+
+  println!("\n=== alloc_budget: sony conditional-subdir fallback borrow (single-copy) ===");
+  println!("  N=4 dispatchers={bytes_n}B  N=8 dispatchers={bytes_2n}B  (same {LARGE}B region)");
+
+  // Doubling the fallback-dispatcher count over the SAME region adds only O(N
+  // descriptors) — FAR below one span copy. The pre-fix path added 4 rows ×
+  // one `read_value` clone ≈ 4·span here (each retained on its walked entry).
+  let span = LARGE - 16; // 90000 — the per-row window / pre-fix per-clone volume
+  let n_delta = bytes_2n.saturating_sub(bytes_n);
+  assert!(
+    n_delta < span,
+    "N→2N conditional-subdir fallback rows grew {n_delta} bytes for the SAME \
+     region — the walk must store a zero-copy empty RawValue (O(N descriptors)), \
+     NOT O(N·M); a growth ≥ one span ({span}) means the fallback rows' \
+     read_value clone regressed back in (#443 R2)."
+  );
+
+  // Confirm we exercised the FALLBACK path (not a matched decode): with no Model
+  // the `0x940e` dispatcher falls to `%unknownCipherData` and emits NO leaf, so
+  // the Sony MakerNote carries zero emissions. A non-zero count would mean a
+  // matched sub-table decode ran (the probe would no longer test the fallback).
+  let meta = parse_exif(&tiff_n).expect("dispatcher Sony TIFF parses");
+  let dispatcher_leaves = meta
+    .maker_note()
+    .map_or(0, |mn| mn.emissions_print_conv().len());
+  assert_eq!(
+    dispatcher_leaves, 0,
+    "0x940e with no Model must fall back to %unknownCipherData (emit no leaf); \
+     a non-zero count means a matched decode ran (test no longer exercises the \
+     fallback path)."
+  );
+}
+
+/// #443 R3 — the CLASS-KILLER regression probe. The R1 (suppressed-leaf) and R2
+/// (`0x2010`/`0x940a`/`0x940c`/`0x940e`) predicates were HAND-LISTED tag IDs, so
+/// they kept missing members of the same enciphered-`SubDirectory` class — e.g.
+/// `0x9405` (a `sub_table: Some(Tag9xxx)` row selected by the RAW value's FIRST
+/// BYTE, not by `Model`): pre-R3 its walk clone was NOT confined, re-amplifying
+/// O(N·M). R3 derives the class from the `SubTable` variant
+/// (`dispatched_by_enciphered_subblock`), so `0x9405` — and every other `Tag9xxx`
+/// ID — is covered WITHOUT a hand-maintained list.
+///
+/// This probes the RAW-SELECTOR fallback shape the reviewer named (distinct from
+/// the R2 MODEL-selector probe above): the crafted region is all `0x5a`, which is
+/// NEITHER a `Tag9405a` selector (`/^[\x1b\x40\x7d]/`) NOR a `Tag9405b` selector
+/// (`/^[\x3a\xb3\x7e\x9a\x25\xe1\x76\x8b]/`), so `sony_emit_enciphered_subblock`
+/// falls to its `_ => {}` `%unknownCipherData` arm (no `process_enciphered`, zero
+/// decode allocation) — isolating the walk clone the fix removes. N duplicate
+/// `0x9405` rows over 1-byte-shifted overlapping windows of ONE fixed region make
+/// N scale while M stays fixed. Pre-R3 this FAILS (the `0x9405` clone regresses);
+/// post-R3 the delta is O(N descriptors).
+///
+/// Called INLINE from the single `alloc_budget` test (the counters are
+/// process-global; see the module doc).
+fn sony_raw_selector_subdir_fallback_is_borrowed_not_amplified() {
+  use exifast::parse_exif;
+
+  // The per-row window; `span = region - 16` (< the 100k excessive-count gate, so
+  // the walk raises no warnings + processes every row).
+  const LARGE: usize = 90_016; // span 90000
+
+  // N→2N duplicate `0x9405` RAW-SELECTOR dispatcher rows over the SAME large
+  // region. Every window's first byte is `0x5a` (a non-matching selector), so all
+  // fall back to `%unknownCipherData` (emit nothing); pre-R3 each still retained a
+  // `read_value` clone of the 90000-byte window (0x9405 ∉ the R2 hand list).
+  let ids_n = [0x9405_u16; 4];
+  let ids_2n = [0x9405_u16; 8];
+  let tiff_n = sony_cipher_tiff(&ids_n, LARGE);
+  let tiff_2n = sony_cipher_tiff(&ids_2n, LARGE);
+  // Warm-up OUTSIDE the measured region (lazy statics / first-call init).
+  assert!(parse_exif(&tiff_n).is_some(), "4-selector Sony TIFF parses");
+  assert!(
+    parse_exif(&tiff_2n).is_some(),
+    "8-selector Sony TIFF parses"
+  );
+  let (_n_ok, bytes_n) = count_alloc_bytes(|| parse_exif(&tiff_n).is_some());
+  let (_2n_ok, bytes_2n) = count_alloc_bytes(|| parse_exif(&tiff_2n).is_some());
+
+  println!("\n=== alloc_budget: sony raw-selector-subdir fallback borrow (single-copy) ===");
+  println!("  N=4 selectors={bytes_n}B  N=8 selectors={bytes_2n}B  (same {LARGE}B region)");
+
+  // Doubling the fallback-row count over the SAME region adds only O(N
+  // descriptors) — FAR below one span copy. The pre-R3 path added 4 rows × one
+  // `read_value` clone ≈ 4·span here (each retained on its walked entry).
+  let span = LARGE - 16; // 90000 — the per-row window / pre-fix per-clone volume
+  let n_delta = bytes_2n.saturating_sub(bytes_n);
+  assert!(
+    n_delta < span,
+    "N→2N raw-selector fallback rows grew {n_delta} bytes for the SAME region — \
+     the routing-derived guard must store a zero-copy empty RawValue for a \
+     `Tag9xxx` `0x9405` row (O(N descriptors)), NOT O(N·M); a growth ≥ one span \
+     ({span}) means an enciphered-subdir ID slipped the class-killer predicate \
+     (the #443 R1/R2 whack-a-mole)."
+  );
+
+  // Confirm we exercised the RAW-SELECTOR FALLBACK (not a matched decode): the
+  // all-`0x5a` region matches neither `Tag9405a` nor `Tag9405b`, so `0x9405`
+  // falls to `%unknownCipherData` and emits NO leaf. A non-zero count would mean a
+  // matched sub-table decode ran (the probe would no longer test the fallback).
+  let meta = parse_exif(&tiff_n).expect("selector Sony TIFF parses");
+  let selector_leaves = meta
+    .maker_note()
+    .map_or(0, |mn| mn.emissions_print_conv().len());
+  assert_eq!(
+    selector_leaves, 0,
+    "0x9405 with a non-matching first byte must fall back to %unknownCipherData \
+     (emit no leaf); a non-zero count means a matched decode ran (test no longer \
+     exercises the raw-selector fallback path)."
+  );
+}
+
 // ---------------------------------------------------------------------------
 // PINNED BUDGETS — set after the Phase-A.3 perf items landed (see report).
 // Each is the measured improved count plus a small headroom margin so trivial,
@@ -438,6 +785,13 @@ fn media_metadata_budget(name: &str) -> usize {
     "ID3v2_4_big.mp3" => 225,      // measured 209 (Contract A: 194 → 209)
     "QuickTime_frea_rexing17b.mov" => 40, // measured 31 (no EXIF string leaf)
     "Real.ra" => 30,               // measured 21 (P8: 31 → 21)
+    // Real Sony ARWs (#443) — POST-fix, the `%Sony::Main` suppressed-Unknown
+    // `0x94xx` cipher leaves no longer clone their value into the cached
+    // emission (they carry a BORROWED span), so these are a lower/equal
+    // baseline: measured FX3 485 / A33 329 / A200 258, each + ~7% headroom.
+    "Sony_ILME-FX3_real.ARW" => 520,  // measured 485
+    "Sony_SLT-A33_real.ARW" => 355,   // measured 329
+    "Sony_DSLR-A200_real.ARW" => 280, // measured 258
     // An unlisted fixture: no pinned budget (the harness still prints + checks
     // parse acceptance, just no ceiling).
     _ => usize::MAX,
@@ -558,6 +912,13 @@ fn extract_info_budget(name: &str) -> (usize, usize) {
     // Ceilings raised to (252, 270).
     "QuickTime_frea_rexing17b.mov" => (252, 270), // measured (237, 254) — +Canon composite-def scratch
     "Real.ra" => (100, 100),                      // measured (88, 87)
+    // Real Sony ARWs (#443) — POST-fix `-j`/`-n` render budgets. The
+    // suppressed-Unknown `0x94xx` cipher leaves are dropped BEFORE materializing
+    // (the `push_maker_note_tags` reorder), so their transient value clone is
+    // gone from BOTH render modes: measured + ~7% headroom.
+    "Sony_ILME-FX3_real.ARW" => (3300, 3440), // measured (3083, 3213)
+    "Sony_SLT-A33_real.ARW" => (2230, 2380),  // measured (2083, 2225)
+    "Sony_DSLR-A200_real.ARW" => (2120, 2250), // measured (1979, 2098)
     _ => (usize::MAX, usize::MAX),
   }
 }

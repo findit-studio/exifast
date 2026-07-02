@@ -27,13 +27,16 @@ fn emit_lens_rec_pentax_jpg_pair() {
   // #284: `%Pentax::LensRec` `LensType` is `Priority => 0` (`Pentax.pm:4202`).
   assert_eq!(em[0].priority(), 0, "LensRec LensType Priority=>0");
   assert_eq!(
-    em[0].value(),
+    em[0].value().as_ref(),
     &crate::value::TagValue::Str("Sigma or Tamron Lens (3 44)".into())
   );
   // -n: the raw "series model" pair.
   let mut em_n = std::vec::Vec::new();
   emit_lens_rec(&block, false, &mut em_n);
-  assert_eq!(em_n[0].value(), &crate::value::TagValue::Str("3 44".into()));
+  assert_eq!(
+    em_n[0].value().as_ref(),
+    &crate::value::TagValue::Str("3 44".into())
+  );
 }
 
 #[test]
