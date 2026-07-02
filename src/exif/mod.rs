@@ -6437,26 +6437,48 @@ impl Walker<'_, '_> {
       && makernotes::vendors::nikon::is_implicit_undef_subdir(tag_id))
       || (self.active_table == TableRef::Pentax
         && makernotes::vendors::pentax::is_implicit_undef_subdir(tag_id))
-      // Sony `%unknownCipherData` cipher rows (#443): the SUPPRESSED-`Unknown`
-      // LEAVES *and* the enciphered-`SubDirectory` dispatchers — every row whose
-      // value the Sony capture loop re-slices from `self.data`, never reading this
-      // decoded `RawValue`. A leaf (`sub_table: None`) is emitted as a ZERO-COPY
-      // BORROWED span; a dispatcher (`sub_table: Some(Tag2010|Tag9xxx|AfInfo)`) is
-      // decoded by `sony_emit_enciphered_subblock`, which re-slices the verbatim
-      // span for BOTH the model/byte-matched decode AND the `%unknownCipherData`
-      // fallback while `emit_sony_value` returns at its SubDirectory guard reading
-      // nothing. `value_resliced_from_data` derives the whole class from the
-      // ROUTING (`SubTable::dispatched_by_enciphered_subblock` + the leaf set), so
-      // a crafted IFD with N such rows over one shared in-bounds region retains
-      // O(N) descriptors, not N clones of the (possibly-huge) `undef[N]` block —
-      // with NO change to any emitted value. Gated to `undef` with `count != 1`
-      // (the `count == 1` int8u carve-out decodes to a scalar and stays on the
-      // normal path), matching the capture loop's borrow guard. Supersedes the
-      // R1/R2 hand-listed tag-ID predicates that kept missing members (#443 R3).
+      // Sony dead-value rows (#443/#486): the SUPPRESSED-`Unknown` cipher LEAVES
+      // *and* EVERY `SubDirectory` row — every row whose value the Sony capture
+      // loop re-slices from `self.data`, never reading this decoded `RawValue`. A
+      // leaf (`sub_table: None`) is emitted as a ZERO-COPY BORROWED span; a
+      // `SubDirectory` row (`sub_table: Some(_)`) is decoded by re-slicing the
+      // verbatim span — the enciphered blocks via `sony_emit_enciphered_subblock`
+      // (both the model/byte-matched decode AND the `%unknownCipherData` fallback),
+      // the plain-binary sub-tables via `sony_emit_binary_subdir` (the
+      // `$count`-matched table or its no-op `_ => return`) — while `emit_sony_value`
+      // returns at its Step-2 SubDirectory guard reading nothing. The `0x1003`
+      // `Panorama` DataMember side-effect likewise re-slices its match span from
+      // `self.data`, so zeroing the clone leaves that latch intact. So a crafted
+      // IFD with N such rows over one shared in-bounds region retains O(N)
+      // descriptors, not N clones of the (possibly-huge) value block — with NO
+      // change to any emitted value.
+      //
+      // The `$format` gate DIFFERS per class (#486 R2 — the R1 blanket
+      // `format == undef` was still format-gated for the SubDirectory class, so a
+      // duplicate `0x0010`/`0x0020`/… SubDirectory row encoded as
+      // `int8u`/`int16u`/`ascii` (any NON-`undef` format, under the excessive-count
+      // gate) MISSED this guard and retained a dead `read_value` clone — the N×M DoS
+      // for the non-`undef` encoding):
+      //   - a SubDirectory row (`sony_tag_has_sub_table`) is dead REGARDLESS of the
+      //     on-disk `$format` — the dispatchers key on `tag_id`/`value_size` + the
+      //     `emit_sony_value` Step-2 return fire off the STATIC table row, never the
+      //     declared format — so NO `undef` gate;
+      //   - a suppressed cipher LEAF (`is_suppressed_cipher_leaf`) is dead ONLY at
+      //     `$format == undef`: the leaf's borrowed span IS its emitted value, and a
+      //     non-`undef` cipher leaf falls through to `emit_sony_value`'s Step-6
+      //     `apply(raw)`, which READS this decoded value — so KEEP the `undef` gate
+      //     (matching the capture loop's `on_disk_format == Undef` borrow guard).
+      // Both keep `count != 1` (the `count == 1` int8u carve-out decodes to a scalar
+      // — a few inline bytes, no large allocation to zero — and stays on the normal
+      // `read_value`/`emit_sony_value` path). Supersedes the R1/R2 hand-listed
+      // tag-ID predicates that kept missing members (#443 R3) + the #443
+      // enciphered-only carve-out (#486 R1) + the R1 SubDirectory format-gate
+      // (#486 R2).
       || (self.active_table == TableRef::Sony
-        && makernotes::vendors::sony::value_resliced_from_data(tag_id)
-        && matches!(format, Format::Undef)
-        && count != 1)
+        && count != 1
+        && (makernotes::vendors::sony::sony_tag_has_sub_table(tag_id)
+          || (makernotes::vendors::sony::is_suppressed_cipher_leaf(tag_id)
+            && matches!(format, Format::Undef))))
     {
       RawValue::Bytes(Vec::new())
     } else {
