@@ -387,6 +387,18 @@ pub fn process_ligogps_with_scale(
   let mut cipher = out.take_cipher_state();
   // LigoGPS.pm:301 `for (; $pos + 0x84 <= length($$dataPt); $pos += 0x84)`.
   while pos + RECORD_STRIDE <= data.len() {
+    // A prior record's `[`/`\`-colon quadrant die (LigoGPS.pm:191) is a FATAL,
+    // uncaught Perl `=~` that unwinds past every remaining record AND every
+    // remaining `ProcessLigoGPS` walk of the file. Model it as a file-level halt,
+    // checked HERE — BEFORE the plain / `DecryptLigoGPS` / decipher paths — so a
+    // trailing plain-ASCII or decryptable `####` record (neither of which reaches
+    // [`decipher_ligogps`]'s own `ligo_aborted` short-circuit) cannot slip out.
+    // The flag lives on the file-level cipher state, so this also halts a fresh
+    // walk that inherits an already-aborted state (multiple LigoGPS blocks /
+    // trailers of one file).
+    if cipher.as_ref().is_some_and(|c| c.ligo_aborted) {
+      break;
+    }
     // The `while` guard proves `pos + RECORD_STRIDE <= data.len()`, so this
     // `.get` is always `Some`; `break` on the impossible miss is byte-identical.
     let Some(rec) = data.get(pos..pos + RECORD_STRIDE) else {
@@ -655,11 +667,27 @@ pub(crate) struct CipherDiscovery {
   /// succeed; its `Some`-ness is the "discovery done" signal (mirroring
   /// ExifTool's `delete $$cipherInfo{'next'}`, LigoGPS.pm:184).
   decipher: Option<DecipherTable>,
-  /// `true` once a DoS cap ([`MAX_CIPHER_CACHE`] / [`MAX_CIPHER_STEPS`]) was
-  /// exceeded — cipher discovery is then abandoned for the rest of the file (no
-  /// more caching, no more ordering attempts). Not an ExifTool concept; an
-  /// exifast crafted-input safeguard.
+  /// `true` once cipher discovery is abandoned for the rest of the file (no more
+  /// caching, no more ordering attempts; the next record is dropped, returning
+  /// `1`). Set ONLY on a DoS cap ([`MAX_CIPHER_CACHE`] / [`MAX_CIPHER_STEPS`]) —
+  /// an exifast crafted-input safeguard, NOT an ExifTool concept. A DoS-abandon
+  /// stops DECIPHER discovery ALONE: the plain-ASCII and `DecryptLigoGPS` record
+  /// paths keep emitting, because ExifTool never dies on these caps (they are
+  /// exifast's own bound), so [`process_ligogps_with_scale`] does NOT halt its
+  /// walk on this flag — contrast [`Self::ligo_aborted`].
   abandoned: bool,
+  /// `true` once the `[`/`\`-colon quadrant die ([`QuadrantMatch::Abort`]) has
+  /// fired — the FILE-level halt, DISTINCT from the DoS [`Self::abandoned`]. It
+  /// models ExifTool's fatal `=~` at LigoGPS.pm:191, which unwinds past every
+  /// remaining record AND every remaining `ProcessLigoGPS` walk of the file (Perl
+  /// never reaches line 204 to commit the table, and the die propagates UNCAUGHT
+  /// out of `ExtractInfo` before `GetInfo` harvests any tag).
+  /// [`process_ligogps_with_scale`] checks this at the TOP of the per-record loop
+  /// — BEFORE the plain / `DecryptLigoGPS` / decipher paths — so once set NOTHING
+  /// more emits (the plain + decrypt paths would otherwise bypass
+  /// [`decipher_ligogps`]'s own short-circuit). Persists across the file's walks
+  /// via the shared [`crate::metadata::LigoGpsMeta`] cipher state.
+  ligo_aborted: bool,
 }
 
 impl CipherDiscovery {
@@ -672,6 +700,7 @@ impl CipherDiscovery {
       ch1: None,
       decipher: None,
       abandoned: false,
+      ligo_aborted: false,
     }
   }
 
@@ -679,8 +708,15 @@ impl CipherDiscovery {
   /// of bundled's `$$et{LigoCipher}{'next'}` still being present at file cleanup
   /// (LigoGPS.pm:28-30). Read by [`crate::metadata::LigoGpsMeta::finish_cipher_discovery`]
   /// to fire the not-enough-points warning once at file end.
+  ///
+  /// Neither an `abandoned` (DoS) nor a `ligo_aborted` (die) state is reported
+  /// incomplete: the DoS caps ([`MAX_CIPHER_CACHE`] / [`MAX_CIPHER_STEPS`]) already
+  /// warned once during the walk, and the `[`/`\`-colon die-abort
+  /// ([`QuadrantMatch::Abort`]) ran AFTER LigoGPS.pm:184 `delete`d `next`, so
+  /// ExifTool's CleanupCipher would not warn "not enough points" for it — either
+  /// way file-end must stay silent.
   pub(crate) const fn discovery_incomplete(&self) -> bool {
-    self.decipher.is_none()
+    self.decipher.is_none() && !self.abandoned && !self.ligo_aborted
   }
 }
 
@@ -830,12 +866,77 @@ fn match_enciphered(rec: &[u8]) -> Option<(u8, u8, u8)> {
     .then_some((mil, colon, ch2))
 }
 
+/// Outcome of the LigoGPS.pm:191 `$colon`-interpolated quadrant match. `$colon`
+/// is an enciphered byte in `0x30..=0x5f`; four of those bytes are Perl regex
+/// metacharacters that change — or break — the compiled pattern, so the outcome
+/// is richer than a plain match / no-match (see [`match_quadrant`]).
+#[derive(Debug, PartialEq, Eq)]
+enum QuadrantMatch {
+  /// Perl's regex matched a `<space><ref><colon><sign?>` pair: learn the
+  /// coordinate-sign quadrant. `(ns_ch, lat_neg, ew_ch, lon_neg)` = ($1
+  /// enciphered lat-ref, $2 lat carried a `-`, $3 enciphered lon-ref, $4 lon
+  /// carried a `-`).
+  Matched(u8, bool, u8, bool),
+  /// Perl's regex compiled but did not match (its `if` is false): no quadrant is
+  /// learned, yet the decipher table still installs (LigoGPS.pm:204) and every
+  /// cached record decodes — the `^`-colon case, a non-matching non-metacharacter
+  /// record, and the documented `?`-colon lock (see [`match_quadrant`]).
+  Unmatched,
+  /// Perl's interpolated pattern is uncompilable (the `[` / `\` colons), so the
+  /// `=~` at LigoGPS.pm:191 DIES before line 204 commits the decipher table and
+  /// before the do-while apply loop (lines 209-218) runs: ExifTool emits NO
+  /// samples from this cipher. [`decipher_ligogps`] models the die as a graceful
+  /// abort (discard the cache, install no table, emit nothing).
+  Abort,
+}
+
 /// LigoGPS.pm:191 — `/ ([0-_])$colon(-?).*? ([0-_])$colon(-?)/` over the whole
 /// enciphered record. Finds the lat then lon `<space><ref><colon><sign?>`
-/// groups; `.*?` is non-greedy and (no `/s`) cannot cross a `\n`. Returns
-/// `(ns_ch, lat_neg, ew_ch, lon_neg)` = ($1 enciphered lat-ref, $2 lat carried a
-/// `-`, $3 enciphered lon-ref, $4 lon carried a `-`).
-fn match_quadrant(rec: &[u8], colon: u8) -> Option<(u8, bool, u8, bool)> {
+/// groups; `.*?` is non-greedy and (no `/s`) cannot cross a `\n`.
+///
+/// `$colon` is the enciphered time-separator byte, in `0x30..=0x5f`, and Perl
+/// interpolates it into the pattern before compiling. Every non-metacharacter
+/// byte — including `]` (0x5d), a plain literal outside a character class —
+/// leaves a literal `<space><ref><colon><sign?>` scan, which the byte loop below
+/// reproduces exactly ([`QuadrantMatch::Matched`] / [`QuadrantMatch::Unmatched`]).
+/// The four regex-metacharacter bytes in that range change the compiled pattern
+/// (ground-truthed against Perl 5.34):
+///   * `[` (0x5b) / `\` (0x5c): the interpolated pattern is uncompilable
+///     (`Unmatched ) in regex`), so the `=~` DIES. LigoGPS.pm:184 has already
+///     `delete`d the `next` lookup, but line 204 has NOT committed the decipher
+///     table and the do-while apply loop never runs — ExifTool commits no table
+///     and emits no samples from this cipher. → [`QuadrantMatch::Abort`].
+///   * `^` (0x5e): a mid-pattern anchor that cannot match after ` ([0-_])`, so
+///     the `if` is false; the table still installs, the two ref bytes fall
+///     through to the LigoGPS.pm:203 `?` fill, and every cached record decodes.
+///     → [`QuadrantMatch::Unmatched`].
+///   * `?` (0x3f): quantifies the preceding `([0-_])` group optional, so Perl
+///     matches a LEFT-SHIFTED pattern — capturing garbage ref bytes (an
+///     enciphered digit into $1, an empty $3) with $2/$4 empty — assigns those
+///     bytes N/E hemispheres and fires the GPSQuadrant warning.
+///
+/// DIVERGENCE — the `?` colon (documented, LOCKED; crafted-only, since a real
+/// cipher maps `:` to a fixed non-metacharacter): exifast declines the quadrant
+/// ([`QuadrantMatch::Unmatched`]), so the ref bytes `?`-fill and the records
+/// still decode, but WITHOUT Perl's shifted garbage-ref assignment and WITHOUT
+/// the GPSQuadrant warning. Reproducing Perl's non-greedy optional-group
+/// backtracking byte-exact is disproportionate for an input that never occurs in
+/// a real cipher, and the resulting hemispheres are nonsense in both engines.
+/// Locked by the end-to-end `decipher_question_colon_locks_no_quadrant_no_warn`
+/// test alongside the `[`/`\` abort and `^` no-match cases.
+fn match_quadrant(rec: &[u8], colon: u8) -> QuadrantMatch {
+  match colon {
+    // `[` (0x5b) / `\` (0x5c): Perl's interpolated pattern will not compile → the
+    // `=~` dies → DecipherLigoGPS aborts (no table committed, no samples).
+    b'[' | b'\\' => return QuadrantMatch::Abort,
+    // `^` (0x5e): a mid-pattern anchor → Perl's `if` is false. `?` (0x3f): Perl
+    // matches a left-shifted optional-group pattern (garbage hemispheres + a
+    // GPSQuadrant warning); exifast declines the quadrant instead — the
+    // documented `?` lock. Both leave the quadrant unlearned → the `?` fill.
+    b'^' | b'?' => return QuadrantMatch::Unmatched,
+    // `]` (0x5d) and every other byte are regex literals here → the literal scan.
+    _ => {}
+  }
   let in_range = |b: u8| (0x30..=0x5f).contains(&b);
   let at = |k: usize| rec.get(k).copied();
   let n = rec.len();
@@ -856,7 +957,7 @@ fn match_quadrant(rec: &[u8], colon: u8) -> Option<(u8, bool, u8, bool)> {
           && at(j + 2) == Some(colon)
         {
           let lon_neg = at(j + 3) == Some(b'-');
-          return Some((ns_ch, lat_neg, ew_ch, lon_neg));
+          return QuadrantMatch::Matched(ns_ch, lat_neg, ew_ch, lon_neg);
         }
         // The byte `.*?` would have to consume to extend past `j` is a newline ⇒
         // this start `i` cannot complete the match; advance the outer scan.
@@ -868,7 +969,7 @@ fn match_quadrant(rec: &[u8], colon: u8) -> Option<(u8, bool, u8, bool)> {
     }
     i += 1;
   }
-  None
+  QuadrantMatch::Unmatched
 }
 
 /// LigoGPS.pm:209-217 — the apply-do-while body: drop the 8-byte header + trailing
@@ -937,11 +1038,15 @@ fn decipher_ligogps(
   // LigoGPS.pm:151-155 — get-or-create the cipher-discovery state.
   let cinfo = cipher.get_or_insert_with(CipherDiscovery::new);
 
-  // DoS: a prior record already exceeded a cap ⇒ discovery is abandoned for the
-  // rest of the file. Drop this record (no caching, no ordering) but still report
-  // it as an enciphered match (`return 1`, so the caller does not fall through to
-  // `DecryptLigoGPS`, which already failed on this record class).
-  if cinfo.abandoned {
+  // A prior record already abandoned discovery — either a DoS cap
+  // ([`CipherDiscovery::abandoned`]) or the `[`/`\`-colon die
+  // ([`CipherDiscovery::ligo_aborted`]). Drop this record (no caching, no
+  // ordering) but still report it as an enciphered match (`return 1`, so the
+  // caller does not fall through to `DecryptLigoGPS`, which already failed on this
+  // record class). The die-abort ALSO halts the whole walk at the loop top; this
+  // short-circuit keeps a DIRECT `decipher_ligogps` caller (and any record between
+  // the die and the loop top) from re-entering discovery.
+  if cinfo.abandoned || cinfo.ligo_aborted {
     return true;
   }
 
@@ -1034,18 +1139,41 @@ fn decipher_ligogps(
     }
 
     // LigoGPS.pm:191-201 — learn the lat/lon quadrant from the coordinate signs.
-    if let Some((ns_ch, lat_neg, ew_ch, lon_neg)) = match_quadrant(rec, colon) {
+    match match_quadrant(rec, colon) {
       // LigoGPS.pm:192 `@decipher{$1,$3} = ($2 ? 'S' : 'N', $4 ? 'W' : 'E')`.
-      decipher_set(&mut map, &mut set, ns_ch, if lat_neg { b'S' } else { b'N' });
-      decipher_set(&mut map, &mut set, ew_ch, if lon_neg { b'W' } else { b'E' });
-      // LigoGPS.pm:193-200 — both coordinates positive ⇒ the hemisphere is
-      // ambiguous. exifast exposes no `GPSQuadrant` API option, so it always
-      // takes ExifTool's no-option branch: keep the 'N'/'E' default (already set
-      // above) and warn.
-      if !lat_neg && !lon_neg {
-        out.set_warning(SmolStr::new(
-          "May need to set API GPSQuadrant option (eg. \"NW\")",
-        ));
+      QuadrantMatch::Matched(ns_ch, lat_neg, ew_ch, lon_neg) => {
+        decipher_set(&mut map, &mut set, ns_ch, if lat_neg { b'S' } else { b'N' });
+        decipher_set(&mut map, &mut set, ew_ch, if lon_neg { b'W' } else { b'E' });
+        // LigoGPS.pm:193-200 — both coordinates positive ⇒ the hemisphere is
+        // ambiguous. exifast exposes no `GPSQuadrant` API option, so it always
+        // takes ExifTool's no-option branch: keep the 'N'/'E' default (already
+        // set above) and warn.
+        if !lat_neg && !lon_neg {
+          out.set_warning(SmolStr::new(
+            "May need to set API GPSQuadrant option (eg. \"NW\")",
+          ));
+        }
+      }
+      // Perl's regex compiled but did not match (the `^` colon, the documented
+      // `?` lock, or a non-matching record): no quadrant is learned — fall
+      // through to the LigoGPS.pm:203 `?` fill and decode the cache as normal.
+      QuadrantMatch::Unmatched => {}
+      // LigoGPS.pm:191 — the `[` / `\` colon makes Perl's interpolated pattern
+      // uncompilable, so the `=~` DIES: line 204 never commits the decipher table
+      // and the do-while apply loop never runs, so ExifTool emits no samples from
+      // this cipher. The die is FATAL and UNCAUGHT — it unwinds past every
+      // remaining record and every remaining `ProcessLigoGPS` walk (out of
+      // `ExtractInfo` before `GetInfo` harvests a tag). Model it as a graceful
+      // FILE-level halt: discard the cached records undeciphered, leave `decipher`
+      // uncommitted, and set `ligo_aborted` (DISTINCT from the DoS `abandoned`) so
+      // [`process_ligogps_with_scale`]'s loop top emits NOTHING more — not the
+      // plain-ASCII path, not `DecryptLigoGPS`, not decipher. LigoGPS.pm:184
+      // already `delete`d `next`, so ExifTool's CleanupCipher would NOT warn "not
+      // enough points" either (mirrored by `discovery_incomplete`).
+      QuadrantMatch::Abort => {
+        cinfo.cache = Vec::new();
+        cinfo.ligo_aborted = true;
+        return true;
       }
     }
 
@@ -1809,6 +1937,104 @@ mod tests {
     b
   }
 
+  /// [`encipher`] under an explicit rotation `k` on `0x30..=0x5f` (#481 metachar
+  /// colons). The enciphered time separator `:` (0x3a) becomes
+  /// `0x30 + ((10 + k) % 48)`, so `k` selects the byte the `$colon`-interpolated
+  /// LigoGPS.pm:191 pattern sees: `k=5`→`?`, `k=33`→`[`, `k=34`→`\`, `k=35`→`]`,
+  /// `k=36`→`^` (and `k=11`→`E`, [`encipher`]'s value). Discovery still completes
+  /// for any `k` — the seconds-digit cycle and the enciphered `2` millennium are
+  /// recovered from the rotation regardless.
+  fn encipher_k(text: &[u8], k: u8) -> Vec<u8> {
+    text
+      .iter()
+      .map(|&c| {
+        if (0x30..=0x5f).contains(&c) {
+          0x30 + ((c - 0x30 + k) % 48)
+        } else {
+          c
+        }
+      })
+      .collect()
+  }
+
+  /// One 0x84-byte record enciphered under rotation `k` (see [`encipher_k`] /
+  /// [`enciphered_record`]).
+  fn enciphered_record_k(body: &str, k: u8) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(0x84);
+    rec.extend_from_slice(b"####");
+    rec.extend_from_slice(&0u32.to_le_bytes());
+    rec.extend_from_slice(&encipher_k(body.as_bytes(), k));
+    rec.resize(0x84, 0);
+    rec
+  }
+
+  /// A `LIGOGPSINFO\0` block (see [`ligo_block`]) enciphered under rotation `k`.
+  fn ligo_block_k(bodies: &[String], k: u8) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(HDR_LIGOGPSINFO);
+    b.extend_from_slice(&[0, 0, 0, 0x14]);
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    for body in bodies {
+      b.extend_from_slice(&enciphered_record_k(body, k));
+    }
+    b
+  }
+
+  /// 12 enciphered records with the seconds advancing 00..11 (all 10 unit-digit
+  /// transitions) → discovery completes at record 11; both coordinates are
+  /// negative (a `-` sign present). Shared by the #481 metachar-colon tests.
+  fn metachar_bodies() -> Vec<String> {
+    (0..12)
+      .map(|s| format!("2024/06/27 12:34:{s:02} S:-31.285065 W:-124.759483 20.50"))
+      .collect()
+  }
+
+  /// One 0x84-byte PLAIN-ASCII record (Redtiger F9 4K, LigoGPS.pm:304-307): a
+  /// 4-byte counter, then the `YYYY/MM/DD HH:MM:SS ...` text, NUL-padded. NOT
+  /// `####`-prefixed, so the walker takes the plain path — bypassing
+  /// [`decipher_ligogps`] (and its `ligo_aborted` short-circuit) entirely.
+  fn plain_record(body: &str) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(0x84);
+    rec.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // 4-byte counter
+    rec.extend_from_slice(body.as_bytes());
+    rec.resize(0x84, 0);
+    rec
+  }
+
+  /// One 0x84-byte `####` record that `DecryptLigoGPS` (LigoGPS.pm:50-99) DECODES
+  /// to `output`, built from single-output steering pairs (`[0x00, byte]` → the
+  /// `byte`, since steering `0x00` gives `i1 | (b & 0x13)` with `b == 0`,
+  /// LigoGPS.pm:91-93). The first 4 output bytes are the counter that
+  /// `ParseLigoGPS`'s `.{4}` skips. Exercises the walker's `DecryptLigoGPS` path,
+  /// which — like the plain path — never reaches [`decipher_ligogps`].
+  fn decryptable_record(output: &[u8]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(0x84);
+    rec.extend_from_slice(b"####");
+    // `num` (LigoGPS.pm:53) = the count of INPUT bytes = 2 per output byte.
+    rec.extend_from_slice(&((output.len() * 2) as u32).to_le_bytes());
+    for &b in output {
+      rec.push(0x00); // steering 0x00 → single-output mode, `b & 0x13` == 0
+      rec.push(b); //    data byte → `b | 0` == b
+    }
+    rec.resize(0x84, 0);
+    rec
+  }
+
+  /// A `LIGOGPSINFO\0` block wrapping arbitrary already-built 0x84-byte records
+  /// (see [`ligo_block`]); the preamble sets `noFuzz` (LigoGPS.pm:299) so raw
+  /// coordinates survive. Lets a test interleave enciphered, plain, and
+  /// decryptable records in ONE walk.
+  fn ligo_block_of(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(HDR_LIGOGPSINFO);
+    b.extend_from_slice(&[0, 0, 0, 0x14]);
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    for rec in records {
+      b.extend_from_slice(rec);
+    }
+    b
+  }
+
   #[test]
   fn decipher_discovers_and_decodes_full_cycle() {
     // 12 enciphered records, seconds advancing 00..11 → all 10 unit-digit
@@ -1860,6 +2086,271 @@ mod tests {
     // N/E default ⇒ POSITIVE coordinates (the deciphered ref letters are N/E).
     assert_eq!(out.samples()[0].latitude(), Some(31.285065));
     assert_eq!(out.samples()[0].longitude(), Some(124.759483));
+  }
+
+  /// LigoGPS.pm:191 — the `$colon`-interpolated quadrant predicate (#481).
+  /// `$colon` is a byte in `0x30..=0x5f`; the four regex-metacharacter bytes in
+  /// that range change Perl's compiled pattern (see [`match_quadrant`]), so the
+  /// outcome is richer than match/no-match: `]` and every non-metacharacter byte
+  /// match literally ([`QuadrantMatch::Matched`]); `^` anchors + `?` shifts
+  /// (exifast declines both → [`QuadrantMatch::Unmatched`]); `[` / `\` make the
+  /// pattern uncompilable so Perl dies ([`QuadrantMatch::Abort`]).
+  #[test]
+  fn match_quadrant_metachar_colon_outcomes() {
+    // ` S<colon>-31.285065 W<colon>-124.759483` — both coordinates negative.
+    let rec = |colon: u8| {
+      let mut v = Vec::from(*b" S");
+      v.push(colon);
+      v.extend_from_slice(b"-31.285065 W");
+      v.push(colon);
+      v.extend_from_slice(b"-124.759483");
+      v
+    };
+
+    // Non-metachar colon (the real-cipher case): literal match, signs from `-`.
+    assert_eq!(
+      match_quadrant(&rec(b'E'), b'E'),
+      QuadrantMatch::Matched(b'S', true, b'W', true)
+    );
+    // `]` (0x5d) is a regex literal too → still matches, not over-suppressed.
+    assert_eq!(
+      match_quadrant(&rec(b']'), b']'),
+      QuadrantMatch::Matched(b'S', true, b'W', true)
+    );
+
+    // `^` (anchor) and `?` (left-shifted optional group) — Perl's literal
+    // coordinate-sign match never holds, so exifast declines the quadrant (→ the
+    // LigoGPS.pm:203 `?` fill) rather than reading a sign off a byte the Perl
+    // regex would not have. `?` is the documented lock (Perl would still match
+    // shifted garbage + warn; the end-to-end test below pins exifast's choice).
+    for colon in [b'^', b'?'] {
+      assert_eq!(
+        match_quadrant(&rec(colon), colon),
+        QuadrantMatch::Unmatched,
+        "colon {colon:#04x} must not set the quadrant via the literal scan"
+      );
+    }
+    // `[` / `\` make Perl's interpolated pattern uncompilable → the `=~` dies →
+    // DecipherLigoGPS aborts (no table, no samples).
+    for colon in [b'[', b'\\'] {
+      assert_eq!(
+        match_quadrant(&rec(colon), colon),
+        QuadrantMatch::Abort,
+        "colon {colon:#04x} makes the Perl pattern uncompilable → abort"
+      );
+    }
+  }
+
+  #[test]
+  fn decipher_abort_colon_installs_no_table_and_emits_no_samples() {
+    // `[` (k=33) and `\` (k=34) are the enciphered-colon bytes for which Perl's
+    // LigoGPS.pm:191 `$colon`-pattern will not compile: the `=~` DIES before line
+    // 204 commits the decipher table and before the do-while apply loop decodes
+    // any cached record, so ExifTool emits NO samples from this cipher. exifast
+    // must abort identically — the impactful #481 divergence (previously it
+    // installed the table and decoded, emitting GPS where ExifTool aborts).
+    // Driven through `decipher_ligogps` end-to-end so the abort's cipher-state
+    // effect (no table, cache discarded) is observable.
+    for (k, colon) in [(33u8, b'['), (34u8, b'\\')] {
+      let bodies = metachar_bodies();
+      let mut cipher: Option<CipherDiscovery> = None;
+      let mut out = LigoGpsMeta::new();
+      for body in &bodies {
+        let matched = decipher_ligogps(
+          &enciphered_record_k(body, k),
+          &mut cipher,
+          None,
+          true,
+          &mut out,
+        );
+        assert!(
+          matched,
+          "colon {colon:#04x}: every enciphered record matches (returns 1)"
+        );
+      }
+      assert!(
+        out.samples().is_empty(),
+        "colon {colon:#04x}: Perl dies at LigoGPS.pm:191 ⇒ NO samples decode",
+      );
+      // LigoGPS.pm:184 deleted `next` before the die, so CleanupCipher would not
+      // warn "not enough points"; exifast likewise stays silent (no abandon warn).
+      assert!(
+        out.warning().is_none(),
+        "colon {colon:#04x}: the die path emits no warning: {:?}",
+        out.warning(),
+      );
+      let state = cipher.as_ref().expect("cipher-discovery state was created");
+      assert!(
+        state.decipher.is_none(),
+        "colon {colon:#04x}: NO decipher table committed"
+      );
+      assert!(
+        state.ligo_aborted,
+        "colon {colon:#04x}: the die sets the file-level abort flag"
+      );
+      assert!(
+        !state.abandoned,
+        "colon {colon:#04x}: the die is NOT the DoS-abandon (distinct flags)"
+      );
+      assert!(
+        state.cache.is_empty(),
+        "colon {colon:#04x}: cached records discarded undeciphered"
+      );
+    }
+  }
+
+  #[test]
+  fn decipher_abort_colon_file_end_cleanup_stays_silent() {
+    // The `[`-colon abort leaves `decipher` uncommitted, but LigoGPS.pm:184 had
+    // already `delete`d `next`, so ExifTool's file-end CleanupCipher does NOT
+    // fire "Not enough GPS points". `discovery_incomplete` treats an abandoned
+    // state as done, so `finish_cipher_discovery` also stays silent.
+    let block = ligo_block_k(&metachar_bodies(), 33);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+    assert!(out.samples().is_empty(), "abort ⇒ no samples end-to-end");
+    out.finish_cipher_discovery();
+    assert!(
+      out.warning().is_none(),
+      "file-end cleanup must stay silent after an abort: {:?}",
+      out.warning(),
+    );
+  }
+
+  #[test]
+  fn abort_halts_trailing_plain_and_decryptable_records_file_level() {
+    // #481 R3 — the `[`/`\`-colon die is a FILE-level halt, not just a
+    // decipher-path one. ExifTool's LigoGPS.pm:191 `=~` dies fatally and unwinds
+    // past EVERY remaining record. In `ProcessLigoGPS` the plain-ASCII (line 307)
+    // and `DecryptLigoGPS` (line 315) paths are tried BEFORE `DecipherLigoGPS`, so
+    // a trailing plain or decryptable record bypasses `decipher_ligogps`'s own
+    // abort short-circuit — the R2 fix alone let them emit. Drive the whole walk:
+    // 12 enciphered records (k=33 → `[`) trigger discovery + the die, THEN a plain
+    // record AND a decryptable `####` record follow. The `sanity_*` companion test
+    // proves BOTH trailing records emit when NOT preceded by a die; here the
+    // file-level halt must suppress them → zero samples.
+    let mut records: Vec<Vec<u8>> = metachar_bodies()
+      .iter()
+      .map(|body| enciphered_record_k(body, 33))
+      .collect();
+    records.push(plain_record("2024/01/15 10:00:00 N:31.5 E:124.7 30.0"));
+    let mut decd = vec![0x01, 0x02, 0x03, 0x04]; // 4-byte counter (skipped by `.{4}`)
+    decd.extend_from_slice(b"2024/01/15 10:00:01 N:32.5 E:125.7 40.0");
+    records.push(decryptable_record(&decd));
+
+    let block = ligo_block_of(&records);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert!(
+      out.samples().is_empty(),
+      "die-abort halts ALL further LigoGPS output (plain + decrypt): {} samples",
+      out.samples().len(),
+    );
+    // The die path is silent, and file-end cleanup stays silent too.
+    assert!(
+      out.warning().is_none(),
+      "die path warns nothing: {:?}",
+      out.warning()
+    );
+    let state = out.take_cipher_state().expect("cipher state persisted");
+    assert!(state.ligo_aborted, "file-level abort flag set");
+    assert!(!state.abandoned, "die is not the DoS-abandon");
+    out.set_cipher_state(Some(state));
+    out.finish_cipher_discovery();
+    assert!(
+      out.warning().is_none(),
+      "cleanup silent: {:?}",
+      out.warning()
+    );
+  }
+
+  #[test]
+  fn sanity_trailing_plain_and_decryptable_records_emit_without_abort() {
+    // Companion to `abort_halts_*`: the SAME trailing plain + decryptable records,
+    // walked WITHOUT any preceding die, both decode — proving the zero-sample
+    // assertion above measures the halt, not inert records. Also the DoS-abandon
+    // contrast: seed a DoS-`abandoned` (but NOT `ligo_aborted`) file-level state —
+    // ExifTool never dies on exifast's caps, so the plain / `DecryptLigoGPS` paths
+    // keep emitting. Only the `ligo_aborted` die halts the walk.
+    let mut decd = vec![0x01, 0x02, 0x03, 0x04];
+    decd.extend_from_slice(b"2024/01/15 10:00:01 N:32.5 E:125.7 40.0");
+    let block = ligo_block_of(&[
+      plain_record("2024/01/15 10:00:00 N:31.5 E:124.7 30.0"),
+      decryptable_record(&decd),
+    ]);
+
+    let mut out = LigoGpsMeta::new();
+    let mut dos = CipherDiscovery::new();
+    dos.abandoned = true; // a prior DoS-abandon — NOT a die
+    out.set_cipher_state(Some(dos));
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert_eq!(
+      out.samples().len(),
+      2,
+      "DoS-abandon leaves the plain + decrypt paths alive (unchanged)",
+    );
+    assert_eq!(out.samples()[0].date_time(), Some("2024:01:15 10:00:00"));
+    assert_eq!(out.samples()[0].latitude(), Some(31.5));
+    assert_eq!(out.samples()[1].date_time(), Some("2024:01:15 10:00:01"));
+    assert_eq!(out.samples()[1].latitude(), Some(32.5));
+  }
+
+  #[test]
+  fn decipher_caret_colon_decodes_with_quadrant_unset() {
+    // `^` (k=36): Perl's pattern COMPILES but the mid-pattern anchor cannot match
+    // after ` ([0-_])`, so the `if` is false — the decipher table still installs,
+    // the ref bytes fall through to the LigoGPS.pm:203 `?` fill, and every cached
+    // record decodes. exifast matches this exactly: 12 samples, refs unset (`?`),
+    // and the `-` sign in the body still drives the coordinate sign negative.
+    let block = ligo_block_k(&metachar_bodies(), 36);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert_eq!(
+      out.samples().len(),
+      12,
+      "^ colon: table installs → all records decode"
+    );
+    assert_eq!(out.samples()[0].date_time(), Some("2024:06:27 12:34:00"));
+    // Quadrant unset ⇒ ref bytes are `?`-filled; the body's `-` still signs the
+    // coordinates negative (LigoGPS.pm:258-259 `$latNeg or $latRef eq 'S'`).
+    assert_eq!(out.samples()[0].latitude(), Some(-31.285065));
+    assert_eq!(out.samples()[0].longitude(), Some(-124.759483));
+    // No GPSQuadrant warning — Perl's `^` branch does not reach line 193 either.
+    assert!(
+      out.warning().is_none(),
+      "^ colon: no warning, {:?}",
+      out.warning()
+    );
+  }
+
+  #[test]
+  fn decipher_question_colon_locks_no_quadrant_no_warn() {
+    // `?` (k=5): the DOCUMENTED, LOCKED #481 divergence. Perl matches a
+    // left-shifted optional-group pattern — assigning N/E hemispheres to garbage
+    // capture bytes and firing the GPSQuadrant warning. exifast instead declines
+    // the quadrant (`?`-fills the ref bytes) and emits NO GPSQuadrant warning,
+    // because reproducing Perl's non-greedy optional-group backtracking byte-exact
+    // is disproportionate for a colon byte a real cipher never produces. This test
+    // pins exifast's chosen output so the divergence cannot drift silently.
+    let block = ligo_block_k(&metachar_bodies(), 5);
+    let mut out = LigoGpsMeta::new();
+    process_ligogps(&block, 0, &mut out, false);
+
+    assert_eq!(
+      out.samples().len(),
+      12,
+      "? colon: exifast still decodes every record"
+    );
+    assert_eq!(out.samples()[0].latitude(), Some(-31.285065));
+    assert_eq!(out.samples()[0].longitude(), Some(-124.759483));
+    assert!(
+      out.warning().is_none(),
+      "? colon (locked divergence): exifast fires NO GPSQuadrant warning, {:?}",
+      out.warning(),
+    );
   }
 
   #[test]
