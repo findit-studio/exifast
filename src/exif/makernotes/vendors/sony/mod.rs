@@ -391,10 +391,12 @@ pub fn routes_to_main(blob: &[u8], make: Option<&str>, model: Option<&str>) -> b
 /// through to `%unknownCipherData` which emits NOTHING
 /// (`exif::mod::sony_emit_enciphered_subblock`'s `_ => {}`), so they are NOT in
 /// this LEAF set — those `sub_table: Some(...)` dispatchers are covered by their
-/// `SubTable` variant instead (see [`value_resliced_from_data`]). This LEAF
+/// `SubTable` variant instead (see [`sony_tag_has_sub_table`]). This LEAF
 /// predicate stays SEPARATE because a leaf's span IS its emitted value (borrowed
 /// via `push_borrowed_span`): the emit path at `exif::mod` keys the borrow off
-/// this exact set.
+/// this exact set, AND — unlike the SubDirectory class — a leaf is dead ONLY at
+/// `$format == undef` (a non-`undef` cipher leaf is READ as its emission), so the
+/// walk guard keeps its `undef` gate for this class.
 #[must_use]
 #[inline]
 pub(crate) fn is_suppressed_cipher_leaf(tag_id: u16) -> bool {
@@ -404,47 +406,62 @@ pub(crate) fn is_suppressed_cipher_leaf(tag_id: u16) -> bool {
   )
 }
 
-/// `true` when a `%Sony::Main` row's decoded value is NEVER read from the walk's
-/// materialized `RawValue` — because the Sony capture loop re-slices the verbatim
-/// on-disk value span from the input buffer instead. The shared `Walker`'s #443
-/// zero-copy guard keys off this to store an EMPTY `RawValue` for such a row
-/// (gated to an `undef` block with `count != 1`), bounding the O(N·M) heap a
-/// crafted IFD with N such rows over one shared in-bounds M-byte region would
-/// otherwise amplify to O(N + M) — WITHOUT changing any emitted value (the
-/// re-slice reads the same span the clone would have held).
+/// `true` when a `%Sony::Main` row carries a `SubDirectory` (`sub_table: Some(_)`)
+/// — the routing fact that makes its decoded leaf value DEAD regardless of the
+/// on-disk `$format`, the FORMAT-INDEPENDENT half of the shared `Walker`'s #443/#486
+/// zero-copy guard.
 ///
-/// Two DISJOINT sub-classes, both re-sliced-from-`data`, never from the clone:
+/// A Sony Main SubDirectory NEVER emits the parent pointer as a value:
+/// `exif::mod::emit_sony_value` returns at its Step-2 SubDirectory guard
+/// (`sub_table.is_some()`) BEFORE reading the decoded `RawValue`, and each of three
+/// disjoint dispatchers re-slices the verbatim on-disk value span from the input
+/// buffer keyed on `tag_id` + `value_size`, NEVER on the decoded value:
 ///
-/// - The SUPPRESSED `%unknownCipherData` LEAVES ([`is_suppressed_cipher_leaf`]) —
-///   `sub_table: None`, emitted as a BORROWED span via `push_borrowed_span`.
-/// - The enciphered-`SubDirectory` dispatchers — every row whose `sub_table` is a
-///   variant `exif::mod::sony_emit_enciphered_subblock` handles
-///   ([`SubTable::dispatched_by_enciphered_subblock`]): `Tag2010` (`0x2010`), the
-///   whole `Tag9xxx` family (13 IDs incl. `0x9400`/`0x9402`/`0x9404`/`0x9405`/
-///   `0x9406`/`0x9050`/`0x9401`/`0x9403`/`0x9416`/`0x202a`/`0x900b`/`0x940a`/
-///   `0x940c`) and `AFInfo`/`Tag940e` (`0x940e`). Both the model/byte-matched
-///   decode AND the `%unknownCipherData` fallback re-slice the span, and
-///   `exif::mod::emit_sony_value` returns at its SubDirectory guard reading
-///   nothing.
+/// - The enciphered `ProcessEnciphered`/`ProcessBinaryData` blocks (`Tag2010`
+///   `0x2010`, the whole `Tag9xxx` family incl. `0x9400`/`0x9402`/`0x9404`/
+///   `0x9405`/`0x9406`/`0x9050`/`0x9401`/`0x9403`/`0x9416`/`0x202a`/`0x900b`/
+///   `0x940a`/`0x940c`, and `AFInfo`/`Tag940e` `0x940e`), decoded by
+///   `exif::mod::sony_emit_enciphered_subblock` — both the model/byte-matched decode
+///   AND the `%unknownCipherData` fallback re-slice the span.
+/// - The older PLAIN (un-enciphered) `ProcessBinaryData` sub-tables (`CameraInfo`
+///   `0x0010`/`FocusInfo` `0x0020`/`CameraSettings` `0x0114`/`ExtraInfo` `0x0116`/
+///   `ShotInfo` `0x3000`), decoded by `exif::mod::sony_emit_binary_subdir` — it
+///   re-slices `data[value_offset..]` for the `$count`-matched table and emits
+///   nothing (its `_ => return` arm) on a non-matching count, reading the decoded
+///   value in NEITHER case.
+/// - The remaining deferred `SubDirectory` targets (`Panorama` `0x1003`,
+///   `HiddenInfo` `0x2044`, `MinoltaMakerNote` `0xb028`, `PrintIm` `0x0e00`), which
+///   no dispatcher walks (so they emit nothing) — the `0x1003` `Panorama` DataMember
+///   side-effect (`Sony.pm:902`) that gates the `0x2010` `Tag2010d` variant
+///   re-slices its match span from `data` too (`exif::mod`'s `0x1003` walk arm reads
+///   `data.get(value_offset..)`), NOT the decoded `RawValue` — so zeroing the clone
+///   leaves the latch intact.
 ///
-/// The SubDirectory side is DERIVED FROM THE `SubTable` VARIANT (the routing),
-/// NOT a hand-maintained tag-ID list — so a future enciphered dispatcher added
-/// under `Tag9xxx` is covered automatically. This SUPERSEDES the #443 R1
-/// suppressed-leaf list + the R2 `is_conditional_cipher_subdir` id list, whose
-/// enumeration kept missing members (`0x9400`/`0x9402`/`0x9404`/`0x9405`/`0x9406`/
-/// `0x9050`/…) — the whack-a-mole this closes (#443 R3).
+/// Because that early-return + span re-slice are FORMAT-INDEPENDENT (they key off
+/// the STATIC table row + the on-disk byte extent, not the declared `$format`), a
+/// crafted duplicate SubDirectory row encoded as `int8u`/`int16u`/`ascii` (any
+/// NON-`undef` format, under the excessive-count gate) has an equally-dead decoded
+/// value. So the shared `Walker`'s guard keys off THIS predicate WITHOUT an `undef`
+/// gate (unlike [`is_suppressed_cipher_leaf`], whose non-`undef` encoding IS read as
+/// the leaf's emitted value, so the leaf class KEEPS its `undef` gate). The guard
+/// stores an EMPTY `RawValue` for such a row (with `count != 1`), bounding the O(N·M)
+/// heap a crafted IFD with N such rows over one shared in-bounds M-byte region would
+/// otherwise amplify to O(N + M) — WITHOUT changing any emitted value (the re-slice
+/// reads the same span the clone would have held). See the per-class split at
+/// `exif::mod`'s `walk_entry` guard.
 ///
-/// The older PLAIN binary sub-tables (`CameraInfo`/`FocusInfo`/`CameraSettings`/
-/// `ExtraInfo`/`ShotInfo`) also re-slice their span (via
-/// `exif::mod::sony_emit_binary_subdir`) but are intentionally left on the
-/// `read_value` path — this fix is scoped to the enciphered-subblock class, and
-/// they stay byte-identical either way.
+/// DERIVED FROM `sub_table: Some(_)` (the routing), NOT a hand-maintained tag-ID
+/// list — so a future SubDirectory row (enciphered or plain) is covered
+/// automatically. This SUPERSEDES the #443 R1 suppressed-leaf list + the R2
+/// `is_conditional_cipher_subdir` id list, whose enumeration kept missing members
+/// (`0x9400`/`0x9402`/`0x9404`/`0x9405`/`0x9406`/`0x9050`/…) — the whack-a-mole this
+/// closes (#443 R3) — AND the #443 enciphered-only carve-out that still eager-cloned
+/// the plain-binary rows (#486 R1) + the R1 SubDirectory `undef` format-gate that
+/// still eager-cloned the non-`undef` encodings (#486 R2).
 #[must_use]
-pub(crate) fn value_resliced_from_data(tag_id: u16) -> bool {
-  is_suppressed_cipher_leaf(tag_id)
-    || lookup(tag_id)
-      .and_then(|t| t.sub_table)
-      .is_some_and(|s| s.dispatched_by_enciphered_subblock())
+#[inline]
+pub(crate) fn sony_tag_has_sub_table(tag_id: u16) -> bool {
+  lookup(tag_id).is_some_and(|t| t.sub_table.is_some())
 }
 
 /// Populate the typed struct from one Sony Main-IFD leaf-tag emission. `raw` is

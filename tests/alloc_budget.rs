@@ -221,6 +221,8 @@ fn alloc_budget() {
   sony_cipher_data_is_borrowed_not_amplified();
   sony_conditional_subdir_fallback_is_borrowed_not_amplified();
   sony_raw_selector_subdir_fallback_is_borrowed_not_amplified();
+  sony_plain_binary_subdir_is_borrowed_not_amplified();
+  sony_nonundef_subdir_is_borrowed_not_amplified();
 }
 
 /// The placeholder-length path ([`exifast::exif::ifd::read_value_byte_len`]) for
@@ -448,12 +450,34 @@ fn sony_region_off(n: usize) -> usize {
 /// windows in-bounds. `span` stays below the 100 000-element excessive-count
 /// gate so the walk raises no warnings.
 fn sony_cipher_tiff(ids: &[u16], region: usize) -> Vec<u8> {
+  // The #443 leaves are `undef` (format 7, 1-byte element); `count == span`.
+  sony_subdir_tiff_fmt(ids, region, 7, 1)
+}
+
+/// Craft the SAME MakerNote as [`sony_cipher_tiff`] but with a caller-chosen on-disk
+/// `format_code` (+ its `elem_size`) for every `%Sony::Main` row — used by the #486
+/// R2 probe to encode duplicate `SubDirectory` rows as a NON-`undef` format (`int8u`
+/// / `int16u` / `ascii`). Each row's on-disk value byte extent (`value_size ==
+/// count * elem_size`) stays `span == region - 16`, so the shared-region overlap +
+/// the per-row window are byte-identical to the `undef` builder; only the declared
+/// `$format` (and thus the decoded `RawValue`'s SHAPE) changes. The dead-value walk
+/// guard's SubDirectory class is format-INDEPENDENT, so it must zero the walk clone
+/// for these too — the DoS the R1 `undef`-gated guard still admitted.
+fn sony_subdir_tiff_fmt(ids: &[u16], region: usize, format_code: u16, elem_size: usize) -> Vec<u8> {
   assert!(
     ids.len() <= 16 && region >= 32,
     "up to 16 shifted windows fit"
   );
-  let span = u32::try_from(region - 16).expect("span fits u32");
-  assert!(span < 100_000, "keep count below the excessive-count gate");
+  let span_bytes = region - 16;
+  assert!(
+    span_bytes % elem_size == 0,
+    "value byte extent must be a whole number of elements"
+  );
+  // The on-disk value byte size (`$size == $count * $formatSize`) is what the
+  // dispatchers re-slice + the guard would clone; keep it FIXED at `span_bytes`
+  // across formats so the probe isolates the format gate, not the region size.
+  let count = u32::try_from(span_bytes / elem_size).expect("count fits u32");
+  assert!(count < 100_000, "keep count below the excessive-count gate");
   let region_off = sony_region_off(ids.len());
   let total = region_off + region;
   const EXIF_OFF: u32 = 26;
@@ -475,25 +499,25 @@ fn sony_cipher_tiff(ids: &[u16], region: usize) -> Vec<u8> {
   let mn_len = u32::try_from(total - MN_OFF).expect("mn_len fits u32");
   t.extend_from_slice(&1u16.to_le_bytes());
   t.extend_from_slice(&0x927cu16.to_le_bytes());
-  t.extend_from_slice(&7u16.to_le_bytes()); // UNDEF
+  t.extend_from_slice(&7u16.to_le_bytes()); // UNDEF (the MakerNote wrapper itself)
   t.extend_from_slice(&mn_len.to_le_bytes());
   t.extend_from_slice(&u32::try_from(MN_OFF).unwrap().to_le_bytes());
   t.extend_from_slice(&0u32.to_le_bytes());
   assert_eq!(t.len(), MN_OFF);
   // [44] `MakerNoteSony` primary signature (Start = $valuePtr + 12).
   t.extend_from_slice(b"SONY DSC \x00\x00\x00");
-  // [56] Sony Main IFD — the cipher leaves, ASCENDING (a valid sorted IFD).
+  // [56] Sony Main IFD — the rows, ASCENDING (a valid sorted IFD).
   t.extend_from_slice(&u16::try_from(ids.len()).unwrap().to_le_bytes());
   for (i, &id) in ids.iter().enumerate() {
     t.extend_from_slice(&id.to_le_bytes());
-    t.extend_from_slice(&7u16.to_le_bytes()); // UNDEF
-    t.extend_from_slice(&span.to_le_bytes()); // count
+    t.extend_from_slice(&format_code.to_le_bytes()); // caller-chosen on-disk format
+    t.extend_from_slice(&count.to_le_bytes()); // count (value_size == count*elem_size)
     // 1-byte-shifted, overlapping, DISTINCT windows of the shared region.
     t.extend_from_slice(&u32::try_from(region_off + i).unwrap().to_le_bytes());
   }
   t.extend_from_slice(&0u32.to_le_bytes());
   assert_eq!(t.len(), region_off);
-  // [region_off] the shared region every leaf's window overlaps.
+  // [region_off] the shared region every row's window overlaps.
   t.resize(total, 0x5a);
   t
 }
@@ -683,9 +707,9 @@ fn sony_conditional_subdir_fallback_is_borrowed_not_amplified() {
 /// they kept missing members of the same enciphered-`SubDirectory` class — e.g.
 /// `0x9405` (a `sub_table: Some(Tag9xxx)` row selected by the RAW value's FIRST
 /// BYTE, not by `Model`): pre-R3 its walk clone was NOT confined, re-amplifying
-/// O(N·M). R3 derives the class from the `SubTable` variant
-/// (`dispatched_by_enciphered_subblock`), so `0x9405` — and every other `Tag9xxx`
-/// ID — is covered WITHOUT a hand-maintained list.
+/// O(N·M). R3 (now #486) derives the class from `sub_table: Some(_)` (the routing),
+/// so `0x9405` — and every other `Tag9xxx` ID — is covered WITHOUT a
+/// hand-maintained list.
 ///
 /// This probes the RAW-SELECTOR fallback shape the reviewer named (distinct from
 /// the R2 MODEL-selector probe above): the crafted region is all `0x5a`, which is
@@ -754,6 +778,180 @@ fn sony_raw_selector_subdir_fallback_is_borrowed_not_amplified() {
      (emit no leaf); a non-zero count means a matched decode ran (test no longer \
      exercises the raw-selector fallback path)."
   );
+}
+
+/// #486 — the residual eager-clone the #443 enciphered-only guard left. The
+/// older PLAIN (un-enciphered) `ProcessBinaryData` sub-tables (`CameraInfo`
+/// `0x0010`/`FocusInfo` `0x0020`/`CameraSettings` `0x0114`/`ExtraInfo` `0x0116`/
+/// `ShotInfo` `0x3000`) ALSO decode by re-slicing the verbatim span from `data`
+/// (`sony_emit_binary_subdir`, `exif/mod.rs`), NEVER reading the walk's decoded
+/// `RawValue` — yet #443's enciphered-only guard covered ONLY the
+/// enciphered-subblock class, so each such row still `read_value`-cloned its
+/// (possibly-huge, in-bounds) `undef[N]` block. #486 R1 widens the guard to EVERY
+/// `sub_table: Some(_)` row (`sony_tag_has_sub_table`), so the plain-binary rows now
+/// store a zero-copy empty `RawValue` too. (#486 R2 then drops the residual `undef`
+/// format-gate for this class — see `sony_nonundef_subdir_is_borrowed_not_amplified`.)
+///
+/// The probe uses `0x0010` `CameraInfo` with a `$count` (`span == 90000`) that
+/// matches NONE of the ported tables (368/5478/5506/6118/15360), so
+/// `sony_emit_binary_subdir` hits its `_ => return` arm (re-slices `data`, emits
+/// NOTHING) — isolating the walk clone the fix removes. N→2N duplicate rows over
+/// ONE fixed region make N scale while M stays fixed; pre-#486 each row retained a
+/// 90000-byte clone (a plain-binary sub_table ∉ the enciphered class), so the
+/// N→2N delta was ≈ N·span; post-#486 it is O(N descriptors).
+///
+/// Called INLINE from the single `alloc_budget` test (the counters are
+/// process-global; see the module doc).
+fn sony_plain_binary_subdir_is_borrowed_not_amplified() {
+  use exifast::parse_exif;
+
+  // The per-row window; `span = region - 16` (< the 100k excessive-count gate, so
+  // the walk raises no warnings + processes every row). 90000 matches no ported
+  // CameraInfo `$count` → the plain-binary dispatcher's no-op `_ => return`.
+  const LARGE: usize = 90_016; // span 90000
+
+  // N→2N duplicate `0x0010` PLAIN-BINARY sub-table rows over the SAME large
+  // region. The non-matching count falls to `sony_emit_binary_subdir`'s no-op arm
+  // (emits nothing); pre-#486 each still retained a `read_value` clone of the
+  // 90000-byte window (a plain-binary sub_table was OUTSIDE the enciphered class).
+  let ids_n = [0x0010_u16; 4];
+  let ids_2n = [0x0010_u16; 8];
+  let tiff_n = sony_cipher_tiff(&ids_n, LARGE);
+  let tiff_2n = sony_cipher_tiff(&ids_2n, LARGE);
+  // Warm-up OUTSIDE the measured region (lazy statics / first-call init).
+  assert!(
+    parse_exif(&tiff_n).is_some(),
+    "4-row plain-binary Sony TIFF parses"
+  );
+  assert!(
+    parse_exif(&tiff_2n).is_some(),
+    "8-row plain-binary Sony TIFF parses"
+  );
+  let (_n_ok, bytes_n) = count_alloc_bytes(|| parse_exif(&tiff_n).is_some());
+  let (_2n_ok, bytes_2n) = count_alloc_bytes(|| parse_exif(&tiff_2n).is_some());
+
+  println!("\n=== alloc_budget: sony plain-binary-subdir borrow (single-copy) ===");
+  println!("  N=4 rows={bytes_n}B  N=8 rows={bytes_2n}B  (same {LARGE}B region)");
+
+  // Doubling the plain-binary row count over the SAME region adds only O(N
+  // descriptors) — FAR below one span copy. The pre-#486 path added 4 rows × one
+  // `read_value` clone ≈ 4·span here (each retained on its walked entry).
+  let span = LARGE - 16; // 90000 — the per-row window / pre-fix per-clone volume
+  let n_delta = bytes_2n.saturating_sub(bytes_n);
+  assert!(
+    n_delta < span,
+    "N→2N plain-binary sub-table rows grew {n_delta} bytes for the SAME region — \
+     the widened guard must store a zero-copy empty RawValue for a `0x0010` \
+     `CameraInfo` row (O(N descriptors)), NOT O(N·M); a growth ≥ one span \
+     ({span}) means the plain-binary rows' read_value clone is still eager (the \
+     #486 gap the #443 enciphered-only predicate left)."
+  );
+
+  // Confirm we exercised the PLAIN-BINARY no-op path (not a matched decode): the
+  // 90000-byte count matches no ported `CameraInfo` table, so `0x0010` re-slices
+  // `data` and emits NO leaf. A non-zero count would mean a matched sub-table
+  // decode ran (the probe would no longer isolate the eager-clone the fix removes).
+  let meta = parse_exif(&tiff_n).expect("plain-binary Sony TIFF parses");
+  let plain_leaves = meta
+    .maker_note()
+    .map_or(0, |mn| mn.emissions_print_conv().len());
+  assert_eq!(
+    plain_leaves, 0,
+    "0x0010 with a non-matching count must fall to sony_emit_binary_subdir's no-op \
+     arm (emit no leaf); a non-zero count means a matched decode ran (test no \
+     longer isolates the plain-binary eager-clone)."
+  );
+}
+
+/// #486 R2 — the residual eager-clone the R1 (`undef`-gated) guard STILL left for a
+/// NON-`undef` SubDirectory encoding. The R1 guard zeroed the walk clone only for
+/// `matches!(format, Format::Undef)`, but a `%Sony::Main` `SubDirectory` row's
+/// decoded value is dead REGARDLESS of the on-disk `$format`: `emit_sony_value`
+/// returns at its Step-2 `sub_table.is_some()` guard (a STATIC table fact, not a
+/// format check) and `sony_emit_binary_subdir` re-slices `data` keyed on
+/// `tag_id`/`value_size`, so it reads the decoded `RawValue` for NO format. A
+/// crafted IFD can therefore encode duplicate `0x0010` `CameraInfo` rows as `int8u`
+/// (format 1) / `int16u` (format 3) / `ascii` (format 2) over one shared span — all
+/// NON-`undef` — and (pre-R2) each retained a large dead `read_value` clone, the
+/// SAME N×M DoS #486 R1 closed for `undef`, re-opened for every other format.
+///
+/// This probe mirrors `sony_plain_binary_subdir_is_borrowed_not_amplified` but sweeps
+/// the three attacker-reachable non-`undef` shapes (each with a `count > 1` under the
+/// 100 000 excessive-count gate, so no warning fires and the guard's `count != 1`
+/// carve-out does not apply). For each, doubling the row count over the SAME region
+/// must add only O(N descriptors) — proving the guard's SubDirectory class is now
+/// FORMAT-INDEPENDENT (the R2 fix). `int8u`/`ascii` (1-byte element) worst-case:
+/// their `read_value` clone is a `Vec<u64>`/`Box<[u8]>` of `span` elements — for
+/// `int8u` that is 8·span bytes, LARGER than the `undef` case, so the R1 gap this
+/// closes was strictly worse for the integer encoding.
+///
+/// Called INLINE from the single `alloc_budget` test (the counters are
+/// process-global; see the module doc).
+fn sony_nonundef_subdir_is_borrowed_not_amplified() {
+  use exifast::parse_exif;
+
+  // span 90000 (< the 100k excessive-count gate). 90000 matches no ported
+  // CameraInfo `$count`/`value_size` → the plain-binary dispatcher's `_ => return`.
+  const LARGE: usize = 90_016;
+  let span = LARGE - 16; // 90000 — the per-row window / pre-fix per-clone volume
+
+  println!("\n=== alloc_budget: sony NON-undef subdir borrow (#486 R2, single-copy) ===");
+
+  // (format_code, elem_size, label) — the three attacker-reachable non-`undef`
+  // encodings of a `0x0010` SubDirectory row. `value_size == count * elem_size ==
+  // span` in every build, so the shared-region window is byte-identical to the
+  // `undef` probe; only the declared `$format` (⇒ decoded `RawValue` shape) differs.
+  for &(fmt, elem, label) in &[(1u16, 1usize, "int8u"), (3, 2, "int16u"), (2, 1, "ascii")] {
+    let ids_n = [0x0010_u16; 4];
+    let ids_2n = [0x0010_u16; 8];
+    let tiff_n = sony_subdir_tiff_fmt(&ids_n, LARGE, fmt, elem);
+    let tiff_2n = sony_subdir_tiff_fmt(&ids_2n, LARGE, fmt, elem);
+    // Warm-up OUTSIDE the measured region (lazy statics / first-call init).
+    assert!(
+      parse_exif(&tiff_n).is_some(),
+      "4-row {label} Sony TIFF parses"
+    );
+    assert!(
+      parse_exif(&tiff_2n).is_some(),
+      "8-row {label} Sony TIFF parses"
+    );
+    let (_n_ok, bytes_n) = count_alloc_bytes(|| parse_exif(&tiff_n).is_some());
+    let (_2n_ok, bytes_2n) = count_alloc_bytes(|| parse_exif(&tiff_2n).is_some());
+    let n_delta = bytes_2n.saturating_sub(bytes_n);
+    println!(
+      "  {label:<6}  N=4 rows={bytes_n}B  N=8 rows={bytes_2n}B  Δ(N→2N)={n_delta}B  (same {span}B span)"
+    );
+
+    // Doubling the NON-`undef` SubDirectory row count over the SAME region adds only
+    // O(N descriptors) — FAR below one span copy. The pre-R2 (`undef`-gated) guard
+    // MISSED these rows, so each of the 4 extra rows retained one `read_value` clone
+    // (≥ span bytes; for `int8u`/`ascii` a `Vec<u64>`/`Box<[u8]>` of `span` elements),
+    // so the delta was ≈ 4·span. A growth ≥ one span means the guard is STILL
+    // format-gated (the #486 R2 gap).
+    assert!(
+      n_delta < span,
+      "N→2N {label} SubDirectory rows grew {n_delta} bytes for the SAME region — the \
+       widened guard must store a zero-copy empty RawValue for a `0x0010` `CameraInfo` \
+       row REGARDLESS of its on-disk format (O(N descriptors)), NOT O(N·M); a growth ≥ \
+       one span ({span}) means the SubDirectory guard is still `undef`-gated (the #486 \
+       R2 non-`undef` DoS bypass)."
+    );
+
+    // Confirm the NON-`undef` no-op path (not a matched decode): the 90000-byte
+    // value_size matches no ported `CameraInfo` table, so `0x0010` re-slices `data`
+    // and emits NO leaf — the same isolation the R1 `undef` probe asserts. (A
+    // matched decode would mean the probe no longer isolates the eager-clone.)
+    let meta = parse_exif(&tiff_n).unwrap_or_else(|| panic!("{label} Sony TIFF parses"));
+    let leaves = meta
+      .maker_note()
+      .map_or(0, |mn| mn.emissions_print_conv().len());
+    assert_eq!(
+      leaves, 0,
+      "0x0010 ({label}) with a non-matching value_size must fall to \
+       sony_emit_binary_subdir's no-op arm (emit no leaf); a non-zero count means a \
+       matched decode ran (test no longer isolates the eager-clone)."
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

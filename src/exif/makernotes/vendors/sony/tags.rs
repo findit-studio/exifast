@@ -190,40 +190,6 @@ pub enum SubTable {
   PrintIm,
 }
 
-impl SubTable {
-  /// `true` when a `%Sony::Main` row carrying this SubDirectory target is decoded
-  /// by `exif::mod::sony_emit_enciphered_subblock` — the `ProcessEnciphered`/
-  /// `ProcessBinaryData` shot/AF/lens series `Tag2010` (0x2010), the whole
-  /// `Tag9xxx` family, and `AFInfo`/`Tag940e` (0x940e), plus the one PLAIN
-  /// `Tag202a` block that shares that dispatcher.
-  ///
-  /// That dispatcher decodes the block by re-slicing the verbatim on-disk value
-  /// span from the input buffer (`data[value_offset..]`) for BOTH the model/byte-
-  /// matched decode AND the `%unknownCipherData` fallback (its `_ => {}` arm), and
-  /// `exif::mod::emit_sony_value` returns at its Step-2 SubDirectory guard WITHOUT
-  /// reading the value — so the walk's decoded [`RawValue`](crate::exif::ifd::RawValue)
-  /// clone of such a row is DEAD (never read). This is the routing fact the #443
-  /// zero-copy walk guard keys off (via [`super::value_resliced_from_data`]).
-  ///
-  /// `Tag9xxx` alone groups THIRTEEN tag IDs (`0x9050`, `0x9400`-`0x9406`,
-  /// `0x940a`, `0x940c`, `0x9416`, `0x900b`, `0x202a`), so a new enciphered
-  /// dispatcher row added under it is covered here AUTOMATICALLY — the guard needs
-  /// no hand-maintained tag-ID list (superseding the #443 R1/R2 lists that kept
-  /// missing members, #443 R3).
-  ///
-  /// Returns `false` for the older PLAIN binary sub-tables (`CameraInfo`,
-  /// `FocusInfo`, `CameraSettings`, `ExtraInfo`, `ShotInfo`) — those are decoded by
-  /// the SEPARATE `exif::mod::sony_emit_binary_subdir` dispatcher and are left on
-  /// the `read_value` path (this fix is scoped to the enciphered-subblock class;
-  /// they are byte-identical either way) — and for the non-`ProcessBinaryData`
-  /// targets (`Panorama`, `HiddenInfo`, `MinoltaMakerNote`, `PrintIm`).
-  #[must_use]
-  #[inline]
-  pub(crate) const fn dispatched_by_enciphered_subblock(&self) -> bool {
-    matches!(self, Self::Tag2010 | Self::Tag9xxx | Self::AfInfo)
-  }
-}
-
 /// `%Sony::Main` (`Sony.pm:707-2711`). Sorted by tag ID.
 ///
 /// 114 rows — one per numeric key of the bundled hash.
@@ -1388,66 +1354,76 @@ mod tests {
     assert_eq!(t.sub_table, Some(SubTable::Tag9xxx));
   }
 
-  /// The #443 R3 CLASS-KILLER routing fact: `dispatched_by_enciphered_subblock`
-  /// is true for EXACTLY the three SubDirectory variants
-  /// `sony_emit_enciphered_subblock` handles (`Tag2010`, `Tag9xxx`, `AfInfo`) and
-  /// false for the plain-binary + non-`ProcessBinaryData` variants. This is what
-  /// lets the walk guard cover the whole enciphered class from ONE variant check,
-  /// with no hand-maintained tag-ID list.
+  /// The #443/#486 CLASS-KILLER routing fact: the dead-value walk guard's
+  /// FORMAT-INDEPENDENT class (`sony_tag_has_sub_table`) is derived from
+  /// `sub_table: Some(_)`, so it covers EVERY `%Sony::Main` SubDirectory row — the
+  /// enciphered (`Tag2010`/`Tag9xxx`/`AfInfo`), the plain-binary
+  /// (`CameraInfo`/`FocusInfo`/`CameraSettings`/`ExtraInfo`/`ShotInfo`) AND the
+  /// deferred (`Panorama`/`HiddenInfo`/`MinoltaMakerNote`/`PrintIm`) targets — with
+  /// no hand-maintained tag-ID list, and (#486 R2) with NO on-disk-`$format` gate: a
+  /// SubDirectory's decoded value is dead whether it is encoded `undef` or a
+  /// duplicate `int8u`/`int16u`/`ascii`. A plain LEAF (`sub_table: None`, not a
+  /// suppressed-cipher leaf) is NOT covered (its decoded value IS its emission).
   #[test]
-  fn enciphered_subblock_class_is_variant_derived() {
-    for v in [SubTable::Tag2010, SubTable::Tag9xxx, SubTable::AfInfo] {
-      assert!(
-        v.dispatched_by_enciphered_subblock(),
-        "{v:?} is decoded by sony_emit_enciphered_subblock"
-      );
+  fn every_subdirectory_row_is_resliced_from_data() {
+    // Every `sub_table: Some(_)` row → its decoded RawValue is dead (re-sliced
+    // from `data` or read by no dispatcher), so the guard zeroes the walk clone
+    // FOR ANY on-disk format (the guard applies `sony_tag_has_sub_table` without an
+    // `undef` gate — the #486 R2 non-`undef` DoS close).
+    for t in SONY_TAGS {
+      if t.sub_table.is_some() {
+        assert!(
+          super::super::sony_tag_has_sub_table(t.id),
+          "0x{:04x} ({}) is a SubDirectory row — its decoded value must be dead \
+           (guard covers the whole `sub_table: Some(_)` class, format-independent)",
+          t.id,
+          t.name
+        );
+      }
     }
-    for v in [
-      SubTable::CameraInfo,
-      SubTable::FocusInfo,
-      SubTable::CameraSettings,
-      SubTable::ExtraInfo,
-      SubTable::ShotInfo,
-      SubTable::Panorama,
-      SubTable::HiddenInfo,
-      SubTable::MinoltaMakerNote,
-      SubTable::PrintIm,
-    ] {
+    // A plain (non-suppressed) LEAF is neither a SubDirectory row nor a suppressed
+    // cipher leaf → its decoded value IS its emission (read, not resliced).
+    for id in [0x0102u16, 0x0104, 0x201d] {
       assert!(
-        !v.dispatched_by_enciphered_subblock(),
-        "{v:?} is NOT an enciphered-subblock dispatcher (left on the read_value path)"
+        !super::super::sony_tag_has_sub_table(id) && !super::super::is_suppressed_cipher_leaf(id),
+        "0x{id:04x} is a plain leaf — its decoded value is read, not resliced"
       );
     }
   }
 
-  /// EVERY tag ID `sony_emit_enciphered_subblock` decodes must resolve — via its
-  /// `SubTable` variant — to the enciphered-subblock class, so the routing-derived
-  /// walk guard confines its walk clone. This pins the exact ID set (incl. the
-  /// members `0x9400`/`0x9402`/`0x9404`/`0x9405`/`0x9406`/`0x9050`/`0x9401`/
-  /// `0x9403`/`0x9416`/`0x202a`/`0x900b` that the R1/R2 hand lists MISSED) so a
-  /// future edit that drops one from `Tag9xxx` — or adds a dispatcher arm without
-  /// wiring its variant — is caught here, not by a fuzzer (#443 R3).
+  /// EVERY tag ID either dispatcher decodes must resolve to a `SubTable` variant,
+  /// so the `sub_table: Some(_)`-derived guard confines its walk clone. This pins
+  /// the exact enciphered ID set (incl. `0x9400`/`0x9402`/`0x9404`/`0x9405`/
+  /// `0x9406`/`0x9050`/`0x9401`/`0x9403`/`0x9416`/`0x202a`/`0x900b` — the members
+  /// the #443 R1/R2 hand lists MISSED) AND the plain-binary set (`0x0010`/`0x0020`/
+  /// `0x0114`/`0x0116`/`0x3000` — the ones #443's enciphered-only predicate left
+  /// eager-cloning), so a future edit dropping a member — or adding a dispatcher
+  /// arm without wiring its `sub_table` — is caught here, not by a fuzzer
+  /// (#443 R3 / #486).
   #[test]
-  fn every_enciphered_subblock_id_is_in_the_class() {
+  fn every_dispatched_subdir_id_is_resliced() {
+    // The enciphered `sony_emit_enciphered_subblock` IDs.
     for id in [
       0x2010u16, 0x9050, 0x9400, 0x9401, 0x9402, 0x9403, 0x9404, 0x9405, 0x9406, 0x940a, 0x940c,
       0x940e, 0x9416, 0x900b, 0x202a,
     ] {
-      let sub = lookup(id)
+      lookup(id)
         .unwrap_or_else(|| panic!("0x{id:04x} is a %Sony::Main row"))
         .sub_table
         .unwrap_or_else(|| panic!("0x{id:04x} is a SubDirectory dispatcher"));
       assert!(
-        sub.dispatched_by_enciphered_subblock(),
-        "0x{id:04x} ({sub:?}) must be in the enciphered-subblock class"
+        super::super::sony_tag_has_sub_table(id),
+        "0x{id:04x} (enciphered) must be resliced-from-data (dead walk clone)"
       );
     }
-    // The plain binary sub-tables are deliberately OUTSIDE the class.
+    // The plain-binary `sony_emit_binary_subdir` IDs — #486 R1 brings them into the
+    // guard too (they re-slice `data`, never the decoded value); #486 R2 makes that
+    // FORMAT-INDEPENDENT (`sony_tag_has_sub_table`, no `undef` gate).
     for id in [0x0010u16, 0x0020, 0x0114, 0x0116, 0x3000] {
-      let sub = lookup(id).unwrap().sub_table.unwrap();
+      lookup(id).unwrap().sub_table.unwrap();
       assert!(
-        !sub.dispatched_by_enciphered_subblock(),
-        "0x{id:04x} ({sub:?}) is a plain binary sub-table, not enciphered-subblock"
+        super::super::sony_tag_has_sub_table(id),
+        "0x{id:04x} (plain-binary) must be resliced-from-data (#486 dead walk clone)"
       );
     }
   }
