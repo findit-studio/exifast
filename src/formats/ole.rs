@@ -14,7 +14,10 @@
 //! This port reads directly over the `&[u8]` chunk bytes.
 //!
 //! Scope: the OLE walker + the `SummaryInformation` / `DocumentSummaryInformation`
-//! property sets (the two summary tables). The UserDefined dictionary, the
+//! property sets (the two summary tables), including the
+//! `DocumentSummaryInformation` second (UserDefined) section — its in-stream
+//! property dictionary (PID 0) names the custom property IDs so they emit under
+//! their document-defined names (`ProcessProperties`, FlashPix.pm:1716-1811). The
 //! `_PID_HLINKS` hyperlinks, embedded-document `Doc<N>` grouping, and the other
 //! `%FlashPix::Main` streams (`CompObj`, `Image Info`, `Current User`, …) are out
 //! of scope for this chunk.
@@ -27,7 +30,7 @@
 use crate::emit::{EmitOptions, EmittedTag};
 use crate::value::{Group, TagValue};
 use smol_str::SmolStr;
-use std::{string::String, vec::Vec};
+use std::{collections::BTreeMap, string::String, vec::Vec};
 
 // ---- OLE sector-type sentinels (FlashPix.pm:42-46) --------------------------
 const HDR_SIZE: usize = 512;
@@ -613,15 +616,17 @@ enum Table {
 }
 
 /// Process an OLE property set (`ProcessProperties`, FlashPix.pm:1691). Reads the
-/// property-set header + its FIRST (predefined) section and emits the recognized
-/// `SummaryInfo` / `DocumentInfo` tags.
+/// property-set header, then loops over up to two sections (`for ($n=0;$n<2;…)`,
+/// FlashPix.pm:1716): the first (predefined) section and — for
+/// `DocumentSummaryInformation`, whose `%FlashPix::Main` entry sets `Multi => 1`
+/// (FlashPix.pm:179) — a second (UserDefined) section. `SummaryInformation` has
+/// no `Multi`, so its loop stops after the first section.
 ///
-/// The second (UserDefined) section of `DocumentSummaryInformation` (reached via
-/// the `Multi` flag, FlashPix.pm:1810) is deferred: its property IDs are named by
-/// an in-stream dictionary (PID 0, FlashPix.pm:1738-1760) that this port does not
-/// decode, so continuing through `%DocumentInfo` would MISATTRIBUTE a custom PID
-/// (e.g. 2 → "Category"). We therefore stop after the predefined section rather
-/// than misname the UserDefined properties.
+/// Each section owns a fresh dictionary + code page (FlashPix.pm:1717-1718). A
+/// PID-0 property carries the section's property dictionary (PID → name,
+/// [`decode_dictionary`]); a non-zero PID present in the dictionary is a
+/// UserDefined custom property emitted under its (mangled) dictionary name,
+/// otherwise it resolves against the predefined summary table.
 fn process_properties(
   data: &[u8],
   table: Table,
@@ -644,103 +649,295 @@ fn process_properties(
     }
   };
   // Start of the first section (offset at byte 44, FlashPix.pm:1711).
-  let pos = get_u32(data, 44, le).unwrap_or(0) as usize;
+  let mut pos = get_u32(data, 44, le).unwrap_or(0) as usize;
   if pos < 48 {
     meta.warn("Bad FPX property section offset");
     return;
   }
-  if pos + 8 > dir_end {
-    return;
+  // The `DocumentSummaryInformation` table carries a 2nd (UserDefined) section,
+  // flagged `Multi => 1` on its `%FlashPix::Main` entry (FlashPix.pm:179);
+  // `SummaryInformation` is single-section. ExifTool stops after the first
+  // section unless `Multi`, advancing `$pos += $size` (FlashPix.pm:1810-1811).
+  let multi = matches!(table, Table::DocumentInfo);
+  for _section in 0..2 {
+    // `%dictionary` + `$codePage` are per-section locals (FlashPix.pm:1717-1718).
+    let mut dictionary: BTreeMap<u32, SmolStr> = BTreeMap::new();
+    let mut code_page: Option<i64> = None;
+    // `last if $pos + 8 > $dirEnd` (FlashPix.pm:1719).
+    if pos.saturating_add(8) > dir_end {
+      break;
+    }
+    let size = get_u32(data, pos, le).unwrap_or(0) as usize;
+    // `last unless $size` (FlashPix.pm:1722).
+    if size == 0 {
+      break;
+    }
+    // The property list + every value offset belong to THIS section; clamp all
+    // bounds to the declared section end so a hostile offset in one section
+    // cannot reach into the following section's bytes and emit under the wrong
+    // name (Finding 3). `min` also caps an over-declared section at the buffer
+    // end (an ExifTool read fails past EOF). A well-formed single-section stream
+    // has `section_end == dir_end`, so the real fixture is byte-identical.
+    let section_end = dir_end.min(pos.saturating_add(size));
+    let num_entries = get_u32(data, pos + 4, le).unwrap_or(0) as usize;
+    // Hard cap: a real property section holds well under 50 entries. Reject an
+    // attacker's multi-million count before the per-entry loop.
+    if num_entries > MAX_PROPERTIES {
+      meta.warn("Excessive FPX property count");
+      break;
+    }
+    if pos + 8 + 8usize.saturating_mul(num_entries) > section_end {
+      meta.warn("Truncated property list");
+      break;
+    }
+    let mut truncated = false;
+    for index in 0..num_entries {
+      // Charge the OLE-wide budget per property entry so a repeated stream (or a
+      // huge entry count) cannot spin `meta.tags` / `meta.warnings` without
+      // bound; when exhausted the caller halts the whole walk (Finding 1).
+      if *budget == 0 {
+        break;
+      }
+      *budget -= 1;
+      let entry = pos + 8 + 8 * index;
+      let tag = get_u32(data, entry, le).unwrap_or(0);
+      let offset = get_u32(data, entry + 4, le).unwrap_or(0) as usize;
+      let val_start = pos + 4 + offset;
+      if val_start >= section_end {
+        truncated = true;
+        break;
+      }
+      let ty = get_u32(data, pos + offset, le).unwrap_or(0);
+      if tag == 0 {
+        // PID 0 is the property dictionary: the `type` field is the entry count
+        // and the value area holds `[PID][nameLen][name]` tuples naming this
+        // section's UserDefined custom properties (FlashPix.pm:1738-1759).
+        decode_dictionary(
+          data,
+          val_start,
+          ty,
+          section_end,
+          le,
+          budget,
+          &mut dictionary,
+        );
+        continue;
+      }
+      // Translate a UserDefined custom PID through the section dictionary
+      // (FlashPix.pm:1762-1766): a hit re-dispatches under the RAW dictionary name
+      // (`$tag = $dictionary{$tag}; $custom = 1`) and suppresses the common-ID +
+      // VARS-masking lookups.
+      let custom_name = dictionary.get(&tag).cloned();
+      let (value, _next) = read_fpx_value(
+        data,
+        val_start,
+        ty,
+        section_end,
+        false,
+        code_page,
+        le,
+        0,
+        budget,
+      );
+      let Some(raw) = value else {
+        meta.warn("Error reading property value");
+        continue;
+      };
+      if let Some(name) = custom_name {
+        // The raw name is the collision key: if it string-matches a predefined
+        // table entry (`$$tagTablePtr{$tag}`, FlashPix.pm:1785 — the two
+        // `_PID_*` string keys, or a decimal string equal to a numeric PID),
+        // ExifTool dispatches that PREDEFINED entry; otherwise it emits the
+        // mangled custom name it added at dictionary-build time (:1753-1757).
+        if let Some(def) = predefined_by_raw_name(&name, table) {
+          // `_PID_LINKBASE`/`_PID_HLINKS` run their conv on the raw VT_BLOB
+          // payload bytes (not the `FpxRaw` placeholder); the rest reuse the read
+          // value. A `Hyperlinks` conv on a `< 4`-byte payload returns `undef`
+          // (`RawConv`) ⇒ the tag is not emitted.
+          match def.conv {
+            Conv::LinkBase | Conv::Hyperlinks => {
+              let blob = blob_payload(data, val_start, ty, section_end, le);
+              if let Some(value) = apply_blob_conv(def.conv, blob, &raw, le, budget) {
+                meta.tags.push(FpxTag {
+                  name: SmolStr::new(def.name),
+                  value,
+                });
+              }
+            }
+            _ => meta.tags.push(FpxTag {
+              name: SmolStr::new(def.name),
+              value: apply_conv(def.conv, raw),
+            }),
+          }
+          continue;
+        }
+        // A mangled custom name carries no PrintConv (`AddTagToTable` adds a bare
+        // `{ Name => … }`, FlashPix.pm:1757); a name that mangles to empty adds no
+        // table entry and — with the common-ID/VARS fallbacks suppressed — emits
+        // nothing (`next unless length $name`, :1755).
+        let mangled = mangle_dictionary_name(name.as_bytes());
+        if !mangled.is_empty() {
+          meta.tags.push(FpxTag {
+            name: SmolStr::from(mangled),
+            value: raw_to_value(raw),
+          });
+        }
+        continue;
+      }
+      // Common IDs (CodePage / LocaleIndicator) resolve against SummaryInfo
+      // regardless of the current table, but only for non-custom PIDs
+      // (FlashPix.pm:1777).
+      let def = if tag == 1 || tag == 0x8000_0000 {
+        if tag == 1 {
+          // CodePage may be stored as int16s; normalise negatives + save it for
+          // decoding this section's later strings (FlashPix.pm:1781-1783).
+          if let FpxRaw::Int(mut n) = raw {
+            if n < 0 {
+              n += 0x1_0000;
+            }
+            code_page = Some(n);
+          }
+        }
+        summary_info(tag)
+      } else {
+        match table {
+          Table::SummaryInfo => summary_info(tag),
+          Table::DocumentInfo => document_info(tag),
+        }
+      };
+      if let Some(def) = def {
+        meta.tags.push(FpxTag {
+          name: SmolStr::new(def.name),
+          value: apply_conv(def.conv, raw),
+        });
+      }
+    }
+    if truncated {
+      meta.warn("Truncated property data");
+    }
+    // `last unless $$dirInfo{Multi}` (FlashPix.pm:1810) — SummaryInformation
+    // stops here; DocumentSummaryInformation advances to the UserDefined section.
+    if !multi {
+      break;
+    }
+    // `$pos += $size` (FlashPix.pm:1811).
+    pos = pos.saturating_add(size);
   }
-  let size = get_u32(data, pos, le).unwrap_or(0) as usize;
-  if size == 0 {
-    return;
-  }
-  // The property list + every value offset belong to THIS section; clamp all
-  // bounds to the declared section end so a hostile first-section offset cannot
-  // reach into a following (UserDefined) section's bytes and emit as a
-  // predefined tag (Finding 3). `min` also caps an over-declared section at the
-  // buffer end (an ExifTool read fails past EOF). A well-formed single-section
-  // stream has `section_end == dir_end`, so the real fixture is byte-identical.
-  let section_end = dir_end.min(pos.saturating_add(size));
-  let num_entries = get_u32(data, pos + 4, le).unwrap_or(0) as usize;
-  // Hard cap: a real property section holds well under 50 entries. Reject an
-  // attacker's multi-million count before the per-entry loop.
-  if num_entries > MAX_PROPERTIES {
-    meta.warn("Excessive FPX property count");
-    return;
-  }
-  if pos + 8 + 8usize.saturating_mul(num_entries) > section_end {
-    meta.warn("Truncated property list");
-    return;
-  }
-  let mut code_page: Option<i64> = None;
-  let mut truncated = false;
-  for index in 0..num_entries {
-    // Charge the OLE-wide budget per property entry so a repeated stream (or a
-    // huge entry count) cannot spin `meta.tags` / `meta.warnings` without bound;
-    // when exhausted the caller halts the whole walk (Finding 1).
+}
+
+/// Decode a UserDefined property dictionary (PID 0, FlashPix.pm:1738-1759). The
+/// property's `type` field is the entry count; each entry is
+/// `[PID u32][nameLen u32][name bytes]`, the name truncated at the first NUL.
+///
+/// Stores the **raw** name (`$dictionary{$tag} = $name`, FlashPix.pm:1750),
+/// NOT the emitted tag name — the raw name is the collision key ExifTool tests
+/// against the predefined table (`$$tagTablePtr{$name}`, :1751) and re-dispatches
+/// through at emit time (`$tag = $dictionary{$tag}`, :1764). Mangling into the
+/// custom tag name ([`mangle_dictionary_name`], :1753-1754) is deferred to
+/// [`process_properties`]'s emit path so a raw name that string-matches a
+/// predefined table key (`_PID_LINKBASE`/`_PID_HLINKS`, or a decimal string equal
+/// to a numeric PID) dispatches the predefined entry instead of a custom tag.
+///
+/// SOUNDNESS: the attacker-controlled entry count is capped at `MAX_PROPERTIES`
+/// and every entry charges the OLE-wide budget (#443-class DoS discipline); every
+/// read is bounds-checked (`data.get`), `val_pos` advances monotonically and is
+/// fenced to `section_end`, so a malformed dictionary can neither panic, read out
+/// of bounds, nor loop.
+fn decode_dictionary(
+  data: &[u8],
+  mut val_pos: usize,
+  count: u32,
+  section_end: usize,
+  le: bool,
+  budget: &mut usize,
+  dictionary: &mut BTreeMap<u32, SmolStr>,
+) {
+  // Cap the `for ($i=0; $i<$type; ++$i)` count (attacker-controlled) before the
+  // loop — same discipline as the property-count cap.
+  let count = (count as usize).min(MAX_PROPERTIES);
+  for _ in 0..count {
     if *budget == 0 {
       break;
     }
     *budget -= 1;
-    let entry = pos + 8 + 8 * index;
-    let tag = get_u32(data, entry, le).unwrap_or(0);
-    let offset = get_u32(data, entry + 4, le).unwrap_or(0) as usize;
-    let val_start = pos + 4 + offset;
-    if val_start >= section_end {
-      truncated = true;
+    // `last if $valPos + 8 > $dirEnd` (FlashPix.pm:1742).
+    if val_pos.saturating_add(8) > section_end {
       break;
     }
-    let ty = get_u32(data, pos + offset, le).unwrap_or(0);
-    if tag == 0 {
-      // Dictionary (UserDefined name lookup) — out of scope; skip it.
+    let entry_start = val_pos;
+    let tag = get_u32(data, entry_start, le).unwrap_or(0);
+    let len = get_u32(data, entry_start + 4, le).unwrap_or(0) as usize;
+    // `$valPos += 8 + $len` (FlashPix.pm:1745).
+    val_pos = entry_start.saturating_add(8).saturating_add(len);
+    // `last if $valPos > $dirEnd` (FlashPix.pm:1746).
+    if val_pos > section_end {
+      break;
+    }
+    // `$name = substr($$dataPt, $valPos - $len, $len)` (FlashPix.pm:1747): the
+    // `len` bytes after the 8-byte entry header (`entry_start + 8 == valPos-len`).
+    let Some(name_bytes) = data.get(entry_start + 8..val_pos) else {
+      break;
+    };
+    // `$name =~ s/\0.*//s` — truncate at the first NUL (FlashPix.pm:1748).
+    let nul = name_bytes
+      .iter()
+      .position(|&b| b == 0)
+      .unwrap_or(name_bytes.len());
+    let raw = name_bytes.get(..nul).unwrap_or(name_bytes);
+    // `next unless length $name` (FlashPix.pm:1749).
+    if raw.is_empty() {
       continue;
     }
-    let (value, _next) = read_fpx_value(
-      data,
-      val_start,
-      ty,
-      section_end,
-      false,
-      code_page,
-      le,
-      0,
-      budget,
-    );
-    let Some(raw) = value else {
-      meta.warn("Error reading property value");
-      continue;
-    };
-    // Common IDs (CodePage / LocaleIndicator) resolve against SummaryInfo
-    // regardless of the current table (FlashPix.pm:1777-1784).
-    let def = if tag == 1 || tag == 0x8000_0000 {
-      summary_info(tag)
+    // `$dictionary{$tag} = $name` (FlashPix.pm:1750) — store the RAW name. The
+    // name is (Latin-1) bytes; the raw ASCII form is what ExifTool compares to
+    // the predefined table keys + re-dispatches at emit time.
+    dictionary.insert(tag, SmolStr::from(latin1_to_string(raw)));
+  }
+}
+
+/// Decode a (Latin-1) byte string to a `String` — every byte maps to the matching
+/// Unicode code point (ASCII-identity, and exact for the ASCII property names +
+/// `_PID_*` collision keys that appear in practice).
+fn latin1_to_string(bytes: &[u8]) -> String {
+  bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Mangle a raw dictionary name into an emitted tag name (FlashPix.pm:1753-1754):
+/// `s/(^| )([a-z])/\U$2/g` then `tr/-_a-zA-Z0-9//dc`. Operates byte-wise on the
+/// (Latin-1) name — Perl's `[a-z]` / char classes are ASCII here, and step 2
+/// drops every non-ASCII byte, so a byte-level pass is faithful.
+fn mangle_dictionary_name(raw: &[u8]) -> String {
+  // Step 1: `s/(^| )([a-z])/\U$2/g` — uppercase the first lowercase letter of
+  // each word (start-of-string, or after a space); a matched space is consumed
+  // (part of the match but not the `\U$2` replacement), i.e. dropped.
+  let mut upper: Vec<u8> = Vec::with_capacity(raw.len());
+  let mut i = 0usize;
+  let mut at_start = true;
+  while let Some(&c) = raw.get(i) {
+    let next_lower = raw.get(i + 1).filter(|b| b.is_ascii_lowercase());
+    if at_start && c.is_ascii_lowercase() {
+      upper.push(c.to_ascii_uppercase());
+      i += 1;
+    } else if c == b' ' {
+      if let Some(&n) = next_lower {
+        upper.push(n.to_ascii_uppercase());
+        i += 2;
+      } else {
+        upper.push(c);
+        i += 1;
+      }
     } else {
-      match table {
-        Table::SummaryInfo => summary_info(tag),
-        Table::DocumentInfo => document_info(tag),
-      }
-    };
-    if tag == 1 {
-      // CodePage may be stored as int16s; normalise negatives + save it.
-      if let FpxRaw::Int(mut n) = raw {
-        if n < 0 {
-          n += 0x1_0000;
-        }
-        code_page = Some(n);
-      }
+      upper.push(c);
+      i += 1;
     }
-    if let Some(def) = def {
-      meta.tags.push(FpxTag {
-        name: SmolStr::new(def.name),
-        value: apply_conv(def.conv, raw),
-      });
-    }
+    at_start = false;
   }
-  if truncated {
-    meta.warn("Truncated property data");
-  }
+  // Step 2: `tr/-_a-zA-Z0-9//dc` — delete every byte outside `[-_a-zA-Z0-9]`.
+  upper
+    .into_iter()
+    .filter(|&b| b == b'-' || b == b'_' || b.is_ascii_alphanumeric())
+    .map(char::from)
+    .collect()
 }
 
 /// Read one property value (`ReadFPXValue`, FlashPix.pm:1282). Returns the decoded
@@ -1187,6 +1384,9 @@ fn apply_conv(conv: Conv, raw: FpxRaw) -> FpxValue {
       ))),
       other => raw_to_value(other),
     },
+    // The two blob-payload convs are dispatched via `apply_blob_conv` on the raw
+    // bytes, never here; pass the read value through if ever reached.
+    Conv::LinkBase | Conv::Hyperlinks => raw_to_value(raw),
   }
 }
 
@@ -1227,6 +1427,16 @@ enum Conv {
   Security,
   /// `AppVersion` `sprintf("%d.%.4d", $val>>16, $val&0xffff)` (ValueConv).
   AppVersion,
+  /// `HyperlinkBase` `$self->Decode($val, "UTF16","II")` (ValueConv,
+  /// FlashPix.pm:523) — the raw VT_BLOB payload decoded as UTF-16LE and truncated
+  /// at the first NUL. Reads the underlying blob bytes, not the [`FpxRaw`]
+  /// placeholder, so it is applied on the raw value path in [`process_properties`].
+  LinkBase,
+  /// `Hyperlinks` `\&ProcessHyperlinks` (RawConv, FlashPix.pm:527) — the raw
+  /// VT_BLOB payload re-parsed as a `[count u32][VT_VARIANT * count]` array whose
+  /// every-6th group yields a link (address `#` subaddress). Also reads the
+  /// underlying blob bytes on the raw value path.
+  Hyperlinks,
 }
 
 const fn def(name: &'static str, conv: Conv) -> FpxDef {
@@ -1288,6 +1498,175 @@ fn document_info(tag: u32) -> Option<FpxDef> {
     0x1d => def("DocVersion", Conv::None),
     _ => return None,
   })
+}
+
+/// The two STRING-keyed `%FlashPix::DocumentInfo` entries (FlashPix.pm:521-528) —
+/// the only predefined UserDefined properties. A UserDefined dictionary that names
+/// a PID `_PID_LINKBASE` / `_PID_HLINKS` re-dispatches through these (ExifTool's
+/// `next if $$tagTablePtr{$name}` + `$$tagTablePtr{$tag}` raw-name lookup) instead
+/// of emitting a mangled custom tag.
+fn document_info_by_name(raw: &str) -> Option<FpxDef> {
+  Some(match raw {
+    "_PID_LINKBASE" => def("HyperlinkBase", Conv::LinkBase),
+    "_PID_HLINKS" => def("Hyperlinks", Conv::Hyperlinks),
+    _ => return None,
+  })
+}
+
+/// Resolve a dictionary raw name against the active property table, mirroring
+/// ExifTool's `$$tagTablePtr{$tag}` lookup after `$tag = $dictionary{$tag}`
+/// (FlashPix.pm:1785). Perl hash keys are strings, so a numeric PID (e.g. `0x02`)
+/// is keyed as its decimal string (`"2"`); a raw dictionary name that string-
+/// matches such a key collides onto the predefined entry (the "numeric-string
+/// collision"). The two `_PID_*` string keys live only in `DocumentInfo` (the
+/// table every DocumentSummaryInformation section uses).
+fn predefined_by_raw_name(raw: &str, table: Table) -> Option<FpxDef> {
+  if matches!(table, Table::DocumentInfo)
+    && let Some(d) = document_info_by_name(raw)
+  {
+    return Some(d);
+  }
+  // A decimal-string name equal to a numeric PID: parse to the canonical `u32`
+  // and require the round-trip to match (so `"2"` collides with `0x02` but `"02"`
+  // / `" 2"` — whose Perl hash keys differ — do not).
+  let n: u32 = raw.parse().ok()?;
+  if n.to_string() != raw {
+    return None;
+  }
+  match table {
+    Table::SummaryInfo => summary_info(n),
+    Table::DocumentInfo => document_info(n),
+  }
+}
+
+/// The raw VT_BLOB / VT_CF payload bytes at a property value position (the
+/// `[count u32][payload]` body, FlashPix.pm:1396-1405) — the value ExifTool's
+/// `_PID_HLINKS` / `_PID_LINKBASE` convs run on. Returns `None` (⇒ the caller
+/// falls back to the placeholder value) when the property is not a blob or the
+/// declared length overruns the section. Every read is bounds-checked.
+fn blob_payload(
+  data: &[u8],
+  val_start: usize,
+  ty: u32,
+  section_end: usize,
+  le: bool,
+) -> Option<&[u8]> {
+  // Only the blob types carry an inline byte payload; a vectored blob is not one
+  // of these realistic tags and is left to the placeholder path.
+  if !matches!(ty & 0x0fff, 65 | 71) || ty & 0xf000 != 0 {
+    return None;
+  }
+  let len = get_u32(data, val_start, le)? as usize;
+  // `last if $valPos + $len + 4 > $dirEnd` (FlashPix.pm:1398).
+  let end = val_start.checked_add(4)?.checked_add(len)?;
+  if end > section_end {
+    return None;
+  }
+  data.get(val_start + 4..end)
+}
+
+/// Apply a blob-payload conversion (`HyperlinkBase` / `Hyperlinks`) to the raw
+/// VT_BLOB bytes (`blob`), or to the read value `raw` when the property was not a
+/// blob (`blob == None`) — mirroring ExifTool running the conv on whatever `$val`
+/// ReadFPXValue produced. `None` means the conv returned `undef` (`Hyperlinks`
+/// with a `< 4`-byte payload) ⇒ the tag is not emitted.
+fn apply_blob_conv(
+  conv: Conv,
+  blob: Option<&[u8]>,
+  raw: &FpxRaw,
+  le: bool,
+  budget: &mut usize,
+) -> Option<FpxValue> {
+  // For a string-typed property ExifTool's `$val` is the decoded string; run the
+  // conv on those UTF-8 bytes. A non-blob non-string value has no byte payload.
+  let str_bytes;
+  let bytes: &[u8] = match blob {
+    Some(b) => b,
+    None => match raw {
+      FpxRaw::Str(s) => {
+        str_bytes = s.as_bytes();
+        str_bytes
+      }
+      _ => return None,
+    },
+  };
+  match conv {
+    // `$self->Decode($val, "UTF16","II")` (FlashPix.pm:523): decode the payload as
+    // UTF-16LE, then truncate at the first NUL (ExifTool's Recompose,
+    // Charset.pm:328 `s/\0.*//s`). Always yields a (possibly empty) string.
+    Conv::LinkBase => {
+      let s = decode_utf16le(bytes);
+      let s = match s.find('\0') {
+        Some(i) => SmolStr::new(&s[..i]),
+        None => SmolStr::from(s),
+      };
+      Some(FpxValue::Str(s))
+    }
+    Conv::Hyperlinks => process_hyperlinks(bytes, le, budget),
+    _ => Some(FpxValue::Binary(bytes.len())),
+  }
+}
+
+/// `ProcessHyperlinks` (FlashPix.pm:1251-1274): the `_PID_HLINKS` blob is a
+/// `[count u32][VT_VARIANT * count]` array; every 6th VT_VARIANT group is one
+/// hyperlink whose element 4 is the address and element 5 the (optional)
+/// subaddress, joined `address#subaddress`. Returns the link list (ExifTool
+/// returns a list ref — always a list, even for one or zero links), or `None`
+/// (`undef`, tag not emitted) when the blob is shorter than the 4-byte count.
+///
+/// SOUNDNESS: `count` is capped at `MAX_VECTOR_ELEMS` and each VT_VARIANT read
+/// charges the OLE-wide budget; the reads are bounds-checked via
+/// [`read_fpx_value`], so a malformed blob cannot panic, over-read, or loop.
+fn process_hyperlinks(val: &[u8], le: bool, budget: &mut usize) -> Option<FpxValue> {
+  // `return undef if $dirEnd < 4` (FlashPix.pm:1257).
+  let dir_end = val.len();
+  let num = get_u32(val, 0, le)?;
+  // Cap the attacker-controlled VT_VARIANT count before the loop (a real property
+  // holds a handful of 6-element groups).
+  let num = (num as usize).min(MAX_VECTOR_ELEMS);
+  let mut vals: Vec<String> = Vec::new();
+  let mut val_pos = 4usize;
+  for _ in 0..num {
+    if *budget == 0 {
+      break;
+    }
+    // `ReadFPXValue($et, \$val, $valPos, VT_VARIANT, $dirEnd)` (:1263).
+    let (v, next) = read_fpx_value(val, val_pos, 12, dir_end, false, None, le, 0, budget);
+    // `last unless defined $value` (:1264).
+    let Some(v) = v else { break };
+    val_pos = next;
+    vals.push(fpx_raw_to_link_string(&v));
+  }
+  // `for ($i=0; $i<@vals; $i+=6) { push @links, $vals[$i+4]; ... }` (:1269-1272).
+  let mut links: Vec<TagValue> = Vec::new();
+  let mut i = 0usize;
+  while i < vals.len() {
+    // Faithful indexing: `$vals[$i+4]` past the end is Perl `undef` → an empty
+    // link; a non-empty `$vals[$i+5]` is appended as `#subaddress`.
+    let address = vals.get(i + 4).cloned().unwrap_or_default();
+    let sub = vals.get(i + 5).map(String::as_str).unwrap_or("");
+    let link = if sub.is_empty() {
+      address
+    } else {
+      std::format!("{address}#{sub}")
+    };
+    links.push(TagValue::Str(SmolStr::from(link)));
+    i += 6;
+  }
+  Some(FpxValue::List(links))
+}
+
+/// Render a VT_VARIANT sub-value as the string ExifTool's `$vals[$i+4/5]` holds
+/// for the hyperlink address/subaddress filter (a string stays itself; a numeric
+/// or binary sub-value stringifies, matching Perl's scalar coercion in the `.=`
+/// concatenation).
+fn fpx_raw_to_link_string(raw: &FpxRaw) -> String {
+  match raw {
+    FpxRaw::Str(s) => s.to_string(),
+    FpxRaw::Int(n) => n.to_string(),
+    FpxRaw::Float(f) => std::format!("{f}"),
+    FpxRaw::List(_) | FpxRaw::Binary(_) => String::new(),
+  }
 }
 
 // ---- PrintConv / ValueConv helpers ------------------------------------------
@@ -1433,6 +1812,72 @@ mod tests {
   fn v_filetime(unix: i64) -> (u32, Vec<u8>) {
     let ft = (unix + 11_644_473_600) as u64 * 10_000_000;
     (64, le64(ft))
+  }
+
+  /// A property-dictionary VALUE (PID 0): the `type` field is the entry count and
+  /// the value bytes are `[PID u32][nameLen u32][name+NUL]` tuples with no
+  /// inter-entry padding (matching ExifTool's `$valPos += 8 + $len`).
+  fn v_dictionary(entries: &[(u32, &str)]) -> (u32, Vec<u8>) {
+    let mut vb = Vec::new();
+    for (pid, name) in entries {
+      let mut nb = name.as_bytes().to_vec();
+      nb.push(0); // NUL terminator (counted in nameLen)
+      vb.extend(le32(*pid));
+      vb.extend(le32(nb.len() as u32));
+      vb.extend(nb);
+    }
+    (entries.len() as u32, vb)
+  }
+
+  /// VT_BLOB (type 65): `[count u32][payload, padded to 4]`.
+  fn v_blob(blob: &[u8]) -> (u32, Vec<u8>) {
+    let pad = (4 - blob.len() % 4) % 4;
+    let mut vb = le32(blob.len() as u32);
+    vb.extend_from_slice(blob);
+    vb.extend(std::vec![0u8; pad]);
+    (65, vb)
+  }
+
+  /// A VT_VARIANT element of sub-type VT_LPWSTR (31): the 4-byte sub-type then the
+  /// `[wordCount u32][utf16le + NUL, padded to 4]` string.
+  fn vt_variant_lpwstr(s: &str) -> Vec<u8> {
+    let mut wb: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    wb.extend([0, 0]); // NUL terminator (a 16-bit word)
+    let pad = (4 - wb.len() % 4) % 4;
+    let mut out = le32(31);
+    out.extend(le32((wb.len() / 2) as u32));
+    out.extend(wb);
+    out.extend(std::vec![0u8; pad]);
+    out
+  }
+
+  /// A VT_VARIANT element of sub-type VT_I4 (3).
+  fn vt_variant_i4(n: i32) -> Vec<u8> {
+    let mut out = le32(3);
+    out.extend(n.to_le_bytes());
+    out
+  }
+
+  /// A `_PID_HLINKS` VT_BLOB: `[num u32][VT_VARIANT * num]`, six VT_VARIANTs per
+  /// hyperlink (only element 4 = address + element 5 = subaddress are extracted).
+  fn v_hlinks(links: &[(&str, &str)]) -> (u32, Vec<u8>) {
+    let mut body = le32((links.len() * 6) as u32);
+    for (addr, sub) in links {
+      body.extend(vt_variant_i4(0));
+      body.extend(vt_variant_i4(0));
+      body.extend(vt_variant_lpwstr(""));
+      body.extend(vt_variant_lpwstr(""));
+      body.extend(vt_variant_lpwstr(addr));
+      body.extend(vt_variant_lpwstr(sub));
+    }
+    v_blob(&body)
+  }
+
+  /// A `_PID_LINKBASE` VT_BLOB holding a UTF-16LE string.
+  fn v_linkbase(s: &str) -> (u32, Vec<u8>) {
+    let mut wb: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    wb.extend([0, 0]);
+    v_blob(&wb)
   }
 
   fn section(props: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
@@ -1753,12 +2198,20 @@ mod tests {
   }
 
   #[test]
-  fn hostile_userdefined_section_skipped() {
+  fn userdefined_dictionary_translates_custom_pids() {
     // DocumentSummaryInformation with section 1 (predefined) = Slides (PID 7) and
-    // section 2 (UserDefined) = a custom PID 2. The UserDefined section must be
-    // skipped — PID 2 must NOT be misattributed to "Category".
+    // section 2 (UserDefined) = a PID-0 dictionary {2 => "MyCustomProp", 3 =>
+    // "test prop"} plus the custom PIDs 2 (VT_LPSTR) and 3 (VT_I4). The 2nd
+    // section is processed (DocumentInfo sets Multi), and each custom PID emits
+    // under its (mangled) dictionary name — NOT the predefined DocumentInfo name
+    // (PID 2 would otherwise resolve to "Category").
     let sec1 = section(&[(0x07, v_i4(3).0, v_i4(3).1)]); // Slides = 3
-    let sec2 = section(&[(0x02, v_i4(9).0, v_i4(9).1)]); // custom PID 2
+    let (dcount, dbytes) = v_dictionary(&[(2, "MyCustomProp"), (3, "test prop")]);
+    let sec2 = section(&[
+      (0, dcount, dbytes),
+      (2, v_lpstr("hello").0, v_lpstr("hello").1),
+      (3, v_i4(42).0, v_i4(42).1),
+    ]);
     let ps = two_section_property_set(&sec1, &sec2);
     let ole = build_ole_named("\u{5}DocumentSummaryInformation", &ps, ps.len() as u32);
     let meta = process(&ole);
@@ -1766,12 +2219,303 @@ mod tests {
       Taggable::tags(&meta, EmitOptions::g1(ConvMode::PrintConv, false)).collect();
     assert!(
       tags.iter().any(|t| t.tag().name() == "Slides"),
-      "the predefined section 1 must still decode"
+      "the predefined section 1 must decode"
     );
+    match tag_named(&tags, "MyCustomProp") {
+      TagValue::Str(s) => assert_eq!(s, "hello"),
+      other => panic!("MyCustomProp = {other:?}"),
+    }
+    match tag_named(&tags, "TestProp") {
+      TagValue::I64(n) => assert_eq!(*n, 42),
+      other => panic!("TestProp = {other:?}"),
+    }
     assert!(
       tags.iter().all(|t| t.tag().name() != "Category"),
-      "the UserDefined section 2 must be skipped, not decoded as Category"
+      "the custom PID 2 must emit as MyCustomProp, not the predefined Category"
     );
+  }
+
+  #[test]
+  fn userdefined_pid_linkbase_hlinks_collision() {
+    // #484 R2: a UserDefined dictionary naming a PID `_PID_LINKBASE` / `_PID_HLINKS`
+    // (the two predefined DocumentInfo string keys, FlashPix.pm:521-528) must emit
+    // the PREDEFINED `HyperlinkBase` / `Hyperlinks` (raw-name collision), while a
+    // NON-colliding name still emits its mangled custom tag.
+    let sec1 = section(&[(0x0f, v_lpstr("acme").0, v_lpstr("acme").1)]); // Company
+    let (dc, db) = v_dictionary(&[
+      (2, "MyCustomProp"),  // non-colliding → mangled custom
+      (4, "_PID_LINKBASE"), // → HyperlinkBase (predefined)
+      (5, "_PID_HLINKS"),   // → Hyperlinks (predefined)
+    ]);
+    let sec2 = section(&[
+      (0, dc, db),
+      (2, v_lpstr("plain").0, v_lpstr("plain").1),
+      (
+        4,
+        v_linkbase("http://base/").0,
+        v_linkbase("http://base/").1,
+      ),
+      (
+        5,
+        v_hlinks(&[("http://a/", "s1"), ("mailto:b", "")]).0,
+        v_hlinks(&[("http://a/", "s1"), ("mailto:b", "")]).1,
+      ),
+    ]);
+    let ps = two_section_property_set(&sec1, &sec2);
+    let meta = process(&build_ole_named(
+      "\u{5}DocumentSummaryInformation",
+      &ps,
+      ps.len() as u32,
+    ));
+    let tags: Vec<EmittedTag> =
+      Taggable::tags(&meta, EmitOptions::g1(ConvMode::PrintConv, false)).collect();
+    // Predefined via raw-name collision.
+    match tag_named(&tags, "HyperlinkBase") {
+      TagValue::Str(s) => assert_eq!(s, "http://base/"),
+      other => panic!("HyperlinkBase = {other:?}"),
+    }
+    match tag_named(&tags, "Hyperlinks") {
+      TagValue::List(v) => assert_eq!(
+        v,
+        &std::vec![
+          TagValue::Str(SmolStr::from("http://a/#s1")),
+          TagValue::Str(SmolStr::from("mailto:b")),
+        ]
+      ),
+      other => panic!("Hyperlinks = {other:?}"),
+    }
+    // Non-colliding name still emits its mangled custom tag (NOT a predefined one).
+    match tag_named(&tags, "MyCustomProp") {
+      TagValue::Str(s) => assert_eq!(s, "plain"),
+      other => panic!("MyCustomProp = {other:?}"),
+    }
+    // The `_PID_*` raw names never leak as literal tag names.
+    assert!(
+      tags
+        .iter()
+        .all(|t| !t.tag().name().starts_with("_PID") && t.tag().name() != "PIDLINKBASE"),
+      "the raw _PID_* names must not be emitted as custom tags"
+    );
+  }
+
+  #[test]
+  fn predefined_by_raw_name_collision() {
+    // The two string keys resolve (only in the DocumentInfo table).
+    assert_eq!(
+      predefined_by_raw_name("_PID_LINKBASE", Table::DocumentInfo).map(|d| d.name),
+      Some("HyperlinkBase")
+    );
+    assert_eq!(
+      predefined_by_raw_name("_PID_HLINKS", Table::DocumentInfo).map(|d| d.name),
+      Some("Hyperlinks")
+    );
+    assert!(predefined_by_raw_name("_PID_LINKBASE", Table::SummaryInfo).is_none());
+    // The numeric-string collision: a decimal name equal to a numeric PID maps to
+    // that predefined entry (Perl hash keys stringify), e.g. "2" == 0x02.
+    assert_eq!(
+      predefined_by_raw_name("2", Table::DocumentInfo).map(|d| d.name),
+      Some("Category")
+    );
+    assert_eq!(
+      predefined_by_raw_name("2", Table::SummaryInfo).map(|d| d.name),
+      Some("Title")
+    );
+    // A non-canonical decimal (leading zero) or a spaced name does NOT collide
+    // (its Perl hash key differs from the canonical "2").
+    assert!(predefined_by_raw_name("02", Table::DocumentInfo).is_none());
+    assert!(predefined_by_raw_name(" 2", Table::DocumentInfo).is_none());
+    // A non-numeric, non-string-key name → no predefined entry (emits mangled).
+    assert!(predefined_by_raw_name("MyCustomProp", Table::DocumentInfo).is_none());
+    // A decimal with no matching numeric PID → none (DocumentInfo has no 0x01).
+    assert!(predefined_by_raw_name("1", Table::DocumentInfo).is_none());
+  }
+
+  #[test]
+  fn process_hyperlinks_parses_address_subaddress() {
+    let mut budget = MAX_TOTAL_EMITTED;
+    // address + non-empty subaddress → "address#subaddress"; empty subaddress →
+    // bare address (FlashPix.pm:1270-1271).
+    let (_, blob) = v_hlinks(&[("http://a/page", "frag"), ("http://b/", "")]);
+    let payload = &blob[4..]; // strip the VT_BLOB `[count u32]` header
+    match process_hyperlinks(payload, true, &mut budget) {
+      Some(FpxValue::List(v)) => assert_eq!(
+        v,
+        std::vec![
+          TagValue::Str(SmolStr::from("http://a/page#frag")),
+          TagValue::Str(SmolStr::from("http://b/")),
+        ]
+      ),
+      other => panic!("hyperlinks = {other:?}"),
+    }
+    // A single hyperlink is STILL a (one-element) list, not a scalar (ExifTool
+    // returns a list ref regardless of length).
+    let (_, one) = v_hlinks(&[("only://x", "")]);
+    match process_hyperlinks(&one[4..], true, &mut budget) {
+      Some(FpxValue::List(v)) => {
+        assert_eq!(v, std::vec![TagValue::Str(SmolStr::from("only://x"))])
+      }
+      other => panic!("single hyperlink = {other:?}"),
+    }
+    // `num == 0` → an empty list (still emitted).
+    match process_hyperlinks(&le32(0), true, &mut budget) {
+      Some(FpxValue::List(v)) => assert!(v.is_empty()),
+      other => panic!("empty hyperlinks = {other:?}"),
+    }
+    // A blob shorter than the 4-byte count → `undef` (tag not emitted).
+    assert!(process_hyperlinks(&[0x01, 0x02], true, &mut budget).is_none());
+  }
+
+  #[test]
+  fn linkbase_decode_truncates_at_nul() {
+    let mut budget = MAX_TOTAL_EMITTED;
+    // UTF-16LE with a trailing NUL word → decoded + NUL-truncated (matching
+    // ExifTool's `Decode($val,"UTF16","II")` Recompose `s/\0.*//s`).
+    let raw = FpxRaw::Binary(0);
+    let bytes: Vec<u8> = "AB".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut with_nul = bytes.clone();
+    with_nul.extend([0, 0]);
+    match apply_blob_conv(Conv::LinkBase, Some(&with_nul), &raw, true, &mut budget) {
+      Some(FpxValue::Str(s)) => assert_eq!(s, "AB"),
+      other => panic!("linkbase = {other:?}"),
+    }
+    // An embedded NUL truncates the string.
+    let mut embedded: Vec<u8> = "A".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    embedded.extend([0, 0]); // NUL
+    embedded.extend("B".encode_utf16().flat_map(u16::to_le_bytes));
+    match apply_blob_conv(Conv::LinkBase, Some(&embedded), &raw, true, &mut budget) {
+      Some(FpxValue::Str(s)) => assert_eq!(s, "A"),
+      other => panic!("embedded-nul linkbase = {other:?}"),
+    }
+    // An empty blob → an empty string (still emitted).
+    match apply_blob_conv(Conv::LinkBase, Some(&[]), &raw, true, &mut budget) {
+      Some(FpxValue::Str(s)) => assert_eq!(s, ""),
+      other => panic!("empty linkbase = {other:?}"),
+    }
+  }
+
+  #[test]
+  fn malformed_hyperlinks_no_panic() {
+    // `process_hyperlinks` must be sound against a hostile count, a truncated
+    // VT_VARIANT array, and every truncation — no panic, OOB read, or unbounded
+    // loop (bounds-checked reads + the MAX_VECTOR_ELEMS cap + the shared budget).
+
+    // (a) A 4-billion count over a tiny buffer terminates at the first failed read.
+    let mut hostile = le32(0xffff_ffff);
+    hostile.extend([0u8; 8]);
+    let mut budget = MAX_TOTAL_EMITTED;
+    let _ = process_hyperlinks(&hostile, true, &mut budget);
+
+    // (b) Truncation fuzz over a well-formed 2-link blob at every length.
+    let (_, blob) = v_hlinks(&[("http://a/", "s"), ("http://b/", "")]);
+    let payload = &blob[4..];
+    for len in 0..=payload.len() {
+      let mut b = MAX_TOTAL_EMITTED;
+      let _ = process_hyperlinks(&payload[..len], true, &mut b);
+    }
+
+    // (c) An all-0xff / all-zero blob must not panic.
+    let mut b = MAX_TOTAL_EMITTED;
+    let _ = process_hyperlinks(&[0xffu8; 64], true, &mut b);
+    let _ = process_hyperlinks(&[0u8; 64], true, &mut b);
+  }
+
+  #[test]
+  fn userdefined_empty_mangle_and_numeric_name_edges() {
+    // ExifTool edge cases the raw-name path must reproduce (verified vs bundled
+    // 13.59): a dictionary name that mangles to EMPTY ("!!!") emits NOTHING (the
+    // custom flag suppresses the numeric fallback), and a numeric-string name
+    // ("2") collides with the predefined numeric PID `0x02` → `Category`.
+    let sec1 = section(&[(0x0f, v_lpstr("acme").0, v_lpstr("acme").1)]);
+    let (dc, db) = v_dictionary(&[(2, "!!!"), (3, "2")]);
+    let sec2 = section(&[
+      (0, dc, db),
+      (2, v_lpstr("punct").0, v_lpstr("punct").1), // name mangles empty → dropped
+      (3, v_i4(99).0, v_i4(99).1),                 // "2" → Category = 99
+    ]);
+    let ps = two_section_property_set(&sec1, &sec2);
+    let meta = process(&build_ole_named(
+      "\u{5}DocumentSummaryInformation",
+      &ps,
+      ps.len() as u32,
+    ));
+    let tags: Vec<EmittedTag> =
+      Taggable::tags(&meta, EmitOptions::g1(ConvMode::PrintConv, false)).collect();
+    // The empty-mangle PID 2 emits no tag at all.
+    assert!(
+      tags
+        .iter()
+        .all(|t| t.tag().value_ref() != &TagValue::Str(SmolStr::from("punct"))),
+      "a name that mangles to empty must emit nothing"
+    );
+    // The numeric-string PID 3 emits under the collided predefined name.
+    match tag_named(&tags, "Category") {
+      TagValue::I64(n) => assert_eq!(*n, 99),
+      other => panic!("Category = {other:?}"),
+    }
+  }
+
+  #[test]
+  fn mangle_dictionary_name_matches_perl() {
+    // `s/(^| )([a-z])/\U$2/g` (uppercase first-of-word, drop the space) then
+    // `tr/-_a-zA-Z0-9//dc` (strip illegal chars).
+    assert_eq!(mangle_dictionary_name(b"MyCustomProp"), "MyCustomProp");
+    assert_eq!(mangle_dictionary_name(b"test prop"), "TestProp");
+    assert_eq!(mangle_dictionary_name(b"my second-prop"), "MySecond-prop");
+    assert_eq!(mangle_dictionary_name(b"my prop!"), "MyProp");
+    assert_eq!(mangle_dictionary_name(b"2nd item"), "2ndItem");
+    assert_eq!(mangle_dictionary_name(b"already Upper"), "AlreadyUpper");
+    assert_eq!(mangle_dictionary_name(b"under_score"), "Under_score");
+    assert_eq!(mangle_dictionary_name(b"   "), ""); // all spaces → empty
+    assert_eq!(mangle_dictionary_name(b"!@#"), ""); // all illegal → empty
+  }
+
+  #[test]
+  fn malformed_dictionary_no_panic() {
+    // `decode_dictionary` must be sound against a hostile entry count, a name
+    // length running past the buffer, and every truncation — no panic, OOB read,
+    // or unbounded loop (#443-class discipline).
+
+    // (a) A name length far past the section end yields no entry (fenced by the
+    // `valPos > section_end` guard), and the 4-billion count does not spin.
+    let mut data = le32(2); // PID 2
+    data.extend(le32(1_000_000)); // nameLen past the buffer
+    data.extend(b"MyProp\0");
+    let mut dict = BTreeMap::new();
+    let mut budget = MAX_TOTAL_EMITTED;
+    decode_dictionary(
+      &data,
+      0,
+      0xffff_ffff,
+      data.len(),
+      true,
+      &mut budget,
+      &mut dict,
+    );
+    assert!(dict.is_empty());
+
+    // (b) Truncation fuzz over a well-formed 2-entry dictionary at every length.
+    let (count, body) = v_dictionary(&[(2, "MyProp"), (3, "Other")]);
+    for len in 0..=body.len() {
+      let mut d = BTreeMap::new();
+      let mut b = MAX_TOTAL_EMITTED;
+      decode_dictionary(&body[..len], 0, count, len, true, &mut b, &mut d);
+    }
+
+    // (c) The full dictionary stores both entries under their RAW names.
+    let mut d = BTreeMap::new();
+    let mut b = MAX_TOTAL_EMITTED;
+    decode_dictionary(&body, 0, count, body.len(), true, &mut b, &mut d);
+    assert_eq!(d.get(&2).map(SmolStr::as_str), Some("MyProp"));
+    assert_eq!(d.get(&3).map(SmolStr::as_str), Some("Other"));
+
+    // (d) The RAW name is stored VERBATIM (mangling is deferred to emit): a name
+    // with a space + an illegal char is kept as-is in the dictionary (the mangle
+    // "TestProp!" → "TestProp" happens only when emitting a custom tag).
+    let (rc, rbody) = v_dictionary(&[(7, "test prop!")]);
+    let mut rd = BTreeMap::new();
+    let mut rb = MAX_TOTAL_EMITTED;
+    decode_dictionary(&rbody, 0, rc, rbody.len(), true, &mut rb, &mut rd);
+    assert_eq!(rd.get(&7).map(SmolStr::as_str), Some("test prop!"));
   }
 
   // ---- Structural crafted-input DoS regression tests (Findings 1/2/3) -----
