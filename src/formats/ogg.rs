@@ -3443,7 +3443,7 @@ mod tests {
     let keys: Vec<String> = tm
       .entries()
       .iter()
-      .map(|(_, _, g, n, _, _, _)| std::format!("{g}:{n}"))
+      .map(|(_, _, g, n, _, _, _, _)| std::format!("{g}:{n}"))
       .collect();
     assert_eq!(
       keys,
@@ -3527,7 +3527,7 @@ mod tests {
     let keys: Vec<String> = tm
       .entries()
       .iter()
-      .map(|(_, _, g, n, _, _, _)| std::format!("{g}:{n}"))
+      .map(|(_, _, g, n, _, _, _, _)| std::format!("{g}:{n}"))
       .collect();
     assert_eq!(
       keys,
@@ -3566,7 +3566,7 @@ mod tests {
     let keys: Vec<String> = tm
       .entries()
       .iter()
-      .map(|(_, _, g, n, _, _, _)| std::format!("{g}:{n}"))
+      .map(|(_, _, g, n, _, _, _, _)| std::format!("{g}:{n}"))
       .collect();
     assert_eq!(
       keys,
@@ -3607,7 +3607,7 @@ mod tests {
     let keys: Vec<String> = tm
       .entries()
       .iter()
-      .map(|(_, _, g, n, _, _, _)| std::format!("{g}:{n}"))
+      .map(|(_, _, g, n, _, _, _, _)| std::format!("{g}:{n}"))
       .collect();
     assert_eq!(
       keys,
@@ -3680,7 +3680,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(_, _, g, n, _, _, _)| g == "Vorbis" && n != "Vendor"),
+        .any(|(_, _, g, n, _, _, _, _)| g == "Vorbis" && n != "Vendor"),
       "at least one Vorbis comment beyond vendor: {:?}",
       w.entries()
     );
@@ -3970,13 +3970,13 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(_, _, g, n, _, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
+        .any(|(_, _, g, n, _, _, _, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 tags present in the engine output"
     );
     assert!(
       w.entries()
         .iter()
-        .any(|(_, _, g, _, _, _, _)| g == "Vorbis"),
+        .any(|(_, _, g, _, _, _, _, _)| g == "Vorbis"),
       "OGG body tags present in the engine output"
     );
   }

@@ -3031,7 +3031,7 @@ mod tests {
     // `(family1, name, value)` shape this comparison helper compares.
     tm.entries()
       .iter()
-      .map(|(_, _, g, n, _, v, _)| (g.clone(), n.clone(), v.clone()))
+      .map(|(_, _, g, n, _, v, _, _)| (g.clone(), n.clone(), v.clone()))
       .collect()
   }
 
@@ -3086,7 +3086,7 @@ mod tests {
       out
         .entries()
         .iter()
-        .map(|(_, _, g, n, _, v, _)| (g.clone(), n.clone(), v.clone()))
+        .map(|(_, _, g, n, _, v, _, _)| (g.clone(), n.clone(), v.clone()))
         .collect()
     }
 

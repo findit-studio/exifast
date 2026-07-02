@@ -532,6 +532,48 @@ fn signed_and_whitespace_string_ingredients_coerce_via_shared_perl_rule() {
   assert_eq!(composite(&m3, "Sum"), Some(TagValue::F64(100.0)));
 }
 
+/// #474 PR 1 — the bare-name `FoundTag` resolver settles an EQUAL-effective-
+/// priority tie by the MIN walk-`seq` (the FIRST-emitted entry), while priority
+/// still DOMINATES the seq (a higher-priority entry wins regardless of order).
+/// This locks the byte-identical PR-1 semantics (min-seq = first-emitted); PR 2
+/// flips the tiebreak to MAX-`seq` for ExifTool's last-walked `>=` rule.
+#[test]
+fn bare_name_resolver_breaks_equal_priority_ties_by_min_seq() {
+  // (a) Two EQUAL-priority (both `1`) same-name entries in DIFFERENT groups ⇒
+  // the resolver returns the FIRST-emitted (min-`seq`) one.
+  let mut m = TagMap::new();
+  let _ = m.write_value_doc(0, "", "First", "Foo", 1, TagValue::U64(10), "First");
+  let _ = m.write_value_doc(0, "", "Second", "Foo", 1, TagValue::U64(20), "Second");
+  assert_eq!(
+    m.resolve(&[], None, "Foo", DocScope::Main),
+    CompositeValue::Present(TagValue::U64(10)),
+    "equal priority ⇒ the first-emitted (min-seq) entry wins"
+  );
+
+  // (b) Priority DOMINATES seq: a higher-priority LATER entry beats a
+  // lower-effective-priority EARLIER one (so the tiebreak is only consulted at
+  // equal priority).
+  let mut m = TagMap::new();
+  let _ = m.write_value_doc(0, "", "Early", "Bar", 0, TagValue::U64(1), "Early");
+  let _ = m.write_value_doc(0, "", "Late", "Bar", 1, TagValue::U64(2), "Late");
+  assert_eq!(
+    m.resolve(&[], None, "Bar", DocScope::Main),
+    CompositeValue::Present(TagValue::U64(2)),
+    "a higher-priority later entry wins over a lower-priority earlier one"
+  );
+
+  // (c) ...and a higher-priority EARLIER entry beats a lower-priority LATER one
+  // (priority dominates in either order).
+  let mut m = TagMap::new();
+  let _ = m.write_value_doc(0, "", "Early", "Baz", 1, TagValue::U64(1), "Early");
+  let _ = m.write_value_doc(0, "", "Late", "Baz", 0, TagValue::U64(2), "Late");
+  assert_eq!(
+    m.resolve(&[], None, "Baz", DocScope::Main),
+    CompositeValue::Present(TagValue::U64(1)),
+    "a higher-priority earlier entry wins over a lower-priority later one"
+  );
+}
+
 // ===========================================================================
 // The registered GPS Composites (GPS.pm / Exif.pm) — end-to-end through the
 // real `REGISTRY` over a two-view (ValueConv + PrintConv) GPS TagMap pair. These
@@ -2233,8 +2275,10 @@ mod subdoc {
   fn composite_at(m: &TagMap, doc: u32, name: &str) -> Option<TagValue> {
     m.entries()
       .iter()
-      .find(|(d, _s, g, n, _p, _v, _)| *d == doc && g.as_str() == "Composite" && n.as_str() == name)
-      .map(|(_d, _s, _g, _n, _p, v, _)| v.clone())
+      .find(|(d, _s, g, n, _p, _v, _, _)| {
+        *d == doc && g.as_str() == "Composite" && n.as_str() == name
+      })
+      .map(|(_d, _s, _g, _n, _p, v, _, _)| v.clone())
   }
 
   #[test]
@@ -2608,7 +2652,7 @@ mod subdoc {
       map
         .entries()
         .iter()
-        .filter(|(d, _s, _g1, n, _p, _v, _f0)| *d == 1 && n.as_str() == "GPSLatitude")
+        .filter(|(d, _s, _g1, n, _p, _v, _f0, _seq)| *d == 1 && n.as_str() == "GPSLatitude")
         .count(),
       1,
       "mixed-family-0 duplicate must collapse to one entry"
@@ -2781,7 +2825,7 @@ mod subdoc {
         map
           .entries()
           .iter()
-          .filter(|(d, _s, _g1, n, _p, _v, _f0)| *d == 1 && n.as_str() == name)
+          .filter(|(d, _s, _g1, n, _p, _v, _f0, _seq)| *d == 1 && n.as_str() == name)
           .count(),
         1,
         "the {name} loser duplicate must collapse to one entry"

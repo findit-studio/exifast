@@ -167,7 +167,7 @@ pub(crate) fn emitted_dedup_override(
 /// emission. Net per-insert: one `HashMap` probe + (on a new key) two inline
 /// `SmolStr` clones, vs the old heap `format!` + a growing linear scan.
 pub(crate) struct TagMap {
-  /// `(doc, doc_subpath, family1, name, priority, value, family0)` in
+  /// `(doc, doc_subpath, family1, name, priority, value, family0, seq)` in
   /// first-occurrence order. A repeated `(doc, doc_subpath, family1, name)`
   /// overrides the stored `(priority, value)` in place IFF the NEW duplicate's
   /// effective priority is non-zero AND `>=` the stored priority (ExifTool's
@@ -202,7 +202,21 @@ pub(crate) struct TagMap {
   /// family-0 (the video track-scoped Sony/QuickTime/GoPro case). A priority-0
   /// `Warning`/`Error` duplicate never wins, so its slot keeps the first
   /// (surviving) family0 — also consistent.
-  entries: Vec<(u32, SmolStr, SmolStr, SmolStr, u8, TagValue, SmolStr)>,
+  ///
+  /// The trailing `seq` is the entry's WALK SEQUENCE: the value of
+  /// [`next_seq`](Self::next_seq) at the [`insert`](Self::insert) that FIRST
+  /// created this slot. It is assigned ONCE and never re-stamped — a later
+  /// same-key duplicate that wins the last-wins override updates
+  /// `(priority, value, family0)` but leaves `seq`, so `seq` increases strictly
+  /// with first-occurrence POSITION. It exists so the bare-name Composite
+  /// resolver can break an equal-effective-priority tie by walk order
+  /// (`FoundTag`, ExifTool.pm:9564); today it reads the MIN `seq` among equals,
+  /// which — because `seq` == position order — is exactly the first-inserted =
+  /// first-emitted entry, i.e. BYTE-IDENTICAL to the pre-`seq` first-among-equals
+  /// tiebreak and consistent with the `Vec<(Tag, u8)>` sink's positional index.
+  /// #474 PR 2 flips the resolver to MAX `seq` for the faithful last-walked
+  /// tiebreak, and re-stamps on a winning replace at that point.
+  entries: Vec<(u32, SmolStr, SmolStr, SmolStr, u8, TagValue, SmolStr, u32)>,
   /// `(doc, doc_subpath, family1, name) → index into `entries`` for O(1) dedup.
   /// The key clones the short `SmolStr`s (inline for ≤23 bytes — no heap), so
   /// the dedup probe never builds the `"g:n"` string the old design allocated
@@ -213,6 +227,12 @@ pub(crate) struct TagMap {
   index: HashMap<(u32, SmolStr, SmolStr, SmolStr), usize>,
   warnings: Vec<String>,
   errors: Vec<String>,
+  /// Monotonic walk-sequence counter: the `seq` stamped on the NEXT
+  /// [`insert`](Self::insert), incremented once per `insert` call (so a slot's
+  /// `seq` reflects its insertion order in the emission walk). See the `entries`
+  /// `seq` field doc — it is the walk-order axis the bare-name Composite resolver
+  /// uses to break equal-priority ties (min-`seq` today = first-emitted).
+  next_seq: u32,
 }
 
 impl TagMap {
@@ -223,6 +243,7 @@ impl TagMap {
       index: HashMap::new(),
       warnings: Vec::new(),
       errors: Vec::new(),
+      next_seq: 0,
     }
   }
 
@@ -295,6 +316,14 @@ impl TagMap {
     // `Warning`/`Error` name fallback forces effective priority to `0` even when
     // the producer passed the default `1`, preserving their first-wins.
     let effective_priority = effective_priority(name, priority);
+    // The walk-sequence stamp for THIS insertion (insertion order in the
+    // emission walk). Consumed once per `insert` call — even a losing duplicate
+    // (a no-op) advances the counter, so gaps are harmless: only the RELATIVE
+    // order of surviving `seq`s matters to the resolver. `saturating_add` avoids
+    // a debug overflow panic on a pathological tag count (well beyond the DoS
+    // budget) while staying monotonic non-decreasing.
+    let seq = self.next_seq;
+    self.next_seq = self.next_seq.saturating_add(1);
     let key = (
       doc,
       SmolStr::new(doc_subpath),
@@ -324,6 +353,16 @@ impl TagMap {
         self.entries[idx].4 = effective_priority;
         self.entries[idx].5 = value;
         self.entries[idx].6 = SmolStr::new(family0);
+        // NOTE (#474 PR 1/2): `seq` is deliberately NOT re-stamped on a winning
+        // replace, so an entry keeps its FIRST-insertion `seq` for its whole
+        // life. That makes `seq` strictly increase with first-occurrence POSITION
+        // (a later same-key duplicate never reorders `seq`), which is exactly
+        // what keeps the bare-name resolver's MIN-`seq` tiebreak byte-identical to
+        // the pre-`seq` first-among-equals — AND keeps it consistent with the
+        // `Vec<(Tag, u8)>` sink, whose positional index is its `seq`. PR 2 flips
+        // the resolver to MAX-`seq` for the faithful last-walked `FoundTag`
+        // tiebreak (ExifTool.pm:9564) and, AT THAT POINT, re-stamps here so the
+        // surviving `seq` tracks the last-walked contributor.
       }
       return;
     }
@@ -336,6 +375,7 @@ impl TagMap {
       effective_priority,
       value,
       SmolStr::new(family0),
+      seq,
     ));
     self.index.insert(key, idx);
   }
@@ -483,15 +523,18 @@ impl TagMap {
   }
 
   /// The collected format-tag entries
-  /// `(doc, doc_subpath, family1, name, priority, value, family0)` in
+  /// `(doc, doc_subpath, family1, name, priority, value, family0, seq)` in
   /// first-occurrence order (the priority-aware dedup already applied). The
   /// consumer builds the JSON key ONCE per entry here via
   /// [`crate::serialize_key::group_key`] (not per emission) — `-G1` collapses
   /// the leading `(doc, doc_subpath)`, `-G3` renders it as a `Doc<N>…:` prefix;
-  /// the `priority` is dedup bookkeeping the consumers ignore. Slice view of the
-  /// backing `Vec` (§3: never expose `&Vec<T>`).
+  /// the `priority`, `family0` and `seq` are dedup / Composite-resolution
+  /// bookkeeping the JSON consumers ignore. Slice view of the backing `Vec`
+  /// (§3: never expose `&Vec<T>`).
   #[inline(always)]
-  pub(crate) const fn entries(&self) -> &[(u32, SmolStr, SmolStr, SmolStr, u8, TagValue, SmolStr)] {
+  pub(crate) const fn entries(
+    &self,
+  ) -> &[(u32, SmolStr, SmolStr, SmolStr, u8, TagValue, SmolStr, u32)] {
     self.entries.as_slice()
   }
 
@@ -619,7 +662,7 @@ mod tests {
     let doc2 = m
       .entries()
       .iter()
-      .filter(|(d, _, _, _, _, _, _)| *d == 2)
+      .filter(|(d, _, _, _, _, _, _, _)| *d == 2)
       .count();
     assert_eq!(doc2, 1);
   }
@@ -668,7 +711,7 @@ mod tests {
     let deep = m
       .entries()
       .iter()
-      .find(|(d, sub, _, _, _, _, _)| *d == 1 && sub.as_str() == "-1-1")
+      .find(|(d, sub, _, _, _, _, _, _)| *d == 1 && sub.as_str() == "-1-1")
       .expect("the Doc1-1-1 entry survives");
     assert_eq!(deep.5, TagValue::Str("three-again".into()));
   }
@@ -732,7 +775,7 @@ mod tests {
     let names: std::vec::Vec<&str> = m
       .entries()
       .iter()
-      .map(|(_, _, _, n, _, _, _)| n.as_str())
+      .map(|(_, _, _, n, _, _, _, _)| n.as_str())
       .collect();
     assert_eq!(names, ["A", "B"]);
   }
@@ -873,5 +916,69 @@ mod tests {
       !emitted_dedup_override(&new_p1, &stored_p2),
       "a Priority=>1 duplicate must NOT override a stored Priority=>2 survivor"
     );
+  }
+
+  /// #474 PR 1 — the per-entry walk-`seq`. It is a monotonic insertion counter
+  /// stamped ONCE at an entry's first insertion and NEVER re-stamped, so it
+  /// tracks first-occurrence order (this is what keeps the bare-name Composite
+  /// resolver's MIN-`seq` tiebreak byte-identical to the pre-`seq` first-among-
+  /// equals). Reading `entries()[i].7` — the private `seq` slot — from the test
+  /// module (same crate) is fine.
+  #[test]
+  fn walk_seq_is_the_first_insertion_order_and_not_restamped() {
+    let seq_of = |m: &TagMap, name: &str| -> u32 {
+      m.entries()
+        .iter()
+        .find(|e| e.3.as_str() == name)
+        .expect("entry present")
+        .7
+    };
+
+    // (a) Distinct keys get strictly increasing `seq`s in insertion order.
+    let mut m = TagMap::new();
+    m.insert(0, "", "G", "A", 1, TagValue::U64(1), "G");
+    m.insert(0, "", "G", "B", 1, TagValue::U64(2), "G");
+    m.insert(0, "", "G", "C", 1, TagValue::U64(3), "G");
+    let seqs: std::vec::Vec<u32> = m.entries().iter().map(|e| e.7).collect();
+    assert_eq!(seqs, [0, 1, 2], "seq is the monotonic insertion order");
+
+    // (b) A last-wins REPLACE (ordinary priority `1 >= 1`) updates the value but
+    // KEEPS the slot's FIRST-insertion `seq` (NOT re-stamped) — the keep-first
+    // invariant that guarantees min-seq ≡ first-emitted. The counter still
+    // advanced (the next new key gets `seq == 4`, not `3`).
+    m.insert(0, "", "G", "A", 1, TagValue::U64(99), "G"); // wins, replaces A's value
+    assert_eq!(seq_of(&m, "A"), 0, "winning replace keeps the FIRST seq");
+    assert_eq!(
+      m.get("G", "A"),
+      Some(&TagValue::U64(99)),
+      "value is last-wins-replaced"
+    );
+    m.insert(0, "", "G", "D", 1, TagValue::U64(4), "G");
+    assert_eq!(
+      seq_of(&m, "D"),
+      4,
+      "the insert counter advanced past the replace"
+    );
+
+    // (c) A priority-0 `Warning`/`Error` duplicate LOSES (first-wins) and its
+    // slot likewise keeps its first `seq` (nothing is touched).
+    let mut m = TagMap::new();
+    m.insert(0, "", "G", "Warning", 1, TagValue::Str("first".into()), "G");
+    let first_warn_seq = seq_of(&m, "Warning");
+    m.insert(
+      0,
+      "",
+      "G",
+      "Warning",
+      1,
+      TagValue::Str("second".into()),
+      "G",
+    ); // loses
+    assert_eq!(
+      seq_of(&m, "Warning"),
+      first_warn_seq,
+      "a losing Warning duplicate leaves the first seq untouched"
+    );
+    assert_eq!(m.get("G", "Warning"), Some(&TagValue::Str("first".into())));
   }
 }
