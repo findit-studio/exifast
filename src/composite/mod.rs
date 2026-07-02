@@ -166,6 +166,7 @@ impl CompositeSink for crate::tagmap::TagMap {
       u8,
       TagValue,
       smol_str::SmolStr,
+      u32,
     )| {
       (groups.is_empty() || groups.contains(&entry.2.as_str()))
         && group0.is_none_or(|g0| entry.6.as_str() == g0)
@@ -180,6 +181,7 @@ impl CompositeSink for crate::tagmap::TagMap {
         u8,
         TagValue,
         smol_str::SmolStr,
+        u32,
       )| { entry.0 == d && entry.3.as_str() == name && group_ok(entry) }
     };
     // Within a single document, a GROUP-SCOPED input (`groups` non-empty) takes
@@ -194,21 +196,33 @@ impl CompositeSink for crate::tagmap::TagMap {
     // 3872) over the earlier-emitted `SubIFD:ImageWidth` (the `%Exif::Main`
     // `Priority => 0` tag, 3880); a Pentax `File:ImageWidth` (`Priority => 1`)
     // beats an `XMP-tiff:ImageWidth` (`%XMP::tiff PRIORITY => 0`). Among EQUAL max
-    // priority we keep the FIRST-emitted (today's tiebreak) — the equal-priority
-    // true file-walk-order recency tiebreak (ExifTool's `$priority >= $oldPriority`
-    // last-wins) is deferred to #474, because exifast's emission order is NOT file
-    // order, so a last-match flip would regress the 6 Pentax composites.
+    // priority the tiebreak is the MIN walk-`seq` (entry.7) — the earliest-inserted
+    // = first-emitted entry (#474 PR 1). Because `seq` == first-occurrence order
+    // (never re-stamped, see `TagMap::insert`), this is BYTE-IDENTICAL to the prior
+    // first-among-equals tiebreak; reading `seq` makes the walk-order axis explicit.
+    // #474 PR 2 flips MIN→MAX `seq` for ExifTool's true `$priority >= $oldPriority`
+    // last-walked `FoundTag` tiebreak (ExifTool.pm:9564), together with a PngMeta
+    // chunk-walk-order emission override — a flip today (without that override, and
+    // given exifast's emission order is NOT file order) would regress the 6 Pentax
+    // composites, so it is intentionally split into PR 2.
     let find_in = |d: u32| {
       if groups.is_empty() {
-        // MAX effective priority, FIRST-emitted among equals (`>` is strict, so a
-        // later equal-priority entry never displaces the first match).
+        // MAX effective priority; among EQUAL priority, MIN walk-`seq` (entry.7,
+        // the earliest-inserted = first-emitted). PR 2 flips `<` to `>` for the
+        // last-walked tiebreak.
         self
           .entries()
           .iter()
           .filter(pred_in(d))
-          .map(|e| (e, crate::tagmap::effective_priority(e.3.as_str(), e.4)))
-          .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
-          .map(|(e, _)| e)
+          .map(|e| (e, crate::tagmap::effective_priority(e.3.as_str(), e.4), e.7))
+          .reduce(|best, cur| {
+            if cur.1 > best.1 || (cur.1 == best.1 && cur.2 < best.2) {
+              cur
+            } else {
+              best
+            }
+          })
+          .map(|(e, _, _)| e)
       } else {
         self.entries().iter().rev().find(pred_in(d))
       }
@@ -228,6 +242,7 @@ impl CompositeSink for crate::tagmap::TagMap {
           u8,
           TagValue,
           smol_str::SmolStr,
+          u32,
         )| { entry.0 != 0 && entry.3.as_str() == name && group_ok(entry) };
         // First cross-doc match by emission order (the lowest `Doc<N>` first,
         // i.e. ExifTool's earliest-extracted base key).
@@ -243,7 +258,7 @@ impl CompositeSink for crate::tagmap::TagMap {
     self
       .entries()
       .iter()
-      .any(|(d, _sub, fam1, n, _pri, _val, _f0)| {
+      .any(|(d, _sub, fam1, n, _pri, _val, _f0, _seq)| {
         *d == doc && fam1.as_str() == "Composite" && n.as_str() == name
       })
   }
@@ -284,22 +299,34 @@ impl CompositeSink for std::vec::Vec<(crate::value::Tag, u8)> {
         item.0.group_ref().doc() == d && item.0.name() == name && group_ok(&item.0)
       }
     };
-    // Bare-name (empty `groups`) ⇒ the HIGHEST effective priority wins, FIRST-
-    // emitted among equals; group-scoped ⇒ LAST match (the duplicate-override).
-    // See the `TagMap` impl's note (equal-priority recency is #474).
+    // Bare-name (empty `groups`) ⇒ the HIGHEST effective priority wins; among
+    // EQUAL priority, the MIN positional index — this `Vec`'s position IS its
+    // walk-`seq` (it is built in emission order and a winning duplicate replaces
+    // IN PLACE, keeping position), so min-index = first-emitted, byte-identical to
+    // the prior first-among-equals AND consistent with the `TagMap` sink's MIN
+    // `seq`. Group-scoped ⇒ LAST match (the duplicate-override). #474 PR 2 flips
+    // this to MAX for the last-walked tiebreak (see the `TagMap` impl's note).
     let find_in = |d: u32| {
       if groups.is_empty() {
         self
           .iter()
-          .filter(pred_in(d))
-          .map(|item| {
+          .enumerate()
+          .filter(|(_i, item)| pred_in(d)(item))
+          .map(|(i, item)| {
             (
               item,
               crate::tagmap::effective_priority(item.0.name(), item.1),
+              i,
             )
           })
-          .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
-          .map(|(item, _)| item)
+          .reduce(|best, cur| {
+            if cur.1 > best.1 || (cur.1 == best.1 && cur.2 < best.2) {
+              cur
+            } else {
+              best
+            }
+          })
+          .map(|(item, _, _)| item)
       } else {
         self.iter().rev().find(pred_in(d))
       }
@@ -413,7 +440,7 @@ pub(crate) fn make_context(
     value_view
       .entries()
       .iter()
-      .map(|(_d, _s, g, n, _p, v, _f0)| (g.as_str(), n.as_str(), v)),
+      .map(|(_d, _s, g, n, _p, v, _f0, _seq)| (g.as_str(), n.as_str(), v)),
   );
   CompositeContext::new(media_data_total, rotation)
 }

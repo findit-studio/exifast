@@ -2154,7 +2154,7 @@ const _: () = {
       // `Doc<N>…:`.
       let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (doc, doc_subpath, group, name, _priority, value, _family0) in entries {
+      for (doc, doc_subpath, group, name, _priority, value, _family0, _seq) in entries {
         crate::serialize_key::group_key_into(
           &mut key,
           *doc,

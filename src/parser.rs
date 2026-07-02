@@ -1124,6 +1124,8 @@ struct DocObject<'a> {
     crate::value::TagValue,
     // family-0 — Composite-resolution metadata only; the JSON key is family-1.
     smol_str::SmolStr,
+    // walk-seq — Composite-resolution bookkeeping only; not part of the JSON key.
+    u32,
   )],
   /// The group-key form: `-G1` (collapse the doc axis — the conformance golden
   /// form) vs `-G3` (`Doc<N>:` prefix). The engine renders `-G1` by default.
@@ -1144,7 +1146,7 @@ impl serde::Serialize for DocObject<'_> {
     // prefixes `Doc<N>…:`), skip any key already emitted by `obj` (first-wins),
     // and serialize the value straight through `TagValue::Serialize`.
     let mut key = String::new();
-    for (doc, doc_subpath, group, name, _priority, value, _family0) in self.entries {
+    for (doc, doc_subpath, group, name, _priority, value, _family0, _seq) in self.entries {
       crate::serialize_key::group_key_into(
         &mut key,
         *doc,

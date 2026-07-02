@@ -1469,7 +1469,7 @@ mod tests {
     let names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(_, _, g, n, _, _, _)| (g == "File").then_some(n.as_str()))
+      .filter_map(|(_, _, g, n, _, _, _, _)| (g == "File").then_some(n.as_str()))
       .collect();
     assert_eq!(
       names,

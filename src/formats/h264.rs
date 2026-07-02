@@ -3787,7 +3787,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(_, _, _, n, _, _, _)| n.contains("WhiteBalance"))
+      .filter(|(_, _, _, n, _, _, _, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the priority winner is emitted");
   }
@@ -3891,7 +3891,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(_, _, _, n, _, _, _)| n.contains("WhiteBalance"))
+      .filter(|(_, _, _, n, _, _, _, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the first-wins survivor is emitted");
   }
