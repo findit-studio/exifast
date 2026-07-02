@@ -1840,7 +1840,7 @@ fn drop_keys(doc: &str, exact_keys: &[&str]) -> String {
 ///     content-auth XML blob whose `seal`/`ka`/`kv`/`da`/`s`/`info` emit under
 ///     family-0 `XML` / family-1 `SEAL` (the flat SEAL table, XMP2.pl:1876; the
 ///     `<seal>` container stripped by `FoundSEAL`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 659;
+const EXPECTED_ACTIVE_FIXTURES: usize = 660;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

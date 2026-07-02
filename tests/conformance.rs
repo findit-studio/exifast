@@ -13236,6 +13236,32 @@ fn png_cpip_conformance() {
   check("PNG_cpip.png", "PNG_cpip.png.n.json", false);
 }
 
+#[test]
+#[cfg(feature = "png")]
+fn png_cpip_userdef_conformance() {
+  // #484 (FlashPix `ProcessProperties` 2-section loop + the UserDefined property
+  // dictionary, FlashPix.pm:1716-1811). The `\x05DocumentSummaryInformation`
+  // stream carries TWO sections: a predefined `%FlashPix::DocumentInfo` section
+  // (`Company`/`Slides`) and — reached via the `Multi => 1` flag on its
+  // `%FlashPix::Main` entry (FlashPix.pm:179) — a UserDefined 2nd section whose
+  // PID-0 property DICTIONARY names custom PIDs ({2 => "MyCustomProp", 3 =>
+  // "test prop", 4 => "_PID_LINKBASE", 5 => "_PID_HLINKS"}). ExifTool re-
+  // dispatches each custom PID through the dictionary RAW name (`$tag =
+  // $dictionary{$tag}`, FlashPix.pm:1764): PIDs 2/3 have non-predefined names →
+  // emit under their MANGLED names (`FlashPix:MyCustomProp` / `FlashPix:TestProp`,
+  // "test prop" → uppercase first-of-word + drop space, strip illegal chars),
+  // while PIDs 4/5 name the two predefined DocumentInfo STRING keys
+  // `_PID_LINKBASE`/`_PID_HLINKS` (FlashPix.pm:521-528) → the raw name collides
+  // with the table (`$$tagTablePtr{$tag}`) so they emit the PREDEFINED
+  // `FlashPix:HyperlinkBase` (UTF-16 ValueConv) + `FlashPix:Hyperlinks`
+  // (ProcessHyperlinks RawConv: `address#subaddress` list). A single-section
+  // `\x05SummaryInformation` (`Title`/`Author`) rides alongside. Crafted via
+  // `tools/gen_png_cpip_userdef_fixture.py`. Oracle: bundled `perl exiftool -j
+  // -G1 -struct` 13.59.
+  check("PNG_cpip_userdef.png", "PNG_cpip_userdef.png.json", true);
+  check("PNG_cpip_userdef.png", "PNG_cpip_userdef.png.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
