@@ -374,6 +374,79 @@ pub fn routes_to_main(blob: &[u8], make: Option<&str>, model: Option<&str>) -> b
   false
 }
 
+/// The seven `%Sony::Main` `%unknownCipherData` LEAF tags — `Sony_0x9407`,
+/// `0x9408`, `0x9409`, `0x940b`, `0x940d`, `0x940f`, `0x9411`
+/// (`Sony.pm:2055-2114`): each is `SubDirectory`-less (`sub_table: None`),
+/// `Unknown => 1`, and rendered by `SonyPrintConv::None` — so its value is the
+/// VERBATIM on-disk `undef[N]` span (the raw bytes), dropped from default output
+/// but recoverable via the `-u`/API path.
+///
+/// This is the exact set the #443 borrowed-span fix confines: the walk stores a
+/// zero-copy empty `RawValue` for these (skipping the `read_value` copy) and the
+/// Sony capture loop emits a [`VendorEmission`](super::VendorEmission) borrowing
+/// the span from the input buffer, so a crafted MakerNote with N such leaves
+/// pointing at one shared M-byte region retains O(N) span descriptors, not N
+/// copies of M. The conditional-ARRAY dispatchers `0x2010`/`0x940a`/`0x940c`/
+/// `0x940e` are `sub_table: Some(...)` and, on a non-matching model, fall
+/// through to `%unknownCipherData` which emits NOTHING
+/// (`exif::mod::sony_emit_enciphered_subblock`'s `_ => {}`), so they are NOT in
+/// this LEAF set — those `sub_table: Some(...)` dispatchers are covered by their
+/// `SubTable` variant instead (see [`value_resliced_from_data`]). This LEAF
+/// predicate stays SEPARATE because a leaf's span IS its emitted value (borrowed
+/// via `push_borrowed_span`): the emit path at `exif::mod` keys the borrow off
+/// this exact set.
+#[must_use]
+#[inline]
+pub(crate) fn is_suppressed_cipher_leaf(tag_id: u16) -> bool {
+  matches!(
+    tag_id,
+    0x9407 | 0x9408 | 0x9409 | 0x940b | 0x940d | 0x940f | 0x9411
+  )
+}
+
+/// `true` when a `%Sony::Main` row's decoded value is NEVER read from the walk's
+/// materialized `RawValue` — because the Sony capture loop re-slices the verbatim
+/// on-disk value span from the input buffer instead. The shared `Walker`'s #443
+/// zero-copy guard keys off this to store an EMPTY `RawValue` for such a row
+/// (gated to an `undef` block with `count != 1`), bounding the O(N·M) heap a
+/// crafted IFD with N such rows over one shared in-bounds M-byte region would
+/// otherwise amplify to O(N + M) — WITHOUT changing any emitted value (the
+/// re-slice reads the same span the clone would have held).
+///
+/// Two DISJOINT sub-classes, both re-sliced-from-`data`, never from the clone:
+///
+/// - The SUPPRESSED `%unknownCipherData` LEAVES ([`is_suppressed_cipher_leaf`]) —
+///   `sub_table: None`, emitted as a BORROWED span via `push_borrowed_span`.
+/// - The enciphered-`SubDirectory` dispatchers — every row whose `sub_table` is a
+///   variant `exif::mod::sony_emit_enciphered_subblock` handles
+///   ([`SubTable::dispatched_by_enciphered_subblock`]): `Tag2010` (`0x2010`), the
+///   whole `Tag9xxx` family (13 IDs incl. `0x9400`/`0x9402`/`0x9404`/`0x9405`/
+///   `0x9406`/`0x9050`/`0x9401`/`0x9403`/`0x9416`/`0x202a`/`0x900b`/`0x940a`/
+///   `0x940c`) and `AFInfo`/`Tag940e` (`0x940e`). Both the model/byte-matched
+///   decode AND the `%unknownCipherData` fallback re-slice the span, and
+///   `exif::mod::emit_sony_value` returns at its SubDirectory guard reading
+///   nothing.
+///
+/// The SubDirectory side is DERIVED FROM THE `SubTable` VARIANT (the routing),
+/// NOT a hand-maintained tag-ID list — so a future enciphered dispatcher added
+/// under `Tag9xxx` is covered automatically. This SUPERSEDES the #443 R1
+/// suppressed-leaf list + the R2 `is_conditional_cipher_subdir` id list, whose
+/// enumeration kept missing members (`0x9400`/`0x9402`/`0x9404`/`0x9405`/`0x9406`/
+/// `0x9050`/…) — the whack-a-mole this closes (#443 R3).
+///
+/// The older PLAIN binary sub-tables (`CameraInfo`/`FocusInfo`/`CameraSettings`/
+/// `ExtraInfo`/`ShotInfo`) also re-slice their span (via
+/// `exif::mod::sony_emit_binary_subdir`) but are intentionally left on the
+/// `read_value` path — this fix is scoped to the enciphered-subblock class, and
+/// they stay byte-identical either way.
+#[must_use]
+pub(crate) fn value_resliced_from_data(tag_id: u16) -> bool {
+  is_suppressed_cipher_leaf(tag_id)
+    || lookup(tag_id)
+      .and_then(|t| t.sub_table)
+      .is_some_and(|s| s.dispatched_by_enciphered_subblock())
+}
+
 /// Populate the typed struct from one Sony Main-IFD leaf-tag emission. `raw` is
 /// the entry's post-Format-decode [`RawValue`]; `val` the already-rendered
 /// [`TagValue`] (read ONLY by 0xb020's string fallback).
@@ -563,23 +636,23 @@ mod tests {
   // the shims pass `make = Some("SONY")` — the Sony5 make-gate (and a no-op for the
   // prefixed variants) — to route them exactly as the oracle decoded. (Routes-AWAY
   // bodies are covered by the surviving `routes_to_main` unit tests above.)
-  fn parse(
-    blob: &[u8],
+  fn parse<'a>(
+    blob: &'a [u8],
     body_offset: usize,
     order: ByteOrder,
-  ) -> (MakerNotesSony, Vec<VendorEmission>) {
+  ) -> (MakerNotesSony, Vec<VendorEmission<'a>>) {
     parse_in_tiff(blob, 0, blob.len(), body_offset, order, true, None)
   }
 
-  fn parse_in_tiff(
-    blob: &[u8],
+  fn parse_in_tiff<'a>(
+    blob: &'a [u8],
     mn_offset: usize,
     mn_len: usize,
     body_offset: usize,
     order: ByteOrder,
     print_conv: bool,
     model: Option<&str>,
-  ) -> (MakerNotesSony, Vec<VendorEmission>) {
+  ) -> (MakerNotesSony, Vec<VendorEmission<'a>>) {
     // `build_blob` always materializes the 12-byte `SONY DSC` prefix, so the IFD
     // is at the fixed body offset 12 (the `MakerNoteSony` Start) regardless of the
     // caller's `body_offset` argument (the retired headerless oracle path took 0).
@@ -620,7 +693,7 @@ mod tests {
       if e.unknown() {
         continue;
       }
-      into.push(group.clone(), e.name(), e.value().clone());
+      into.push(group.clone(), e.name(), e.value().into_owned());
     }
   }
 
@@ -734,7 +807,7 @@ mod tests {
     let (typed, emissions) = parse(&blob, 0, ByteOrder::Little);
     assert_eq!(typed.quality(), Some(2));
     assert_eq!(emissions[0].name(), "Quality");
-    assert_eq!(emissions[0].value(), &TagValue::Str("Fine".into()));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::Str("Fine".into()));
   }
 
   #[test]
@@ -746,7 +819,7 @@ mod tests {
     );
     let (typed, emissions) = parse(&blob, 12, ByteOrder::Little);
     assert_eq!(typed.quality(), Some(0));
-    assert_eq!(emissions[0].value(), &TagValue::Str("RAW".into()));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::Str("RAW".into()));
   }
 
   #[test]
@@ -756,7 +829,10 @@ mod tests {
     let (typed, emissions) = parse(&blob, 0, ByteOrder::Little);
     assert_eq!(typed.model_id(), Some(358));
     assert_eq!(typed.model_name(), Some("ILCE-9"));
-    assert_eq!(emissions[0].value(), &TagValue::Str("ILCE-9".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("ILCE-9".into())
+    );
   }
 
   #[test]
@@ -773,7 +849,7 @@ mod tests {
       Some("E-Mount, T-Mount, Other Lens or no lens")
     );
     assert_eq!(
-      emissions[0].value(),
+      emissions[0].value().as_ref(),
       &TagValue::Str("E-Mount, T-Mount, Other Lens or no lens".into())
     );
 
@@ -791,7 +867,10 @@ mod tests {
     let blob = build_blob(&[], &[(0x200e, 0x03, 1, std::vec![0x02, 0, 0, 0])]);
     let (typed, emissions) = parse(&blob, 0, ByteOrder::Little);
     assert_eq!(typed.picture_effect(), Some(2));
-    assert_eq!(emissions[0].value(), &TagValue::Str("Pop Color".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("Pop Color".into())
+    );
   }
 
   #[test]
@@ -915,10 +994,10 @@ mod tests {
   }
 
   /// Find an emission by name.
-  fn emit_value(em: &[VendorEmission], name: &str) -> Option<TagValue> {
+  fn emit_value(em: &[VendorEmission<'_>], name: &str) -> Option<TagValue> {
     em.iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   }
 
   /// End-to-end DataMember threading (`Sony.pm:1278-1279,1326-1330`): 0x201c
@@ -1041,10 +1120,11 @@ mod tests {
     let one = |tag: u16| build_blob(&[], &[(tag, 0x01, 1, std::vec![0x05, 0, 0, 0])]);
 
     // 0x201c — DSC-RX100 matches no branch ⇒ absent.
+    let b201c = one(0x201c);
     let (_t, em) = parse_in_tiff(
-      &one(0x201c),
+      &b201c,
       0,
-      one(0x201c).len(),
+      b201c.len(),
       0,
       ByteOrder::Little,
       true,
@@ -1060,10 +1140,11 @@ mod tests {
     // branch 1 needs AFAreaILCE==4 (undef), branch 5 needs NEX/.../DSC-RX
     // (ILCE-9 IS in branch 5's NEX/ILCE set) → matches branch 5. So instead
     // verify the genuine 0x201e miss: an ILCA body without AFAreaILCA set.
+    let b201e = one(0x201e);
     let (_t2, em2) = parse_in_tiff(
-      &one(0x201e),
+      &b201e,
       0,
-      one(0x201e).len(),
+      b201e.len(),
       0,
       ByteOrder::Little,
       true,
@@ -1095,10 +1176,11 @@ mod tests {
     );
 
     // 0x2022 — ILCE-9 writes neither variant ⇒ absent.
+    let b2022 = one(0x2022);
     let (_t4, em4) = parse_in_tiff(
-      &one(0x2022),
+      &b2022,
       0,
-      one(0x2022).len(),
+      b2022.len(),
       0,
       ByteOrder::Little,
       true,
@@ -1111,10 +1193,11 @@ mod tests {
     );
 
     // POSITIVE control — a matching body still emits the tag.
+    let b2022_pos = one(0x2022);
     let (_t5, em5) = parse_in_tiff(
-      &one(0x2022),
+      &b2022_pos,
       0,
-      one(0x2022).len(),
+      b2022_pos.len(),
       0,
       ByteOrder::Little,
       true,

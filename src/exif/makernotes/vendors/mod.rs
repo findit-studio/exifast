@@ -54,6 +54,36 @@ pub type AppleMakerNote = MakerNotesApple;
 /// Compatibility alias — Phase-1 API name preserved.
 pub type CanonMakerNote = MakerNotesCanon;
 
+/// A vendor emission's VALUE — either an owned, already-rendered
+/// [`TagValue`](crate::value::TagValue) (the common case: every named/computed
+/// leaf) or, from Phase 4 (#443), a `Borrowed(&'a [u8])` verbatim `undef[N]`
+/// span sliced zero-copy from the input buffer (the SUPPRESSED-`Unknown` Sony
+/// `0x94xx` `%unknownCipherData` leaves). Confining the suppressed-leaf value to
+/// a borrow — materialized only on read via [`VendorEmission::value`] — bounds
+/// the memory a crafted MakerNote can amplify (N leaves over one M-byte region
+/// retain O(N) span descriptors, not N copies of M).
+///
+/// COVARIANT in `'a` (`&'a [u8]` is covariant, `TagValue` is `'a`-free), so a
+/// detached `EmissionValue<'static>` (an all-owned producer) is usable wherever
+/// an `EmissionValue<'a>` is expected.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmissionValue<'a> {
+  /// An owned, already-rendered value — the common case (every named/computed
+  /// vendor leaf).
+  Owned(crate::value::TagValue),
+  /// A verbatim `undef[N]` value span, borrowed ZERO-COPY from the input buffer
+  /// (#443). Used ONLY for a SUPPRESSED-`Unknown` Sony `0x94xx`
+  /// `%unknownCipherData` leaf: its value is the raw on-disk bytes
+  /// (`data[value_offset .. value_offset + value_size]`), which the default
+  /// output drops (`Unknown => 1`) and only the `-u`/API path materializes (via
+  /// [`VendorEmission::value`]). Borrowing — rather than copying into a
+  /// [`TagValue::Bytes`](crate::value::TagValue::Bytes) — is what bounds the
+  /// memory a crafted MakerNote (N leaves over one shared M-byte region) can
+  /// amplify: O(N) span descriptors sharing the buffer, not N copies of M.
+  Borrowed(&'a [u8]),
+}
+
 /// One vendor MakerNote emission — the rendered `(name, value)` pair plus the
 /// `Unknown => 1` flag the emission engine uses to suppress it from default
 /// output (`ExifTool.pm:9179-9185`).
@@ -65,6 +95,10 @@ pub type CanonMakerNote = MakerNotesCanon;
 /// `Unknown` ones once — exactly as it does for every other format, so the
 /// per-vendor `if def.is_unknown() { continue; }` is gone.
 ///
+/// The `'a` lifetime is the input buffer a [`Borrowed`](EmissionValue) value
+/// points into (Phase 4, #443, the Sony `0x94xx` suppressed-`Unknown` leaves);
+/// an all-owned emission ignores it.
+///
 /// D8: no public fields; accessors only. The constructor is `pub(crate)` (only
 /// the in-crate vendor body parsers build these), but the read accessors are
 /// `pub` so the captured-MakerNote accessors
@@ -72,11 +106,13 @@ pub type CanonMakerNote = MakerNotesCanon;
 /// remain usable from outside the crate.
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq)]
-pub struct VendorEmission {
+pub struct VendorEmission<'a> {
   /// The resolved tag name (the vendor table's `Name`).
   name: smol_str::SmolStr,
-  /// The rendered value for the active [`ConvMode`](crate::emit::ConvMode).
-  value: crate::value::TagValue,
+  /// The rendered value for the active [`ConvMode`](crate::emit::ConvMode) —
+  /// [`Owned`](EmissionValue::Owned) for a named/computed leaf, or a borrowed
+  /// verbatim span for a suppressed-`Unknown` cipher-data leaf (Phase 4, #443).
+  value: EmissionValue<'a>,
   /// ExifTool's `Unknown => 1` flag — `true` ⇒ the engine suppresses this tag
   /// from default output.
   unknown: bool,
@@ -98,7 +134,7 @@ pub struct VendorEmission {
 }
 
 #[cfg(feature = "alloc")]
-impl VendorEmission {
+impl<'a> VendorEmission<'a> {
   /// Compose a vendor emission from its name, rendered value, and `Unknown`
   /// flag, with ExifTool's default duplicate `Priority => 1`
   /// (`ExifTool.pm:9553`). (`pub(crate)`: only the in-crate vendor body parsers
@@ -124,7 +160,31 @@ impl VendorEmission {
   ) -> Self {
     Self {
       name,
-      value,
+      value: EmissionValue::Owned(value),
+      unknown,
+      priority,
+      group1_override: None,
+    }
+  }
+
+  /// Compose a SUPPRESSED-`Unknown` vendor emission whose value is a verbatim
+  /// `undef[N]` span BORROWED zero-copy from the input buffer (#443) — the Sony
+  /// `0x94xx` `%unknownCipherData` leaves. The value is NOT materialized here;
+  /// it becomes a [`TagValue::Bytes`](crate::value::TagValue::Bytes) only if
+  /// [`value`](Self::value) is read (the `-u`/API path), so N such leaves over
+  /// one shared M-byte region retain O(N) span descriptors, not N copies of M.
+  /// `group1_override` is `None` (the emission inherits the vendor group).
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn new_borrowed_span(
+    name: smol_str::SmolStr,
+    span: &'a [u8],
+    unknown: bool,
+    priority: u8,
+  ) -> Self {
+    Self {
+      name,
+      value: EmissionValue::Borrowed(span),
       unknown,
       priority,
       group1_override: None,
@@ -146,7 +206,7 @@ impl VendorEmission {
   ) -> Self {
     Self {
       name,
-      value,
+      value: EmissionValue::Owned(value),
       unknown,
       priority: 1,
       group1_override: Some(group1),
@@ -170,7 +230,7 @@ impl VendorEmission {
   ) -> Self {
     Self {
       name,
-      value,
+      value: EmissionValue::Owned(value),
       unknown,
       priority,
       group1_override,
@@ -184,11 +244,25 @@ impl VendorEmission {
     self.name.as_str()
   }
 
-  /// The rendered value.
+  /// The rendered value, materialized ON READ. An [`Owned`](EmissionValue::Owned)
+  /// value is returned by reference ([`Cow::Borrowed`](std::borrow::Cow::Borrowed),
+  /// zero-copy); a borrowed suppressed-`Unknown` cipher-data span (Phase 4, #443)
+  /// materializes into an owned [`TagValue::Bytes`](crate::value::TagValue::Bytes)
+  /// only here — so the default consumer, which drops `Unknown` leaves BEFORE
+  /// reading, never pays the copy, while the `-u`/API path recovers the exact
+  /// on-disk bytes.
   #[must_use]
-  #[inline(always)]
-  pub const fn value(&self) -> &crate::value::TagValue {
-    &self.value
+  #[inline]
+  pub fn value(&self) -> std::borrow::Cow<'_, crate::value::TagValue> {
+    match &self.value {
+      EmissionValue::Owned(v) => std::borrow::Cow::Borrowed(v),
+      // Materialize the borrowed verbatim span into an owned `TagValue::Bytes`
+      // (#443) — byte-identical to what the eager `raw_to_tag_value` produced
+      // from a `RawValue::Bytes(span.to_vec())`, but paid ONLY here, on read.
+      EmissionValue::Borrowed(span) => {
+        std::borrow::Cow::Owned(crate::value::TagValue::Bytes(span.to_vec()))
+      }
+    }
   }
 
   /// Whether this emission carries ExifTool's `Unknown => 1` flag — the

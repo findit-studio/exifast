@@ -359,8 +359,8 @@ fn split_first_colon(inner: &[u8]) -> (&[u8], Option<&[u8]>) {
 /// `%DJI::Info` carries no Conv, so the result is independent of `print_conv`
 /// (the parameter is accepted for call-site symmetry with the IFD path).
 #[must_use]
-pub fn parse_dji_info(blob: &[u8]) -> Vec<VendorEmission> {
-  let mut emissions: Vec<VendorEmission> = Vec::new();
+pub fn parse_dji_info<'e>(blob: &[u8]) -> Vec<VendorEmission<'e>> {
+  let mut emissions: Vec<VendorEmission<'e>> = Vec::new();
   // `/\G.../g`: the first capture must begin at offset 0 (the dispatch
   // guarantees `[ae_dbg_info:`); each subsequent `\G` anchor is the index
   // just past the previous `]`. A failed match terminates the loop.
@@ -402,7 +402,7 @@ mod tests {
   use super::*;
   use crate::value::TagValue;
 
-  fn names(emis: &[VendorEmission]) -> Vec<&str> {
+  fn names<'s>(emis: &'s [VendorEmission<'_>]) -> Vec<&'s str> {
     emis.iter().map(VendorEmission::name).collect()
   }
 
@@ -436,9 +436,18 @@ mod tests {
         "SensorID",
       ]
     );
-    assert_eq!(emis[0].value(), &TagValue::Str("Ver=1.0,exp=auto".into()));
-    assert_eq!(emis[1].value(), &TagValue::Str("0 1 2 3 4 5".into()));
-    assert_eq!(emis[3].value(), &TagValue::Str("-12.3,4.5,0.0".into()));
+    assert_eq!(
+      emis[0].value().as_ref(),
+      &TagValue::Str("Ver=1.0,exp=auto".into())
+    );
+    assert_eq!(
+      emis[1].value().as_ref(),
+      &TagValue::Str("0 1 2 3 4 5".into())
+    );
+    assert_eq!(
+      emis[3].value().as_ref(),
+      &TagValue::Str("-12.3,4.5,0.0".into())
+    );
   }
 
   #[test]
@@ -446,7 +455,10 @@ mod tests {
     // Bundled: `[some_unknown_tag:hello world]` ⇒ DJI:Some_Unknown_Tag.
     let emis = parse_dji_info(b"[ae_dbg_info:x][some_unknown_tag:hello world]");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo", "Some_Unknown_Tag"]);
-    assert_eq!(emis[1].value(), &TagValue::Str("hello world".into()));
+    assert_eq!(
+      emis[1].value().as_ref(),
+      &TagValue::Str("hello world".into())
+    );
   }
 
   #[test]
@@ -454,7 +466,7 @@ mod tests {
     // `split /:/, $1, 2` ⇒ value = "a:b:c=1". Bundled: DJI:AEDebugInfo "a:b:c=1".
     let emis = parse_dji_info(b"[ae_dbg_info:a:b:c=1]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Str("a:b:c=1".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("a:b:c=1".into()));
   }
 
   #[test]
@@ -471,7 +483,7 @@ mod tests {
     // DJI:Tag "emptykey".
     let emis = parse_dji_info(b"[ae_dbg_info:x][:emptykey]");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo", "Tag"]);
-    assert_eq!(emis[1].value(), &TagValue::Str("emptykey".into()));
+    assert_eq!(emis[1].value().as_ref(), &TagValue::Str("emptykey".into()));
   }
 
   #[test]
@@ -480,7 +492,7 @@ mod tests {
     // Bundled: "(Binary data 0 bytes, use -b option to extract)".
     let emis = parse_dji_info(b"[ae_dbg_info:]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Bytes(std::vec![]));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Bytes(std::vec![]));
   }
 
   #[test]
@@ -488,7 +500,7 @@ mod tests {
     // `hello\0\0\0` ⇒ printable prefix "hello", trailing NULs stripped.
     let emis = parse_dji_info(b"[ae_dbg_info:hello\x00\x00\x00]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Str("hello".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("hello".into()));
   }
 
   #[test]
@@ -497,7 +509,10 @@ mod tests {
     // Bundled: "(Binary data 5 bytes, …)".
     let emis = parse_dji_info(b"[ae_dbg_info:ab\x00cd]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Bytes(b"ab\x00cd".to_vec()));
+    assert_eq!(
+      emis[0].value().as_ref(),
+      &TagValue::Bytes(b"ab\x00cd".to_vec())
+    );
   }
 
   #[test]
@@ -506,7 +521,7 @@ mod tests {
     let emis = parse_dji_info(b"[ae_dbg_info:\x01\x02\x03\xff\xfe]");
     assert_eq!(emis.len(), 1);
     assert_eq!(
-      emis[0].value(),
+      emis[0].value().as_ref(),
       &TagValue::Bytes(b"\x01\x02\x03\xff\xfe".to_vec())
     );
   }
@@ -528,7 +543,7 @@ mod tests {
     let emis = parse_dji_info(b"[ae_dbg_info:ok]x[awb_dbg_info:y]");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo"]);
     assert_eq!(
-      emis[0].value(),
+      emis[0].value().as_ref(),
       &TagValue::Str("ok]x[awb_dbg_info:y".into())
     );
   }
@@ -556,7 +571,7 @@ mod tests {
     // is captured. Bundled 13.59: DJI:AEDebugInfo "ok".
     let emis = parse_dji_info(b"[ae_dbg_info:ok]\n");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo"]);
-    assert_eq!(emis[0].value(), &TagValue::Str("ok".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("ok".into()));
   }
 
   #[test]
@@ -566,8 +581,8 @@ mod tests {
     // MakeTagInfo "Tagb". Bundled 13.59: DJI:AEDebugInfo "a:1", DJI:Tagb 2.
     let emis = parse_dji_info(b"[ae_dbg_info:a:1][b:2]\n");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo", "Tagb"]);
-    assert_eq!(emis[0].value(), &TagValue::Str("a:1".into()));
-    assert_eq!(emis[1].value(), &TagValue::Str("2".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("a:1".into()));
+    assert_eq!(emis[1].value().as_ref(), &TagValue::Str("2".into()));
   }
 
   #[test]
@@ -591,7 +606,7 @@ mod tests {
     let emis = parse_dji_info(b"[ae_dbg_info:ok]\n[awb_dbg_info:y]");
     assert_eq!(names(&emis), std::vec!["AEDebugInfo"]);
     assert_eq!(
-      emis[0].value(),
+      emis[0].value().as_ref(),
       &TagValue::Bytes(b"ok]\n[awb_dbg_info:y".to_vec())
     );
   }
@@ -603,7 +618,7 @@ mod tests {
     // the anchor). Bundled 13.59: DJI:AEDebugInfo "ok".
     let emis = parse_dji_info(b"[ae_dbg_info:ok\n]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Str("ok".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("ok".into()));
   }
 
   #[test]
@@ -614,7 +629,10 @@ mod tests {
     // Bundled 13.59: DJI:AEDebugInfo "(Binary data 4 bytes, …)".
     let emis = parse_dji_info(b"[ae_dbg_info:ok\n\n]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Bytes(b"ok\n\n".to_vec()));
+    assert_eq!(
+      emis[0].value().as_ref(),
+      &TagValue::Bytes(b"ok\n\n".to_vec())
+    );
   }
 
   #[test]
@@ -624,7 +642,7 @@ mod tests {
     // (the NULs are stripped). Bundled 13.59: DJI:AEDebugInfo "ok".
     let emis = parse_dji_info(b"[ae_dbg_info:ok\x00\n]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Str("ok".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("ok".into()));
   }
 
   #[test]
@@ -635,7 +653,10 @@ mod tests {
     // DJI:AEDebugInfo "(Binary data 4 bytes, …)".
     let emis = parse_dji_info(b"[ae_dbg_info:ok\n\x00]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Bytes(b"ok\n\x00".to_vec()));
+    assert_eq!(
+      emis[0].value().as_ref(),
+      &TagValue::Bytes(b"ok\n\x00".to_vec())
+    );
   }
 
   #[test]
@@ -645,7 +666,7 @@ mod tests {
     // binary (the full 1-byte value). Bundled 13.59: "(Binary data 1 bytes,…)".
     let emis = parse_dji_info(b"[ae_dbg_info:\n]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Bytes(b"\n".to_vec()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Bytes(b"\n".to_vec()));
   }
 
   #[test]
@@ -655,7 +676,7 @@ mod tests {
     // DJI:AEDebugInfo "hello".
     let emis = parse_dji_info(b"[ae_dbg_info:hello\x00\x00\n]");
     assert_eq!(emis.len(), 1);
-    assert_eq!(emis[0].value(), &TagValue::Str("hello".into()));
+    assert_eq!(emis[0].value().as_ref(), &TagValue::Str("hello".into()));
   }
 
   // ---- MakeTagInfo name-derivation unit coverage (ExifTool.pm:9312-9317) ----

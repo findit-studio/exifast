@@ -336,7 +336,7 @@ fn apple_iphone_real_fixture_emits_makernote_group() {
   let mnv = emissions
     .iter()
     .find(|e| e.name() == "MakerNoteVersion")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert!(mnv.is_some(), "MakerNoteVersion emitted");
 }
 
@@ -378,7 +378,7 @@ fn pentax_k10d_real_fixture_decodes_typed_and_emits() {
     emissions
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   use exifast::value::TagValue;
   assert_eq!(
@@ -833,7 +833,7 @@ fn canon_serialinfo_5d_decodes_internal_serial_number2() {
   let isn2 = emissions
     .iter()
     .find(|e| e.name() == "InternalSerialNumber2")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(
     isn2,
     Some(exifast::TagValue::Str("ABC123XYZ".into())),
@@ -842,7 +842,7 @@ fn canon_serialinfo_5d_decodes_internal_serial_number2() {
   let isn = emissions
     .iter()
     .find(|e| e.name() == "InternalSerialNumber")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(isn, Some(exifast::TagValue::Str("DEF456".into())));
 
   // The bogus `SerialInfo` SubDirectory parent is NEVER emitted (#177).
@@ -873,7 +873,7 @@ fn canon_serialinfo_rawconv_drops_non_word() {
   let isn = emissions
     .iter()
     .find(|e| e.name() == "InternalSerialNumber")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(isn, Some(exifast::TagValue::Str("DEF456".into())));
 }
 
@@ -995,7 +995,7 @@ fn panasonic_lumix_real_fixture_emits_print_conv_labels() {
     emissions
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   use exifast::value::TagValue;
   assert_eq!(find("ImageQuality"), Some(TagValue::Str("High".into())));
@@ -1114,7 +1114,7 @@ fn panasonic3_dcft7_base12_out_of_line_lenstype() {
     mn.emissions_print_conv()
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   assert_eq!(
     find("LensType"),
@@ -1137,7 +1137,7 @@ fn panasonic3_dcft7_base0_offset_is_corrupted() {
     .emissions_print_conv()
     .iter()
     .find(|e| e.name() == "LensType")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_ne!(
     lens,
     Some(TagValue::Str("LUMIX-LENS-12".into())),
@@ -1362,7 +1362,7 @@ fn canon_eos_real_fixture_emits_print_conv_labels() {
     emissions
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   use exifast::value::TagValue;
   assert_eq!(
@@ -2226,7 +2226,7 @@ fn leica10_dispatches_to_panasonic_main_image_quality() {
     .emissions_print_conv()
     .iter()
     .find(|e| e.name() == "ImageQuality")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(
     iq,
     Some(TagValue::Str("High".into())),
@@ -2504,7 +2504,7 @@ fn leica1_dispatches_to_panasonic_main_image_quality() {
     .emissions_print_conv()
     .iter()
     .find(|e| e.name() == "ImageQuality")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(
     iq,
     Some(TagValue::Str("High".into())),
@@ -3041,7 +3041,7 @@ fn synthetic_dji_typed_populates_all_main_tags() {
     emissions
       .iter()
       .find(|e| e.name() == n)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   assert_eq!(find("Make"), Some(TagValue::Str("DJI".into())));
   assert_eq!(find("SpeedX"), Some(TagValue::Str("+1.50".into())));
@@ -5032,7 +5032,7 @@ fn canon_makernote_dirsize_overrun_salvages_clamped_entries() {
   let owner = emissions
     .iter()
     .find(|e| e.name() == "OwnerName")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(
     owner,
     Some(exifast::TagValue::Str("OwnerX".into())),
@@ -5041,7 +5041,7 @@ fn canon_makernote_dirsize_overrun_salvages_clamped_entries() {
   let imgtype = emissions
     .iter()
     .find(|e| e.name() == "CanonImageType")
-    .map(|e| e.value().clone());
+    .map(|e| e.value().into_owned());
   assert_eq!(
     imgtype,
     Some(exifast::TagValue::Str("CanonImg".into())),
@@ -5322,7 +5322,7 @@ fn canon_salvaged_dir_prescan_drives_focallength_and_lenstype() {
     emissions
       .iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   };
   // The dependent FocalLength sub-table emission scaled by the pre-scanned
   // FocalUnits = 2 ⇒ 100/2 = "50 mm" (the salvage drove the pre-scan).

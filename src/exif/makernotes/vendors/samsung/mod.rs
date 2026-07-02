@@ -218,7 +218,7 @@ fn first_u32(raw: &RawValue) -> Option<u32> {
 pub(crate) fn emit_picture_wizard(
   members: &[u64],
   print_conv: bool,
-  out: &mut Vec<VendorEmission>,
+  out: &mut Vec<VendorEmission<'_>>,
 ) {
   // (member index, name, conv) — FORMAT int16u ⇒ array index N.
   const MEMBERS: &[(usize, &str, SamsungPrintConv)] = &[
@@ -314,7 +314,7 @@ pub(crate) fn emit_crypt(
   raw: &RawValue,
   key: &[i64],
   unknown: bool,
-  out: &mut Vec<VendorEmission>,
+  out: &mut Vec<VendorEmission<'_>>,
 ) {
   // `split(" ",$val)` over the RENDERED value — `None` for a shape that does not
   // render to integers (a parseable wrong-format Crypt entry). ExifTool's RawConv

@@ -276,17 +276,17 @@ impl MakerNotesDji {
 /// `blob` is the raw 0x927C value (DJI's body has no header — `Start =>
 /// '$valuePtr'`); `parent_order` is the parent IFD walk's byte order.
 #[must_use]
-pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesDji, Vec<VendorEmission>) {
+pub fn parse<'e>(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesDji, Vec<VendorEmission<'e>>) {
   parse_with_print_conv(blob, parent_order, true)
 }
 
 /// Like [`parse`] but lets the caller toggle PrintConv.
 #[must_use]
-pub fn parse_with_print_conv(
+pub fn parse_with_print_conv<'e>(
   blob: &[u8],
   parent_order: ByteOrder,
   print_conv: bool,
-) -> (MakerNotesDji, Vec<VendorEmission>) {
+) -> (MakerNotesDji, Vec<VendorEmission<'e>>) {
   parse_in_tiff(blob, 0, blob.len(), parent_order, print_conv)
 }
 
@@ -308,15 +308,15 @@ pub fn parse_with_print_conv(
 /// `MakerNotesDji` fields (it carries debug blobs, not the camera-pose / speed
 /// data the struct models), so the typed slot stays empty there.
 #[must_use]
-pub fn parse_in_tiff(
+pub fn parse_in_tiff<'e>(
   tiff_data: &[u8],
   mn_offset: usize,
   mn_len: usize,
   parent_order: ByteOrder,
   print_conv: bool,
-) -> (MakerNotesDji, Vec<VendorEmission>) {
+) -> (MakerNotesDji, Vec<VendorEmission<'e>>) {
   let mut typed = MakerNotesDji::new();
-  let mut emissions: Vec<VendorEmission> = Vec::new();
+  let mut emissions: Vec<VendorEmission<'e>> = Vec::new();
   // DJIInfo (`MakerNoteDJIInfo`, `NotIFD => 1`): the whole 0x927C value is the
   // bracketed-string body (`DirStart = 0`). `%DJI::Info` has no Conv, so the
   // emissions are `print_conv`-independent.
@@ -359,7 +359,7 @@ pub fn parse_into_metadata(
     if e.unknown() {
       continue;
     }
-    into.push(group.clone(), e.name(), e.value().clone());
+    into.push(group.clone(), e.name(), e.value().into_owned());
   }
 }
 
@@ -454,7 +454,10 @@ mod tests {
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].name(), "Pitch");
-    assert_eq!(emissions[0].value(), &TagValue::Str("+12.50".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("+12.50".into())
+    );
     assert!((typed.flight_pitch().unwrap() - 12.5).abs() < 1e-6);
   }
 
@@ -516,7 +519,7 @@ mod tests {
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].name(), "Make");
-    assert_eq!(emissions[0].value(), &TagValue::Str("DJI".into()));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::Str("DJI".into()));
     assert_eq!(typed.make(), Some("DJI"));
   }
 
@@ -533,11 +536,20 @@ mod tests {
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(emissions.len(), 3);
     assert_eq!(emissions[0].name(), "SpeedX");
-    assert_eq!(emissions[0].value(), &TagValue::Str("+1.25".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("+1.25".into())
+    );
     assert_eq!(emissions[1].name(), "SpeedY");
-    assert_eq!(emissions[1].value(), &TagValue::Str("-3.50".into()));
+    assert_eq!(
+      emissions[1].value().as_ref(),
+      &TagValue::Str("-3.50".into())
+    );
     assert_eq!(emissions[2].name(), "SpeedZ");
-    assert_eq!(emissions[2].value(), &TagValue::Str("+0.00".into()));
+    assert_eq!(
+      emissions[2].value().as_ref(),
+      &TagValue::Str("+0.00".into())
+    );
     let triple = typed.flight_speed().expect("all three speed tags");
     assert!((triple.0 - 1.25).abs() < 1e-6);
     assert!((triple.1 + 3.5).abs() < 1e-6);

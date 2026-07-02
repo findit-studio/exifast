@@ -396,7 +396,7 @@ pub fn routes_to_leica10(blob: &[u8]) -> bool {
 /// (18 for Leica10) — threaded from the dispatcher rather than hard-coded,
 /// the cross-vendor generalization of the DC-FT7 base-threading.
 #[must_use]
-pub fn parse_leica10_gated(
+pub fn parse_leica10_gated<'e>(
   tiff_data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -404,7 +404,7 @@ pub fn parse_leica10_gated(
   parent_order: ByteOrder,
   print_conv: bool,
   model: Option<&str>,
-) -> Option<(MakerNotesPanasonic, Vec<VendorEmission>)> {
+) -> Option<(MakerNotesPanasonic, Vec<VendorEmission<'e>>)> {
   // The gate reads the captured MakerNote blob (the bytes the dispatcher
   // classified) — `tiff_data[mn_offset .. mn_offset + mn_len]`.
   let blob_end = mn_offset.saturating_add(mn_len).min(tiff_data.len());
@@ -512,7 +512,7 @@ pub fn routes_to_leica1(make: Option<&str>) -> bool {
 // (`tiff_data`/`mn_offset`/`mn_len`) plus the make-gate + model + body-offset
 // inputs are all load-bearing and threaded from the dispatcher.
 #[allow(clippy::too_many_arguments)]
-pub fn parse_leica1_gated(
+pub fn parse_leica1_gated<'e>(
   tiff_data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -521,7 +521,7 @@ pub fn parse_leica1_gated(
   print_conv: bool,
   make: Option<&str>,
   model: Option<&str>,
-) -> Option<(MakerNotesPanasonic, Vec<VendorEmission>)> {
+) -> Option<(MakerNotesPanasonic, Vec<VendorEmission<'e>>)> {
   // The Leica1 `Condition` is MAKE-only (`$$self{Make} eq "LEICA"`,
   // `MakerNotes.pm:602`) — it does NOT read the blob.
   if !routes_to_leica1(make) {
@@ -712,20 +712,20 @@ mod tests {
   // the `body_offset` argument the oracle took is always `HEADER_LEN` here; the
   // dynamic-base addend is the separate `base_offset`. The typed slot is installed
   // for both modes by this helper, so the `-n` typed tests are unaffected.
-  fn parse(blob: &[u8], order: ByteOrder) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+  fn parse<'e>(blob: &[u8], order: ByteOrder) -> (MakerNotesPanasonic, Vec<VendorEmission<'e>>) {
     parse_with_print_conv(blob, order, true)
   }
 
-  fn parse_with_print_conv(
+  fn parse_with_print_conv<'e>(
     blob: &[u8],
     order: ByteOrder,
     print_conv: bool,
-  ) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+  ) -> (MakerNotesPanasonic, Vec<VendorEmission<'e>>) {
     parse_in_tiff(blob, 0, blob.len(), HEADER_LEN, order, print_conv, None, 0)
   }
 
   #[allow(clippy::too_many_arguments)]
-  fn parse_in_tiff(
+  fn parse_in_tiff<'e>(
     tiff_data: &[u8],
     mn_offset: usize,
     mn_len: usize,
@@ -734,7 +734,7 @@ mod tests {
     print_conv: bool,
     model: Option<&str>,
     base_offset: usize,
-  ) -> (MakerNotesPanasonic, Vec<VendorEmission>) {
+  ) -> (MakerNotesPanasonic, Vec<VendorEmission<'e>>) {
     debug_assert_eq!(
       body_offset, HEADER_LEN,
       "the isolated Panasonic Main walk uses HEADER_LEN as the body offset"
@@ -764,7 +764,7 @@ mod tests {
       if e.unknown() {
         continue;
       }
-      into.push(group.clone(), e.name(), e.value().clone());
+      into.push(group.clone(), e.name(), e.value().into_owned());
     }
   }
 
@@ -809,7 +809,7 @@ mod tests {
     let (_typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].name(), "ImageQuality");
-    assert_eq!(emissions[0].value(), &TagValue::Str("High".into()));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::Str("High".into()));
   }
 
   #[test]
@@ -818,7 +818,10 @@ mod tests {
     let blob = build_blob(&[(0x1a, 0x03, 1, std::vec![0x04, 0x00, 0, 0])]);
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(typed.image_stabilization(), Some(4));
-    assert_eq!(emissions[0].value(), &TagValue::Str("On, Mode 2".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("On, Mode 2".into())
+    );
   }
 
   #[test]
@@ -827,7 +830,10 @@ mod tests {
     let blob = build_blob(&[(0x02, 0x07, 4, std::vec![0x00, 0x01, 0x00, 0x08])]);
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(typed.firmware_version(), Some("0.1.0.8"));
-    assert_eq!(emissions[0].value(), &TagValue::Str("0.1.0.8".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("0.1.0.8".into())
+    );
   }
 
   #[test]
@@ -842,7 +848,7 @@ mod tests {
       Some("(S00) 2004:07:19 no. 0102")
     );
     assert_eq!(
-      emissions[0].value(),
+      emissions[0].value().as_ref(),
       &TagValue::Str("(S00) 2004:07:19 no. 0102".into())
     );
   }
@@ -853,7 +859,10 @@ mod tests {
     let blob = build_blob(&[(0x1f, 0x03, 1, std::vec![0x06, 0x00, 0, 0])]);
     let (typed, emissions) = parse(&blob, ByteOrder::Little);
     assert_eq!(typed.shooting_mode(), Some(6));
-    assert_eq!(emissions[0].value(), &TagValue::Str("Program".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("Program".into())
+    );
   }
 
   #[test]
@@ -903,10 +912,10 @@ mod tests {
   }
 
   /// Find the first emission named `name`.
-  fn emit_value(em: &[VendorEmission], name: &str) -> Option<TagValue> {
+  fn emit_value(em: &[VendorEmission<'_>], name: &str) -> Option<TagValue> {
     em.iter()
       .find(|e| e.name() == name)
-      .map(|e| e.value().clone())
+      .map(|e| e.value().into_owned())
   }
 
   /// 0x0f AFAreaMode model-conditional (`Panasonic.pm:336-382`). On DMC-FZ10

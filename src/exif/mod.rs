@@ -1444,13 +1444,17 @@ enum MakerNoteValueConvDecode<'a> {
 }
 
 #[cfg(feature = "alloc")]
-impl MakerNoteValueConvDecode<'_> {
+impl<'a> MakerNoteValueConvDecode<'a> {
   /// Re-run the vendor decoder for `-n` (ValueConv) and return its emissions.
   /// The gated variants `.expect(...)` a `Some` result — faithful to the eager
   /// walk's invariant that a route which matched in PrintConv matches in
   /// ValueConv too (same gate, PrintConv-independent).
+  ///
+  /// The emissions borrow the input buffer `'a` (the Sony suppressed-`Unknown`
+  /// `0x94xx` leaves carry a zero-copy span, #443); every other variant is
+  /// all-owned, so its free element lifetime unifies with `'a` at no cost.
   #[must_use]
-  fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission> {
+  fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission<'a>> {
     use makernotes::vendors::{dji, panasonic};
     match self {
       MakerNoteValueConvDecode::None => std::vec::Vec::new(),
@@ -1725,7 +1729,7 @@ pub struct MakerNote<'a> {
   /// re-resolve out-of-line offsets against the TIFF block. The PrintConv
   /// decode ALSO yields the typed vendor [`MakerNotesMeta`] slot, which the
   /// domain projection / dispatch tests read, so it stays EAGER.
-  cached_emissions_print_conv: std::vec::Vec<makernotes::VendorEmission>,
+  cached_emissions_print_conv: std::vec::Vec<makernotes::VendorEmission<'a>>,
   /// How to recompute the `-n` (post-ValueConv raw) emissions ON DEMAND —
   /// Golden-v2 P0 single-mode decode. The eager walk decodes the vendor body
   /// ONCE (PrintConv, above); the ValueConv emissions are needed only by the
@@ -1826,7 +1830,7 @@ impl<'a> MakerNote<'a> {
   /// have a body parser yet).
   #[must_use]
   #[inline(always)]
-  pub fn emissions_print_conv(&self) -> &[makernotes::VendorEmission] {
+  pub fn emissions_print_conv(&self) -> &[makernotes::VendorEmission<'a>] {
     &self.cached_emissions_print_conv
   }
 
@@ -1841,7 +1845,7 @@ impl<'a> MakerNote<'a> {
   /// parser yet (Phase 3/4) and for a gated vendor whose `%Main` route did not
   /// match (its PrintConv decode produced no emissions either).
   #[must_use]
-  pub fn emissions_value_conv(&self) -> std::vec::Vec<makernotes::VendorEmission> {
+  pub fn emissions_value_conv(&self) -> std::vec::Vec<makernotes::VendorEmission<'a>> {
     self.value_conv_decode.recompute()
   }
 
@@ -6433,6 +6437,26 @@ impl Walker<'_, '_> {
       && makernotes::vendors::nikon::is_implicit_undef_subdir(tag_id))
       || (self.active_table == TableRef::Pentax
         && makernotes::vendors::pentax::is_implicit_undef_subdir(tag_id))
+      // Sony `%unknownCipherData` cipher rows (#443): the SUPPRESSED-`Unknown`
+      // LEAVES *and* the enciphered-`SubDirectory` dispatchers — every row whose
+      // value the Sony capture loop re-slices from `self.data`, never reading this
+      // decoded `RawValue`. A leaf (`sub_table: None`) is emitted as a ZERO-COPY
+      // BORROWED span; a dispatcher (`sub_table: Some(Tag2010|Tag9xxx|AfInfo)`) is
+      // decoded by `sony_emit_enciphered_subblock`, which re-slices the verbatim
+      // span for BOTH the model/byte-matched decode AND the `%unknownCipherData`
+      // fallback while `emit_sony_value` returns at its SubDirectory guard reading
+      // nothing. `value_resliced_from_data` derives the whole class from the
+      // ROUTING (`SubTable::dispatched_by_enciphered_subblock` + the leaf set), so
+      // a crafted IFD with N such rows over one shared in-bounds region retains
+      // O(N) descriptors, not N clones of the (possibly-huge) `undef[N]` block —
+      // with NO change to any emitted value. Gated to `undef` with `count != 1`
+      // (the `count == 1` int8u carve-out decodes to a scalar and stays on the
+      // normal path), matching the capture loop's borrow guard. Supersedes the
+      // R1/R2 hand-listed tag-ID predicates that kept missing members (#443 R3).
+      || (self.active_table == TableRef::Sony
+        && makernotes::vendors::sony::value_resliced_from_data(tag_id)
+        && matches!(format, Format::Undef)
+        && count != 1)
     {
       RawValue::Bytes(Vec::new())
     } else {
@@ -7049,11 +7073,11 @@ impl Walker<'_, '_> {
   /// `canon_start` afterward (the dispatch does, so the Canon leaves emit via the
   /// cached emissions, NOT inline in `push_exif_tags`).
   #[must_use]
-  fn capture_canon_emissions(
+  fn capture_canon_emissions<'e>(
     &self,
     canon_start: usize,
     print_conv: bool,
-  ) -> std::vec::Vec<makernotes::VendorEmission> {
+  ) -> std::vec::Vec<makernotes::VendorEmission<'e>> {
     let mut emissions = std::vec::Vec::new();
     let mut sink = VendorEmissionSink::new(&mut emissions);
     for entry in self.entries.get(canon_start..).unwrap_or(&[]) {
@@ -7260,7 +7284,7 @@ impl Walker<'_, '_> {
             // out-of-line value offsets resolve against the parent TIFF block
             // (Canon/Sony/Panasonic), not the captured blob.
             let mut meta = makernotes::MakerNotesMeta::from_detected(detected);
-            let mut cached_pc = std::vec::Vec::<makernotes::VendorEmission>::new();
+            let mut cached_pc = std::vec::Vec::<makernotes::VendorEmission<'_>>::new();
             let mut value_conv_decode = MakerNoteValueConvDecode::None;
             // The family-1 group for the cached emissions. Defaults to the
             // dispatched vendor's `group1()`; the cross-table Leica10 arm
@@ -9750,9 +9774,19 @@ impl ExifMeta<'_> {
     // the vendor body ONCE on demand (P0 — owned `Vec`). A shared push folds
     // either slice into `out`.
     let push = |out: &mut std::vec::Vec<crate::emit::EmittedTag>,
-                emissions: &[makernotes::VendorEmission]| {
+                emissions: &[makernotes::VendorEmission<'_>]| {
       out.reserve(emissions.len());
       for e in emissions {
+        // DROP the `Unknown => 1` leaves BEFORE materializing the value (#443):
+        // every consumer of this stream ([`run_emission`](crate::emit::run_emission),
+        // `collect_deduped_tags`, `emits_movable_tag`) suppresses `Unknown` leaves,
+        // so skipping them here is byte-identical — AND it means a borrowed
+        // suppressed-`Unknown` cipher-data span (the Sony `0x94xx` leaves) is NEVER
+        // materialized on this path (`e.value()` below only ever sees an `Owned`
+        // value), closing the transient copy the old drop-AFTER-materialize made.
+        if e.unknown() {
+          continue;
+        }
         // The family-1 group: the captured MakerNote's `group1` by default, OR
         // the emission's own override when set — the Samsung `0x0035 PreviewIFD`
         // descent emits its `%Nikon::PreviewIFD` leaves under `PreviewIFD`
@@ -9764,7 +9798,7 @@ impl ExifMeta<'_> {
         out.push(crate::emit::EmittedTag::new_with_priority(
           crate::value::Group::new("MakerNotes", g1),
           smol_str::SmolStr::new(e.name()),
-          e.value().clone(),
+          e.value().into_owned(),
           e.unknown(),
           e.priority(),
         ));
@@ -10628,23 +10662,45 @@ impl ExifSink for EmittedTagSink<'_> {
 /// (a safe no-op) rather than `unreachable!()`, so a stray core entry can never
 /// turn into a malformed-input panic (defense in depth).
 #[cfg(feature = "alloc")]
-struct VendorEmissionSink<'v> {
+struct VendorEmissionSink<'v, 'a> {
   /// The destination [`VendorEmission`] buffer (borrowed) — pushed in walk
-  /// (emission) order.
-  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>,
+  /// (emission) order. The element lifetime `'a` is the input buffer a Phase-4
+  /// borrowed span (#443) points into; owned emissions ignore it.
+  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission<'a>>,
 }
 
 #[cfg(feature = "alloc")]
-impl<'v> VendorEmissionSink<'v> {
+impl<'v, 'a> VendorEmissionSink<'v, 'a> {
   /// Wrap a destination buffer.
   #[inline(always)]
-  fn new(emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>) -> Self {
+  fn new(emissions: &'v mut std::vec::Vec<makernotes::VendorEmission<'a>>) -> Self {
     Self { emissions }
+  }
+
+  /// Capture a SUPPRESSED-`Unknown` leaf as a BORROWED verbatim value span
+  /// (#443) — zero-copy from the walker's input buffer `'a`. Used by the Sony
+  /// capture loop for the `0x94xx` `%unknownCipherData` leaves (whose value is
+  /// the raw on-disk `undef[N]` bytes and is dropped from default output); the
+  /// borrow is materialized only if the `-u`/API path reads it, so N leaves
+  /// over one shared region cannot amplify to N copies. INHERENT (not on
+  /// [`ExifSink`]): the borrowed-span emission is confined to this capture sink,
+  /// so the trait — and its ~19 generic `emit_*` consumers — keep their owned
+  /// `TagValue` contract unchanged.
+  #[inline(always)]
+  fn push_borrowed_span(&mut self, name: &str, span: &'a [u8], unknown: bool, priority: u8) {
+    self
+      .emissions
+      .push(makernotes::VendorEmission::new_borrowed_span(
+        smol_str::SmolStr::new(name),
+        span,
+        unknown,
+        priority,
+      ));
   }
 }
 
 #[cfg(feature = "alloc")]
-impl ExifSink for VendorEmissionSink<'_> {
+impl ExifSink for VendorEmissionSink<'_, '_> {
   // The scalar writers are the core Exif/GPS leaf path and are not reached by a
   // Canon walk (every Canon emission goes through `write_vendor_value`). They
   // DROP the value (`Ok(())`) instead of `unreachable!()` so a stray core entry
@@ -10756,15 +10812,15 @@ fn canon_capture_group1_override(family1: &str) -> Option<&'static str> {
 /// DISCARDED — the family-1 group is the fixed override, faithful to
 /// `%Nikon::PreviewIFD`'s `GROUPS => { 1 => PreviewIFD }`.
 #[cfg(feature = "alloc")]
-struct PreviewIfdSink<'v> {
+struct PreviewIfdSink<'v, 'a> {
   /// The destination [`VendorEmission`] buffer (borrowed) — pushed in walk order.
-  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission>,
+  emissions: &'v mut std::vec::Vec<makernotes::VendorEmission<'a>>,
   /// The family-1 group every captured emission carries (`"PreviewIFD"`).
   group1: &'static str,
 }
 
 #[cfg(feature = "alloc")]
-impl ExifSink for PreviewIfdSink<'_> {
+impl ExifSink for PreviewIfdSink<'_, '_> {
   #[inline(always)]
   fn write_str(
     &mut self,
@@ -12179,14 +12235,14 @@ fn populate_canon_typed(
 /// carried for symmetry with the dispatch capture inputs and the bounds it
 /// documents, not consumed by the walk.
 #[cfg(feature = "alloc")]
-fn canon_recompute_value_conv(
+fn canon_recompute_value_conv<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
   order: ByteOrder,
   model: Option<&str>,
   file_type: Option<&str>,
-) -> std::vec::Vec<makernotes::VendorEmission> {
+) -> std::vec::Vec<makernotes::VendorEmission<'e>> {
   // The `-n` recompute is the isolated walk with `print_conv = false` and the
   // typed slot discarded (the `-n` path needs only the ValueConv emissions).
   canon_makernote_isolated(data, mn_offset, mn_len, order, model, file_type, false).0
@@ -12225,13 +12281,13 @@ fn canon_recompute_value_conv(
 /// and is ALWAYS returned (non-Option — the oracle's `MakerNotesApple` is always
 /// present, even empty).
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn apple_makernote_isolated(
+pub(in crate::exif) fn apple_makernote_isolated<'e>(
   blob: &[u8],
   parent_order: ByteOrder,
   print_conv: bool,
   make: Option<&str>,
 ) -> (
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   Option<makernotes::vendors::apple::MakerNotesApple>,
 ) {
   // The oracle's `blob.len() < 14` guard (`apple/mod.rs`): a blob too short to
@@ -12429,8 +12485,8 @@ pub(in crate::exif) fn apple_makernote_isolated(
 /// matching `parse_in_tiff`).
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
-pub(in crate::exif) fn sony_makernote_isolated(
-  data: &[u8],
+pub(in crate::exif) fn sony_makernote_isolated<'a>(
+  data: &'a [u8],
   mn_offset: usize,
   mn_len: usize,
   body_offset: usize,
@@ -12440,7 +12496,7 @@ pub(in crate::exif) fn sony_makernote_isolated(
   software: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'a>>,
   makernotes::vendors::sony::MakerNotesSony,
 )> {
   use makernotes::vendors::sony;
@@ -12619,16 +12675,45 @@ pub(in crate::exif) fn sony_makernote_isolated(
       // rides in the entry's `conv`. A defensive non-Sony conv (never produced
       // under `TableRef::Sony`) is skipped — `emit_sony_value` needs the `SonyTag`.
       if let ResolvedConv::Sony(sony_tag) = entry.conv {
-        let Ok(()) = emit_sony_value(
-          g1,
-          entry,
-          sony_tag,
-          model,
-          af_area,
-          print_conv,
-          Some(&mut typed),
-          &mut sink,
-        );
+        // The seven `%unknownCipherData` suppressed-`Unknown` LEAVES (#443): emit
+        // the verbatim on-disk `undef[N]` value span ZERO-COPY as a BORROWED
+        // `VendorEmission`, materialized into `TagValue::Bytes` only if the
+        // `-u`/API path reads it — instead of cloning it into the cached emission.
+        // Byte-identical to the eager `raw_to_tag_value(RawValue::Bytes(span))`
+        // (same name, `Unknown => 1`, and `Priority`), but it bounds the memory a
+        // crafted MakerNote with many such leaves over ONE shared region can
+        // amplify (O(N) span descriptors, not N copies of the region). The walk
+        // stored an EMPTY `RawValue` for exactly this set (the `walk_entry`
+        // zero-copy guard), so `emit_sony_value`'s render is BYPASSED; the guard
+        // MATCHES that walk guard (`undef`, `value_size != 1` == `count != 1`), and
+        // the value extent is already range-checked in-bounds by the walk, so the
+        // span slice always resolves. A `count == 1` leaf (the `int8u` scalar
+        // carve-out) stays on the normal `emit_sony_value` path below.
+        let off = entry.value_offset();
+        if sony::is_suppressed_cipher_leaf(entry.tag_id)
+          && matches!(entry.on_disk_format, Format::Undef)
+          && entry.value_size() != 1
+          && let Some(end) = off.checked_add(entry.value_size())
+          && let Some(span) = data.get(off..end)
+        {
+          sink.push_borrowed_span(
+            sony_tag.name(),
+            span,
+            sony_tag.is_unknown(),
+            sony_tag.tag_priority(),
+          );
+        } else {
+          let Ok(()) = emit_sony_value(
+            g1,
+            entry,
+            sony_tag,
+            model,
+            af_area,
+            print_conv,
+            Some(&mut typed),
+            &mut sink,
+          );
+        }
       }
       // The enciphered `Tag9050x`/`Tag9400x` `ProcessBinaryData` sub-blocks
       // (`emit_sony_value` skips them as deferred SubDirectory rows). They are
@@ -13166,7 +13251,7 @@ fn sony_tag9050c_model(model: Option<&str>) -> bool {
 /// `-n` emissions (the typed slot is the SAME for both and ALWAYS returned,
 /// non-Option, matching `parse_in_tiff`).
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn panasonic_makernote_isolated(
+pub(in crate::exif) fn panasonic_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -13175,7 +13260,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated(
   model: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::panasonic::MakerNotesPanasonic,
 )> {
   use makernotes::vendors::panasonic;
@@ -13226,7 +13311,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated(
 /// replaced by `body_offset`).
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
-pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
+pub(in crate::exif) fn panasonic_makernote_isolated_with_offset<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -13236,7 +13321,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
   model: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::panasonic::MakerNotesPanasonic,
 )> {
   use makernotes::vendors::panasonic;
@@ -13496,7 +13581,7 @@ pub(in crate::exif) fn panasonic_makernote_isolated_with_offset(
 /// emissions (the typed slot is the SAME for both and ALWAYS returned, non-Option,
 /// matching `parse_in_tiff`).
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn nikon_makernote_isolated(
+pub(in crate::exif) fn nikon_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -13504,7 +13589,7 @@ pub(in crate::exif) fn nikon_makernote_isolated(
   model: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::nikon::MakerNotesNikon,
 )> {
   use makernotes::vendors::nikon::{self, MakerNotesNikon, ParsedValue, SubTable};
@@ -13855,7 +13940,7 @@ fn pentax_decrypt_shutter_count(
 
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
-pub(in crate::exif) fn pentax_makernote_isolated(
+pub(in crate::exif) fn pentax_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -13865,7 +13950,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
   model: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::pentax::MakerNotesPentax,
 )> {
   use makernotes::vendors::pentax::{self, MakerNotesPentax, SubTable};
@@ -14358,7 +14443,7 @@ pub(in crate::exif) fn pentax_makernote_isolated(
 /// `Some(empty)` (vendor identified, nothing decoded), never `None`.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn samsung_makernote_isolated(
+pub(in crate::exif) fn samsung_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -14373,7 +14458,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
   file_type: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::samsung::MakerNotesSamsung,
 )> {
   use makernotes::vendors::samsung::{self, MakerNotesSamsung, SubTable};
@@ -14671,7 +14756,7 @@ pub(in crate::exif) fn samsung_makernote_isolated(
 /// `Some(empty)` (vendor identified, nothing decoded), never `None`.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn leica_makernote_isolated(
+pub(in crate::exif) fn leica_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -14682,7 +14767,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
   model: Option<&str>,
   print_conv: bool,
 ) -> Option<(
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   makernotes::vendors::leica::MakerNotesLeica,
 )> {
   use makernotes::vendors::leica::MakerNotesLeica;
@@ -14924,7 +15009,7 @@ pub(in crate::exif) fn leica_makernote_isolated(
 /// `data` at `mn_offset` (it does not slice to `mn_len`), so the parameter is
 /// carried for symmetry with the decode inputs, not consumed by the walk.
 #[cfg(feature = "alloc")]
-pub(in crate::exif) fn canon_makernote_isolated(
+pub(in crate::exif) fn canon_makernote_isolated<'e>(
   data: &[u8],
   mn_offset: usize,
   mn_len: usize,
@@ -14933,7 +15018,7 @@ pub(in crate::exif) fn canon_makernote_isolated(
   file_type: Option<&str>,
   print_conv: bool,
 ) -> (
-  std::vec::Vec<makernotes::VendorEmission>,
+  std::vec::Vec<makernotes::VendorEmission<'e>>,
   Option<makernotes::vendors::canon::MakerNotesCanon>,
 ) {
   // The SAME entry-region guard `walk_canon_in_tiff` applies at its top
@@ -22512,7 +22597,7 @@ mod tests {
     let e = emitted.get(0).expect("emission 0");
     assert_eq!(e.name(), "RunTime");
     assert_eq!(
-      e.value(),
+      e.value().as_ref(),
       &TagValue::I64(42),
       "the int8u 0x2a renders as the scalar 42, not a bytes blob"
     );
@@ -22569,7 +22654,7 @@ mod tests {
     );
     assert_eq!(emitted.get(0).expect("0").name(), "HDRImageType");
     assert_eq!(
-      emitted.get(0).expect("0").value(),
+      emitted.get(0).expect("0").value().as_ref(),
       &TagValue::Str("".into()),
       "count-0 numeric renders the empty string"
     );
@@ -22713,7 +22798,7 @@ mod tests {
         .find(|e| e.name() == "AETarget")
         .expect("AETarget (the index-0 int64u entry) must be emitted");
       assert_eq!(
-        ae_target.value(),
+        ae_target.value().as_ref(),
         &crate::value::TagValue::U64(0x8899_AABB_CCDD_EEFF),
         "print_conv={print_conv}: the index-0 int64u value decodes via Format::Int64u"
       );
@@ -24046,7 +24131,7 @@ mod tests {
       .find(|e| e.name() == "LensType")
       .expect("LensType emits");
     assert_eq!(
-      lens.value(),
+      lens.value().as_ref(),
       &crate::value::TagValue::Str("G".into()),
       "undef[1] LensType must coerce to int8u then render via the LensType conv ⇒ \"G\""
     );
@@ -24079,7 +24164,7 @@ mod tests {
       .find(|e| e.name() == "AFAreaMode")
       .expect("the undef[1] AFInfo SubDirectory must emit its offset-0 AFAreaMode");
     assert_eq!(
-      af.value(),
+      af.value().as_ref(),
       &crate::value::TagValue::Str("Single Area".into()),
       "the inline AFInfo byte 0x00 ⇒ AFAreaMode \"Single Area\" (offset-0 int8u)"
     );
@@ -24270,7 +24355,7 @@ mod tests {
     makernotes::vendors::pentax::emit_lens_rec(span, true, &mut emissions);
     let lens = emissions.iter().find(|e| e.name() == "LensType");
     assert_eq!(
-      lens.map(|e| e.value().clone()),
+      lens.map(|e| e.value().into_owned()),
       Some(crate::value::TagValue::Str(
         "Sigma or Tamron Lens (3 44)".into()
       )),
@@ -25003,7 +25088,7 @@ mod tests {
       assert!(
         emi
           .iter()
-          .any(|e| e.name() == "FocalLength" && e.value() == &want),
+          .any(|e| e.name() == "FocalLength" && e.value().as_ref() == &want),
         "print_conv={print_conv}: an undef[100001] 0x02 is EXEMPT from the \
          excessive-count guard ⇒ FocalLength 550; emi={:?}",
         emi
@@ -26419,7 +26504,7 @@ mod tests {
       emissions
         .iter()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     assert_eq!(find("Quality"), Some(TagValue::Str("Fine".into())));
     assert_eq!(find("SonyModelID"), Some(TagValue::Str("ILCE-9".into())));
@@ -26517,7 +26602,7 @@ mod tests {
         .iter()
         .rev()
         .find(|e| e.name() == n)
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     };
     // 0x9050 was deciphered ONCE (latch still unset at its walk position), so the
     // single-enciphered ShutterCount recovers correctly — matching bundled.
@@ -26581,7 +26666,7 @@ mod tests {
     let mis_color_mode = mis_emit
       .iter()
       .find(|e| e.name() == "ColorMode")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(
       mis_color_mode,
       Some(TagValue::Str("WRONG".into())),
@@ -26715,7 +26800,11 @@ mod tests {
       true,
     );
     let typed = typed.expect("pc=true ⇒ typed slot installed");
-    let find = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.value().clone());
+    let find = |n: &str| {
+      em.iter()
+        .find(|e| e.name() == n)
+        .map(|e| e.value().into_owned())
+    };
     assert_eq!(
       find("AFAreaMode"),
       Some(TagValue::Str("Single-point AF".into()))
@@ -26796,7 +26885,7 @@ mod tests {
       let emitted = em
         .iter()
         .find(|e| e.name() == "ImageUniqueID")
-        .map(|e| e.value().clone());
+        .map(|e| e.value().into_owned());
       assert_eq!(
         emitted,
         Some(TagValue::Str(ID_HEX.into())),
@@ -26821,7 +26910,7 @@ mod tests {
       let emitted = em
         .iter()
         .find(|e| e.name() == "ImageUniqueID")
-        .map(|e| e.value().clone());
+        .map(|e| e.value().into_owned());
       assert_eq!(
         emitted,
         Some(TagValue::Str(SHORT_ZERO_HEX.into())),
@@ -26849,7 +26938,7 @@ mod tests {
     let emitted = em
       .iter()
       .find(|e| e.name() == "ImageUniqueID")
-      .map(|e| e.value().clone());
+      .map(|e| e.value().into_owned());
     assert_eq!(emitted, Some(TagValue::Str(NUL_HEX.into())));
     assert_eq!(typed.image_unique_id(), Some(NUL_HEX));
   }
@@ -26873,7 +26962,7 @@ mod tests {
       let emitted = em
         .iter()
         .find(|e| e.name() == "ImageUniqueID")
-        .map(|e| e.value().clone());
+        .map(|e| e.value().into_owned());
       assert_eq!(emitted, Some(TagValue::Str("".into())), "format {format}");
       assert_eq!(typed.image_unique_id(), Some(""));
     }
@@ -27307,7 +27396,7 @@ for my $n (sort {{ $a <=> $b }} grep {{ /^\d+$/ }} keys %main) {{
       emissions
         .iter()
         .find(|e| e.name() == "SerialNumber")
-        .map(|e| e.value().clone())
+        .map(|e| e.value().into_owned())
     }
 
     for print_conv in [true, false] {

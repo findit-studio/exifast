@@ -315,20 +315,20 @@ mod tests {
   // through the surviving path. The isolated helper installs the typed slot only
   // for `-j` (`print_conv.then(...)`); the `-n` tests below ignore the typed
   // surface, so an empty fallback there is never observed.
-  fn parse(
+  fn parse<'e>(
     blob: &[u8],
     order: ByteOrder,
     make: Option<&str>,
-  ) -> (MakerNotesApple, Vec<VendorEmission>) {
+  ) -> (MakerNotesApple, Vec<VendorEmission<'e>>) {
     parse_with_print_conv(blob, order, true, make)
   }
 
-  fn parse_with_print_conv(
+  fn parse_with_print_conv<'e>(
     blob: &[u8],
     order: ByteOrder,
     print_conv: bool,
     make: Option<&str>,
-  ) -> (MakerNotesApple, Vec<VendorEmission>) {
+  ) -> (MakerNotesApple, Vec<VendorEmission<'e>>) {
     let (emissions, typed) = crate::exif::apple_makernote_isolated(blob, order, print_conv, make);
     (typed.unwrap_or_else(MakerNotesApple::new), emissions)
   }
@@ -354,7 +354,7 @@ mod tests {
     assert_eq!(typed.maker_note_version(), Some(4));
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].name(), "MakerNoteVersion");
-    assert_eq!(emissions[0].value(), &TagValue::I64(4));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::I64(4));
   }
 
   #[test]
@@ -363,7 +363,10 @@ mod tests {
     let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.hdr_image_type(), Some(3));
     assert_eq!(emissions.len(), 1);
-    assert_eq!(emissions[0].value(), &TagValue::Str("HDR Image".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("HDR Image".into())
+    );
   }
 
   #[test]
@@ -373,7 +376,7 @@ mod tests {
     assert_eq!(typed.camera_type(), Some(0));
     assert_eq!(typed.camera_type_label(), Some("Back Wide Angle"));
     assert_eq!(
-      emissions[0].value(),
+      emissions[0].value().as_ref(),
       &TagValue::Str("Back Wide Angle".into())
     );
   }
@@ -383,14 +386,17 @@ mod tests {
     let blob = one_entry_blob(0x0014, 0x0009, 1, [0x00, 0x00, 0x00, 0x05]); // 5 = unknown
     let (typed, emissions) = parse(&blob, ByteOrder::Big, Some("Apple"));
     assert_eq!(typed.image_capture_type(), Some(5));
-    assert_eq!(emissions[0].value(), &TagValue::Str("Unknown (5)".into()));
+    assert_eq!(
+      emissions[0].value().as_ref(),
+      &TagValue::Str("Unknown (5)".into())
+    );
   }
 
   #[test]
   fn parse_with_print_conv_off_emits_raw_int() {
     let blob = one_entry_blob(0x000a, 0x0009, 1, [0x00, 0x00, 0x00, 0x03]);
     let (_typed, emissions) = parse_with_print_conv(&blob, ByteOrder::Big, false, Some("Apple"));
-    assert_eq!(emissions[0].value(), &TagValue::I64(3));
+    assert_eq!(emissions[0].value().as_ref(), &TagValue::I64(3));
   }
 
   #[test]

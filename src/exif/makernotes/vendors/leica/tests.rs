@@ -387,8 +387,9 @@ fn leica4_descends_into_subdir_and_data1() {
   )
   .expect("Leica4 walk");
   let has = |name: &str, val: &str| {
-    em.iter()
-      .any(|e: &VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+    em.iter().any(|e: &VendorEmission<'_>| {
+      e.name() == name && e.value().as_ref() == &TagValue::Str(val.into())
+    })
   };
   let names: std::vec::Vec<&str> = em.iter().map(VendorEmission::name).collect();
   // Subdir leaves (descended Leica4 -> Subdir).
@@ -413,7 +414,9 @@ fn leica4_descends_into_subdir_and_data1() {
   // higher-priority `0x3405` value and the later Data1 value never overrides it.
   let prio = |name: &str, val: &str| -> Option<u8> {
     em.iter()
-      .find(|e: &&VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+      .find(|e: &&VendorEmission<'_>| {
+        e.name() == name && e.value().as_ref() == &TagValue::Str(val.into())
+      })
       .map(VendorEmission::priority)
   };
   assert_eq!(
@@ -507,8 +510,9 @@ fn leica4_subdir_child_decodes_under_its_own_byte_order() {
   )
   .expect("Leica4 walk");
   let has = |name: &str, val: &str| {
-    em.iter()
-      .any(|e: &VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+    em.iter().any(|e: &VendorEmission<'_>| {
+      e.name() == name && e.value().as_ref() == &TagValue::Str(val.into())
+    })
   };
   let names: std::vec::Vec<&str> = em.iter().map(VendorEmission::name).collect();
   // The BIG-endian child IFD's plain leaves decode under the child order.
@@ -536,7 +540,9 @@ fn leica4_subdir_child_decodes_under_its_own_byte_order() {
   // intact for the Data1 LensType.
   let prio = |name: &str, val: &str| -> Option<u8> {
     em.iter()
-      .find(|e: &&VendorEmission| e.name() == name && e.value() == &TagValue::Str(val.into()))
+      .find(|e: &&VendorEmission<'_>| {
+        e.name() == name && e.value().as_ref() == &TagValue::Str(val.into())
+      })
       .map(VendorEmission::priority)
   };
   assert_eq!(
