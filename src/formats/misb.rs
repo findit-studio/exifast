@@ -552,7 +552,7 @@ fn parse_misb(data: &[u8], doc: u32, out: &mut Vec<MisbLeaf>) {
   }
 }
 
-/// `MISB::ProcessKLV` (MISB.pm:337-382) — walk a local set's `[1-byte tag][BER
+/// `MISB::ProcessKLV` (MISB.pm:337-382) — walk a local set's `[BER-OID tag][BER
 /// length][value]` records over `data[start..start+dir_len]`, decoding each via
 /// its table entry (or the default-format/binary fallback). Bounds-checked.
 #[allow(clippy::too_many_arguments)]
@@ -571,10 +571,11 @@ fn process_klv(
   let mut pos = start;
   while dir_end.saturating_sub(pos) > 1 {
     // The loop guard keeps `pos` in-bounds; `.get` keeps it panic-free regardless.
-    let Some(&tag) = data.get(pos) else {
+    // ST 0601 local-set tags are BER-OID: tags >= 128 span two bytes.
+    let Ok((tag, n)) = misb::klv::read_ber_oid(data.get(pos..dir_end).unwrap_or(&[])) else {
       return;
     };
-    pos = pos.saturating_add(1);
+    pos = pos.saturating_add(n);
     // MISB.pm:351-357 — BER length.
     let Some((len, next)) = read_ber(data, pos, dir_end) else {
       return; // MISB.pm:354 `last if $pos + $n > $dirEnd`
@@ -603,13 +604,13 @@ fn decode_tag(
   data: &[u8],
   pos: usize,
   len: usize,
-  tag: u8,
+  tag: u64,
   table: Table,
   byte_order: ByteOrder,
   doc: u32,
   out: &mut Vec<MisbLeaf>,
 ) {
-  if let Some(entry) = lookup(table, tag) {
+  if let Some(entry) = u8::try_from(tag).ok().and_then(|t| lookup(table, t)) {
     if let Conv::Sub(sub) = entry.conv {
       // MISB.pm:434-442 — nested SubDirectory: recurse with the sub-table's
       // byte order. (The recognized container tag itself yields no scalar.)
@@ -878,7 +879,7 @@ fn unknown_value(
 }
 
 /// `MISB_$key`-style placeholder name for an unrecognized local-set tag id.
-fn unknown_name(tag: u8) -> SmolStr {
+fn unknown_name(tag: u64) -> SmolStr {
   std::format!("MISB_Unknown_0x{tag:04x}").into()
 }
 
@@ -1128,6 +1129,20 @@ mod tests {
     body.extend_from_slice(&uas_ls_version_record());
     let leaves = decode(&payload(&body));
     assert_single_uas_version(&leaves);
+  }
+
+  /// ST 0601 tags >= 128 are two-byte BER-OID (`0x81 0x06` = tag 134). Reading a
+  /// 1-byte tag takes `0x06` as the length and swallows the items behind it.
+  #[test]
+  fn two_byte_ber_oid_tag_keeps_following_items() {
+    let mut inner = vec![0x81, 0x06, 0x01, 0x32];
+    inner.extend_from_slice(&uas_ls_version_record());
+    let leaves = decode_uas_local_set(&inner);
+    assert_eq!(
+      leaf(&leaves, "UAS_LSVersionNumber").value_n,
+      TagValue::I64(11)
+    );
+    assert!(leaf(&leaves, "MISB_Unknown_0x0086").unknown);
   }
 
   /// Wrap a UAS local-set `inner` body in one top-level KLV ([`UAS_KEY`] + a
