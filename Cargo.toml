@@ -235,6 +235,8 @@ derive_more = { version = "2", default-features = false, features = ["display", 
 # Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
 # typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
 jiff        = { version = "0.2", default-features = false }
+# MISB ST 0601 local-set tags are BER-OID (tags >= 128 take two bytes).
+misb        = { version = "0.2.0", default-features = false }
 # Pure-Rust zlib/DEFLATE inflater. Shared by two features (each pulls it via
 # `dep:miniz_oxide`):
 #   * `png` — PNG compressed chunks (`zTXt`, compressed `iTXt`, `iCCP` body,
