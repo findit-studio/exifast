@@ -234,7 +234,7 @@ phf = { version = "0.13", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 # Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
 # typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
-jiff        = { version = "0.2", default-features = false }
+jiff        = { version = "1.0", default-features = false }
 # Pure-Rust zlib/DEFLATE inflater. Shared by two features (each pulls it via
 # `dep:miniz_oxide`):
 #   * `png` — PNG compressed chunks (`zTXt`, compressed `iTXt`, `iCCP` body,
